@@ -1313,6 +1313,9 @@ impl AnalyzeOpts {
     /// furthest (`crate::app::time_skip_carry`), so its replay jumps where that
     /// recording did. All sources must share one timing format; mixing
     /// formats cannot preserve their different switch-in charging rules.
+    /// A record that notes its background starts (a prefix of a whole
+    /// recorded schedule) keeps its own format and its own jumps, from the
+    /// same recording as its starts, never another source's jumps beside them.
     /// An incompatible format or invalid record is refused before writing.
     pub fn write_trial_record(&self, record: PreemptionRecord, path: &Path) -> anyhow::Result<()> {
         let (skips, format, identity) = {
@@ -1337,9 +1340,21 @@ impl AnalyzeOpts {
                 .reserved_input()
                 .require_same_for_chosen(&reserved_input)?;
         }
+        // A trial that keeps a source's noted background starts (a prefix of
+        // its whole schedule) is one recording's whole history: it keeps that
+        // source's format and its own jumps, from the same recording as its
+        // starts, whichever source the cache would pick for the same events.
+        // Any other takes the sources' shared format, which lies below the
+        // background-starts format (`TimeSkipSources::remember`), and the
+        // cache's jumps.
+        let (record, skips) = if record.notes_background_starts() {
+            let own = record.time_skips().unwrap_or_default().to_vec();
+            (record, own)
+        } else {
+            (record.with_format(format), skips)
+        };
         let record = self.stamp_trial_record(
             record
-                .with_format(format)
                 .with_time_skips(skips)
                 .with_guest_ids(guest_ids)
                 .with_reserved_input(reserved_input),
@@ -1677,6 +1692,125 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A trial states the background-starts format only when it keeps a
+    /// source's noted starts, a prefix of its whole schedule: a spliced trial
+    /// or a shorter prefix of a recording that notes its starts is written in
+    /// the format below, which the re-record of that recording's schedule
+    /// replay states too, so the two combine as sources.
+    #[test]
+    fn a_trial_states_the_background_starts_format_only_with_its_starts() {
+        use detcore::preemptions::BACKGROUND_STARTS_FORMAT;
+        use detcore::preemptions::BackgroundStart;
+        use detcore::types::DetTid;
+
+        let tid = DetTid::from_raw(3);
+        let events = vec![SchedEvent::branches(tid, 1), SchedEvent::branches(tid, 2)];
+        let mut value =
+            serde_json::to_value(PreemptionRecord::from_sched_events(events.clone())).unwrap();
+        value["format_version"] = serde_json::json!(BACKGROUND_STARTS_FORMAT);
+        value["background_starts"] = serde_json::to_value(vec![BackgroundStart {
+            after: 1,
+            thread: tid,
+            call: 1,
+        }])
+        .unwrap();
+        let noting: PreemptionRecord = serde_json::from_value(value).unwrap();
+        noting.validate().unwrap();
+        assert!(noting.notes_background_starts());
+        let re_record = PreemptionRecord::from_sched_events(events.clone())
+            .with_format(Some(BACKGROUND_STARTS_FORMAT - 1));
+        let args = crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+        let crate::Subcommand::Analyze(mut options) = args.command else {
+            panic!("not analyze")
+        };
+        options.apply_global(&args.global);
+        options.time_skip_sources.lock().unwrap().remember(&noting);
+        options
+            .time_skip_sources
+            .lock()
+            .unwrap()
+            .remember(&re_record);
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("trial.json");
+        let read = || PreemptionReader::try_new(&output).unwrap().into_inner();
+
+        options
+            .write_trial_schedule(events.clone(), &output)
+            .unwrap();
+        let spliced = read();
+        assert_eq!(spliced.format_version(), Some(BACKGROUND_STARTS_FORMAT - 1));
+        assert!(spliced.background_starts().is_empty());
+
+        options
+            .write_trial_record(noting.schedule_prefix(1), &output)
+            .unwrap();
+        let shorter = read();
+        assert_eq!(shorter.format_version(), Some(BACKGROUND_STARTS_FORMAT - 1));
+        assert!(shorter.background_starts().is_empty());
+
+        options
+            .write_trial_record(noting.schedule_prefix(events.len()), &output)
+            .unwrap();
+        let whole = read();
+        assert_eq!(whole.format_version(), Some(BACKGROUND_STARTS_FORMAT));
+        assert_eq!(whole.background_starts(), noting.background_starts());
+
+        // A whole recorded schedule that notes its starts keeps its own jumps
+        // beside them: two recordings of the same events, S in format 3 and T
+        // in format 4 with its starts and other jumps, never lend each other
+        // their jumps in a whole-schedule trial, in either order. S, which
+        // notes no starts, takes one recording's jumps whole.
+        let jump = |target| detcore::preemptions::TimeSkip {
+            event: 1,
+            target: detcore::types::LogicalTime::from_nanos(target),
+            reason: detcore::preemptions::TimeSkipReason::IdleGuestPollers,
+        };
+        let s = PreemptionRecord::from_sched_events(events.clone())
+            .with_format(Some(BACKGROUND_STARTS_FORMAT - 1))
+            .with_time_skips(vec![jump(1000)]);
+        let mut value = serde_json::to_value(&noting).unwrap();
+        value["time_skips"] = serde_json::to_value(vec![jump(2000)]).unwrap();
+        let t: PreemptionRecord = serde_json::from_value(value).unwrap();
+        t.validate().unwrap();
+        assert!(t.notes_background_starts());
+        for order in [[&s, &t], [&t, &s]] {
+            *options.time_skip_sources.lock().unwrap() = Default::default();
+            for source in order {
+                options.time_skip_sources.lock().unwrap().remember(source);
+            }
+            let whole = |source: &PreemptionRecord| {
+                options
+                    .write_trial_record(source.schedule_prefix(events.len()), &output)
+                    .unwrap();
+                read()
+            };
+            let written = whole(&t);
+            assert_eq!(written.format_version(), Some(BACKGROUND_STARTS_FORMAT));
+            assert_eq!(written.time_skips(), Some(&[jump(2000)][..]));
+            assert_eq!(written.background_starts(), t.background_starts());
+            let written = whole(&s);
+            assert_eq!(written.format_version(), Some(BACKGROUND_STARTS_FORMAT - 1));
+            assert!(written.background_starts().is_empty());
+            assert_eq!(written.time_skips(), order[0].time_skips());
+        }
+
+        // A source of a format this Hermit does not read keeps it as a source,
+        // so a trial from it states it too and is refused by name, not
+        // lowered into a format this Hermit reads.
+        let newer = detcore::preemptions::PREEMPTION_RECORD_FORMAT + 1;
+        *options.time_skip_sources.lock().unwrap() = Default::default();
+        options.time_skip_sources.lock().unwrap().remember(
+            &PreemptionRecord::from_sched_events(events.clone()).with_format(Some(newer)),
+        );
+        let refusal = options
+            .write_trial_schedule(events.clone(), &output)
+            .unwrap_err();
+        assert!(
+            format!("{refusal:#}").contains(&format!("record format Some({newer})")),
+            "{refusal:#}"
+        );
     }
 
     /// Analyze and bisect run every trial under the timeslice a recording says

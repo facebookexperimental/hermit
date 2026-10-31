@@ -91,16 +91,23 @@ pub(super) fn read_settings<T: serde::de::DeserializeOwned>(path: &Path) -> Resu
 
 impl BoundaryRecording {
     /// Combine a validated preemption history with the sole global record
-    /// stream. The legacy history must not contain another global stream. The
-    /// history's format is checked by [`Recording::decode`], which refuses it
-    /// as a policy refusal (`RecordFormatRefusal`): a deserializer would lose
-    /// that error's type.
+    /// stream. The legacy history must not contain another global stream, nor
+    /// background starts (`BackgroundStart`), which only the legacy schedule
+    /// replayer takes. The history's format is checked by
+    /// [`Recording::decode`], which refuses it as a policy refusal
+    /// (`RecordFormatRefusal`): a deserializer would lose that error's type.
     pub fn new(preemptions: PreemptionRecord, schedule: Schedule) -> anyhow::Result<Self> {
         preemptions
             .validate_contents()
             .map_err(anyhow::Error::msg)?;
         if !preemptions.global.is_empty() {
             bail!("slice-boundary recording has a second, legacy global event stream");
+        }
+        if !preemptions.background_starts.is_empty() {
+            bail!(
+                "slice-boundary recording notes background starts, which a boundary replay does \
+                 not take; only a legacy schedule records and replays them"
+            );
         }
         Ok(Self {
             preemptions,
@@ -626,6 +633,85 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
         assert!(HistoryReader::read(&path).is_err());
         assert_ne!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// A boundary replay takes no background starts, so a boundary recording
+    /// that notes any is refused by name, by the constructor and by the reader
+    /// of a serialized one, beside a valid boundary schedule. A legacy record
+    /// keeps a start at either end of its events. The slice-boundary writer
+    /// states no format that claims the starts' list, keeps one this Hermit
+    /// does not read as stated, and refuses to start after noting a start.
+    #[test]
+    fn a_boundary_recording_with_background_starts_is_refused_by_name() {
+        use crate::preemptions::BACKGROUND_STARTS_FORMAT;
+        use crate::preemptions::BackgroundStart;
+        use crate::preemptions::PREEMPTION_RECORD_FORMAT;
+        use crate::preemptions::format_without_background_starts;
+        let Recording::Boundaries(valid) = sample(true) else {
+            unreachable!()
+        };
+        let start = BackgroundStart {
+            after: 0,
+            thread: DetTid::from_raw(3),
+            call: 1,
+        };
+        let mut metadata = valid.preemptions.clone();
+        metadata.format_version = Some(BACKGROUND_STARTS_FORMAT);
+        metadata.background_starts.push(start);
+        metadata.validate_contents().unwrap();
+        let error = BoundaryRecording::new(metadata, valid.schedule.clone()).unwrap_err();
+        assert!(
+            error.to_string().contains("notes background starts"),
+            "{error}"
+        );
+        let mut wire: serde_json::Value =
+            serde_json::from_slice(&sample(true).encode().unwrap()).unwrap();
+        let preemptions = &mut wire["slice_boundary_recording"]["preemptions"];
+        preemptions["format_version"] = BACKGROUND_STARTS_FORMAT.into();
+        preemptions["background_starts"] = serde_json::to_value(vec![start]).unwrap();
+        let error = Recording::decode(&serde_json::to_vec(&wire).unwrap()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("notes background starts"),
+            "{error:#}"
+        );
+        let events = vec![SchedEvent::branches(DetTid::from_raw(3), 1)];
+        for after in [0, 1] {
+            let mut legacy = PreemptionRecord::from_sched_events(events.clone())
+                .with_format(Some(BACKGROUND_STARTS_FORMAT));
+            legacy
+                .background_starts
+                .push(BackgroundStart { after, ..start });
+            let bytes = Recording::Legacy(legacy.clone()).encode().unwrap();
+            assert_eq!(
+                Recording::decode(&bytes).unwrap(),
+                Recording::Legacy(legacy)
+            );
+        }
+        let boundary_format = |writer: PreemptionWriter| writer.inner.format_version;
+        for format in [BACKGROUND_STARTS_FORMAT, PREEMPTION_RECORD_FORMAT + 1, 0] {
+            let expected = format_without_background_starts(Some(format));
+            let before = PreemptionWriter::new(None)
+                .with_format(Some(format))
+                .with_slice_boundaries()
+                .unwrap();
+            assert_eq!(boundary_format(before), expected, "format {format}");
+            let after = PreemptionWriter::new(None)
+                .with_slice_boundaries()
+                .unwrap()
+                .with_format(Some(format));
+            assert_eq!(boundary_format(after), expected, "format {format}");
+        }
+        let noting = PreemptionWriter::new(None)
+            .with_slice_boundaries()
+            .unwrap()
+            .noting_background_starts();
+        assert_eq!(
+            boundary_format(noting),
+            format_without_background_starts(Some(PREEMPTION_RECORD_FORMAT))
+        );
+        let mut noted = PreemptionWriter::new(None).noting_background_starts();
+        noted.insert_background_start(DetTid::from_raw(3), 1);
+        assert!(noted.with_slice_boundaries().is_err());
     }
 
     #[test]

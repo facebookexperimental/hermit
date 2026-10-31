@@ -5440,7 +5440,11 @@ impl Scheduler {
             // format 2 once it makes a jump, a FIFO fast-forward it recomputes
             // or a jump past the record's end (`PreemptionWriter::insert_time_skip`):
             // the jumps must be listed to be replayed, though that record's own
-            // replay then decides a FIFO open by the newer rules.
+            // replay then decides a FIFO open by the newer rules. A writer that
+            // notes no background starts states at most the format below
+            // `BACKGROUND_STARTS_FORMAT` (`PreemptionWriter::with_format`), so
+            // a schedule replay of a record that notes them re-records in the
+            // format below, with the same timing rules.
             let writer =
                 writer.with_format(replayed_format.unwrap_or(Some(PREEMPTION_RECORD_FORMAT)));
             // A schedule replay follows the background starts its record
@@ -24377,6 +24381,80 @@ mod test {
         };
         assert_eq!(replay(3), (true, Some(3)));
         assert_eq!(replay(2), (false, Some(2)));
+    }
+
+    /// A schedule replay notes no background starts, so its re-record of a
+    /// record that notes them states the format below
+    /// `BACKGROUND_STARTS_FORMAT`, with the same timing rules, and a replay of
+    /// that re-record counts no call it begins as a desync, where a replay of
+    /// the noting record counts an unrecorded start. A fresh legacy recording
+    /// still states the newest format and notes its starts.
+    #[test]
+    fn a_replay_re_records_a_background_starts_record_below_its_format() {
+        use crate::preemptions::BACKGROUND_STARTS_FORMAT;
+        use crate::preemptions::PreemptionRecord;
+        let dir = tempfile::tempdir().unwrap();
+        let tid = DetTid::from_raw(3);
+        let events = vec![
+            SchedEvent::branches(tid, 10).with_time(LogicalTime::from_nanos(100)),
+            SchedEvent::branches(tid, 20).with_time(LogicalTime::from_nanos(200)),
+        ];
+        let replay = |value: serde_json::Value| {
+            let path = dir.path().join("record.json");
+            std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+            Scheduler::new(&Config {
+                replay_schedule_from: Some(path),
+                record_preemptions: true,
+                ..Config::default()
+            })
+        };
+        let written = |sched: &mut Scheduler| -> PreemptionRecord {
+            let mut writer = sched.preemption_writer.take().unwrap();
+            for event in &events {
+                writer.insert_schedevent(event.clone());
+            }
+            serde_json::from_str(&writer.into_string()).unwrap()
+        };
+
+        let mut fresh = Scheduler::new(&Config {
+            record_preemptions: true,
+            ..Config::default()
+        });
+        let recorded = written(&mut fresh);
+        assert_eq!(recorded.format_version(), Some(PREEMPTION_RECORD_FORMAT));
+        assert!(recorded.notes_background_starts());
+
+        let mut noting = replay(serde_json::to_value(&recorded).unwrap());
+        assert!(noting.charge_replayed_switch_ins);
+        let re_record = written(&mut noting);
+        assert_eq!(
+            re_record.format_version(),
+            Some(BACKGROUND_STARTS_FORMAT - 1)
+        );
+        assert!(!re_record.notes_background_starts());
+        assert!(re_record.charges_replayed_switch_ins());
+        noting.record_or_replay_background_start(tid, 1);
+        assert_eq!(
+            noting.replayer.as_ref().unwrap().desync_counts[&tid].hard,
+            1
+        );
+
+        let mut again = replay(serde_json::to_value(&re_record).unwrap());
+        assert!(again.charge_replayed_switch_ins);
+        again.record_or_replay_background_start(tid, 1);
+        assert!(
+            again
+                .replayer
+                .as_ref()
+                .unwrap()
+                .desync_counts
+                .get(&tid)
+                .is_none_or(|counts| counts.hard == 0)
+        );
+        assert_eq!(
+            written(&mut again).format_version(),
+            Some(BACKGROUND_STARTS_FORMAT - 1)
+        );
     }
 
     fn register_known_thread(sched: &mut Scheduler, tid: DetTid) {

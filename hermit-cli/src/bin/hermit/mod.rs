@@ -2366,8 +2366,13 @@ mod tests {
         use detcore::preemptions::RecordFormatRefusal;
         use detcore::preemptions::boundary_recording::Recording;
 
-        const RECORDS: [&[u8]; 2] = [
-            br#"{"per_thread":{},"global":[],"format_version":4}"#,
+        // The first format past the newest this Hermit reads.
+        let future = format!(
+            r#"{{"per_thread":{{}},"global":[],"format_version":{}}}"#,
+            detcore::preemptions::PREEMPTION_RECORD_FORMAT + 1
+        );
+        let records: [&[u8]; 2] = [
+            future.as_bytes(),
             br#"{"per_thread":{},"global":[],"format_version":3,"time_skips":[]}"#,
         ];
         for contextual in [false, true] {
@@ -2384,7 +2389,7 @@ mod tests {
                     }
                     error
                 };
-                for bytes in RECORDS {
+                for bytes in records {
                     let refusal = Recording::decode(bytes).unwrap_err();
                     assert!(refusal.is::<RecordFormatRefusal>());
                     let prose = adapt(Error::msg(refusal.to_string()));

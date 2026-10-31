@@ -44,8 +44,35 @@ use crate::types::SchedEvent;
 
 /// The first format whose records note every background start
 /// (`BackgroundStart`), so that a call such a record does not start at a point
-/// did not start there.
-pub const BACKGROUND_STARTS_FORMAT: u32 = 2;
+/// did not start there: the next number above [`SWITCH_IN_CHARGE_FORMAT`] on
+/// the record-format counter ([`PREEMPTION_RECORD_FORMAT`]).
+///
+/// Only a writer that notes every start it takes may state this format or a
+/// newer one (`PreemptionWriter::noting_background_starts`). Any other
+/// writer, and any record that drops its starts, states at most the format
+/// below it ([`format_without_background_starts`]).
+pub const BACKGROUND_STARTS_FORMAT: u32 = 4;
+
+/// The newest format a record may state when it does not hold every
+/// background start of its run: `format`, lowered below
+/// [`BACKGROUND_STARTS_FORMAT`] when it is a format this Hermit reads at or
+/// above it (`BACKGROUND_STARTS_FORMAT..=PREEMPTION_RECORD_FORMAT`). A schedule
+/// replay's re-record, a slice-boundary recording, an edit or a shorter
+/// prefix of a schedule, and an analyze or bisect trial note no starts, so
+/// they keep the timing rules of their format and claim no list of starts.
+/// Any other stated format, newer than this Hermit or invalid (0), stays as
+/// stated, so that reading the record still refuses it
+/// (`PreemptionRecord::validate_format`): lowered, a newer Hermit's record
+/// would read as one without what it may hold.
+pub fn format_without_background_starts(format: Option<u32>) -> Option<u32> {
+    format.map(|format| {
+        if (BACKGROUND_STARTS_FORMAT..=PREEMPTION_RECORD_FORMAT).contains(&format) {
+            BACKGROUND_STARTS_FORMAT - 1
+        } else {
+            format
+        }
+    })
+}
 
 /// The turn that began a kernel-run blocking call
 /// (`ResourceID::is_kernel_run_blocking`: a blocking read of an external
@@ -253,9 +280,12 @@ impl std::hash::Hash for HostObservedCount {
 /// - Format 3 ([`SWITCH_IN_CHARGE_FORMAT`]) was written by a run that charged
 ///   every stretch of guest code a turn, so its replay charges a replayed
 ///   switch-in under which guest code runs.
+/// - Format 4 ([`BACKGROUND_STARTS_FORMAT`]) notes every background start its
+///   run took (`background_starts`), so its schedule replay begins each
+///   kernel-run call where the recording did.
 ///
 /// A record of a newer format is refused (`PreemptionRecord::validate_format`).
-pub const PREEMPTION_RECORD_FORMAT: u32 = SWITCH_IN_CHARGE_FORMAT;
+pub const PREEMPTION_RECORD_FORMAT: u32 = BACKGROUND_STARTS_FORMAT;
 
 /// The format from which a record lists all its jumps of global time.
 pub const TIME_SKIPS_FORMAT: u32 = 2;
@@ -528,12 +558,17 @@ impl PreemptionRecord {
             // when it finds it finished.
             rejoins: if followed { None } else { rejoins.clone() },
             // The background starts are points of the recorded run too, and
-            // go the same way. The format goes with them, as an edited
+            // go the same way. The format goes below them, as an edited
             // record's does (`forget_run_points`): a format that notes
             // background starts says the record holds every start its run
             // took, so a shorter prefix that kept it without them would tell
-            // its replay that no call began.
-            format_version: if followed { None } else { *format_version },
+            // its replay that no call began. It keeps the timing rules of the
+            // format below.
+            format_version: if followed {
+                format_without_background_starts(*format_version)
+            } else {
+                *format_version
+            },
             background_starts: if followed {
                 Vec::new()
             } else {
@@ -604,6 +639,11 @@ impl PreemptionRecord {
             let mut record = source.clone();
             record.global.clear();
             record.per_thread.clear();
+            // The mixed order is neither source's, so it keeps no background
+            // starts, and its format goes below theirs, as an edit's does
+            // (`forget_run_points`).
+            record.background_starts.clear();
+            record.format_version = format_without_background_starts(record.format_version);
             record
         };
         let mut record = metadata(self);
@@ -659,9 +699,25 @@ impl PreemptionRecord {
     }
 
     /// The same record in the newest format ([`PREEMPTION_RECORD_FORMAT`]),
-    /// which a record from a run of this Hermit has.
+    /// which a record from a run of this Hermit has, or the newest one below
+    /// [`BACKGROUND_STARTS_FORMAT`] when the record does not note its run's
+    /// background starts ([`format_without_background_starts`]). A stated
+    /// format this Hermit does not read (an explicit 1, 0, or one newer than
+    /// [`PREEMPTION_RECORD_FORMAT`]) stays as stated, so that reading the
+    /// record still refuses it (`validate_format`).
     pub fn with_current_format(self) -> Self {
-        self.with_format(Some(PREEMPTION_RECORD_FORMAT))
+        if self
+            .format_version
+            .is_some_and(|format| !(TIME_SKIPS_FORMAT..=PREEMPTION_RECORD_FORMAT).contains(&format))
+        {
+            return self;
+        }
+        let format = if self.notes_background_starts() {
+            Some(PREEMPTION_RECORD_FORMAT)
+        } else {
+            format_without_background_starts(Some(PREEMPTION_RECORD_FORMAT))
+        };
+        self.with_format(format)
     }
 
     /// The same record in `format` (`None` for format 1). Analyze and bisect
@@ -831,9 +887,10 @@ impl PreemptionRecord {
         self.callback_checkpoints.clear();
         self.rejoins = None;
         // The background starts sit between events an edit moves, so they go
-        // too, and the format with them: the edited record notes no start.
+        // too, and the format goes below them: the edited record notes no
+        // start, and keeps the timing rules of the format below.
         self.background_starts.clear();
-        self.format_version = None;
+        self.format_version = format_without_background_starts(self.format_version);
     }
 
     /// TODO: provide a better way to create an empty PreemptionRecord but with entries for a given set of tids.
@@ -1050,15 +1107,6 @@ impl PreemptionRecord {
     /// ([`Self::validate_format`]), whose failure is a refusal rather than a
     /// malformed record, and which readers check separately for that reason.
     pub fn validate_contents(&self) -> Result<(), String> {
-        if let Some(format) = self.format_version
-            && format > PREEMPTION_RECORD_FORMAT
-        {
-            return Err(format!(
-                "the preemption record is format {format}, written by a newer Hermit; this \
-                 Hermit reads formats up to {PREEMPTION_RECORD_FORMAT}. Replay it with the \
-                 Hermit that recorded it, or a newer one"
-            ));
-        }
         let events = self.global.len() as u64;
         if let Some(start) = self
             .background_starts
@@ -1690,6 +1738,152 @@ mod tests {
         edited.preemptions_only();
         assert!(edited.background_starts().is_empty());
         assert!(!edited.notes_background_starts());
+    }
+
+    /// Only a writer that notes every background start states
+    /// `BACKGROUND_STARTS_FORMAT` or newer: any other writer, an edit, a
+    /// mixed interpolation and `with_current_format` on a record without
+    /// noted starts state the format below it, and lowering never raises an
+    /// older format.
+    #[test]
+    fn only_a_record_that_notes_its_background_starts_states_their_format() {
+        let below = Some(BACKGROUND_STARTS_FORMAT - 1);
+        assert_eq!(
+            format_without_background_starts(Some(PREEMPTION_RECORD_FORMAT)),
+            below
+        );
+        assert_eq!(
+            format_without_background_starts(Some(TIME_SKIPS_FORMAT)),
+            Some(TIME_SKIPS_FORMAT)
+        );
+        assert_eq!(format_without_background_starts(None), None);
+        let tid = DetTid::from_raw(3);
+        let read = |writer: PreemptionWriter| -> PreemptionRecord {
+            serde_json::from_str(&writer.into_string()).unwrap()
+        };
+
+        let mut plain = PreemptionWriter::new(None).with_format(Some(PREEMPTION_RECORD_FORMAT));
+        plain.insert_schedevent(SchedEvent::branches(tid, 10));
+        plain.insert_background_start(tid, 1);
+        let plain = read(plain);
+        assert_eq!(plain.format_version(), below);
+        assert!(!plain.notes_background_starts());
+        assert!(plain.background_starts().is_empty());
+
+        let mut noting = PreemptionWriter::new(None)
+            .with_format(Some(PREEMPTION_RECORD_FORMAT))
+            .noting_background_starts();
+        noting.insert_schedevent(SchedEvent::branches(tid, 10));
+        noting.insert_background_start(tid, 1);
+        noting.insert_schedevent(SchedEvent::branches(tid, 20));
+        let noting = read(noting);
+        assert_eq!(noting.format_version(), Some(PREEMPTION_RECORD_FORMAT));
+        assert!(noting.notes_background_starts());
+        assert_eq!(noting.background_starts().len(), 1);
+        assert_eq!(
+            noting.clone().with_current_format().format_version(),
+            Some(PREEMPTION_RECORD_FORMAT)
+        );
+        assert_eq!(
+            PreemptionRecord::from_sched_events(Vec::new())
+                .with_current_format()
+                .format_version(),
+            below
+        );
+
+        let mut edited = noting.clone();
+        edited.split_map(|event, _| [event]);
+        assert_eq!(edited.format_version(), below);
+        assert!(edited.background_starts().is_empty());
+        edited.validate().unwrap();
+        let mut older = PreemptionRecord::from_sched_events(vec![SchedEvent::branches(tid, 10)])
+            .with_format(Some(TIME_SKIPS_FORMAT));
+        older.preemptions_only();
+        assert_eq!(older.format_version(), Some(TIME_SKIPS_FORMAT));
+
+        let other_tid = DetTid::from_raw(5);
+        let events = |order: &[(DetTid, u32)]| -> Vec<SchedEvent> {
+            order
+                .iter()
+                .map(|&(tid, count)| SchedEvent::branches(tid, count))
+                .collect()
+        };
+        let source = |order: &[(DetTid, u32)], after: u64| {
+            let mut record = PreemptionRecord::from_sched_events(events(order));
+            record.format_version = Some(PREEMPTION_RECORD_FORMAT);
+            record.background_starts.push(BackgroundStart {
+                after,
+                thread: tid,
+                call: 1,
+            });
+            record.validate().unwrap();
+            record
+        };
+        let a = source(&[(tid, 10), (other_tid, 20), (tid, 30)], 1);
+        let b = source(&[(other_tid, 20), (tid, 10), (tid, 30)], 2);
+        let mixed = a
+            .interpolate_events(&b, events(&[(tid, 10), (tid, 30), (other_tid, 20)]))
+            .unwrap();
+        assert_eq!(mixed.format_version(), below);
+        assert!(mixed.background_starts().is_empty());
+        assert_eq!(
+            a.interpolate_events(&b, a.schedevents().to_vec())
+                .unwrap()
+                .format_version(),
+            Some(PREEMPTION_RECORD_FORMAT)
+        );
+    }
+
+    /// The starts cap lowers only a format this Hermit reads at or above
+    /// `BACKGROUND_STARTS_FORMAT`. A newer format, and an invalid 0, stay as
+    /// stated through a schedule replay's re-record (the writer), a shorter
+    /// prefix, an edit and `with_current_format`, and an interpolation refuses
+    /// them, so that reading still refuses the record by name: lowered, a
+    /// newer Hermit's record would read as one without what it may hold. A
+    /// plain `min` in `format_without_background_starts` fails this test.
+    #[test]
+    fn a_format_this_hermit_does_not_read_survives_the_starts_cap() {
+        let tid = DetTid::from_raw(3);
+        for stated in [
+            PREEMPTION_RECORD_FORMAT + 1,
+            PREEMPTION_RECORD_FORMAT + 2,
+            0,
+        ] {
+            assert_eq!(format_without_background_starts(Some(stated)), Some(stated));
+            let refusal = PreemptionRecord::from_sched_events(Vec::new())
+                .with_format(Some(stated))
+                .validate_format()
+                .unwrap_err();
+            assert!(
+                refusal.contains(&format!("record format Some({stated})")),
+                "{refusal}"
+            );
+            let refused = |record: &PreemptionRecord, path: &str| {
+                assert_eq!(record.format_version(), Some(stated), "{path}");
+                let back: PreemptionRecord =
+                    serde_json::from_str(&serde_json::to_string(record).unwrap()).unwrap();
+                assert_eq!(back.format_version(), Some(stated), "{path}");
+                assert_eq!(back.validate_format(), Err(refusal.clone()), "{path}");
+            };
+            let mut writer = PreemptionWriter::new(None).with_format(Some(stated));
+            writer.insert_schedevent(SchedEvent::branches(tid, 10));
+            let written: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+            refused(&written, "schedule replay re-record");
+            let mut record = PreemptionRecord::from_sched_events(vec![
+                SchedEvent::branches(tid, 10),
+                SchedEvent::branches(tid, 20),
+            ]);
+            record.format_version = Some(stated);
+            refused(&record.schedule_prefix(1), "shorter prefix");
+            let mut edited = record.clone();
+            edited.split_map(|event, _| [event]);
+            refused(&edited, "edit");
+            refused(&record.clone().with_current_format(), "with_current_format");
+            let mixed = record
+                .interpolate_events(&record, record.schedevents()[..1].to_vec())
+                .unwrap_err();
+            assert_eq!(mixed, refusal, "interpolation");
+        }
     }
 
     /// `--pipe-wake-latency` rides in a preemption record as the epoch does:
@@ -2465,8 +2659,9 @@ mod tests {
 
     /// The background starts name points of the recorded run, as the
     /// readmissions do, and the record's format says it holds them all: a
-    /// prefix of the whole schedule keeps both, and a shorter one drops both,
-    /// as an edited record does, so its replay starts each call as before.
+    /// prefix of the whole schedule keeps both, and a shorter one drops the
+    /// starts and states the format below theirs, as an edited record does,
+    /// so its replay starts each call as before.
     #[test]
     fn a_schedule_prefix_keeps_the_background_starts_only_for_the_whole_schedule() {
         let tid = DetTid::from_raw(3);
@@ -2496,7 +2691,11 @@ mod tests {
         }
         for len in [0, 1] {
             let prefix = record.schedule_prefix(len);
-            assert_eq!(prefix.format_version, None, "prefix of {len} events");
+            assert_eq!(
+                prefix.format_version,
+                Some(BACKGROUND_STARTS_FORMAT - 1),
+                "prefix of {len} events"
+            );
             assert!(
                 prefix.background_starts().is_empty(),
                 "prefix of {len} events"
@@ -2862,9 +3061,14 @@ impl PreemptionWriter {
 
     /// Write the record in `format` (`None` for format 1): the newest
     /// ([`PREEMPTION_RECORD_FORMAT`]) for a run that follows no record, or the
-    /// format of the record a replay follows, whose rules it ran by.
+    /// format of the record a replay follows, whose rules it ran by. A writer
+    /// notes no background starts until `noting_background_starts` says it
+    /// does, so it states at most the format below
+    /// [`BACKGROUND_STARTS_FORMAT`] ([`format_without_background_starts`]): a
+    /// schedule replay's re-record of a record that notes its starts states
+    /// the format below, the same timing rules without a list of starts.
     pub fn with_format(mut self, format: Option<u32>) -> Self {
-        self.inner.format_version = format;
+        self.inner.format_version = format_without_background_starts(format);
         self
     }
 
@@ -2894,10 +3098,18 @@ impl PreemptionWriter {
     /// event. Metadata stays in the legacy history, with exactly one global
     /// stream in the new envelope. Existing writers remain legacy by default.
     pub fn with_slice_boundaries(mut self) -> Result<Self, String> {
-        if !self.inner.global.is_empty() || self.boundary_records.is_some() {
+        // A boundary replay takes no background starts
+        // (`BoundaryRecording::new`), so a writer that noted one cannot
+        // become a boundary writer, and a boundary writer states no format
+        // that claims their list.
+        if !self.inner.global.is_empty()
+            || !self.inner.background_starts.is_empty()
+            || self.boundary_records.is_some()
+        {
             self.flushed = true;
             return Err("slice-boundary protocol must be selected before recording events".into());
         }
+        self.inner.format_version = format_without_background_starts(self.inner.format_version);
         self.boundary_records = Some(Vec::new());
         Ok(self)
     }
@@ -3007,7 +3219,13 @@ impl PreemptionWriter {
     /// takes (`insert_background_start`), and a record without any says its
     /// run began none.
     pub fn noting_background_starts(mut self) -> Self {
-        self.inner.format_version = Some(PREEMPTION_RECORD_FORMAT);
+        // A slice-boundary writer notes no starts (`insert_background_start`),
+        // so it states the format below theirs.
+        self.inner.format_version = if self.boundary_records.is_some() {
+            format_without_background_starts(Some(PREEMPTION_RECORD_FORMAT))
+        } else {
+            Some(PREEMPTION_RECORD_FORMAT)
+        };
         self
     }
 
