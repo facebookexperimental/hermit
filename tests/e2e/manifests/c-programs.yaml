@@ -14072,10 +14072,10 @@ test:
         # show that the host read returns at once, as an alias outside the guest could clear
         # the instance's O_NONBLOCK. That case is left out there (the guest's --no-zero-read).
         # DBT discovers a descriptor received over SCM_RIGHTS when a call first names it, with
-        # the host's status flags, so the received case's descriptor shows the O_NONBLOCK
-        # Detcore set on its sender's description and its blocking read answers EAGAIN. A
-        # received pipe end does the same, at main too (measured 2026-10-31), so the case is
-        # left out there (the guest's --no-received).
+        # the host's status flags, where the O_NONBLOCK may be the one Detcore set on its
+        # sender's description. Detcore cannot tell the received case's blocking mode there and
+        # refuses its F_GETFL by name (hermit-cli/tests/cli.rs runs it), so the case is left
+        # out there (the guest's --no-received).
         guest_args:
           kvm:
             - --no-zero-read

@@ -65,23 +65,29 @@
 //
 // Arguments: an optional --no-zero-read, which leaves out the zero case
 // (KVM's executor refuses a zero-count inotify read by name), and an optional
-// --no-received, which leaves out the received case (DBT gives a received
-// descriptor the O_NONBLOCK Detcore set on its sender's open file
-// description), in that order; then an optional case name, which runs only
-// that case. Two cases run only when
-// named, as Hermit refuses their reads by name; natively each read waits for
-// the main thread's event:
+// --no-received, which leaves out the received case (DBT cannot tell a
+// received instance's blocking mode, and refuses its F_GETFL by name), in
+// that order; then an optional case name, which runs only that case. Four
+// cases run only when named, as Hermit refuses their reads by name on some
+// backend; natively each read waits for an event:
 // - received-unmatched: a blocking instance sent over a datagram socket to a
 //   name, which Hermit cannot match to its sender's open file description.
 // - received-outside NAME DIR: an instance from outside the run, blocking on
 //   the host: the process that started this one serves it, watching DIR, on
 //   the abstract unix socket NAME. A sibling's read of it waits for the file
 //   the main thread makes in DIR.
+// - received-single-threaded, received-unmatched-single-threaded: the
+//   receipts of received and received-unmatched, read by the receiver
+//   itself, the only thread, while a SIGALRM handler makes the event 20 ms
+//   later. Under DBT, a refusal raised in a sibling while another thread
+//   waits inside Detcore ends the run only after DynamoRIO's exit gives up
+//   waiting for that thread (50 s); from the only thread it ends at once.
 
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -92,6 +98,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <time.h>
@@ -662,10 +669,23 @@ static int receive_fd(int socket) {
   return fd;
 }
 
-// A blocking instance travels over a socket and is read by a sibling while
-// the main thread makes its event 20 ms later: over a socketpair
-// (`unmatched` 0), or over a datagram socket to a name (1).
-static void received_case(const char *label, int unmatched, const char *dir) {
+// The file a single-threaded receipt's SIGALRM handler creates.
+static char alarm_path[96];
+
+static void make_event_on_alarm(int signal_number) {
+  (void)signal_number;
+  int saved = errno;
+  int fd = open(alarm_path, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+  if (fd >= 0) close(fd);
+  errno = saved;
+}
+
+// A blocking instance travels over a socket and is read while its event
+// comes 20 ms later: over a socketpair (`unmatched` 0), or over a datagram
+// socket to a name (1). A sibling reads it while the main thread makes the
+// event, or with `alone` the main thread reads it, the only thread, while a
+// SIGALRM handler makes the event.
+static void received_case(const char *label, int unmatched, int alone, const char *dir) {
   make_dir(dir);
   int original = watch(dir, 0, IN_CREATE);
   int received;
@@ -693,17 +713,27 @@ static void received_case(const char *label, int unmatched, const char *dir) {
   }
   close(original);
   struct blocked_read r = {.fd = received, .how = READ};
-  if (!unmatched) {
+  if (!unmatched && !alone) {
     char what[160];
     snprintf(what, sizeof what, "%s: F_GETFL shows the received descriptor blocking", label);
     report(what, !nonblocking(received));
   }
-  pthread_t thread;
-  if (pthread_create(&thread, NULL, blocked_reader, &r) != 0) fail("pthread_create");
-  sleep_ms(20);
   char one[3] = {dir[0], '1', 0};
-  create_file(dir, one);
-  if (pthread_join(thread, NULL) != 0) fail("pthread_join");
+  if (alone) {
+    path_in(alarm_path, sizeof alarm_path, dir, one);
+    struct sigaction action = {.sa_handler = make_event_on_alarm, .sa_flags = SA_RESTART};
+    sigemptyset(&action.sa_mask);
+    struct itimerval later = {.it_value = {.tv_sec = 0, .tv_usec = 20000}};
+    if (sigaction(SIGALRM, &action, NULL) != 0) fail("sigaction");
+    if (setitimer(ITIMER_REAL, &later, NULL) != 0) fail("setitimer");
+    blocked_reader(&r);
+  } else {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, blocked_reader, &r) != 0) fail("pthread_create");
+    sleep_ms(20);
+    create_file(dir, one);
+    if (pthread_join(thread, NULL) != 0) fail("pthread_join");
+  }
   printf("%s read %zd bytes (%s), event %s\n", label, r.got,
          r.got < 0 ? strerrorname_np(r.error) : "ok", name_or_dash(r.buffer, r.got, EVENT));
   char what[160];
@@ -787,9 +817,15 @@ int main(int argc, char **argv) {
   if (selected(only, "readv-three")) three_case();
   if (selected(only, "preadv2-hipri")) sibling_case("preadv2-hipri", PREADV2_HIPRI, "h", "h1");
   if (selected(only, "preadv2-nowait")) nowait_case();
-  if (received_case_runs && selected(only, "received")) received_case("received", 0, "x");
+  if (received_case_runs && selected(only, "received")) received_case("received", 0, 0, "x");
   if (only != NULL && strcmp(only, "received-unmatched") == 0) {
-    received_case("received-unmatched", 1, "u");
+    received_case("received-unmatched", 1, 0, "u");
+  }
+  if (only != NULL && strcmp(only, "received-single-threaded") == 0) {
+    received_case("received-single-threaded", 0, 1, "x");
+  }
+  if (only != NULL && strcmp(only, "received-unmatched-single-threaded") == 0) {
+    received_case("received-unmatched-single-threaded", 1, 1, "u");
   }
   if (only != NULL && strcmp(only, "received-outside") == 0) {
     if (argc <= arg + 2) fail("received-outside: no socket name or directory");
