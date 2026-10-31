@@ -288,6 +288,7 @@ mod real_random {
                     deterministic_io: true,
                     has_uts_namespace: false,
                     notice_host_network_abstract_binds: false,
+                    standard_stream_aliases: None,
                     max_timeslice: NonZeroU64::new(1_000_000),
                     record_preemptions_to: Some(future_recording),
                     detlog_io_buffers: true,

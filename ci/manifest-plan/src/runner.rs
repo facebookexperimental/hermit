@@ -22394,6 +22394,17 @@ exit "$(cat "$PWD/exit-status")"
                  the turn in a blocking FIFO open",
             ),
             (
+                "c-programs/proc-locks",
+                "kvm",
+                "`rendered` requires Linux's answers to vectored reads of /proc/locks, which \
+                 Detcore renders itself on KVM (package K slice K8-h of \
+                 https://github.com/rrnewton/hermit/issues/4213); ptrace serves a snapshot of the \
+                 kernel's file, whose vectored reads are ENOSYS, a named limitation. `ofd` takes \
+                 OFD locks instead of the record locks LOCK_API=1 selects: KVM's provider holds a \
+                 record lock as an OFD lock (https://github.com/rrnewton/reverie/issues/1223), \
+                 whose /proc/locks rows Detcore refuses by name",
+            ),
+            (
                 "c-programs/scm-rights-received-descriptors",
                 "in-guest-trap",
                 "`--no-exec` skips the exec check: in-guest LiteInst refuses execve",

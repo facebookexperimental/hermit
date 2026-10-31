@@ -32,6 +32,7 @@ use crate::types::DetTid;
 use crate::types::LogicalTime;
 
 pub(crate) mod fd_directory;
+pub(crate) mod fdinfo;
 mod fixed;
 pub(crate) mod ids;
 pub(crate) mod levels;
@@ -770,9 +771,14 @@ pub(crate) fn placeholder_link(
         Some(hash) => (&path[..hash], Some(&path[hash + 1..])),
         None => (path, None),
     };
-    let mut file = ProcfsFile::from_path(Path::new(
-        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path),
-    ))?;
+    let path = Path::new(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path));
+    // A descriptor's fdinfo is a per-process file only as Detcore renders it
+    // (`ProcfsFile::rendered_fdinfo_at`), which its placeholder's identity
+    // says.
+    let mut file = match identity {
+        Some(_) => ProcfsFile::rendered_fdinfo_at(path).or_else(|| ProcfsFile::from_path(path))?,
+        None => ProcfsFile::from_path(path)?,
+    };
     match (file.per_process_name().is_some(), identity) {
         (true, Some(identity)) => {
             let identity = std::str::from_utf8(identity).ok()?;
@@ -826,6 +832,12 @@ pub(crate) struct RenderedFiles {
     /// (`Config::container_mount_table`, which hermit-cli builds for a run in
     /// its container).
     pub(crate) mounts: bool,
+    /// Whether Detcore renders `/proc/locks` from its lock ledger
+    /// (`locks::LockLedger::rendered_rows`, package K slice K8-h): exactly
+    /// where the guest's procfs is not the kernel's
+    /// (`procfs_inode::tool_can_name_guest_descriptors`, KVM), so there is no
+    /// kernel file to keep the guest's rows of.
+    pub(crate) locks: bool,
 }
 
 impl RenderedFiles {
@@ -834,6 +846,7 @@ impl RenderedFiles {
     pub(crate) const ALL: Self = Self {
         cpuinfo: true,
         mounts: true,
+        locks: true,
     };
 
     /// The files Detcore renders in every session, without `/proc/cpuinfo`
@@ -841,16 +854,24 @@ impl RenderedFiles {
     pub(crate) const WITHOUT_CPUINFO: Self = Self {
         cpuinfo: false,
         mounts: false,
+        locks: false,
     };
 
     /// The files a session renders whose configuration virtualizes CPUID
     /// (`virtualize_cpuid`) and whose backend delivers the guest's CPUID
     /// instruction to Detcore (`cpuid_interception`), with a container mount
-    /// table or without one (`mount_table`).
-    pub(crate) fn of(virtualize_cpuid: bool, cpuid_interception: bool, mount_table: bool) -> Self {
+    /// table or without one (`mount_table`), on a backend whose procfs is its
+    /// own rather than the kernel's (`backend_procfs`) or not.
+    pub(crate) fn of(
+        virtualize_cpuid: bool,
+        cpuid_interception: bool,
+        mount_table: bool,
+        backend_procfs: bool,
+    ) -> Self {
         Self {
             cpuinfo: virtualize_cpuid && cpuid_interception,
             mounts: mount_table,
+            locks: backend_procfs,
         }
     }
 }
@@ -1024,6 +1045,12 @@ impl ProcfsTask {
         Self { process, thread }
     }
 
+    /// The task this spelling names, by numbers, where the caller's process
+    /// is `pid` and the caller `tid`; `None` for a spelling that names none.
+    pub(crate) fn bound_for(self, pid: i32, tid: i32) -> Option<BoundTask> {
+        self.bound_to(pid, tid).bound()
+    }
+
     /// The one task this spelling names, by its number, where the caller's
     /// process is `pid` and the caller `tid`: the thread below `task/`, else
     /// the task at the top of `/proc` (a process's leader, or the thread a
@@ -1137,6 +1164,33 @@ pub(crate) fn per_process_name(path: &Path) -> Option<PerProcessName> {
             path.as_os_str().len(),
         ))
         .copied()
+}
+
+/// The name, within its task's directory, of the fdinfo of descriptor `fd`
+/// (`fdinfo/<fd>`), which Detcore renders as a per-process file where the
+/// guest's procfs is not the kernel's (package K slice K8-h): made once per
+/// descriptor number and kept, as [`per_process_path`] keeps the paths it
+/// names, so that a rendered fdinfo's path carries it like any per-process
+/// file's name ([`PerProcessName::filename`]).
+pub(crate) fn fdinfo_name(fd: i32) -> &'static str {
+    static NAMES: std::sync::Mutex<BTreeMap<i32, &'static str>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let mut names = NAMES.lock().expect("fdinfo name table poisoned");
+    names
+        .entry(fd)
+        .or_insert_with(|| Box::leak(format!("fdinfo/{fd}").into_boxed_str()))
+}
+
+/// The descriptor number a canonical fdinfo name holds, as Linux's
+/// `name_to_int` accepts it: decimal digits with no leading zero (`0`
+/// itself excepted) and no sign, at most `i32::MAX`. `None` for any other
+/// name, which names no descriptor (`proc_lookupfd_common` fails it with
+/// ENOENT).
+fn canonical_descriptor_name(name: &str) -> Option<i32> {
+    let canonical = !name.is_empty()
+        && name.bytes().all(|byte| byte.is_ascii_digit())
+        && (name == "0" || !name.starts_with('0'));
+    canonical.then(|| name.parse::<i32>().ok()).flatten()
 }
 
 /// Whether `path`, a rendered file's, is a per-process file's, which Linux
@@ -1574,6 +1628,10 @@ pub(crate) struct ProcfsSnapshotContext {
     /// its name and what the reader adds to them (`procfs::task_stat`).
     /// Built by the caller, which asks Detcore's global state.
     pub(crate) task_stat: Option<task_stat::TaskStat>,
+    /// For a descriptor's fdinfo Detcore opened as rendered, its text
+    /// (`procfs::fdinfo::render`). Built by the caller, from the descriptor's
+    /// state at this read (`Detcore::render_own_fdinfo`).
+    pub(crate) fdinfo_rendering: Option<Vec<u8>>,
 }
 
 impl ProcfsFile {
@@ -1781,10 +1839,11 @@ impl ProcfsFile {
     /// task's, `/proc/<pid>/<file>` or `/proc/<pid>/task/<tid>/<file>`, as
     /// Linux names the file in descriptor links.
     pub(crate) fn rendered_path(&self, files: RenderedFiles) -> Option<&'static Path> {
-        self.rendered_path_where(
-            self.rendered || files.cpuinfo,
-            self.rendered || files.mounts,
-        )
+        self.rendered_path_where(RenderedFiles {
+            cpuinfo: self.rendered || files.cpuinfo,
+            mounts: self.rendered || files.mounts,
+            locks: self.rendered || files.locks,
+        })
     }
 
     /// The path of this file where the reads of a descriptor open on it are
@@ -1806,8 +1865,48 @@ impl ProcfsFile {
     /// table, and what it holds, on every backend
     /// (<https://github.com/rrnewton/hermit/issues/4213>).
     pub(crate) fn per_process_name(&self) -> Option<&'static str> {
-        self.task
-            .and_then(|_| Self::per_process_name_of(&self.kind))
+        self.task?;
+        match self.kind {
+            // Detcore's fdinfo of a descriptor, which only the rendering
+            // path binds to a task ([`Self::rendered_fdinfo_at`]).
+            ProcfsKind::Fdinfo => self.target_fd.map(fdinfo_name),
+            ref kind => Self::per_process_name_of(kind),
+        }
+    }
+
+    /// The descriptor fdinfo at `path`, `/proc/<pid>[/task/<tid>]/fdinfo/<fd>`
+    /// (with `self` and `thread-self`), as a per-process file Detcore renders
+    /// (package K slice K8-h): the task its path names, for the caller to
+    /// bind, and the descriptor, named canonically as Linux's lookup requires
+    /// ([`canonical_descriptor_name`]). [`Self::from_path`] keeps an fdinfo
+    /// bound to no task, so that every descriptor the kernel opens is
+    /// classified and sanitized as before; only where Detcore renders fdinfo
+    /// does it build the file here (`Detcore::rendered_procfs_at`). `None`
+    /// for any other path.
+    pub(crate) fn rendered_fdinfo_at(path: &Path) -> Option<Self> {
+        let normalized = normalize_observed_path(path)?;
+        let text = normalized.to_str()?;
+        let (directory, name) = text.rsplit_once('/')?;
+        let fd = canonical_descriptor_name(name)?;
+        let task = ProcfsTask::parse(directory, "fdinfo")?;
+        let mut file = Self::from_path(&normalized)?;
+        if file.kind != ProcfsKind::Fdinfo || file.target_fd != Some(fd) {
+            return None;
+        }
+        file.task = Some(task);
+        Some(file)
+    }
+
+    /// Whether this is a descriptor's fdinfo, by any spelling.
+    pub(crate) fn is_fdinfo(&self) -> bool {
+        self.kind == ProcfsKind::Fdinfo
+    }
+
+    /// The descriptor an fdinfo describes, for a rendered one.
+    pub(crate) fn rendered_fdinfo_target(&self) -> Option<i32> {
+        (self.is_fdinfo() && self.task.is_some())
+            .then_some(self.target_fd)
+            .flatten()
     }
 
     /// The per-process files Detcore renders, by their name in a process's
@@ -1978,9 +2077,20 @@ impl ProcfsFile {
     /// `single_open` and serves them with `seq_read` and `seq_lseek`
     /// (`proc_single_file_operations`, `proc_pid_set_comm_operations`,
     /// fs/proc/base.c:823-828 and 1772-1778 in 6.17), so both follow the same
-    /// positioning.
+    /// positioning. So does a descriptor's fdinfo Detcore opened as rendered
+    /// (package K slice K8-h), rendered from the descriptor's state instead
+    /// (`Detcore::render_own_fdinfo`): Linux opens it with `single_open` and
+    /// serves it with `seq_read` and `seq_lseek` too
+    /// (`proc_fdinfo_file_operations`, fs/proc/fd.c:108-113 in v7.1.3). And
+    /// `/proc/locks` where Detcore renders it from its lock ledger (package K
+    /// slice K8-h), a `seq_file` whose read from its start, or after a seek,
+    /// walks the lock list again (`locks_start`, fs/locks.c).
     pub(crate) fn renders_task_record(&self) -> bool {
-        self.rendered && (self.is_task_stat() || self.is_task_comm())
+        self.rendered
+            && (self.is_task_stat()
+                || self.is_task_comm()
+                || self.is_fdinfo()
+                || self.lists_locks())
     }
 
     /// Where this rendered `stat`'s sequence is (Linux's `m->read_pos`): the
@@ -2075,8 +2185,12 @@ impl ProcfsFile {
     /// the file's kind and task from the path, and for a per-process file the
     /// task identity the path carries ([`per_process_name`]).
     pub(crate) fn from_rendered_path(path: &Path) -> Option<Self> {
-        let mut file = Self::from_path(path)?;
-        if let Some(name) = per_process_name(path) {
+        let name = per_process_name(path);
+        let mut file = match name {
+            Some(name) if name.filename.starts_with("fdinfo/") => Self::rendered_fdinfo_at(path)?,
+            _ => Self::from_path(path)?,
+        };
+        if let Some(name) = name {
             file.incarnation = name.incarnation;
         }
         Some(file)
@@ -2086,26 +2200,28 @@ impl ProcfsFile {
     /// behind it ([`Self::is_rendered`]).
     pub(crate) fn opened_path(&self) -> Option<&'static Path> {
         self.rendered
-            .then(|| self.rendered_path_where(true, true))
+            .then(|| self.rendered_path_where(RenderedFiles::ALL))
             .flatten()
     }
 
-    /// [`Self::rendered_path`], where Detcore renders `/proc/cpuinfo` exactly
-    /// when `cpuinfo_rendered`, and a process's `mountinfo` and `mounts`
-    /// exactly when `mounts_rendered`.
-    fn rendered_path_where(
-        &self,
-        cpuinfo_rendered: bool,
-        mounts_rendered: bool,
-    ) -> Option<&'static Path> {
+    /// [`Self::rendered_path`], where Detcore renders the files `files`
+    /// names: `/proc/cpuinfo`, a process's `mountinfo` and `mounts`, and
+    /// `/proc/locks`, exactly where it says so.
+    fn rendered_path_where(&self, files: RenderedFiles) -> Option<&'static Path> {
         match self.kind {
             ProcfsKind::RandomUuid => Some(Path::new("/proc/sys/kernel/random/uuid")),
             ProcfsKind::PtyNr => Some(Path::new("/proc/sys/kernel/pty/nr")),
             ProcfsKind::Uptime => Some(Path::new("/proc/uptime")),
             ProcfsKind::SystemStat => Some(Path::new("/proc/stat")),
-            ProcfsKind::Cpuinfo if cpuinfo_rendered => Some(Path::new("/proc/cpuinfo")),
+            ProcfsKind::Cpuinfo if files.cpuinfo => Some(Path::new("/proc/cpuinfo")),
+            ProcfsKind::Locks if files.locks => Some(Path::new("/proc/locks")),
             ProcfsKind::Fixed(file) => Some(file.path()),
-            ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts if !mounts_rendered => None,
+            ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts if !files.mounts => None,
+            ProcfsKind::Fdinfo => Some(per_process_path(
+                self.bound_task()?,
+                fdinfo_name(self.rendered_fdinfo_target()?),
+                self.incarnation,
+            )),
             _ if let Some(name) = Self::per_process_name_of(&self.kind) => {
                 Some(per_process_path(self.bound_task()?, name, self.incarnation))
             }
@@ -2118,7 +2234,7 @@ impl ProcfsFile {
     /// decided that this session renders it.
     pub(crate) fn into_rendered(self) -> Self {
         assert!(
-            self.rendered_path_where(true, true).is_some(),
+            self.rendered_path_where(RenderedFiles::ALL).is_some(),
             "{:?} is not rendered",
             self.kind
         );
@@ -2170,6 +2286,11 @@ impl ProcfsFile {
             | ProcfsKind::ProcessStat
             | ProcfsKind::ProcessCgroup
             | ProcfsKind::ProcessComm => false,
+            // An fdinfo is served by `seq_read` too, with no `.read_iter`
+            // (`proc_fdinfo_file_operations`, fs/proc/fd.c in v7.1.3): so
+            // for one Detcore renders. A descriptor the kernel opened keeps
+            // the answer it had before Detcore rendered any (declared).
+            ProcfsKind::Fdinfo => !self.rendered,
             _ => true,
         }
     }
@@ -2195,6 +2316,7 @@ impl ProcfsFile {
         self.snapshot_carries_uptime()
             || self.shows_at_read()
             || self.mount_table_rendering().is_some()
+            || self.lists_locks()
     }
 
     /// Whether the snapshot of this file a first read takes is a function of
@@ -2258,6 +2380,12 @@ impl ProcfsFile {
             // The bytes are the session's container mount table, which the
             // first read supplies (`Detcore::mount_table_snapshot`).
             ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts => b"",
+            // The bytes are the descriptor's state as the first read finds it
+            // (`Detcore::render_own_fdinfo`).
+            ProcfsKind::Fdinfo => b"",
+            // The rows are the lock ledger's as the first read finds it
+            // (`Detcore::ledger_locks_text`).
+            ProcfsKind::Locks => b"",
             _ => unreachable!("{:?} has no rendered path", self.kind),
         }
     }
@@ -2537,6 +2665,7 @@ impl ProcfsFile {
             cpus_allowed,
             lock_rows_kept,
             task_stat,
+            fdinfo_rendering,
         } = context;
         // Linux prints a task's `Cpus_allowed` with `nr_cpu_ids` bits.
         let cpus_allowed = cpus_allowed.map(|cpus| (cpus, machine.cpus));
@@ -2544,7 +2673,14 @@ impl ProcfsFile {
         // A process's `stat`, or a task's `comm`, Detcore opened is rendered
         // from the task's facts, which the caller looked up for this read;
         // the template stands in for nothing.
-        if self.renders_task_record() {
+        // A descriptor's fdinfo Detcore opened is its rendering, which the
+        // caller made for this read.
+        if self.rendered && self.is_fdinfo() {
+            self.contents =
+                Some(fdinfo_rendering.expect("a rendered fdinfo read without its rendering"));
+            return;
+        }
+        if self.renders_task_record() && !self.lists_locks() {
             let task_stat = task_stat.expect("a rendered stat read without its task's facts");
             self.contents = Some(if self.is_task_comm() {
                 task_stat::render_comm(&task_stat.comm)
@@ -2908,9 +3044,24 @@ impl ProcfsFile {
         self.contents = None;
     }
 
+    /// The descriptor a kernel-opened fdinfo describes, whose bytes the
+    /// snapshot sanitizes (`sanitize_fdinfo`). None for one Detcore renders
+    /// ([`Self::rendered_fdinfo_target`]), which has no kernel bytes.
     pub(crate) fn target_fd(&self) -> Option<i32> {
-        self.target_fd
+        self.target_fd.filter(|_| !self.rendered)
     }
+}
+
+/// The task a `/proc/<pid>[/task/<tid>]/fdinfo/<name>` spelling (with `self`
+/// and `thread-self`) names, whatever its last component is
+/// (`Detcore::rendered_procfs_at`, for a name that is no descriptor number).
+pub(crate) fn fdinfo_spelling_task(path: &Path) -> Option<ProcfsTask> {
+    let normalized = normalize_observed_path(path)?;
+    let (directory, name) = normalized.to_str()?.rsplit_once('/')?;
+    if name.is_empty() {
+        return None;
+    }
+    ProcfsTask::parse(directory, "fdinfo")
 }
 
 /// Whether `path` spells `/proc/mounts`, Linux's symbolic link to the
@@ -6534,7 +6685,7 @@ Rss:                   4 kB\n" as &[u8];
             assert!(file.seeks_only_from_start_or_position(), "{spelling}");
             assert_eq!(file.rendered_path(RenderedFiles::ALL), None, "unbound");
             file.bind_task(37, 38);
-            let without = RenderedFiles::of(true, true, false);
+            let without = RenderedFiles::of(true, true, false, false);
             assert_eq!(
                 file.rendered_path(without),
                 None,
@@ -7858,10 +8009,13 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             file.rendered_path(RenderedFiles::ALL),
             Some(Path::new("/proc/cpuinfo"))
         );
-        assert_eq!(RenderedFiles::of(true, true, true), RenderedFiles::ALL);
+        assert_eq!(
+            RenderedFiles::of(true, true, true, true),
+            RenderedFiles::ALL
+        );
         for (virtualize, intercepted) in [(true, false), (false, true), (false, false)] {
             assert_eq!(
-                RenderedFiles::of(virtualize, intercepted, false),
+                RenderedFiles::of(virtualize, intercepted, false, false),
                 RenderedFiles::WITHOUT_CPUINFO
             );
         }
@@ -10695,5 +10849,116 @@ total_commit_ms 0\n"
         file.set_task_incarnation(beyond);
         let path = file.into_rendered().opened_path().unwrap();
         crate::procfs_inode::rendered_inode(path);
+    }
+
+    /// A descriptor's fdinfo is a per-process file only as Detcore renders
+    /// it (package K slice K8-h): `from_path` binds no spelling to a task, so
+    /// a descriptor the kernel opened is classified and sanitized as before
+    /// (its `read_iter` answer included); `rendered_fdinfo_at` names the task
+    /// and the descriptor, by every spelling of a task's directory, and only
+    /// a descriptor name Linux's `name_to_int` takes. Bound and rendered, its
+    /// path is the task's `fdinfo/<fd>`, it renders at each `show` as a
+    /// rendered `stat` does, has no `read_iter` and no kernel bytes, and its
+    /// path and its placeholder's name both name it again.
+    #[test]
+    fn a_descriptors_fdinfo_is_a_per_process_file_only_where_detcore_renders_it() {
+        for spelling in [
+            "/proc/self/fdinfo/3",
+            "/proc/thread-self/fdinfo/3",
+            "/proc/7/fdinfo/3",
+            "/proc/7/task/8/fdinfo/3",
+            "/proc/self/task/8/fdinfo/3",
+        ] {
+            let kernel = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            assert!(kernel.is_fdinfo(), "{spelling}");
+            assert_eq!(kernel.per_process_name(), None, "{spelling}");
+            assert_eq!(kernel.rendered_path(RenderedFiles::ALL), None, "{spelling}");
+            assert_eq!(kernel.target_fd(), Some(3), "{spelling}");
+            assert!(kernel.has_read_iter(), "{spelling}");
+            assert!(!kernel.renders_task_record(), "{spelling}");
+            let rendered = ProcfsFile::rendered_fdinfo_at(Path::new(spelling)).unwrap();
+            assert_eq!(rendered.per_process_name(), Some("fdinfo/3"), "{spelling}");
+            assert_eq!(rendered.rendered_fdinfo_target(), Some(3), "{spelling}");
+            assert!(rendered.shows_at_read(), "{spelling}");
+            assert!(rendered.snapshot_at_first_read(), "{spelling}");
+        }
+        for other in [
+            "/proc/self/fdinfo/03",
+            "/proc/self/fdinfo/+3",
+            "/proc/self/fdinfo/2147483648",
+            "/proc/self/fdinfo/",
+            "/proc/self/fdinfo",
+            "/proc/self/fd/3",
+            "/proc/self/fdinfo/3/x",
+        ] {
+            assert!(
+                ProcfsFile::rendered_fdinfo_at(Path::new(other)).is_none(),
+                "{other}"
+            );
+        }
+        // The task a name that is no descriptor number is looked up in.
+        assert_eq!(
+            fdinfo_spelling_task(Path::new("/proc/self/fdinfo/03"))
+                .and_then(|task| task.bound_for(3, 5)),
+            Some(BoundTask {
+                process: 3,
+                thread: None
+            })
+        );
+        assert_eq!(fdinfo_spelling_task(Path::new("/proc/self/fdinfo")), None);
+        for (spelling, path) in [
+            ("/proc/self/fdinfo/3", "/proc/3/fdinfo/3"),
+            ("/proc/thread-self/fdinfo/3", "/proc/3/task/5/fdinfo/3"),
+        ] {
+            let mut file = ProcfsFile::rendered_fdinfo_at(Path::new(spelling)).unwrap();
+            file.bind_task(3, 5);
+            file.set_task_incarnation(TaskIncarnation {
+                process: 1,
+                thread: file.bound_task().unwrap().thread.map(|_| 1),
+            });
+            let rendered = file.into_rendered();
+            let opened = rendered.opened_path().unwrap();
+            assert_eq!(opened, Path::new(path), "{spelling}");
+            assert!(rendered_path_is_seq_file(opened), "{spelling}");
+            assert!(rendered.renders_task_record(), "{spelling}");
+            assert!(!rendered.has_read_iter(), "{spelling}");
+            assert_eq!(rendered.target_fd(), None, "{spelling}");
+            assert!(rendered.rendering_template().is_empty(), "{spelling}");
+            let again = ProcfsFile::from_rendered_path(opened).unwrap();
+            assert_eq!(
+                again.rendered_path(RenderedFiles::WITHOUT_CPUINFO),
+                Some(opened),
+                "{spelling}"
+            );
+            let link = format!("/memfd:{} (deleted)", placeholder_name(opened, b""));
+            assert_eq!(
+                placeholder_link_path(link.as_bytes(), RenderedFiles::WITHOUT_CPUINFO),
+                Some(opened),
+                "{spelling}"
+            );
+        }
+    }
+
+    /// Where the guest's procfs is not the kernel's, `/proc/locks` is a file
+    /// Detcore renders, from its lock ledger, at each read from its start
+    /// (package K slice K8-h); elsewhere the kernel's, filtered as before.
+    #[test]
+    fn proc_locks_is_rendered_only_where_the_backends_procfs_is_its_own() {
+        let file = ProcfsFile::from_path(Path::new("/proc/locks")).unwrap();
+        assert!(file.lists_locks());
+        assert_eq!(
+            file.rendered_path(RenderedFiles::of(true, true, true, false)),
+            None
+        );
+        let backend_procfs = RenderedFiles::of(true, true, true, true);
+        assert_eq!(
+            file.rendered_path(backend_procfs),
+            Some(Path::new("/proc/locks"))
+        );
+        let rendered = file.into_rendered();
+        assert!(rendered.snapshot_at_first_read());
+        assert!(rendered.renders_task_record());
+        assert!(rendered.rendering_template().is_empty());
+        assert!(rendered_path_is_seq_file(Path::new("/proc/locks")));
     }
 }

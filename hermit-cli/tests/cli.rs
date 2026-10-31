@@ -58237,3 +58237,1515 @@ fn namespace_record_format_refusals_are_policy_before_guest_startup() {
         }
     }
 }
+
+static PROC_FDINFO_LINES_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// `tests/c/proc_fdinfo_lines.c`, built once per test process.
+fn proc_fdinfo_lines_guest() -> &'static Path {
+    PROC_FDINFO_LINES_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("proc-fdinfo-lines");
+        fs::create_dir_all(&build_root).expect("failed to create proc-fdinfo-lines directory");
+        let guest = build_root.join("proc_fdinfo_lines");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/proc_fdinfo_lines.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile proc-fdinfo-lines guest");
+        assert!(
+            output.status.success(),
+            "proc-fdinfo-lines guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// The fdinfo-lines guest's stdout on `backend` with `guest_args`, at L2:
+/// `--strict --verify --verify-strict`, whose report must show bitwise
+/// parity over a nonzero number of compared INFO messages.
+fn proc_fdinfo_lines_at_l2(backend: &str, guest_args: &[&str]) -> String {
+    let guest = proc_fdinfo_lines_guest();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join(format!("{backend}.json"));
+    let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+    let mut args = vec![
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--proc=standard",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        &report_arg,
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+    ];
+    args.extend_from_slice(guest_args);
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+            .expect("parse the verification report");
+    assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+    let compared = &verdict["compared_log_messages"];
+    assert!(
+        compared["left"].as_u64().is_some_and(|count| count > 0)
+            && compared["left"] == compared["right"],
+        "{backend} compared no INFO messages: {verdict}"
+    );
+    stdout(&output)
+}
+
+/// What Detcore says when it refuses a `/proc/locks` snapshot or a fdinfo read
+/// that would show a guest's record lock (`F_SETLK`) that KVM's provider holds
+/// as an OFD lock: Linux shows a `POSIX` lock with its taker's pid, released at
+/// the taker's close of any descriptor of the file or at its exit, where the
+/// provider's lock would show as `OFDLCK` with owner -1 for as long as its
+/// description is referenced (https://github.com/rrnewton/reverie/issues/1223).
+const RECORD_LOCK_HELD_AS_OFD: &str = "is held by the backend as an OFD lock of its open file \
+                                       description \
+                                       (https://github.com/rrnewton/reverie/issues/1223)";
+
+/// The fdinfo-lines guest on KVM under `run --strict`, without `--verify`,
+/// with `guest_args`: the run must stop with the policy-refusal exit, and its
+/// stderr name each of `reasons`. Its stdout, up to the refusal.
+fn proc_fdinfo_lines_refused_on_kvm(guest_args: &[&str], reasons: &[&str]) -> String {
+    let guest = proc_fdinfo_lines_guest();
+    let mut args = vec![
+        "--backend=kvm",
+        "run",
+        "--strict",
+        "--proc=standard",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+    ];
+    args.extend_from_slice(guest_args);
+    let output = hermit(&args);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?} did not stop with the policy-refusal exit\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    for reason in reasons {
+        assert!(
+            stderr(&output).contains(reason),
+            "{args:?} does not name {reason:?}\nstderr:\n{}",
+            stderr(&output)
+        );
+    }
+    stdout(&output)
+}
+
+/// What KVM shows of the fdinfo-lines guest's native transcript, line by
+/// line, under the named differences between KVM and Linux, each the
+/// provider's, none Detcore's rendering:
+/// - it has no memfd seals (`F_ADD_SEALS` and `F_GET_SEALS` fail with
+///   ENOSYS) and no leases (`F_SETLEASE` fails with ENOSYS), so no lease
+///   line, and no `FASYNC` status flag, which Linux sets with a lease;
+/// - it refuses `flock(2)` by stopping the run, so the guest runs with
+///   `--skip-flock` on both sides;
+/// - it refuses a signalfd update that passes flags (EINVAL), which Linux
+///   validates and then ignores (`do_signalfd4`): LinuxEmu's gap
+///   https://github.com/rrnewton/reverie/issues/1207. The guest's update
+///   repeats the mask it set, so the descriptor's state is the same either
+///   way.
+///
+/// The guest runs with `--skip-posix` on both sides: KVM's provider holds a
+/// record lock (`F_SETLK`) as an OFD lock, whose fdinfo line Detcore refuses
+/// by name ([`RECORD_LOCK_HELD_AS_OFD`]), which the test asserts by itself.
+fn with_kvm_fdinfo_differences(native: &str) -> String {
+    let mut shown = String::new();
+    let mut leased = false;
+    for line in native.lines() {
+        let line = match line {
+            "F_ADD_SEALS: ok" => "F_ADD_SEALS: -1 ENOSYS".to_owned(),
+            "signalfd update with SFD_NONBLOCK: ok" => {
+                "signalfd update with SFD_NONBLOCK: EINVAL".to_owned()
+            }
+            "seals: 6" => "seals: -1".to_owned(),
+            "F_SETLEASE F_RDLCK: ok" => {
+                leased = true;
+                "F_SETLEASE F_RDLCK: -1 ENOSYS".to_owned()
+            }
+            "F_SETLEASE F_UNLCK: ok" => {
+                leased = false;
+                "F_SETLEASE F_UNLCK: -1 ENOSYS".to_owned()
+            }
+            line if leased && line.starts_with("lock:\t") && line.contains("LEASE") => continue,
+            line if leased && line == "flags:\t02120000" => "flags:\t02100000".to_owned(),
+            line => line.to_owned(),
+        };
+        shown.push_str(&line);
+        shown.push('\n');
+    }
+    shown
+}
+
+/// The fdinfo-lines guest's `--standard-stream-kinds` run and its report:
+/// each standard stream's kind, by its own `fstat`, and the names of its
+/// fdinfo's lines, run natively (`backend` `None`) or on `backend` under
+/// `run` with `hermit_flags` (`--strict`, or `--allow-unsupported-syscalls`,
+/// which `--strict` refuses), without `--verify`, which would replace the
+/// streams. A new pseudo-terminal master, whose fdinfo Linux
+/// prints with a `tty-index` line, is standard output (`pty_out`) or standard
+/// input, the other a regular file; standard error is a pipe. The report is
+/// empty where the run wrote none.
+fn standard_stream_kinds(
+    backend: Option<&str>,
+    pty_out: bool,
+    hermit_flags: &[&str],
+) -> (std::process::Output, String) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let regular_path = directory.path().join("regular");
+    fs::write(&regular_path, "data\n").expect("write the regular file");
+    let regular = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&regular_path)
+        .expect("open the regular file");
+    let master = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open("/dev/ptmx")
+        .expect("open a pseudo-terminal master");
+    let (stdin, stdout) = if pty_out {
+        (regular, master)
+    } else {
+        (master, regular)
+    };
+    let guest = proc_fdinfo_lines_guest()
+        .to_str()
+        .expect("guest path is UTF-8");
+    let directory_arg = directory.path().to_str().expect("directory path is UTF-8");
+    let output = match backend {
+        None => Command::new(guest)
+            .args([directory_arg, "--standard-stream-kinds"])
+            .stdin(Stdio::from(stdin))
+            .stdout(Stdio::from(stdout))
+            .output()
+            .expect("run proc-fdinfo-lines natively"),
+        Some(backend) => {
+            let mut args = vec!["--backend", backend, "run"];
+            args.extend_from_slice(hermit_flags);
+            args.extend([
+                "--proc=standard",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--base-env=minimal",
+                "--",
+                guest,
+                directory_arg,
+                "--standard-stream-kinds",
+            ]);
+            let mut command = hermit_command(&args);
+            command
+                .stdin(Stdio::from(stdin))
+                .stdout(Stdio::from(stdout));
+            hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command)
+        }
+    };
+    let report = fs::read_to_string(directory.path().join("standard-streams")).unwrap_or_default();
+    (output, report)
+}
+
+/// Detcore renders the caller's own `/proc/<pid>/fdinfo/<fd>` on KVM, whose
+/// procfs is not the kernel's (package K slice K8-h), as Linux prints it:
+/// for a pipe, a sealed memfd, eventfds (the count after writes and a read,
+/// an `EFD_SEMAPHORE` one), a signalfd before and after an update, timerfds
+/// (unarmed, armed, absolute, a one-shot one that fired and was read, a
+/// periodic one counted once, forwarded by `timerfd_gettime` and read), Unix
+/// sockets with descriptors queued and received, record, OFD and lease
+/// locks, a re-read after a rewind, the ENOENT lookups, and the standard
+/// output and error, which `--verify` captures (a pipe KVM's executor keeps,
+/// whose mount its `statx` does not report). The guest checks every host
+/// identity (mount, inode, a lock's inode) against `statx` and `fstat` and
+/// masks it, so its transcript compares directly: KVM's at L2 equals
+/// Linux's, apart from the named differences of
+/// [`with_kvm_fdinfo_differences`]. Both run without a record lock
+/// (`--skip-posix`): with one, KVM stops at the fdinfo read after it, by
+/// name ([`RECORD_LOCK_HELD_AS_OFD`]), where Linux shows a `POSIX` lock.
+///
+/// Each standard stream's fdinfo follows its own object, whatever the others
+/// are ([`standard_stream_kinds`]): with a pseudo-terminal master as standard
+/// output or as standard input and a regular file as the other, a read of
+/// the master's fdinfo is refused by name (Linux prints its `tty-index`, the
+/// number of a host terminal, which Detcore does not render): a fail-closed
+/// run (`--strict`) stops with the policy-refusal exit, and under
+/// `--allow-unsupported-syscalls` (which `--strict` refuses) the read fails
+/// with `EOPNOTSUPP`, while the regular file's and the pipe's are rendered as
+/// Linux prints them.
+#[test]
+fn run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences() {
+    let test = "run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences";
+    if kvm_unavailable(test) {
+        return;
+    }
+    let guest = proc_fdinfo_lines_guest();
+    let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let native = Command::new(guest)
+        .arg(native_directory.path())
+        .args(["--skip-flock", "--skip-posix"])
+        .output()
+        .expect("run proc-fdinfo-lines natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let native = stdout(&native);
+    assert!(native.ends_with("failures=0\n"), "native:\n{native}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let kvm = proc_fdinfo_lines_at_l2(
+        "kvm",
+        &[
+            directory.path().to_str().expect("directory path is UTF-8"),
+            "--skip-flock",
+            "--skip-posix",
+        ],
+    );
+    assert_eq!(kvm, with_kvm_fdinfo_differences(&native), "{test}");
+
+    // With a record lock, the fdinfo read after it is refused by name.
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let refused = proc_fdinfo_lines_refused_on_kvm(
+        &[
+            directory.path().to_str().expect("directory path is UTF-8"),
+            "--skip-flock",
+        ],
+        &["the rendered fdinfo of descriptor", RECORD_LOCK_HELD_AS_OFD],
+    );
+    assert!(
+        refused.ends_with("F_SETLK write 0-9: ok\n"),
+        "{test}: KVM stops at the fdinfo read after the record lock\n{refused}"
+    );
+
+    for (pty_out, master) in [(true, 1), (false, 0)] {
+        let (native_run, native) = standard_stream_kinds(None, pty_out, &[]);
+        assert!(
+            native_run.status.success(),
+            "{test}: native: {native_run:?}"
+        );
+        let master_line =
+            format!("{master} (character device 5:2): pos flags mnt_id ino tty-index\n");
+        assert!(native.contains(&master_line), "{test}: native:\n{native}");
+        assert!(
+            native.ends_with("failures=0\n"),
+            "{test}: native:\n{native}"
+        );
+        let (refused, _) = standard_stream_kinds(Some("kvm"), pty_out, &["--strict"]);
+        assert_eq!(
+            refused.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{test}: KVM refuses the master's fdinfo by name, standard stream {master}\n\
+             stderr:\n{}",
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains(&format!(
+                "the rendered fdinfo of descriptor {master}: a character device 5:2 whose \
+                 driver prints lines of its own"
+            )),
+            "{test}: KVM refuses the master's fdinfo by name, standard stream {master}\n\
+             stderr:\n{}",
+            stderr(&refused)
+        );
+        let (allowed, kvm) =
+            standard_stream_kinds(Some("kvm"), pty_out, &["--allow-unsupported-syscalls"]);
+        assert!(
+            allowed.status.success(),
+            "{test}: KVM with --allow-unsupported-syscalls, standard stream {master}: \
+             {allowed:?}"
+        );
+        assert_eq!(
+            kvm,
+            native
+                .replace(
+                    &master_line,
+                    &format!("{master} (character device 5:2): open or read EOPNOTSUPP\n")
+                )
+                .replace("failures=0\n", "failures=1\n"),
+            "{test}: a pseudo-terminal master as standard stream {master}"
+        );
+    }
+}
+
+/// The fdinfo-lines guest at L2 on ptrace, whose fdinfo the kernel prints
+/// and Detcore sanitizes as before package K slice K8-h (unchanged by it):
+/// every host identity it shows agrees with `statx` and `fstat`, and every
+/// step runs.
+#[test]
+fn proc_fdinfo_lines_verify_at_bitwise_parity_on_ptrace() {
+    // The guest's own line checks refuse every malformed line before they
+    // mask one (timer nanoseconds, IDs, owners, ranges).
+    let self_test = Command::new(proc_fdinfo_lines_guest())
+        .arg("--self-test")
+        .output()
+        .expect("run the fdinfo-lines guest's self-test");
+    assert!(
+        self_test.status.success() && stdout(&self_test).ends_with("self-test ok\n"),
+        "self-test: {self_test:?}"
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let ptrace = proc_fdinfo_lines_at_l2(
+        "ptrace",
+        &[directory.path().to_str().expect("directory path is UTF-8")],
+    );
+    assert!(ptrace.ends_with("failures=0\n"), "ptrace:\n{ptrace}");
+}
+
+/// Where the guest's procfs is not the kernel's (KVM), Detcore renders
+/// `/proc/locks` from its lock ledger (package K slice K8-h), which learns
+/// each description's locks from the backend's `descriptor_status` fact:
+/// through an OFD lock, a forked child's OFD lock on a file it opened (shown
+/// while the child lives) and the close that ends them, KVM's rows at L2 are
+/// ptrace's, which Detcore keeps of the kernel's file. A record lock
+/// (`F_SETLK`), which KVM's provider holds as an OFD lock, stops KVM's run at
+/// the first snapshot that would show it, by name
+/// ([`RECORD_LOCK_HELD_AS_OFD`]), where ptrace shows Linux's `POSIX` row.
+///
+/// Two more cases follow Linux where the kernel snapshot's filter cannot:
+/// - two opens of one file holding identical shared OFD locks are two rows,
+///   and a dup of one adds none (Linux lists each lock object);
+/// - a flock the launcher holds on the file it gives the guest as standard
+///   input was never a guest process's, whichever lock call the guest makes
+///   through that description first (`F_OFD_SETLK` or `F_SETLK`): its fdinfo
+///   line names owner 0, a taker outside the guest's PID namespace, and
+///   `/proc/locks` leaves its row out (`locks_translate_pid`, `locks_show`);
+///   with `F_SETLK`, KVM refuses the fdinfo read by name, as above. These
+///   runs take no `--verify`, which would give the guest a pipe for standard
+///   input instead of the launcher's description;
+/// - standard input and output that the launcher gives as one description
+///   (`<>file >&0`), which Detcore models with an identity for each and
+///   `kcmp(KCMP_FILE)` names one description: one OFD lock taken through
+///   both is one row, and an unlock through standard output leaves none;
+///   after a fork that leaves the description in each process through one
+///   stream, the parent's unlock leaves none in any table; with standard
+///   input closed, the lock stays a row through an exec that keeps standard
+///   output; with both streams closed, it is no row. As two opens of one
+///   file, each open's identical lock is a row of its own. These runs take
+///   no `--verify`, which would replace the streams;
+/// - a library caller's reserved standard input (`hermit::reserve_kvm_stdin`)
+///   that is a file of its own, while the caller's own standard input and
+///   output are one description: the guest's standard input and output are
+///   two descriptions, as the launcher finds by comparing the descriptors it
+///   hands the guest rather than its own fds 0-2, so a lock through each is a
+///   row of its own, as ptrace shows with two such files. A fresh process of
+///   this test runs it, with that one description as its fds 0 and 1;
+/// - a descriptor a parent sends to a child forked before it opened it stays
+///   the child's after the parent closes its own, so its lock is a row until
+///   the child exits, as ptrace shows it;
+/// - a description in flight when its sender exits or closes its descriptor
+///   keeps an OFD lock or a flock until the receipt, and loses a POSIX lock
+///   with the sender's exit or close, as native Linux shows; ptrace shows the
+///   same rows, and so does KVM for the OFD lock, while it refuses flock by
+///   name, and the snapshot that would show the record lock it holds as an
+///   OFD lock through the flight (Codex's narrow check of K8-h reb9: KVM
+///   listed it in flight and after the receipt, where Linux lists none);
+/// - a description in flight to a receiving socket that goes without a close
+///   (the receiver's exec drops it by close-on-exec, or the receiver dies by
+///   its own `SIGKILL`, the raw exit of its only thread, its parent's
+///   `SIGKILL`, or the default action of its own `SIGTERM`, `abort()`'s
+///   `SIGABRT` or a faulting write's `SIGSEGV`) loses its OFD lock with the
+///   socket, and a fresh open's conflicting lock succeeds, as native Linux
+///   shows; ptrace and KVM show the same rows, and KVM refuses the parent's
+///   `SIGKILL` by name (Claude's narrow check of K8-h reb6, finding 1: KVM
+///   listed the lock for the rest of the run; Codex's narrow check of reb8:
+///   it still did after a death by a fatal signal's default action, which KVM
+///   now settles at the death's terminal receipt). The same holds where the
+///   receiver execs this program, keeping the socket, and the new image dies
+///   by its own `SIGTERM`, whose table the exec gave it; and where the parent
+///   keeps a descriptor of the receiving socket, the receiver's death by its
+///   own `SIGTERM` takes nothing: the lock is a row, and a conflicting lock
+///   fails with `EAGAIN`, until the parent closes its descriptor (Claude's
+///   narrow check of reb9: neither was tested). Where the receiver has a
+///   second thread that keeps calling through its descriptors while the main
+///   thread ends the process by its own `SIGKILL` or by exit_group, every one
+///   of the sibling's calls succeeds and
+///   /proc/locks lists the lock while it is held, until the process ends, as
+///   native Linux shows (the narrow checks of reb7: the sibling's calls failed
+///   with `EBADF`, and the row went while the lock was held);
+/// - with standard input and output one description, standard input in
+///   flight to the process itself when an unlock through standard output
+///   releases the one lock: no row from the unlock on, as native Linux shows
+///   (finding 2: KVM kept the in-flight identity's lock until the receipt).
+///   This run takes no `--verify`, which would replace the streams;
+/// - two opens of one file holding identical OFD read locks, the second sent
+///   to a child forked before, which receives it, and then closed by the
+///   parent: two rows while the child holds the second, as native Linux
+///   shows, since the receipt joins the description and is no second
+///   identity (finding 3: a second identity would share the identical lock's
+///   row). ptrace's snapshot filter shows one row for two identical shared
+///   OFD locks (its named residual), so this case runs natively and on KVM;
+/// - a process that receives its own locked description over `SCM_RIGHTS`
+///   (which joins the description it sent) and execs, keeping both
+///   descriptors, shows its one lock once, before the exec and after it, as
+///   ptrace does.
+#[test]
+fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
+    let test = "run_kvm_renders_proc_locks_from_the_lock_ledger";
+    // The reserved standard input case's own process (below): the guest's
+    // standard input is the reserved file, this process's fds 0 and 1 are one
+    // description of another file, and the guest's standard output is fd 1.
+    const RESERVED_STDIN_GUEST: &str = "HERMIT_RESERVED_STDIN_LOCKS_GUEST";
+    const RESERVED_STDIN_DIRECTORY: &str = "HERMIT_RESERVED_STDIN_LOCKS_DIRECTORY";
+    if let (Some(guest), Some(directory)) = (
+        std::env::var_os(RESERVED_STDIN_GUEST),
+        std::env::var_os(RESERVED_STDIN_DIRECTORY),
+    ) {
+        let directory = PathBuf::from(directory);
+        let reserved = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.join("reserved-stdin"))
+            .expect("open the reserved standard input");
+        hermit::reserve_kvm_stdin(Some(reserved)).expect("reserve the guest's standard input");
+        // A real run needs more stack than a test thread has in a debug
+        // build; the command is not `Send`, so it is built on that thread.
+        let status = std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                let mut command = reverie::process::Command::new(&guest);
+                command.arg(&directory).arg("--stdin-and-stdout-locks");
+                let config = hermit::DetConfig {
+                    max_timeslice: None,
+                    proc_level: detcore_model::config::ProcLevel::Standard,
+                    ..Default::default()
+                };
+                hermit::run_with_backend(command, config, false, &None, hermit::Backend::Kvm)
+                    .map_err(|error| format!("{error:#}"))
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(
+            status,
+            Ok(reverie::process::ExitStatus::Exited(0)),
+            "{test}: the library KVM run with a reserved standard input"
+        );
+        return;
+    }
+    if kvm_unavailable(test) {
+        return;
+    }
+    let rows = |backend: &str, record_lock: bool| {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let directory = directory.path().to_str().expect("directory path is UTF-8");
+        let mut args = vec![directory, "--proc-locks"];
+        if !record_lock {
+            args.push("--skip-posix");
+        }
+        proc_fdinfo_lines_at_l2(backend, &args)
+    };
+    // ptrace shows Linux's rows of the record lock, with its taker.
+    assert_eq!(
+        rows("ptrace", true),
+        "F_SETLK a: ok\n\
+         --- record lock on a ---\n\
+         1: POSIX ADVISORY WRITE 1 00:00:1 0 EOF\n\
+         F_OFD_SETLK b: ok\n\
+         --- and an OFD lock on b ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         2: POSIX ADVISORY WRITE 1 00:00:2 0 EOF\n\
+         child's F_OFD_SETLK: ok\n\
+         --- and the child's OFD lock on c ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         2: OFDLCK ADVISORY WRITE -1 00:00:2 0 EOF\n\
+         3: POSIX ADVISORY WRITE 1 00:00:3 0 EOF\n\
+         --- after the child exited ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         2: POSIX ADVISORY WRITE 1 00:00:2 0 EOF\n\
+         F_SETLK a unlock: ok\n\
+         --- after a's unlock ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         --- after b's close ---\n\
+         failures=0\n",
+        "{test}: ptrace's rows of a record lock"
+    );
+    // KVM stops at the first snapshot that would show it.
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    assert_eq!(
+        proc_fdinfo_lines_refused_on_kvm(
+            &[
+                directory.path().to_str().expect("directory path is UTF-8"),
+                "--proc-locks",
+            ],
+            &["/proc/locks: a record lock", RECORD_LOCK_HELD_AS_OFD],
+        ),
+        "F_SETLK a: ok\n",
+        "{test}: KVM refuses the record lock's rows by name"
+    );
+    // Without it, KVM's rows are ptrace's.
+    let kvm = rows("kvm", false);
+    assert_eq!(kvm, rows("ptrace", false), "{test}");
+    assert_eq!(
+        kvm,
+        "F_OFD_SETLK b: ok\n\
+         --- and an OFD lock on b ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         child's F_OFD_SETLK: ok\n\
+         --- and the child's OFD lock on c ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         2: OFDLCK ADVISORY WRITE -1 00:00:2 0 EOF\n\
+         --- after the child exited ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         --- after b's close ---\n\
+         failures=0\n",
+        "{test}"
+    );
+
+    let twins = {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        proc_fdinfo_lines_at_l2(
+            "kvm",
+            &[
+                directory.path().to_str().expect("directory path is UTF-8"),
+                "--twin-ofd-locks",
+            ],
+        )
+    };
+    assert_eq!(
+        twins,
+        "F_OFD_SETLK through the first open: ok\n\
+         F_OFD_SETLK through the second open: ok\n\
+         F_OFD_SETLK through the first open's dup: ok\n\
+         --- two opens' identical shared OFD locks and a dup ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 9\n\
+         2: OFDLCK ADVISORY READ -1 00:00:1 0 9\n\
+         failures=0\n",
+        "{test}: two opens' identical OFD locks"
+    );
+
+    for (option, call) in [
+        ("--inherited-stdin-lock", "F_OFD_SETLK"),
+        ("--inherited-stdin-lock=record", "F_SETLK"),
+    ] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let input_path = directory.path().join("standard-input");
+        fs::write(&input_path, "data\n").expect("write the standard input file");
+        let input = fs::File::open(&input_path).expect("open the standard input file");
+        // SAFETY: flock on a descriptor this test owns.
+        let locked = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&input), libc::LOCK_SH) };
+        assert_eq!(locked, 0, "{test}: the launcher's flock");
+        let guest = proc_fdinfo_lines_guest();
+        let directory_arg = directory.path().to_str().expect("directory path is UTF-8");
+        let args = [
+            "--backend",
+            "kvm",
+            "run",
+            "--strict",
+            "--proc=standard",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            directory_arg,
+            option,
+        ];
+        let mut command = hermit_command(&args);
+        command.stdin(Stdio::from(
+            input.try_clone().expect("share the standard input"),
+        ));
+        let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+        if call == "F_SETLK" {
+            // KVM's provider holds the record lock as an OFD lock: the fdinfo
+            // read that would show it is refused by name.
+            assert_eq!(
+                output.status.code(),
+                Some(HERMIT_POLICY_REFUSAL_EXIT),
+                "{test}: KVM refuses the record lock's fdinfo line by name\nstderr:\n{}",
+                stderr(&output)
+            );
+            assert!(
+                stderr(&output).contains("the rendered fdinfo of descriptor 0")
+                    && stderr(&output).contains(RECORD_LOCK_HELD_AS_OFD),
+                "{test}: KVM refuses the record lock's fdinfo line by name\nstderr:\n{}",
+                stderr(&output)
+            );
+            assert_eq!(stdout(&output), "F_SETLK on standard input: ok\n", "{test}");
+            drop(input);
+            continue;
+        }
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            format!(
+                "{call} on standard input: ok\n\
+                 == standard input\n\
+                 pos:\t0\n\
+                 flags:\t0100000\n\
+                 mnt_id:\t=statx\n\
+                 ino:\t=fstat\n\
+                 lock:\t1: FLOCK  ADVISORY  READ 0 DEV:INO 0 EOF\n\
+                 lock:\t2: OFDLCK ADVISORY  READ -1 DEV:INO 0 0\n\
+                 --- with the launcher's flock on standard input ---\n\
+                 1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+                 failures=0\n"
+            ),
+            "{test}: the launcher's flock through {call}"
+        );
+        drop(input);
+    }
+
+    // The fdinfo-lines guest on KVM, without --verify, with standard input
+    // and output as given and its scratch files in `directory`.
+    let run_with_streams = |directory: &Path, mode: &str, stdin: fs::File, stdout: fs::File| {
+        let guest = proc_fdinfo_lines_guest();
+        let directory_arg = directory.to_str().expect("directory path is UTF-8");
+        let args = [
+            "--backend",
+            "kvm",
+            "run",
+            "--strict",
+            "--proc=standard",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            directory_arg,
+            mode,
+        ];
+        let mut command = hermit_command(&args);
+        command
+            .stdin(Stdio::from(stdin))
+            .stdout(Stdio::from(stdout));
+        let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+        assert_success(&output, &args);
+    };
+    let read_write = |path: &Path| {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .expect("open a standard streams' file")
+    };
+
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let shared_path = directory.path().join("shared-standard-streams");
+    let shared = read_write(&shared_path);
+    run_with_streams(
+        directory.path(),
+        "--shared-stdio-locks",
+        shared
+            .try_clone()
+            .expect("share the standard streams' file"),
+        shared,
+    );
+    assert_eq!(
+        fs::read_to_string(&shared_path).expect("read the shared standard streams' file"),
+        "F_OFD_SETLK through standard input: ok\n\
+         --- one lock through standard input ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         F_OFD_SETLK through standard output: ok\n\
+         --- the same lock through standard output ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         F_OFD_SETLK unlock through standard output: ok\n\
+         --- after the unlock through standard output ---\n\
+         failures=0\n",
+        "{test}: one description as standard input and output"
+    );
+
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let opens_path = directory.path().join("independent-standard-streams");
+    run_with_streams(
+        directory.path(),
+        "--shared-stdio-locks",
+        read_write(&opens_path),
+        read_write(&opens_path),
+    );
+    assert_eq!(
+        fs::read_to_string(&opens_path).expect("read the independent standard streams' file"),
+        "F_OFD_SETLK through standard input: ok\n\
+         --- one lock through standard input ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         F_OFD_SETLK through standard output: ok\n\
+         --- the same lock through standard output ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         2: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         F_OFD_SETLK unlock through standard output: ok\n\
+         --- after the unlock through standard output ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         failures=0\n",
+        "{test}: two opens of one file as standard input and output"
+    );
+
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let forked = read_write(&directory.path().join("forked-standard-streams"));
+    run_with_streams(
+        directory.path(),
+        "--shared-stdio-fork-unlock",
+        forked
+            .try_clone()
+            .expect("share the standard streams' file"),
+        forked,
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("shared-stdio-fork"))
+            .expect("read the fork case's report"),
+        "F_OFD_SETLK through standard input: ok\n\
+         --- one lock through standard input ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         child's close of standard input: ok\n\
+         close of standard output: ok\n\
+         --- each process holding the description through one stream ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         F_OFD_SETLK unlock through standard input: ok\n\
+         --- after the parent's unlock through standard input ---\n\
+         failures=0\n",
+        "{test}: one description left in each process through one stream"
+    );
+
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let close_exec_path = directory.path().join("close-exec-standard-streams");
+    let close_exec = read_write(&close_exec_path);
+    run_with_streams(
+        directory.path(),
+        "--shared-stdio-close-exec",
+        close_exec
+            .try_clone()
+            .expect("share the standard streams' file"),
+        close_exec,
+    );
+    assert_eq!(
+        fs::read_to_string(&close_exec_path).expect("read the close-exec case's file"),
+        "F_OFD_SETLK through standard input: ok\n\
+         close of standard input: ok\n\
+         --- standard output holding the description ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         --- after an exec that kept standard output ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         failures=0\n",
+        "{test}: standard input closed before an exec that keeps standard output"
+    );
+
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let closed = read_write(&directory.path().join("closed-standard-streams"));
+    run_with_streams(
+        directory.path(),
+        "--shared-stdio-close-both",
+        closed
+            .try_clone()
+            .expect("share the standard streams' file"),
+        closed,
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("shared-stdio-close-both"))
+            .expect("read the close-both case's report"),
+        "F_OFD_SETLK through standard input: ok\n\
+         --- one lock through standard input ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         close of standard output: ok\n\
+         close of standard input: ok\n\
+         --- after both streams closed ---\n\
+         failures=0\n",
+        "{test}: both streams of one description closed"
+    );
+
+    // The guest's report in `text`: from its first words, which may follow
+    // the test harness's own on a line, to the end of its `failures=` line.
+    let report_in = |text: &str| {
+        let report = text
+            .find("F_OFD_SETLK through standard input")
+            .map_or("", |start| &text[start..]);
+        let end = report
+            .find("failures=")
+            .and_then(|failures| {
+                report[failures..]
+                    .find('\n')
+                    .map(|newline| failures + newline + 1)
+            })
+            .unwrap_or(report.len());
+        report[..end].to_owned()
+    };
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let ptrace_output_path = directory.path().join("output");
+    let guest = proc_fdinfo_lines_guest();
+    let args = [
+        "run",
+        "--strict",
+        "--proc=standard",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        directory.path().to_str().expect("directory path is UTF-8"),
+        "--stdin-and-stdout-locks",
+    ];
+    let mut command = hermit_command(&args);
+    command
+        .stdin(Stdio::from(read_write(&directory.path().join("input"))))
+        .stdout(Stdio::from(read_write(&ptrace_output_path)));
+    let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+    assert_success(&output, &args);
+    let ptrace =
+        report_in(&fs::read_to_string(&ptrace_output_path).expect("read the ptrace run's output"));
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    read_write(&directory.path().join("reserved-stdin"));
+    let ambient_path = directory.path().join("ambient-standard-streams");
+    let ambient = read_write(&ambient_path);
+    let child = Command::new(std::env::current_exe().expect("this test's executable"))
+        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .env(RESERVED_STDIN_GUEST, guest)
+        .env(RESERVED_STDIN_DIRECTORY, directory.path())
+        .stdin(Stdio::from(
+            ambient
+                .try_clone()
+                .expect("share the ambient streams' file"),
+        ))
+        .stdout(Stdio::from(ambient))
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run the reserved standard input case");
+    let ambient_text =
+        fs::read_to_string(&ambient_path).expect("read the ambient standard streams' file");
+    assert!(
+        child.status.success(),
+        "{test}: the reserved standard input's process: {:?}\nstdout:\n{ambient_text}\nstderr:\n{}",
+        child.status,
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let kvm = report_in(&ambient_text);
+    assert_eq!(kvm, ptrace, "{test}: a reserved standard input of its own");
+    assert_eq!(
+        kvm,
+        "F_OFD_SETLK through standard input: ok\n\
+         --- a lock through standard input ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         F_OFD_SETLK through standard output: ok\n\
+         --- and one through standard output ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         2: OFDLCK ADVISORY READ -1 00:00:2 2 2\n\
+         failures=0\n",
+        "{test}: a reserved standard input of its own"
+    );
+
+    let from_parent = |backend: &str| {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        proc_fdinfo_lines_at_l2(
+            backend,
+            &[
+                directory.path().to_str().expect("directory path is UTF-8"),
+                "--received-from-parent",
+            ],
+        )
+    };
+    let kvm = from_parent("kvm");
+    assert_eq!(
+        kvm,
+        from_parent("ptrace"),
+        "{test}: a descriptor received from a parent"
+    );
+    assert_eq!(
+        kvm,
+        "F_OFD_SETLK: ok\n\
+         sendmsg to the child: 1\n\
+         child's receipt: ok\n\
+         close of the parent's descriptor: ok\n\
+         --- the child holding the description the parent closed ---\n\
+         1: OFDLCK ADVISORY WRITE -1 00:00:1 0 EOF\n\
+         --- after the child exited ---\n\
+         failures=0\n",
+        "{test}: a descriptor received from a parent"
+    );
+
+    // A lock held through a description in flight when its sender lets go:
+    // a child locks a file it opened after the fork, sends the descriptor,
+    // and exits (the parent looks while the child is a zombie) or closes its
+    // descriptor; the parent looks while the description is in flight, after
+    // its receipt, and after its close. Each section's rows as their lock
+    // classes, in order. Natively /proc/locks lists the host's locks too, so
+    // the native run's rows are the locked file's, by inode; under Hermit
+    // every row is the guest's own. Linux's in-flight reference holds an OFD
+    // lock and a flock until the receipt; a POSIX lock is the sender's, and
+    // goes with its close or its exit. ptrace shows Linux's rows, and so does
+    // KVM for the OFD lock; it refuses flock by name, and the first snapshot,
+    // which would show the record lock its provider holds as an OFD lock
+    // through the flight.
+    let lock_classes = |text: &str, inode: Option<u64>| {
+        let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+        for line in text.lines() {
+            if let Some(label) = line
+                .strip_prefix("--- ")
+                .and_then(|rest| rest.strip_suffix(" ---"))
+            {
+                sections.push((label.to_owned(), Vec::new()));
+                continue;
+            }
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let is_row = fields.first().is_some_and(|first| {
+                first.ends_with(':') && first[..first.len() - 1].parse::<u64>().is_ok()
+            }) && fields.len() >= 8
+                && fields[1] != "->";
+            let ours = inode.is_none_or(|inode| {
+                fields.get(5).is_some_and(|object| {
+                    object.rsplit(':').next() == Some(inode.to_string().as_str())
+                })
+            });
+            if let Some((_, rows)) = sections.last_mut()
+                && is_row
+                && ours
+            {
+                rows.push(fields[1].to_owned());
+            }
+        }
+        sections
+    };
+    for (variant, first) in [
+        ("exits", "in flight after the sender exited"),
+        ("closes", "in flight after the sender closed its descriptor"),
+    ] {
+        let in_flight_sections = |rows: [&[&str]; 3]| {
+            [first, "received", "closed"]
+                .into_iter()
+                .zip(rows)
+                .map(|(label, rows)| {
+                    (
+                        label.to_owned(),
+                        rows.iter().map(|row| (*row).to_owned()).collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for (kind, linux) in [
+            ("ofd", in_flight_sections([&["OFDLCK"], &["OFDLCK"], &[]])),
+            ("flock", in_flight_sections([&["FLOCK"], &["FLOCK"], &[]])),
+            ("posix", in_flight_sections([&[], &[], &[]])),
+        ] {
+            let case = format!("the sender {variant}, {kind}");
+            let mode = format!("--in-flight-sender-{variant}={kind}");
+            let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+            let native = Command::new(proc_fdinfo_lines_guest())
+                .arg(native_directory.path())
+                .arg(&mode)
+                .output()
+                .expect("run the fdinfo-lines guest natively");
+            assert!(
+                native.status.success(),
+                "{test}: native, {case}: {native:?}"
+            );
+            let inode = std::os::unix::fs::MetadataExt::ino(
+                &fs::metadata(native_directory.path().join("in-flight"))
+                    .expect("the native run's locked file"),
+            );
+            let native_rows = lock_classes(&stdout(&native), Some(inode));
+            assert_eq!(
+                native_rows,
+                linux,
+                "{test}: native, {case}\n{}",
+                stdout(&native)
+            );
+            let ptrace_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+            let ptrace = proc_fdinfo_lines_at_l2(
+                "ptrace",
+                &[
+                    ptrace_directory
+                        .path()
+                        .to_str()
+                        .expect("directory path is UTF-8"),
+                    &mode,
+                ],
+            );
+            assert_eq!(
+                lock_classes(&ptrace, None),
+                native_rows,
+                "{test}: ptrace, {case}\n{ptrace}"
+            );
+            let kvm_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+            let kvm_directory_arg = kvm_directory
+                .path()
+                .to_str()
+                .expect("directory path is UTF-8");
+            if kind == "flock" {
+                let guest = proc_fdinfo_lines_guest();
+                let args = [
+                    "--backend=kvm",
+                    "run",
+                    "--strict",
+                    "--proc=standard",
+                    "--epoch=2026-01-01T00:00:00Z",
+                    "--base-env=minimal",
+                    "--",
+                    guest.to_str().expect("guest path is UTF-8"),
+                    kvm_directory_arg,
+                    &mode,
+                ];
+                let output = hermit(&args);
+                assert_eq!(
+                    output.status.code(),
+                    Some(HERMIT_POLICY_REFUSAL_EXIT),
+                    "{test}: KVM refuses the sender's flock by name, {case}\nstderr:\n{}",
+                    stderr(&output)
+                );
+                assert!(
+                    stderr(&output).contains("refused by the backend: KVM flock is unsupported"),
+                    "{test}: KVM refuses the sender's flock by name, {case}\nstderr:\n{}",
+                    stderr(&output)
+                );
+                continue;
+            }
+            if kind == "posix" {
+                let refused = proc_fdinfo_lines_refused_on_kvm(
+                    &[kvm_directory_arg, &mode],
+                    &["/proc/locks: a record lock", RECORD_LOCK_HELD_AS_OFD],
+                );
+                // The guest prints a snapshot's label before it reads.
+                assert!(
+                    refused.ends_with(&format!(": ok\n--- {first} ---\n"))
+                        && refused.matches("--- ").count() == 1,
+                    "{test}: KVM refuses the first snapshot by name, {case}\n{refused}"
+                );
+                continue;
+            }
+            let kvm = proc_fdinfo_lines_at_l2("kvm", &[kvm_directory_arg, &mode]);
+            assert_eq!(
+                lock_classes(&kvm, None),
+                native_rows,
+                "{test}: KVM, {case}\n{kvm}"
+            );
+            assert_eq!(kvm, ptrace, "{test}: KVM and ptrace, {case}");
+        }
+    }
+
+    // Each section's rows as `lock_classes` gives them, under `labels`.
+    let sections = |labels: &[&str], rows: &[&[&str]]| {
+        labels
+            .iter()
+            .zip(rows)
+            .map(|(label, rows)| {
+                (
+                    (*label).to_owned(),
+                    rows.iter().map(|row| (*row).to_owned()).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // A lock only a message queued to a receiving socket holds, when that
+    // socket goes without a close: a child holds its only descriptor
+    // (close-on-exec), and execs, kills itself with SIGKILL, leaves through a
+    // raw exit of its only thread, is killed by the parent's SIGKILL, or dies
+    // by the default action of its own SIGTERM, abort()'s SIGABRT or a
+    // write's SIGSEGV, after the parent locked a file, sent the descriptor and
+    // closed its own; or the child execs first, keeping the socket, and the
+    // new image dies by its own SIGTERM once the description is queued, which
+    // takes the table the exec gave it (exec-terminated). Linux destroys the
+    // message with the socket, and the lock with the description, so a fresh
+    // open's conflicting lock succeeds and no row is left. KVM lets go of a
+    // table that a death by a fatal signal ended at the death's terminal
+    // receipt (Codex's narrow check of K8-h reb8: before, KVM listed the lock
+    // in all four snapshots), the table a thread named after its exec
+    // included (Claude's narrow check of reb9: without that naming, KVM
+    // refuses at the second snapshot). Where the parent keeps a descriptor of
+    // the receiving socket (parent-keeps-socket), the child's death by its
+    // own SIGTERM takes nothing: the lock stays a row, and a fresh open's
+    // conflicting lock fails with EAGAIN, until the parent closes its
+    // descriptor, which takes the socket's last reference.
+    let gone = sections(
+        &[
+            "in flight to the child's socket",
+            "after the child's socket went",
+            "after a fresh open's lock and unlock",
+            "at the end",
+        ],
+        &[&["OFDLCK"], &[], &[], &[]],
+    );
+    let kept = sections(
+        &[
+            "in flight to the child's socket",
+            "after the child's death",
+            "after a fresh open's attempt",
+            "after the parent's receiving end closed",
+            "at the end",
+        ],
+        &[&["OFDLCK"], &["OFDLCK"], &["OFDLCK"], &[], &[]],
+    );
+    const GRANTED: &str = "a fresh open's conflicting F_OFD_SETLK: ok\n";
+    for (how, expected, lines) in [
+        ("exec", &gone, &["the child's exec: ok\n", GRANTED][..]),
+        (
+            "kills-itself",
+            &gone,
+            &["the child's death by SIGKILL: ok\n", GRANTED][..],
+        ),
+        ("exits", &gone, &["the child's raw exit: ok\n", GRANTED][..]),
+        (
+            "killed",
+            &gone,
+            &["the child's death by SIGKILL: ok\n", GRANTED][..],
+        ),
+        (
+            "terminated",
+            &gone,
+            &["the child's death by SIGTERM: ok\n", GRANTED][..],
+        ),
+        (
+            "aborts",
+            &gone,
+            &["the child's death by SIGABRT: ok\n", GRANTED][..],
+        ),
+        (
+            "faults",
+            &gone,
+            &["the child's death by SIGSEGV: ok\n", GRANTED][..],
+        ),
+        (
+            "exec-terminated",
+            &gone,
+            &[
+                "the child's exec: ok\n",
+                "the child's death by SIGTERM: ok\n",
+                GRANTED,
+            ][..],
+        ),
+        (
+            "parent-keeps-socket",
+            &kept,
+            &[
+                "the child's death by SIGTERM: ok\n",
+                "a fresh open's conflicting F_OFD_SETLK: -1 EAGAIN\n",
+                "close of the parent's receiving end: ok\n",
+                "a second fresh open's conflicting F_OFD_SETLK: ok\n",
+            ][..],
+        ),
+    ] {
+        let case = format!("the receiving socket's process goes by {how}");
+        let shows_every_line = |transcript: &str| {
+            lines.iter().all(|line| transcript.contains(line))
+                && transcript.ends_with("failures=0\n")
+        };
+        let mode = format!("--in-flight-receiver-gone={how}");
+        let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let native = Command::new(proc_fdinfo_lines_guest())
+            .arg(native_directory.path())
+            .arg(&mode)
+            .output()
+            .expect("run the fdinfo-lines guest natively");
+        assert!(
+            native.status.success(),
+            "{test}: native, {case}: {native:?}"
+        );
+        let native = stdout(&native);
+        assert!(
+            shows_every_line(&native),
+            "{test}: native, {case}\n{native}"
+        );
+        let inode = std::os::unix::fs::MetadataExt::ino(
+            &fs::metadata(native_directory.path().join("receiver-gone"))
+                .expect("the native run's locked file"),
+        );
+        assert_eq!(
+            &lock_classes(&native, Some(inode)),
+            expected,
+            "{test}: native, {case}\n{native}"
+        );
+        let ptrace_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let ptrace = proc_fdinfo_lines_at_l2(
+            "ptrace",
+            &[
+                ptrace_directory
+                    .path()
+                    .to_str()
+                    .expect("directory path is UTF-8"),
+                &mode,
+            ],
+        );
+        assert!(
+            shows_every_line(&ptrace),
+            "{test}: ptrace, {case}\n{ptrace}"
+        );
+        assert_eq!(
+            &lock_classes(&ptrace, None),
+            expected,
+            "{test}: ptrace, {case}\n{ptrace}"
+        );
+        let kvm_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let kvm_directory_arg = kvm_directory
+            .path()
+            .to_str()
+            .expect("directory path is UTF-8");
+        if how == "killed" {
+            let guest = proc_fdinfo_lines_guest();
+            let args = [
+                "--backend=kvm",
+                "run",
+                "--strict",
+                "--proc=standard",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--base-env=minimal",
+                "--",
+                guest.to_str().expect("guest path is UTF-8"),
+                kvm_directory_arg,
+                &mode,
+            ];
+            let output = hermit(&args);
+            assert_eq!(
+                output.status.code(),
+                Some(HERMIT_POLICY_REFUSAL_EXIT),
+                "{test}: KVM refuses the parent's SIGKILL by name, {case}\nstderr:\n{}",
+                stderr(&output)
+            );
+            assert!(
+                stderr(&output).contains(
+                    "kill refused by the backend: KVM signal delivery refused: KVM cannot \
+                     deliver a signal to another process"
+                ),
+                "{test}: KVM refuses the parent's SIGKILL by name, {case}\nstderr:\n{}",
+                stderr(&output)
+            );
+            continue;
+        }
+        let kvm = proc_fdinfo_lines_at_l2("kvm", &[kvm_directory_arg, &mode]);
+        assert_eq!(
+            &lock_classes(&kvm, None),
+            expected,
+            "{test}: KVM, {case}\n{kvm}"
+        );
+        assert_eq!(kvm, ptrace, "{test}: KVM and ptrace, {case}");
+    }
+
+    // The same, where the child that holds the receiving socket has a second
+    // thread that keeps calling through the child's descriptors while the
+    // main thread ends the process, by SIGKILL to itself or by exit_group.
+    // Until the process ends, Linux keeps its descriptors, so every one of the
+    // sibling's calls succeeds, and the queued message holds the lock, so
+    // /proc/locks lists it while it refuses a conflicting lock. Detcore lets
+    // go of the child's table only once the exit is granted, which logically
+    // ends the sibling (Claude's and Codex's narrow checks of reb7: before,
+    // the sibling's calls failed with EBADF, and the row went while the lock
+    // was held).
+    const BUSY_SIBLING: &str = "the busy sibling ran: yes\n\
+                                its calls through the child's descriptors that failed: 0\n\
+                                its reads of /proc/locks that listed no lock: 0\n";
+    let busy = sections(
+        &[
+            "in flight to the child's socket",
+            "after the child's death",
+            "after a fresh open's lock and unlock",
+        ],
+        &[&["OFDLCK"], &[], &[]],
+    );
+    for how in ["kills-itself", "exit-group"] {
+        let case = format!("the busy receiver ends itself by {how}");
+        let mode = format!("--in-flight-receiver-dies-busy={how}");
+        let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let native = Command::new(proc_fdinfo_lines_guest())
+            .arg(native_directory.path())
+            .arg(&mode)
+            .output()
+            .expect("run the fdinfo-lines guest natively");
+        assert!(
+            native.status.success(),
+            "{test}: native, {case}: {native:?}"
+        );
+        let native = stdout(&native);
+        assert!(
+            native.contains(BUSY_SIBLING)
+                && native.contains("a fresh open's conflicting F_OFD_SETLK: ok\n")
+                && native.ends_with("failures=0\n"),
+            "{test}: native, {case}\n{native}"
+        );
+        let inode = std::os::unix::fs::MetadataExt::ino(
+            &fs::metadata(native_directory.path().join("receiver-dies-busy"))
+                .expect("the native run's locked file"),
+        );
+        assert_eq!(
+            lock_classes(&native, Some(inode)),
+            busy,
+            "{test}: native, {case}\n{native}"
+        );
+        let mut transcripts = Vec::new();
+        for backend in ["ptrace", "kvm"] {
+            let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+            let transcript = proc_fdinfo_lines_at_l2(
+                backend,
+                &[
+                    directory.path().to_str().expect("directory path is UTF-8"),
+                    &mode,
+                ],
+            );
+            assert!(
+                transcript.contains(BUSY_SIBLING)
+                    && transcript.contains("a fresh open's conflicting F_OFD_SETLK: ok\n")
+                    && transcript.ends_with("failures=0\n"),
+                "{test}: {backend}, {case}\n{transcript}"
+            );
+            assert_eq!(
+                lock_classes(&transcript, None),
+                busy,
+                "{test}: {backend}, {case}\n{transcript}"
+            );
+            transcripts.push(transcript);
+        }
+        assert_eq!(
+            transcripts[1], transcripts[0],
+            "{test}: KVM and ptrace, {case}"
+        );
+    }
+
+    // One description as standard input and output: a lock through standard
+    // input, then standard input sent to this process itself and closed, so
+    // that only the message queued to the receiving socket holds that
+    // identity, then an unlock through standard output, the receipt and the
+    // received descriptor's close. One description, one lock: Linux lists it
+    // until the unlock, and no more.
+    let alias_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let alias_path = alias_directory.path().join("in-flight-standard-streams");
+    let alias = read_write(&alias_path);
+    let native = Command::new(proc_fdinfo_lines_guest())
+        .arg(alias_directory.path())
+        .arg("--stdio-alias-in-flight")
+        .stdin(Stdio::from(
+            alias.try_clone().expect("share the standard streams' file"),
+        ))
+        .stdout(Stdio::from(alias))
+        .output()
+        .expect("run the fdinfo-lines guest natively");
+    assert!(
+        native.status.success(),
+        "{test}: native, standard input in flight: {native:?}"
+    );
+    let native = fs::read_to_string(&alias_path).expect("read the native run's report");
+    let inode = std::os::unix::fs::MetadataExt::ino(
+        &fs::metadata(&alias_path).expect("the native run's standard streams' file"),
+    );
+    let in_flight_alias = sections(
+        &[
+            "one lock through standard input",
+            "standard input in flight",
+            "after the unlock through standard output",
+            "received",
+            "closed",
+        ],
+        &[&["OFDLCK"], &["OFDLCK"], &[], &[], &[]],
+    );
+    assert_eq!(
+        lock_classes(&native, Some(inode)),
+        in_flight_alias,
+        "{test}: native, standard input in flight\n{native}"
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let alias_path = directory.path().join("in-flight-standard-streams");
+    let alias = read_write(&alias_path);
+    run_with_streams(
+        directory.path(),
+        "--stdio-alias-in-flight",
+        alias.try_clone().expect("share the standard streams' file"),
+        alias,
+    );
+    assert_eq!(
+        fs::read_to_string(&alias_path).expect("read the in-flight standard input case's file"),
+        "F_OFD_SETLK through standard input: ok\n\
+         --- one lock through standard input ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         sendmsg of standard input: 1\n\
+         close of standard input: ok\n\
+         --- standard input in flight ---\n\
+         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
+         F_OFD_SETLK unlock through standard output: ok\n\
+         --- after the unlock through standard output ---\n\
+         recvmsg: 1 descriptors\n\
+         --- received ---\n\
+         close of the received descriptor: ok\n\
+         --- closed ---\n\
+         failures=0\n",
+        "{test}: one description as standard input and output, standard input in flight"
+    );
+
+    // Two opens of one file holding identical OFD read locks; the parent sends
+    // the second to a child forked before, which receives it, and closes its
+    // own. Linux lists each lock object.
+    let twins = sections(
+        &[
+            "two opens' identical OFD locks",
+            "the child holding the second open",
+            "after the child closed the second open",
+            "after the first open's close",
+        ],
+        &[
+            &["OFDLCK", "OFDLCK"],
+            &["OFDLCK", "OFDLCK"],
+            &["OFDLCK"],
+            &[],
+        ],
+    );
+    let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let native = Command::new(proc_fdinfo_lines_guest())
+        .arg(native_directory.path())
+        .arg("--joined-twin-locks")
+        .output()
+        .expect("run the fdinfo-lines guest natively");
+    assert!(
+        native.status.success(),
+        "{test}: native, joined twins: {native:?}"
+    );
+    let native = stdout(&native);
+    let inode = std::os::unix::fs::MetadataExt::ino(
+        &fs::metadata(native_directory.path().join("joined-twins"))
+            .expect("the native run's locked file"),
+    );
+    assert_eq!(
+        lock_classes(&native, Some(inode)),
+        twins,
+        "{test}: native, joined twins\n{native}"
+    );
+    let kvm_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let kvm = proc_fdinfo_lines_at_l2(
+        "kvm",
+        &[
+            kvm_directory
+                .path()
+                .to_str()
+                .expect("directory path is UTF-8"),
+            "--joined-twin-locks",
+        ],
+    );
+    assert!(
+        kvm.ends_with("failures=0\n"),
+        "{test}: KVM, joined twins\n{kvm}"
+    );
+    assert_eq!(
+        lock_classes(&kvm, None),
+        twins,
+        "{test}: KVM, joined twins\n{kvm}"
+    );
+
+    let received = |backend: &str| {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        proc_fdinfo_lines_at_l2(
+            backend,
+            &[
+                directory.path().to_str().expect("directory path is UTF-8"),
+                "--received-lock-exec",
+            ],
+        )
+    };
+    let kvm = received("kvm");
+    assert_eq!(
+        kvm,
+        received("ptrace"),
+        "{test}: a received copy across an exec"
+    );
+    assert_eq!(
+        kvm,
+        "F_OFD_SETLK: ok\n\
+         sendmsg of the locked descriptor: 1\n\
+         recvmsg: 1 descriptors\n\
+         --- one lock through the opened and the received descriptor ---\n\
+         1: OFDLCK ADVISORY WRITE -1 00:00:1 0 EOF\n\
+         --- after an exec that kept both ---\n\
+         1: OFDLCK ADVISORY WRITE -1 00:00:1 0 EOF\n\
+         failures=0\n",
+        "{test}: a received copy across an exec"
+    );
+}

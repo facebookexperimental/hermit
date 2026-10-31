@@ -586,6 +586,58 @@ fn duplicate_current_stdin() -> io::Result<Option<fs::File>> {
     }
 }
 
+/// For each of the three descriptors `fds` a launch hands a guest as its
+/// standard input, output and error (`None` for a closed one), the lowest of
+/// them that is one open file description with it, as `kcmp(KCMP_FILE)`
+/// answers for this process's own descriptors; `None` where kcmp gives no
+/// answer for a pair (a kernel without it, a seccomp profile that refuses it,
+/// or a descriptor that is not open). Detcore's lock ledger takes the streams
+/// of one group as the one description they are
+/// (`DetConfig::standard_stream_aliases`).
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(
+        dead_code,
+        reason = "only the x86_64 KVM launch groups the standard streams"
+    )
+)]
+fn standard_stream_aliases(fds: [Option<std::os::fd::RawFd>; 3]) -> Option<[u8; 3]> {
+    const KCMP_FILE: libc::c_long = 0;
+    // SAFETY: getpid reads only this process's identity.
+    let pid = libc::c_long::from(unsafe { libc::getpid() });
+    let mut aliases = [0u8, 1, 2];
+    for later in 1..fds.len() {
+        let Some(b) = fds[later] else {
+            continue;
+        };
+        for earlier in 0..later {
+            let Some(a) = fds[earlier] else {
+                continue;
+            };
+            // SAFETY: kcmp only compares two descriptors of this process.
+            let answer = unsafe {
+                libc::syscall(
+                    libc::SYS_kcmp,
+                    pid,
+                    pid,
+                    KCMP_FILE,
+                    libc::c_long::from(a),
+                    libc::c_long::from(b),
+                )
+            };
+            match answer {
+                0 => {
+                    aliases[later] = aliases[earlier];
+                    break;
+                }
+                1..=3 => {}
+                _ => return None,
+            }
+        }
+    }
+    Some(aliases)
+}
+
 fn ensure_kvm_stdin_reserved() -> io::Result<()> {
     let mut reservation = KVM_STDIN_RESERVATION
         .lock()
@@ -3891,6 +3943,16 @@ async fn run_kvm(
     } else {
         reserved_kvm_stdin()?
     };
+    // Which of the guest's standard streams are one open file description:
+    // the stdin this launch hands the guest, and this process's own standard
+    // output and error, which the executor passes through unless it captures
+    // them. A captured run's output streams are the executor's own carriers,
+    // so nothing is known there.
+    config.standard_stream_aliases = if capture_output {
+        None
+    } else {
+        standard_stream_aliases([stdin.as_ref().map(AsRawFd::as_raw_fd), Some(1), Some(2)])
+    };
     let requested_cwd = command
         .get_current_dir()
         .map(Path::to_owned)
@@ -6617,6 +6679,43 @@ mod tests {
     use super::*;
 
     static SKID_OVERSHOOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The standard streams a launch hands a KVM guest are grouped by the
+    /// descriptors themselves, not by this process's fds 0-2: a stdin that is
+    /// a file of its own (a reserved stdin distinct from the output streams)
+    /// stays a description of its own even where the output streams are one,
+    /// and a stdin that is one description with the standard output joins it.
+    #[test]
+    fn standard_streams_are_grouped_by_the_descriptors_handed_over() {
+        let directory = tempfile::tempdir().unwrap();
+        let open = |name: &str| {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(directory.path().join(name))
+                .unwrap()
+        };
+        let reserved = open("reserved-stdin");
+        let output = open("output");
+        let output_copy = output.try_clone().unwrap();
+        let error = open("error");
+        let fd = |file: &fs::File| Some(file.as_raw_fd());
+        assert_eq!(
+            standard_stream_aliases([fd(&reserved), fd(&output), fd(&output_copy)]),
+            Some([0, 1, 1])
+        );
+        let stdin_copy = output.try_clone().unwrap();
+        assert_eq!(
+            standard_stream_aliases([fd(&stdin_copy), fd(&output), fd(&error)]),
+            Some([0, 0, 2])
+        );
+        assert_eq!(
+            standard_stream_aliases([None, fd(&output), fd(&error)]),
+            Some([0, 1, 2])
+        );
+    }
 
     /// Runs `check_tracing_environment` against probes that report `denied`
     /// as unavailable and every other probe as available; returns the refusal,

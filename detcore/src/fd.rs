@@ -1213,6 +1213,57 @@ struct OpenFileDescription {
     /// ([`DetFd::is_last_reference`]). Not printed.
     #[serde(skip)]
     in_flight: usize,
+    /// What Linux's fdinfo of this description's file prints that no call
+    /// reads back, recorded where the guest set it through Detcore
+    /// ([`FdinfoFacts`]). `None` for a description of no such kind, and for
+    /// one Detcore did not create (inherited, received without joining the
+    /// description its sender's table modeled, or rediscovered after an
+    /// exec), whose fdinfo it then cannot render. Shared by every alias,
+    /// as the file is. Not printed, so descriptions log as before.
+    #[serde(default)]
+    fdinfo_facts: Option<FdinfoFacts>,
+    /// For one of the container's standard streams whose open file
+    /// description the launcher passed on another of them too, as the
+    /// launcher's `kcmp(KCMP_FILE)` of the descriptors it handed the guest
+    /// answered (`Config::standard_stream_aliases`, which
+    /// `FileMetadata::setup_stdio` applies): the group's key, the identity of its
+    /// lowest stream, by which `procfs::locks::LockLedger` takes the group as
+    /// the one description it is. Shared by every alias. Not printed.
+    #[serde(default)]
+    stdio_alias_group: Option<OpenFileId>,
+}
+
+/// State of an anonymous-inode file that its `/proc/<pid>/fdinfo/<fd>`
+/// prints and no call reads back, as the guest set it through Detcore's
+/// handlers (package K slice K8-h, `Detcore::render_own_fdinfo`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum FdinfoFacts {
+    /// An eventfd: whether `eventfd2` made it with `EFD_SEMAPHORE`
+    /// (`eventfd-semaphore`, fs/eventfd.c).
+    Eventfd {
+        /// `EFD_SEMAPHORE`.
+        semaphore: bool,
+    },
+    /// A signalfd: the signals it reads, as `signalfd4` last set them, bit
+    /// `n - 1` for signal `n`, without `SIGKILL` and `SIGSTOP`, which Linux
+    /// takes out (`sigmask:`, fs/signalfd.c).
+    Signalfd {
+        /// The mask.
+        mask: u64,
+    },
+    /// A timerfd: its clock, the flags of its last `timerfd_settime`, and
+    /// Linux's own timer (`clockid:`, `settime flags:`, `ticks:` and
+    /// `it_value:`, fs/timerfd.c).
+    Timerfd {
+        /// The clock `timerfd_create` named.
+        clockid: i32,
+        /// `TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET` of the last setting;
+        /// 0 before any.
+        settime_flags: u32,
+        /// Linux's own timer, as the guest's settings, reads and
+        /// `timerfd_gettime` calls left it.
+        linux: LinuxTimerfd,
+    },
 }
 /// Written out, not derived, so that `channel` is printed only when it is set:
 /// a run without `--pipe-wake-latency` logs every description exactly as
@@ -1359,6 +1410,83 @@ impl VirtualTimerfd {
             deadline.as_nanos().saturating_sub(now.as_nanos())
         });
         (left, self.interval_ns)
+    }
+}
+
+/// What Linux's own timer behind a timerfd holds (`ctx->t` and `ctx->ticks`
+/// in fs/timerfd.c), which only the timer's fdinfo shows: Linux counts one
+/// expiration when its timer fires and leaves it stopped, and counts the
+/// periods after that one only when a read or `timerfd_gettime` forwards it,
+/// where Detcore's model counts every expiration at each probe
+/// ([`VirtualTimerfd::expire_through`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LinuxTimerfd {
+    /// Where the timer would fire next, or `None` when it will not.
+    pub(crate) deadline: Option<LogicalTime>,
+    /// The expirations counted as of the last forward that no read has
+    /// taken, without one since then.
+    pub(crate) ticks: u64,
+}
+
+impl LinuxTimerfd {
+    /// The state `timerfd_settime` leaves: armed at `deadline`, nothing
+    /// counted.
+    pub(crate) fn set(deadline: Option<LogicalTime>) -> Self {
+        LinuxTimerfd { deadline, ticks: 0 }
+    }
+
+    /// What Linux's `timerfd_gettime` does at `now` to a timer of interval
+    /// `interval_ns` (`do_timerfd_gettime`): one that has fired is forwarded
+    /// past `now`, counting every period that ended since it fired. A
+    /// one-shot timer that has fired is not restarted; its one expiration
+    /// stays counted. Nothing for a timer that has not fired.
+    pub(crate) fn forward(&mut self, now: LogicalTime, interval_ns: u64) {
+        let Some(deadline) = self.deadline else {
+            return;
+        };
+        if now < deadline {
+            return;
+        }
+        let elapsed = now.as_nanos() - deadline.as_nanos();
+        match elapsed.checked_div(interval_ns) {
+            None => {
+                self.ticks = self.ticks.saturating_add(1);
+                self.deadline = None;
+            }
+            Some(periods) => {
+                let counted = 1 + periods;
+                self.ticks = self.ticks.saturating_add(counted);
+                self.deadline = Some(LogicalTime::from_nanos(
+                    deadline
+                        .as_nanos()
+                        .saturating_add(counted.saturating_mul(interval_ns)),
+                ));
+            }
+        }
+    }
+
+    /// What a successful read leaves (`timerfd_read_iter`): the timer
+    /// forwarded past the read, as Detcore's model is after the probe that
+    /// made the read ready (`next`, its [`VirtualTimerfd::deadline`]), and
+    /// nothing counted.
+    pub(crate) fn after_read(&mut self, next: Option<LogicalTime>) {
+        self.deadline = next;
+        self.ticks = 0;
+    }
+
+    /// What Linux's `timerfd_show` prints at `now`: its count, with the one
+    /// expiration of a timer that has fired since its last forward, and the
+    /// time left to that timer (`timerfd_get_remaining`, 0 once it has fired
+    /// or when it will not), in nanoseconds.
+    pub(crate) fn view(&self, now: LogicalTime) -> (u64, u64) {
+        match self.deadline {
+            Some(deadline) if now >= deadline => (self.ticks.saturating_add(1), 0),
+            Some(deadline) => (
+                self.ticks,
+                deadline.as_nanos().saturating_sub(now.as_nanos()),
+            ),
+            None => (self.ticks, 0),
+        }
     }
 }
 
@@ -1547,6 +1675,8 @@ impl DetFd {
                 may_hold_ofd_lock: false,
                 rights: SocketRights::default(),
                 in_flight: 0,
+                fdinfo_facts: None,
+                stdio_alias_group: None,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             }))),
@@ -1780,6 +1910,18 @@ impl DetFd {
             debug_assert_eq!(d.ty, FdType::Timerfd);
             d.timerfd = timerfd;
         })
+    }
+
+    /// What this description's fdinfo prints that no call reads back, where
+    /// the guest set it through Detcore ([`FdinfoFacts`]).
+    pub(crate) fn fdinfo_facts(&self) -> Option<FdinfoFacts> {
+        self.with_description(|d| d.fdinfo_facts)
+    }
+
+    /// Record what this description's fdinfo prints that no call reads back,
+    /// under every alias.
+    pub(crate) fn set_fdinfo_facts(&self, facts: FdinfoFacts) {
+        self.with_description(|d| d.fdinfo_facts = Some(facts))
     }
 
     /// Record the process identity carried by a newly created pidfd.
@@ -2448,6 +2590,16 @@ impl DetFd {
     /// Return the shared procfs cursor and initialized snapshot length.
     pub(crate) fn procfs_position(&self) -> Option<(usize, Option<usize>)> {
         self.with_description(|d| d.procfs.as_ref().map(ProcfsFile::position))
+    }
+
+    /// Whether this is a descriptor's fdinfo Detcore opened as rendered
+    /// (`ProcfsFile::rendered_fdinfo_target`).
+    pub(crate) fn procfs_is_rendered_fdinfo(&self) -> bool {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .is_some_and(|procfs| procfs.is_rendered() && procfs.is_fdinfo())
+        })
     }
 
     pub(crate) fn procfs_target_fd(&self) -> Option<i32> {
@@ -3324,6 +3476,19 @@ impl DetFd {
     /// Whether `procfs::locks::LockLedger` follows this description's locks.
     pub(crate) fn is_lock_tracked(&self) -> bool {
         self.with_description(|d| d.lock_tracked)
+    }
+
+    /// The alias group of this description, where it is one of the
+    /// container's standard streams that is one open file description with
+    /// another of them (`FileMetadata::setup_stdio`).
+    pub(crate) fn stdio_alias_group(&self) -> Option<OpenFileId> {
+        self.with_description(|d| d.stdio_alias_group)
+    }
+
+    /// Put this description, one of the container's standard streams, in
+    /// alias group `group`.
+    pub(crate) fn set_stdio_alias_group(&self, group: OpenFileId) {
+        self.with_description(|d| d.stdio_alias_group = Some(group));
     }
 
     /// Mark this description as registered on reception over `SCM_RIGHTS`.
@@ -4519,6 +4684,38 @@ mod tests {
         }
         assert_eq!(added, 4);
         assert_eq!(often, once);
+    }
+
+    /// What a timerfd's fdinfo shows follows Linux's own timer
+    /// (`LinuxTimerfd`), which counts one expiration when it fires and the
+    /// periods after it only when `timerfd_gettime` or a read forwards it,
+    /// whatever Detcore's probes counted meanwhile; a one-shot timer that
+    /// fired is not restarted.
+    #[test]
+    fn a_timerfds_fdinfo_view_follows_linuxs_forwarding() {
+        let mut model = VirtualTimerfd::set(Some(at(1_000)), 300);
+        let mut linux = LinuxTimerfd::set(Some(at(1_000)));
+        assert_eq!(linux.view(at(400)), (0, 600));
+        model.expire_through(at(1_950));
+        assert_eq!(linux.view(at(1_950)), (1, 0));
+        linux.forward(at(1_950), 300);
+        assert_eq!(linux.view(at(1_950)), (4, 250));
+        assert_eq!(linux.view(at(2_200)), (5, 0));
+        assert_eq!(model.expire_through(at(2_300)), 1);
+        linux.after_read(model.deadline);
+        assert_eq!(linux.view(at(2_300)), (0, 200));
+
+        let mut once_model = VirtualTimerfd::set(Some(at(10)), 0);
+        let mut once = LinuxTimerfd::set(Some(at(10)));
+        assert_eq!(once.view(at(5)), (0, 5));
+        assert_eq!(once.view(at(10)), (1, 0));
+        once.forward(at(20), 0);
+        assert_eq!(once.view(at(20)), (1, 0));
+        once_model.expire_through(at(20));
+        once.after_read(once_model.deadline);
+        assert_eq!(once.view(at(30)), (0, 0));
+
+        assert_eq!(LinuxTimerfd::set(None).view(at(5)), (0, 0));
     }
 
     /// A timer disarmed with a zero value keeps its interval for

@@ -1922,6 +1922,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/proc_fdinfo_lines.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/proc_fdinfo_lines.c is owned by hermit-cli/tests/cli.rs: run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences runs it on KVM under run --strict --verify --verify-strict at bitwise parity and requires its transcript of /proc/self/fdinfo lines to equal the same guest's native run, apart from named KVM differences; proc_fdinfo_lines_verify_at_bitwise_parity_on_ptrace runs it at the same level on ptrace; run_kvm_renders_proc_locks_from_the_lock_ledger compares its --proc-locks /proc/locks rows on KVM with ptrace's. A generic manifest cannot compare a backend's transcript with a native run under a named-difference mapping."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/proc_fdinfo_mount_classes.c",
       "runner": "hermit-cli/tests/procfs_determinism.rs",
       "why": "tests/c/proc_fdinfo_mount_classes.c is owned by hermit-cli/tests/procfs_determinism.rs: The dedicated procfs integration suite compiles the guest and asserts mount-class identities in fdinfo under its controlled filesystem setup, which is outside the generic manifest contract."

@@ -842,6 +842,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.cfg.virtualize_cpuid,
             guest.has_cpuid_interception(),
             self.cfg.container_mount_table.is_some(),
+            !procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend),
         )
     }
 
@@ -5379,6 +5380,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             guest_log::starts_new_process(guest.thread_state().mm_id);
         }
 
+        // The table this thread holds, for the terminal receipt of its
+        // process's death by a fatal signal to let go of
+        // (`Detcore::name_table_for_death`), before it runs. Boxed, so that its
+        // request does not grow this future.
+        Box::pin(self.name_table_for_death(guest)).await;
+
         // Except for the root task, let's block until it's our turn to go:
         let th = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
 
@@ -5569,6 +5576,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if !surviving.is_empty() || guest.thread_state().exec_dropped_lock_tracked() {
             tool_global::note_table_exec(guest, surviving).await;
         }
+        // The descriptors of the table the exec replaced go now, in the
+        // exec's turn, the close-on-exec ones as the exec dropped them, with
+        // what the queues of their sockets held
+        // (`Detcore::release_exec_dropped_descriptors`): a copy in flight to a
+        // receiving socket the exec closed is released, as Linux releases it
+        // at the exec, and the lock ledger stops counting its locks. A failed
+        // exec never reaches this callback, and its kept table went with it.
+        self.release_exec_dropped_descriptors(guest).await;
+        // The table the exec gave this thread, in place of the one it named
+        // at its start (`Detcore::name_table_for_death`). Boxed, as below.
+        Box::pin(self.name_table_for_death(guest)).await;
         // The new image's auxiliary vector, as it finds it on its initial
         // stack, for its `/proc/<pid>/auxv` (package K slice K2 of
         // https://github.com/rrnewton/hermit/issues/4213). Not under record

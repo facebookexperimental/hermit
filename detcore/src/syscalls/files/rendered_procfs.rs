@@ -270,13 +270,14 @@ const DYNAMIC_PATHS: [&std::ffi::CStr; 4] = [
 ];
 
 /// The paths of every procfs file a session renders (`files`):
-/// `/proc/cpuinfo` too where it renders that.
+/// `/proc/cpuinfo` and `/proc/locks` too where it renders them.
 pub(crate) fn rendered_paths(
     files: RenderedFiles,
 ) -> impl Iterator<Item = &'static std::ffi::CStr> {
     DYNAMIC_PATHS
         .into_iter()
         .chain(files.cpuinfo.then_some(c"/proc/cpuinfo"))
+        .chain(files.locks.then_some(c"/proc/locks"))
         .chain(
             FixedProcfsFile::ALL
                 .into_iter()
@@ -1432,10 +1433,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         else {
             return Ok(());
         };
-        if !ProcfsFile::from_rendered_path(path).is_some_and(|file| file.shows_at_read()) {
+        let Some(file) = ProcfsFile::from_rendered_path(path).filter(|file| file.shows_at_read())
+        else {
             return Ok(());
-        }
+        };
         match self.rendered_task_state(guest, path).await {
+            // An fdinfo's `seq_show` finds no task: ENOENT (fs/proc/fd.c).
+            Some((_, false)) if file.is_fdinfo() => Err(Errno::ENOENT),
             Some((_, false)) => Err(Errno::ESRCH),
             _ => Ok(()),
         }
@@ -1520,7 +1524,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             path
         };
-        if let Some(mut procfs) = ProcfsFile::from_path(path) {
+        // A descriptor's fdinfo is a per-process file Detcore renders where
+        // the guest's procfs is not the kernel's (package K slice K8-h):
+        // classified so only there, so that every other backend's opens of
+        // one stay the kernel's, as before.
+        let classified = if self.renders_fdinfo() {
+            if let Some(task) = crate::procfs::fdinfo_spelling_task(path)
+                && ProcfsFile::rendered_fdinfo_at(path).is_none()
+                && self.names_own_process_spelling(guest, task).await
+            {
+                // A name that is no descriptor number, as Linux's lookup
+                // reads one (`name_to_int`): no such entry.
+                return Err(Errno::ENOENT.into());
+            }
+            ProcfsFile::rendered_fdinfo_at(path).or_else(|| ProcfsFile::from_path(path))
+        } else {
+            ProcfsFile::from_path(path)
+        };
+        if let Some(mut procfs) = classified {
             // A per-process file belongs to the task its path names, which
             // Detcore's process table decides exists, as Linux's lookup of
             // `/proc/<pid>` and `task/<tid>` does: a task that is not there
@@ -1549,6 +1570,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.bind_task_identity(guest, &mut procfs, answer).await?;
                 if self.kept_by_kernel(guest, &procfs, without_mm).await {
                     return Ok(None);
+                }
+                // The fdinfo of a descriptor the caller's table does not hold
+                // has no entry (`proc_lookupfd_common`): ENOENT.
+                if let Some(fd) = procfs.rendered_fdinfo_target()
+                    && !Self::table_holds(guest, fd)
+                {
+                    return Err(Errno::ENOENT.into());
                 }
                 // A process's `mountinfo` or `mounts` shows the mounts below
                 // its own root: where that process (a child that chrooted)
@@ -2006,7 +2034,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// stops with the policy's exit, and a run with
     /// `--allow-unsupported-syscalls` gives the guest's call EOPNOTSUPP.
     /// Never an ordinary answer such as EACCES.
-    async fn scratch_failure<G: Guest<Self>>(
+    pub(super) async fn scratch_failure<G: Guest<Self>>(
         guest: &mut G,
         sysno: reverie::syscalls::Sysno,
         reason: String,
@@ -2689,6 +2717,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Some(task) = file.bound_task() else {
             return false;
         };
+        // A descriptor's fdinfo (package K slice K8-h): Detcore renders the
+        // caller's own process's, whose descriptor table is the one the
+        // backend's `descriptor_status` fact and the injected calls reach;
+        // another process's stays the backend's.
+        if file.is_fdinfo() {
+            return !self.names_own_process(guest, task).await;
+        }
         // A task's `comm` (package K slice A+): Detcore renders only the
         // reader's own process's, from its record, where the record is the
         // name's source (`procfs::task_stat::renders_task_comm`).
@@ -6300,10 +6335,12 @@ mod tests {
                 "{path:?}"
             );
         }
-        // `/proc/cpuinfo` is rendered only in a session that renders it.
+        // `/proc/cpuinfo` and `/proc/locks` are rendered only in a session
+        // that renders them.
         let without = RenderedFiles::WITHOUT_CPUINFO;
-        assert_eq!(rendered_paths(without).count() + 1, paths.len());
+        assert_eq!(rendered_paths(without).count() + 2, paths.len());
         assert!(rendered_paths(without).all(|path| path != c"/proc/cpuinfo"));
+        assert!(rendered_paths(without).all(|path| path != c"/proc/locks"));
         assert!(!could_name_rendered(
             Path::new("/proc/cpuinfo"),
             without,

@@ -135,10 +135,46 @@
 //! - the exit that leaves a descriptor table to no holder (a thread's `exit`,
 //!   or an `exit_group`, which ends its whole process), as guest calls alone
 //!   count a table's holders (`FileMetadata::holders`): it lets go of every
-//!   descriptor of the table in the exiting thread's turn, before it asks to
-//!   exit (`Detcore::release_table_at_exit`), as Linux releases a table with
+//!   descriptor of the table in the exiting thread's turn, once the scheduler
+//!   has granted the exit (`ResourceID::Exit`) and just before the native
+//!   call (`Detcore::release_table_at_exit`), as Linux releases a table with
 //!   its last holder's exit (`exit_files`,
-//!   <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/exit.c?h=v6.17#n956>).
+//!   <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/exit.c?h=v6.17#n956>);
+//! - a `SIGKILL` a process sends itself (a `kill`, `tgkill`, `tkill` or
+//!   `pidfd_send_signal` naming its own process or thread), which ends it as
+//!   an `exit_group` does: its table goes the same way, after the grant and
+//!   just before the call that sends it
+//!   (`Detcore::reserve_controlled_self_sigkill_exit`,
+//!   `Detcore::send_reserved_sigkill`);
+//! - on KVM, the death of a process by the default action of a fatal signal
+//!   (its own `SIGTERM`, `abort()`'s `SIGABRT`, a fault's `SIGSEGV`), which
+//!   no guest call of the dying process carries: its terminal receipt, which
+//!   the scheduler consumes while the control barrier it installs holds every
+//!   later turn, lets go of each table the dying threads named
+//!   (`Detcore::name_table_for_death`) that no other process holds, before
+//!   the backend publishes the death to the parent or retires the process
+//!   (`GlobalState::release_tables_at_death`), as Linux's `do_exit` runs
+//!   `exit_files`, and the deferred last `fput`s in `exit_task_work`, before
+//!   `exit_notify` lets the parent reap it
+//!   (<https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/exit.c?h=v7.1.3#n971>,
+//!   `#n976`, `#n988`): the receiving socket's last reference purges its
+//!   queue (`unix_release_sock`,
+//!   <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/unix/af_unix.c?h=v7.1.3#n721>),
+//!   and the last reference of a description a purged message held removes
+//!   its locks (`__fput`'s `locks_remove_file`,
+//!   <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/file_table.c?h=v7.1.3#n502>);
+//! - the `exec` that drops the receiving socket's last descriptor by
+//!   close-on-exec, where threads of the exec'ing process alone hold its
+//!   table, as guest calls count them (`FileMetadata::holders`): Linux kills
+//!   the other threads (`de_thread`), copies the table only where another
+//!   process holds it (`unshare_files`), and closes the close-on-exec
+//!   descriptors of the table the exec keeps (`do_close_on_exec`,
+//!   <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/exec.c?h=v6.17#n1194>);
+//!   Detcore lets go of the replaced table's descriptors at the new image's
+//!   first callback, still in the exec's turn
+//!   (`Detcore::release_exec_dropped_descriptors`): the close-on-exec ones,
+//!   and the others, which the new table holds too, so their going releases
+//!   nothing.
 //!
 //! A description whose last reference a release drops goes with it, with the
 //! messages queued to it in turn, as Linux's last `fput` releases them: a
@@ -149,17 +185,30 @@
 //!
 //! Residuals, each named with whether it is deterministic or host-timed:
 //! - deterministic: a receiving socket whose last descriptor goes with a
-//!   table Detcore did not let go at an exit (the table of a process a
-//!   signal killed; one a thread made without `CLONE_FILES` held when
-//!   another thread's `exit_group` ended it; one carried across a snapshot,
-//!   whose holders are not known) or with the close-on-exec descriptors an
-//!   `exec` drops takes its queue with it when that table is released,
-//!   without the releases above: the copies in
-//!   flight it held stay counted for the rest of the run, so the lock ledger
-//!   keeps counting their locks (which `/proc/locks` does not list once the
-//!   kernel has no row for them) and a socket among them keeps its port, as a
-//!   socket an exiting process held keeps its port. The count never depends
-//!   on when that table is released;
+//!   table Detcore did not let go takes its queue with it when that table is
+//!   released, without the releases above. Those tables are: the table of a
+//!   process another process's `SIGKILL` killed, which Detcore holds only in
+//!   the victim's exit hook (KVM refuses a signal to another process); on a
+//!   backend that sends no terminal receipt (every backend but KVM), the
+//!   table of a process another fatal signal ended, where the delivery's
+//!   commit does not tell Detcore whether the process ends (a PID
+//!   namespace's init survives it, and an exec in flight changes which
+//!   threads die); one a thread made without `CLONE_FILES` held when another
+//!   thread's `exit_group` or `exec` ended it, and, outside KVM's terminal
+//!   receipt, a fatal signal; and one carried across a snapshot, whose
+//!   holders are not known, also at an `exec`. The copies in flight such a
+//!   queue held stay counted for the rest of the run, so the lock ledger
+//!   keeps counting their locks, and a socket among them keeps its port, as a
+//!   socket an exiting process held keeps its port. Where `/proc/locks` is
+//!   the kernel's file, filtered by the ledger (ptrace), no row shows for
+//!   those locks once the kernel has none, so only the port is kept. Where
+//!   Detcore renders `/proc/locks` from the ledger (KVM), a terminal receipt
+//!   that cannot decide about a table it ended (a dying thread that named
+//!   none, in a process one of whose threads has a table of its own, or a
+//!   table whose holders do not name the process) refuses every later
+//!   snapshot by name, for the rest of the run, if the ledger counts any copy
+//!   in flight at the receipt, rather than list a lock Linux has released.
+//!   The count never depends on when that table is released;
 //! - host-timed, as before this queue existed: a table Detcore did not let go
 //!   at an exit still names its descriptions until the backend tears the
 //!   exited thread's state down, at no particular point of the guest's
@@ -168,7 +217,9 @@
 //!   receiving socket's queue, follows that teardown. A table whose last
 //!   holder leaves through `exit` or `exit_group` (an ordinary forked
 //!   child's, or a threaded process's whose threads all exit or one of which
-//!   calls `exit_group`) goes at that exit, so this never applies to it;
+//!   calls `exit_group`), or through a `SIGKILL` of its own, goes at that
+//!   exit, and one an exec replaced where only the exec'ing process held it
+//!   goes at the exec, so this never applies to them;
 //! - deterministic: a socket queued, directly or through other queued
 //!   sockets, on its own queue keeps its description, and every description
 //!   queued on it, until the run ends, where Linux's garbage collector
@@ -200,7 +251,13 @@
 //!   unrecorded, as before;
 //! - deterministic: a lock on a description in flight over a socket Detcore
 //!   does not pair is not held by the ledger between the sender's last close
-//!   and the receipt, which shows it again.
+//!   and the receipt, which shows it again. Nor is a lock taken through a
+//!   description after a copy of it was sent: a copy counts for the ledger
+//!   only where the ledger followed the description's locks when the send
+//!   queued it (`SentDescriptor::lock_copy`), so from the sender's last close
+//!   to the receipt no row shows for that lock, on ptrace and on KVM, while
+//!   Linux lists it and refuses a conflicting lock (Codex's notes on K8-h
+//!   reb7).
 //!
 //! The receiving socket is known only where Detcore knows a socket's peer,
 //! in any process that holds it and through any of its aliases: the two
@@ -395,6 +452,61 @@ const LINK_TARGET: usize = 64;
 /// delivers at most one `SCM_RIGHTS` message, of at most `SCM_MAX_FD` (253)
 /// descriptors, beside a few fixed-size messages, far below this.
 const MAX_CONTROL_BYTES: usize = 64 * 1024;
+
+/// What releasing queued descriptors that no receive will deliver releases
+/// in turn ([`settle`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Settled {
+    /// The copies in flight `procfs::locks::LockLedger` counted, which it
+    /// uncounts (`PlaceholderCopies::Unsent`).
+    pub(crate) lock_copies: Vec<crate::types::OpenFileId>,
+    /// The sockets among the descriptions that went with their last copy,
+    /// whose ports go with them (`GlobalRequest::ReleasePort`).
+    pub(crate) ports: Vec<crate::types::OpenFileId>,
+}
+
+/// Release `released`, queued descriptors Linux released without a receive:
+/// each uncounts its copy in flight, and a description whose last reference
+/// such a copy was goes with it, with the messages queued to it in turn
+/// ([`InFlightOpenFile::release`]), as Linux's last `fput` releases them. What
+/// that releases in the global state comes back, for the caller to apply
+/// (`Detcore::settle_released_rights` in the releasing call, and the global
+/// state at the terminal receipt of a death by a fatal signal,
+/// `GlobalState::release_tables_at_death`).
+pub(crate) fn settle(released: Vec<SentDescriptor>) -> Settled {
+    let mut pending = released;
+    let mut settled = Settled::default();
+    while let Some(sent) = pending.pop() {
+        settled.lock_copies.extend(sent.lock_copy);
+        if let Some((open_file, ty, queued)) = sent.open_file.and_then(InFlightOpenFile::release) {
+            if ty == crate::fd::FdType::Socket {
+                settled.ports.push(open_file);
+            }
+            pending.extend(queued);
+        }
+    }
+    settled
+}
+
+/// Whether a run with `cfg` follows the queues of `AF_UNIX` sockets and lets
+/// a table go at its last holder's exit (`Detcore::release_table_at_exit`,
+/// and the global state at the terminal receipt of a death by a fatal
+/// signal, `GlobalState::release_tables_at_death`): where Detcore records
+/// received descriptors (`Detcore::receipt_mode`), and not under record and
+/// replay, whose recordings were made with a table going at the teardown.
+pub(crate) fn releases_tables_at_exits(cfg: &crate::config::Config) -> bool {
+    !cfg.recordreplay_modes
+        && !cfg.backend.tool_shares_guest_descriptor_table
+        && cfg.sequentialize_threads
+}
+
+/// Whether a run with `cfg` has the lock ledger follow copies in flight
+/// (`procfs::locks::LockLedger::placeholder_copies`) of the descriptions
+/// whose locks it follows: where it feeds the `/proc/locks` the guest reads
+/// (`Detcore::refresh_received_locks`).
+pub(crate) fn follows_lock_copies(cfg: &crate::config::Config) -> bool {
+    cfg.virtualize_time && !cfg.recordreplay_modes
+}
 
 /// The descriptors carried by the `SCM_RIGHTS` messages in a sent or
 /// received control buffer.
@@ -2404,7 +2516,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// whose locks it follows: where it feeds the `/proc/locks` the guest
     /// reads (`Detcore::refresh_received_locks`).
     fn follows_lock_copies(&self) -> bool {
-        self.cfg.virtualize_time && !self.cfg.recordreplay_modes
+        follows_lock_copies(&self.cfg)
     }
 
     /// Release the queued descriptors that Linux released in the current
@@ -2425,24 +2537,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// a description is released only when it counts none
     /// ([`InFlightOpenFile::release`]).
     pub(crate) async fn settle_released_rights<G: Guest<Self>>(&self, guest: &mut G) {
-        let mut pending = guest.thread_state().take_released_rights();
-        let mut uncounted = Vec::new();
-        let mut ports = Vec::new();
-        while let Some(sent) = pending.pop() {
-            uncounted.extend(sent.lock_copy);
-            if let Some((open_file, ty, queued)) =
-                sent.open_file.and_then(InFlightOpenFile::release)
-            {
-                if ty == crate::fd::FdType::Socket {
-                    ports.push(open_file);
-                }
-                pending.extend(queued);
-            }
-        }
-        if !uncounted.is_empty() && self.follows_lock_copies() {
+        let Settled { lock_copies, ports } = settle(guest.thread_state().take_released_rights());
+        if !lock_copies.is_empty() && self.follows_lock_copies() {
             let _ = crate::tool_global::placeholder_copies(
                 guest,
-                crate::procfs::locks::PlaceholderCopies::Unsent(uncounted),
+                crate::procfs::locks::PlaceholderCopies::Unsent(lock_copies),
             )
             .await;
         }
@@ -2451,17 +2550,47 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Name this thread's descriptor table to the global state
+    /// (`GlobalRequest::HoldTable`), at the thread's start and after an exec
+    /// gave it a new table, for the terminal receipt of a death by a fatal
+    /// signal to let go of (`GlobalState::release_tables_at_death`): the death
+    /// of a process by a fatal signal's default action (its own `SIGTERM`, an
+    /// `abort()`, a `SIGSEGV`) is no guest call of its own, so no handler of
+    /// the dying process runs at the point of the schedule where it ends.
+    /// Only where those receipts exist, a run whose backend's process signal
+    /// control is `ToolControlled` (KVM), whose tool runs in Detcore's own
+    /// process, so that the request carries the table itself
+    /// (`tool_global::HeldTable`), and only where tables go at their last
+    /// holder's exit ([`releases_tables_at_exits`]).
+    pub(crate) async fn name_table_for_death<G: Guest<Self>>(&self, guest: &mut G) {
+        if !releases_tables_at_exits(&self.cfg)
+            || guest.signal_control_mode() != reverie::BackendSignalControlMode::ToolControlled
+        {
+            return;
+        }
+        let table = Arc::clone(&guest.thread_state().file_metadata);
+        crate::tool_global::hold_table(guest, table).await;
+    }
+
     /// The calling thread is about to exit, with its whole process where
-    /// `whole_process` (an `exit_group`), before it asks the scheduler to let
-    /// it (`ResourceID::Exit`), so in its own turn, before any other task's:
-    /// where that exit leaves its descriptor table to no holder, as guest
-    /// calls alone count them (`FileMetadata::holders`), the table goes now,
-    /// as Linux releases it with its last holder's exit
-    /// (`ThreadState::release_table_at_exit`), and what the queues of its
-    /// sockets held is released with them (`Self::settle_released_rights`).
-    /// A later close in another table is then a description's last reference
-    /// whether or not the backend has torn any thread state down yet. Not
-    /// under record and replay, whose recordings were made with the table
+    /// `whole_process` (an `exit_group`, or a `SIGKILL` it sends its own
+    /// process): the scheduler has granted the exit (`ResourceID::Exit`), and
+    /// the native call that carries it out comes next, so this runs in the
+    /// exiting thread's own turn, before any other task's. Where that exit
+    /// leaves its descriptor table to no holder, as guest calls alone count
+    /// them (`FileMetadata::holders`), the table goes now, as Linux releases
+    /// it with its last holder's exit (`ThreadState::release_table_at_exit`),
+    /// and what the queues of its sockets held is released with them
+    /// (`Self::settle_released_rights`). A later close in another table is
+    /// then a description's last reference whether or not the backend has
+    /// torn any thread state down yet. Not before the grant: until then the
+    /// process's other threads still run, and Linux still holds every
+    /// descriptor of the table, so a call through one must not fail with
+    /// `EBADF`, and another process must not see a lock gone that the host
+    /// still holds (Claude's and Codex's narrow checks of K8-h reb7). The
+    /// grant of a group exit logically ends the other threads, and no turn
+    /// runs until the group has ended (`Scheduler::hold_turns_until_the_group_ends`).
+    /// Not under record and replay, whose recordings were made with the table
     /// going at the teardown, and only where this run pairs `AF_UNIX`
     /// sockets.
     pub(crate) async fn release_table_at_exit<G: Guest<Self>>(
@@ -2475,6 +2604,44 @@ impl<T: RecordOrReplay> Detcore<T> {
         if guest.thread_state().release_table_at_exit(whole_process)
             && guest.thread_state().holds_released_rights()
         {
+            Box::pin(self.settle_released_rights(guest)).await;
+        }
+    }
+
+    /// An exec of `process` is about to replace its table, `replaced`, with
+    /// `new`, which keeps `replaced` for the new image's first callback
+    /// (`Self::release_exec_dropped_descriptors`): there `process` leaves
+    /// `replaced`, as guest calls count its holders (`FileMetadata::holders`),
+    /// and where threads of `process` alone held it, the exec drops its
+    /// close-on-exec descriptors from it, and its descriptors go. A failed
+    /// exec drops `new`, and with it the table it kept, so nothing changes.
+    /// Not under record and replay, and only where this run pairs `AF_UNIX`
+    /// sockets, as for the release of a table at an exit
+    /// (`Self::release_table_at_exit`).
+    pub(crate) fn keep_table_for_exec<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        replaced: &Arc<std::sync::Mutex<crate::tool_local::FileMetadata>>,
+        new: &mut crate::tool_local::FileMetadata,
+        process: crate::types::DetPid,
+    ) {
+        if self.keeps_recorded_decisions() || !self.pairs_unix_sockets(guest) {
+            return;
+        }
+        new.keep_replaced_table(Arc::clone(replaced), process);
+    }
+
+    /// The new image's first callback after an exec Detcore ran
+    /// (`Self::handle_execveat`), still in the exec's turn: the descriptors of
+    /// the table the exec replaced go now
+    /// (`ThreadState::release_exec_dropped_descriptors`), the close-on-exec
+    /// ones as Linux closes them at the exec (`do_close_on_exec`), and what
+    /// the queues of their sockets held is released with them
+    /// (`Self::settle_released_rights`): a receiving socket whose last
+    /// descriptor was close-on-exec takes the copies in flight it held, and
+    /// the lock ledger stops counting their locks.
+    pub(crate) async fn release_exec_dropped_descriptors<G: Guest<Self>>(&self, guest: &mut G) {
+        if guest.thread_state().release_exec_dropped_descriptors() {
             Box::pin(self.settle_released_rights(guest)).await;
         }
     }
@@ -2536,8 +2703,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_detfd(fd, |detfd| detfd.is_lock_tracked())
                     .unwrap_or(false)
             {
-                Box::pin(self.refresh_description_locks(guest, fd, super::files::LockCall::Joined))
-                    .await?;
+                Box::pin(self.refresh_description_locks(
+                    guest,
+                    fd,
+                    super::files::LockCall::Joined,
+                    None,
+                ))
+                .await?;
             }
             // The copy is no longer in flight: it was received, so its
             // description may take a placeholder lock again

@@ -184,6 +184,52 @@ pub struct FileMetadata {
     /// which no exit releases.
     #[serde(default)]
     holders: BTreeMap<DetPid, usize>,
+    /// The table the exec that made this one replaced, and the exec'ing
+    /// process (`Self::keep_replaced_table`): kept from the exec's entry
+    /// (`Detcore::handle_execveat`) until the new image's first callback,
+    /// where that process leaves the replaced table, and where it was the
+    /// table's last holder, the table's descriptors go, the close-on-exec ones
+    /// as Linux closes them at the exec
+    /// (`ThreadState::release_exec_dropped_descriptors`). A failed exec drops
+    /// this table, and the replaced one with it. Never serialized, and never
+    /// copied.
+    #[serde(skip)]
+    exec_replaced: ReplacedTable,
+}
+
+/// The table an exec replaced, and the exec'ing process
+/// ([`FileMetadata::exec_replaced`]). A copy of the table that holds it
+/// starts with none: the exec's own table leaves the replaced one, once.
+#[derive(Default)]
+struct ReplacedTable(Option<(Arc<Mutex<FileMetadata>>, DetPid)>);
+
+impl Clone for ReplacedTable {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for ReplacedTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ReplacedTable")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
+/// What the death of a process by a fatal signal did with one of the tables
+/// its threads held ([`FileMetadata::release_at_death`]).
+#[derive(Debug)]
+pub(crate) enum TableAtDeath {
+    /// No holder is left, and every descriptor went: what the queues of the
+    /// sockets whose last reference went held, for the death to release
+    /// (`Detcore::settle_released_rights`'s rule).
+    Released(Vec<SentDescriptor>),
+    /// Another process still holds the table, which keeps every descriptor.
+    Kept,
+    /// The table's holders are not known, or do not name the process, so
+    /// whether its death released the table cannot be decided.
+    Undecided,
 }
 
 /// The descriptors of messages queued to sockets a table released
@@ -924,6 +970,7 @@ impl FileMetadata {
             exec_dropped_lock_tracked: false,
             released_rights: ReleasedRights::default(),
             holders: BTreeMap::from([(owner, 1)]),
+            exec_replaced: ReplacedTable::default(),
         }
     }
 
@@ -1169,6 +1216,7 @@ impl FileMetadata {
             exec_dropped_lock_tracked: false,
             released_rights: ReleasedRights::default(),
             holders: BTreeMap::from([(child, 1)]),
+            exec_replaced: ReplacedTable::default(),
         }
     }
 
@@ -1202,6 +1250,7 @@ impl FileMetadata {
                 .any(|detfd| detfd.is_cloexec() && detfd.is_lock_tracked()),
             released_rights: ReleasedRights::default(),
             holders: BTreeMap::from([(task, 1)]),
+            exec_replaced: ReplacedTable::default(),
         }
     }
 
@@ -1236,6 +1285,37 @@ impl FileMetadata {
             *count -= 1;
         }
         self.holders.is_empty()
+    }
+
+    /// `process` has ended, by the default action of a fatal signal, as the
+    /// terminal receipt of its death says (`GlobalState::release_tables_at_death`),
+    /// and this is one of the tables its threads held. Every thread of it
+    /// leaves the table at once ([`Self::leave`]); where that leaves the
+    /// table to no holder, every descriptor of it goes, in order, as Linux
+    /// releases a table with its last holder's exit (`exit_files`), and a
+    /// socket whose last reference goes takes its queue ([`Self::release_detfd`]).
+    /// Where another process still holds the table (`CLONE_FILES` without
+    /// `CLONE_THREAD`), it keeps every descriptor. Where its holders are not
+    /// known, or do not name `process`, nothing is decided.
+    pub(crate) fn release_at_death(&mut self, process: DetPid) -> TableAtDeath {
+        if !self.holders.contains_key(&process) {
+            return TableAtDeath::Undecided;
+        }
+        if !self.leave(process, true) {
+            return TableAtDeath::Kept;
+        }
+        self.release_every_descriptor();
+        TableAtDeath::Released(self.take_released_rights())
+    }
+
+    /// Keep `replaced`, the table an exec of `process` replaces with this
+    /// one, until the new image's first callback ([`Self::exec_replaced`]).
+    pub(crate) fn keep_replaced_table(
+        &mut self,
+        replaced: Arc<Mutex<FileMetadata>>,
+        process: DetPid,
+    ) {
+        self.exec_replaced = ReplacedTable(Some((replaced, process)));
     }
 
     /// Read the live table incarnation for an independently owned exec cut.
@@ -1626,7 +1706,12 @@ impl FileMetadata {
     }
 
     /// set default fds
-    fn setup_stdio(mut self, _pid: Pid, owner: DetTid) -> Self {
+    ///
+    /// `aliases`: for each of the three, the lowest of them that is one open
+    /// file description with it, where the launcher knows
+    /// (`Config::standard_stream_aliases`); only `procfs::locks::LockLedger`
+    /// reads the groups.
+    fn setup_stdio(mut self, _pid: Pid, owner: DetTid, aliases: Option<[u8; 3]>) -> Self {
         // guest stdio can be a pipe, which make things difficult
         // hence use a dummy stat here.
         // The raw syscall, not libc's interposable fstat: this runs inside the
@@ -1673,6 +1758,27 @@ impl FileMetadata {
         stdin.mark_flock_mode_unobserved();
         stdout.mark_flock_mode_unobserved();
         stderr.mark_flock_mode_unobserved();
+
+        // Which of the three are one open file description, as the launcher
+        // found with kcmp(KCMP_FILE) on the descriptors it handed the guest
+        // (`Config::standard_stream_aliases`): it may pass one description on
+        // several (`<>file >&0`, `>log 2>&1`), each of which Detcore models
+        // with an identity of its own, and the lock ledger then takes the
+        // group as the one description it is. Where the launcher does not
+        // know, each stream is a description of its own (a named residual).
+        if let Some(aliases) = aliases {
+            let streams = [&stdin, &stdout, &stderr];
+            for (later, earlier) in aliases.iter().enumerate() {
+                let earlier = usize::from(*earlier);
+                if earlier < later {
+                    let group = streams[earlier]
+                        .stdio_alias_group()
+                        .unwrap_or_else(|| streams[earlier].open_file_id());
+                    streams[earlier].set_stdio_alias_group(group);
+                    streams[later].set_stdio_alias_group(group);
+                }
+            }
+        }
 
         self.add_detfd(stdin);
         self.add_detfd(stdout);
@@ -1725,6 +1831,9 @@ impl FileMetadata {
         let files = crate::procfs::RenderedFiles {
             cpuinfo: decided == Some(true),
             mounts: true,
+            // Rendered only where the tool runs outside the guest (KVM), which
+            // never rediscovers its descriptors.
+            locks: false,
         };
         let found = may_be_placeholder
             .then(|| placeholder_behind(fd, files))
@@ -2008,9 +2117,10 @@ impl FileMetadata {
     }
 
     /// Let go of every descriptor of this table, in order, as its last
-    /// holder's exit does (`ThreadState::release_table_at_exit`): a socket
-    /// whose last reference goes takes its queue ([`Self::release_detfd`]).
-    /// No port is released here.
+    /// holder's exit does (`ThreadState::release_table_at_exit`), or the
+    /// exec that replaced it (`ThreadState::release_exec_dropped_descriptors`):
+    /// a socket whose last reference goes takes its queue
+    /// ([`Self::release_detfd`]). No port is released here.
     fn release_every_descriptor(&mut self) {
         let mut fds: Vec<RawFd> = self.file_handles.keys().copied().collect();
         fds.sort_unstable();
@@ -3066,6 +3176,249 @@ mod file_metadata_tests {
         unknown.holders.clear();
         unknown.join_holder(process);
         assert!(!unknown.leave(process, true), "holders not known");
+    }
+
+    /// An exec leaves the table it replaces, all of the exec'ing process's
+    /// threads at once (`ThreadState::release_exec_dropped_descriptors`), and
+    /// drops that table's descriptors only where it was the last holder:
+    /// Linux copies a table another process still holds (`unshare_files`),
+    /// which keeps every descriptor, and that process's own exit then lets the
+    /// table go, which the exec'ing process no longer counts against. A table
+    /// whose holders are not known is left as it is (Codex's notes on K8-h
+    /// reb7: the exec'ing process stayed a holder of the shared table, so the
+    /// other process's exit never let it go).
+    #[test]
+    fn an_exec_leaves_a_table_another_process_still_holds() {
+        let process = DetTid::from_raw(9052);
+        let sharer = DetTid::from_raw(9053);
+        let exec_of = |table: FileMetadata| {
+            let replaced = Arc::new(Mutex::new(table));
+            let mut new = replaced.lock().unwrap().for_exec(process);
+            new.hold_alone(process);
+            new.keep_replaced_table(Arc::clone(&replaced), process);
+            let state = ThreadState::new(process, &Config::default(), ());
+            *state.file_metadata.lock().unwrap() = new;
+            let released = state.release_exec_dropped_descriptors();
+            (replaced, released)
+        };
+
+        let mut shared = FileMetadata::new(process);
+        shared.join_holder(process);
+        shared.join_holder(sharer);
+        shared
+            .add_fd(process, 3, OFlag::O_CLOEXEC, FdType::Regular, None)
+            .unwrap();
+        let (shared, released) = exec_of(shared);
+        assert!(!released, "a process made with CLONE_FILES still holds it");
+        let mut shared = shared.lock().unwrap();
+        assert_eq!(shared.file_handles.len(), 1, "it keeps every descriptor");
+        assert_eq!(shared.holders, BTreeMap::from([(sharer, 1)]));
+        assert!(shared.leave(sharer, true), "its exit lets the table go");
+
+        let mut unknown = FileMetadata::new(process);
+        unknown.holders.clear();
+        unknown
+            .add_fd(process, 3, OFlag::O_CLOEXEC, FdType::Regular, None)
+            .unwrap();
+        let (unknown, released) = exec_of(unknown);
+        assert!(!released);
+        assert_eq!(
+            unknown.lock().unwrap().file_handles.len(),
+            1,
+            "holders not known"
+        );
+    }
+
+    /// The exec of a process whose table only it holds lets go of that
+    /// table's descriptors at the new image's first callback
+    /// (`ThreadState::release_exec_dropped_descriptors`): here a receiving
+    /// socket whose last descriptor, in the child, is close-on-exec, queued a
+    /// description the parent sent and closed, so the exec releases the copy
+    /// in flight, as Linux releases it when the exec closes the socket
+    /// (Claude's narrow check of K8-h reb6, finding 1: before, the copy, and
+    /// with it the lock ledger's count of its locks, stayed for the rest of
+    /// the run). The replaced table names nothing afterwards, and a second
+    /// call releases nothing.
+    #[test]
+    fn an_exec_releases_what_its_close_on_exec_receiving_socket_held() {
+        let parent_id = DetTid::from_raw(9054);
+        let child_id = DetTid::from_raw(9055);
+        let mut parent = FileMetadata::new(parent_id);
+        parent
+            .add_fd(parent_id, 3, OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        parent
+            .add_fd(parent_id, 4, OFlag::O_CLOEXEC, FdType::Socket, None)
+            .unwrap();
+        let left = parent.with_detfd(3, |detfd| detfd.clone()).unwrap();
+        let right = parent.with_detfd(4, |detfd| detfd.clone()).unwrap();
+        left.pair_sockets(&right, false);
+        drop(right);
+        let mut child = parent.fork_for(child_id);
+        assert_eq!(parent.remove_fd(4), None, "the child holds the receiver");
+        assert_eq!(child.remove_fd(3), None, "the parent holds the sender");
+        parent
+            .add_fd(parent_id, 5, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        let carried = parent
+            .with_detfd(5, |detfd| detfd.in_flight_open_file(true))
+            .unwrap();
+        let sent_id = parent.with_detfd(5, |detfd| detfd.open_file_id()).unwrap();
+        assert!(matches!(
+            left.queue_rights_to_peer(
+                vec![SentDescriptor {
+                    file: (1, 5),
+                    open_file: Some(carried),
+                    lock_copy: Some(sent_id),
+                }],
+                1
+            ),
+            Ok(())
+        ));
+        assert_eq!(parent.remove_fd(5), None, "a copy is in flight");
+
+        child.join_holder(child_id);
+        let replaced = Arc::new(Mutex::new(child));
+        let mut new = replaced.lock().unwrap().for_exec(child_id);
+        new.hold_alone(child_id);
+        assert!(
+            new.file_handles.is_empty(),
+            "the receiver was close-on-exec"
+        );
+        new.keep_replaced_table(Arc::clone(&replaced), child_id);
+        let state = ThreadState::new(child_id, &Config::default(), ());
+        *state.file_metadata.lock().unwrap() = new;
+
+        assert!(state.release_exec_dropped_descriptors());
+        let released: Vec<_> = state
+            .take_released_rights()
+            .into_iter()
+            .map(|sent| {
+                (
+                    sent.lock_copy,
+                    sent.open_file
+                        .and_then(crate::fd::InFlightOpenFile::release)
+                        .map(|(id, ty, _)| (id, ty)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            released,
+            [(Some(sent_id), Some((sent_id, FdType::Regular)))],
+            "the exec released the copy in flight, its description's last reference"
+        );
+        assert!(
+            replaced.lock().unwrap().file_handles.is_empty(),
+            "the replaced table names nothing"
+        );
+        assert!(!state.release_exec_dropped_descriptors(), "released once");
+        drop(left);
+    }
+
+    /// The death of a process by a fatal signal's default action, which its
+    /// terminal receipt reports (`GlobalState::release_tables_at_death`), lets
+    /// go of a table only that process held (`FileMetadata::release_at_death`):
+    /// here a receiving socket whose last descriptor the child holds queued
+    /// a description the parent sent and closed, so the death releases the
+    /// copy in flight, the description's last reference, as Linux's
+    /// `exit_files` releases it before the parent can wait (Codex's narrow
+    /// check of K8-h reb8: before, KVM listed its lock after the child died
+    /// by its own SIGTERM, abort() or SIGSEGV). Every thread of the process
+    /// leaves at once. A table another process still holds keeps every
+    /// descriptor, and a table whose holders are not known, or do not name
+    /// the process, is left undecided.
+    #[test]
+    fn a_fatal_signals_death_releases_a_table_only_its_process_held() {
+        let parent_id = DetTid::from_raw(9056);
+        let child_id = DetTid::from_raw(9057);
+        let sharer = DetTid::from_raw(9058);
+        let mut parent = FileMetadata::new(parent_id);
+        parent
+            .add_fd(parent_id, 3, OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        parent
+            .add_fd(parent_id, 4, OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        let left = parent.with_detfd(3, |detfd| detfd.clone()).unwrap();
+        let right = parent.with_detfd(4, |detfd| detfd.clone()).unwrap();
+        left.pair_sockets(&right, false);
+        drop(right);
+        let mut child = parent.fork_for(child_id);
+        child.hold_alone(child_id);
+        assert_eq!(parent.remove_fd(4), None, "the child holds the receiver");
+        assert_eq!(child.remove_fd(3), None, "the parent holds the sender");
+        parent
+            .add_fd(parent_id, 5, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        let carried = parent
+            .with_detfd(5, |detfd| detfd.in_flight_open_file(true))
+            .unwrap();
+        let sent_id = parent.with_detfd(5, |detfd| detfd.open_file_id()).unwrap();
+        assert!(matches!(
+            left.queue_rights_to_peer(
+                vec![SentDescriptor {
+                    file: (1, 5),
+                    open_file: Some(carried),
+                    lock_copy: Some(sent_id),
+                }],
+                1
+            ),
+            Ok(())
+        ));
+        assert_eq!(parent.remove_fd(5), None, "a copy is in flight");
+
+        // A second thread of the child holds the table too.
+        child.join_holder(child_id);
+        let TableAtDeath::Released(rights) = child.release_at_death(child_id) else {
+            panic!("the child alone held its table");
+        };
+        assert_eq!(
+            crate::syscalls::scm_rights::settle(rights),
+            crate::syscalls::scm_rights::Settled {
+                lock_copies: vec![sent_id],
+                ports: Vec::new(),
+            },
+            "the death released the copy in flight, its description's last reference"
+        );
+        assert!(child.file_handles.is_empty(), "every descriptor went");
+        assert!(child.holders.is_empty(), "both threads left");
+        assert!(
+            matches!(child.release_at_death(child_id), TableAtDeath::Undecided),
+            "released once"
+        );
+
+        let mut shared = FileMetadata::new(child_id);
+        shared.join_holder(sharer);
+        shared
+            .add_fd(child_id, 3, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        assert!(matches!(
+            shared.release_at_death(child_id),
+            TableAtDeath::Kept
+        ));
+        assert_eq!(shared.file_handles.len(), 1, "it keeps every descriptor");
+        assert_eq!(shared.holders, BTreeMap::from([(sharer, 1)]));
+
+        let mut unknown = FileMetadata::new(child_id);
+        unknown.holders.clear();
+        unknown
+            .add_fd(child_id, 3, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        assert!(matches!(
+            unknown.release_at_death(child_id),
+            TableAtDeath::Undecided
+        ));
+        assert_eq!(unknown.file_handles.len(), 1, "holders not known");
+        let mut another = FileMetadata::new(sharer);
+        another
+            .add_fd(sharer, 3, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        assert!(matches!(
+            another.release_at_death(child_id),
+            TableAtDeath::Undecided
+        ));
+        assert_eq!(another.file_handles.len(), 1, "not the process's table");
+        drop(left);
     }
 
     #[test]
@@ -6098,7 +6451,7 @@ impl<T> ThreadState<T> {
             }
             metadata
         } else {
-            FileMetadata::new(pid).setup_stdio(pid.into(), pid)
+            FileMetadata::new(pid).setup_stdio(pid.into(), pid, cfg.standard_stream_aliases)
         };
         let process_files = Some(file_metadata.files_id);
         ThreadState {
@@ -7167,12 +7520,14 @@ impl<T> ThreadState<T> {
     }
 
     /// This thread is exiting, with its whole process where `whole_process`
-    /// (an `exit_group`): it no longer holds its descriptor table
-    /// (`FileMetadata::leave`). Where no thread holds the table any more, as
-    /// guest calls alone count its holders (`FileMetadata::holders`), the
-    /// table goes with this exit, as Linux releases it with its last
-    /// holder's exit (`exit_files`): every descriptor of it is let go now, in
-    /// this thread's turn, so that whether another table's later close is a
+    /// (an `exit_group`), and the scheduler has granted the exit: it no longer
+    /// holds its descriptor table (`FileMetadata::leave`). Where no thread
+    /// holds the table any more, as guest calls alone count its holders
+    /// (`FileMetadata::holders`), the table goes with this exit, as Linux
+    /// releases it with its last holder's exit (`exit_files`): every
+    /// descriptor of it is let go now, in this thread's turn, before the
+    /// native call that ends it (`Detcore::release_table_at_exit`), so that
+    /// whether another table's later close is a
     /// description's last reference depends on this call and not on when the
     /// backend tears thread states down. A socket whose last reference goes
     /// takes its queue, for the exit to release
@@ -7189,6 +7544,46 @@ impl<T> ThreadState<T> {
             return false;
         }
         metadata.release_every_descriptor();
+        true
+    }
+
+    /// The new image's first callback, after an exec that replaced a table
+    /// (`FileMetadata::keep_replaced_table`): the exec'ing process leaves it,
+    /// all its threads at once (`FileMetadata::leave`), as Linux's exec kills
+    /// the process's other threads (`de_thread`) and gives the process a table
+    /// of its own where another process still holds the old one
+    /// (`unshare_files`). Where that leaves the table to no holder, every
+    /// descriptor of it goes now, in order. The close-on-exec ones go as Linux
+    /// closes them at the exec (`do_close_on_exec`); the others, which this
+    /// thread's new table holds too, release nothing by going. So the replaced
+    /// table names no description any more, however long the backend keeps
+    /// it, and whether a later close is a description's last reference
+    /// depends on the exec, not on when the backend drops that table. Where
+    /// another process still holds it (`CLONE_FILES` without `CLONE_THREAD`),
+    /// that process keeps every descriptor, and the table goes with that
+    /// process's own exit or exec, which the exec'ing process no longer
+    /// counts against. A socket whose last reference goes takes its queue,
+    /// for the exec to release ([`Self::take_released_rights`]), as Linux
+    /// purges a released socket's receive queue (`unix_release_sock`). No
+    /// port is released here: `Detcore::handle_execveat` releases those of the
+    /// descriptions the exec closes before the exec runs, as before. Returns
+    /// whether that left anything to release.
+    pub(crate) fn release_exec_dropped_descriptors(&self) -> bool {
+        let Some((replaced, process)) = self.metadata().exec_replaced.0.take() else {
+            return false;
+        };
+        let released = {
+            let mut replaced = replaced.lock().expect("file metadata mutex poisoned");
+            if !replaced.leave(process, true) {
+                return false;
+            }
+            replaced.release_every_descriptor();
+            replaced.take_released_rights()
+        };
+        if released.is_empty() {
+            return false;
+        }
+        self.defer_released_rights(released);
         true
     }
 

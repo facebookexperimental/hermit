@@ -1326,6 +1326,17 @@ pub struct GlobalState {
     /// so that `/proc/locks` keeps exactly the guest's own rows
     /// (`procfs::locks::LockLedger`). Locked after `sched`, never before it.
     lock_ledger: Mutex<crate::procfs::locks::LockLedger>,
+    /// The descriptor table each guest thread holds, as the thread last named
+    /// it (`GlobalRequest::HoldTable`, `Detcore::name_table_for_death`): at its
+    /// start, and after an exec gave it a new one; forgotten when the thread
+    /// deregisters or dies. The terminal receipt of a death by a fatal signal
+    /// lets go of the dying threads' tables from here
+    /// ([`Self::release_tables_at_death`]). Only a run whose backend's process
+    /// signal control is `ToolControlled` (KVM) names any, and its tool runs
+    /// in this process. Held weakly: a table goes with its last thread state,
+    /// as before. Locked after `sched`, never before it, and before
+    /// `lock_ledger`.
+    held_tables: Mutex<BTreeMap<DetTid, std::sync::Weak<Mutex<crate::tool_local::FileMetadata>>>>,
     /// The registered root thread, whose first image
     /// `Config::launch_image` names, and whether that image was completed.
     root_dettid: OnceLock<DetTid>,
@@ -1943,6 +1954,7 @@ impl GlobalState {
             exec_images: process_exit_cleanup.exec_images,
             process_auxv: process_exit_cleanup.process_auxv,
             lock_ledger: Mutex::new(Default::default()),
+            held_tables: Mutex::new(BTreeMap::new()),
             root_dettid: OnceLock::new(),
             root_image_marked: AtomicBool::new(false),
             launcher_identity: OnceLock::new(),
@@ -2922,11 +2934,24 @@ impl GlobalTool for GlobalState {
         self.sched.lock().unwrap().authorize_signal_boundary(task)
     }
 
+    /// A terminal receipt of a death by a fatal signal also lets go of the
+    /// dying threads' descriptor tables (`GlobalState::release_tables_at_death`),
+    /// before the receipt returns to the backend, so before the backend
+    /// publishes the death to a parent or retires the process: the control
+    /// barrier the receipt installed holds every later turn until then.
     async fn on_backend_signal_boundary(
         &self,
         receipt: reverie::SignalBoundaryReceipt,
     ) -> Result<(), reverie::Error> {
-        self.sched.lock().unwrap().consume_signal_boundary(receipt)
+        let death = self
+            .sched
+            .lock()
+            .unwrap()
+            .consume_signal_boundary(receipt)?;
+        if let Some(death) = death {
+            self.release_tables_at_death(death);
+        }
+        Ok(())
     }
 
     fn on_backend_process_retired(
@@ -3049,6 +3074,9 @@ impl GlobalTool for GlobalState {
                 ),
             );
         }
+        if let GlobalRequest::HoldTable(table) = &gr.2 {
+            return self.hold_table(from, table);
+        }
         // Intercept even malformed counted envelopes before taking a deadline
         // hint. Native controls belong to the already owned exec cut.
         if native_exec::is_native_exec_control(&gr.2) {
@@ -3161,6 +3189,146 @@ impl GlobalTool for GlobalState {
 }
 
 impl GlobalState {
+    /// Hold `table` as the descriptor table thread `from` holds
+    /// (`GlobalRequest::HoldTable`, [`Self::held_tables`]), until the thread
+    /// names another, deregisters, or dies. Answered at once: as for a mapping
+    /// capture, no scheduler state changes, no clock moves, and no forwarded
+    /// record is drained, so naming a table changes nothing else in the run.
+    ///
+    /// A request that reached the global state through a transport that
+    /// encodes its requests carries no table (`HeldTable`): it is answered
+    /// with the reason, by which the sender stops the run.
+    fn hold_table(&self, from: Tid, table: &HeldTable) -> <Self as GlobalTool>::Response {
+        let Some(table) = &table.0 else {
+            return (
+                None,
+                GlobalResponse::HoldTable(Err(format!(
+                    "thread {from} named its descriptor table through a transport that encodes \
+                     its requests, which carries no table: {HELD_TABLE_IS_IN_PROCESS}, so the \
+                     terminal receipt of a death by a fatal signal could not let go of it"
+                ))),
+            );
+        };
+        self.held_tables
+            .lock()
+            .unwrap()
+            .insert(DetTid::from_raw(from.as_raw()), Arc::downgrade(table));
+        (None, GlobalResponse::HoldTable(Ok(())))
+    }
+
+    /// Release the port reserved for the socket `open_file` names, as its
+    /// last reference's going does (`GlobalRequest::ReleasePort`): the port,
+    /// if one was reserved.
+    fn release_port(&self, open_file: OpenFileId) -> Option<u16> {
+        let mut used_ports = self.used_ports.lock().unwrap();
+        let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
+        let port = open_file_to_port.remove(&open_file);
+        if let Some(port) = port {
+            used_ports.remove(&port);
+        }
+        port
+    }
+
+    /// `death` ended its process by the default action of a fatal signal, as
+    /// its terminal receipt says (`Scheduler::consume_signal_boundary`): the
+    /// process's own `SIGTERM`, an `abort()`, a `SIGSEGV`, which no handler of
+    /// the dying process sees end it. Linux's `do_exit` releases the dying
+    /// task's descriptor table with `exit_files` before `exit_notify` lets a
+    /// parent reap it, and a table's last holder's going closes every
+    /// descriptor of it; a socket's last reference purges its receive queue
+    /// (`unix_release_sock`), and the last reference of a description that a
+    /// queued message held removes its locks (`locks_remove_file`), so a lock
+    /// only such a message held is gone before the parent's `wait` returns.
+    /// Here, before the receipt returns to the backend, while the control
+    /// barrier the receipt installed holds every later turn: each table the
+    /// dying threads named ([`Self::held_tables`]) that no other process holds
+    /// goes (`tool_local::FileMetadata::release_at_death`), and what the queues
+    /// of its sockets held is released (`scm_rights::settle`): the lock ledger
+    /// uncounts the copies in flight it counted, and the sockets among the
+    /// descriptions that went release their ports, as an exit Detcore grants
+    /// does (`Detcore::release_table_at_exit`). Decided from the receipt alone,
+    /// at the same point of the schedule in every run. A table the death
+    /// cannot decide about (a dying thread named none, or its holders do not
+    /// name the process) is refused by name instead: if the ledger counts any
+    /// copy in flight, every later `/proc/locks` snapshot it renders is
+    /// refused (`procfs::locks::LockLedger::refuse`), as it could show a lock
+    /// Linux has released. Only where tables go at their last holder's exit
+    /// (`scm_rights::releases_tables_at_exits`).
+    fn release_tables_at_death(&self, death: crate::scheduler::signal_control::SignalDeath) {
+        use crate::syscalls::scm_rights;
+        use crate::tool_local::TableAtDeath;
+        if !scm_rights::releases_tables_at_exits(&self.cfg) {
+            return;
+        }
+        let mut unnamed = None;
+        let tables = {
+            let mut held = self.held_tables.lock().unwrap();
+            let mut tables: Vec<Arc<Mutex<crate::tool_local::FileMetadata>>> = Vec::new();
+            for thread in &death.threads {
+                match held.remove(thread).and_then(|table| table.upgrade()) {
+                    Some(table) => {
+                        if !tables.iter().any(|known| Arc::ptr_eq(known, &table)) {
+                            tables.push(table);
+                        }
+                    }
+                    None => {
+                        unnamed.get_or_insert(*thread);
+                    }
+                }
+            }
+            tables
+        };
+        // A thread that named no table has not started yet. A thread of the
+        // process holds the table its creator held (CLONE_FILES) unless one of
+        // the process's threads has a table of its own, which marks the
+        // process in the ledger (`LockLedger::mark_private_tables`): only then
+        // may an unnamed thread hold a table no other thread named.
+        let mut undecided = unnamed
+            .filter(|_| {
+                tables.is_empty()
+                    || self
+                        .lock_ledger
+                        .lock()
+                        .unwrap()
+                        .has_private_tables(death.process)
+            })
+            .map(|thread| format!("its thread {thread} named no descriptor table"));
+        let mut released = Vec::new();
+        for table in tables {
+            match table.lock().unwrap().release_at_death(death.process) {
+                TableAtDeath::Released(rights) => released.extend(rights),
+                TableAtDeath::Kept => {}
+                TableAtDeath::Undecided => {
+                    undecided.get_or_insert_with(|| {
+                        "a table of its threads does not count it among its holders".to_owned()
+                    });
+                }
+            }
+        }
+        let scm_rights::Settled { lock_copies, ports } = scm_rights::settle(released);
+        if scm_rights::follows_lock_copies(&self.cfg) {
+            let mut ledger = self.lock_ledger.lock().unwrap();
+            if !lock_copies.is_empty() {
+                // Uncounting never refuses: only a send names a locked copy.
+                let _ = ledger.placeholder_copies(crate::procfs::locks::PlaceholderCopies::Unsent(
+                    lock_copies,
+                ));
+            }
+            if let Some(reason) = undecided
+                && ledger.counts_copies_in_flight()
+            {
+                ledger.refuse(format!(
+                    "process {} died by a fatal signal while a copy of a description was in \
+                     flight, and {reason}, so which locks its death released is unknown",
+                    death.process
+                ));
+            }
+        }
+        for open_file in ports {
+            self.release_port(open_file);
+        }
+    }
+
     /// The ID for the next guest task, when Detcore chooses the IDs: each
     /// call takes the next one, whether or not the clone that asked succeeds,
     /// skipping IDs any guest task already used, including an explicit
@@ -3308,6 +3476,9 @@ impl GlobalState {
                     self.capture_brk_mappings(from, gr.1, *check, *fact),
                 ),
             );
+        }
+        if let GlobalRequest::HoldTable(table) = &gr.2 {
+            return self.hold_table(from, table);
         }
         // This entry is also used directly. The strict native cut must precede
         // ordinary forwarding drain/checks and all sender-clock accounting.
@@ -3900,6 +4071,9 @@ impl GlobalState {
             }
             GlobalRequest::CheckBrkMappings(..) => {
                 unreachable!("mapping capture is answered before clock accounting")
+            }
+            GlobalRequest::HoldTable(_) => {
+                unreachable!("a held table is answered before clock accounting")
             }
             #[cfg(target_arch = "aarch64")]
             GlobalRequest::StoreExclusive(_) => {
@@ -4495,6 +4669,11 @@ impl GlobalState {
                 }
             }
             GlobalRequest::DeregisterThread(deregistration) => {
+                // A thread that leaves holds no table for a death to release.
+                self.held_tables
+                    .lock()
+                    .unwrap()
+                    .remove(&deregistration.dettid);
                 R::DeregisterThread(self.recv_deregister_thread(from, deregistration).await)
             }
             GlobalRequest::PublishedGuestSigmask(thread) => {
@@ -5144,6 +5323,61 @@ impl GlobalState {
                 }
                 R::DescriptionLocks(())
             }
+            GlobalRequest::DescriptionLocksTaken(open_file, locks, taken, slots, identity) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let process = sched.registered_process(dtid).unwrap_or(dtid);
+                self.lock_ledger
+                    .lock()
+                    .unwrap()
+                    .note_locks_taken(process, open_file, locks, taken, slots, identity);
+                R::DescriptionLocksTaken(())
+            }
+            GlobalRequest::SecondIdentityLocks(open_file, locks, slots) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let process = sched.registered_process(dtid).unwrap_or(dtid);
+                self.lock_ledger
+                    .lock()
+                    .unwrap()
+                    .note_second_identity_locks(process, open_file, locks, slots);
+                R::SecondIdentityLocks(())
+            }
+            GlobalRequest::LockOwners(open_file, locks) => {
+                // A taker is shown while the container's `/proc` lists it (a
+                // live process, or a zombie not yet reaped).
+                let sched = self.lock_rpc_scheduler(false).await;
+                let listed = sched.procfs_listing(None).processes;
+                let ledger = self.lock_ledger.lock().unwrap();
+                R::LockOwners(match ledger.record_lock_held_as_ofd(&locks) {
+                    Some(reason) => Err(reason),
+                    None => Ok(ledger.owners(open_file, &locks, &|process| {
+                        listed.binary_search(&process.as_raw()).is_ok()
+                    })),
+                })
+            }
+            GlobalRequest::LedgerLockRows => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let listed = sched.procfs_listing(None).processes;
+                // As for a kernel snapshot (`GuestLockRows`): a table a
+                // process that exited used references nothing, and a
+                // referenced description whose locks are unknown refuses the
+                // snapshot.
+                // A row that would show a guest's record lock the backend
+                // holds as an OFD lock refuses it too.
+                let mut ledger = self.lock_ledger.lock().unwrap();
+                ledger.prune(|process| sched.process_is_alive(process));
+                R::LedgerLockRows(match ledger.unknown() {
+                    Some(reason) => Err(reason.to_string()),
+                    None => {
+                        let rows = ledger.rendered_rows(&|process| {
+                            listed.binary_search(&process.as_raw()).is_ok()
+                        });
+                        match ledger.record_lock_held_as_ofd(rows.iter().map(|(lock, _)| lock)) {
+                            Some(reason) => Err(reason),
+                            None => Ok(rows),
+                        }
+                    }
+                })
+            }
             GlobalRequest::TableReleased(open_file, remaining) => {
                 let sched = self.lock_rpc_scheduler(false).await;
                 let process = sched.registered_process(dtid).unwrap_or(dtid);
@@ -5171,6 +5405,14 @@ impl GlobalState {
                 let _sched = self.lock_rpc_scheduler(false).await;
                 self.lock_ledger.lock().unwrap().refuse(reason);
                 R::LockLedgerRefused(())
+            }
+            GlobalRequest::RecordLocksHeldAsOfd(objects) => {
+                let _sched = self.lock_rpc_scheduler(false).await;
+                self.lock_ledger
+                    .lock()
+                    .unwrap()
+                    .note_record_locks_held_as_ofd(objects);
+                R::RecordLocksHeldAsOfd(())
             }
             GlobalRequest::GuestLockRows(rows) => {
                 // A positive owner is the kernel's number for a process in the
@@ -5411,13 +5653,7 @@ impl GlobalState {
             }
             GlobalRequest::ReleasePort(open_file_id) => {
                 let _sched = self.lock_rpc_scheduler(false).await;
-                let mut used_ports = self.used_ports.lock().unwrap();
-                let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
-                let port = open_file_to_port.remove(&open_file_id);
-                if let Some(port) = port {
-                    used_ports.remove(&port);
-                }
-                R::ReleasePort(port)
+                R::ReleasePort(self.release_port(open_file_id))
             }
         };
 
@@ -7253,7 +7489,72 @@ pub enum SignalScope {
 /// `Resources`: a change to another payload type defined elsewhere
 /// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 19;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 20;
+
+/// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
+/// carries to the global state, for the terminal receipt of a death by a
+/// fatal signal to let go of (`GlobalState::release_tables_at_death`). The
+/// request carries the table itself.
+///
+/// The assumption, written down: this works only where the tool runs in
+/// Hermit's own process and the backend hands each request to the global
+/// state in memory. No Reverie capability states that. It holds for KVM, the
+/// one backend whose process signal control is `ToolControlled` (the only
+/// mode that sends such receipts and names tables,
+/// `Detcore::name_table_for_death`), whose transports call `receive_rpc` in
+/// memory. A table never crosses a process boundary: a transport that encodes
+/// its requests encodes it as nothing and decodes it as no table (`None`),
+/// never a copy that nothing shares, and the global state answers that
+/// request with its reason (`GlobalState::hold_table`), by which the sender
+/// stops the run with the policy-refusal exit at the thread's first naming,
+/// rather than panic in the transport or let a death go undecided. Two are
+/// equal when they are the same table, or both carry none.
+#[derive(Clone)]
+pub struct HeldTable(Option<Arc<Mutex<crate::tool_local::FileMetadata>>>);
+
+impl HeldTable {
+    /// `table`, to hold.
+    pub(crate) fn new(table: Arc<Mutex<crate::tool_local::FileMetadata>>) -> Self {
+        Self(Some(table))
+    }
+}
+
+impl std::fmt::Debug for HeldTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HeldTable")
+    }
+}
+
+impl PartialEq for HeldTable {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Some(table), Some(other)) => Arc::ptr_eq(table, other),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for HeldTable {}
+
+/// Why a [`HeldTable`] carries no table across a process boundary.
+const HELD_TABLE_IS_IN_PROCESS: &str = "a guest thread's descriptor table (GlobalRequest::HoldTable) \
+     is handed over in memory and does not cross a process boundary";
+
+/// Encoded as nothing: the table stays in its process.
+impl Serialize for HeldTable {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_unit()
+    }
+}
+
+/// Decoded as no table, which the global state refuses by name
+/// (`GlobalState::hold_table`).
+impl<'de> Deserialize<'de> for HeldTable {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        <()>::deserialize(deserializer).map(|()| Self(None))
+    }
+}
 
 /// This is public only so it can be used in the `GlobalTool` trait.
 /// It should NOT be used by any client outside of this file.
@@ -8042,6 +8343,50 @@ pub enum GlobalRequest {
         /// The thread's actual slice counter at detection.
         slice: u64,
     },
+    /// As `DescriptionLocks`, with the locks known, after a call of the
+    /// sender's that can take a lock through the description, and the locks
+    /// the call proved it took, which are the sender's process's, and what
+    /// else names its open file description: possibly another identity (one
+    /// recorded on reception as a description of its own), or the other
+    /// standard streams of its alias group, with their slots in the sender's
+    /// table (`procfs::locks::LedgerIdentity`,
+    /// `procfs::locks::LockLedger::note_locks_taken`). Appended last.
+    DescriptionLocksTaken(
+        OpenFileId,
+        Vec<crate::procfs::locks::HeldLock>,
+        Vec<crate::procfs::locks::HeldLock>,
+        u32,
+        crate::procfs::locks::LedgerIdentity,
+    ),
+    /// The owner each of these locks, held through this description, shows
+    /// on a lock line of a rendered fdinfo
+    /// (`procfs::locks::LockLedger::owners`). Appended last.
+    LockOwners(OpenFileId, Vec<crate::procfs::locks::HeldLock>),
+    /// The `/proc/locks` rows Detcore renders from the ledger where the
+    /// guest's procfs is not the kernel's
+    /// (`procfs::locks::LockLedger::rendered_rows`). Appended last.
+    LedgerLockRows,
+    /// As `DescriptionLocks`, with the locks known, for a description of the
+    /// sender's table that may be a second identity of another, read after a
+    /// call of its own that took no lock: one the sender recorded on reception
+    /// as a description of its own
+    /// (`procfs::locks::LockLedger::note_second_identity_locks`). Appended
+    /// last.
+    SecondIdentityLocks(OpenFileId, Vec<crate::procfs::locks::HeldLock>, u32),
+    /// The descriptor table the sender holds, at its start or after an exec
+    /// gave it a new one, for the terminal receipt of a death by a fatal
+    /// signal to let go of (`GlobalState::held_tables`,
+    /// `Detcore::name_table_for_death`). Sent only where the tool runs in this
+    /// process (`HeldTable`). Answered at once, outside the scheduler.
+    /// Appended last.
+    HoldTable(HeldTable),
+    /// A guest's record-lock request (`F_SETLK`, `F_SETLKW`) succeeded, where
+    /// the ledger takes the backend's fact, and the backend holds the lock it
+    /// took as an OFD lock, on these files (`MAJOR:MINOR:INODE`), or on a file
+    /// the fact could not name (`None`)
+    /// (`procfs::locks::LockLedger::note_record_locks_held_as_ofd`). Appended
+    /// last.
+    RecordLocksHeldAsOfd(Option<Vec<String>>),
 }
 
 /// Responses from the global object
@@ -8375,6 +8720,23 @@ pub enum GlobalResponse {
     /// An accepted finding or named refusal. Never carries a clock or grant.
     /// Appended last; this is not a forwarding-health certificate.
     ReplayDeparture(Result<(), replay_departure::Refusal>),
+    /// Appended last.
+    DescriptionLocksTaken(()),
+    /// One owner per lock asked about, in order, or why the locks cannot be
+    /// shown (`procfs::locks::LockLedger::record_lock_held_as_ofd`). Appended
+    /// last.
+    LockOwners(Result<Vec<i64>, String>),
+    /// The rows and their owners, or, while a referenced description's locks
+    /// are unknown, why no snapshot can be decided. Appended last.
+    LedgerLockRows(Result<Vec<(crate::procfs::locks::HeldLock, i64)>, String>),
+    /// Appended last.
+    SecondIdentityLocks(()),
+    /// The table is held, or why it cannot be: it reached the global state
+    /// through a transport that encodes requests, which carries no table
+    /// (`HeldTable`). Appended last.
+    HoldTable(Result<(), String>),
+    /// Appended last.
+    RecordLocksHeldAsOfd(()),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -11680,6 +12042,36 @@ where
     }
 }
 
+/// Name `table` as the descriptor table the calling thread holds
+/// (`GlobalRequest::HoldTable`, `GlobalState::held_tables`). Sent as it is,
+/// outside the scheduler, like a mapping capture: it publishes nothing,
+/// carries no forwarded-record count, and its answer moves no clock. Where the
+/// table cannot reach the global state (the backend's transport encodes its
+/// requests, `HeldTable`), the run stops by name with the policy-refusal exit.
+pub(crate) async fn hold_table<G, T>(
+    guest: &mut G,
+    table: Arc<Mutex<crate::tool_local::FileMetadata>>,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let state = guest.thread_state();
+    let request = (
+        state.thread_logical_time.clone(),
+        state.mm_id,
+        GlobalRequest::HoldTable(HeldTable::new(table)),
+    );
+    match guest.send_rpc(request).await {
+        (None, GlobalResponse::HoldTable(Ok(()))) => {}
+        (None, GlobalResponse::HoldTable(Err(reason))) => {
+            error!("[detcore] {reason}");
+            report_policy_refusal(guest, reason).await;
+            unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT).await
+        }
+        other => panic!("unexpected answer to a held table: {other:?}"),
+    }
+}
+
 /// Set the write hint of the inode of the placeholder directory `key` names
 /// to `hint`, or read it with `None`, as `F_SET_RW_HINT` and `F_GET_RW_HINT`
 /// do (`procfs::locks::LockLedger::placeholder_write_hint`): the hint after
@@ -11858,6 +12250,95 @@ pub(crate) async fn note_description_locks<G, T>(
     assert_eq!(response, GlobalResponse::DescriptionLocks(()));
 }
 
+/// Record the locks `open_file` holds after a call of the sender's that can
+/// take a lock through it, the locks `taken` that the call proved it took,
+/// that `slots` slots of the sender's table name it, and what else names its
+/// open file description (`identity`)
+/// (`procfs::locks::LockLedger::note_locks_taken`).
+pub(crate) async fn note_description_locks_taken<G, T>(
+    guest: &mut G,
+    open_file: OpenFileId,
+    locks: Vec<crate::procfs::locks::HeldLock>,
+    taken: Vec<crate::procfs::locks::HeldLock>,
+    slots: u32,
+    identity: crate::procfs::locks::LedgerIdentity,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(
+        guest,
+        GlobalRequest::DescriptionLocksTaken(open_file, locks, taken, slots, identity),
+    )
+    .await
+    .1;
+    assert_eq!(response, GlobalResponse::DescriptionLocksTaken(()));
+}
+
+/// Record the locks `open_file`, a description of the sender's table that may
+/// be a second identity of another, holds after a call of its own that took
+/// no lock, and that `slots` slots of the sender's table name it
+/// (`procfs::locks::LockLedger::note_second_identity_locks`).
+pub(crate) async fn note_second_identity_locks<G, T>(
+    guest: &mut G,
+    open_file: OpenFileId,
+    locks: Vec<crate::procfs::locks::HeldLock>,
+    slots: u32,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(
+        guest,
+        GlobalRequest::SecondIdentityLocks(open_file, locks, slots),
+    )
+    .await
+    .1;
+    assert_eq!(response, GlobalResponse::SecondIdentityLocks(()));
+}
+
+/// The owner each of `locks`, held through `open_file`, shows on a lock line
+/// of a rendered fdinfo (`procfs::locks::LockLedger::owners`), in order, or
+/// why the lines cannot be shown: one is an OFD lock on a file on which the
+/// backend held a guest's record lock as an OFD lock
+/// (`procfs::locks::LockLedger::record_lock_held_as_ofd`).
+pub(crate) async fn lock_owners<G, T>(
+    guest: &mut G,
+    open_file: OpenFileId,
+    locks: Vec<crate::procfs::locks::HeldLock>,
+) -> Result<Vec<i64>, String>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::LockOwners(open_file, locks))
+        .await
+        .1
+    {
+        GlobalResponse::LockOwners(owners) => owners,
+        _ => unreachable!(),
+    }
+}
+
+/// The `/proc/locks` rows Detcore renders from the ledger, with their owners
+/// (`procfs::locks::LockLedger::rendered_rows`), or why no snapshot can be
+/// decided (`procfs::locks::LockLedger::unknown`).
+pub(crate) async fn ledger_lock_rows<G, T>(
+    guest: &mut G,
+) -> Result<Vec<(crate::procfs::locks::HeldLock, i64)>, String>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::LedgerLockRows)
+        .await
+        .1
+    {
+        GlobalResponse::LedgerLockRows(rows) => rows,
+        _ => unreachable!(),
+    }
+}
+
 /// Record that `remaining` slots of the sender's table still name
 /// `open_file` (`procfs::locks::LockLedger::release`).
 pub(crate) async fn note_table_released<G, T>(guest: &mut G, open_file: OpenFileId, remaining: u32)
@@ -11910,6 +12391,20 @@ where
         .await
         .1;
     assert_eq!(response, GlobalResponse::LockLedgerRefused(()));
+}
+
+/// Record that the backend holds a guest's record lock as an OFD lock on the
+/// files `objects` names, or on a file the fact could not name (`None`)
+/// (`procfs::locks::LockLedger::note_record_locks_held_as_ofd`).
+pub(crate) async fn note_record_locks_held_as_ofd<G, T>(guest: &mut G, objects: Option<Vec<String>>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::RecordLocksHeldAsOfd(objects))
+        .await
+        .1;
+    assert_eq!(response, GlobalResponse::RecordLocksHeldAsOfd(()));
 }
 
 /// Which of the rows of a `/proc/locks` snapshot the guest owns, in row order
@@ -12463,6 +12958,174 @@ mod tests {
         assert_eq!(state.take_guest_id().await, None);
         assert_eq!(state.next_guest_id.load(SeqCst), 0);
         assert_eq!(state.take_guest_id().await, None);
+    }
+
+    /// The terminal receipt of a death by a fatal signal lets go of the
+    /// tables the dying threads named (`GlobalState::release_tables_at_death`):
+    /// a receiving socket whose last descriptor the dead child held takes
+    /// the copy in flight its queue held, so the lock ledger stops counting
+    /// it, and the dead thread's table is forgotten. A dying thread that
+    /// named no table, beside one that named the process's table, decides
+    /// nothing more where the process has no thread with a table of its own.
+    /// Where it may hold a table no thread named (the process has such a
+    /// thread, or no thread named any), and the ledger counts a copy in
+    /// flight at the death, every later `/proc/locks` snapshot is refused by
+    /// name, for the rest of the run (Codex's narrow check of K8-h reb8). A
+    /// table that reached the global state through a transport that encodes
+    /// requests arrives as no table, and is refused by name (`HeldTable`).
+    #[test]
+    fn a_death_by_a_fatal_signal_lets_go_of_the_tables_its_threads_named() {
+        use nix::fcntl::OFlag;
+
+        use crate::fd::FdType;
+        use crate::fd::SentDescriptor;
+        use crate::procfs::locks::PlaceholderCopies;
+        use crate::scheduler::signal_control::SignalDeath;
+        use crate::types::DetPid;
+        use crate::types::DetTid;
+
+        let config = Config {
+            virtualize_time: true,
+            sequentialize_threads: true,
+            recordreplay_modes: false,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let hold = |tid: DetTid, thread: &crate::ThreadState<()>| {
+            assert_eq!(
+                state.hold_table(
+                    Tid::from_raw(tid.as_raw()),
+                    &super::HeldTable::new(std::sync::Arc::clone(&thread.file_metadata)),
+                ),
+                (None, GlobalResponse::HoldTable(Ok(())))
+            );
+        };
+
+        // The parent sends its locked description to the socket the child
+        // holds, and closes its own descriptor of it.
+        let parent_id = DetTid::from_raw(9060);
+        let child_id = DetTid::from_raw(9061);
+        let parent = crate::ThreadState::new(parent_id, &config, ());
+        parent
+            .add_fd(3, OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        parent
+            .add_fd(4, OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        let left = parent.with_detfd(3, |detfd| detfd.clone()).unwrap();
+        let right = parent.with_detfd(4, |detfd| detfd.clone()).unwrap();
+        left.pair_sockets(&right, false);
+        drop(right);
+        let child = crate::ThreadState::new(child_id, &config, ());
+        let mut copy = parent.file_metadata.lock().unwrap().fork_for(child_id);
+        copy.hold_alone(child_id);
+        *child.file_metadata.lock().unwrap() = copy;
+        assert_eq!(parent.remove_fd(4), None, "the child holds the receiver");
+        assert_eq!(child.remove_fd(3), None, "the parent holds the sender");
+        parent
+            .add_fd(5, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        let carried = parent
+            .with_detfd(5, |detfd| detfd.in_flight_open_file(true))
+            .unwrap();
+        let sent_id = parent.with_detfd(5, |detfd| detfd.open_file_id()).unwrap();
+        assert!(
+            left.queue_rights_to_peer(
+                vec![SentDescriptor {
+                    file: (1, 5),
+                    open_file: Some(carried),
+                    lock_copy: Some(sent_id),
+                }],
+                1,
+            )
+            .is_ok()
+        );
+        assert_eq!(parent.remove_fd(5), None, "a copy is in flight");
+        let ledger = || state.lock_ledger.lock().unwrap();
+        assert_eq!(
+            ledger().placeholder_copies(PlaceholderCopies::Sending(vec![sent_id])),
+            Ok(())
+        );
+        hold(child_id, &child);
+        state.release_tables_at_death(SignalDeath {
+            process: DetPid::from_raw(child_id.as_raw()),
+            threads: vec![child_id],
+        });
+        assert!(
+            !ledger().counts_copies_in_flight(),
+            "the copy in flight went with the receiving socket"
+        );
+        assert_eq!(ledger().unknown(), None);
+        assert!(state.held_tables.lock().unwrap().is_empty());
+        assert!(
+            matches!(
+                child
+                    .file_metadata
+                    .lock()
+                    .unwrap()
+                    .release_at_death(child_id),
+                crate::tool_local::TableAtDeath::Undecided
+            ),
+            "the table went, with its holders"
+        );
+
+        // A thread that named no table beside one that named the process's.
+        let shared_id = DetTid::from_raw(9062);
+        let unnamed_id = DetTid::from_raw(9063);
+        let shared = crate::ThreadState::new(shared_id, &config, ());
+        shared.file_metadata.lock().unwrap().join_holder(shared_id);
+        hold(shared_id, &shared);
+        assert_eq!(
+            ledger().placeholder_copies(PlaceholderCopies::Sending(vec![sent_id])),
+            Ok(())
+        );
+        state.release_tables_at_death(SignalDeath {
+            process: DetPid::from_raw(shared_id.as_raw()),
+            threads: vec![shared_id, unnamed_id],
+        });
+        assert_eq!(ledger().unknown(), None, "the unnamed thread shares it");
+        assert!(ledger().counts_copies_in_flight(), "its table held no copy");
+
+        // In a process one of whose threads has a table of its own, a thread
+        // that named none may hold a table no thread named: refused.
+        let private_id = DetTid::from_raw(9064);
+        let private = DetPid::from_raw(private_id.as_raw());
+        ledger().mark_private_tables(private);
+        state.release_tables_at_death(SignalDeath {
+            process: private,
+            threads: vec![private_id],
+        });
+        let refusal = ledger().unknown().map(str::to_owned);
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|reason| reason.contains("died by a fatal signal")),
+            "{refusal:?}"
+        );
+        drop(left);
+
+        // Through a transport that encodes its requests, the table is encoded
+        // as nothing and decoded as none, and refused by name.
+        let request = GlobalRequest::HoldTable(super::HeldTable::new(std::sync::Arc::clone(
+            &child.file_metadata,
+        )));
+        let encoded = bincode::serde::encode_to_vec(&request, bincode::config::legacy()).unwrap();
+        let (decoded, _): (GlobalRequest, usize) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::legacy()).unwrap();
+        assert_ne!(decoded, request, "no table crosses the encoding");
+        let GlobalRequest::HoldTable(decoded) = decoded else {
+            panic!("a held table decodes as a held table: {decoded:?}");
+        };
+        let refused = state.hold_table(Tid::from_raw(child_id.as_raw()), &decoded);
+        assert!(
+            matches!(
+                &refused,
+                (None, GlobalResponse::HoldTable(Err(reason)))
+                    if reason.contains("a transport that encodes its requests")
+            ),
+            "{refused:?}"
+        );
+        assert!(state.held_tables.lock().unwrap().is_empty());
     }
 
     /// `response` as `receive_rpc` returns it after a turn was granted

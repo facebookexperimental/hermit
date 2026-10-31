@@ -91,6 +91,7 @@ pub(crate) mod other_process_procfs;
 mod prefilter_tests;
 pub(crate) mod procfs_levels;
 pub(crate) mod procfs_numbers;
+mod rendered_fdinfo;
 pub(crate) mod rendered_procfs;
 
 /// A conversion from SOCK_* flags to O_* flags which makes unsafe (but checked during testing) assumptions.
@@ -950,6 +951,21 @@ fn is_inherited_container_output(resource: Option<ResourceID>) -> bool {
     )
 }
 
+/// Whether `resource` is one of the container's standard streams, which
+/// Detcore models from the start with an identity each and one stat, the
+/// supervisor's standard input's (`setup_stdio`), whatever descriptions the
+/// launcher passed: a descriptor the guest put in their place carries its own
+/// file's resource (`dup2(file, 1)` copies it), and a dup of one shares its
+/// identity.
+fn is_container_stream(resource: Option<ResourceID>) -> bool {
+    matches!(
+        resource,
+        Some(ResourceID::Device(
+            Device::ContainerStdin | Device::ContainerStdout | Device::ContainerStderr
+        ))
+    )
+}
+
 /// The one-time notice for a guest's bind of the abstract `AF_UNIX` name
 /// `name` (without its leading NUL) in a `--network=host` run
 /// ([`Config::notice_host_network_abstract_binds`]): `in_use` when the bind
@@ -1757,11 +1773,46 @@ pub(crate) fn may_write_process_memory(flags: OFlag, descriptor: Option<(&Path, 
         })
 }
 
+/// [`Detcore::ledger_takes_fact`]'s rule: the backend's fact stands in for an
+/// fdinfo only where the tool cannot read the guest's descriptors through the
+/// kernel's procfs (`tool_can_name_guest_descriptors` false), and only where
+/// Detcore renders procfs (`renders_procfs`), which it never does under
+/// record and replay, whose recordings hold no fact.
+fn ledger_takes_fact_where(tool_can_name_guest_descriptors: bool, renders_procfs: bool) -> bool {
+    !tool_can_name_guest_descriptors && renders_procfs
+}
+
+/// The status flags the guest's `F_GETFL` answers, from the kernel's
+/// `physical` ones: `O_NONBLOCK` as the guest set it (`logical_nonblocking`),
+/// which Detcore may have set physically for its own polling, and, for a
+/// rendered procfs file's placeholder, which was reopened without the guest's
+/// `O_NOFOLLOW` (`rendered_nofollow`), that flag, which Linux keeps. One rule
+/// for `F_GETFL` and a rendered fdinfo's `flags:` line, so they cannot
+/// disagree.
+pub(crate) fn guest_status_flags(
+    physical: i64,
+    logical_nonblocking: bool,
+    rendered_nofollow: bool,
+) -> i64 {
+    let physical = if rendered_nofollow {
+        physical | i64::from(libc::O_NOFOLLOW)
+    } else {
+        physical
+    };
+    let nonblocking = i64::from(OFlag::O_NONBLOCK.bits());
+    if logical_nonblocking {
+        physical | nonblocking
+    } else {
+        physical & !nonblocking
+    }
+}
+
 /// The guest call after which [`Detcore::refresh_description_locks`] reads a
 /// descriptor's locks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LockCall {
-    /// `F_OFD_SETLK` or `F_OFD_SETLKW`.
+    /// `F_OFD_SETLK` or `F_OFD_SETLKW`, and, where the ledger takes the
+    /// backend's fact, `F_SETLK`, `F_SETLKW` or `F_SETLEASE`.
     Fcntl,
     /// `flock`.
     Flock,
@@ -1798,6 +1849,180 @@ impl LockCall {
     /// Whether the call can take or release a lock.
     fn changes_locks(self) -> bool {
         matches!(self, Self::Fcntl | Self::Flock)
+    }
+}
+
+/// What a lock call's description held just before the call, where the
+/// ledger takes the backend's fact (package K slice K8-h), and the class of
+/// lock the call's request can take: one Linux records with the caller's
+/// process as its taker (`flc_pid` is `current->tgid`: `flock_make_lock`,
+/// `flock_to_posix_lock` and `lease_init`, fs/locks.c). An unlock takes
+/// nothing, and an OFD lock's owner is its description, so neither has one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LockBaseline {
+    /// `FLOCK`, `POSIX` or `LEASE`, as a lock line spells the class.
+    pub(crate) class: &'static str,
+    /// The description's locks before the call.
+    pub(crate) held: Vec<crate::procfs::locks::HeldLock>,
+}
+
+/// The locks of `after`, a description's locks after a call, that the call
+/// proved it took ([`LockBaseline`]): those of the class its request can
+/// take that the description did not hold before it. A lease the description
+/// held already was changed in place (`lease_modify`), so none is taken then;
+/// a flock of the same mode, or any lock it held before, is not the caller's.
+/// Without a baseline (an unlock, an OFD request, or a fact the backend did
+/// not give before the call) nothing is proved taken.
+pub(crate) fn locks_taken(
+    baseline: Option<&LockBaseline>,
+    after: &[crate::procfs::locks::HeldLock],
+) -> Vec<crate::procfs::locks::HeldLock> {
+    let Some(baseline) = baseline else {
+        return Vec::new();
+    };
+    if baseline.class == "LEASE" && baseline.held.iter().any(|lock| lock.class == "LEASE") {
+        return Vec::new();
+    }
+    after
+        .iter()
+        .filter(|lock| lock.class == baseline.class && !baseline.held.contains(lock))
+        .cloned()
+        .collect()
+}
+
+/// The lock class a `fcntl` record-lock or lease request (`l_type` or the
+/// lease type) can take ([`LockBaseline`]), or `None` for an unlock.
+fn requested_lock_class(lock_type: i32, class: &'static str) -> Option<&'static str> {
+    (lock_type == libc::F_RDLCK || lock_type == libc::F_WRLCK).then_some(class)
+}
+
+/// The files, as a lock line spells its object (`MAJOR:MINOR:INODE`), on which
+/// the backend holds a guest's record lock as an OFD lock, from `locks`, the
+/// description's locks just after a record-lock request through it succeeded
+/// (`Detcore::note_record_lock_held_as_ofd`): none where the description holds
+/// a `POSIX` lock (the backend took the record lock as Linux does), else the
+/// files of its OFD locks. A successful request leaves a lock over its range,
+/// so a backend that holds record locks as OFD locks shows one, merged with
+/// any OFD lock the description held over the range already.
+fn record_lock_files_held_as_ofd(locks: &[crate::procfs::locks::HeldLock]) -> Vec<String> {
+    if locks.iter().any(|lock| lock.class == "POSIX") {
+        return Vec::new();
+    }
+    let mut files = locks
+        .iter()
+        .filter(|lock| lock.class == "OFDLCK")
+        .map(|lock| lock.object.clone())
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    files
+}
+
+#[cfg(test)]
+mod lock_baseline_tests {
+    use super::*;
+    use crate::procfs::locks::HeldLock;
+
+    fn held(class: &str, access: &str, inode: u64) -> HeldLock {
+        HeldLock {
+            class: class.to_owned(),
+            mode: if class == "LEASE" {
+                "ACTIVE"
+            } else {
+                "ADVISORY"
+            }
+            .to_owned(),
+            access: access.to_owned(),
+            object: format!("00:18:{inode}"),
+            start: "0".to_owned(),
+            end: "EOF".to_owned(),
+        }
+    }
+
+    fn baseline(class: &'static str, held: Vec<HeldLock>) -> LockBaseline {
+        LockBaseline { class, held }
+    }
+
+    /// A call proves it took only a lock of the class its request takes that
+    /// the description did not hold just before it: never a lock inherited or
+    /// received already held (a host's flock on an inherited standard
+    /// input), whatever the call; nothing without a baseline (an unlock, an
+    /// OFD request, no fact before the call); a same-mode flock again takes
+    /// nothing, a conversion takes the new mode; a lease changed in place
+    /// takes nothing, a new lease is taken.
+    #[test]
+    fn a_call_takes_only_the_new_locks_of_its_class() {
+        let inherited = held("FLOCK", "WRITE", 7);
+        // An unlock, or an OFD request: no baseline, nothing taken, even on
+        // the description's first observation.
+        assert!(locks_taken(None, std::slice::from_ref(&inherited)).is_empty());
+        // A record lock beside an inherited flock: only the record lock.
+        let record = held("POSIX", "WRITE", 7);
+        assert_eq!(
+            locks_taken(
+                Some(&baseline("POSIX", vec![inherited.clone()])),
+                &[inherited.clone(), record.clone()]
+            ),
+            [record]
+        );
+        // The inherited flock asked for again in its own mode: nothing.
+        assert!(
+            locks_taken(
+                Some(&baseline("FLOCK", vec![inherited.clone()])),
+                std::slice::from_ref(&inherited)
+            )
+            .is_empty()
+        );
+        // Converted to the other mode: the new lock is the caller's.
+        let shared = held("FLOCK", "READ", 7);
+        assert_eq!(
+            locks_taken(
+                Some(&baseline("FLOCK", vec![inherited.clone()])),
+                std::slice::from_ref(&shared)
+            ),
+            [shared]
+        );
+        // A lease of another type through a description that has one: the
+        // existing lease changed in place, nothing taken.
+        let read_lease = held("LEASE", "READ", 7);
+        let write_lease = held("LEASE", "WRITE", 7);
+        assert!(
+            locks_taken(
+                Some(&baseline("LEASE", vec![read_lease.clone()])),
+                std::slice::from_ref(&write_lease)
+            )
+            .is_empty()
+        );
+        // A first lease: taken.
+        assert_eq!(
+            locks_taken(
+                Some(&baseline("LEASE", Vec::new())),
+                std::slice::from_ref(&read_lease)
+            ),
+            [read_lease]
+        );
+        // Only an F_RDLCK or F_WRLCK request takes a lock.
+        assert_eq!(requested_lock_class(libc::F_WRLCK, "POSIX"), Some("POSIX"));
+        assert_eq!(requested_lock_class(libc::F_RDLCK, "LEASE"), Some("LEASE"));
+        assert_eq!(requested_lock_class(libc::F_UNLCK, "POSIX"), None);
+    }
+
+    /// After a successful record-lock request, the description's OFD locks
+    /// name the files on which the backend holds the record lock as an OFD
+    /// lock, each once, beside any flock; a `POSIX` lock says the backend took
+    /// it as Linux does, so none.
+    #[test]
+    fn a_record_lock_held_as_an_ofd_lock_names_its_file() {
+        let flock = held("FLOCK", "READ", 7);
+        let ofd = held("OFDLCK", "WRITE", 7);
+        let mut second = held("OFDLCK", "READ", 7);
+        second.start = "100".to_owned();
+        assert_eq!(
+            record_lock_files_held_as_ofd(&[flock.clone(), ofd.clone(), second]),
+            ["00:18:7"]
+        );
+        assert!(record_lock_files_held_as_ofd(std::slice::from_ref(&flock)).is_empty());
+        assert!(record_lock_files_held_as_ofd(&[held("POSIX", "WRITE", 7), ofd]).is_empty());
     }
 }
 
@@ -1839,6 +2064,18 @@ pub(crate) enum FdinfoRead {
     /// ([`fdinfo_failure_hides`]): the description contributes no lock, which
     /// can hide the guest's row but never admits a host's.
     Untrackable(String),
+    /// Where the guest's procfs is not the kernel's, what the backend's
+    /// `descriptor_status` fact reports (`Detcore::ledger_descriptor_status`).
+    /// Boxed, so that the futures that hold an `FdinfoRead` stay their size.
+    Facts(Box<FactLocks>),
+}
+
+/// The locks the backend's `descriptor_status` fact reports a description
+/// holds, every class, spelled as an fdinfo spells them
+/// ([`held_locks_of_status`]), and the inode number of its file, if known.
+pub(crate) struct FactLocks {
+    locks: Vec<crate::procfs::locks::HeldLock>,
+    inode: Option<String>,
 }
 
 impl FdinfoRead {
@@ -1846,9 +2083,60 @@ impl FdinfoRead {
     fn inode(&self) -> Option<String> {
         match self {
             Self::Contents(contents) => fdinfo_inode(contents),
+            Self::Facts(facts) => facts.inode.clone(),
             Self::Unknown(_) | Self::Untrackable(_) => None,
         }
     }
+}
+
+/// The locks of a backend's `descriptor_status` fact, spelled as a
+/// `/proc/locks` row and a fdinfo `lock:` line spell them
+/// (`procfs::locks::HeldLock`): class, mode (`ADVISORY`, `MANDATORY`, or a
+/// lease's `ACTIVE`), access, the object as `%02x:%02x:%llu` of the
+/// superblock device and the inode, and the range. Every class: where the
+/// guest's procfs is not the kernel's, the ledger is the only record of the
+/// guest's leases and record locks too.
+pub(crate) fn held_locks_of_status(
+    status: &reverie::DescriptorStatus,
+) -> Vec<crate::procfs::locks::HeldLock> {
+    status
+        .locks
+        .iter()
+        .map(|lock| {
+            let (class, mode) = match lock.class {
+                reverie::LockClass::Posix => ("POSIX", None),
+                reverie::LockClass::OpenFileDescription => ("OFDLCK", None),
+                reverie::LockClass::Flock => ("FLOCK", None),
+                reverie::LockClass::Lease => ("LEASE", Some("ACTIVE")),
+                _ => ("UNKNOWN", Some("UNKNOWN")),
+            };
+            let mode = mode.unwrap_or(if lock.mandatory {
+                "MANDATORY"
+            } else {
+                "ADVISORY"
+            });
+            let record = matches!(
+                lock.class,
+                reverie::LockClass::Posix | reverie::LockClass::OpenFileDescription
+            );
+            crate::procfs::locks::HeldLock {
+                class: class.to_owned(),
+                mode: mode.to_owned(),
+                access: if lock.write { "WRITE" } else { "READ" }.to_owned(),
+                object: format!(
+                    "{:02x}:{:02x}:{}",
+                    libc::major(lock.raw_device),
+                    libc::minor(lock.raw_device),
+                    lock.raw_inode
+                ),
+                start: if record { lock.start } else { 0 }.to_string(),
+                end: match lock.end {
+                    Some(end) if record => end.to_string(),
+                    _ => "EOF".to_owned(),
+                },
+            }
+        })
+        .collect()
 }
 
 /// Why [`Detcore::read_staged_fdinfo`] did not read an fdinfo.
@@ -2022,6 +2310,78 @@ mod fdinfo_refusal_tests {
         ] {
             assert!(!fdinfo_failure_hides(errno), "{errno}");
         }
+    }
+
+    /// The lock ledger takes the backend's fact only where no kernel fdinfo
+    /// of the guest's descriptors exists and Detcore renders procfs: never
+    /// under record and replay (`renders_procfs` is false there), where the
+    /// fact would decide the ledger from the replaying host's state, and
+    /// never where the kernel's procfs is the guest's (ptrace and the
+    /// in-guest backends keep their recorded fdinfo reads).
+    #[test]
+    fn the_ledger_takes_the_fact_only_where_procfs_is_rendered_and_not_the_kernels() {
+        assert!(ledger_takes_fact_where(false, true));
+        // KVM under record and replay, or after a chroot.
+        assert!(!ledger_takes_fact_where(false, false));
+        // ptrace, DBT, SaBRe, LiteInst, in-guest, rendering or not.
+        assert!(!ledger_takes_fact_where(true, true));
+        assert!(!ledger_takes_fact_where(true, false));
+    }
+
+    /// The locks of a `descriptor_status` fact are spelled as the fdinfo
+    /// text the ledger reads elsewhere spells them: for the OFD and flock
+    /// locks the text path keeps (`held_locks_in_fdinfo`), field for field
+    /// the same; the record locks and leases it leaves out are kept too,
+    /// with a lease's `ACTIVE` state as its mode and a record lock's range.
+    #[test]
+    fn a_facts_locks_are_spelled_as_an_fdinfo_spells_them() {
+        let fdinfo = b"pos:\t0\nflags:\t0100002\nmnt_id:\t31\nino:\t1234\n\
+            lock:\t1: FLOCK  ADVISORY  READ 7 00:2a:1234 0 EOF\n\
+            lock:\t2: POSIX  ADVISORY  WRITE 7 00:2a:1234 0 9\n\
+            lock:\t3: OFDLCK ADVISORY  READ -1 00:2a:1234 100 EOF\n\
+            lock:\t4: LEASE  ACTIVE    WRITE 7 103:fffff:1234 0 EOF\n";
+        let status = reverie::DescriptorStatus::from_fdinfo(fdinfo).expect("Linux's format");
+        let from_fact = held_locks_of_status(&status);
+        let lock = |class: &str, mode: &str, access: &str, object: &str, start: &str, end: &str| {
+            crate::procfs::locks::HeldLock {
+                class: class.to_owned(),
+                mode: mode.to_owned(),
+                access: access.to_owned(),
+                object: object.to_owned(),
+                start: start.to_owned(),
+                end: end.to_owned(),
+            }
+        };
+        assert_eq!(
+            from_fact,
+            [
+                lock("FLOCK", "ADVISORY", "READ", "00:2a:1234", "0", "EOF"),
+                lock("POSIX", "ADVISORY", "WRITE", "00:2a:1234", "0", "9"),
+                lock("OFDLCK", "ADVISORY", "READ", "00:2a:1234", "100", "EOF"),
+                lock("LEASE", "ACTIVE", "WRITE", "103:fffff:1234", "0", "EOF"),
+            ]
+        );
+        let from_text = crate::procfs::locks::held_locks_in_fdinfo(fdinfo);
+        assert_eq!(
+            from_text,
+            [from_fact[0].clone(), from_fact[2].clone()],
+            "the classes the text path keeps"
+        );
+    }
+
+    /// `F_GETFL`'s answer, which a rendered fdinfo's `flags:` line shares:
+    /// the guest's own `O_NONBLOCK` whatever Detcore set physically, and a
+    /// rendered procfs file's `O_NOFOLLOW`, which its placeholder lost.
+    #[test]
+    fn the_guests_status_flags_follow_its_own_nonblocking_and_nofollow() {
+        let nonblock = i64::from(libc::O_NONBLOCK);
+        let rdwr = i64::from(libc::O_RDWR);
+        assert_eq!(guest_status_flags(rdwr | nonblock, false, false), rdwr);
+        assert_eq!(guest_status_flags(rdwr, true, false), rdwr | nonblock);
+        assert_eq!(
+            guest_status_flags(0, false, true),
+            i64::from(libc::O_NOFOLLOW)
+        );
     }
 
     #[test]
@@ -6435,8 +6795,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         // non-atomic conversion), the description's own fdinfo now says which
         // locks it holds (`procfs::locks`).
         let fd = call.fd();
+        // A shared or exclusive request can take a flock, which Linux
+        // records with the caller as its taker; an unlock, none.
+        let operation = call.operation();
+        let class = (operation & libc::LOCK_UN == 0
+            && operation & (libc::LOCK_SH | libc::LOCK_EX) != 0)
+            .then_some("FLOCK");
+        let baseline = self.lock_baseline(guest, fd, class);
         let result = self.flock_through_the_kernel(guest, call).await;
-        self.refresh_description_locks(guest, fd, LockCall::Flock)
+        self.refresh_description_locks(guest, fd, LockCall::Flock, baseline)
             .await?;
         result
     }
@@ -7254,6 +7621,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A process's `mountinfo` or `mounts`, in a run with a container
         // mount table: the table's bytes, whoever opened the file.
         let mount_table = self.mount_table_snapshot(guest, call.fd())?;
+        // `/proc/locks` where the guest's procfs is not the kernel's: the
+        // lock ledger's rows, whoever opened the file (Detcore, or the
+        // backend's own procfs through a spelling Detcore does not resolve,
+        // such as one with `..`), instead of the backend's file (package K
+        // slice K8-h).
+        let ledger_locks = self.renders_proc_locks(guest)
+            && guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.procfs_lists_locks())?;
         let raw_contents = match template {
             // A descriptor that cannot read (`O_PATH`, write-only, or access
             // mode 3) reads nothing (EBADF), as the kernel's read of it,
@@ -7283,7 +7659,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if position == 0 {
                     self.require_rendered_task(guest, call.fd()).await?;
                 }
-                mount_table.unwrap_or_else(|| template.to_vec())
+                // `/proc/locks` Detcore renders: its lock ledger's rows now
+                // (package K slice K8-h).
+                match mount_table {
+                    Some(table) => table,
+                    None if ledger_locks => Box::pin(self.ledger_locks_text(guest)).await,
+                    None => template.to_vec(),
+                }
             }
             // A mount table file the kernel opened takes no capture of the
             // kernel's bytes, which the table replaces; a descriptor that
@@ -7298,6 +7680,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     return Err(Errno::EBADF.into());
                 }
                 table
+            }
+            None if ledger_locks => {
+                if !can_read(
+                    guest
+                        .thread_state()
+                        .with_detfd(call.fd(), |detfd| detfd.status_flags())?,
+                ) {
+                    return Err(Errno::EBADF.into());
+                }
+                Box::pin(self.ledger_locks_text(guest)).await
             }
             None => {
                 if let Some((crate::procfs::private_maps::Format::NumaMaps, target)) = &maps_target
@@ -7463,51 +7855,30 @@ impl<T: RecordOrReplay> Detcore<T> {
             (None, None) => contents,
         };
         let fdinfo_identity = if let Some(target_fd) = target_fd {
-            let (cached_stat, logical_flags, open_file_id, fd_type, inode_override) =
+            let (cached_stat, logical_flags, open_file_id, fd_type, resource) =
                 guest.thread_state().with_detfd(target_fd, |detfd| {
                     (
                         detfd.stat(),
                         detfd.status_flags(),
                         detfd.open_file_id(),
                         detfd.ty(),
-                        deterministic_stdio_inode_for_resource(target_fd, detfd.resource()),
+                        detfd.resource(),
                     )
                 })?;
             let stat = match cached_stat {
                 Some(stat) => stat,
                 None => DetStat::from(self.inject_fstat(guest, target_fd).await?),
             };
-            // Keyed as `fstat` keys the descriptor, so the two numbers agree.
-            let virtual_inode = match inode_override {
-                Some(inode) => inode,
-                // Detcore numbered it when it rendered the file.
-                None if let Some((path, _)) = rendered_target => {
-                    DetInode::mint(procfs_inode::rendered_inode(path))
-                }
-                // The directory a placeholder stands for, as its `fstat`
-                // numbers it.
-                None if let Some(inode) = placeholder_inode => DetInode::mint(inode),
-                None => {
-                    let procfs =
-                        Self::procfs_entry(guest, &stat, StatTarget::Descriptor(target_fd)).await;
-                    let files = self.rendered_files(guest);
-                    if let Some(path) =
-                        rendered_entry(&procfs, &stat, guest.config().recordreplay_modes, files)
-                    {
-                        DetInode::mint(procfs_inode::rendered_inode(path))
-                    } else {
-                        determinize_inode_observing_mtime(
-                            guest,
-                            stat.raw_inode(),
-                            procfs.name(stat.dev),
-                            ObservedMtime::Unobserved,
-                            InodeSighting::Descriptor,
-                        )
-                        .await
-                        .0
-                    }
-                }
-            };
+            // Boxed, so that this call's future holds its answer alone.
+            let virtual_inode = Box::pin(self.fdinfo_inode(
+                guest,
+                target_fd,
+                &stat,
+                resource,
+                rendered_target.map(|(path, _)| path),
+                placeholder_inode,
+            ))
+            .await;
             let raw_mount_id =
                 detcore_model::procfs::parse_fdinfo_mount_id(&contents).ok_or_else(|| {
                     Error::Tool(anyhow::anyhow!(
@@ -7806,9 +8177,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // sequentialized threads no other guest thread's lock call (and its
         // fdinfo record) runs between them. Parallel execution would need
         // them taken as one.
-        let lock_rows_kept = if guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_lists_locks())?
+        let lock_rows_kept = if !ledger_locks
+            && guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.procfs_lists_locks())?
         {
             match crate::procfs::locks::lock_rows(&contents) {
                 Some(rows) => match crate::tool_global::guest_lock_rows(guest, rows).await {
@@ -7864,9 +8236,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         // A process's `stat` or `comm` Detcore opened renders its task's
         // record in the process table as of this read (`procfs::task_stat`).
-        let task_stat = self
-            .rendered_task_stat(guest, call.fd(), virtual_ppid)
-            .await?;
+        // A descriptor's fdinfo Detcore opened renders that descriptor's
+        // state as of this read (package K slice K8-h); no other file renders
+        // a task record then. Boxed, so that this call's future holds its
+        // answer alone.
+        let (task_stat, fdinfo_rendering) = if guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_is_rendered_fdinfo())?
+        {
+            let Some(rendering) = Box::pin(self.render_own_fdinfo(guest, call.fd())).await? else {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "descriptor {} is a rendered fdinfo Detcore has no rendering of",
+                    call.fd()
+                )));
+            };
+            (None, Some(rendering))
+        } else {
+            (
+                self.rendered_task_stat(guest, call.fd(), virtual_ppid)
+                    .await?,
+                None,
+            )
+        };
         guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),
@@ -7895,10 +8286,84 @@ impl<T: RecordOrReplay> Detcore<T> {
                     cpus_allowed,
                     lock_rows_kept: lock_rows_kept.clone(),
                     task_stat,
+                    fdinfo_rendering: fdinfo_rendering.clone(),
                 },
             );
         })?;
         Ok(())
+    }
+
+    /// The inode number a descriptor's fdinfo shows for descriptor
+    /// `target_fd`, whose raw stat is `stat`: keyed as `fstat` keys the
+    /// descriptor, so the two numbers agree. A standard stream's fixed number
+    /// (`deterministic_stdio_inode_for_resource`); a procfs file Detcore
+    /// renders (`rendered`), the number Detcore gave it; a directory Detcore
+    /// serves on a placeholder, the number its `fstat` shows
+    /// (`placeholder_inode`); any other file, its number in the run's pool.
+    pub(super) async fn fdinfo_inode<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        target_fd: RawFd,
+        stat: &DetStat,
+        resource: Option<ResourceID>,
+        rendered: Option<&'static Path>,
+        placeholder_inode: Option<u64>,
+    ) -> DetInode {
+        match deterministic_stdio_inode_for_resource(target_fd, resource) {
+            Some(inode) => inode,
+            // Detcore numbered it when it rendered the file.
+            None if let Some(path) = rendered => DetInode::mint(procfs_inode::rendered_inode(path)),
+            // The directory a placeholder stands for, as its `fstat` numbers
+            // it.
+            None if let Some(inode) = placeholder_inode => DetInode::mint(inode),
+            None => {
+                let procfs =
+                    Self::procfs_entry(guest, stat, StatTarget::Descriptor(target_fd)).await;
+                let files = self.rendered_files(guest);
+                if let Some(path) =
+                    rendered_entry(&procfs, stat, guest.config().recordreplay_modes, files)
+                {
+                    DetInode::mint(procfs_inode::rendered_inode(path))
+                } else {
+                    determinize_inode_observing_mtime(
+                        guest,
+                        stat.raw_inode(),
+                        procfs.name(stat.dev),
+                        ObservedMtime::Unobserved,
+                        InodeSighting::Descriptor,
+                    )
+                    .await
+                    .0
+                }
+            }
+        }
+    }
+
+    /// The mount ID an fdinfo Detcore renders shows for a file on mount
+    /// `raw_mount_id` (package K slice K8-h): the number the guest's own
+    /// `statx` reports for it (`Self::fill_statx_mount_id`), a hidden
+    /// mount's nearest shown ancestor (`Self::shown_mount_id`) through the
+    /// run's mount-ID pool, and 0 where that `statx` reports none: a mount
+    /// the backend does not report (`None`), a run with no mount provenance
+    /// to number it by (`Config::mountinfo_mount_ids_captured`), or one the
+    /// pool cannot number. A raw 0 stays 0. That 0 is Detcore's convention,
+    /// as the sanitizer of a kernel fdinfo prints it for an object on a mount
+    /// the guest's `mountinfo` does not show (a memfd's internal mount);
+    /// Linux prints that mount's own nonzero number.
+    pub(super) async fn fdinfo_mount_id<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        raw_mount_id: Option<u64>,
+    ) -> u64 {
+        match raw_mount_id {
+            Some(raw_mount_id)
+                if raw_mount_id != 0 && guest.config().mountinfo_mount_ids_captured =>
+            {
+                let shown = self.shown_mount_id(guest, raw_mount_id);
+                determinize_mount_id(guest, shown, None).await.unwrap_or(0)
+            }
+            _ => 0,
+        }
     }
 
     /// The bytes of the procfs file open as `fd`, if it is a process's
@@ -11293,19 +11758,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 && detfd.status_flags() & libc::O_NOFOLLOW != 0,
                         )
                     })?;
-                // A rendered procfs file's placeholder was reopened without
-                // the guest's `O_NOFOLLOW`, which Linux keeps.
-                let physical_flags = if rendered_nofollow {
-                    physical_flags | i64::from(libc::O_NOFOLLOW)
-                } else {
-                    physical_flags
-                };
-                let nonblocking = i64::from(OFlag::O_NONBLOCK.bits());
-                if logical_nonblocking {
-                    Ok(physical_flags | nonblocking)
-                } else {
-                    Ok(physical_flags & !nonblocking)
-                }
+                Ok(guest_status_flags(
+                    physical_flags,
+                    logical_nonblocking,
+                    rendered_nofollow,
+                ))
             }
             F_SETFL(flags) => {
                 let (fd_type, internal_socket, physically_nonblocking, inherited_external_read) =
@@ -11417,8 +11874,49 @@ impl<T: RecordOrReplay> Detcore<T> {
             // itself is the kernel's, as for POSIX locks.
             F_OFD_SETLK(_) | F_OFD_SETLKW(_) => {
                 let result = self.record_or_replay(guest, call).await?;
-                self.refresh_description_locks(guest, fd, LockCall::Fcntl)
+                self.refresh_description_locks(guest, fd, LockCall::Fcntl, None)
                     .await?;
+                Ok(result)
+            }
+            // Where the ledger takes the backend's fact (package K slice
+            // K8-h; `Self::ledger_takes_fact`), there is no kernel
+            // `/proc/locks` to keep a record lock's or a lease's row by its
+            // owner: the ledger is the record, and Detcore renders the rows
+            // from it. A record lock the backend holds as an OFD lock (KVM's
+            // provider: https://github.com/rrnewton/reverie/issues/1223) is
+            // shown nowhere: a `/proc/locks` snapshot or a fdinfo read that
+            // would show it is refused by name
+            // (`Self::note_record_lock_held_as_ofd`).
+            F_SETLK(_) | F_SETLKW(_) | F_SETLK64(_) | F_SETLKW64(_) | F_SETLEASE(_)
+                if self.ledger_takes_fact(guest) =>
+            {
+                // The class of lock the request can take, which Linux
+                // records with the caller as its taker; an unlock, none.
+                let class = match call.cmd() {
+                    F_SETLEASE(kind) => requested_lock_class(kind, "LEASE"),
+                    F_SETLK(Some(lock)) | F_SETLKW(Some(lock)) => guest
+                        .memory()
+                        .read_value(lock)
+                        .ok()
+                        .and_then(|lock: libc::flock| {
+                            requested_lock_class(i32::from(lock.l_type), "POSIX")
+                        }),
+                    F_SETLK64(Some(lock)) | F_SETLKW64(Some(lock)) => guest
+                        .memory()
+                        .read_value(lock)
+                        .ok()
+                        .and_then(|lock: libc::flock64| {
+                            requested_lock_class(i32::from(lock.l_type), "POSIX")
+                        }),
+                    _ => None,
+                };
+                let baseline = self.lock_baseline(guest, fd, class);
+                let result = self.record_or_replay(guest, call).await?;
+                Box::pin(self.refresh_description_locks(guest, fd, LockCall::Fcntl, baseline))
+                    .await?;
+                if class == Some("POSIX") {
+                    self.note_record_lock_held_as_ofd(guest, fd).await;
+                }
                 Ok(result)
             }
             _ => {
@@ -11473,6 +11971,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         fd: RawFd,
         call: LockCall,
+        baseline: Option<LockBaseline>,
     ) -> Result<(), Error> {
         let model = guest.thread_state().with_detfd(fd, |detfd| {
             detfd.set_lock_tracked();
@@ -11485,9 +11984,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             if call == LockCall::Fcntl {
                 detfd.set_may_hold_ofd_lock();
             }
-            (detfd.open_file_id(), detfd.is_received_for_locks())
+            (
+                detfd.open_file_id(),
+                detfd.is_received_for_locks(),
+                detfd.stdio_alias_group(),
+            )
         });
-        let Ok((open_file, received)) = model else {
+        let Ok((open_file, received, alias_group)) = model else {
             if call.changes_locks() {
                 let fdinfo = self.read_own_fdinfo(guest, fd, call.name()).await?;
                 Self::note_alias(guest, &fdinfo).await;
@@ -11498,11 +12001,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         if received && call.changes_locks() {
             Self::note_alias(guest, &fdinfo).await;
         }
-        let held = matches!(&fdinfo, FdinfoRead::Contents(_));
+        let held = matches!(&fdinfo, FdinfoRead::Contents(_) | FdinfoRead::Facts(..));
+        let from_fact = matches!(&fdinfo, FdinfoRead::Facts(..));
         let locks = match fdinfo {
             FdinfoRead::Contents(contents) => {
                 Ok(crate::procfs::locks::held_locks_in_fdinfo(&contents))
             }
+            FdinfoRead::Facts(facts) => Ok(facts.locks),
             FdinfoRead::Unknown(reason) => Err(reason),
             // Hidden, never admitted: the description contributes no lock
             // until a later read through a proved procfs.
@@ -11521,8 +12026,116 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_detfd(fd, |detfd| detfd.set_may_hold_ofd_lock());
         }
         let slots = guest.thread_state().slots_naming(open_file);
-        crate::tool_global::note_description_locks(guest, open_file, locks, slots).await;
+        // From the fact, after a call that can take a lock, the ledger also
+        // learns which locks this process proved it took, whose lines name it
+        // (`procfs::locks::LockLedger::note_locks_taken`), and what else names
+        // the open file description: possibly another identity, on reception
+        // (`procfs::locks::LockLedger::second_identities`), or the other
+        // standard streams of its alias group, which are that description
+        // (`procfs::locks::LockLedger::alias_groups`). A receipt that joined
+        // the description its sender's table modeled is that description, so
+        // the ledger learns only this table's slots and the locks it holds.
+        match locks {
+            Ok(locks) if from_fact && call.changes_locks() => {
+                let taken = locks_taken(baseline.as_ref(), &locks);
+                let identity = if received {
+                    crate::procfs::locks::LedgerIdentity::Received
+                } else if let Some(group) = alias_group {
+                    crate::procfs::locks::LedgerIdentity::StandardStreams {
+                        group,
+                        members: Self::alias_group_members(guest, group),
+                    }
+                } else {
+                    crate::procfs::locks::LedgerIdentity::Own
+                };
+                crate::tool_global::note_description_locks_taken(
+                    guest, open_file, locks, taken, slots, identity,
+                )
+                .await;
+            }
+            Ok(locks) if from_fact && call != LockCall::Joined => {
+                crate::tool_global::note_second_identity_locks(guest, open_file, locks, slots)
+                    .await;
+            }
+            locks => {
+                crate::tool_global::note_description_locks(guest, open_file, locks, slots).await;
+            }
+        }
         Ok(())
+    }
+
+    /// The identities of alias group `group` (the container's standard
+    /// streams that are one open file description, `FileMetadata::setup_stdio`)
+    /// that the caller's table names, each once, with how many of its slots
+    /// name it. Each is marked as one whose locks the ledger follows
+    /// (`DetFd::set_lock_tracked`), as the caller's own description is, so
+    /// that its closes, its replacements and its survival of an exec reach the
+    /// ledger too.
+    fn alias_group_members<G: Guest<Self>>(guest: &G, group: OpenFileId) -> Vec<(OpenFileId, u32)> {
+        let (numbers, _, _) = guest.thread_state().descriptor_table();
+        let mut members: Vec<(OpenFileId, u32)> = Vec::new();
+        for fd in numbers {
+            let Ok(Some(member)) = guest.thread_state().with_detfd(fd, |detfd| {
+                (detfd.stdio_alias_group() == Some(group)).then(|| {
+                    detfd.set_lock_tracked();
+                    detfd.open_file_id()
+                })
+            }) else {
+                continue;
+            };
+            if !members.iter().any(|(known, _)| *known == member) {
+                members.push((member, guest.thread_state().slots_naming(member)));
+            }
+        }
+        members
+    }
+
+    /// The description's locks now, before a lock call that can take a
+    /// lock of `class`, from the backend's fact, where the ledger takes it
+    /// ([`LockBaseline`]); `None` elsewhere, or where the backend gives no
+    /// fact for the descriptor, so that nothing is attributed to the call.
+    fn lock_baseline<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        fd: RawFd,
+        class: Option<&'static str>,
+    ) -> Option<LockBaseline> {
+        let class = class?;
+        if !self.ledger_takes_fact(guest) {
+            return None;
+        }
+        let status = guest.descriptor_status(fd).ok()?;
+        Some(LockBaseline {
+            class,
+            held: held_locks_of_status(&status),
+        })
+    }
+
+    /// After a guest's record-lock request (`F_SETLK`, `F_SETLKW`) through
+    /// `fd` succeeded, where the ledger takes the backend's fact: whether the
+    /// backend holds the lock it took as an OFD lock of the description, as
+    /// KVM's provider holds every record lock
+    /// (https://github.com/rrnewton/reverie/issues/1223), which the ledger
+    /// then shows on no `/proc/locks` row and no fdinfo line
+    /// (`procfs::locks::LockLedger::record_locks_held_as_ofd`). The fact says,
+    /// after the call ([`record_lock_files_held_as_ofd`]). Where the backend
+    /// gives no fact for the descriptor (`NotProvided`, an object it keeps
+    /// itself), no lock through it is shown anywhere, so nothing is noted;
+    /// where the fact fails for another cause, the file is unknown, and every
+    /// OFD lock may be such a lock.
+    async fn note_record_lock_held_as_ofd<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) {
+        let files = match guest.descriptor_status(fd) {
+            Ok(status) => {
+                let files = record_lock_files_held_as_ofd(&held_locks_of_status(&status));
+                if files.is_empty() {
+                    return;
+                }
+                Some(files)
+            }
+            Err(reverie::FactError::Errno(errno)) if errno != Errno::EBADF => None,
+            Err(_) => return,
+        };
+        crate::tool_global::note_record_locks_held_as_ofd(guest, files).await;
     }
 
     /// After a lock or unlock through a descriptor whose description the
@@ -11538,7 +12151,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdinfoRead::Unknown(reason) => {
                 crate::tool_global::note_lock_ledger_refused(guest, reason.clone()).await;
             }
-            FdinfoRead::Contents(_) | FdinfoRead::Untrackable(_) => {
+            FdinfoRead::Contents(_) | FdinfoRead::Facts(..) | FdinfoRead::Untrackable(_) => {
                 crate::tool_global::note_aliased_inode(guest, fdinfo.inode()).await;
             }
         }
@@ -11626,6 +12239,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         fd: RawFd,
         call: &str,
     ) -> Result<FdinfoRead, Error> {
+        // A backend whose `/proc` is its own (KVM) gives no procfs anchor:
+        // its `descriptor_status` fact reports the description's locks
+        // instead, where the ledger may take it
+        // ([`Self::ledger_descriptor_status`]).
+        if !procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend) {
+            return Ok(self.ledger_descriptor_status(guest, fd, call));
+        }
         let mapped = guest
             .inject_with_retry(Syscall::Mmap(
                 syscalls::Mmap::new()
@@ -11677,6 +12297,132 @@ impl<T: RecordOrReplay> Detcore<T> {
                  ({why})"
             )),
         })
+    }
+
+    /// Whether the lock ledger takes the backend's `descriptor_status` fact
+    /// for a description's locks (package K slice K8-h): where the guest's
+    /// procfs is not the kernel's, so no fdinfo can be read through it
+    /// (`procfs_inode::tool_can_name_guest_descriptors`), and only where
+    /// Detcore renders procfs (`Detcore::renders_procfs`), which it never
+    /// does under record and replay. The fact is a read of the backend's
+    /// state that no recording holds: consulted under replay, it would decide
+    /// the ledger, and with it a `/proc/locks` snapshot and the lock
+    /// bookkeeping's refusal, from the replaying host's state instead of the
+    /// recording's (package K design section 8, amendment 1). Elsewhere the
+    /// description stays untrackable, as before the fact existed.
+    pub(crate) fn ledger_takes_fact<G: Guest<Self>>(&self, guest: &G) -> bool {
+        ledger_takes_fact_where(
+            procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend),
+            self.renders_procfs(guest),
+        )
+    }
+
+    /// [`Self::read_own_fdinfo`] where the guest's procfs is not the
+    /// kernel's: the locks the backend's `descriptor_status` fact reports the
+    /// description named by `fd` holds, if the ledger may take it
+    /// ([`Self::ledger_takes_fact`]), with the inode number of its file (from
+    /// a lock, else Detcore's raw stat of the descriptor), for
+    /// `procfs::locks::LockLedger::alias_inode`. Nothing is injected.
+    ///
+    /// Where it may not, or the backend does not report the fact for this
+    /// descriptor (`NotProvided`: an object the backend keeps itself), or
+    /// says it is not open (`EBADF`, or an errno the guest's own view or the
+    /// backend decides, [`fdinfo_failure_hides`]), the description is
+    /// untrackable, as it was before the fact existed; any other errno leaves
+    /// its locks unknown, so a later `/proc/locks` read refuses by name.
+    fn ledger_descriptor_status<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        fd: RawFd,
+        call: &str,
+    ) -> FdinfoRead {
+        if !self.ledger_takes_fact(guest) {
+            return FdinfoRead::Untrackable(format!(
+                "after {call} on fd {fd}, the guest's /proc did not give a procfs fdinfo \
+                 (the backend's /proc is not the kernel's procfs)"
+            ));
+        }
+        match guest.descriptor_status(fd) {
+            Ok(status) => {
+                let locks = held_locks_of_status(&status);
+                let inode = status
+                    .locks
+                    .first()
+                    .map(|lock| lock.raw_inode)
+                    .or_else(|| {
+                        guest
+                            .thread_state()
+                            .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.inode))
+                            .ok()
+                            .flatten()
+                    })
+                    .map(|inode| inode.to_string());
+                FdinfoRead::Facts(Box::new(FactLocks { locks, inode }))
+            }
+            Err(reverie::FactError::Errno(errno))
+                if errno != Errno::EBADF && !fdinfo_failure_hides(errno) =>
+            {
+                FdinfoRead::Unknown(fdinfo_refusal(
+                    call,
+                    fd,
+                    "read the backend's descriptor_status of",
+                    errno,
+                ))
+            }
+            Err(error) => FdinfoRead::Untrackable(format!(
+                "after {call} on fd {fd}, the backend gave no descriptor_status of it \
+                 ({error:?})"
+            )),
+        }
+    }
+
+    /// Whether every `/proc/locks` snapshot is the lock ledger's rows
+    /// ([`Self::ledger_locks_text`]): where the guest's procfs is not the
+    /// kernel's (`procfs_inode::tool_can_name_guest_descriptors`, KVM), so no
+    /// kernel file holds the guest's rows to keep, and where Detcore renders
+    /// procfs (`Self::renders_procfs`), the gate under which the ledger takes
+    /// the backend's fact ([`Self::ledger_takes_fact`]), so that the rows are
+    /// never a ledger's that took no fact. Elsewhere the kernel's file is
+    /// filtered to the guest's rows, as before
+    /// (`procfs::locks::guest_lock_rows`).
+    pub(crate) fn renders_proc_locks<G: Guest<Self>>(&self, guest: &G) -> bool {
+        !procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend)
+            && self.renders_procfs(guest)
+    }
+
+    /// The `/proc/locks` rows Detcore renders from its lock ledger where the
+    /// guest's procfs is not the kernel's (package K slice K8-h;
+    /// `procfs::locks::LockLedger::rendered_rows`), as the kernel would
+    /// spell them before the sanitizer numbers their identities: one row per
+    /// lock, `N: CLASS MODE ACCESS OWNER MAJOR:MINOR:INODE START END`. While
+    /// a description some guest table references has locks Detcore does not
+    /// know, no snapshot can be decided, and the run stops by name, as for a
+    /// kernel snapshot.
+    async fn ledger_locks_text<G: Guest<Self>>(&self, guest: &mut G) -> Vec<u8> {
+        match crate::tool_global::ledger_lock_rows(guest).await {
+            Ok(rows) => rows
+                .iter()
+                .enumerate()
+                .map(|(index, (lock, owner))| {
+                    format!(
+                        "{}: {} {} {} {owner} {} {} {}\n",
+                        index + 1,
+                        lock.class,
+                        lock.mode,
+                        lock.access,
+                        lock.object,
+                        lock.start,
+                        lock.end
+                    )
+                })
+                .collect::<String>()
+                .into_bytes(),
+            Err(reason) => {
+                let reason =
+                    format!("/proc/locks: {reason}; Detcore cannot render that description's rows");
+                self.refuse_lock_bookkeeping(guest, reason).await
+            }
+        }
     }
 
     /// Stop the run, by name, with the policy-refusal exit, because Detcore
@@ -13977,6 +14723,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.set_guest_held())?;
+        // Its fdinfo's `eventfd-semaphore`, which no call reads back.
+        guest.thread_state().with_detfd(fd, |detfd| {
+            detfd.set_fdinfo_facts(FdinfoFacts::Eventfd {
+                semaphore: call.flags().bits() & libc::EFD_SEMAPHORE != 0,
+            })
+        })?;
         if internally_nonblocking {
             self.maybe_set_nonblocking_fd(guest, fd);
         }
@@ -14025,15 +14777,65 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             crate::tool_global::register_signalfd(guest, detpid, mask).await;
         }
-        self.add_fd(
-            guest,
-            signalfd,
-            OFlag::from_bits_truncate(
-                call.flags().bits() & (libc::SFD_CLOEXEC | libc::SFD_NONBLOCK),
-            ),
-            FdType::Signalfd,
-        )
-        .await?;
+        // A call on an existing signalfd (`ufd` not -1) changes that one
+        // context's mask (`do_signalfd4`, fs/signalfd.c): every descriptor of
+        // the description reads the new mask, and the call's flags, which
+        // Linux only validates, change nothing. Only a new signalfd is a new
+        // description (https://github.com/rrnewton/hermit/issues/4914). An
+        // update of a descriptor Detcore does not model as a signalfd (one it
+        // classified otherwise) is modelled as one from now on, with the
+        // status flags it had. A named residual: an update of a descriptor
+        // Detcore keeps no model of at all (one received over `SCM_RIGHTS`
+        // that the receipt did not record; Hermit closes every inherited
+        // descriptor above 2 at entry) is modelled from the call's flags, as
+        // every update was before, since its own flags would take injected
+        // `F_GETFL` and `F_GETFD` calls that no recording holds.
+        let modelled = if call.fd() == -1 {
+            None
+        } else {
+            guest
+                .thread_state()
+                .with_detfd(signalfd, |detfd| {
+                    (
+                        detfd.ty() == FdType::Signalfd,
+                        detfd.status_flags(),
+                        detfd.is_cloexec(),
+                    )
+                })
+                .ok()
+        };
+        let creation_flags = OFlag::from_bits_truncate(
+            call.flags().bits() & (libc::SFD_CLOEXEC | libc::SFD_NONBLOCK),
+        );
+        match modelled {
+            Some((true, _, _)) => {}
+            Some((false, status_flags, cloexec)) => {
+                let kept = OFlag::from_bits_truncate(status_flags & libc::O_NONBLOCK)
+                    | if cloexec {
+                        OFlag::O_CLOEXEC
+                    } else {
+                        OFlag::empty()
+                    };
+                self.add_fd(guest, signalfd, kept, FdType::Signalfd).await?;
+            }
+            None => {
+                self.add_fd(guest, signalfd, creation_flags, FdType::Signalfd)
+                    .await?;
+            }
+        }
+        // Its fdinfo's `sigmask:`, which no call reads back: the mask this
+        // call set, which Linux keeps without SIGKILL and SIGSTOP
+        // (`signalfd4`, fs/signalfd.c), on the description every alias
+        // shares. A mask Detcore could not read leaves none, and that fdinfo
+        // is not rendered.
+        if let Some(mask) = mask {
+            let unblockable = (1u64 << (libc::SIGKILL - 1)) | (1u64 << (libc::SIGSTOP - 1));
+            guest.thread_state().with_detfd(signalfd, |detfd| {
+                detfd.set_fdinfo_facts(FdinfoFacts::Signalfd {
+                    mask: mask & !unblockable,
+                })
+            })?;
+        }
         Ok(signalfd as i64)
     }
 
@@ -14067,6 +14869,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Timerfd,
         )
         .await?;
+        // Its fdinfo's `clockid:`, which no call reads back.
+        {
+            use reverie::syscalls::FromToRaw;
+            let clockid = call.clockid().into_raw() as i32;
+            guest.thread_state().with_detfd(fd, |detfd| {
+                detfd.set_fdinfo_facts(FdinfoFacts::Timerfd {
+                    clockid,
+                    settime_flags: 0,
+                    linux: crate::fd::LinuxTimerfd::default(),
+                })
+            })?;
+        }
         if internally_nonblocking {
             self.maybe_set_nonblocking_fd(guest, fd);
         }
@@ -14832,7 +15646,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         // This process now holds the description too, with any OFD or flock
         // lock it holds (`procfs::locks`).
-        self.refresh_description_locks(guest, fd, LockCall::PidfdGetfd)
+        self.refresh_description_locks(guest, fd, LockCall::PidfdGetfd, None)
             .await?;
         Ok(fd as i64)
     }

@@ -18824,16 +18824,20 @@ mod nextest_timeout_tests {
         // (https://github.com/rrnewton/hermit/issues/4930): 105. And
         // run_kvm_refuses_a_finite_soft_address_space_limit_before_the_guest_starts
         // and run_kvm_an_exec_the_host_refuses_memory_for_is_a_policy_refusal_not_a_guest_enomem
-        // (https://github.com/rrnewton/reverie/issues/1225): 107.
+        // (https://github.com/rrnewton/reverie/issues/1225): 107. And package K
+        // slice K8-h's
+        // run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences and
+        // run_kvm_renders_proc_locks_from_the_lock_ledger
+        // (https://github.com/rrnewton/hermit/issues/4213): 109.
         // The spinner is retained but ignored and excluded because its explicit
         // maximum requests an unavailable timer: 106 selected CLI tests remain.
         assert_eq!(
             names.len(),
-            107,
+            109,
             "update the exact CI inventory with new KVM tests"
         );
         names.retain(|name| name != excluded);
-        assert_eq!(names.len(), 106);
+        assert_eq!(names.len(), 108);
         let required_cases = [
             "run_kvm_self_sigkill_from_nonleader_is_group_fatal",
             "run_kvm_synchronous_root_segv_preserves_guest_exit",
@@ -18873,6 +18877,8 @@ mod nextest_timeout_tests {
             "run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit",
             "run_kvm_refuses_a_finite_soft_address_space_limit_before_the_guest_starts",
             "run_kvm_an_exec_the_host_refuses_memory_for_is_a_policy_refusal_not_a_guest_enomem",
+            "run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences",
+            "run_kvm_renders_proc_locks_from_the_lock_ledger",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -19981,8 +19987,12 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // (https://github.com/rrnewton/hermit/issues/4930): 105 selected. And
         // run_kvm_refuses_a_finite_soft_address_space_limit_before_the_guest_starts
         // and run_kvm_an_exec_the_host_refuses_memory_for_is_a_policy_refusal_not_a_guest_enomem
-        // (https://github.com/rrnewton/reverie/issues/1225): 107 selected.
-        ("privileged-only-test.cli_kvm", 107usize),
+        // (https://github.com/rrnewton/reverie/issues/1225): 107 selected. And
+        // package K slice K8-h's
+        // run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences and
+        // run_kvm_renders_proc_locks_from_the_lock_ledger
+        // (https://github.com/rrnewton/hermit/issues/4213): 109 selected.
+        ("privileged-only-test.cli_kvm", 109usize),
     ] {
         let step = privileged
             .steps

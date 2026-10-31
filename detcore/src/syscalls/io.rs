@@ -5259,7 +5259,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<(), Error> {
         if self.cfg.virtualize_time && !self.cfg.recordreplay_modes {
             for &fd in fds {
-                self.refresh_description_locks(guest, fd, call).await?;
+                self.refresh_description_locks(guest, fd, call, None)
+                    .await?;
             }
         }
         Ok(())

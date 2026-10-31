@@ -2221,6 +2221,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
+        // The SIGKILL ends the process as an exit_group does: once the grant
+        // has logically ended the process's other threads, a table only it
+        // holds goes, with what the queues of its sockets held, just before
+        // the call that ends it (`Self::release_table_at_exit`).
+        self.release_table_at_exit(guest, true).await;
         true
     }
 
@@ -3533,6 +3538,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.record_sigkill_robust_lists(guest, reservation.token)
             .await;
         commit_sigkill(guest, reservation.token, true).await;
+        // The caller's own process ends with this send, as with an
+        // exit_group: once the grant has logically ended the process's other
+        // threads, a table only it holds goes, with what the queues of its
+        // sockets held, just before the send (`Self::release_table_at_exit`).
+        self.release_table_at_exit(guest, true).await;
         Ok(self.record_or_replay(guest, call).await?)
     }
 

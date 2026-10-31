@@ -6888,6 +6888,10 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
+        guest_args:
+          kvm:
+            - rendered
+            - ofd
         hermit_args:
           liteinst:
             - --max-timeslice=disabled

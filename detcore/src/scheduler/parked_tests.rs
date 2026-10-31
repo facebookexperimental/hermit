@@ -1677,14 +1677,26 @@ fn a_group_exit_retires_permit_holding_siblings_whose_receipts_settle_them() {
                     7 << 8,
                 )
             };
-            s.consume_signal_boundary(SignalBoundaryReceipt {
-                permit,
-                outcome: SignalBoundaryOutcome::Terminated {
-                    group: true,
-                    wait_status,
-                },
-            })
-            .unwrap();
+            let death = s
+                .consume_signal_boundary(SignalBoundaryReceipt {
+                    permit,
+                    outcome: SignalBoundaryOutcome::Terminated {
+                        group: true,
+                        wait_status,
+                    },
+                })
+                .unwrap();
+            // Only a death no committed exit fenced, a fatal signal's, is
+            // reported, with every thread it ended, for its tables to go
+            // (`GlobalState::release_tables_at_death`); a committed exit let
+            // its table go at its grant.
+            assert_eq!(
+                death,
+                fatal.then(|| super::signal_control::SignalDeath {
+                    process: DetPid::from_raw(100),
+                    threads: vec![issuer, holder, sleeper],
+                })
+            );
             for (sibling, response) in [(holder, &holder_response), (sleeper, &sleeper_response)] {
                 assert!(s.thread_is_logically_killed(sibling));
                 assert!(!s.next_turns.contains_key(&sibling));
@@ -1715,9 +1727,11 @@ fn a_group_exit_retires_permit_holding_siblings_whose_receipts_settle_them() {
                 },
             };
             for permit in [held, observed.permit] {
-                s.consume_signal_boundary(follower(permit)).unwrap();
+                // A follower settles its permit only: the group's death was
+                // reported once, by the receipt that committed it.
+                assert_eq!(s.consume_signal_boundary(follower(permit)).unwrap(), None);
                 // An exact duplicate is acknowledged, never applied again.
-                s.consume_signal_boundary(follower(permit)).unwrap();
+                assert_eq!(s.consume_signal_boundary(follower(permit)).unwrap(), None);
             }
             assert!(s.parked.permits.is_empty());
             assert_eq!(s.parked.terminal_processes.len(), 1);
@@ -2311,7 +2325,11 @@ fn committed_exit_boundary_fences_later_turns_until_exact_terminal_receipt() {
             },
             ..wrong
         };
-        s.consume_signal_boundary(receipt).unwrap();
+        assert_eq!(
+            s.consume_signal_boundary(receipt).unwrap(),
+            None,
+            "a committed exit let its table go at its grant"
+        );
         assert!(!s.parked.exit_fences.contains_key(&leader));
         assert!(!s.parked.permits.contains_key(&leader));
         assert_eq!(s.control_barrier(), group);
@@ -3151,14 +3169,23 @@ fn fatal_signal_final_transition_installs_stage_two_before_stage_one_retires() {
         .authorize_signal_boundary(task(200, 200))
         .unwrap()
         .unwrap();
-    s.consume_signal_boundary(SignalBoundaryReceipt {
-        permit,
-        outcome: SignalBoundaryOutcome::Terminated {
-            group: true,
-            wait_status: libc::SIGKILL,
-        },
-    })
-    .unwrap();
+    let death = s
+        .consume_signal_boundary(SignalBoundaryReceipt {
+            permit,
+            outcome: SignalBoundaryOutcome::Terminated {
+                group: true,
+                wait_status: libc::SIGKILL,
+            },
+        })
+        .unwrap();
+    assert_eq!(
+        death,
+        Some(super::signal_control::SignalDeath {
+            process: DetPid::from_raw(200),
+            threads: vec![child],
+        }),
+        "a fatal signal's death is reported for its table to go"
+    );
 
     let child_key = ProcessGeneration::from_backend(task(200, 200).process);
     assert!(!s.parked.permits.contains_key(&child));
@@ -3180,15 +3207,19 @@ fn fatal_signal_final_transition_installs_stage_two_before_stage_one_retires() {
         .reserve_exit_boundary(child, DetPid::from_raw(200), child_mm, true)
         .unwrap();
     let permit = reserved.parked.exit_fences[&child].permit;
-    reserved
-        .consume_signal_boundary(SignalBoundaryReceipt {
-            permit,
-            outcome: SignalBoundaryOutcome::Terminated {
-                group: true,
-                wait_status: libc::SIGKILL,
-            },
-        })
-        .unwrap();
+    assert_eq!(
+        reserved
+            .consume_signal_boundary(SignalBoundaryReceipt {
+                permit,
+                outcome: SignalBoundaryOutcome::Terminated {
+                    group: true,
+                    wait_status: libc::SIGKILL,
+                },
+            })
+            .unwrap(),
+        None,
+        "a self-SIGKILL's fenced exit let its table go at its grant"
+    );
     let event = child_exit_event(
         task(100, 100).process,
         task(200, 200).process,

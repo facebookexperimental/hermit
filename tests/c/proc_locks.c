@@ -13,7 +13,15 @@
 
 #define SNAPSHOT_CAP (256 * 1024)
 
-static int take_lock(int fd) {
+/*
+ * Take a whole-file write lock on `fd` with the call LOCK_API selects, or with
+ * F_OFD_SETLK whatever it selects (`ofd`).
+ */
+static int take_lock(int fd, int ofd) {
+  if (ofd) {
+    struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+    return fcntl(fd, F_OFD_SETLK, &lock);
+  }
 #if LOCK_API == 1
   struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
   return fcntl(fd, F_SETLK, &lock);
@@ -93,7 +101,22 @@ static int open_and_read(const char* path, char* snapshot) {
   return count <= 0 || check_virtual_graph(snapshot);
 }
 
-int main(void) {
+/*
+ * Usage: proc_locks [rendered [ofd]]. Without an argument, /proc/locks is a
+ * snapshot Hermit serves of the kernel's file, where vectored reads are a
+ * named limitation (ENOSYS); with "rendered", it is a file Hermit renders
+ * itself (KVM, from Detcore's lock ledger), where they answer as Linux does.
+ * With "ofd", the locks are OFD locks whatever LOCK_API selects: KVM's
+ * provider holds a record lock (F_SETLK, lockf) as an OFD lock, whose
+ * /proc/locks rows Hermit refuses by name
+ * (https://github.com/rrnewton/reverie/issues/1223).
+ */
+int main(int argc, char** argv) {
+  int rendered = argc > 1 && strcmp(argv[1], "rendered") == 0;
+  int ofd = argc > 2 && strcmp(argv[2], "ofd") == 0;
+  if (argc > 3 || (argc >= 2 && !rendered) || (argc == 3 && !ofd)) {
+    return 2;
+  }
   char first_path[96];
   char second_path[96];
   snprintf(
@@ -105,8 +128,8 @@ int main(void) {
       LOCK_API);
   int first = open(first_path, O_CREAT | O_RDWR | O_TRUNC, 0600);
   int second = open(second_path, O_CREAT | O_RDWR | O_TRUNC, 0600);
-  if (first < 0 || second < 0 || take_lock(first) < 0 ||
-      take_lock(second) < 0) {
+  if (first < 0 || second < 0 || take_lock(first, ofd) < 0 ||
+      take_lock(second, ofd) < 0) {
     return 1;
   }
 
@@ -152,13 +175,26 @@ int main(void) {
   }
 
   struct iovec vector = {.iov_base = positioned, .iov_len = sizeof(positioned)};
-  errno = 0;
-  if (readv(locks, &vector, 1) != -1 || errno != ENOSYS) {
-    return 1;
-  }
-  errno = 0;
-  if (preadv(locks, &vector, 1, 0) != -1 || errno != ENOSYS) {
-    return 1;
+  if (rendered) {
+    /* Linux's answers: the end of the file for readv, whose position the
+     * reads above left there, and the file's first bytes for preadv at 0. */
+    if (readv(locks, &vector, 1) != 0) {
+      return 1;
+    }
+    memset(positioned, 0, sizeof(positioned));
+    if (preadv(locks, &vector, 1, 0) != (ssize_t)sizeof(positioned) ||
+        memcmp(positioned, direct, sizeof(positioned)) != 0) {
+      return 1;
+    }
+  } else {
+    errno = 0;
+    if (readv(locks, &vector, 1) != -1 || errno != ENOSYS) {
+      return 1;
+    }
+    errno = 0;
+    if (preadv(locks, &vector, 1, 0) != -1 || errno != ENOSYS) {
+      return 1;
+    }
   }
 
   puts("proc-locks-virtual-graph-and-aliases-ok");

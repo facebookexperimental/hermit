@@ -986,6 +986,21 @@ pub struct Config {
     #[clap(skip)]
     pub guest_ids: crate::pid::GuestIds,
 
+    /// **Internal:** For each of the guest's standard streams 0, 1 and 2, the lowest of them that
+    /// is one open file description with it, as `kcmp(KCMP_FILE)` answered for the descriptors
+    /// the launcher hands the guest (Hermit's KVM launch, where the guest's output is not
+    /// captured: the stdin it reserved, and its own standard output and error, which the
+    /// executor passes through). `None` where that is not known (any other launch, a captured or
+    /// replaced stream, or a kernel that refuses kcmp): each stream is then a description of its
+    /// own. Detcore's lock ledger takes the streams of one group as the one description they are
+    /// (package K slice K8-h). The backend's own answer, a provider query naming which guest
+    /// descriptors are one host description, would also cover descriptors no launcher hands
+    /// over; no backend offers one yet. The DBT backend's runtime reads the frozen legacy form
+    /// ([`to_legacy_backend_json`]), which leaves this field out.
+    #[serde(default)]
+    #[clap(skip)]
+    pub standard_stream_aliases: Option<[u8; 3]>,
+
     /// **Internal:** Path to the replay data folder.
     #[clap(skip)]
     pub replay_data: Option<PathBuf>,
@@ -3031,7 +3046,9 @@ impl Default for Config {
 /// false. So is [`Config::notice_host_network_abstract_binds`], added after this form
 /// froze, which reads back as false: DBT's runtime then prints no notice for
 /// an abstract `AF_UNIX` bind. So is [`Config::eager_lone_preemptions`], added after this form froze,
-/// which has no effect without a PMU timer and reads back as false. Every
+/// which has no effect without a PMU timer and reads back as false. So is
+/// [`Config::standard_stream_aliases`], added after this form froze, set only for KVM, which
+/// reads back as unset. Every
 /// other field is serialized exactly as `serde_json::to_string(config)`
 /// serializes it.
 ///
@@ -3600,7 +3617,9 @@ mod legacy_backend_json {
     // reads as absent, its serde default.
     /// `replay_continue_fairly` came after it too; only the scheduler reads
     /// it, so it is never written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 45] = [
+    /// `standard_stream_aliases` came after it too, and is set only for KVM;
+    /// it is never written and reads as unset.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 46] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3646,6 +3665,7 @@ mod legacy_backend_json {
         "access_trace_max_records",
         "access_trace_max_bytes",
         "replay_continue_fairly",
+        "standard_stream_aliases",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3821,7 +3841,8 @@ mod legacy_backend_json {
                     | "chaos_timeslice"
                     | "access_trace"
                     | "access_trace_max_records"
-                    | "access_trace_max_bytes",
+                    | "access_trace_max_bytes"
+                    | "standard_stream_aliases",
                 ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
@@ -4139,7 +4160,8 @@ mod legacy_backend_json {
                 | "chaos_timeslice_draw"
                 | "chaos_timeslice"
                 | "guest_ids"
-                | "detlog_anon" => Ok(()),
+                | "detlog_anon"
+                | "standard_stream_aliases" => Ok(()),
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
@@ -5045,7 +5067,8 @@ mod tests {
                 | "chaos_timeslice_draw"
                 | "chaos_timeslice"
                 | "guest_ids"
-                | "detlog_anon" => {}
+                | "detlog_anon"
+                | "standard_stream_aliases" => {}
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
@@ -5084,11 +5107,12 @@ mod tests {
         // `chaos_timeslice_range`, `chaos_timeslice_draw`, `chaos_timeslice`,
         // `guest_ids`, `virtual_timeout`, `detlog_anon`,
         // `access_trace`, `access_trace_from`, `access_trace_max_records`,
-        // `access_trace_max_bytes`, `replay_continue_fairly` and
-        // `strict_schedule_boundaries` none: fourteen more keys and
-        // forty-four fewer, so thirty keys fewer than fields.
+        // `access_trace_max_bytes`, `replay_continue_fairly`,
+        // `standard_stream_aliases` and `strict_schedule_boundaries` none:
+        // fourteen more keys and forty-five fewer, so thirty-one keys fewer
+        // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 30);
+        assert_eq!(fields.len(), keys.len() + 31);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:

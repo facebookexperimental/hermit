@@ -976,13 +976,22 @@ impl Scheduler {
             .is_some_and(|terminal| terminal.process == process && terminal.status == status)
     }
 
+    /// Consume a backend's signal-boundary receipt. A terminal receipt that
+    /// ended its process without a committed exit of its own (no exit fence:
+    /// the default action of a fatal signal, not an `exit`, an `exit_group`
+    /// or a `SIGKILL` the process sent itself, whose grant fenced the exit),
+    /// and that is not a committed group's follower, comes back as the
+    /// process's [`SignalDeath`], for the caller to let go of its threads'
+    /// descriptor tables (`GlobalState::release_tables_at_death`) while the
+    /// control barrier it installed (the child's exit reservation, or the
+    /// process's retirement) still holds every later turn.
     pub(crate) fn consume_signal_boundary(
         &mut self,
         receipt: SignalBoundaryReceipt,
-    ) -> Result<(), reverie::Error> {
+    ) -> Result<Option<SignalDeath>, reverie::Error> {
         let tid = DetTid::from_raw(receipt.permit.task.tid.as_raw());
         if self.parked.completed.get(&tid) == Some(&receipt) {
-            return Ok(());
+            return Ok(None);
         }
         if self.parked.permits.get(&tid) != Some(&receipt.permit) {
             return Err(reverie::syscalls::Errno::EINVAL.into());
@@ -1004,6 +1013,7 @@ impl Scheduler {
         // changing any membership or consuming the permit.
         let mut retire = Vec::new();
         let mut final_transition = None;
+        let mut death = None;
         if let SignalBoundaryOutcome::Terminated { group, wait_status } = receipt.outcome {
             let pid = DetPid::from_raw(receipt.permit.task.process.tgid.as_raw());
             let current = self.real_timers.task_identity(pid, tid);
@@ -1060,6 +1070,17 @@ impl Scheduler {
                         ExitStatus::from_raw(wait_status),
                     )
                     .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
+                if exit_fence.is_none() && final_transition.is_some() {
+                    let mut threads: Vec<DetTid> =
+                        retire.iter().map(|(target, _, _)| *target).collect();
+                    threads.push(tid);
+                    threads.sort_unstable();
+                    threads.dedup();
+                    death = Some(SignalDeath {
+                        process: pid,
+                        threads,
+                    });
+                }
             }
         }
         // Cleanup/failure may already have logically killed the task. Exact
@@ -1095,8 +1116,18 @@ impl Scheduler {
         if exit_fence.is_some() {
             self.wake_control_waiter();
         }
-        Ok(())
+        Ok(death)
     }
+}
+
+/// A process a terminal receipt ended without a committed exit of its own: by
+/// the default action of a fatal signal (`Scheduler::consume_signal_boundary`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SignalDeath {
+    /// The process that ended.
+    pub(crate) process: DetPid,
+    /// Its threads the receipt ended, the receipt's own included, in order.
+    pub(crate) threads: Vec<DetTid>,
 }
 
 /// Never call the backend's RunFailure publisher with the scheduler mutex held:

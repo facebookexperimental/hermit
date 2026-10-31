@@ -58,18 +58,49 @@
 //!   copied DBT `vfork` child runs `LOCK_UN` natively), and a stale record
 //!   would admit a host process's identical flock where the guest's procfs is
 //!   not namespace-private (`--no-namespace`). This also hides another
-//!   process's POSIX and flock rows there;
-//! - TEMPORARY EXEMPTION, for KVM only in practice: a row whose object is on
-//!   device `00:00`. KVM keeps a backend-local copy of `/proc/locks`, built
-//!   from the supervisor's fdinfo `lock:` lines for the guest's own files, and
-//!   prints every row there as `00:00:N` with owner `-1`, so no guest
-//!   description's lock line (which names the real device) matches it, and
-//!   this filter would otherwise drop all of them. Linux itself never prints
-//!   `00:00` for a lockable object (an anonymous device's minor starts at 1),
-//!   so no kernel row is kept by this rule. This is not Linux behaviour being
-//!   modelled: it is an exemption for one backend's local file, to be removed
-//!   when package K replaces KVM's local `/proc/locks` with Detcore's own
-//!   rendering (slice K8).
+//!   process's POSIX and flock rows there.
+//!
+//! Where the guest's procfs is not the kernel's (KVM, whose provider kept a
+//! backend-local `/proc/locks` until package K slice K8), there is no kernel
+//! file to filter: Detcore renders the rows from this ledger itself
+//! ([`LockLedger::rendered_rows`]), which learns each description's locks
+//! from the backend's `descriptor_status` fact instead of an fdinfo
+//! (`Detcore::refresh_description_locks`), and the rows go through the same
+//! sanitizer. KVM's provider holds a guest record lock as an OFD lock of its
+//! description (<https://github.com/rrnewton/reverie/issues/1223>), which
+//! would be shown as `OFDLCK` with owner -1 for as long as the description is
+//! referenced, shared by every process that holds it, where Linux shows a
+//! `POSIX` lock with its taker's pid until the taker closes any descriptor of
+//! the file or exits: a snapshot that would show an OFD lock on a file on
+//! which the guest took a record lock is refused by name
+//! ([`LockLedger::record_lock_held_as_ofd`]). fdinfo lists no waiters, so no
+//! waiter row is shown: a named difference (package K decision 7.5). A copy
+//! in flight whose release Detcore cannot place in the guest's schedule
+//! stays counted, and its locks listed, after the host has released them (a
+//! receiving socket that went with a table Detcore did not let go:
+//! `crate::syscalls::scm_rights`'s residuals; the terminal receipt of a
+//! death by a fatal signal lets go of the dying threads' tables, and refuses
+//! every later snapshot by name where it cannot decide which). Each
+//! description's locks are their own rows, as Linux lists each lock object,
+//! so two descriptions holding identical shared locks show two rows there,
+//! unlike the kernel snapshot's filter below; only a description that may be
+//! a second identity of another shares a row with an identical lock
+//! ([`LockLedger::rendered_rows`]): one recorded on reception as a
+//! description of its own, which Detcore could not join to the description
+//! its sender's table modeled (a received descriptor that joined it is that
+//! description, not a second identity). The container's standard streams,
+//! which Detcore's model gives an identity each though the launcher may have
+//! passed one description on several, are taken as one description exactly
+//! where the launcher's `kcmp(KCMP_FILE)` of the descriptors it handed the
+//! guest said they are one (`Config::standard_stream_aliases`, which Detcore
+//! applies when it sets them up; [`LockLedger::alias_groups`]): their locks
+//! are one row, and a call through
+//! any of them gives every identity of the group, in every table, the locks
+//! the call left. A lock's owner is
+//! the guest process a call was proved to take it in (the description's
+//! locks just before the call against those after it,
+//! `syscalls::files::locks_taken`), so a lock held already when Detcore
+//! first read the description is never the caller's.
 //!
 //! Within a group that stays, a waiter row stays only when a guest process
 //! owns it. A group whose granted row goes, goes whole, as Linux drops a whole
@@ -240,16 +271,6 @@ impl HeldLock {
         }
     }
 
-    /// Whether the object is on device `00:00`: the temporary KVM exemption
-    /// (see the module comment), removed when package K slice K8 replaces
-    /// KVM's local `/proc/locks`. Linux never prints that device for a
-    /// lockable object.
-    fn on_null_device(&self) -> bool {
-        let mut parts = self.object.split(':');
-        let number = |part: Option<&str>| part.and_then(|part| u32::from_str_radix(part, 16).ok());
-        number(parts.next()) == Some(0) && number(parts.next()) == Some(0)
-    }
-
     /// Whether Linux ties this lock to an open file description rather than
     /// to a task: an OFD lock or a flock.
     fn belongs_to_a_description(&self) -> bool {
@@ -354,10 +375,7 @@ pub(crate) fn guest_lock_rows(
         if row.waiter {
             continue;
         }
-        // TEMPORARY EXEMPTION for KVM's backend-local `/proc/locks`
-        // (`HeldLock::on_null_device`); removed with package K slice K8.
-        keep[index] = row.lock.on_null_device()
-            || owned[index]
+        keep[index] = owned[index]
             || (row.lock.kept_by_field_match()
                 && unclaimed.get_mut(&row.lock).is_some_and(|count| {
                     let available = *count > 0;
@@ -371,7 +389,8 @@ pub(crate) fn guest_lock_rows(
     for (index, row) in rows.iter().enumerate() {
         if row.waiter {
             keep[index] = kept_groups.contains(row.sequence.as_str())
-                && (row.lock.on_null_device() || (row.owner > 0 && guest_process(row.owner)));
+                && row.owner > 0
+                && guest_process(row.owner);
         }
     }
     keep
@@ -418,7 +437,12 @@ type Table = u64;
 ///
 /// Where it cannot follow a reference exactly, the ledger forgets it, which
 /// hides the guest's own row; it never keeps one it has not seen, which would
-/// show a host's.
+/// show a host's. One exception, named: a copy in flight whose release
+/// Detcore cannot place in the guest's schedule (a receiving socket that went
+/// with a table Detcore did not let go, `crate::syscalls::scm_rights`'s
+/// residuals) stays counted for the rest of the run, so where `/proc/locks`
+/// is rendered from the ledger (KVM) its locks stay listed after the host has
+/// released them.
 #[derive(Debug, Default)]
 pub(crate) struct LockLedger {
     next_table: Table,
@@ -426,10 +450,10 @@ pub(crate) struct LockLedger {
     owners: BTreeMap<Table, BTreeSet<DetPid>>,
     references: BTreeMap<OpenFileId, BTreeMap<Table, u32>>,
     locks: BTreeMap<OpenFileId, DescriptionLocks>,
-    /// The locks the descriptions of a process's table held when it
+    /// What the ledger knew of the descriptions of a process's table when it
     /// completed an exec ([`LockLedger::exec`]), for those its new table names
     /// as survivors ([`LockLedger::exec_kept`]).
-    after_exec: BTreeMap<DetPid, BTreeMap<OpenFileId, DescriptionLocks>>,
+    after_exec: BTreeMap<DetPid, BTreeMap<OpenFileId, KeptDescription>>,
     /// Processes whose new table, after an exec ([`LockLedger::exec`]),
     /// still references the descriptions of the old one that hold a `flock`
     /// on a placeholder directory, until the exec names its survivors
@@ -488,6 +512,98 @@ pub(crate) struct LockLedger {
     /// The write hint of each placeholder directory's inode whose hint a
     /// guest set (`F_SET_RW_HINT`, [`LockLedger::placeholder_write_hint`]).
     placeholder_write_hints: BTreeMap<crate::procfs::fd_directory::PlaceholderLockKey, u64>,
+    /// The guest process that took each lock a description holds, where
+    /// Detcore saw the call that took it ([`LockLedger::note_locks_taken`]):
+    /// the process Linux names on a non-OFD lock's line (`fl_pid`), which a
+    /// lock line Detcore renders shows ([`LockLedger::owners`]). A lock that
+    /// was already held when Detcore first read it (an inherited or received
+    /// description) has none. Kept while the description holds the lock.
+    takers: BTreeMap<OpenFileId, BTreeMap<HeldLock, DetPid>>,
+    /// Descriptions that may be a second identity of one the ledger knows
+    /// under another, whose locks they then list again
+    /// ([`LockLedger::rendered_rows`]), where the ledger takes the backend's
+    /// fact: one recorded on reception (`SCM_RIGHTS` or `pidfd_getfd`) as a
+    /// description of its own, which may be the sender's (one that joined the
+    /// description its sender's table modeled is that description, and no
+    /// second identity) ([`LockLedger::note_second_identity_locks`], and
+    /// [`LedgerIdentity::Received`]). Kept while some table references the
+    /// description, and across an exec that keeps it
+    /// ([`LockLedger::exec_kept`]).
+    second_identities: BTreeSet<OpenFileId>,
+    /// The container's standard streams that are one open file description
+    /// with others, by identity, with their group's key
+    /// ([`LedgerIdentity::StandardStreams`]): the launcher may pass one
+    /// description on several (`<>file >&0`, `>log 2>&1`), each of which
+    /// Detcore models with an identity of its own, and the launcher's
+    /// `kcmp(KCMP_FILE)` of the descriptors it handed the guest said which
+    /// (`Config::standard_stream_aliases`). A call through any of them changes the
+    /// one description's locks, so every identity of the group a table
+    /// references holds the locks the last call read, in whichever table it
+    /// is ([`LockLedger::reconcile_aliases`]), and the group's locks are one
+    /// row each ([`LockLedger::rendered_rows`]). Kept while some table
+    /// references the identity, and across an exec that keeps it.
+    alias_groups: BTreeMap<OpenFileId, OpenFileId>,
+    /// The files, as a lock line spells its object (`MAJOR:MINOR:INODE`), on
+    /// which a guest's record-lock request (`F_SETLK`, `F_SETLKW`) succeeded
+    /// while the backend held the lock it took as an OFD lock of the open
+    /// file description, where the ledger takes the backend's fact
+    /// ([`LockLedger::note_record_locks_held_as_ofd`]): KVM's provider holds
+    /// every record lock so (<https://github.com/rrnewton/reverie/issues/1223>).
+    /// Linux shows such a lock as `POSIX` with its taker's pid, and releases
+    /// it at the taker's close of any descriptor of the file or at its exit;
+    /// the backend's lock shows as `OFDLCK` with owner -1 and stays while the
+    /// description is referenced, through a fork or a copy in flight. A row
+    /// rendered as `POSIX` would not be faithful either: a conflicting lock
+    /// gets what the host's OFD lock decides. So no OFD lock on such a file is
+    /// shown for the rest of the run: a `/proc/locks` snapshot or a fdinfo
+    /// read that would show one is refused by name
+    /// ([`LockLedger::record_lock_held_as_ofd`]), as is one that would show an
+    /// OFD lock the guest took itself on that file (named).
+    record_locks_held_as_ofd: BTreeSet<String>,
+    /// Such a request succeeded through a descriptor whose locks the backend's
+    /// fact could not report after it: the file is unknown, so every OFD lock
+    /// may be such a lock ([`LockLedger::record_lock_held_as_ofd`]).
+    record_lock_held_as_ofd_anywhere: bool,
+}
+
+/// What a description is besides its own identity in Detcore's model, where
+/// the ledger takes the backend's fact (package K slice K8-h): whether
+/// another identity may name its open file description, and, where Detcore
+/// knows, which.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LedgerIdentity {
+    /// Detcore knows of no other identity of its open file description.
+    Own,
+    /// Recorded on reception (`SCM_RIGHTS`) as a description of its own,
+    /// which Detcore could not join to the description its sender's table
+    /// modeled: it may be a second identity of one the ledger knows
+    /// ([`LockLedger::second_identities`]).
+    Received,
+    /// One of the container's standard streams that is one open file
+    /// description with others, as the launcher's `kcmp(KCMP_FILE)` of the
+    /// descriptors it handed the guest answered ([`LockLedger::alias_groups`]).
+    StandardStreams {
+        /// The group's key: the identity of its lowest stream.
+        group: OpenFileId,
+        /// The group's identities the caller's table names, each with how
+        /// many of its slots name it, the caller's own among them.
+        members: Vec<(OpenFileId, u32)>,
+    },
+}
+
+/// What the ledger knew of a description of a process's table when the
+/// process completed an exec ([`LockLedger::exec`]), which a survivor keeps
+/// ([`LockLedger::exec_kept`]): its locks, the process that took each (Linux
+/// keeps a lock's `fl_pid`, the taker's tgid, which an exec does not change),
+/// whether it may be a second identity of another
+/// ([`LockLedger::second_identities`]), and its alias group
+/// ([`LockLedger::alias_groups`]).
+#[derive(Debug, Clone)]
+struct KeptDescription {
+    locks: DescriptionLocks,
+    takers: BTreeMap<HeldLock, DetPid>,
+    second_identity: bool,
+    alias_group: Option<OpenFileId>,
 }
 
 /// A change to the copies in flight over `SCM_RIGHTS`
@@ -572,6 +688,16 @@ impl LockLedger {
         table
     }
 
+    /// Everything the ledger knows of `open_file`, which no table references
+    /// and no copy in flight holds any longer: its locks, their takers, and
+    /// whether it is a second identity or a standard stream of an alias group.
+    fn forget(&mut self, open_file: OpenFileId) {
+        self.locks.remove(&open_file);
+        self.takers.remove(&open_file);
+        self.second_identities.remove(&open_file);
+        self.alias_groups.remove(&open_file);
+    }
+
     fn set_references(&mut self, open_file: OpenFileId, table: Table, slots: u32) {
         let references = self.references.entry(open_file).or_default();
         if slots == 0 {
@@ -583,7 +709,7 @@ impl LockLedger {
             self.references.remove(&open_file);
             // A copy in flight still holds the description's locks.
             if !self.in_flight.contains_key(&open_file) {
-                self.locks.remove(&open_file);
+                self.forget(open_file);
             }
             // Linux releases a description's `flock` locks with its last
             // reference (`locks_remove_file`, from `__fput`).
@@ -720,13 +846,25 @@ impl LockLedger {
         Ok(())
     }
 
+    /// Whether any copy is in flight ([`Self::in_flight`]).
+    pub(crate) fn counts_copies_in_flight(&self) -> bool {
+        !self.in_flight.is_empty()
+    }
+
+    /// Whether a thread of `process` has a descriptor table of its own
+    /// ([`Self::mark_private_tables`]), so that its tables cannot be told
+    /// apart.
+    pub(crate) fn has_private_tables(&self, process: DetPid) -> bool {
+        self.tainted.contains(&process)
+    }
+
     fn uncount_copy(&mut self, open_file: OpenFileId) {
         if let Some(count) = self.in_flight.get_mut(&open_file) {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 self.in_flight.remove(&open_file);
                 if !self.references.contains_key(&open_file) {
-                    self.locks.remove(&open_file);
+                    self.forget(open_file);
                 }
             }
         }
@@ -804,8 +942,186 @@ impl LockLedger {
         let table = self.table_of(process);
         self.set_references(open_file, table, slots);
         if self.references.contains_key(&open_file) {
+            // A lock the description no longer holds has no taker; one it
+            // still holds keeps its own.
+            if let Some(takers) = self.takers.get_mut(&open_file) {
+                match &locks {
+                    Ok(held) => takers.retain(|lock, _| held.contains(lock)),
+                    Err(_) => takers.clear(),
+                }
+            }
             self.locks.insert(open_file, locks);
+            self.reconcile_aliases(open_file);
         }
+    }
+
+    /// Give every identity of `open_file`'s alias group that a table still
+    /// references, or that a queued `SCM_RIGHTS` copy holds
+    /// ([`Self::alias_groups`], [`Self::in_flight`]), the locks and takers
+    /// `open_file` holds now: they are one open file description, whose locks
+    /// a call through any of them changed, in whichever process's table or
+    /// queued message each is. A member only a queued copy holds still counts
+    /// (`Self::counts`), so one left behind would keep showing the locks the
+    /// description held before the call.
+    fn reconcile_aliases(&mut self, open_file: OpenFileId) {
+        let Some(group) = self.alias_groups.get(&open_file).copied() else {
+            return;
+        };
+        let Some(locks) = self.locks.get(&open_file).cloned() else {
+            return;
+        };
+        let takers = self.takers.get(&open_file).cloned();
+        let others = self
+            .alias_groups
+            .iter()
+            .filter(|(member, key)| {
+                **key == group
+                    && **member != open_file
+                    && (self.references.contains_key(*member)
+                        || self.in_flight.contains_key(*member))
+            })
+            .map(|(member, _)| *member)
+            .collect::<Vec<_>>();
+        for member in others {
+            self.locks.insert(member, locks.clone());
+            match &takers {
+                Some(takers) => {
+                    self.takers.insert(member, takers.clone());
+                }
+                None => {
+                    self.takers.remove(&member);
+                }
+            }
+        }
+    }
+
+    /// As [`Self::note_locks`], after a call of `process`'s that can take a
+    /// lock through the description (`F_SETLK`, `F_OFD_SETLK`, `flock`,
+    /// `F_SETLEASE`): `taken`, the locks the call proved it took (the caller
+    /// compares the description's locks just before the call with `locks`
+    /// after it, `syscalls::files::locks_taken`), were taken by `process`,
+    /// as Linux records the caller in a new lock (`flc_pid`,
+    /// `current->tgid`). Every other lock keeps its taker, or has none: one
+    /// the description held already when Detcore first read it (inherited, or
+    /// received) is never the caller's, whatever the call. A lease that the
+    /// call changed in place (a lease of another type through the same
+    /// description) keeps the taker of the lease it replaces, as Linux
+    /// changes the type of the existing lease (`lease_modify`).
+    /// `identity`: whether the description may be a second identity of
+    /// another (one recorded on reception as a description of its own), or is
+    /// one of a group of the container's standard streams that are one
+    /// description, each of which the caller's table names then holds the
+    /// same locks through its own slots ([`LedgerIdentity`]).
+    ///
+    /// A named residual, unreachable where the ledger takes the fact today
+    /// (KVM's provider holds a record lock as an OFD lock, whose owner is
+    /// -1): a POSIX unlock that trims or splits a record lock leaves pieces
+    /// whose taker Linux keeps (the lock trimmed in place, or a
+    /// `locks_copy_lock` of it for a split, in `posix_lock_inode`), while
+    /// the unlock takes nothing, so the ledger knows no taker for them and
+    /// their lines show 0.
+    pub(crate) fn note_locks_taken(
+        &mut self,
+        process: DetPid,
+        open_file: OpenFileId,
+        locks: Vec<HeldLock>,
+        taken: Vec<HeldLock>,
+        slots: u32,
+        identity: LedgerIdentity,
+    ) {
+        let lease_taker = self.takers.get(&open_file).and_then(|takers| {
+            takers
+                .iter()
+                .find(|(lock, _)| lock.class == "LEASE")
+                .map(|(_, taker)| *taker)
+        });
+        let leases = locks
+            .iter()
+            .filter(|lock| lock.class == "LEASE")
+            .cloned()
+            .collect::<Vec<_>>();
+        self.note(process, open_file, Ok(locks.clone()), slots);
+        match &identity {
+            LedgerIdentity::Own => {}
+            LedgerIdentity::Received => {
+                if self.references.contains_key(&open_file) {
+                    self.second_identities.insert(open_file);
+                }
+            }
+            LedgerIdentity::StandardStreams { group, members } => {
+                if self.references.contains_key(&open_file) {
+                    self.alias_groups.insert(open_file, *group);
+                }
+                for (member, member_slots) in members {
+                    if *member == open_file {
+                        continue;
+                    }
+                    self.note(process, *member, Ok(locks.clone()), *member_slots);
+                    if self.references.contains_key(member) {
+                        self.alias_groups.insert(*member, *group);
+                    }
+                }
+            }
+        }
+        if self.references.contains_key(&open_file) {
+            let takers = self.takers.entry(open_file).or_default();
+            for lock in taken {
+                takers.insert(lock, process);
+            }
+            if let Some(taker) = lease_taker {
+                for lease in leases {
+                    takers.entry(lease).or_insert(taker);
+                }
+            }
+            self.reconcile_aliases(open_file);
+        }
+    }
+
+    /// As [`Self::note_locks`], where the ledger takes the backend's fact,
+    /// for a description of `process`'s table that may be a second identity
+    /// of one the ledger knows already ([`Self::second_identities`]), read
+    /// after a call of its own that took no lock: one recorded on reception
+    /// (`SCM_RIGHTS` or `pidfd_getfd`) as a description of its own, which
+    /// Detcore could not join to the description its sender's table modeled.
+    pub(crate) fn note_second_identity_locks(
+        &mut self,
+        process: DetPid,
+        open_file: OpenFileId,
+        locks: Vec<HeldLock>,
+        slots: u32,
+    ) {
+        self.note(process, open_file, Ok(locks), slots);
+        if self.references.contains_key(&open_file) {
+            self.second_identities.insert(open_file);
+        }
+    }
+
+    /// The owner each of `locks`, held through `open_file`, shows on its
+    /// fdinfo line (`lock_get_status`): -1 for an OFD lock
+    /// (`locks_translate_pid`); for any other, the process that took it
+    /// ([`Self::note_locks_taken`]) while `listed` says the reader's PID
+    /// namespace still has it (a live process, or a zombie not yet reaped),
+    /// else 0, as Linux shows a pid the namespace cannot see (a taker outside
+    /// the guest, or gone).
+    pub(crate) fn owners(
+        &self,
+        open_file: OpenFileId,
+        locks: &[HeldLock],
+        listed: &dyn Fn(DetPid) -> bool,
+    ) -> Vec<i64> {
+        let takers = self.takers.get(&open_file);
+        locks
+            .iter()
+            .map(|lock| {
+                if lock.class == "OFDLCK" {
+                    return -1;
+                }
+                match takers.and_then(|takers| takers.get(lock)) {
+                    Some(taker) if listed(*taker) => i64::from(taker.as_raw()),
+                    _ => 0,
+                }
+            })
+            .collect()
     }
 
     /// `remaining` slots of `process`'s table name `open_file` after a close
@@ -880,7 +1196,8 @@ impl LockLedger {
     /// count, so that a survivor's lock is never let go between the two and
     /// another process cannot take a conflicting one (on KVM, without
     /// sequentialized threads, two exclusive locks); `exec_kept` releases the
-    /// ones the exec closed. Any other description's locks are kept aside for
+    /// ones the exec closed. Any other description's locks, their takers and
+    /// whether it may be a second identity of another are kept aside for
     /// `exec_kept`: a backend that rediscovers its descriptor table after an
     /// exec (the in-guest backends, where no placeholder is served) names no
     /// survivor, and the exec then leaves none of them referenced.
@@ -895,7 +1212,15 @@ impl LockLedger {
                 if self.holds_placeholder_flock(*open_file) {
                     held.push((*open_file, *slots));
                 } else if let Some(locks) = self.locks.get(open_file) {
-                    kept.insert(*open_file, locks.clone());
+                    kept.insert(
+                        *open_file,
+                        KeptDescription {
+                            locks: locks.clone(),
+                            takers: self.takers.get(open_file).cloned().unwrap_or_default(),
+                            second_identity: self.second_identities.contains(open_file),
+                            alias_group: self.alias_groups.get(open_file).copied(),
+                        },
+                    );
                 }
             }
         }
@@ -919,8 +1244,9 @@ impl LockLedger {
 
     /// The descriptions whose locks Detcore follows that `process`'s table
     /// names after the exec [`Self::exec`] recorded, with their slot counts:
-    /// each is referenced through the new table with its locks, and a
-    /// description that held a placeholder `flock` and is not among them,
+    /// each is referenced through the new table with its locks, their takers,
+    /// whether it may be a second identity of another and its alias group, and
+    /// a description that held a placeholder `flock` and is not among them,
     /// one the exec closed, is released.
     pub(crate) fn exec_kept(&mut self, process: DetPid, surviving: &[(OpenFileId, u32)]) {
         let kept = self.after_exec.remove(&process).unwrap_or_default();
@@ -942,10 +1268,11 @@ impl LockLedger {
             }
         }
         for (open_file, slots) in surviving {
+            let before = kept.get(open_file);
             let Some(locks) = self
                 .locks
                 .get(open_file)
-                .or_else(|| kept.get(open_file))
+                .or_else(|| before.map(|before| &before.locks))
                 .cloned()
             else {
                 continue;
@@ -953,6 +1280,24 @@ impl LockLedger {
             self.set_references(*open_file, table, *slots);
             if self.references.contains_key(open_file) {
                 self.locks.insert(*open_file, locks);
+                // What else the ledger knew of the description stays with it
+                // where leaving the old table dropped it: the process that
+                // took each lock it holds (Linux keeps a lock's `fl_pid`,
+                // which the exec does not change), whether it may be a second
+                // identity of another, and its alias group, whose identities
+                // then still share a row and its changes
+                // ([`Self::rendered_rows`], [`Self::reconcile_aliases`]).
+                if let Some(before) = before {
+                    if before.second_identity {
+                        self.second_identities.insert(*open_file);
+                    }
+                    if let Some(group) = before.alias_group {
+                        self.alias_groups.insert(*open_file, group);
+                    }
+                    if !before.takers.is_empty() && !self.takers.contains_key(open_file) {
+                        self.takers.insert(*open_file, before.takers.clone());
+                    }
+                }
             }
         }
     }
@@ -1058,6 +1403,61 @@ impl LockLedger {
     /// does one an opaque process's table references, nor a lock on an
     /// aliased inode.
     pub(crate) fn held(&self) -> Vec<HeldLock> {
+        self.held_by_description()
+            .into_iter()
+            .map(|(_, lock)| lock)
+            .collect()
+    }
+
+    /// The `/proc/locks` rows Detcore renders from the ledger where the
+    /// guest's procfs is not the kernel's (package K slice K8-h): one row per
+    /// lock of each description [`Self::held`] counts, with the owner its row
+    /// shows ([`Self::owners`]), as Linux lists each lock object
+    /// (`locks_show`): two descriptions with identical locks (two opens of
+    /// one file holding the same shared lock) are two rows, and one
+    /// description, however many descriptors and processes share it, is one.
+    /// The identities of an alias group of the container's standard streams
+    /// ([`Self::alias_groups`]) are one description, whose locks are one row
+    /// each. A description that may be a second identity of one the ledger
+    /// knows already ([`Self::second_identities`]: one recorded on reception
+    /// as a description of its own) lists that one's locks again, so its lock
+    /// is one row with an identical lock of another description, which is a
+    /// named residual where they are in fact two. A row whose owner the
+    /// reader's PID namespace cannot see (0) is left out, as `locks_show`
+    /// leaves it out (fs/locks.c in v7.1.3).
+    pub(crate) fn rendered_rows(&self, listed: &dyn Fn(DetPid) -> bool) -> Vec<(HeldLock, i64)> {
+        // One identity of each alias group speaks for it: every identity of
+        // the group holds the same locks (`reconcile_aliases`).
+        let mut speakers: BTreeMap<OpenFileId, OpenFileId> = BTreeMap::new();
+        let held = self
+            .held_by_description()
+            .into_iter()
+            .filter(|(open_file, _)| match self.alias_groups.get(open_file) {
+                Some(group) => *speakers.entry(*group).or_insert(*open_file) == *open_file,
+                None => true,
+            })
+            .collect::<Vec<_>>();
+        let (second, own): (Vec<_>, Vec<_>) = held
+            .into_iter()
+            .partition(|(open_file, _)| self.second_identities.contains(open_file));
+        let mut rows: Vec<(HeldLock, i64)> = Vec::new();
+        for (open_file, lock) in own {
+            let owner = self.owners(open_file, std::slice::from_ref(&lock), listed)[0];
+            if owner != 0 {
+                rows.push((lock, owner));
+            }
+        }
+        for (open_file, lock) in second {
+            let owner = self.owners(open_file, std::slice::from_ref(&lock), listed)[0];
+            if owner != 0 && !rows.iter().any(|(row, by)| *row == lock && *by == owner) {
+                rows.push((lock, owner));
+            }
+        }
+        rows
+    }
+
+    /// [`Self::held`], with the description holding each lock.
+    fn held_by_description(&self) -> Vec<(OpenFileId, HeldLock)> {
         if self.aliased_everything {
             return Vec::new();
         }
@@ -1070,9 +1470,9 @@ impl LockLedger {
         self.locks
             .iter()
             .filter(|(open_file, _)| self.counts(open_file, Some(&opaque_tables)))
-            .filter_map(|(_, locks)| locks.as_ref().ok())
-            .flat_map(|locks| locks.iter().cloned())
-            .filter(|lock| {
+            .filter_map(|(open_file, locks)| Some((*open_file, locks.as_ref().ok()?)))
+            .flat_map(|(open_file, locks)| locks.iter().map(move |lock| (open_file, lock.clone())))
+            .filter(|(_, lock)| {
                 let inode = lock.object.rsplit(':').next().unwrap_or_default();
                 !self.aliased_inodes.contains(inode)
             })
@@ -1087,6 +1487,45 @@ impl LockLedger {
     /// guest's rows depend on a transient host state.
     pub(crate) fn refuse(&mut self, reason: String) {
         self.refused.get_or_insert(reason);
+    }
+
+    /// A guest's record-lock request (`F_SETLK`, `F_SETLKW`) succeeded, where
+    /// the ledger takes the backend's fact, through a description that holds,
+    /// after it, no `POSIX` lock and OFD locks on the files `objects` names
+    /// (`Some`), or whose locks the fact could not report (`None`): the
+    /// backend holds the record lock as an OFD lock
+    /// ([`Self::record_locks_held_as_ofd`]).
+    pub(crate) fn note_record_locks_held_as_ofd(&mut self, objects: Option<Vec<String>>) {
+        match objects {
+            Some(objects) => self.record_locks_held_as_ofd.extend(objects),
+            None => self.record_lock_held_as_ofd_anywhere = true,
+        }
+    }
+
+    /// Why `locks`, which a `/proc/locks` snapshot or a descriptor's fdinfo
+    /// would show, cannot be shown: one of them is an OFD lock on a file on
+    /// which the backend held a guest's record lock as an OFD lock
+    /// ([`Self::record_locks_held_as_ofd`]). `None` when none is.
+    pub(crate) fn record_lock_held_as_ofd<'a>(
+        &self,
+        locks: impl IntoIterator<Item = &'a HeldLock>,
+    ) -> Option<String> {
+        locks
+            .into_iter()
+            .any(|lock| {
+                lock.class == "OFDLCK"
+                    && (self.record_lock_held_as_ofd_anywhere
+                        || self.record_locks_held_as_ofd.contains(&lock.object))
+            })
+            .then(|| {
+                "a record lock the guest took with F_SETLK or F_SETLKW is held by the backend \
+                 as an OFD lock of its open file description \
+                 (https://github.com/rrnewton/reverie/issues/1223): it would show as OFDLCK \
+                 with owner -1 for as long as that description is referenced, where Linux \
+                 shows POSIX with the taker's pid until the taker closes any descriptor of the \
+                 file or exits"
+                    .to_owned()
+            })
     }
 
     /// Why a `/proc/locks` snapshot taken now cannot be decided: the run's
@@ -1439,15 +1878,17 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
     }
 
     #[test]
-    fn rows_a_backend_rendered_on_the_null_device_are_kept() {
-        // KVM's backend-local copy of the file (the temporary exemption,
-        // removed with package K slice K8).
+    fn rows_on_the_null_device_get_no_exemption() {
+        // KVM's backend-local copy of the file printed every row on device
+        // `00:00`, which this filter kept until package K slice K8 rendered
+        // KVM's rows from the ledger instead. A row there is now kept by the
+        // rules alone: a host's OFD row and a host process's flock, never.
         let contents = b"\
 1: OFDLCK ADVISORY WRITE -1 00:00:1 0 EOF
 2: FLOCK ADVISORY WRITE 98765 00:00:2 0 EOF
 ";
         let rows = lock_rows(contents).unwrap();
-        assert_eq!(guest_lock_rows(&rows, |_| false, &[]), [true, true]);
+        assert_eq!(guest_lock_rows(&rows, |_| false, &[]), [false, false]);
     }
 
     #[test]
@@ -2073,6 +2514,47 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         assert_eq!(ledger.held(), [lock("1")]);
     }
 
+    /// Once the backend held a guest's record lock as an OFD lock on a file,
+    /// no OFD lock on that file can be shown, for the rest of the run: one
+    /// the guest took itself is refused with it. Another file's OFD lock, and
+    /// a flock on the same file, are shown. A record lock whose file the fact
+    /// could not name refuses every OFD lock.
+    #[test]
+    fn no_ofd_lock_shows_on_a_file_whose_record_lock_is_held_as_one() {
+        let other =
+            held_locks_in_fdinfo(b"lock:\t1: OFDLCK ADVISORY WRITE -1 00:18:9 0 EOF\n").remove(0);
+        let mut ledger = LockLedger::default();
+        assert_eq!(
+            ledger.record_lock_held_as_ofd([&lock("0"), &other, &flock_held("READ")]),
+            None
+        );
+        ledger.note_record_locks_held_as_ofd(Some(vec![lock("0").object]));
+        let reason = ledger
+            .record_lock_held_as_ofd([&lock("5")])
+            .expect("an OFD lock on the file is refused");
+        assert!(reason.contains("https://github.com/rrnewton/reverie/issues/1223"));
+        assert!(
+            ledger
+                .record_lock_held_as_ofd([&other, &flock_held("READ")])
+                .is_none()
+        );
+        assert!(
+            ledger
+                .record_lock_held_as_ofd([&other, &lock("0")])
+                .is_some()
+        );
+        // An unlock, a close or the end of every table changes nothing.
+        ledger.prune(|_| false);
+        assert!(ledger.record_lock_held_as_ofd([&lock("0")]).is_some());
+        ledger.note_record_locks_held_as_ofd(None);
+        assert!(ledger.record_lock_held_as_ofd([&other]).is_some());
+        assert!(
+            ledger
+                .record_lock_held_as_ofd([&flock_held("WRITE")])
+                .is_none()
+        );
+    }
+
     #[test]
     fn unknown_locks_count_while_a_table_references_them() {
         let [parent, child] = [3, 4].map(DetPid::from_raw);
@@ -2347,5 +2829,490 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
             kept(&[GUEST, unterminated]),
             format!("{GUEST}{unterminated}")
         );
+    }
+
+    fn flock_held(access: &str) -> HeldLock {
+        held_locks_in_fdinfo(
+            format!("lock:\t1: FLOCK  ADVISORY  {access} 3 00:18:7 0 EOF\n").as_bytes(),
+        )
+        .remove(0)
+    }
+
+    /// The ledger names the guest process that took each lock where a call
+    /// proved it took it (`note_locks_taken`'s `taken`), which a rendered
+    /// lock line shows: an OFD lock as -1 whoever took it; any other lock as
+    /// its taker while the reader's namespace lists it, else 0, as Linux shows
+    /// a taker it cannot see; a lock the description already held when first
+    /// read as 0. A repeated request keeps the first taker; a conversion is a
+    /// new lock, its caller's; an unlock forgets the taker, and so does the
+    /// description's last close.
+    #[test]
+    fn a_lock_line_names_the_process_that_took_the_lock() {
+        let [parent, child] = [3, 4].map(DetPid::from_raw);
+        let listed_all = |_: DetPid| true;
+        let mut ledger = LockLedger::default();
+        // Received or inherited already locked: no taker.
+        ledger.note_locks(parent, description(0), vec![flock_held("READ")], 1);
+        assert_eq!(
+            ledger.owners(description(0), &[flock_held("READ")], &listed_all),
+            [0]
+        );
+        ledger.note_locks_taken(
+            child,
+            description(1),
+            vec![flock_held("READ"), lock("5")],
+            vec![flock_held("READ")],
+            1,
+            LedgerIdentity::Own,
+        );
+        assert_eq!(
+            ledger.owners(
+                description(1),
+                &[flock_held("READ"), lock("5")],
+                &listed_all
+            ),
+            [4, -1]
+        );
+        // The same lock asked for again by another process keeps its taker:
+        // the call took nothing new.
+        ledger.note_locks_taken(
+            parent,
+            description(1),
+            vec![flock_held("READ"), lock("5")],
+            Vec::new(),
+            1,
+            LedgerIdentity::Own,
+        );
+        assert_eq!(
+            ledger.owners(description(1), &[flock_held("READ")], &listed_all),
+            [4]
+        );
+        // A conversion is a new lock, the converting process's.
+        ledger.note_locks_taken(
+            parent,
+            description(1),
+            vec![flock_held("WRITE")],
+            vec![flock_held("WRITE")],
+            1,
+            LedgerIdentity::Own,
+        );
+        assert_eq!(
+            ledger.owners(description(1), &[flock_held("WRITE")], &listed_all),
+            [3]
+        );
+        // A taker the namespace no longer lists (it exited and was reaped).
+        assert_eq!(
+            ledger.owners(description(1), &[flock_held("WRITE")], &|process| process
+                != parent),
+            [0]
+        );
+        // An unlock forgets the taker: taken again, it is the new caller's.
+        ledger.note_locks_taken(
+            parent,
+            description(1),
+            Vec::new(),
+            Vec::new(),
+            1,
+            LedgerIdentity::Own,
+        );
+        ledger.note_locks_taken(
+            child,
+            description(1),
+            vec![flock_held("WRITE")],
+            vec![flock_held("WRITE")],
+            1,
+            LedgerIdentity::Own,
+        );
+        assert_eq!(
+            ledger.owners(description(1), &[flock_held("WRITE")], &listed_all),
+            [4]
+        );
+        // The last close forgets the description, and its takers with it.
+        ledger.release(parent, description(1), 0);
+        ledger.release(child, description(1), 0);
+        ledger.note_locks(child, description(1), vec![flock_held("WRITE")], 1);
+        assert_eq!(
+            ledger.owners(description(1), &[flock_held("WRITE")], &listed_all),
+            [0]
+        );
+    }
+
+    /// A description the ledger first sees through a call that took nothing
+    /// (an inherited standard input already holding a host's flock, through
+    /// the guest's first OFD unlock) names no taker for the lock it held:
+    /// its line shows 0 and `/proc/locks` leaves its row out, as Linux does
+    /// for a taker outside the reader's PID namespace.
+    #[test]
+    fn a_lock_held_before_the_first_call_names_no_taker() {
+        let guest = DetPid::from_raw(3);
+        let listed_all = |_: DetPid| true;
+        let mut ledger = LockLedger::default();
+        ledger.note_locks_taken(
+            guest,
+            description(0),
+            vec![flock_held("WRITE")],
+            Vec::new(),
+            1,
+            LedgerIdentity::Own,
+        );
+        assert_eq!(
+            ledger.owners(description(0), &[flock_held("WRITE")], &listed_all),
+            [0]
+        );
+        assert!(ledger.rendered_rows(&listed_all).is_empty());
+    }
+
+    /// A lease, as `syscalls::files::held_locks_of_status` spells one (an
+    /// fdinfo's lease line is not a description's lock for the kernel
+    /// snapshot's filter, so `held_locks_in_fdinfo` keeps none).
+    fn lease_held(access: &str) -> HeldLock {
+        HeldLock {
+            class: "LEASE".to_owned(),
+            mode: "ACTIVE".to_owned(),
+            access: access.to_owned(),
+            object: "00:18:7".to_owned(),
+            start: "0".to_owned(),
+            end: "EOF".to_owned(),
+        }
+    }
+
+    /// A lease another call changed in place (`F_SETLEASE` of another type
+    /// through the same description) keeps its taker, as Linux changes the
+    /// type of the existing lease (`lease_modify`); released and taken
+    /// again, it is the new caller's.
+    #[test]
+    fn a_changed_lease_keeps_its_taker() {
+        let [first, second] = [3, 4].map(DetPid::from_raw);
+        let listed_all = |_: DetPid| true;
+        let mut ledger = LockLedger::default();
+        ledger.note_locks_taken(
+            first,
+            description(0),
+            vec![lease_held("READ")],
+            vec![lease_held("READ")],
+            2,
+            LedgerIdentity::Own,
+        );
+        ledger.note_locks_taken(
+            second,
+            description(0),
+            vec![lease_held("WRITE")],
+            Vec::new(),
+            2,
+            LedgerIdentity::Own,
+        );
+        assert_eq!(
+            ledger.owners(description(0), &[lease_held("WRITE")], &listed_all),
+            [3]
+        );
+        ledger.note_locks_taken(
+            second,
+            description(0),
+            Vec::new(),
+            Vec::new(),
+            2,
+            LedgerIdentity::Own,
+        );
+        ledger.note_locks_taken(
+            second,
+            description(0),
+            vec![lease_held("READ")],
+            vec![lease_held("READ")],
+            2,
+            LedgerIdentity::Own,
+        );
+        assert_eq!(
+            ledger.owners(description(0), &[lease_held("READ")], &listed_all),
+            [4]
+        );
+    }
+
+    /// The `/proc/locks` rows Detcore renders from the ledger: one row per
+    /// lock of each referenced description, as Linux lists each lock object,
+    /// an OFD lock with owner -1, a flock with its taker, and no row for a
+    /// lock whose owner the namespace cannot see (a taker gone, or none
+    /// known), as `locks_show` leaves out a row whose owner translates to 0.
+    /// Two descriptions holding identical shared locks (two opens of one
+    /// file) are two rows; one description however many slots name it is
+    /// one; a description recorded on reception as one of its own, which may be a second
+    /// identity of another, shares the row of an identical lock. A
+    /// description no table references any more shows nothing.
+    #[test]
+    fn rendered_rows_are_the_referenced_locks_with_their_owners() {
+        let [parent, child] = [3, 4].map(DetPid::from_raw);
+        let listed_all = |_: DetPid| true;
+        let mut ledger = LockLedger::default();
+        ledger.note_locks_taken(
+            parent,
+            description(0),
+            vec![lock("0"), flock_held("WRITE")],
+            vec![flock_held("WRITE")],
+            2,
+            LedgerIdentity::Own,
+        );
+        // An identical shared lock of an independent description: its own
+        // row.
+        ledger.note_locks_taken(
+            child,
+            description(1),
+            vec![lock("0")],
+            Vec::new(),
+            1,
+            LedgerIdentity::Own,
+        );
+        // A flock the description held already when first read: no owner.
+        ledger.note_locks(parent, description(2), vec![flock_held("READ")], 1);
+        // A description recorded on reception as one of its own, holding the same lock as
+        // description 0: one row with it.
+        ledger.note_second_identity_locks(child, description(3), vec![lock("0")], 1);
+        assert_eq!(
+            ledger.rendered_rows(&listed_all),
+            [(lock("0"), -1), (flock_held("WRITE"), 3), (lock("0"), -1)]
+        );
+        // Its taker gone, the flock's row goes; the OFD locks' stay.
+        assert_eq!(
+            ledger.rendered_rows(&|process| process != parent),
+            [(lock("0"), -1), (lock("0"), -1)]
+        );
+        // Closed everywhere, nothing.
+        ledger.release(parent, description(0), 0);
+        ledger.release(child, description(1), 0);
+        ledger.release(parent, description(2), 0);
+        ledger.release(child, description(3), 0);
+        assert!(ledger.rendered_rows(&listed_all).is_empty());
+    }
+
+    /// The alias group of the container's standard streams `0` and `1`, which
+    /// `kcmp(KCMP_FILE)` said are one open file description, as the caller's
+    /// table names `members` of them, one slot each.
+    fn streams(members: &[u64]) -> LedgerIdentity {
+        LedgerIdentity::StandardStreams {
+            group: description(0),
+            members: members
+                .iter()
+                .map(|member| (description(*member), 1))
+                .collect(),
+        }
+    }
+
+    /// Two standard streams that are one open file description
+    /// (`<>file >&0`): the one lock taken through either is one row, as Linux
+    /// lists the one lock once, and an unlock through either leaves none, also
+    /// after an exec that keeps both streams.
+    #[test]
+    fn standard_streams_that_are_one_description_share_a_row() {
+        let process = DetPid::from_raw(3);
+        let listed_all = |_: DetPid| true;
+        let mut ledger = LockLedger::default();
+        let both = || streams(&[0, 1]);
+        ledger.note_locks_taken(
+            process,
+            description(0),
+            vec![lock("0")],
+            Vec::new(),
+            1,
+            both(),
+        );
+        assert_eq!(ledger.rendered_rows(&listed_all), [(lock("0"), -1)]);
+        ledger.note_locks_taken(
+            process,
+            description(1),
+            vec![lock("0")],
+            Vec::new(),
+            1,
+            both(),
+        );
+        assert_eq!(ledger.rendered_rows(&listed_all), [(lock("0"), -1)]);
+        ledger.note_locks_taken(process, description(1), Vec::new(), Vec::new(), 1, both());
+        assert!(ledger.rendered_rows(&listed_all).is_empty());
+        ledger.note_locks_taken(
+            process,
+            description(0),
+            vec![lock("0")],
+            Vec::new(),
+            1,
+            both(),
+        );
+        ledger.exec(process);
+        ledger.exec_kept(process, &[(description(0), 1), (description(1), 1)]);
+        assert_eq!(ledger.rendered_rows(&listed_all), [(lock("0"), -1)]);
+        ledger.note_locks_taken(process, description(1), Vec::new(), Vec::new(), 1, both());
+        assert!(ledger.rendered_rows(&listed_all).is_empty());
+    }
+
+    /// Standard input and output are one description and hold a lock taken
+    /// through standard input; after a fork the parent closes standard output
+    /// and the child standard input, so each identity is left in one table
+    /// only. The parent's unlock through standard input releases the one
+    /// lock, so no table shows it any more, as on Linux.
+    #[test]
+    fn an_unlock_through_one_alias_releases_the_lock_in_every_table() {
+        let [parent, child] = [3, 4].map(DetPid::from_raw);
+        let listed_all = |_: DetPid| true;
+        let mut ledger = LockLedger::default();
+        ledger.note_locks_taken(
+            parent,
+            description(0),
+            vec![lock("0")],
+            Vec::new(),
+            1,
+            streams(&[0, 1]),
+        );
+        ledger.fork(parent, child, false);
+        ledger.release(parent, description(1), 0);
+        ledger.release(child, description(0), 0);
+        assert_eq!(ledger.rendered_rows(&listed_all), [(lock("0"), -1)]);
+        ledger.note_locks_taken(
+            parent,
+            description(0),
+            Vec::new(),
+            Vec::new(),
+            1,
+            streams(&[0]),
+        );
+        assert!(ledger.rendered_rows(&listed_all).is_empty());
+    }
+
+    /// Standard input and output are one description and hold a lock taken
+    /// through standard input. The process sends standard input over
+    /// `SCM_RIGHTS` and closes it, so only the copy in flight holds that
+    /// identity, then unlocks through standard output. The copy in flight
+    /// takes the unlock too, as the one description it is, so no row is left
+    /// while it is in flight, nor after its receipt, as on Linux (Claude's
+    /// narrow check of K8-h reb6, finding 2: before, the copy kept the lock,
+    /// and its row stayed until the receipt).
+    #[test]
+    fn an_unlock_through_one_alias_reaches_an_identity_only_a_copy_in_flight_holds() {
+        let process = DetPid::from_raw(3);
+        let listed_all = |_: DetPid| true;
+        let mut ledger = LockLedger::default();
+        ledger.note_locks_taken(
+            process,
+            description(0),
+            vec![lock("0")],
+            Vec::new(),
+            1,
+            streams(&[0, 1]),
+        );
+        ledger
+            .placeholder_copies(PlaceholderCopies::Sending(vec![description(0)]))
+            .unwrap();
+        ledger.release(process, description(0), 0);
+        assert_eq!(
+            ledger.rendered_rows(&listed_all),
+            [(lock("0"), -1)],
+            "the one lock, held through standard output and the copy in flight"
+        );
+        ledger.note_locks_taken(
+            process,
+            description(1),
+            Vec::new(),
+            Vec::new(),
+            1,
+            streams(&[1]),
+        );
+        assert!(
+            ledger.rendered_rows(&listed_all).is_empty(),
+            "the unlock reached the identity only the copy in flight holds"
+        );
+        ledger.note_locks(process, description(0), Vec::new(), 1);
+        ledger
+            .placeholder_copies(PlaceholderCopies::Received(description(0)))
+            .unwrap();
+        assert!(
+            ledger.rendered_rows(&listed_all).is_empty(),
+            "after the receipt"
+        );
+    }
+
+    /// Two standard streams that are independent opens of one file
+    /// (`kcmp(KCMP_FILE)` said they are two descriptions, so neither is in an
+    /// alias group), each holding the same shared OFD lock: two rows, as
+    /// Linux lists each lock object, and an unlock through one leaves the
+    /// other's row.
+    #[test]
+    fn standard_streams_of_their_own_keep_a_row_each() {
+        let process = DetPid::from_raw(3);
+        let listed_all = |_: DetPid| true;
+        let mut ledger = LockLedger::default();
+        for stream in [0, 1] {
+            ledger.note_locks_taken(
+                process,
+                description(stream),
+                vec![lock("0")],
+                Vec::new(),
+                1,
+                LedgerIdentity::Own,
+            );
+        }
+        assert_eq!(
+            ledger.rendered_rows(&listed_all),
+            [(lock("0"), -1), (lock("0"), -1)]
+        );
+        ledger.note_locks_taken(
+            process,
+            description(1),
+            Vec::new(),
+            Vec::new(),
+            1,
+            LedgerIdentity::Own,
+        );
+        assert_eq!(ledger.rendered_rows(&listed_all), [(lock("0"), -1)]);
+    }
+
+    /// A process that receives its own locked description over `SCM_RIGHTS`
+    /// holds it under two identities where Detcore could not join the second
+    /// to the first on reception:
+    /// the one lock is one row, and stays one through an exec that keeps both
+    /// descriptors, which keeps the second identity's mark with it.
+    #[test]
+    fn a_second_identity_keeps_sharing_its_row_across_an_exec() {
+        let process = DetPid::from_raw(3);
+        let listed_all = |_: DetPid| true;
+        let mut ledger = LockLedger::default();
+        ledger.note_locks_taken(
+            process,
+            description(0),
+            vec![lock("0")],
+            Vec::new(),
+            1,
+            LedgerIdentity::Own,
+        );
+        ledger.note_second_identity_locks(process, description(1), vec![lock("0")], 1);
+        assert_eq!(ledger.rendered_rows(&listed_all), [(lock("0"), -1)]);
+        ledger.exec(process);
+        ledger.exec_kept(process, &[(description(0), 1), (description(1), 1)]);
+        assert_eq!(ledger.rendered_rows(&listed_all), [(lock("0"), -1)]);
+    }
+
+    /// A lock a call of the process took keeps its taker through an exec
+    /// that keeps the description, as Linux keeps a lock's `fl_pid` (the
+    /// taker's tgid, which an exec does not change): its line still names the
+    /// process, and `/proc/locks` still shows its row.
+    #[test]
+    fn a_lock_keeps_its_taker_across_an_exec() {
+        let process = DetPid::from_raw(3);
+        let listed_all = |_: DetPid| true;
+        let mut ledger = LockLedger::default();
+        let held = flock_held("WRITE");
+        ledger.note_locks_taken(
+            process,
+            description(0),
+            vec![held.clone()],
+            vec![held.clone()],
+            1,
+            LedgerIdentity::Own,
+        );
+        assert_eq!(
+            ledger.owners(description(0), std::slice::from_ref(&held), &listed_all),
+            [3]
+        );
+        ledger.exec(process);
+        ledger.exec_kept(process, &[(description(0), 1)]);
+        assert_eq!(
+            ledger.owners(description(0), std::slice::from_ref(&held), &listed_all),
+            [3]
+        );
+        assert_eq!(ledger.rendered_rows(&listed_all), [(held, 3)]);
     }
 }

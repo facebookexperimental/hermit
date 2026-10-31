@@ -173,6 +173,9 @@ pub(crate) fn incarnation_fits(incarnation: crate::procfs::TaskIncarnation) -> b
 /// (`Detcore::bind_task_identity`); a value outside a field here is a
 /// Detcore defect, and panics rather than wraps into another file's number.
 pub(crate) fn per_process_inode(name: crate::procfs::PerProcessName) -> u64 {
+    if let Some(fd) = name.filename.strip_prefix("fdinfo/") {
+        return fdinfo_inode(name, fd);
+    }
     let index = crate::procfs::ProcfsFile::PER_PROCESS_NAMES
         .iter()
         .position(|candidate| *candidate == name.filename)
@@ -209,6 +212,34 @@ pub(crate) fn per_process_inode(name: crate::procfs::PerProcessName) -> u64 {
         | thread << (INCARNATION_BITS * 2)
         | process_incarnation << INCARNATION_BITS
         | thread_incarnation
+}
+
+/// The inode number of the fdinfo of descriptor `fd` (its name's digits) of
+/// the task `name` describes (package K slice K8-h), on every backend that
+/// renders one: bit 63 set and the file-index field 0, which no other
+/// per-process file takes ([`per_process_inode`] numbers those from 1), then
+/// the 64-bit FNV-1a hash of the task's numbers, their incarnations and the
+/// descriptor's digits, cut to its low 60 bits. A descriptor number has no
+/// room beside the task's fields in [`per_process_inode`]'s layout, which
+/// `comm` filled. Two fdinfo files share a number only where their hashes
+/// collide in 60 bits; Linux numbers each from a host-wide counter at its
+/// lookup (`get_next_ino`).
+fn fdinfo_inode(name: crate::procfs::PerProcessName, fd: &str) -> u64 {
+    let incarnation = name.incarnation.unwrap_or(crate::procfs::TaskIncarnation {
+        process: 0,
+        thread: None,
+    });
+    let fields = [
+        u64::from(name.task.process as u32),
+        u64::from(name.task.thread.unwrap_or(0) as u32),
+        u64::from(incarnation.process),
+        u64::from(incarnation.thread.unwrap_or(0)),
+    ];
+    let hash = fields.iter().fold(FNV_OFFSET_BASIS, |hash, field| {
+        fnv1a(hash, &field.to_le_bytes())
+    });
+    let hash = fnv1a(hash, fd.as_bytes());
+    1 << 63 | (hash & ((1 << (64 - 1 - INDEX_BITS)) - 1))
 }
 
 /// The bit every path key sets, which no 32-bit procfs inode number has.
@@ -1087,6 +1118,47 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     use super::*;
+
+    /// A rendered fdinfo's inode number (package K slice K8-h) is a
+    /// per-process file's (bit 63) whose file index is 0, which no other
+    /// per-process file takes, so it is no other file's number; two fdinfo
+    /// files differ by descriptor, task, thread or incarnation.
+    #[test]
+    fn an_fdinfo_inode_is_its_own_per_process_number() {
+        use crate::procfs::BoundTask;
+        use crate::procfs::PerProcessName;
+        use crate::procfs::TaskIncarnation;
+        let name = |process, thread, incarnation, filename| PerProcessName {
+            task: BoundTask { process, thread },
+            incarnation: Some(TaskIncarnation {
+                process: incarnation,
+                thread: thread.map(|_| 1),
+            }),
+            filename,
+        };
+        let index = |inode: u64| (inode >> (PID_BITS * 2 + INCARNATION_BITS * 2)) & 0b111;
+        let fdinfo = per_process_inode(name(3, None, 1, "fdinfo/3"));
+        assert_eq!(fdinfo >> 63, 1);
+        assert_eq!(index(fdinfo), 0);
+        let others = [
+            per_process_inode(name(3, None, 1, "fdinfo/4")),
+            per_process_inode(name(4, None, 1, "fdinfo/3")),
+            per_process_inode(name(3, Some(3), 1, "fdinfo/3")),
+            per_process_inode(name(3, None, 2, "fdinfo/3")),
+        ];
+        assert!(
+            others
+                .iter()
+                .all(|other| *other != fdinfo && index(*other) == 0)
+        );
+        for filename in crate::procfs::ProcfsFile::PER_PROCESS_NAMES {
+            let inode = per_process_inode(name(3, None, 1, filename));
+            assert_ne!(index(inode), 0, "{filename}");
+            assert_ne!(inode, fdinfo, "{filename}");
+        }
+        // The same file is the same number.
+        assert_eq!(per_process_inode(name(3, None, 1, "fdinfo/3")), fdinfo);
+    }
 
     /// An inode number of a per-process file tells apart 255 incarnations of
     /// a number, for the process and for the thread each: the 255th task to

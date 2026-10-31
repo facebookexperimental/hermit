@@ -2793,8 +2793,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await;
         }
-        // A table's last holder takes it with its exit.
-        self.release_table_at_exit(guest, false).await;
         let request = guest.thread_state().mk_request(
             ResourceID::Exit {
                 group: false,
@@ -2838,6 +2836,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await;
         }
+        // A table's last holder takes it with its exit: after the grant, just
+        // before the native exit, as an exit_group does
+        // (`Self::release_table_at_exit`).
+        self.release_table_at_exit(guest, false).await;
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }
@@ -2867,9 +2869,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await;
         }
-        // Every thread of the process exits with it: a table only they held
-        // goes with this exit.
-        self.release_table_at_exit(guest, true).await;
         // On [`OwnerDeathPath::Barrier`] the walk follows the grant and wakes
         // at once, as an exit does (`Self::run_robust_list_owner_death`):
         // nothing can call the exit_group off, the grant logically kills the
@@ -2910,6 +2909,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.stage_thread_group_robust_list_wakes(guest, RobustListExit::ExitGroup)
                 .await
         }
+        // Every thread of the process exits with it: a table only they held
+        // goes with this exit, once the grant has logically ended the other
+        // threads, so none of them runs again against a table Detcore has let
+        // go, and before the native exit_group, so no turn runs between
+        // (`Self::release_table_at_exit`).
+        self.release_table_at_exit(guest, true).await;
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }
@@ -4289,7 +4294,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 thread_state.mm_id,
             )
         };
-        let (new_metadata, closed_open_files, exec_fd_blocking) = {
+        let (mut new_metadata, closed_open_files, exec_fd_blocking) = {
             let metadata = old_metadata.lock().unwrap();
             // The exec'ing thread leads its process from here, alone.
             let mut new_metadata = metadata.for_exec(dettid);
@@ -4300,6 +4305,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 new_metadata.exec_blocking_overrides(),
             )
         };
+        // The close-on-exec descriptors this exec drops from the old table go
+        // at the new image's first callback, if the exec succeeds
+        // (`Detcore::release_exec_dropped_descriptors`).
+        self.keep_table_for_exec(guest, &old_metadata, &mut new_metadata, detpid);
         let preserve_exec_fd_status = guest.config().backend.rediscovers_descriptors_after_exec;
         let exe = match self.exec_image(guest, &call) {
             Some(exe) => Some(exe),
