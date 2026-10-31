@@ -1403,6 +1403,10 @@ mod tests {
             &["--dap-listen=127.0.0.1:4711", "--dap-gdb=/usr/bin/gdb"],
         ),
         ("max-timeslice", &["--preemption-timeout=disabled"]),
+        (
+            "post-crash-timeslice",
+            &["--post-crash-timeslice=400000000"],
+        ),
         ("target-timeslice", &["--target-timeslice=5000"]),
         (
             "target-timeslice-syscalls-only",
