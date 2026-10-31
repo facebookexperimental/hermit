@@ -5628,14 +5628,26 @@ fn checked_xattr_arguments<M: MemoryAccess>(
 /// read, so a name with no NUL within them is too long (ERANGE) even when
 /// the bytes after them cannot be read, and only a fault within them is
 /// EFAULT. The answer checks the length.
+fn read_xattr_name<M: MemoryAccess>(memory: &M, address: u64) -> Result<Vec<u8>, Errno> {
+    read_guest_string(memory, address, XATTR_NAME_MAX + 1)
+}
+
+/// The NUL-terminated string at guest address `address`, as Linux's
+/// `strncpy_from_user` copies it with room for `limit` bytes: its bytes before
+/// the NUL, or `limit` bytes when no NUL ends it within them (even when the
+/// bytes after them cannot be read), and EFAULT only for a fault within
+/// them.
 ///
 /// Each read stays within one page and uses the guest's own access rights
 /// (`read_exact_with_user_access`): an exact read that faults only when a
 /// needed byte does, as the kernel's copy faults.
-fn read_xattr_name<M: MemoryAccess>(memory: &M, address: u64) -> Result<Vec<u8>, Errno> {
+pub(super) fn read_guest_string<M: MemoryAccess>(
+    memory: &M,
+    address: u64,
+    limit: usize,
+) -> Result<Vec<u8>, Errno> {
     const PAGE: u64 = 4096;
     let mut name = Vec::new();
-    let limit = XATTR_NAME_MAX + 1;
     while name.len() < limit {
         let start = address
             .checked_add(name.len() as u64)
@@ -5794,6 +5806,24 @@ fn legacy_times_request<M: MemoryAccess>(memory: &M, times: u64, timevals: bool)
         Ok(_) => PathRequest::Times {
             explicit: Some(true),
         },
+    }
+}
+
+/// What Linux answers `utime` (a `struct utimbuf`) or `utimes`/`futimesat`
+/// (two `struct timeval`, when `timevals`) from its times at guest address
+/// `times` before it looks at the file ([`legacy_times_request`]): EFAULT
+/// where they cannot be read, EINVAL for a microsecond count out of range,
+/// and `None` otherwise (fs/utimes.c:214-217 and :175-186 at v6.17).
+#[cfg(target_arch = "x86_64")]
+pub(super) fn legacy_times_error<M: MemoryAccess>(
+    memory: &M,
+    times: u64,
+    timevals: bool,
+) -> Option<Errno> {
+    match legacy_times_request(memory, times, timevals) {
+        PathRequest::Fault => Some(Errno::EFAULT),
+        PathRequest::Invalid => Some(Errno::EINVAL),
+        _ => None,
     }
 }
 

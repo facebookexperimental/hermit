@@ -43,12 +43,14 @@ const TID: i32 = 4242;
 
 /// A thread that records every syscall injected through it and answers each
 /// with `reply`. Nothing else it offers is expected to be used, but for its
-/// registers where a test supplies them (`with_registers`).
+/// registers where a test supplies them (`with_registers`), and a backend's
+/// typed refusal where a test supplies one (`with_refusal`).
 pub(crate) struct InjectGuest<T: RecordOrReplay<ThreadState = ()>> {
     pub(crate) config: Config,
     thread: ThreadState<()>,
     reply: Result<i64, Errno>,
     registers: Option<libc::user_regs_struct>,
+    refusal: Option<reverie::UnsupportedRefusal>,
     injected: Mutex<Vec<(Sysno, SyscallArgs)>>,
     _tool: std::marker::PhantomData<T>,
 }
@@ -62,6 +64,7 @@ impl<T: RecordOrReplay<ThreadState = ()>> InjectGuest<T> {
             thread,
             reply,
             registers: None,
+            refusal: None,
             injected: Mutex::new(Vec::new()),
             _tool: std::marker::PhantomData,
         }
@@ -70,6 +73,12 @@ impl<T: RecordOrReplay<ThreadState = ()>> InjectGuest<T> {
     /// Answer `regs` with `registers` rather than refusing to.
     pub(crate) fn with_registers(mut self, registers: libc::user_regs_struct) -> Self {
         self.registers = Some(registers);
+        self
+    }
+
+    /// Report `refusal` as the backend's record of the last injection, once.
+    pub(crate) fn with_refusal(mut self, refusal: reverie::UnsupportedRefusal) -> Self {
+        self.refusal = Some(refusal);
         self
     }
 
@@ -163,6 +172,9 @@ impl<T: RecordOrReplay<ThreadState = ()>> Guest<Detcore<T>> for InjectGuest<T> {
     }
     fn read_clock(&mut self) -> Result<u64, reverie::Error> {
         panic!("forwarding a syscall reads no clock")
+    }
+    fn take_unsupported_refusal(&mut self) -> Option<reverie::UnsupportedRefusal> {
+        self.refusal.take()
     }
 }
 

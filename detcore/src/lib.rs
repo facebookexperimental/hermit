@@ -1303,6 +1303,54 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
     }
 
+    /// pkey_alloc, pkey_mprotect and pkey_free, passed through.
+    ///
+    /// An address space that allocates or applies a protection key may hold
+    /// pages its guest cannot write although Hermit's copies can
+    /// (`MemoryMetadata::protection_keys`). A key exists only once pkey_alloc
+    /// returns one: a failed allocation (EINVAL, ENOSPC, or a backend without
+    /// protection keys answering ENOSYS) allocates nothing, so it is not
+    /// recorded.
+    ///
+    /// pkey_mprotect is recorded after it returns, unless it cannot have
+    /// applied a key: key -1 (plain mprotect), ENOSYS (the backend ran
+    /// nothing), no length, or a failure Linux returns before it changes any
+    /// mapping. Every other outcome is recorded, failures included
+    /// ([`pkey_mprotect_may_apply_a_key`]); a record is never cleared.
+    /// Recording after the call is the same as before it for the reads that
+    /// consult the record: they renumber only with sequentialized threads, so
+    /// no other guest thread reads between the call and the record.
+    ///
+    /// A backend that does not implement protection keys declines all three
+    /// calls with a typed refusal, which is named rather than handed to the
+    /// guest as its errno ([`Detcore::report_backend_refusal`]).
+    async fn handle_protection_key_call<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        let sysno = call.number();
+        let args = call.into_parts().1;
+        let result = self.passthrough(guest, call).await;
+        let records_a_key = match sysno {
+            Sysno::pkey_alloc => matches!(result, Ok(key) if key >= 0),
+            Sysno::pkey_mprotect => {
+                pkey_mprotect_may_apply_a_key(args.arg0, args.arg1, args.arg2, args.arg3, &result)
+            }
+            _ => false,
+        };
+        if records_a_key {
+            guest.thread_state().note_protection_keys();
+        }
+        self.report_backend_refusal(
+            guest,
+            sysno,
+            reverie::UnsupportedOperation::ProtectionKeys,
+            result,
+        )
+        .await
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-643): Review unsupported-syscall reporting and fail-fast behavior.
     /// Applies the legacy policy to an explicitly listed but unsupported syscall.
@@ -4180,10 +4228,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::inotify_rm_watch,
                 // Inotify fault recovery leaves a faulted read's bytes alone
                 // once the address space has used protection keys, which it
-                // learns only from these two calls
-                // (`MemoryMetadata::protection_keys`). Both still pass through.
+                // learns only from the first two calls
+                // (`MemoryMetadata::protection_keys`). All three still pass
+                // through; a backend's refusal of any of them is named
+                // (`Detcore::report_backend_refusal`).
                 Sysno::pkey_alloc,
                 Sysno::pkey_mprotect,
+                Sysno::pkey_free,
                 Sysno::memfd_create,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-862): Keep modeled pidfd creation intercepted.
@@ -6012,14 +6063,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         syscall_histogram::mark_refused::<T, _>(guest);
                         Some(refusal)
                     }
-                    None => match self.answer_rendered_procfs_operation(guest, &call).await {
+                    // Another guest process's `cmdline`, descriptor link or
+                    // `fdinfo`, where the backend's `/proc/<pid>` is not the
+                    // guest's process: decided here, never by a host lookup
+                    // (`other_process_procfs`).
+                    None => match self.other_process_procfs_answer(guest, &call).await {
                         Some(answer) => Some(answer),
-                        None => match self.answer_rendered_procfs_mapping(guest, &call).await {
+                        None => match self.answer_rendered_procfs_operation(guest, &call).await {
                             Some(answer) => Some(answer),
-                            None => self
-                                .answer_rendered_procfs_path_call(guest, &call)
-                                .await
-                                .transpose(),
+                            None => match self.answer_rendered_procfs_mapping(guest, &call).await {
+                                Some(answer) => Some(answer),
+                                None => self
+                                    .answer_rendered_procfs_path_call(guest, &call)
+                                    .await
+                                    .transpose(),
+                            },
                         },
                     },
                 }
@@ -7217,37 +7275,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     self.observe_sigreturn_mask(guest).await;
                     self.passthrough(guest, call).await
                 }
-                // An address space that allocates or applies a protection key may
-                // hold pages its guest cannot write although Hermit's copies can
-                // (`MemoryMetadata::protection_keys`). A key exists only once
-                // pkey_alloc returns one: a failed allocation (EINVAL, ENOSPC, or
-                // a backend without protection keys answering ENOSYS) allocates
-                // nothing, so it is not recorded.
-                SyscallClassification::PassThrough if call.number() == Sysno::pkey_alloc => {
-                    let result = self.passthrough(guest, call).await;
-                    if matches!(result, Ok(key) if key >= 0) {
-                        guest.thread_state().note_protection_keys();
-                    }
-                    result
-                }
-                // pkey_mprotect is recorded after it returns, unless it cannot
-                // have applied a key: key -1 (plain mprotect), ENOSYS (the backend
-                // ran nothing), no length, or a failure Linux returns before it
-                // changes any mapping. Every other outcome is recorded, failures
-                // included ([`pkey_mprotect_may_apply_a_key`]); a record is never
-                // cleared. Recording after the call is the same as before it for
-                // the reads that consult the record: they renumber only with
-                // sequentialized threads, so no other guest thread reads between
-                // the call and the record.
-                SyscallClassification::PassThrough if call.number() == Sysno::pkey_mprotect => {
-                    let args = call.into_parts().1;
-                    let result = self.passthrough(guest, call).await;
-                    if pkey_mprotect_may_apply_a_key(
-                        args.arg0, args.arg1, args.arg2, args.arg3, &result,
-                    ) {
-                        guest.thread_state().note_protection_keys();
-                    }
-                    result
+                // The protection-key calls, boxed: their state is not carried by
+                // every other call's future (`syscall_hot_path_tests`).
+                SyscallClassification::PassThrough
+                    if matches!(
+                        call.number(),
+                        Sysno::pkey_alloc | Sysno::pkey_mprotect | Sysno::pkey_free
+                    ) =>
+                {
+                    Box::pin(self.handle_protection_key_call(guest, call)).await
                 }
                 SyscallClassification::PassThrough => self.passthrough(guest, call).await,
                 // The kernel's restart of a wait Detcore emulates, or ran in the
@@ -7920,22 +7956,24 @@ mod subscription_tests {
         );
     }
 
-    /// Inotify fault recovery decides from these two calls whether the
-    /// address space has used protection keys
+    /// Inotify fault recovery decides from pkey_alloc and pkey_mprotect
+    /// whether the address space has used protection keys
     /// (`MemoryMetadata::protection_keys`). Under `--passthru-opt` a
     /// PassThrough call is otherwise never seen, and recovery would rewrite
-    /// bytes a protection key kept Linux from copying.
+    /// bytes a protection key kept Linux from copying. pkey_free is seen as
+    /// well, so that a backend's refusal of any of the three is named there
+    /// too (`Detcore::report_backend_refusal`).
     #[test]
     fn passthru_opt_intercepts_the_protection_key_calls() {
         let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
-        for syscall in [Sysno::pkey_alloc, Sysno::pkey_mprotect] {
+        for syscall in [Sysno::pkey_alloc, Sysno::pkey_mprotect, Sysno::pkey_free] {
             assert_eq!(
                 syscall_classification::classify_syscall(syscall),
                 syscall_classification::SyscallClassification::PassThrough
             );
             assert!(
                 subscriptions.iter_syscalls().any(|sysno| sysno == syscall),
-                "passthru_opt let {syscall} bypass Detcore's protection-key record"
+                "passthru_opt let {syscall} bypass Detcore's protection-key handling"
             );
         }
     }

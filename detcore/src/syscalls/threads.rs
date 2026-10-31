@@ -2074,6 +2074,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return refusal;
         }
+        // Linux's EINVAL for the flags, on every backend, so that a backend
+        // is asked only for a clone Linux would perform and declines only
+        // one it cannot (`UnsupportedOperation::Clone`). A clone3's stack is
+        // checked against the user address limit the backend reports, the
+        // one its kernel's `access_ok` enforces (`clone3_args_einval`).
+        let user_limit = matches!(clone_family, syscalls::family::CloneFamily::Clone3(_))
+            .then(|| guest.user_address_limit().ok().map(|limit| limit.max_end))
+            .flatten();
+        if linux_refuses_clone_flags(&guest.memory(), &clone_family, user_limit) {
+            return Err(Errno::EINVAL.into());
+        }
         // clone3's `struct clone_args` is read field by field
         // (`clone3_field`): Reverie's whole-struct read fails for a valid
         // 64-byte one at the end of a mapping, which lost its flags, exit
@@ -2246,15 +2257,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         ts.pending_vfork = None;
 
         // A backend that cannot create the child says so with a typed refusal
-        // (an in-guest backend runs one thread of the guest). Answering the
-        // guest with the refusal's errno would be an error Linux never gives
-        // a valid clone, so the run is refused instead, as for an exec the
-        // backend cannot perform.
+        // (an in-guest backend runs one thread of the guest; KVM cannot give a
+        // child some of the sharing Linux allows). Answering the guest with
+        // the refusal's errno would be an error Linux never gives a valid
+        // clone, so the run is refused instead, as for an exec the backend
+        // cannot perform, and named on stderr when the run ends
+        // (`report_refusal_reason`).
+        let source = if refusal.is_some() {
+            "refused by the backend"
+        } else {
+            "refused"
+        };
         let diagnostic = refusal
             .map(|refusal| refusal.diagnostic.to_string())
             .or(untraced_refusal);
         if let (Some(diagnostic), Err(errno)) = (diagnostic, &maybe_res) {
-            tracing::error!("[detcore, dtid {parent_dettid}] {diagnostic}; no child was created");
+            let named = CloneFlags::from_bits_retain(flags.bits() & !0xff);
+            crate::syscalls::helpers::report_refusal_reason(
+                self.cfg.panic_on_unsupported_syscalls,
+                &format!(
+                    "[dtid {parent_dettid}] {sysno} {source}: {diagnostic} (flags {named:?}, \
+                     exit signal {exit_signal}). No child was created."
+                ),
+            );
             if !self.cfg.panic_on_unsupported_syscalls {
                 crate::tool_global::report_unsupported_syscall(guest, sysno).await;
             }
@@ -9109,6 +9134,265 @@ mod clone3_signal_fields_tests {
             assert!(!super::clone3_signal_fields_valid(1 << bit, 17), "{bit}");
         }
         assert!(!super::clone3_signal_fields_valid(0, 65));
+    }
+}
+
+/// Whether Linux refuses `clone_family` with EINVAL, from its flags and its
+/// `struct clone_args` alone, before it reads anything else or creates
+/// anything. A `clone3` is decided only where no check the kernel makes first
+/// could fail another way: its struct, of a size the kernel takes, is read
+/// whole with the guest's own access, as `copy_from_user` reads it, has no
+/// nonzero tail past the fields known here (E2BIG), and names no `set_tid`
+/// array, whose copy could fault (EFAULT). Linux's EINVALs that depend on the
+/// caller's state, `CLONE_PARENT` from a namespace's init and a thread after
+/// `unshare(CLONE_NEWPID)`, are left to the backend. `user_limit` is the
+/// guest's user address limit, as its backend reports it
+/// (`Guest::user_address_limit`), if it does.
+fn linux_refuses_clone_flags<M: MemoryAccess>(
+    memory: &M,
+    clone_family: &syscalls::family::CloneFamily,
+    user_limit: Option<u64>,
+) -> bool {
+    match clone_family {
+        // `clone` takes the low 32 bits of its argument, less the exit signal
+        // in the low byte, and writes a pidfd where it writes the parent's tid.
+        syscalls::family::CloneFamily::Clone(clone) => {
+            clone_flags_einval(u64::from(clone.flags().bits() as u32) & !0xff, true)
+        }
+        syscalls::family::CloneFamily::Clone3(clone) => {
+            let size = clone.size();
+            let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(0);
+            let mut bytes = vec![0u8; size.min(page)];
+            (CLONE_ARGS_SIZE_VER0..=page).contains(&size)
+                && clone
+                    .args()
+                    .and_then(|args| Addr::<u8>::from_raw(args.as_raw()))
+                    .filter(|args| super::chosen_ids::within_user_memory(args.as_raw(), size))
+                    .is_some_and(|args| {
+                        memory.read_exact_with_user_access(args, &mut bytes).is_ok()
+                    })
+                && clone3_args_einval(&bytes, user_limit)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        _ => false,
+    }
+}
+
+/// Whether Linux refuses a clone with these `flags` with EINVAL, whatever the
+/// caller's state: the check of `kernel_clone` for a pidfd written where the
+/// parent's tid goes (`pidfd_is_parent_tid`), and the checks `copy_process`
+/// makes first, at Linux v6.17:
+/// https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?h=v6.17#n2582
+/// https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?h=v6.17#n1935
+fn clone_flags_einval(flags: u64, pidfd_is_parent_tid: bool) -> bool {
+    let flags = CloneFlags::from_bits_retain(flags);
+    let thread = flags.contains(CloneFlags::CLONE_THREAD);
+    (flags.contains(CloneFlags::CLONE_PIDFD | CloneFlags::CLONE_PARENT_SETTID)
+        && pidfd_is_parent_tid)
+        || flags.contains(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS)
+        || flags.contains(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_FS)
+        || (thread && !flags.contains(CloneFlags::CLONE_SIGHAND))
+        || (flags.contains(CloneFlags::CLONE_SIGHAND) && !flags.contains(CloneFlags::CLONE_VM))
+        || (thread && flags.intersects(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID))
+        || flags.contains(CloneFlags::CLONE_PIDFD | CloneFlags::CLONE_DETACHED)
+}
+
+/// Whether Linux refuses a `clone3` whose `struct clone_args` is `bytes` with
+/// EINVAL before it creates anything: the checks of
+/// `copy_clone_args_from_user` and `clone3_args_valid`, then
+/// [`clone_flags_einval`]. False wherever another error could come first, a
+/// nonzero tail (E2BIG) or a `set_tid` copy (EFAULT):
+/// https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?h=v6.17#n2768
+/// https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?h=v6.17#n2849
+///
+/// `clone3_stack_valid` refuses a stack range that `access_ok` refuses,
+/// one whose end passes the user address limit (`__access_ok` and
+/// `valid_user_address`, arch/x86/include/asm/uaccess_64.h:56-57 and 98-107
+/// at v6.17). That limit is the kernel's (four- or five-level paging on a
+/// host), so it is decided only from `user_limit`, the guest's limit as its
+/// backend reports it, and left to the backend without one:
+/// https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?h=v6.17#n2829
+fn clone3_args_einval(bytes: &[u8], user_limit: Option<u64>) -> bool {
+    const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
+    const CLONE_INTO_CGROUP: u64 = 1 << 33;
+    if bytes
+        .iter()
+        .skip(CLONE_ARGS_SIZE_VER2)
+        .any(|byte| *byte != 0)
+    {
+        return false;
+    }
+    let field = |offset: usize| {
+        let mut word = [0u8; 8];
+        for (i, byte) in word.iter_mut().enumerate() {
+            *byte = bytes.get(offset + i).copied().unwrap_or(0);
+        }
+        u64::from_ne_bytes(word)
+    };
+    let (flags, exit_signal, stack, stack_size) = (field(0), field(32), field(40), field(48));
+    let (set_tid, set_tid_size) = (field(64), field(72));
+    let into_cgroup = flags & CLONE_INTO_CGROUP != 0;
+    if set_tid_size > 32
+        || (set_tid == 0) != (set_tid_size == 0)
+        || exit_signal > 64
+        || (into_cgroup && (field(80) > i32::MAX as u64 || bytes.len() < CLONE_ARGS_SIZE_VER2))
+    {
+        return true;
+    }
+    if set_tid != 0 {
+        return false;
+    }
+    let sighand = libc::CLONE_SIGHAND as u64 | CLONE_CLEAR_SIGHAND;
+    flags & !(0xffff_ffff | CLONE_CLEAR_SIGHAND | CLONE_INTO_CGROUP) != 0
+        || !clone3_signal_fields_valid(flags, exit_signal)
+        || flags & libc::CLONE_DETACHED as u64 != 0
+        || flags & sighand == sighand
+        || (flags & (libc::CLONE_THREAD | libc::CLONE_PARENT) as u64 != 0 && exit_signal != 0)
+        || (stack == 0) != (stack_size == 0)
+        || stack.checked_add(stack_size).is_none()
+        || (stack != 0 && user_limit.is_some_and(|limit| stack + stack_size > limit))
+        || clone_flags_einval(flags, field(8) == field(24))
+}
+
+#[cfg(test)]
+mod linux_clone_einval_tests {
+    use super::clone_flags_einval;
+    use super::clone3_args_einval;
+
+    const VM: u64 = libc::CLONE_VM as u64;
+    const FS: u64 = libc::CLONE_FS as u64;
+    const FILES: u64 = libc::CLONE_FILES as u64;
+    const SIGHAND: u64 = libc::CLONE_SIGHAND as u64;
+    const THREAD: u64 = libc::CLONE_THREAD as u64;
+    const PIDFD: u64 = 0x1000;
+    const PARENT_SETTID: u64 = libc::CLONE_PARENT_SETTID as u64;
+    /// glibc's pthread_create flags, less the tid and TLS flags.
+    const PTHREAD: u64 = VM | FS | FILES | SIGHAND | THREAD | libc::CLONE_SYSVSEM as u64;
+
+    /// Exactly copy_process's first checks and kernel_clone's pidfd check
+    /// refuse: never the sharing Linux allows, such as a process with
+    /// CLONE_VM and CLONE_FS, CLONE_FILES or CLONE_SIGHAND, or a thread
+    /// without CLONE_FS, CLONE_FILES or CLONE_SYSVSEM.
+    #[test]
+    fn only_the_kernels_flag_rules_refuse() {
+        let newns = libc::CLONE_NEWNS as u64;
+        let newuser = libc::CLONE_NEWUSER as u64;
+        let newpid = libc::CLONE_NEWPID as u64;
+        let detached = libc::CLONE_DETACHED as u64;
+        for (flags, pidfd_is_parent_tid, einval) in [
+            (0, true, false),
+            (VM | libc::CLONE_VFORK as u64, true, false),
+            (PTHREAD, true, false),
+            (VM | SIGHAND | THREAD, true, false),
+            (VM | FS, true, false),
+            (VM | FILES, true, false),
+            (VM | SIGHAND, true, false),
+            (VM | SIGHAND | THREAD | newns, true, false),
+            (PIDFD | PTHREAD, true, false),
+            (PIDFD | PARENT_SETTID, false, false),
+            (newns | FS, true, true),
+            (newuser | FS, true, true),
+            (VM | FS | FILES | THREAD, true, true),
+            (SIGHAND, true, true),
+            (PTHREAD | newpid, true, true),
+            (VM | SIGHAND | THREAD | newuser, true, true),
+            (PIDFD | PARENT_SETTID, true, true),
+            (PIDFD | detached, true, true),
+        ] {
+            assert_eq!(
+                clone_flags_einval(flags, pidfd_is_parent_tid),
+                einval,
+                "{flags:#x} {pidfd_is_parent_tid}"
+            );
+        }
+    }
+
+    /// A clone_args of `len` bytes with these fields, the rest zero.
+    fn args(len: usize, fields: &[(usize, u64)]) -> Vec<u8> {
+        let mut bytes = vec![0u8; len];
+        for (offset, value) in fields {
+            bytes[*offset..*offset + 8].copy_from_slice(&value.to_ne_bytes());
+        }
+        bytes
+    }
+
+    /// clone3's own checks refuse first, in their order: a set_tid shape,
+    /// the exit signal, CLONE_INTO_CGROUP's field, then flags clone3 does not
+    /// take, CLONE_SIGHAND with CLONE_CLEAR_SIGHAND, an exit signal for a
+    /// thread and an unpaired or overflowing stack. Where the kernel could
+    /// fail another way first, a nonzero tail (E2BIG) or a set_tid array to
+    /// copy (EFAULT), nothing is decided.
+    #[test]
+    fn clone3_decides_only_what_the_kernel_checks_first() {
+        let sigchld = libc::SIGCHLD as u64;
+        let fork = [(32, sigchld)];
+        for (bytes, einval) in [
+            (args(64, &fork), false),
+            (args(88, &[(0, PTHREAD), (40, 0x1000), (48, 0x1000)]), false),
+            (args(88, &[(0, 0x80), (32, sigchld)]), false),
+            (args(128, &[(0, VM | FS), (32, sigchld)]), false),
+            (args(88, &[(0, PTHREAD), (32, sigchld)]), true),
+            (
+                args(88, &[(0, libc::CLONE_PARENT as u64), (32, sigchld)]),
+                true,
+            ),
+            (args(88, &[(0, 0x11)]), true),
+            (args(88, &[(0, libc::CLONE_DETACHED as u64)]), true),
+            (args(88, &[(0, VM | SIGHAND | (1 << 32))]), true),
+            (args(88, &[(0, 1 << 34)]), true),
+            (args(88, &[(32, 65)]), true),
+            (args(88, &[(40, 0x1000)]), true),
+            (args(88, &[(48, 0x1000)]), true),
+            (args(88, &[(40, u64::MAX), (48, 2)]), true),
+            (args(88, &[(64, 0x1000)]), true),
+            (args(88, &[(72, 1)]), true),
+            (args(88, &[(64, 0x1000), (72, 33)]), true),
+            (args(80, &[(0, 1 << 33)]), true),
+            (args(88, &[(0, 1 << 33), (80, 1 << 31)]), true),
+            (args(88, &[(0, 1 << 33), (80, 3)]), false),
+            (args(88, &[(0, THREAD), (64, 0x1000), (72, 1)]), false),
+            (args(96, &[(0, THREAD), (88, 1)]), false),
+            (args(96, &[(0, THREAD)]), true),
+            (
+                args(88, &[(0, PIDFD | PARENT_SETTID), (8, 8), (24, 8)]),
+                true,
+            ),
+            (
+                args(88, &[(0, PIDFD | PARENT_SETTID), (8, 8), (24, 16)]),
+                false,
+            ),
+            (
+                args(64, &[(0, libc::CLONE_NEWNS as u64 | FS), (32, sigchld)]),
+                true,
+            ),
+        ] {
+            assert_eq!(clone3_args_einval(&bytes, None), einval, "{bytes:x?}");
+        }
+    }
+
+    /// A stack whose end passes the user address limit the backend reports
+    /// is refused, as `access_ok` refuses it: one in the kernel's half, and
+    /// one a byte past the limit. One that ends at the limit is not, and
+    /// without a reported limit nothing is decided from the stack's place.
+    #[test]
+    fn clone3_refuses_a_stack_past_the_reported_user_limit() {
+        let sigchld = libc::SIGCHLD as u64;
+        let limit = (1_u64 << 47) - 4096;
+        let stack = |base: u64, size: u64| args(88, &[(32, sigchld), (40, base), (48, size)]);
+        for (bytes, user_limit, einval) in [
+            (stack(0xffff_8000_0000_0000, 0x1000), Some(limit), true),
+            (stack(0xffff_8000_0000_0000, 0x1000), None, false),
+            (stack(limit - 0x1000, 0x1001), Some(limit), true),
+            (stack(limit - 0x1000, 0x1000), Some(limit), false),
+            (stack(0x7000_0000, 0x1000), Some(limit), false),
+            (args(88, &[(32, sigchld)]), Some(limit), false),
+        ] {
+            assert_eq!(
+                clone3_args_einval(&bytes, user_limit),
+                einval,
+                "{bytes:x?} {user_limit:?}"
+            );
+        }
     }
 }
 

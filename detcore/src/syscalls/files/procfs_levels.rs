@@ -246,7 +246,12 @@ fn absent_prefix(path: &Path, level: detcore_model::config::ProcLevel) -> Option
 /// treats it (rename looks up the last one's directory first). So does a
 /// trailing slash in the guest's spelling `bytes` (O_CREAT then fails with
 /// EISDIR).
-fn dashed_spelling(parent: &Path, prefix: &Path, named: &Path, bytes: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn dashed_spelling(
+    parent: &Path,
+    prefix: &Path,
+    named: &Path,
+    bytes: &[u8],
+) -> Option<Vec<u8>> {
     let name_length = prefix.file_name()?.len();
     let mut substituted = parent.as_os_str().as_bytes().to_vec();
     if !substituted.ends_with(b"/") {
@@ -1000,6 +1005,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// The answer to the call `sysno`, its argument `values` but for the path
+    /// at argument `path`, which is `spelling`, a name procfs does not have
+    /// ([`dashed_spelling`]): the kernel's refusal of the call's other
+    /// arguments, which Linux checks before its walk, if it makes one, and
+    /// otherwise ENOENT, where the walk ends ([`Self::issue_substituted`]).
+    pub(super) async fn answer_for_absent_name<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        values: [usize; 6],
+        path: usize,
+        spelling: Vec<u8>,
+    ) -> Result<i64, Error> {
+        let replacement = Replacement {
+            argument: Some(path),
+            bytes: spelling,
+        };
+        self.issue_substituted(guest, sysno, values, vec![replacement], true)
+            .await
     }
 
     /// Whether the socket `fd` is a datagram socket, as the socket says

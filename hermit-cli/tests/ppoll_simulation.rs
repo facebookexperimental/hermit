@@ -206,12 +206,16 @@ fn ppoll_masked_waits_poll_under_their_mask() {
 
 /// On a backend whose kernel does not report the guest's signal state, Hermit
 /// cannot tell whether the backend holds a signal that should end a masked
-/// ppoll's wait, so under `run --strict` such a call that would block still
-/// fails closed with ENOSYS (`masked-fail-closed`), where the ptrace backend
-/// waits under the mask (`ppoll_masked_waits_poll_under_their_mask`).
+/// ppoll's wait, so such a call that would block is refused by name
+/// (`masked-fail-closed`), where the ptrace backend waits under the mask
+/// (`ppoll_masked_waits_poll_under_their_mask`). Under `run --strict` the run
+/// fails, naming the call, before the guest prints anything; the DBT runtime
+/// ends a fail-closed refusal with its own exit status, not
+/// `HERMIT_POLICY_REFUSAL_EXIT`. With `--allow-unsupported-syscalls` the
+/// guest gets ENOSYS, as it did before the refusal was named.
 #[cfg(feature = "dbt")]
 #[test]
-fn dbt_masked_ppoll_that_would_block_fails_closed() {
+fn dbt_masked_ppoll_that_would_block_is_refused_by_name() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
@@ -229,26 +233,50 @@ fn dbt_masked_ppoll_that_would_block_fails_closed() {
         .arg(&guest);
     command_output(compile, "ppoll guest compilation");
 
-    let mut run = Command::new("timeout");
-    run.args(["--kill-after", "5s", "60s"])
-        .arg(hermit_test::hermit_binary())
-        .args([
-            "--backend=dbt",
-            "run",
-            "--strict",
-            "--base-env=minimal",
-            "--",
-        ])
-        .arg(&guest)
-        .arg("masked-fail-closed");
-    // Validation runs guests in an empty working directory, which DBT needs
-    // named on its command line.
-    hermit_test::configure_guest_execution(&mut run);
-    let output = command_output(run, "strict dbt masked ppoll fail-closed run");
+    let run = |mode: &str| {
+        let mut run = Command::new("timeout");
+        run.args(["--kill-after", "5s", "60s"])
+            .arg(hermit_test::hermit_binary())
+            .args(["--backend=dbt", "run", mode, "--base-env=minimal", "--"])
+            .arg(&guest)
+            .arg("masked-fail-closed");
+        // Validation runs guests in an empty working directory, which DBT
+        // needs named on its command line.
+        hermit_test::configure_guest_execution(&mut run);
+        run
+    };
+
+    let mut strict = run("--strict");
+    let rendered = format!("{strict:?}");
+    let output = hermit_test::hermit_output(&rendered, &mut strict);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a blocking masked ppoll under strict dbt did not end the run: \
+         {rendered}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains(
+            "hermit: [dtid 3] ppoll refused: a ppoll with a temporary signal mask that would \
+             wait cannot be served on this backend"
+        ),
+        "the strict dbt run did not name the ppoll refusal\nstderr:\n{stderr}",
+    );
+    assert!(
+        !stdout.contains("ppoll-simulation-ok"),
+        "the guest ran past the refused ppoll\nstdout:\n{stdout}",
+    );
+
+    let output = command_output(
+        run("--allow-unsupported-syscalls"),
+        "dbt masked ppoll run allowing unsupported operations",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("ppoll-simulation-ok"),
-        "a blocking masked ppoll did not fail closed with ENOSYS under dbt\nstdout:\n{stdout}\nstderr:\n{}",
+        "with unsupported operations allowed, a blocking masked ppoll did not get ENOSYS under \
+         dbt\nstdout:\n{stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr),
     );
 }

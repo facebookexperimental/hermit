@@ -623,6 +623,160 @@ fn pselect6_probe_result(result: Result<i64, Errno>) -> Result<i64, Errno> {
     }
 }
 
+/// Runs `probe`, a zero-timeout ppoll, and returns its result, `EINTR`
+/// included. Only `ERESTARTSYS`, which ppoll itself never returns, is retried:
+/// it is the backend's report that a signal stopped the probe before its
+/// `syscall` instruction ran, and the backend holds that signal for the
+/// guest's resume, so the probe runs again, as `inject_with_retry` ran it.
+///
+/// `inject_with_retry` also retried `EINTR`, which hung the call forever on a
+/// backend that runs it itself: where the probe's temporary mask lets in a
+/// pending caught signal, such a backend answers `EINTR` and installs the
+/// mask for that signal's delivery as the guest resumes, and the signal stays
+/// pending until then, so every retry found it again. Linux answers that case
+/// with ERESTARTNOHAND (`do_poll`, fs/select.c), keeps the temporary mask for
+/// the delivery (`poll_select_finish`), and the delivery to a handler makes
+/// it `EINTR` (`handle_signal`, arch/x86/kernel/signal.c), so `EINTR` is the
+/// guest's answer, as for pselect6's probes. A traced guest's probe gets the
+/// kernel's own ERESTARTNOHAND, which was never retried. A backend that runs
+/// the real call inside the guest's process gets `EINTR` once a handler has
+/// run for the signal, which the retry turned into a later probe's 0.
+async fn inject_ppoll_probe<G, T>(guest: &mut G, probe: syscalls::Ppoll) -> Result<i64, Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    loop {
+        let result = guest.inject(probe).await;
+        if !ppoll_probe_runs_again(result) {
+            return result;
+        }
+    }
+}
+
+/// Whether `inject_ppoll_probe` runs a probe again after `result`: only after
+/// the backend's report that it did not run (`ERESTARTSYS`).
+fn ppoll_probe_runs_again(result: Result<i64, Errno>) -> bool {
+    result == Err(Errno::ERESTARTSYS)
+}
+
+/// The pending signals that the temporary mask `mask` lets in, in the signal
+/// state `sets` a backend reports, when every one of them is a signal the
+/// process ignores (`crate::syscalls::ignored_at_generation`: set to SIG_IGN,
+/// or default-ignored with no handler), and so one Linux discards as a ppoll
+/// under `mask` returns (`get_signal`, kernel/signal.c); the empty set when
+/// the mask lets none in. `None` when it lets in one that is not ignored.
+fn ignored_signals_let_in(sets: &reverie::SignalSets, mask: KernelSigset) -> Option<KernelSigset> {
+    let let_in = (sets.pending | sets.shared_pending) & !mask;
+    let ignored = crate::syscalls::ignored_at_generation(sets.ignored, sets.caught);
+    (let_in & !ignored == 0).then_some(let_in)
+}
+
+/// [`ignored_signals_let_in`] for the calling thread, from the signal state
+/// its backend reports (`Guest::signal_sets`); `None` from a backend that
+/// reports none.
+fn ignored_signals_let_in_now<G, T>(guest: &G, mask: KernelSigset) -> Option<KernelSigset>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    guest
+        .signal_sets(guest.tid())
+        .ok()
+        .and_then(|sets| ignored_signals_let_in(&sets, mask))
+}
+
+/// The refusal of a masked pselect6 that a backend running the call itself
+/// failed with ENOSYS for a pending signal its temporary mask lets in, which
+/// it cannot act on inside the call, as for ppoll
+/// (`Detcore::refuse_masked_ppoll_signal`).
+const MASKED_PSELECT6_SIGNAL_REASON: &str = "a pselect6 whose temporary signal mask lets in a \
+     pending signal that would stop the process, or an ignored one pending beside a signal \
+     that ends the call, cannot be served on this backend: it cannot act on that signal inside \
+     the call";
+
+/// The refusal of a masked pselect6 that a backend running the call itself
+/// failed with ENOSYS for its descriptor sets, as KVM's does for more than 64
+/// descriptors or for a selected standard output or error it captures, each
+/// before it looks at a signal (`masked_pselect6_refusal_reason`). Linux
+/// serves both: it clamps the count to its descriptor table
+/// (`core_sys_select`, fs/select.c:641-642 at v6.17) and never fails the
+/// call with ENOSYS.
+const MASKED_PSELECT6_DECLINED_REASON: &str = "a pselect6 with a temporary signal mask whose \
+     descriptor sets this backend does not serve (more than 64 descriptors, or a standard \
+     output or error it captures) cannot be served on this backend";
+
+/// The signals whose default action stops the process (`SIG_KERNEL_STOP_MASK`
+/// and `sig_kernel_stop`, include/linux/signal.h:422-424 and :448 at v6.17):
+/// SIGSTOP, SIGTSTP, SIGTTIN and SIGTTOU.
+const DEFAULT_STOP_SIGNALS: KernelSigset = (1 << (libc::SIGSTOP - 1))
+    | (1 << (libc::SIGTSTP - 1))
+    | (1 << (libc::SIGTTIN - 1))
+    | (1 << (libc::SIGTTOU - 1));
+
+/// Whether the signal state `sets` holds a pending signal that the temporary
+/// mask `mask` lets in (SIGKILL and SIGSTOP always: no mask blocks them) and
+/// that a backend running a masked ppoll or pselect6 itself cannot act on
+/// inside the call, so that it fails the call with ENOSYS: one the process
+/// ignores (the shared rule, `crate::syscalls::ignored_at_generation`), which
+/// Linux discards before it restarts the call, or one whose default action
+/// stops the process with no handler (`DEFAULT_STOP_SIGNALS`). A caught
+/// signal, or one whose default action ends the process, ends the call
+/// instead.
+fn lets_in_a_signal_the_backend_cannot_act_on(
+    sets: &reverie::SignalSets,
+    mask: KernelSigset,
+) -> bool {
+    let unblockable: KernelSigset = (1 << (libc::SIGKILL - 1)) | (1 << (libc::SIGSTOP - 1));
+    let let_in = (sets.pending | sets.shared_pending) & !(mask & !unblockable);
+    let ignored = crate::syscalls::ignored_at_generation(sets.ignored, sets.caught);
+    let stops = DEFAULT_STOP_SIGNALS & !sets.caught & !ignored;
+    let_in & (ignored | stops) != 0
+}
+
+/// Why a masked pselect6 of `nfds` descriptors that the backend failed with
+/// ENOSYS, under the temporary mask `mask`, is refused, from the signal state
+/// `sets` the backend reports for the thread, if it reports any. More
+/// descriptors than one machine word holds (`PSELECT6_INTERNAL_MAX_NFDS`)
+/// KVM's backend declines first, before it reads the sets or looks at a
+/// signal, so the call is refused for its descriptor sets whatever is
+/// pending. Otherwise it is refused for a pending signal the backend cannot
+/// act on inside the call (`lets_in_a_signal_the_backend_cannot_act_on`), or,
+/// with none pending, for the call's descriptor sets. A selected standard
+/// output or error the backend captures it also declines before it looks at
+/// a signal, and Detcore cannot see which descriptors it captures, so such a
+/// call with such a signal pending is refused for the signal. With no state
+/// reported, the signal.
+fn masked_pselect6_refusal_reason(
+    sets: Option<&reverie::SignalSets>,
+    mask: KernelSigset,
+    nfds: i32,
+) -> &'static str {
+    if nfds > PSELECT6_INTERNAL_MAX_NFDS {
+        return MASKED_PSELECT6_DECLINED_REASON;
+    }
+    match sets {
+        Some(sets) if !lets_in_a_signal_the_backend_cannot_act_on(sets, mask) => {
+            MASKED_PSELECT6_DECLINED_REASON
+        }
+        _ => MASKED_PSELECT6_SIGNAL_REASON,
+    }
+}
+
+/// [`masked_pselect6_refusal_reason`] for the calling thread, from the signal
+/// state its backend reports now (`Guest::signal_sets`).
+fn masked_pselect6_refusal_reason_now<G, T>(
+    guest: &G,
+    mask: KernelSigset,
+    nfds: i32,
+) -> &'static str
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    masked_pselect6_refusal_reason(guest.signal_sets(guest.tid()).ok().as_ref(), mask, nfds)
+}
+
 pub(super) fn read_pselect6_fd_set<T, G>(
     guest: &mut G,
     address: Option<AddrMut<'_, libc::fd_set>>,
@@ -1528,7 +1682,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A virtual timerfd among the sets is readable exactly when its
             // deadline has passed (`crate::syscalls::timerfd`).
             crate::syscalls::timerfd::publish_expired(guest).await;
-            return Ok(guest.inject(call).await?);
+            let result = guest.inject(call).await;
+            // A backend that runs the call itself answers ENOSYS for a pending
+            // signal the mask lets in that it cannot act on inside the call
+            // (`settle_masked_pselect6_enosys`).
+            if result == Err(Errno::ENOSYS)
+                && let Some(argument) = sigmask_argument
+                && argument.sigmask != 0
+                && argument.sigsetsize == KERNEL_SIGSET_SIZE
+                && let Some(mask_addr) = Addr::<libc::sigset_t>::from_raw(argument.sigmask)
+            {
+                let mask = read_kernel_sigset(guest, mask_addr).await?;
+                return self
+                    .settle_masked_pselect6_enosys(guest, call, sanitize_ppoll_signal_mask(mask))
+                    .await;
+            }
+            return Ok(result?);
         }
 
         // Linux clamps raw fd-set copies to the process fd table's current max_fds.
@@ -1608,6 +1777,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .await;
             staged.release(guest);
+            // Linux's pselect6 never fails with ENOSYS. A backend that runs
+            // the call itself answers it for more descriptors than it serves,
+            // which it declines before it looks at any signal: refused by name,
+            // as the zero-timeout call is (`settle_masked_pselect6_enosys`),
+            // never handed to the guest.
+            if let Err(Error::Errno(Errno::ENOSYS)) = result {
+                let reason = masked_pselect6_refusal_reason_now(guest, mask, call.nfds());
+                return self
+                    .refuse_masked_wait_because(guest, Sysno::pselect6, reason)
+                    .await;
+            }
             return result;
         }
 
@@ -1738,17 +1918,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `KernelSignalWait` below decides interruption against the temporary
         // mask instead (`with_wait_mask`), and the probes carry no mask.
         let kernel_signal_wait = self.cfg.backend.supports_blocked_wait_signal_interruption;
-        let probe_sigmask = sigmask
+        // The probes' mask cell and the mask it holds, kept to write back after
+        // a removal in that cell (`remove_signals_discarded_under_a_temporary_mask_in`).
+        let probe_mask_cell = sigmask
             .filter(|_| !kernel_signal_wait && !gated)
-            .map(|mask| {
-                let sigset = stack.push(mask);
-                stack
-                    .push(Pselect6SigmaskArg {
-                        sigmask: sigset.as_raw(),
-                        sigsetsize: KERNEL_SIGSET_SIZE,
-                    })
-                    .cast()
-            });
+            .map(|mask| (stack.push(mask).as_raw(), mask));
+        let probe_sigmask = probe_mask_cell.map(|(sigset, _)| {
+            stack
+                .push(Pselect6SigmaskArg {
+                    sigmask: sigset,
+                    sigsetsize: KERNEL_SIGSET_SIZE,
+                })
+                .cast()
+        });
         // On a backend whose kernel reports the guest's signal state, only a
         // signal that would end the wait natively does; the mask cell lets the
         // wait block signals under the one scratch-stack guard
@@ -1928,7 +2110,49 @@ impl<T: RecordOrReplay> Detcore<T> {
                         },
                         None => guest.inject(probe).await,
                     };
-                    let result = pselect6_probe_result(raw_result);
+                    let mut result = pselect6_probe_result(raw_result);
+                    // A backend that runs the call itself answers ENOSYS for a
+                    // pending signal the mask lets in that it cannot act on, as
+                    // it does for ppoll (`settle_masked_ppoll_enosys`): ignored
+                    // ones alone are removed, in the probe's own cells, as
+                    // Linux discards them, and the probe runs again with its
+                    // cells as it read them. Anything else is refused by name.
+                    if result == Err(Errno::ENOSYS)
+                        && let Some((mask_cell, mask)) = probe_mask_cell
+                    {
+                        if let Some(set) = ignored_signals_let_in_now(guest, mask) {
+                            crate::syscalls::helpers::remove_signals_discarded_under_a_temporary_mask_in(
+                                guest,
+                                set,
+                                mask_cell,
+                                probe_timeout,
+                            )
+                            .await?;
+                            guest.memory().write_value(
+                                AddrMut::<KernelSigset>::from_raw(mask_cell).ok_or(Errno::EFAULT)?,
+                                &mask,
+                            )?;
+                            guest.memory().write_value(
+                                probe_timeout,
+                                &Timespec {
+                                    tv_sec: 0,
+                                    tv_nsec: 0,
+                                },
+                            )?;
+                            write_pselect6_fd_set(guest, probe.readfds(), &original_readfds)?;
+                            write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
+                            write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
+                            result = pselect6_probe_result(guest.inject(probe).await);
+                        }
+                        if result == Err(Errno::ENOSYS) {
+                            self.write_pselect6_remaining(guest, call, deadline).await?;
+                            let reason =
+                                masked_pselect6_refusal_reason_now(guest, mask, call.nfds());
+                            break self
+                                .refuse_masked_wait_because(guest, Sysno::pselect6, reason)
+                                .await;
+                        }
+                    }
                     if result != Ok(0) {
                         let copy_result = if result.is_ok() {
                             self.copy_pselect6_results(guest, probe, call, len)
@@ -2532,7 +2756,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // probe's copies take the scratch stack.
                 crate::syscalls::timerfd::publish_expired(guest).await;
             }
-            let (probe, staged) = match self.prepare_ppoll_probe(guest, call, first).await? {
+            let signal_mask = read_ppoll_mask(guest, call, first).await?;
+            let (probe, staged) = match self.stage_ppoll_probe(guest, call, signal_mask).await? {
                 Some((probe, staged)) => (probe, Some(staged)),
                 None => {
                     if let Some(refused) = self.refuse_unstageable_ppoll_copy(guest).await {
@@ -2565,11 +2790,24 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .await
                     .map_err(Into::into)
             } else {
-                guest.inject_with_retry(probe).await.map_err(Into::into)
+                inject_ppoll_probe(guest, probe).await.map_err(Into::into)
             };
             if let Some(staged) = staged {
                 staged.release(guest);
             }
+            // A backend that runs the call itself answers ENOSYS for a pending
+            // signal the mask lets in that it cannot act on inside the call
+            // (`settle_masked_ppoll_enosys`); after the copies are given back,
+            // whose stack the settling may use.
+            let result = match (result, signal_mask) {
+                (Err(Error::Errno(Errno::ENOSYS)), Some(signal_mask))
+                    if !self.cfg.recordreplay_modes =>
+                {
+                    self.settle_masked_ppoll_enosys(guest, call, signal_mask, false)
+                        .await
+                }
+                (result, _) => result,
+            };
             // Replay serves the probe from the recording, so the kernel never
             // installs its mask; deliver a recorded interruption under it, as
             // for pselect6.
@@ -2661,6 +2899,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             if let Some(staged) = staged {
                 staged.release(guest);
             }
+            // Linux's ppoll never fails with ENOSYS. A backend that runs the
+            // call itself answers it for a masked wait it cannot keep under
+            // the mask, and for a pending signal the mask lets in that it
+            // cannot act on inside the call: refused by name
+            // (`refuse_masked_ppoll_enosys`), never handed to the guest.
+            if let (Err(Error::Errno(Errno::ENOSYS)), Some(mask)) = (&result, temporary_mask) {
+                return self.refuse_masked_ppoll_enosys(guest, mask).await;
+            }
             // Replay serves the call from the recording, so the kernel never
             // installs its mask; deliver a recorded interruption under it
             // (https://github.com/rrnewton/hermit/issues/3992).
@@ -2683,26 +2929,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `stage_private_cells` clear of the pollfd array that Linux writes. So
     /// neither a sibling's write nor the guest's own mask can make the probe
     /// sleep or block Hermit's timer signal. `None` when the copies have
-    /// nowhere to go (`refuse_unstageable_ppoll_copy`). `first` says the
-    /// mask's read is the call's first injection, so a signal that stops it
-    /// restarts the call (`restart_if_first_probe_not_run`).
-    async fn prepare_ppoll_probe<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        call: syscalls::Ppoll,
-        first: bool,
-    ) -> Result<
-        Option<(
-            syscalls::Ppoll,
-            StagedCells<<G::Stack as Stack>::StackGuard>,
-        )>,
-        Error,
-    > {
-        let signal_mask = read_ppoll_mask(guest, call, first).await?;
-        self.stage_ppoll_probe(guest, call, signal_mask).await
-    }
-
-    /// `prepare_ppoll_probe` after the mask's read: `signal_mask` is the
+    /// nowhere to go (`refuse_unstageable_ppoll_copy`). `signal_mask` is the
     /// mask `read_ppoll_mask` read, if the call names one.
     async fn stage_ppoll_probe<G: Guest<Self>>(
         &self,
@@ -2811,32 +3038,47 @@ impl<T: RecordOrReplay> Detcore<T> {
                     None => Err(Errno::ENOSYS.into()),
                 };
             };
+            // The copies are given back before the time left is written: their
+            // red-zone window may cover the guest's timeout, which Linux never
+            // sees.
             let result = if self.cfg.backend.supports_blocked_wait_signal_interruption {
-                self.wait_on_masked_ppoll_probe(
-                    guest,
-                    probe,
-                    staged.mask(),
-                    staged.timerfd_scratch,
-                    deadline,
-                )
-                .await
+                let result = self
+                    .wait_on_masked_ppoll_probe(
+                        guest,
+                        probe,
+                        staged.mask(),
+                        staged.timerfd_scratch,
+                        deadline,
+                    )
+                    .await;
+                staged.release(guest);
+                result
             } else {
                 // Without the kernel's signal state, Hermit cannot tell whether
                 // the backend holds a signal that should end the wait, so a
-                // ppoll that would block still fails closed. An expired
-                // timerfd on virtual time is made readable first, in the
-                // staged cells' scratch (`crate::syscalls::timerfd`).
+                // ppoll that would block fails closed, refused by name
+                // (`refuse_masked_ppoll_wait`). An expired timerfd on virtual
+                // time is made readable first, in the staged cells' scratch
+                // (`crate::syscalls::timerfd`). A backend that runs the call
+                // itself answers EINTR, with the mask installed for the
+                // delivery, when a pending caught signal ends it
+                // (`inject_ppoll_probe`), and ENOSYS for one it cannot act on
+                // (`settle_masked_ppoll_enosys`, after the copies are given
+                // back, whose stack the settling may use).
                 crate::syscalls::timerfd::publish_expired_in(guest, staged.timerfd_scratch).await;
-                let result = guest.inject_with_retry(probe).await;
-                if probe.syscall_would_have_blocked(result) {
-                    Err(Errno::ENOSYS.into())
-                } else {
-                    result.map_err(Into::into)
+                let result = inject_ppoll_probe(guest, probe).await;
+                staged.release(guest);
+                match (result, signal_mask) {
+                    (Err(Errno::ENOSYS), Some(signal_mask)) => {
+                        self.settle_masked_ppoll_enosys(guest, call, signal_mask, true)
+                            .await
+                    }
+                    (result, _) if probe.syscall_would_have_blocked(result) => {
+                        self.refuse_masked_ppoll_wait(guest).await
+                    }
+                    (result, _) => result.map_err(Into::into),
                 }
             };
-            // Before the time left is written: the copies' red-zone window may
-            // cover the guest's timeout, which Linux never sees.
-            staged.release(guest);
             if let (Some(timeout_address), Some(timeout), Some(started_at)) =
                 (timeout_address, timeout, started_at)
             {
@@ -2866,6 +3108,181 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await?;
         }
         result
+    }
+
+    /// The answer to a ppoll with a temporary signal mask that would wait, on
+    /// a backend that cannot interrupt a blocked wait for a signal
+    /// (`BackendCapabilities::supports_blocked_wait_signal_interruption` is
+    /// false): Hermit cannot keep the mask in place across the wait, so the
+    /// call is refused by name through the unsupported-operation policy, on
+    /// stderr when the run ends (`report_refusal_reason`); with unsupported
+    /// operations allowed the guest gets ENOSYS, as before. Linux's ppoll
+    /// never fails with ENOSYS.
+    async fn refuse_masked_ppoll_wait<G: Guest<Self>>(&self, guest: &mut G) -> Result<i64, Error> {
+        const REASON: &str = "a ppoll with a temporary signal mask that would wait cannot be \
+             served on this backend: it cannot keep the mask in place across the wait";
+        self.refuse_masked_wait_because(guest, Sysno::ppoll, REASON)
+            .await
+    }
+
+    /// The answer to a ppoll whose temporary signal mask lets in a pending
+    /// signal that the backend, which runs the call itself, cannot act on
+    /// inside the call: one that would stop the process, or an ignored one
+    /// pending beside one that ends the call (`settle_masked_ppoll_enosys`).
+    /// Refused by name as `refuse_masked_ppoll_wait` refuses a wait.
+    async fn refuse_masked_ppoll_signal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<i64, Error> {
+        const REASON: &str = "a ppoll whose temporary signal mask lets in a pending signal that \
+             would stop the process, or an ignored one pending beside a signal that ends the \
+             call, cannot be served on this backend: it cannot act on that signal inside the call";
+        self.refuse_masked_wait_because(guest, Sysno::ppoll, REASON)
+            .await
+    }
+
+    /// A masked wait, `sysno`, refused by name for `reason`, through the
+    /// unsupported-operation policy.
+    async fn refuse_masked_wait_because<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        reason: &'static str,
+    ) -> Result<i64, Error> {
+        crate::syscalls::helpers::report_refusal_reason(
+            self.cfg.panic_on_unsupported_syscalls,
+            &format!(
+                "[dtid {}] {sysno} refused: {reason}",
+                guest.thread_state().dettid
+            ),
+        );
+        if !self.cfg.panic_on_unsupported_syscalls {
+            crate::tool_global::report_unsupported_syscall(guest, sysno).await;
+        }
+        self.refuse_unserviceable_operation_because(guest, sysno, Errno::ENOSYS, reason)
+            .await
+    }
+
+    /// The answer to a masked ppoll that the kernel beneath waits in
+    /// (`ppoll_uses_kernel_wait`) and the backend failed with ENOSYS, which
+    /// Linux's ppoll never returns: a backend that runs the call itself
+    /// declines a wait it cannot keep under the mask, and a pending signal
+    /// the mask lets in that it cannot act on inside the call. Ignored ones
+    /// alone, which Linux discards as the call returns before it restarts
+    /// the call to wait again, are removed as it removes them
+    /// (`discard_ignored_signals_let_in`), and the call is refused as a wait;
+    /// anything else is refused as such a signal.
+    async fn refuse_masked_ppoll_enosys<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        mask: KernelSigset,
+    ) -> Result<i64, Error> {
+        if self.discard_ignored_signals_let_in(guest, mask).await? {
+            self.refuse_masked_ppoll_wait(guest).await
+        } else {
+            self.refuse_masked_ppoll_signal(guest).await
+        }
+    }
+
+    /// The answer to a zero-timeout probe of a masked ppoll, `call` with
+    /// the temporary mask `signal_mask` as `read_ppoll_mask` read it, that the
+    /// backend failed with ENOSYS, which Linux's ppoll never returns. A
+    /// backend that runs the call itself answers it when a pending signal the
+    /// mask lets in is one it cannot act on inside the call, where Linux
+    /// returns ERESTARTNOHAND (`do_poll`, fs/select.c): it cannot discard an
+    /// ignored signal, restart the call, or stop the process.
+    ///
+    /// When every such signal is one the process ignores (the shared rule,
+    /// `crate::syscalls::ignored_at_generation`), Linux discards each as the
+    /// call returns (`get_signal`, kernel/signal.c) and, having delivered
+    /// nothing, restarts the call, which polls again
+    /// (`arch_do_signal_or_restart`, arch/x86/kernel/signal.c). So does this:
+    /// they are removed from the thread's queues
+    /// (`discard_ignored_signals_let_in`), and a new probe runs, whose result
+    /// is the call's. Where the call would wait (`waits`), a probe that finds
+    /// nothing ready is refused as a wait (`refuse_masked_ppoll_wait`), as
+    /// one without those signals is. Any other such signal, a stop or an
+    /// ignored one beside a signal that ends the call, is refused by name
+    /// (`refuse_masked_ppoll_signal`): which ignored signals Linux discards
+    /// then depends on the handler's own mask, read nowhere here.
+    async fn settle_masked_ppoll_enosys<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Ppoll,
+        signal_mask: KernelSigset,
+        waits: bool,
+    ) -> Result<i64, Error> {
+        if !self
+            .discard_ignored_signals_let_in(guest, sanitize_ppoll_signal_mask(signal_mask))
+            .await?
+        {
+            return self.refuse_masked_ppoll_signal(guest).await;
+        }
+        let again = match self
+            .stage_ppoll_probe(guest, call, Some(signal_mask))
+            .await?
+        {
+            Some((probe, staged)) => {
+                let again = inject_ppoll_probe(guest, probe).await;
+                staged.release(guest);
+                again
+            }
+            None => {
+                return match self.refuse_unstageable_ppoll_copy(guest).await {
+                    Some(refused) => refused,
+                    None => Err(Errno::ENOSYS.into()),
+                };
+            }
+        };
+        match again {
+            Err(Errno::ENOSYS) => self.refuse_masked_ppoll_signal(guest).await,
+            Ok(0) if waits => self.refuse_masked_ppoll_wait(guest).await,
+            result => result.map_err(Into::into),
+        }
+    }
+
+    /// The answer to a zero-timeout masked pselect6, `call` with the
+    /// temporary mask `mask`, that the backend failed with ENOSYS, as for
+    /// ppoll (`settle_masked_ppoll_enosys`): when every pending signal the mask
+    /// lets in is one the process ignores, they are removed, as Linux discards
+    /// them before it restarts the call, and the call runs again, whose result
+    /// is the answer. Anything else is refused by name: for a pending signal
+    /// the backend cannot act on inside the call, or, with none, for the
+    /// descriptor sets it declined (`masked_pselect6_refusal_reason`).
+    async fn settle_masked_pselect6_enosys<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pselect6,
+        mask: KernelSigset,
+    ) -> Result<i64, Error> {
+        if self.discard_ignored_signals_let_in(guest, mask).await? {
+            match guest.inject(call).await {
+                Err(Errno::ENOSYS) => {}
+                result => return Ok(result?),
+            }
+        }
+        let reason = masked_pselect6_refusal_reason_now(guest, mask, call.nfds());
+        self.refuse_masked_wait_because(guest, Sysno::pselect6, reason)
+            .await
+    }
+
+    /// Removes the pending signals the temporary mask `mask` lets in, when
+    /// the backend reports this thread's signal state (`Guest::signal_sets`)
+    /// and every one of them is a signal the process ignores
+    /// (`ignored_signals_let_in`): Linux discards those as the call returns.
+    /// True when it removed them, or there were none; false, removing
+    /// nothing, when one is not ignored or the backend reports no state.
+    async fn discard_ignored_signals_let_in<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        mask: KernelSigset,
+    ) -> Result<bool, Error> {
+        let Some(ignored) = ignored_signals_let_in_now(guest, mask) else {
+            return Ok(false);
+        };
+        crate::syscalls::helpers::remove_signals_discarded_under_a_temporary_mask(guest, ignored)
+            .await?;
+        Ok(true)
     }
 
     /// The wait of a ppoll with a temporary mask under sequentialized threads:
@@ -5558,6 +5975,178 @@ mod tests {
         assert_eq!(pselect6_fd_set_len(1), Ok(8));
         assert_eq!(pselect6_fd_set_len(65), Ok(16));
         assert_eq!(pselect6_fd_set_len(libc::FD_SETSIZE as i32), Ok(128));
+    }
+
+    /// A ppoll probe runs again only after the backend's report that it did
+    /// not run. EINTR, which a backend that runs the call itself answers with
+    /// the temporary mask installed for a pending caught signal's delivery,
+    /// is the guest's answer: retrying it found the signal again forever.
+    #[test]
+    fn ppoll_probes_run_again_only_after_a_not_run_report() {
+        assert!(ppoll_probe_runs_again(Err(Errno::ERESTARTSYS)));
+        for result in [
+            Err(Errno::EINTR),
+            Err(Errno::ERESTARTNOHAND),
+            Err(Errno::ENOSYS),
+            Err(Errno::EFAULT),
+            Ok(0),
+            Ok(1),
+        ] {
+            assert!(!ppoll_probe_runs_again(result), "{result:?}");
+        }
+    }
+
+    /// The pending signals a temporary mask lets in, when every one of them
+    /// is ignored by the shared rule: set to SIG_IGN, or ignored by default
+    /// with no handler, on either queue; none when the mask lets in a caught
+    /// or default-fatal one, or a default-ignored one with a handler.
+    #[test]
+    fn a_temporary_mask_lets_in_only_ignored_signals_or_not() {
+        let bit = |signal: i32| 1_u64 << (signal - 1);
+        let sets = |pending: u64, shared: u64, ignored: u64, caught: u64| {
+            reverie::SignalSets::new(pending, shared, bit(libc::SIGWINCH), ignored, caught)
+        };
+        let winch = bit(libc::SIGWINCH);
+        let chld = bit(libc::SIGCHLD);
+        let usr1 = bit(libc::SIGUSR1);
+        let hup = bit(libc::SIGHUP);
+        let none = 0;
+        for (sets, mask, expected) in [
+            (sets(winch, 0, 0, 0), none, Some(winch)),
+            (sets(0, chld, 0, 0), none, Some(chld)),
+            (sets(winch, chld, 0, 0), none, Some(winch | chld)),
+            (sets(hup, 0, hup, 0), none, Some(hup)),
+            (sets(winch | usr1, 0, 0, usr1), usr1, Some(winch)),
+            (sets(winch, 0, 0, 0), winch, Some(0)),
+            (sets(0, 0, 0, 0), none, Some(0)),
+            (sets(winch | usr1, 0, 0, usr1), none, None),
+            (sets(usr1, 0, 0, 0), none, None),
+            (sets(winch, 0, 0, winch), none, None),
+            (sets(bit(libc::SIGTSTP), 0, 0, 0), none, None),
+        ] {
+            assert_eq!(
+                ignored_signals_let_in(&sets, mask),
+                expected,
+                "{sets:?} {mask:#x}"
+            );
+        }
+    }
+
+    /// A masked pselect6 that the backend failed with ENOSYS is refused for a
+    /// pending signal only when the mask lets in one the backend cannot act on
+    /// inside the call: an ignored one, or one whose default action stops the
+    /// process (SIGSTOP whatever the mask). With nothing pending, a blocked
+    /// signal, or only a caught or default-fatal one let in, which would end
+    /// the call instead, the backend declined the call's descriptor sets, as
+    /// KVM's does for nfds 100. Before, every such call was refused for a
+    /// pending signal. A backend that reports no signal state keeps that
+    /// reason.
+    #[test]
+    fn a_masked_pselect6_refusal_names_a_signal_only_when_one_is_pending() {
+        let bit = |signal: i32| 1_u64 << (signal - 1);
+        let sets = |pending: u64, shared: u64, ignored: u64, caught: u64| {
+            reverie::SignalSets::new(pending, shared, 0, ignored, caught)
+        };
+        let winch = bit(libc::SIGWINCH);
+        let usr1 = bit(libc::SIGUSR1);
+        let tstp = bit(libc::SIGTSTP);
+        let stop = bit(libc::SIGSTOP);
+        let term = bit(libc::SIGTERM);
+        let none = 0;
+        for (sets, mask, expected) in [
+            (
+                Some(sets(0, 0, 0, 0)),
+                none,
+                MASKED_PSELECT6_DECLINED_REASON,
+            ),
+            (
+                Some(sets(usr1, 0, 0, usr1)),
+                none,
+                MASKED_PSELECT6_DECLINED_REASON,
+            ),
+            (
+                Some(sets(0, term, 0, 0)),
+                none,
+                MASKED_PSELECT6_DECLINED_REASON,
+            ),
+            (
+                Some(sets(winch, 0, 0, 0)),
+                winch,
+                MASKED_PSELECT6_DECLINED_REASON,
+            ),
+            (
+                Some(sets(tstp, 0, 0, tstp)),
+                none,
+                MASKED_PSELECT6_DECLINED_REASON,
+            ),
+            (
+                Some(sets(tstp, 0, tstp, 0)),
+                none,
+                MASKED_PSELECT6_SIGNAL_REASON,
+            ),
+            (
+                Some(sets(winch, 0, 0, 0)),
+                none,
+                MASKED_PSELECT6_SIGNAL_REASON,
+            ),
+            (
+                Some(sets(0, winch, 0, 0)),
+                none,
+                MASKED_PSELECT6_SIGNAL_REASON,
+            ),
+            (
+                Some(sets(usr1 | winch, 0, 0, usr1)),
+                none,
+                MASKED_PSELECT6_SIGNAL_REASON,
+            ),
+            (
+                Some(sets(tstp, 0, 0, 0)),
+                none,
+                MASKED_PSELECT6_SIGNAL_REASON,
+            ),
+            (
+                Some(sets(stop, 0, 0, 0)),
+                stop,
+                MASKED_PSELECT6_SIGNAL_REASON,
+            ),
+            (None, none, MASKED_PSELECT6_SIGNAL_REASON),
+        ] {
+            for nfds in [0, 1, PSELECT6_INTERNAL_MAX_NFDS] {
+                assert_eq!(
+                    masked_pselect6_refusal_reason(sets.as_ref(), mask, nfds),
+                    expected,
+                    "{sets:?} {mask:#x} {nfds}"
+                );
+            }
+        }
+    }
+
+    /// A masked pselect6 of more descriptors than one machine word holds is
+    /// refused for its descriptor sets whatever is pending, a caught and an
+    /// ignored signal together included: KVM's backend declines that count
+    /// before it looks at any signal. Before, nfds 100 with such signals
+    /// pending was refused for a signal.
+    #[test]
+    fn a_masked_pselect6_of_more_than_64_descriptors_is_refused_for_its_sets() {
+        let bit = |signal: i32| 1_u64 << (signal - 1);
+        let winch = bit(libc::SIGWINCH);
+        let usr1 = bit(libc::SIGUSR1);
+        let tstp = bit(libc::SIGTSTP);
+        for sets in [
+            Some(reverie::SignalSets::new(usr1 | winch, 0, 0, 0, usr1)),
+            Some(reverie::SignalSets::new(winch, 0, 0, winch, 0)),
+            Some(reverie::SignalSets::new(tstp, 0, 0, 0, 0)),
+            Some(reverie::SignalSets::new(0, 0, 0, 0, 0)),
+            None,
+        ] {
+            for nfds in [PSELECT6_INTERNAL_MAX_NFDS + 1, 100, 1024, i32::MAX] {
+                assert_eq!(
+                    masked_pselect6_refusal_reason(sets.as_ref(), 0, nfds),
+                    MASKED_PSELECT6_DECLINED_REASON,
+                    "{sets:?} {nfds}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -374,7 +374,7 @@ enum ProcfsLevel {
     Thread,
     /// `thread-self`'s thread, which spells back as `thread-self`.
     ThreadSelf,
-    /// A process's or thread's `fd`.
+    /// A process's or thread's `fd` or `fdinfo`.
     Descriptors,
     /// Anything else.
     Opaque,
@@ -401,7 +401,7 @@ pub(super) struct NamedTask {
 /// `self` (a link to the caller's process directory, one level down) and a
 /// numbered process directory, `thread-self` (a link to `<pid>/task/<tid>`,
 /// three levels down), a process's `task` and a numbered thread in it, and
-/// `fd`. A `..` at the root stays there. With it, every task the path names
+/// `fd` and `fdinfo`. A `..` at the root stays there. With it, every task the path names
 /// by number on the way, in order ([`NamedTask`]): the walk looks each up, so
 /// the path names what this resolves it to only while each exists, and
 /// fails with `ENOENT` at the first that does not
@@ -478,9 +478,10 @@ pub(super) fn resolved_procfs_dotdot(path: &Path) -> Option<(PathBuf, Vec<NamedT
                 });
                 ProcfsLevel::Thread
             }
-            (Some(ProcfsLevel::Process | ProcfsLevel::Thread | ProcfsLevel::ThreadSelf), b"fd") => {
-                ProcfsLevel::Descriptors
-            }
+            (
+                Some(ProcfsLevel::Process | ProcfsLevel::Thread | ProcfsLevel::ThreadSelf),
+                b"fd" | b"fdinfo",
+            ) => ProcfsLevel::Descriptors,
             _ => ProcfsLevel::Opaque,
         };
         kept.push((name, level, false, None));
@@ -5191,6 +5192,19 @@ mod tests {
             resolved("/proc/thread-self/fd/.."),
             Some("/proc/thread-self".to_string())
         );
+        // `fdinfo` is a directory every process has, as `fd` is.
+        assert_eq!(
+            resolved("/proc/7/fdinfo/../cmdline"),
+            Some("/proc/7/cmdline".to_string())
+        );
+        assert_eq!(
+            tasks("/proc/7/fdinfo/../cmdline"),
+            Some(vec![task(Some(7), None)])
+        );
+        assert_eq!(
+            resolved("/proc/self/task/9/fdinfo/.."),
+            Some("/proc/self/task/9".to_string())
+        );
         assert_eq!(
             resolved("/proc/thread-self/../../.."),
             Some("/proc".to_string())
@@ -5207,6 +5221,7 @@ mod tests {
         assert_eq!(resolved("/proc/sys/../fs"), None);
         assert_eq!(resolved("/tmp/../proc/fs"), None);
         assert_eq!(resolved("/proc/self/fd/3/.."), None, "a descriptor link");
+        assert_eq!(resolved("/proc/self/fdinfo/3/.."), None, "a file");
     }
 
     /// A directory descriptor is told to be on a placeholder's object from

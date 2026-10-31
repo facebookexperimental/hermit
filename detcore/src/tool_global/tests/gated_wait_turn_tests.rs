@@ -449,6 +449,12 @@ impl GlobalRPC<GlobalState> for TurnGuest {
             GlobalRequest::PublishedGuestSigmask(_) => {
                 GlobalResponse::GuestSigmaskForStatus(self.status_mask)
             }
+            // A masked `ppoll` that would block, refused by name: a run that
+            // allows unsupported operations reports it and goes on
+            // (`Detcore::refuse_masked_ppoll_wait`).
+            GlobalRequest::ReportUnsupportedSyscall(name) if name == "ppoll" => {
+                GlobalResponse::ReportUnsupportedSyscall(())
+            }
             request => panic!("an unexpected RPC: {request:?}"),
         };
         (None, response)

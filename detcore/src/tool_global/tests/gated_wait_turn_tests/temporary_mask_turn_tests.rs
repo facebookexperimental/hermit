@@ -1439,11 +1439,13 @@ async fn under_the_gate_a_masked_epoll_pwait2_takes_the_same_path() {
 }
 
 /// With the gate off the masked forms keep today's paths: a masked `ppoll`
-/// that would block still fails with `ENOSYS` on in-guest, a masked
-/// `epoll_pwait` with a timeout keeps its raw in-turn call, and a masked
-/// `pselect6`'s internal probes still carry its temporary mask; no `/proc`
-/// read, no removal. Mutation "a gated path keyed on anything but the gate":
-/// one of them changes.
+/// that would block is refused by name on in-guest
+/// (`Detcore::refuse_masked_ppoll_wait`), which this configuration, allowing
+/// unsupported operations, reports as unsupported and answers with `ENOSYS`;
+/// a masked `epoll_pwait` with a timeout keeps its raw in-turn call, and a
+/// masked `pselect6`'s internal probes still carry its temporary mask; no
+/// `/proc` read, no removal. Mutation "a gated path keyed on anything but the
+/// gate": one of them changes.
 #[tokio::test]
 async fn with_the_gate_off_the_masked_forms_keep_today_s_paths() {
     if super::isolated_child(
@@ -1461,6 +1463,14 @@ async fn with_the_gate_off_the_masked_forms_keep_today_s_paths() {
     assert!(
         matches!(result, Err(Error::Errno(Errno::ENOSYS))),
         "{result:?}"
+    );
+    assert!(
+        guest.rpcs().iter().any(|request| matches!(
+            request,
+            GlobalRequest::ReportUnsupportedSyscall(name) if name == "ppoll"
+        )),
+        "the refusal was not reported: {:?}",
+        guest.rpcs()
     );
     let mut guest = turn_guest(false, Some(0));
     let result = tool

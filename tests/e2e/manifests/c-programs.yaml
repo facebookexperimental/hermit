@@ -4028,6 +4028,13 @@ test:
           in-guest-trap:
             - --max-timeslice=disabled
         hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each ran clean that way, 3 of 3, on the five nightly pressure sweeps from 2026-10-21 to 2026-10-25 (Hermit 9b30cb9a to 7903351d), after 10 of 10 in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
+        # KVM refuses userfaultfd by name (the backend's Userfaultfd refusal)
+        # until it implements the call, so its cell stays disabled, and the
+        # validator accepts no oracle for a disabled backend. When the KVM cell
+        # is enabled, its oracle must be "userfaultfd-served", never ptrace's
+        # "userfaultfd-": that prefix also matches "userfaultfd-unavailable
+        # ENOSYS", what the guest prints when the call is refused under
+        # --allow-unsupported-syscalls, so it would pass a KVM that serves nothing.
         expected_stdout_contains:
           ptrace: "userfaultfd-"
       naked:
@@ -6403,7 +6410,7 @@ test:
           - ptrace
         backends_disabled:
           dbt: "NAMED REFUSAL (https://github.com/rrnewton/hermit/issues/4574): the guest's CLONE_VM child, a process that shares its parent's memory without CLONE_THREAD or CLONE_VFORK, is refused by detcore-dbt before the clone runs (copied child cannot own inherited Detcore state), which ends the run as an internal DBT failure; DBT also reports no initial stack pointer, so its own file is the kernel's (https://github.com/rrnewton/hermit/issues/4565)."
-          kvm: "KNOWN GAP (https://github.com/rrnewton/hermit/issues/4564): Detcore cannot read another process's memory, so another process's /proc/<pid>/cmdline, and a descriptor its owner opened read by another process, are the kernel beneath's; on KVM that is the executor's host /proc lookup, whose answer (EACCES, or ENOENT where the supervisor has no task with that number) depends on the host, so no row can be pinned."
+          kvm: "NAMED REFUSAL (https://github.com/rrnewton/hermit/issues/4564): Detcore cannot read another process's memory, and on KVM the guest's processes are not host tasks, so /proc/<pid> would name whatever host task holds that number. Detcore refuses the parent's open of its running child's /proc/<pid>/cmdline by name, a fail-closed policy refusal that ends the run (exit 122), so no row can be pinned until another process's file can be served."
           sabre: "NAMED GAP, not fixed, under the owner's ruling that SaBRe is a drop candidate: SaBRe kills this guest with SIGSEGV when its first thread exits, at glibc's madvise(MADV_DONTNEED) of the exiting thread's stack (https://github.com/rrnewton/hermit/issues/4562); SaBRe also reports no initial stack pointer, so its file is the kernel's (https://github.com/rrnewton/hermit/issues/4565)."
           liteinst: "NAMED GAP: the guest re-executes itself to choose its own arguments and environment, and the in-guest runtime refuses execve and execveat with a typed refusal that ends the run (https://github.com/rrnewton/hermit/issues/4567); LiteInst also reports no initial stack pointer (https://github.com/rrnewton/hermit/issues/4565)."
           in-guest-trap: "NAMED GAP: the guest re-executes itself to choose its own arguments and environment, and the in-guest runtime refuses execve and execveat with a typed refusal that ends the run (https://github.com/rrnewton/hermit/issues/4567); in-guest-trap also reports no initial stack pointer (https://github.com/rrnewton/hermit/issues/4565)."
@@ -14130,7 +14137,7 @@ test:
           - sabre
           - dbt
         backends_disabled:
-          kvm: LinuxEmu has no protection keys (pkey_alloc answers ENOSYS)
+          kvm: "NAMED REFUSAL: LinuxEmu has no protection keys. Its ENOSYS for pkey_alloc carries the typed refusal ProtectionKeys, which Detcore turns into a fail-closed policy refusal that ends the run (exit 122)"
           liteinst: The in-guest runtime refuses protection keys (pkey_alloc answers EOPNOTSUPP)
           in-guest-trap: The in-guest runtime runs the guest's syscalls with its own protection-key rights, so a read into a page a key keeps the guest from writing is copied anyway (all 12 bytes changed, where Linux changes none)
       naked:
@@ -14174,7 +14181,7 @@ test:
           - sabre
           - dbt
         backends_disabled:
-          kvm: LinuxEmu has no protection keys (pkey_alloc answers ENOSYS)
+          kvm: LinuxEmu has no protection keys; with --allow-unsupported-syscalls the guest gets pkey_alloc's ENOSYS, and the refusal is only logged
           liteinst: The in-guest runtime refuses protection keys (pkey_alloc answers EOPNOTSUPP)
           in-guest-trap: The in-guest runtime runs the guest's syscalls with its own protection-key rights, so a read into a page a key keeps the guest from writing is copied anyway (all 12 bytes changed, where Linux changes none)
   - id: c-programs/inotify-received-descriptor

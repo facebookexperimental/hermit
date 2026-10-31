@@ -13181,6 +13181,7 @@ mod tests {
     mod fatal_delivery_tests;
     mod gated_wait_turn_tests;
     mod guest_mask_publication_tests;
+    mod other_process_procfs_tests;
     mod replay_departure_tests;
     mod replay_departure_transport;
     mod reserved_input_exec_tests;

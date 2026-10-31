@@ -123,6 +123,63 @@ impl<T: RecordOrReplay> Detcore<T> {
         .await
     }
 
+    /// A backend that does not implement a guest's call declines it with an
+    /// errno and the typed refusal `operation` (`reverie::UnsupportedRefusal`),
+    /// as for `flock` and for a signal it cannot deliver. Report that refusal
+    /// by name ([`report_refusal_reason`]), and route it through the
+    /// unsupported-operation policy
+    /// ([`Self::refuse_unserviceable_operation_because`]), instead of handing
+    /// the guest the backend's errno as if Linux had answered the call: a
+    /// fail-closed run ends as a policy refusal, and a run that allows
+    /// unsupported operations gives the guest the refusal's errno. Callers
+    /// pass the handler's result right after the injection that may have been
+    /// refused, since the next injection replaces the backend's record. A
+    /// result that is not the refusal's errno, and a backend that records no
+    /// refusal, pass through unchanged; a refusal of another operation passes
+    /// the result through with a warning. No backend is named here: the policy
+    /// is keyed on the backend's refusal alone.
+    pub(crate) async fn report_backend_refusal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        operation: reverie::UnsupportedOperation,
+        result: Result<i64, Error>,
+    ) -> Result<i64, Error> {
+        let errno = match &result {
+            Err(Error::Errno(errno)) => *errno,
+            _ => return result,
+        };
+        let Some(refusal) = guest.take_unsupported_refusal() else {
+            return result;
+        };
+        let dettid = guest.thread_state().dettid;
+        if refusal.operation != operation || refusal.errno != errno {
+            tracing::warn!(
+                "[dtid {dettid}] {sysno}: the backend's refusal ({:?}, {}) is not the one this \
+                 call can be refused with ({operation:?}, {errno}): {}",
+                refusal.operation,
+                refusal.errno,
+                refusal.diagnostic
+            );
+            // Judged as any other last refusal of an event is, as it would
+            // have been had this call not taken it.
+            judge_backend_refusal::<T, G>(guest, Some(refusal), sysno);
+            return result;
+        }
+        report_refusal_reason(
+            self.cfg.panic_on_unsupported_syscalls,
+            &format!(
+                "[dtid {dettid}] {sysno} refused by the backend: {}",
+                refusal.diagnostic
+            ),
+        );
+        if !self.cfg.panic_on_unsupported_syscalls {
+            crate::tool_global::report_unsupported_syscall(guest, sysno).await;
+        }
+        self.refuse_unserviceable_operation_because(guest, sysno, refusal.errno, refusal.diagnostic)
+            .await
+    }
+
     /// Record or replay a BLOCKING syscall without stalling the current thread (and thus
     /// deadlocking).  This uses a protocol of an extra resource request before/after the
     /// syscall to inform the scheduler that the thread is leaving/rejoining the runnable
@@ -4135,6 +4192,87 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
+    remove_pending_ignored(guest, set, IgnoredRemoval::NotHeldByLinux).await
+}
+
+/// [`remove_ignored_signals`] for the ignored signals a masked wait's
+/// temporary mask lets in, pending under the thread's own mask, which Linux
+/// discards as the call returns (`get_signal`, kernel/signal.c), on a
+/// backend that runs the call itself and cannot discard them inside it
+/// (`Detcore::settle_masked_ppoll_enosys`). The same removal, with its own
+/// log line.
+pub(crate) async fn remove_signals_discarded_under_a_temporary_mask<T, G>(
+    guest: &mut G,
+    set: u64,
+) -> Result<(), Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    remove_pending_ignored(guest, set, IgnoredRemoval::LetInByTemporaryMask).await
+}
+
+/// [`remove_signals_discarded_under_a_temporary_mask`] in two cells a caller
+/// that holds the scratch stack reserved itself: `set_cell`, into which `set`
+/// is written, and `timeout`, which is zeroed. The caller writes back what
+/// they held.
+pub(crate) async fn remove_signals_discarded_under_a_temporary_mask_in<T, G>(
+    guest: &mut G,
+    set: u64,
+    set_cell: usize,
+    timeout: AddrMut<'_, Timespec>,
+) -> Result<(), Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if set == 0 {
+        return Ok(());
+    }
+    let cell = AddrMut::<u64>::from_raw(set_cell).ok_or_else(|| {
+        Error::Tool(anyhow::anyhow!(
+            "removing ignored signals {set:#x}: no cell for the set"
+        ))
+    })?;
+    guest.memory().write_value(cell, &set)?;
+    guest.memory().write_value(
+        timeout,
+        &Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+    )?;
+    remove_pending_ignored_in(
+        guest,
+        set,
+        cell.cast::<libc::sigset_t>(),
+        timeout.into(),
+        IgnoredRemoval::LetInByTemporaryMask,
+    )
+    .await
+}
+
+/// Why [`remove_pending_ignored`] removes ignored signals, which its log line
+/// names.
+#[derive(Clone, Copy)]
+enum IgnoredRemoval {
+    /// D37: ones Linux would not hold, under the in-guest delivery gate.
+    NotHeldByLinux,
+    /// Ones a temporary mask lets in, which Linux discards as the call returns.
+    LetInByTemporaryMask,
+}
+
+/// The removal of [`remove_ignored_signals`], logged for `why`, in two cells
+/// of its own.
+async fn remove_pending_ignored<T, G>(
+    guest: &mut G,
+    set: u64,
+    why: IgnoredRemoval,
+) -> Result<(), Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
     if set == 0 {
         return Ok(());
     }
@@ -4155,6 +4293,23 @@ where
     // SAFETY: the kernel only reads the set; Reverie types the argument as
     // mutable.
     let set_cell = unsafe { set_cell.cast::<libc::sigset_t>().into_mut() };
+    remove_pending_ignored_in(guest, set, set_cell, timeout, why).await
+}
+
+/// The removal of [`remove_ignored_signals`]: trusted zero-timeout
+/// `rt_sigtimedwait` calls for `set`, held in `set_cell`, with the zero
+/// timeout in `timeout`, until `EAGAIN`.
+async fn remove_pending_ignored_in<T, G>(
+    guest: &mut G,
+    set: u64,
+    set_cell: AddrMut<'_, libc::sigset_t>,
+    timeout: Addr<'_, Timespec>,
+    why: IgnoredRemoval,
+) -> Result<(), Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
     for _ in 0..MAX_IGNORED_REMOVALS {
         let taken = guest
             .inject(
@@ -4165,17 +4320,23 @@ where
                     .with_sigsetsize(KERNEL_SIGSET_SIZE),
             )
             .await;
-        match taken {
-            Ok(signal) => tracing::info!(
+        match (taken, why) {
+            (Ok(signal), IgnoredRemoval::NotHeldByLinux) => tracing::info!(
                 "[dtid {}] under the in-guest delivery gate, removed ignored signal {} that Linux \
                  would not hold (D37)",
                 guest.thread_state().dettid,
                 signal
             ),
-            Err(Errno::EAGAIN) => return Ok(()),
+            (Ok(signal), IgnoredRemoval::LetInByTemporaryMask) => tracing::info!(
+                "[dtid {}] removed ignored signal {} that a temporary mask lets in, which Linux \
+                 discards as the call returns",
+                guest.thread_state().dettid,
+                signal
+            ),
+            (Err(Errno::EAGAIN), _) => return Ok(()),
             // Hermit's own failure, never the guest's result: the guest's call
             // (rt_sigaction, rt_sigsuspend, a masked wait) cannot return it.
-            Err(errno) => {
+            (Err(errno), _) => {
                 return Err(Error::Tool(anyhow::anyhow!(
                     "removing ignored signals {set:#x}: the trusted rt_sigtimedwait failed with \
                      {errno}"
@@ -4859,8 +5020,22 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    let dettid = guest.thread_state().dettid;
     let refusal = guest.take_unsupported_refusal();
+    judge_backend_refusal::<T, G>(guest, refusal, sysno);
+}
+
+/// [`fail_on_tool_decided_injection`]'s judgement of a refusal already taken
+/// from the backend: also used by `Detcore::report_backend_refusal` for a
+/// refusal that is not the one its call can be refused with.
+pub(crate) fn judge_backend_refusal<T, G>(
+    guest: &mut G,
+    refusal: Option<reverie::UnsupportedRefusal>,
+    sysno: Sysno,
+) where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let dettid = guest.thread_state().dettid;
     if refusal.is_some() {
         crate::syscall_histogram::mark_refused::<T, G>(guest);
     }
@@ -4875,6 +5050,24 @@ where
     if let Some(failure) = tool_decided_injection_failure(refusal, dettid, sysno) {
         tracing::error!("{failure}");
         panic!("{failure}");
+    }
+}
+
+/// Report a named refusal through tracing, and, when the run ends
+/// (`fail_closed`, the setting `panic_on_unsupported_syscalls`), directly on
+/// stderr as well, as the `flock` refusal does, so that neither `--log=off` nor
+/// `--log-file` hides why the run ended. A run that allows unsupported
+/// operations goes on with the refusal's errno and has the reason in its log
+/// only, as the refusals of a held signal and of a `pselect6` mask do: on a
+/// backend whose tool runs inside the guest process, stderr is the guest's own
+/// descriptor 2, which the guest may have pointed anywhere.
+pub(crate) fn report_refusal_reason(fail_closed: bool, message: &str) {
+    tracing::error!("{message}");
+    if fail_closed {
+        let _ = std::io::Write::write_fmt(
+            &mut crate::util::RetryingStderr,
+            format_args!("hermit: {message}\n"),
+        );
     }
 }
 
@@ -10940,5 +11133,146 @@ mod tool_decided_injection_tests {
                 "{operation:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod backend_refusal_tests {
+    use reverie::Pid;
+    use reverie::Tool;
+
+    use super::*;
+    use crate::config::Config;
+    use crate::record_or_replay::NoopTool;
+    use crate::syscall_hot_path_tests::InjectGuest;
+
+    const DIAGNOSTIC: &str = "this backend does not implement the call";
+
+    /// A fail-closed tool whose policy returns the typed error rather than
+    /// ending the process, and a guest whose last injection the backend
+    /// refused with `refusal`.
+    fn fail_closed(
+        refusal: Option<reverie::UnsupportedRefusal>,
+    ) -> (Detcore<NoopTool>, InjectGuest<NoopTool>) {
+        let config = Config {
+            panic_on_unsupported_syscalls: true,
+            exit_on_unsupported_syscall: true,
+            shutdown_on_unsupported_syscall: false,
+            ..Config::default()
+        };
+        let tool = <Detcore<NoopTool> as Tool>::new(Pid::from_raw(4242), &config);
+        let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+        guest.config = config;
+        if let Some(refusal) = refusal {
+            guest = guest.with_refusal(refusal);
+        }
+        (tool, guest)
+    }
+
+    fn refusal(operation: reverie::UnsupportedOperation) -> reverie::UnsupportedRefusal {
+        reverie::UnsupportedRefusal::new(operation, Errno::ENOSYS, DIAGNOSTIC)
+    }
+
+    const CALLS: [(Sysno, reverie::UnsupportedOperation); 4] = [
+        (
+            Sysno::pkey_alloc,
+            reverie::UnsupportedOperation::ProtectionKeys,
+        ),
+        (
+            Sysno::pkey_mprotect,
+            reverie::UnsupportedOperation::ProtectionKeys,
+        ),
+        (
+            Sysno::pkey_free,
+            reverie::UnsupportedOperation::ProtectionKeys,
+        ),
+        (
+            Sysno::userfaultfd,
+            reverie::UnsupportedOperation::Userfaultfd,
+        ),
+    ];
+
+    /// The backend's refusal of the call is refused by policy under the
+    /// call's name, fail-closed: the guest never sees the backend's ENOSYS,
+    /// and the call counts as refused.
+    #[test]
+    fn the_calls_own_refusal_is_refused_by_policy() {
+        futures::executor::block_on(async {
+            for (sysno, operation) in CALLS {
+                let (tool, mut guest) = fail_closed(Some(refusal(operation)));
+                let result = tool
+                    .report_backend_refusal(&mut guest, sysno, operation, Err(Errno::ENOSYS.into()))
+                    .await;
+                match result {
+                    Err(Error::Tool(error)) => assert_eq!(
+                        error
+                            .downcast_ref::<crate::UnsupportedSyscallError>()
+                            .expect("the policy's named refusal")
+                            .0,
+                        sysno
+                    ),
+                    other => panic!("{sysno}: expected the typed refusal, got {other:?}"),
+                }
+                assert!(guest.thread_state().stats.syscall_refused, "{sysno}");
+                assert!(
+                    guest.injected().is_empty(),
+                    "{sysno}: nothing more is injected"
+                );
+            }
+        })
+    }
+
+    /// Anything else keeps the call's own result: a success (the refusal is
+    /// left for the event's end), an errno the backend did not explain, and a
+    /// refusal of another operation or with another errno than the call's.
+    #[test]
+    fn anything_else_keeps_the_calls_result() {
+        futures::executor::block_on(async {
+            for (sysno, operation) in CALLS {
+                let (tool, mut guest) = fail_closed(Some(refusal(operation)));
+                let result = tool
+                    .report_backend_refusal(&mut guest, sysno, operation, Ok(3))
+                    .await;
+                assert!(matches!(result, Ok(3)), "{sysno}: {result:?}");
+                assert!(
+                    guest.take_unsupported_refusal().is_some(),
+                    "{sysno}: a success leaves the refusal in place"
+                );
+
+                let (tool, mut guest) = fail_closed(None);
+                let result = tool
+                    .report_backend_refusal(&mut guest, sysno, operation, Err(Errno::ENOSYS.into()))
+                    .await;
+                assert!(
+                    matches!(result, Err(Error::Errno(Errno::ENOSYS))),
+                    "{sysno}: {result:?}"
+                );
+                assert!(!guest.thread_state().stats.syscall_refused, "{sysno}");
+
+                let other = if operation == reverie::UnsupportedOperation::Userfaultfd {
+                    reverie::UnsupportedOperation::ProtectionKeys
+                } else {
+                    reverie::UnsupportedOperation::Userfaultfd
+                };
+                for (backend, errno) in [
+                    (refusal(other), Errno::ENOSYS),
+                    (
+                        reverie::UnsupportedRefusal::new(operation, Errno::EINVAL, DIAGNOSTIC),
+                        Errno::ENOSYS,
+                    ),
+                ] {
+                    let (tool, mut guest) = fail_closed(Some(backend));
+                    let result = tool
+                        .report_backend_refusal(&mut guest, sysno, operation, Err(errno.into()))
+                        .await;
+                    assert!(
+                        matches!(result, Err(Error::Errno(Errno::ENOSYS))),
+                        "{sysno}: {result:?}"
+                    );
+                    // Judged as the event's last refusal: counted, not answered.
+                    assert!(guest.thread_state().stats.syscall_refused, "{sysno}");
+                }
+            }
+        })
     }
 }

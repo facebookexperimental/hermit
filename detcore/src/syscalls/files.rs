@@ -86,6 +86,7 @@ use crate::types::*;
 pub(crate) mod descriptor_directory;
 #[cfg(test)]
 mod determinize_stat_tests;
+pub(crate) mod other_process_procfs;
 #[cfg(test)]
 mod prefilter_tests;
 pub(crate) mod procfs_levels;
@@ -14836,13 +14837,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(fd as i64)
     }
 
-    /// userfaultfd system call.
+    /// userfaultfd system call. A backend that does not implement it declines
+    /// it with a typed refusal, which is named rather than handed to the
+    /// guest as its errno (`Detcore::report_backend_refusal`).
     pub async fn handle_userfaultfd<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Userfaultfd,
     ) -> Result<i64, Error> {
-        let fd = self.record_or_replay(guest, call).await? as RawFd;
+        let result = self
+            .record_or_replay(guest, call)
+            .await
+            .map_err(Error::from);
+        let fd = self
+            .report_backend_refusal(
+                guest,
+                Sysno::userfaultfd,
+                reverie::UnsupportedOperation::Userfaultfd,
+                result,
+            )
+            .await? as RawFd;
         self.add_fd(
             guest,
             fd,

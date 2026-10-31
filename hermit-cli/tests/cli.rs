@@ -9653,8 +9653,9 @@ const AUXV_FROM_THE_KERNEL: &str = "dbt, sabre, liteinst, in-guest-trap";
 /// every `/proc` file (EACCES), so the kernel beneath cannot decide another
 /// process's open there, and Detcore's fallback asks only for the caller's
 /// own CAP_SYS_PTRACE, where Linux allows two of these opens without it. The
-/// provider also refuses `clone(CLONE_NEWUSER)` and `clone(CLONE_VM)` without
-/// `CLONE_THREAD`.
+/// provider also cannot create a `clone(CLONE_NEWUSER)` child or a
+/// `CLONE_VM` process, and refuses both by name, which ends a strict run, so
+/// the guest is told not to attempt them there (`--no-sharing-clones`).
 const KVM_KNOWN_DIFFERENCES: [(&str, &str); 4] = [
     (
         "access: without CAP_SYS_PTRACE, dumpable: dumpable 1, creator opened, helper without \
@@ -9672,13 +9673,13 @@ const KVM_KNOWN_DIFFERENCES: [(&str, &str); 4] = [
         "userns: the creator opens its CLONE_NEWUSER child's file (opened), and so does a helper \
          without CAP_SYS_PTRACE (opened); the child is refused its creator's (EACCES) and opens \
          its own (opened)\n",
-        "userns: clone(CLONE_NEWUSER) is refused (Operation not supported)\n",
+        "userns: not attempted: the backend refuses clone(CLONE_NEWUSER) by name\n",
     ),
     (
         "clone_vm: a CLONE_VM child's PR_SET_DUMPABLE(0) makes its creator's shared map not \
          dumpable (0), and a helper without CAP_SYS_PTRACE is refused the creator's file \
          (EACCES)\n",
-        "clone_vm: clone(CLONE_VM) is refused (Operation not supported)\n",
+        "clone_vm: not attempted: the backend refuses a CLONE_VM process by name\n",
     ),
 ];
 
@@ -9728,7 +9729,7 @@ fn detcore_renders_process_auxv_on_every_backend() {
     for backend in procfs_backends(test) {
         let report = directory.path().join(format!("{backend}.json"));
         let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
-        let args = [
+        let mut args = vec![
             "--backend",
             backend,
             "run",
@@ -9743,6 +9744,11 @@ fn detcore_renders_process_auxv_on_every_backend() {
             guest.to_str().expect("guest path is UTF-8"),
             "--hermit",
         ];
+        // KVM refuses a clone(CLONE_NEWUSER) child and a CLONE_VM process by
+        // name (`KVM_KNOWN_DIFFERENCES`).
+        if backend == "kvm" {
+            args.push("--no-sharing-clones");
+        }
         let output = hermit(&args);
         assert_success(&output, &args);
         let verdict: serde_json::Value =
@@ -9795,7 +9801,8 @@ fn detcore_renders_process_auxv_on_every_backend() {
             // cannot decide another process's open there, and the fallback
             // asks only for the caller's own CAP_SYS_PTRACE, refusing two
             // opens Linux allows without it; and the provider refuses
-            // clone(CLONE_NEWUSER) and a CLONE_VM process.
+            // clone(CLONE_NEWUSER) and a CLONE_VM process by name, so the
+            // guest does not attempt them.
             let mut expected = first.clone();
             for (linux, kvm) in KVM_KNOWN_DIFFERENCES {
                 eprintln!("{test}: kvm: KNOWN DIFFERENCE: {kvm:?} where Linux gives {linux:?}");
@@ -19063,6 +19070,873 @@ fn run_kvm_flock_is_a_named_refusal_where_ptrace_excludes() {
         stderr.contains("refused by the backend: KVM flock is unsupported"),
         "opt-in: the KVM run did not name the flock refusal on stderr\nstderr:\n{stderr}"
     );
+}
+
+/// A ppoll, or with argv[3] "pselect6" a pselect6, whose temporary mask lets
+/// in a signal already pending under the thread's own mask. argv[1] is
+/// "caught" (SIGUSR1, with a handler) or "ignored" (SIGWINCH, ignored by
+/// default), argv[2] the timeout in milliseconds. The own mask blocks the
+/// signal and the temporary mask blocks
+/// SIGUSR2 instead, so a handler that runs under the temporary mask sees
+/// SIGUSR2 blocked. Linux answers EINTR after running the handler under the
+/// temporary mask, or discards the ignored signal, restarts the call and
+/// returns 0 when the timeout ends; either way the own mask is back after
+/// the call and the signal is no longer pending. With argv[1] "none" no
+/// signal is pending, with "mixed" both are (the lines report SIGUSR1), and
+/// with argv[3] "pselect6-100" the pselect6 passes nfds 100.
+const MASKED_PPOLL_PENDING_GUEST: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/select.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t handled, usr2_blocked_in_handler;
+
+static void on_usr1(int sig) {
+  (void)sig;
+  sigset_t now;
+  sigprocmask(SIG_BLOCK, NULL, &now);
+  handled++;
+  usr2_blocked_in_handler = sigismember(&now, SIGUSR2);
+}
+
+int main(int argc, char **argv) {
+  if (argc != 3 && argc != 4) return 2;
+  int mixed = !strcmp(argv[1], "mixed");
+  int caught = mixed || !strcmp(argv[1], "caught");
+  int none = !strcmp(argv[1], "none");
+  int pselect = argc == 4 && !strncmp(argv[3], "pselect6", 8);
+  int nfds = argc == 4 && !strcmp(argv[3], "pselect6-100") ? 100 : 0;
+  long milliseconds = strtol(argv[2], NULL, 10);
+  int sig = caught ? SIGUSR1 : SIGWINCH;
+  if (caught) {
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = on_usr1;
+    if (sigaction(SIGUSR1, &action, NULL)) return 3;
+  }
+  sigset_t own;
+  sigemptyset(&own);
+  sigaddset(&own, sig);
+  if (mixed) sigaddset(&own, SIGWINCH);
+  if (!none && (sigprocmask(SIG_BLOCK, &own, NULL) || raise(sig) || (mixed && raise(SIGWINCH))))
+    return 3;
+  int fds[2];
+  if (pipe(fds)) return 3;
+  struct pollfd entry = {.fd = fds[0], .events = POLLIN};
+  struct timespec timeout = {0, milliseconds * 1000000};
+  sigset_t temporary;
+  sigemptyset(&temporary);
+  sigaddset(&temporary, SIGUSR2);
+  /* The raw calls, so that the kernel writes the time left back into the
+     guest's own timespec; glibc's wrappers pass it a copy. */
+  int ready;
+  if (pselect) {
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(fds[0], &readable);
+    struct { const sigset_t *mask; size_t size; } wrapper = {&temporary, 8};
+    ready = (int)syscall(SYS_pselect6, nfds ? nfds : fds[0] + 1, &readable, NULL, NULL, &timeout,
+                         &wrapper);
+  } else {
+    ready = (int)syscall(SYS_ppoll, &entry, 1, &timeout, &temporary, 8);
+  }
+  int saved = errno;
+  long left = timeout.tv_sec * 1000000000L + timeout.tv_nsec;
+  sigset_t after, pending;
+  sigprocmask(SIG_BLOCK, NULL, &after);
+  sigpending(&pending);
+  printf("%s %ld: %s %s handled=%d usr2-blocked-in-handler=%d\n", argv[1], milliseconds,
+         pselect ? argv[3] : "ppoll",
+         ready < 0 ? strerrorname_np(saved) : ready == 0 ? "0" : "ready", (int)handled,
+         (int)usr2_blocked_in_handler);
+  printf("%s %ld: after: signal-blocked=%d usr2-blocked=%d signal-pending=%d time-left=%s\n",
+         argv[1], milliseconds, sigismember(&after, sig), sigismember(&after, SIGUSR2),
+         sigismember(&pending, sig),
+         left == 0 ? "none" : left > 0 && left <= milliseconds * 1000000 ? "some" : "wrong");
+  return 0;
+}
+"#;
+
+/// The guest above, compiled once per test process.
+fn masked_ppoll_pending_guest() -> PathBuf {
+    let build_root = process_build_root("masked-ppoll-pending");
+    fs::create_dir_all(&build_root).expect("failed to create the guest directory");
+    let source = build_root.join("masked_ppoll_pending.c");
+    let guest = build_root.join("masked_ppoll_pending");
+    if !guest.exists() {
+        fs::write(&source, MASKED_PPOLL_PENDING_GUEST).expect("failed to write the guest");
+        let compiled = Command::new("cc")
+            .args(["-O0", "-Wall", "-Wextra", "-Werror"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the guest");
+        assert!(compiled.status.success(), "{compiled:?}");
+    }
+    guest
+}
+
+/// A masked ppoll, and a masked pselect6, whose temporary mask lets in a
+/// signal already pending, at a zero and a 100 ms timeout, on ptrace and on
+/// KVM, against Linux's answer (measured natively:
+/// `MASKED_PPOLL_PENDING_GUEST`). A caught signal ends the call with EINTR
+/// after its handler ran under the temporary mask, and the thread's own mask
+/// is back after the call. An ignored one is discarded and the call returns
+/// 0. On KVM the caught ppoll used to hang: Detcore retried the backend's
+/// EINTR, and each retry found the signal still pending. The ignored ones got
+/// a bare ENOSYS. Now the backend's EINTR is the answer, and Detcore removes
+/// the ignored signal, as Linux discards it, and probes again. KVM cannot keep
+/// a ppoll's mask in place across a wait, so the ignored signal with a
+/// timeout ends there as the named refusal of that wait, after the removal; a
+/// pselect6 waits there by probing in each turn. The zero-timeout cases also
+/// hold at L2 on both backends (strict comparison, bitwise parity, INFO
+/// messages compared). Without sequentialized threads the kernel beneath runs
+/// a ppoll that would wait: the same answers, where KVM's wait used to reach
+/// the guest as a bare ENOSYS. A masked pselect6 of nfds 100 with nothing
+/// pending answers 0 natively and on ptrace, at a zero and a 100 ms timeout;
+/// KVM's backend declines more than 64 descriptors before it looks at any
+/// signal, and each refusal names that, with a caught and an ignored signal
+/// pending too. It named a pending signal there, and at 100 ms the guest got
+/// a bare ENOSYS, as on main.
+#[test]
+fn run_kvm_masked_ppoll_with_a_pending_signal_answers_as_linux() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM masked ppoll case: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = masked_ppoll_pending_guest();
+    let guest = guest.to_str().expect("guest path should be UTF-8");
+    let linux = |call: &str, mode: &str, milliseconds: &str| match mode {
+        "caught" => format!(
+            "caught {milliseconds}: {call} EINTR handled=1 usr2-blocked-in-handler=1\n\
+             caught {milliseconds}: after: signal-blocked=1 usr2-blocked=0 signal-pending=0 \
+             time-left={}\n",
+            if milliseconds == "0" { "none" } else { "some" }
+        ),
+        _ => format!(
+            "ignored {milliseconds}: {call} 0 handled=0 usr2-blocked-in-handler=0\n\
+             ignored {milliseconds}: after: signal-blocked=1 usr2-blocked=0 signal-pending=0 \
+             time-left=none\n"
+        ),
+    };
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let both = ["--backend=ptrace", "--backend=kvm"].as_slice();
+    // ptrace's own masked pselect6 differs from Linux in two of these cases,
+    // on main too: with a zero timeout a pending caught signal ends the run
+    // with an internal failure (signal-delivery-check), and with a timeout a
+    // pending ignored signal stays pending after the call
+    // (https://github.com/rrnewton/hermit/issues/4968). Those two run on KVM
+    // alone, against Linux's answer, until that issue is fixed.
+    let kvm = ["--backend=kvm"].as_slice();
+    for (call, mode, milliseconds, backends) in [
+        ("ppoll", "caught", "0", both),
+        ("ppoll", "caught", "100", both),
+        ("ppoll", "ignored", "0", both),
+        ("ppoll", "ignored", "100", both),
+        ("pselect6", "caught", "0", kvm),
+        ("pselect6", "caught", "100", both),
+        ("pselect6", "ignored", "0", both),
+        ("pselect6", "ignored", "100", kvm),
+    ] {
+        let case = format!("{call} {mode} {milliseconds}");
+        for &backend in backends {
+            let refused = backend == "--backend=kvm" && case == "ppoll ignored 100";
+            // Each zero-timeout case also runs twice under the strict
+            // comparison, which must report bitwise parity.
+            let report = directory.path().join(format!(
+                "{call}-{mode}-{milliseconds}-{}.json",
+                &backend[10..]
+            ));
+            let report_arg = report.to_str().expect("report path should be UTF-8");
+            let verify = milliseconds == "0" && !refused;
+            let mut args = vec![backend, "run", "--strict", "--base-env=minimal"];
+            if verify {
+                args.extend(["--verify", "--verify-strict", "--verify-json", report_arg]);
+            }
+            args.extend(["--", guest, mode, milliseconds, call]);
+            let output = hermit(&args);
+            let stdout = stdout(&output);
+            let stderr = stderr(&output);
+            if refused {
+                assert_eq!(
+                    output.status.code(),
+                    Some(HERMIT_POLICY_REFUSAL_EXIT),
+                    "{case} {backend}: a wait under the mask must end the strict run as a \
+                     policy refusal\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                );
+                assert!(
+                    stderr.contains(
+                        "ppoll refused: a ppoll with a temporary signal mask that would wait \
+                         cannot be served on this backend"
+                    ),
+                    "{case} {backend}: the refusal is not named\nstderr:\n{stderr}"
+                );
+                assert!(
+                    !stdout.contains("ppoll"),
+                    "{case} {backend}: the guest went on past the refused wait\nstdout:\n{stdout}"
+                );
+                continue;
+            }
+            assert_success(&output, &args);
+            assert_eq!(stdout, linux(call, mode, milliseconds), "{case} {backend}");
+            assert!(
+                !stderr.contains(&format!("{call} refused")),
+                "{case} {backend}: the call is not refused\nstderr:\n{stderr}"
+            );
+            if verify {
+                let verdict: serde_json::Value = serde_json::from_slice(
+                    &fs::read(&report).expect("strict verification wrote no verdict"),
+                )
+                .expect("strict verification verdict is valid JSON");
+                assert_eq!(
+                    verdict["bitwise_parity"], true,
+                    "{case} {backend}: {verdict}"
+                );
+                for side in ["left", "right"] {
+                    assert!(
+                        verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+                        "{case} {backend}: no INFO messages compared: {verdict}"
+                    );
+                }
+            }
+        }
+    }
+
+    // A masked pselect6 of nfds 100. Linux answers it, measured here
+    // natively: 0 with nothing pending, at a zero and at a 100 ms timeout,
+    // and EINTR with a caught and an ignored signal both pending. ptrace gives
+    // Linux's answers with nothing pending; with a caught signal pending at a
+    // zero timeout it fails, on main too
+    // (https://github.com/rrnewton/hermit/issues/4968), so that case runs on
+    // KVM alone. KVM's backend runs the call itself and declines more than 64
+    // descriptors with ENOSYS, before it looks at any signal; each refusal
+    // names that. The 100 ms call used to reach the guest as a bare ENOSYS,
+    // and the one with both signals pending was refused for a signal.
+    let wide = |mode: &str, milliseconds: &str, answer: &str, handled: u8| {
+        let blocked = u8::from(mode != "none");
+        format!(
+            "{mode} {milliseconds}: pselect6-100 {answer} handled={handled} \
+             usr2-blocked-in-handler={handled}\n\
+             {mode} {milliseconds}: after: signal-blocked={blocked} usr2-blocked=0 \
+             signal-pending=0 time-left=none\n"
+        )
+    };
+    for (mode, milliseconds, linux, backends) in [
+        ("none", "0", wide("none", "0", "0", 0), both),
+        ("none", "100", wide("none", "100", "0", 0), both),
+        ("mixed", "0", wide("mixed", "0", "EINTR", 1), kvm),
+    ] {
+        let case = format!("pselect6 nfds 100 {mode} {milliseconds}");
+        let native = Command::new(guest)
+            .args([mode, milliseconds, "pselect6-100"])
+            .output()
+            .expect("failed to run the guest natively");
+        assert!(native.status.success(), "{case} native: {native:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&native.stdout),
+            linux,
+            "{case} native"
+        );
+        for &backend in backends {
+            let args = [
+                backend,
+                "run",
+                "--strict",
+                "--base-env=minimal",
+                "--",
+                guest,
+                mode,
+                milliseconds,
+                "pselect6-100",
+            ];
+            let output = hermit(&args);
+            let stdout = stdout(&output);
+            let stderr = stderr(&output);
+            if backend == "--backend=ptrace" {
+                assert_success(&output, &args);
+                assert_eq!(stdout, linux, "{case} {backend}");
+                continue;
+            }
+            assert_eq!(
+                output.status.code(),
+                Some(HERMIT_POLICY_REFUSAL_EXIT),
+                "{case} {backend}: the declined call must end the strict run as a policy \
+                 refusal\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                stderr.contains(
+                    "pselect6 refused: a pselect6 with a temporary signal mask whose \
+                     descriptor sets this backend does not serve (more than 64 descriptors, \
+                     or a standard output or error it captures) cannot be served on this \
+                     backend"
+                ),
+                "{case} {backend}: the refusal does not name the descriptor sets\n\
+                 stderr:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains("lets in a pending signal"),
+                "{case} {backend}: the refusal names a signal, which the backend never \
+                 looked at\nstderr:\n{stderr}"
+            );
+            assert!(
+                !stdout.contains("pselect6-100"),
+                "{case} {backend}: the guest went on past the refused call\nstdout:\n{stdout}"
+            );
+        }
+    }
+
+    // Without sequentialized threads, a relaxation --strict refuses, the
+    // kernel beneath runs a ppoll that would wait with its own timeout. KVM
+    // answers a pending caught signal its mask lets in with EINTR there too,
+    // and refuses the wait by name, where the guest used to get a bare ENOSYS.
+    for (mode, backend) in [
+        ("caught", "--backend=ptrace"),
+        ("caught", "--backend=kvm"),
+        ("ignored", "--backend=ptrace"),
+        ("ignored", "--backend=kvm"),
+    ] {
+        let case = format!("{mode} 100 without sequentialized threads");
+        let args = [
+            backend,
+            "run",
+            "--no-sequentialize-threads",
+            "--base-env=minimal",
+            "--",
+            guest,
+            mode,
+            "100",
+            "ppoll",
+        ];
+        let output = hermit(&args);
+        let stdout = stdout(&output);
+        let stderr = stderr(&output);
+        if mode == "ignored" && backend == "--backend=kvm" {
+            assert_eq!(
+                output.status.code(),
+                Some(HERMIT_POLICY_REFUSAL_EXIT),
+                "{case} {backend}: the wait must end the run as a policy refusal\n\
+                 stdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                stderr.contains(
+                    "ppoll refused: a ppoll with a temporary signal mask that would wait \
+                     cannot be served on this backend"
+                ),
+                "{case} {backend}: the refusal is not named\nstderr:\n{stderr}"
+            );
+            assert!(
+                !stdout.contains("ppoll"),
+                "{case} {backend}: the guest went on past the refused wait\nstdout:\n{stdout}"
+            );
+        } else {
+            assert_success(&output, &args);
+            assert_eq!(stdout, linux("ppoll", mode, "100"), "{case} {backend}");
+        }
+    }
+}
+
+/// Calls with two paths, `link`, `linkat`, `rename`, `renameat` and
+/// `renameat2`, whose second path goes on past a live child's cmdline,
+/// `/proc/<child>/cmdline/x`. argv[1] is a writable directory and argv[2]
+/// "all", "first", or one case "<call>:<source>". The first path, the
+/// source, is missing ("missing-file"), in a missing directory
+/// ("missing-dir"), in a directory with no permissions, searched without the
+/// capabilities that pass over them ("sealed-dir"), or `/` ("root"). The
+/// cases "<call>:first" put the cmdline path first, with a missing name in
+/// argv[1] as the second. Each prints "<call>:<source>: <errno or ok>".
+const TWO_PATH_PROCFS_GUEST: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/capability.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static const char *const calls[] = {"link", "linkat", "rename", "renameat", "renameat2"};
+static const char *const sources[] = {"missing-file", "missing-dir", "sealed-dir", "root"};
+
+static long two_path_call(const char *name, const char *from, const char *to) {
+  if (!strcmp(name, "link")) return syscall(SYS_link, from, to);
+  if (!strcmp(name, "linkat")) return syscall(SYS_linkat, AT_FDCWD, from, AT_FDCWD, to, 0);
+  if (!strcmp(name, "rename")) return syscall(SYS_rename, from, to);
+  if (!strcmp(name, "renameat")) return syscall(SYS_renameat, AT_FDCWD, from, AT_FDCWD, to);
+  return syscall(SYS_renameat2, AT_FDCWD, from, AT_FDCWD, to, 0);
+}
+
+static void report(const char *label, long result) {
+  printf("%s: %s\n", label, result < 0 ? strerrorname_np(errno) : "ok");
+  fflush(stdout);
+}
+
+int main(int argc, char **argv) {
+  if (argc != 3) return 2;
+  char missing_file[4096], missing_dir[4096], sealed[4096], sealed_name[4096], target[4096];
+  snprintf(missing_file, sizeof missing_file, "%s/absent", argv[1]);
+  snprintf(missing_dir, sizeof missing_dir, "%s/absent-dir/x", argv[1]);
+  snprintf(sealed, sizeof sealed, "%s/sealed", argv[1]);
+  snprintf(sealed_name, sizeof sealed_name, "%s/sealed/x", argv[1]);
+  snprintf(target, sizeof target, "%s/target", argv[1]);
+  if ((mkdir(sealed, 0700) && errno != EEXIST) || chmod(sealed, 0)) return 3;
+  /* Without the capabilities that pass over a directory's permissions, which
+     a root guest has, so that the sealed directory cannot be searched. */
+  struct __user_cap_header_struct header = {_LINUX_CAPABILITY_VERSION_3, 0};
+  struct __user_cap_data_struct data[2];
+  if (syscall(SYS_capget, &header, data)) return 3;
+  data[0].effective &= ~((1u << CAP_DAC_OVERRIDE) | (1u << CAP_DAC_READ_SEARCH));
+  if (syscall(SYS_capset, &header, data)) return 3;
+  int ready[2];
+  if (pipe(ready)) return 3;
+  pid_t child = fork();
+  if (child < 0) return 3;
+  if (child == 0) {
+    char byte;
+    (void)read(ready[0], &byte, 1);
+    _exit(0);
+  }
+  char past[64], label[64];
+  snprintf(past, sizeof past, "/proc/%d/cmdline/x", (int)child);
+  for (size_t i = 0; i < sizeof calls / sizeof *calls; i++) {
+    for (size_t j = 0; j < sizeof sources / sizeof *sources; j++) {
+      snprintf(label, sizeof label, "%s:%s", calls[i], sources[j]);
+      if (strcmp(argv[2], "all") && strcmp(argv[2], label)) continue;
+      const char *from = j == 0 ? missing_file : j == 1 ? missing_dir : j == 2 ? sealed_name : "/";
+      report(label, two_path_call(calls[i], from, past));
+    }
+  }
+  for (size_t i = 0; i < sizeof calls / sizeof *calls; i++) {
+    snprintf(label, sizeof label, "%s:first", calls[i]);
+    if (strcmp(argv[2], "all") && strcmp(argv[2], "first") && strcmp(argv[2], label)) continue;
+    report(label, two_path_call(calls[i], past, target));
+  }
+  (void)write(ready[1], "x", 1);
+  waitpid(child, NULL, 0);
+  if (chmod(sealed, 0700) || rmdir(sealed)) return 4;
+  return 0;
+}
+"#;
+
+/// The guest above, compiled once per test process.
+fn two_path_procfs_guest() -> PathBuf {
+    let build_root = process_build_root("two-path-procfs");
+    fs::create_dir_all(&build_root).expect("failed to create the guest directory");
+    let source = build_root.join("two_path_procfs.c");
+    let guest = build_root.join("two_path_procfs");
+    if !guest.exists() {
+        fs::write(&source, TWO_PATH_PROCFS_GUEST).expect("failed to write the guest");
+        let compiled = Command::new("cc")
+            .args(["-O0", "-Wall", "-Wextra", "-Werror"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the guest");
+        assert!(compiled.status.success(), "{compiled:?}");
+    }
+    guest
+}
+
+/// A call with two paths whose second path goes on past another guest
+/// process's cmdline (`TWO_PATH_PROCFS_GUEST`), against Linux's answers,
+/// measured natively in the test. Linux walks the first path before the
+/// second (`do_linkat`, `do_renameat2` in fs/namei.c), so its answer depends
+/// on the first: ENOENT for link's missing source but ENOTDIR for rename's,
+/// whose source name it looks up only after both directories; ENOENT for a
+/// missing directory and EACCES for one it cannot search, whatever the call;
+/// and ENOTDIR for `/`. ptrace gives Linux's answers. On KVM the backend's
+/// ENOENT for the respelled call does not say which path failed, so each of
+/// the twenty is refused by name; it used to answer ENOTDIR for all twenty,
+/// and main answered EACCES or ENOENT, which host timing could change. With
+/// the cmdline path first, which Linux walks first, KVM answers ENOTDIR, as
+/// Linux does. Each Hermit run works in a tmpfs, so a run refused in
+/// mid-call leaves no unsearchable directory behind.
+#[test]
+fn run_kvm_a_second_path_past_another_process_cmdline_is_refused_by_name() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM two-path case: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = two_path_procfs_guest();
+    let guest = guest.to_str().expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let native = Command::new(guest)
+        .arg(directory.path())
+        .arg("all")
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let linux = String::from_utf8(native.stdout).expect("the guest prints UTF-8");
+    assert_eq!(linux.lines().count(), 25, "native:\n{linux}");
+    for line in [
+        "link:missing-file: ENOENT",
+        "rename:missing-file: ENOTDIR",
+        "linkat:missing-dir: ENOENT",
+        "renameat2:sealed-dir: EACCES",
+        "renameat:root: ENOTDIR",
+        "link:first: ENOTDIR",
+    ] {
+        assert!(
+            linux.lines().any(|answer| answer == line),
+            "native: no {line:?}\n{linux}"
+        );
+    }
+    let scratch = "/tmp/two-path";
+    let mount = format!("--mount=type=tmpfs,target={scratch}");
+    let run = |backend: &str, case: &str| {
+        let args = [
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            mount.as_str(),
+            "--",
+            guest,
+            scratch,
+            case,
+        ];
+        let output = hermit(&args);
+        (args.map(str::to_owned), output)
+    };
+    let (args, output) = run("--backend=ptrace", "all");
+    assert_success(&output, &args.each_ref().map(String::as_str));
+    assert_eq!(stdout(&output), linux, "ptrace");
+    let (args, output) = run("--backend=kvm", "first");
+    assert_success(&output, &args.each_ref().map(String::as_str));
+    let first = linux
+        .lines()
+        .filter(|line| line.contains(":first: "))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    assert_eq!(stdout(&output), first, "kvm, the cmdline path first");
+    for line in linux.lines().filter(|line| !line.contains(":first: ")) {
+        let (case, _) = line.split_once(": ").expect("each line names its case");
+        let (call, _) = case.split_once(':').expect("each case names its call");
+        let (_, output) = run("--backend=kvm", case);
+        let stdout = stdout(&output);
+        let stderr = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{case}: the strict KVM run must end as a policy refusal\nstdout:\n{stdout}\n\
+             stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "{call} refused: {call} cannot be answered on this backend for /proc/"
+            )) && stderr.contains("/cmdline/x, the call's second path"),
+            "{case}: the refusal is not named\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stdout.contains(case),
+            "{case}: the guest went on past the refused call\nstdout:\n{stdout}"
+        );
+    }
+}
+
+/// Calls whose own arguments Linux checks before it walks the path, on
+/// another process's `/proc` files: past a live child's cmdline,
+/// `/proc/<child>/cmdline/x` ("past"), a reaped child's
+/// `/proc/<pid>/cmdline` ("gone") and the live child's cmdline, with
+/// controls whose answer the walk decides; then calls with an empty pathname
+/// on descriptors of the parent's own cmdline and fd directory, inherited by
+/// a forked child, for which they are another process's files. argv[1] is a
+/// writable directory and argv[2] "all" or one case. Each case prints
+/// "<case>: <errno or ok>".
+const PROCFS_ARGUMENT_ERRORS_GUEST: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#include <utime.h>
+
+static const char *selected;
+
+static int want(const char *label) {
+  return !strcmp(selected, "all") || !strcmp(selected, label);
+}
+
+static void report(const char *label, long result) {
+  printf("%s: %s\n", label, result < 0 ? strerrorname_np(errno) : "ok");
+  fflush(stdout);
+}
+
+#define CASE(label, call) \
+  if (want(label)) report(label, call)
+
+int main(int argc, char **argv) {
+  if (argc != 3) return 2;
+  selected = argv[2];
+  char existing[4096];
+  snprintf(existing, sizeof existing, "%s/existing", argv[1]);
+  int made = open(existing, O_CREAT | O_WRONLY, 0600);
+  if (made < 0 || close(made)) return 3;
+  pid_t reaped = fork();
+  if (reaped < 0) return 3;
+  if (reaped == 0) _exit(0);
+  if (waitpid(reaped, NULL, 0) != reaped) return 3;
+  int ready[2];
+  if (pipe(ready)) return 3;
+  pid_t child = fork();
+  if (child < 0) return 3;
+  if (child == 0) {
+    char byte;
+    (void)read(ready[0], &byte, 1);
+    _exit(0);
+  }
+  char past[64], gone[64], cmdline[64];
+  snprintf(past, sizeof past, "/proc/%d/cmdline/x", (int)child);
+  snprintf(gone, sizeof gone, "/proc/%d/cmdline", (int)reaped);
+  snprintf(cmdline, sizeof cmdline, "/proc/%d/cmdline", (int)child);
+  void *unreadable = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (unreadable == MAP_FAILED) return 3;
+  struct timeval timevals[2] = {{0, 0}, {0, 0}};
+  struct utimbuf utimbuf = {0, 0};
+  struct timespec omit[2] = {{0, UTIME_OMIT}, {0, UTIME_OMIT}};
+  static char value[65537];
+  char buffer[64];
+  struct statx stx;
+  char *const args[] = {"x", NULL};
+  char *const env[] = {NULL};
+  const unsigned exchange_noreplace = 2 | 1; /* RENAME_EXCHANGE | RENAME_NOREPLACE */
+  const unsigned statx_sync_both = 0x6000; /* AT_STATX_SYNC_TYPE */
+
+  CASE("mknod-dir-past", syscall(SYS_mknod, past, S_IFDIR | 0600, 0));
+  CASE("mknodat-dir-past", syscall(SYS_mknodat, AT_FDCWD, past, S_IFDIR | 0600, 0));
+  CASE("mknod-dir-gone", syscall(SYS_mknod, gone, S_IFDIR | 0600, 0));
+  CASE("mknodat-dir-gone", syscall(SYS_mknodat, AT_FDCWD, gone, S_IFDIR | 0600, 0));
+  CASE("mknod-no-type-past", syscall(SYS_mknod, past, 0030000 | 0600, 0));
+  CASE("mknod-fifo-past", syscall(SYS_mknod, past, S_IFIFO | 0600, 0));
+  CASE("mknod-chr-past", syscall(SYS_mknod, past, S_IFCHR | 0600, makedev(1, 3)));
+  CASE("mknodat-fifo-gone", syscall(SYS_mknodat, AT_FDCWD, gone, S_IFIFO | 0600, 0));
+  CASE("renameat2-exchange-noreplace-first",
+       syscall(SYS_renameat2, AT_FDCWD, past, AT_FDCWD, existing, exchange_noreplace));
+  CASE("renameat2-exchange-noreplace-second",
+       syscall(SYS_renameat2, AT_FDCWD, existing, AT_FDCWD, past, exchange_noreplace));
+  CASE("renameat2-first", syscall(SYS_renameat2, AT_FDCWD, past, AT_FDCWD, existing, 0));
+  CASE("symlink-empty-target", syscall(SYS_symlink, "", past));
+  CASE("symlinkat-empty-target", syscall(SYS_symlinkat, "", AT_FDCWD, past));
+  CASE("symlink-target", syscall(SYS_symlink, "target", past));
+  CASE("statx-reserved-mask", syscall(SYS_statx, AT_FDCWD, past, 0, 0x80000000u, &stx));
+  CASE("statx-both-syncs",
+       syscall(SYS_statx, AT_FDCWD, past, statx_sync_both, STATX_BASIC_STATS, &stx));
+  CASE("statx", syscall(SYS_statx, AT_FDCWD, past, 0, STATX_BASIC_STATS, &stx));
+  CASE("utimensat-omit", syscall(SYS_utimensat, AT_FDCWD, past, omit, 0));
+  CASE("utimensat-omit-unknown-flag", syscall(SYS_utimensat, AT_FDCWD, past, omit, 0x40000000));
+  CASE("utimensat-unknown-flag", syscall(SYS_utimensat, AT_FDCWD, past, NULL, 1));
+  CASE("utimensat", syscall(SYS_utimensat, AT_FDCWD, past, NULL, 0));
+  CASE("getxattr-empty-name", syscall(SYS_getxattr, past, "", buffer, sizeof buffer));
+  CASE("removexattr-empty-name", syscall(SYS_removexattr, past, ""));
+  CASE("setxattr-unknown-flag", syscall(SYS_setxattr, past, "user.x", "v", 1, 4));
+  CASE("setxattr-too-big", syscall(SYS_setxattr, past, "user.x", value, sizeof value, 0));
+  CASE("getxattr", syscall(SYS_getxattr, past, "user.x", buffer, sizeof buffer));
+  CASE("execveat-unknown-flag", syscall(SYS_execveat, AT_FDCWD, past, args, env, 1));
+  CASE("execveat", syscall(SYS_execveat, AT_FDCWD, past, args, env, 0));
+  CASE("utimes-unreadable-times", syscall(SYS_utimes, past, unreadable));
+  CASE("utime-unreadable-times", syscall(SYS_utime, past, unreadable));
+  CASE("utimes-cmdline-unreadable-times", syscall(SYS_utimes, cmdline, unreadable));
+  CASE("utimes", syscall(SYS_utimes, past, timevals));
+  CASE("utime", syscall(SYS_utime, past, &utimbuf));
+  CASE("utimes-gone", syscall(SYS_utimes, gone, timevals));
+  (void)write(ready[1], "x", 1);
+  waitpid(child, NULL, 0);
+
+  /* Descriptors of the parent's own cmdline and fd directory, which the
+     forked child inherits: an empty pathname with AT_EMPTY_PATH names the
+     descriptor's file, and without it is ENOENT. */
+  char own[64];
+  snprintf(own, sizeof own, "/proc/%d/cmdline", (int)getpid());
+  int own_cmdline = open(own, O_RDONLY | O_CLOEXEC);
+  snprintf(own, sizeof own, "/proc/%d/fd", (int)getpid());
+  int own_fd_directory = open(own, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (own_cmdline < 0 || own_fd_directory < 0) return 3;
+  pid_t inheritor = fork();
+  if (inheritor < 0) return 3;
+  if (inheritor == 0) {
+    CASE("execveat-empty-path-inherited",
+         syscall(SYS_execveat, own_cmdline, "", args, env, AT_EMPTY_PATH));
+    CASE("execveat-empty-path-unknown-flag-inherited",
+         syscall(SYS_execveat, own_cmdline, "", args, env, AT_EMPTY_PATH | 1));
+    CASE("execveat-empty-no-flag-inherited",
+         syscall(SYS_execveat, own_cmdline, "", args, env, 0));
+    CASE("execveat-empty-path-inherited-directory",
+         syscall(SYS_execveat, own_fd_directory, "", args, env, AT_EMPTY_PATH));
+    CASE("statx-empty-path-reserved-mask-inherited",
+         syscall(SYS_statx, own_cmdline, "", AT_EMPTY_PATH, 0x80000000u, &stx));
+    CASE("statx-empty-path-inherited",
+         syscall(SYS_statx, own_cmdline, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &stx));
+    _exit(0);
+  }
+  if (waitpid(inheritor, NULL, 0) != inheritor) return 3;
+  return 0;
+}
+"#;
+
+/// The guest above, compiled once per test process.
+fn procfs_argument_errors_guest() -> PathBuf {
+    let build_root = process_build_root("procfs-argument-errors");
+    fs::create_dir_all(&build_root).expect("failed to create the guest directory");
+    let source = build_root.join("procfs_argument_errors.c");
+    let guest = build_root.join("procfs_argument_errors");
+    if !guest.exists() {
+        fs::write(&source, PROCFS_ARGUMENT_ERRORS_GUEST).expect("failed to write the guest");
+        let compiled = Command::new("cc")
+            .args(["-O0", "-Wall", "-Wextra", "-Werror"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the guest");
+        assert!(compiled.status.success(), "{compiled:?}");
+    }
+    guest
+}
+
+/// The errors Linux decides from a call's own arguments before it walks the
+/// path, on another guest process's `/proc` files
+/// (`PROCFS_ARGUMENT_ERRORS_GUEST`), against Linux's answers, measured
+/// natively in the test: a mknod of a directory is EPERM and one of no file
+/// type EINVAL (`may_mknod`); renameat2's RENAME_EXCHANGE with
+/// RENAME_NOREPLACE is EINVAL, with the path first or second; an empty
+/// symlink target ENOENT; statx's reserved mask bit and both of its
+/// synchronisation flags EINVAL; utimensat answers two UTIME_OMIT with 0
+/// before it looks at its path or flags, and an unknown flag EINVAL; an empty
+/// extended attribute name ERANGE, an unknown setxattr flag EINVAL and a
+/// value over 64 KiB E2BIG; and an unknown execveat flag EINVAL. The controls,
+/// a mknod of a FIFO or a device, renameat2, a symlink, statx, utimensat,
+/// getxattr and execveat with valid arguments, get the walk's answer, ENOTDIR
+/// past the cmdline and ENOENT for the reaped child. utime and utimes copy
+/// their times first, so unreadable times are EFAULT past the cmdline and on
+/// the live child's cmdline itself (`do_futimesat` and `utime`,
+/// fs/utimes.c:175-177 and :214-217); with readable times they get the
+/// walk's answer. On descriptors of the parent's own cmdline and fd
+/// directory, inherited by a forked child, an empty pathname with
+/// AT_EMPTY_PATH is the descriptor's file: execveat of it is EACCES (a
+/// cmdline is not executable, and a directory cannot be executed), an unknown
+/// execveat flag EINVAL, statx's reserved mask bit EINVAL, and a valid statx
+/// succeeds; without AT_EMPTY_PATH the empty pathname is ENOENT. ptrace gives
+/// Linux's answers. KVM's backend checks most of these after its walk, or
+/// refuses them otherwise, and Detcore took its EPERM for a mknod of a
+/// directory for the backend's own refusal. Before, KVM answered seventeen
+/// of the first twenty-eight otherwise and refused one: ENOTDIR or ENOENT for
+/// fifteen, where Linux answers EPERM, EINVAL, ENOENT, ERANGE, E2BIG or 0;
+/// EINVAL for two UTIME_OMIT with an unknown flag, where Linux answers 0;
+/// EOPNOTSUPP for an unknown execveat flag; and a refusal by name for
+/// renameat2's pair with the path second. Before the last twelve were fixed,
+/// KVM answered eleven of them otherwise: ENOSYS for the six utime and utimes
+/// calls, which its backend does not implement; ENOENT for the three execveat
+/// calls with AT_EMPTY_PATH, where Linux answers EACCES or EINVAL; and
+/// ENOTDIR for the valid statx of the descriptor, where Linux succeeds.
+/// Detcore now decides each from the arguments, issues utime and utimes as
+/// utimensat, and takes an empty pathname with AT_EMPTY_PATH for the
+/// descriptor, and KVM gives Linux's answers.
+#[test]
+fn run_kvm_argument_errors_on_another_process_procfs_answer_as_linux() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM procfs argument-error case: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = procfs_argument_errors_guest();
+    let guest = guest.to_str().expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let native = Command::new(guest)
+        .arg(directory.path())
+        .arg("all")
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let linux = String::from_utf8(native.stdout).expect("the guest prints UTF-8");
+    assert_eq!(linux.lines().count(), 40, "native:\n{linux}");
+    for line in [
+        "mknod-dir-past: EPERM",
+        "mknodat-dir-past: EPERM",
+        "mknod-dir-gone: EPERM",
+        "mknodat-dir-gone: EPERM",
+        "mknod-no-type-past: EINVAL",
+        "mknod-fifo-past: ENOTDIR",
+        "mknodat-fifo-gone: ENOENT",
+        "renameat2-exchange-noreplace-first: EINVAL",
+        "renameat2-exchange-noreplace-second: EINVAL",
+        "renameat2-first: ENOTDIR",
+        "symlink-empty-target: ENOENT",
+        "symlink-target: ENOTDIR",
+        "statx-reserved-mask: EINVAL",
+        "utimensat-omit: ok",
+        "utimensat-omit-unknown-flag: ok",
+        "getxattr-empty-name: ERANGE",
+        "setxattr-too-big: E2BIG",
+        "execveat-unknown-flag: EINVAL",
+        "execveat: ENOTDIR",
+        "utimes-unreadable-times: EFAULT",
+        "utime-unreadable-times: EFAULT",
+        "utimes-cmdline-unreadable-times: EFAULT",
+        "utimes: ENOTDIR",
+        "utime: ENOTDIR",
+        "utimes-gone: ENOENT",
+        "execveat-empty-path-inherited: EACCES",
+        "execveat-empty-path-unknown-flag-inherited: EINVAL",
+        "execveat-empty-no-flag-inherited: ENOENT",
+        "execveat-empty-path-inherited-directory: EACCES",
+        "statx-empty-path-reserved-mask-inherited: EINVAL",
+        "statx-empty-path-inherited: ok",
+    ] {
+        assert!(
+            linux.lines().any(|answer| answer == line),
+            "native: no {line:?}\n{linux}"
+        );
+    }
+    let scratch = "/tmp/argument-errors";
+    let mount = format!("--mount=type=tmpfs,target={scratch}");
+    for backend in ["--backend=ptrace", "--backend=kvm"] {
+        let args = [
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            mount.as_str(),
+            "--",
+            guest,
+            scratch,
+            "all",
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), linux, "{backend}");
+        // A named refusal's line, "<call> refused: <reason>" or "<call>
+        // refused by the backend: <reason>". KVM also logs, once per run,
+        // that Detcore declined to read a host task's /proc signal state;
+        // that is no refusal of a call.
+        let stderr = stderr(&output);
+        assert!(
+            !stderr
+                .lines()
+                .any(|line| line.contains(" refused: ") || line.contains(" refused by the backend")),
+            "{backend}: a call was refused by name\nstderr:\n{stderr}"
+        );
+    }
 }
 
 /// tests/c/kill_child_and_wait.c: a parent kills its own pausing child with
