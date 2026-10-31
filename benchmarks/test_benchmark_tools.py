@@ -52,6 +52,27 @@ class TestDirectRun(unittest.TestCase):
         self.assertTrue(desc["bound.wall"].startswith("APPLIED"))
 
 
+    def test_prepare_command(self):
+        entry = {"argv": ["/bin/bash", "x.sh", "--run"], "prepare_script": True}
+        self.assertEqual(direct.prepare_command(entry),
+                         ["/bin/bash", "x.sh", "--prepare"])
+        self.assertIsNone(direct.prepare_command({"argv": ["/bin/true"]}))
+        self.assertEqual(
+            direct.prepare_command({"argv": ["/bin/true"],
+                                    "prepare_argv": ["cc", "-o", "x", "x.c"]}),
+            ["cc", "-o", "x", "x.c"])
+
+    def test_load_workloads_validation(self):
+        spec = {"workloads": [{"name": "a/b", "argv": ["/bin/true"]}]}
+        self.assertEqual(direct.load_workloads(spec)[0]["name"], "a/b")
+        for bad in ({"workloads": []},
+                    {"workloads": [{"name": "x", "argv": []}]},
+                    {"workloads": [{"name": "x", "argv": ["/bin/true"]},
+                                   {"name": "x", "argv": ["/bin/true"]}]}):
+            with self.assertRaises(ValueError):
+                direct.load_workloads(bad)
+
+
 class TestGeomeanReport(unittest.TestCase):
     def test_geomean(self):
         self.assertAlmostEqual(geo.geomean([2.0, 8.0]), 4.0)
@@ -76,7 +97,7 @@ class TestGeomeanReport(unittest.TestCase):
             "getpid": {"native": {"slope_us_per_call": 0.07},
                        "kvm": {"slope_us_per_call": 4.2}},
             "tiny": {"native": {"wall": {"median": 0.5}},
-                     "kvm": {"wall": {"median": 5.0}}},
+                     "kvm": {"wall": {"median": 0.15}}},
         }}
         rows = geo.build_rows(results, 30.0)
         summary = [r for r in rows if r["kind"] == "summary" and r["backend"] == "kvm"]
@@ -87,6 +108,23 @@ class TestGeomeanReport(unittest.TestCase):
         pop = [r for r in rows if r["kind"] == "population"]
         self.assertEqual(len(pop), len(geo.SEED_WORKLOADS))
         self.assertTrue(all(r["status"] == "not_measured" for r in pop))
+
+    def test_intercept_corrected_workload_enters_geomean(self):
+        results = {"workloads": {
+            "startup_true": {"native": {"wall": {"median": 0.003}},
+                             "kvm": {"wall": {"median": 0.115}}},
+            "getpid": {"native": {"slope_us_per_call": 0.16},
+                       "kvm": {"slope_us_per_call": 6.4}},
+            "data-handling/jq-json-transform": {
+                "native": {"wall": {"median": 1.003}},
+                "kvm": {"wall": {"median": 2.115}}},
+        }}
+        rows = geo.build_rows(results, 30.0)
+        meas = [r for r in rows if r["kind"] == "measurement"
+                and r["workload"] == "data-handling/jq-json-transform"]
+        self.assertEqual(len(meas), 1)
+        self.assertEqual(meas[0]["basis"], "intercept_corrected")
+        self.assertAlmostEqual(meas[0]["ratio"], 2.0)  # (2.115-.115)/(1.003-.003)
 
     def test_seed_population_is_rows_1_to_16_and_20(self):
         self.assertEqual(len(geo.SEED_WORKLOADS), 17)

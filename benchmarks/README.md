@@ -124,6 +124,10 @@ DBT, and writes raw samples with full-SHA metadata to
 `benchmarks/results/direct/results.json`. Use it for timing only; general
 Hermit runs still go through `bin/safehermit`.
 
+With `--workloads benchmarks/seed_workloads.json`, `direct_run.py` also times
+the full, unshrunk seed cell programs (each `--run` script's `--prepare`
+fixture step is run once first, mirroring the e2e harness).
+
 `geomean_report.py` turns that output into ledger-ready JSONL. A workload
 enters the geomean only when its native median is at least 30 s or it carries
 an intercept-corrected ratio; startup rows are emitted as excluded, never

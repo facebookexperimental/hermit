@@ -93,7 +93,11 @@ def build_rows(results: dict, min_native_s: float) -> list[dict]:
             per_backend.setdefault(backend, []).append(ratio)
         measured.add("micro/getpid-slope")
 
-    # Long-wall rows from any workload with per-backend wall medians.
+    # Generic workloads: intercept-corrected when startup intercepts exist
+    # (basis (b)), else the >=min-native-s long-wall rule (basis (a)).
+    startup = workloads.get("startup_true") or {}
+    intercepts = {b: (e.get("wall") or {}).get("median")
+                  for b, e in startup.items()}
     for name, per_backend_walls in workloads.items():
         if name in ("getpid", "startup_true") or not isinstance(per_backend_walls, dict):
             continue
@@ -104,11 +108,22 @@ def build_rows(results: dict, min_native_s: float) -> list[dict]:
             median = (entry.get("wall") or {}).get("median")
             if median is None or native is None:
                 continue
-            if qualifies(native, False, min_native_s):
+            ratio = None
+            basis = None
+            if intercepts.get(backend) is not None and intercepts.get("native") is not None:
+                try:
+                    ratio = corrected_ratio(median, intercepts[backend],
+                                            native, intercepts["native"])
+                    basis = "intercept_corrected"
+                except ValueError:
+                    ratio = None
+            if ratio is None and qualifies(native, False, min_native_s):
+                ratio, basis = median / native, "long_wall"
+            if ratio is not None:
                 rows.append({"kind": "measurement", "workload": name,
-                             "backend": backend, "ratio": median / native,
-                             "basis": "long_wall", "native_median_s": native})
-                per_backend.setdefault(backend, []).append(median / native)
+                             "backend": backend, "ratio": ratio,
+                             "basis": basis, "native_median_s": native})
+                per_backend.setdefault(backend, []).append(ratio)
                 measured.add(name)
             else:
                 excluded.setdefault(backend, []).append(name)
@@ -118,10 +133,19 @@ def build_rows(results: dict, min_native_s: float) -> list[dict]:
         if backend != "native":
             excluded.setdefault(backend, []).append("startup_true")
 
+    unavailable: dict[str, list[str]] = {}
+    for name, per_backend_walls in workloads.items():
+        if name in ("getpid", "startup_true") or not isinstance(per_backend_walls, dict):
+            continue
+        for backend, entry in per_backend_walls.items():
+            if backend != "native" and entry.get("status") != "ok":
+                unavailable.setdefault(backend, []).append(name)
+
     for backend, ratios in sorted(per_backend.items()):
         rows.append({"kind": "summary", "backend": backend,
                      "geomean": geomean(ratios), "n_workloads": len(ratios),
-                     "excluded": sorted(set(excluded.get(backend, [])))})
+                     "excluded": sorted(set(excluded.get(backend, []))),
+                     "unavailable": sorted(set(unavailable.get(backend, [])))})
 
     for name in SEED_WORKLOADS:
         rows.append({"kind": "population", "workload": name, "seed": True,

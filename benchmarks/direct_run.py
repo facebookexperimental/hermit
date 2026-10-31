@@ -137,16 +137,53 @@ class Bounds:
         }
 
 
-def run_sample(cmd: list[str], bounds: Bounds, expect_stdout: str | None) -> dict:
+def load_workloads(spec: dict) -> list[dict]:
+    """Validate a workload-spec document (pure; tested).
+
+    Format: {"workloads": [{"name": str, "argv": [str, ...],
+                            "prepare_argv": [str, ...] (optional)}]}
+    """
+    entries = spec.get("workloads")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("spec needs a non-empty 'workloads' list")
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+            raise ValueError(f"workload entry lacks a string name: {entry!r}")
+        argv = entry.get("argv")
+        if not isinstance(argv, list) or not argv or not all(
+                isinstance(a, str) for a in argv):
+            raise ValueError(f"workload {entry['name']}: argv must be a non-empty string list")
+        if entry["name"] in seen:
+            raise ValueError(f"duplicate workload name: {entry['name']}")
+        seen.add(entry["name"])
+    return entries
+
+
+def prepare_command(entry: dict) -> list[str] | None:
+    """The untimed fixture-prepare argv for a spec entry, if it declares one.
+
+    Mirrors the e2e harness: a `--run` shell script is first invoked once
+    with `--prepare` (same script, E2E_FIXTURE_DIR set) to build its guests.
+    """
+    if entry.get("prepare_script") and len(entry["argv"]) >= 2:
+        return [entry["argv"][0], entry["argv"][1], "--prepare"]
+    return entry.get("prepare_argv")
+
+
+def run_sample(cmd: list[str], bounds: Bounds, expect_stdout: str | None,
+               extra_env: dict[str, str] | None = None) -> dict:
     """One timed direct-child run. Returns wall/cpu, status, and stdout."""
     with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
         env = {k: v for k, v in os.environ.items()
                if k not in ("RUST_LOG", "HERMIT_LOG", "HERMIT_LOG_FILE")}
         env["LC_ALL"] = "C"
+        if extra_env:
+            env.update(extra_env)
         rusage0 = resource.getrusage(resource.RUSAGE_CHILDREN)
         start = time.perf_counter_ns()
         proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f, env=env,
-                                preexec_fn=bounds.preexec)
+                                cwd=ROOT, preexec_fn=bounds.preexec)
         try:
             proc.wait(timeout=bounds.timeout_s)
             status = "ok" if proc.returncode == 0 else f"exit:{proc.returncode}"
@@ -178,10 +215,11 @@ def hermit_cmd(hermit: Path, backend: str, prog: list[str]) -> list[str]:
 
 
 def measure(cmd: list[str], bounds: Bounds, expect: str | None,
-            iterations: int, warmups: int) -> dict:
+            iterations: int, warmups: int,
+            extra_env: dict[str, str] | None = None) -> dict:
     for _ in range(warmups):
-        run_sample(cmd, bounds, expect)
-    rows = [run_sample(cmd, bounds, expect) for _ in range(iterations)]
+        run_sample(cmd, bounds, expect, extra_env)
+    rows = [run_sample(cmd, bounds, expect, extra_env) for _ in range(iterations)]
     ok = [r for r in rows if r["status"] == "ok"]
     result: dict = {"command": cmd, "rows": rows, "status": "ok" if len(ok) == len(rows) else "failed"}
     if ok:
@@ -210,6 +248,8 @@ def main() -> int:
     ap.add_argument("--cpu", type=int, default=None)
     ap.add_argument("--getpid-counts", default="0,10000,50000,100000")
     ap.add_argument("--output-dir", type=Path, default=ROOT / "benchmarks/results/direct")
+    ap.add_argument("--workloads", type=Path, default=None,
+                    help="workload-spec JSON (see benchmarks/seed_workloads.json)")
     args = ap.parse_args()
 
     backends = tuple(b.strip() for b in args.backends.split(",") if b.strip())
@@ -270,6 +310,41 @@ def main() -> int:
         getpid[b] = entry
         print(f"getpid {b}: slope_us={entry.get('slope_us_per_call')}", file=sys.stderr)
     results["workloads"]["getpid"] = getpid
+
+    # Optional workload spec (e.g. benchmarks/seed_workloads.json): full,
+    # unshrunk cell programs timed per backend at K=1. Declared concurrency
+    # is 1 (serial); per-sample containment is the Bounds above.
+    if args.workloads:
+        spec = load_workloads(json.loads(args.workloads.read_text()))
+        e2e_tmp = str((args.output_dir / "e2e-tmp").resolve())
+        Path(e2e_tmp).mkdir(parents=True, exist_ok=True)
+        print(f"workload sweep: {len(spec)} workloads x {len(backends)} backends "
+              f"x {args.iterations} reps, concurrency=1, K=1 cpu={cpu}, "
+              f"load={os.getloadavg()}", file=sys.stderr)
+        for entry in spec:
+            entry = {**entry,
+                     "argv": [a.replace("{OUTPUT_DIR}", str(args.output_dir))
+                              for a in entry["argv"]],
+                     **({"prepare_argv": [a.replace("{OUTPUT_DIR}", str(args.output_dir))
+                                          for a in entry["prepare_argv"]]}
+                        if entry.get("prepare_argv") else {})}
+            fixture_dir = str((args.output_dir / "fixtures" /
+                               entry["name"].replace("/", "_")).resolve())
+            Path(fixture_dir).mkdir(parents=True, exist_ok=True)
+            spec_env = {"E2E_TMPDIR": e2e_tmp, "E2E_FIXTURE_DIR": fixture_dir}
+            prep = prepare_command(entry)
+            if prep:
+                subprocess.run(prep, cwd=ROOT, check=True,
+                               env={**os.environ, **spec_env})
+            per_backend = {}
+            for b in backends:
+                per_backend[b] = measure(
+                    hermit_cmd(args.hermit, b, entry["argv"]), bounds, None,
+                    args.iterations, args.warmups,
+                    extra_env=spec_env)
+                wall = per_backend[b].get("wall", {}).get("median")
+                print(f"workload {entry['name']} {b}: {wall}", file=sys.stderr)
+            results["workloads"][entry["name"]] = per_backend
     results["loadavg_end"] = os.getloadavg()
 
     out = args.output_dir / "results.json"
