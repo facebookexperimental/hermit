@@ -3416,6 +3416,108 @@ mod tests {
             );
         }
     }
+
+    /// Under `--no-namespace`, every record analyze and bisect write for a
+    /// trial states the guest IDs every trial takes, resolved before the first
+    /// (`RunOpts::prepare_trial_guest_ids`, `crate::app::run::resolved_trial_guest_ids`):
+    /// the schedule a bisection or an analysis replays (`write_trial_schedule`),
+    /// a prefix record (`write_trial_record`), a minimization candidate
+    /// (`stamp_trial_record`) and the preemption record a check replays
+    /// (`RunData::with_preempts_in`). A record without them reads as numbered
+    /// by a PID namespace, which no such trial can replay. The input was
+    /// recorded in a window Hermit chose (`refuse_host_ids: false`) and the
+    /// trials refuse host IDs, so a written record states the trials' IDs only
+    /// where it is stamped. Resolving the IDs probes the host, so this test
+    /// sets them as resolution leaves them; the CLI tests
+    /// `no_namespace_bisect_replays_the_schedules_it_writes` and
+    /// `no_namespace_minimize_replays_its_candidate_records` run the whole
+    /// path where the host admits chosen IDs.
+    #[test]
+    fn every_record_written_for_a_trial_states_the_trials_chosen_ids() {
+        use detcore_model::pid::GuestIds;
+        let trials = GuestIds::Chosen {
+            base: 31744,
+            refuse_host_ids: true,
+        };
+        let _resolved = crate::app::run::resolve_trial_guest_ids_in_test(trials);
+        // The native reserved-input layout a recording made here carries,
+        // which main's Chosen-input admission requires of every source.
+        let provenance = serde_json::json!({
+            "contract": "sealed-private-input-v1",
+            "base": "0x71010000",
+            "abi": std::env::consts::ARCH,
+            "page_bytes": unsafe { libc::sysconf(libc::_SC_PAGESIZE) },
+        });
+        let with_provenance = |record: PreemptionRecord| -> PreemptionRecord {
+            let mut value = serde_json::to_value(record).unwrap();
+            value["reserved_input"] = provenance.clone();
+            serde_json::from_value(value).unwrap()
+        };
+        let events = vec![SchedEvent::branches(detcore::types::DetTid::from_raw(3), 4)];
+        let input = with_provenance(
+            PreemptionRecord::from_sched_events(events.clone())
+                .with_current_format()
+                .with_guest_ids(GuestIds::Chosen {
+                    base: 31744,
+                    refuse_host_ids: false,
+                }),
+        );
+        let args =
+            crate::app::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+        let crate::app::Subcommand::Analyze(mut options) = args.command else {
+            panic!("not analyze")
+        };
+        options.apply_global(&args.global);
+        let workspace = tempfile::tempdir().unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        // As analyze and bisect remember their input recordings.
+        options.time_skip_sources.lock().unwrap().remember(&input);
+        let states_the_trials_ids = |path: &Path| {
+            assert_eq!(
+                detcore::preemptions::read_recorded_guest_ids(path).unwrap(),
+                trials,
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                detcore::preemptions::read_recorded_reserved_input(path)
+                    .unwrap()
+                    .as_json(),
+                Some(&provenance),
+                "{}",
+                path.display()
+            );
+        };
+        // As the bisection writes a trial's schedule (`event_level_search`).
+        let schedule = workspace.path().join("bisect_round_001.preempts");
+        options
+            .write_trial_schedule(events.clone(), &schedule)
+            .unwrap();
+        states_the_trials_ids(&schedule);
+        // As the baseline search writes a prefix of the target's record.
+        let prefix = workspace.path().join("prefix.preempts");
+        options.write_trial_record(input.clone(), &prefix).unwrap();
+        states_the_trials_ids(&prefix);
+        // As minimization builds a candidate from the initial schedule.
+        let candidate = options.stamp_trial_record(with_provenance(
+            PreemptionRecord::from_vecs(&Default::default())
+                .with_guest_ids(input.guest_ids().unwrap_or_default()),
+        ));
+        assert_eq!(candidate.guest_ids(), Some(trials));
+        // As the check of the critical preemption builds its run.
+        let check = RunData::new_baseline(&options, "verify".to_owned())
+            .unwrap()
+            .with_preempts_in(with_provenance(PreemptionRecord::from_sched_events(events)));
+        states_the_trials_ids(
+            check
+                .runopts
+                .det_opts
+                .det_config
+                .replay_preemptions_from
+                .as_deref()
+                .unwrap(),
+        );
+    }
     /// `--trial-timeout=auto` bounds a run at max(60 s, 10 times the
     /// slowest endpoint run measured so far), rounded up to whole seconds,
     /// and gives no bound before an endpoint was measured; a number of

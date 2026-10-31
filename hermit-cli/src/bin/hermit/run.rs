@@ -3051,9 +3051,47 @@ static TRIAL_GUEST_IDS: std::sync::Mutex<Option<detcore_model::pid::GuestIds>> =
 /// stamps every record it writes for a trial with them
 /// (`AnalyzeOpts::stamp_trial_record`).
 pub(crate) fn resolved_trial_guest_ids() -> Option<detcore_model::pid::GuestIds> {
+    #[cfg(test)]
+    if let Some(ids) = TRIAL_GUEST_IDS_IN_TEST.get() {
+        return Some(ids);
+    }
     *TRIAL_GUEST_IDS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The trial guest IDs a unit test set on its own thread
+    /// ([`resolve_trial_guest_ids_in_test`]), so that tests running beside it
+    /// see the process's memo as before.
+    static TRIAL_GUEST_IDS_IN_TEST: std::cell::Cell<Option<detcore_model::pid::GuestIds>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Clears the trial guest IDs [`resolve_trial_guest_ids_in_test`] set when it
+/// drops.
+#[cfg(test)]
+pub(crate) struct TrialGuestIdsInTest;
+
+#[cfg(test)]
+impl Drop for TrialGuestIdsInTest {
+    fn drop(&mut self) {
+        TRIAL_GUEST_IDS_IN_TEST.set(None);
+    }
+}
+
+/// Makes `ids` this thread's resolved trial guest IDs, as
+/// `RunOpts::prepare_trial_guest_ids` leaves them for every trial, until the
+/// returned guard drops. Resolving them for real probes the host
+/// (`guest_ids::may_choose_ids`), which a unit test cannot rely on.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn resolve_trial_guest_ids_in_test(
+    ids: detcore_model::pid::GuestIds,
+) -> TrialGuestIdsInTest {
+    TRIAL_GUEST_IDS_IN_TEST.set(Some(ids));
+    TrialGuestIdsInTest
 }
 
 /// The guest IDs every trial of an analysis or bisection under
