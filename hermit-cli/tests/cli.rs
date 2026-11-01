@@ -42864,20 +42864,32 @@ fn run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name() {
 /// DBT's refusal status today (as in
 /// [`dbt_refuses_a_vfork_childs_scheduler_policy_query_by_name`]).
 ///
+/// An instance the guest made nonblocking (`received-nonblocking`, and
+/// `received-nonblocking-read` without its F_GETFL) is refused too, at its
+/// F_GETFL and at the read after its event, which finds nothing queued,
+/// though Linux, and DBT before this marking, answer it with O_NONBLOCK and
+/// EAGAIN: Detcore makes every instance nonblocking on the host, so DBT
+/// cannot tell the guest's mode. A receipt matched to its sender's
+/// description (<https://github.com/rrnewton/hermit/issues/5016>) would
+/// have to change these cases on purpose.
+///
 /// Each refused call comes from the guest's only thread: `received`'s F_GETFL
-/// before its reader exists, and the reads of the `-single-threaded` cases,
-/// the same two receipts read by the receiver itself while a signal handler
-/// makes the event. A refusal raised in a sibling while another thread waits
-/// for its turn inside Detcore, as `received-unmatched`'s reader is, ends the
-/// run only after DynamoRIO's exit gives up waiting for that thread to reach
-/// a safe point (10,000 waits of 5 ms): 52 s of this test's 57 s limit.
+/// before its reader exists, the nonblocking cases' calls, and the reads of
+/// the `-single-threaded` cases, the same two receipts read by the receiver
+/// itself while a signal handler makes the event. A refusal raised in a
+/// sibling while another thread waits for its turn inside Detcore, as
+/// `received-unmatched`'s reader is, ends the run only after DynamoRIO's exit
+/// gives up waiting for that thread to reach a safe point (10,000 waits of
+/// 5 ms): 52 s of this test's 57 s limit.
 #[test]
 fn run_dbt_received_inotify_instances_are_refused_by_name() {
     if dbt_unavailable("run_dbt_received_inotify_instances_are_refused_by_name") {
         return;
     }
     let guest = inotify_blocking_read_guest().to_str().unwrap().to_owned();
-    // `received` asks F_GETFL first; the single-threaded cases read at once.
+    // `received` and `received-nonblocking` ask F_GETFL first; the
+    // single-threaded cases read at once, and `received-nonblocking-read`
+    // reads its event, then reads again with nothing queued.
     for (case, syscall, reason) in [
         (
             "received",
@@ -42892,6 +42904,17 @@ fn run_dbt_received_inotify_instances_are_refused_by_name() {
         ),
         (
             "received-unmatched-single-threaded",
+            "read",
+            "Detcore refuses read: Detcore cannot tell whether this read of inotify descriptor",
+        ),
+        (
+            "received-nonblocking",
+            "fcntl",
+            "Detcore refuses fcntl(F_GETFL): Detcore cannot tell the blocking mode of inotify \
+             descriptor",
+        ),
+        (
+            "received-nonblocking-read",
             "read",
             "Detcore refuses read: Detcore cannot tell whether this read of inotify descriptor",
         ),

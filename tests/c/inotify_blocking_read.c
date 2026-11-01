@@ -67,11 +67,11 @@
 // (KVM's executor refuses a zero-count inotify read by name), and an optional
 // --no-received, which leaves out the received case (DBT cannot tell a
 // received instance's blocking mode, and refuses its F_GETFL by name), in
-// that order; then an optional case name, which runs only that case. Four
-// cases run only when named, as Hermit refuses their reads by name on some
-// backend; natively each read waits for an event:
+// that order; then an optional case name, which runs only that case. Six
+// cases run only when named, as Hermit refuses them by name on some backend:
 // - received-unmatched: a blocking instance sent over a datagram socket to a
-//   name, which Hermit cannot match to its sender's open file description.
+//   name, which Hermit cannot match to its sender's open file description;
+//   natively its read waits for the main thread's event.
 // - received-outside NAME DIR: an instance from outside the run, blocking on
 //   the host: the process that started this one serves it, watching DIR, on
 //   the abstract unix socket NAME. A sibling's read of it waits for the file
@@ -82,6 +82,13 @@
 //   later. Under DBT, a refusal raised in a sibling while another thread
 //   waits inside Detcore ends the run only after DynamoRIO's exit gives up
 //   waiting for that thread (50 s); from the only thread it ends at once.
+// - received-nonblocking, received-nonblocking-read: an instance the guest
+//   makes nonblocking (IN_NONBLOCK), sent over a socketpair and received
+//   back, in the only thread. F_GETFL shows it nonblocking (the first case
+//   asks), and a read returns the event made before it, then fails with
+//   EAGAIN. Under DBT both are refused by name, at F_GETFL and at the read
+//   that finds nothing queued: Detcore makes every instance nonblocking on
+//   the host, so DBT cannot tell this instance's mode from a blocking one's.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -680,6 +687,44 @@ static void make_event_on_alarm(int signal_number) {
   errno = saved;
 }
 
+// An instance the guest makes nonblocking, sent over a socketpair and
+// received back, in the only thread: F_GETFL shows it nonblocking
+// (`getfl`), and a read returns the event made before it, then fails with
+// EAGAIN.
+static void received_nonblocking_case(const char *label, int getfl, const char *dir) {
+  make_dir(dir);
+  int original = watch(dir, IN_NONBLOCK, IN_CREATE);
+  int pair[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) fail("socketpair");
+  send_fd(pair[0], original, NULL, 0);
+  int received = receive_fd(pair[1]);
+  close(pair[0]);
+  close(pair[1]);
+  close(original);
+  char what[160];
+  if (getfl) {
+    snprintf(what, sizeof what, "%s: F_GETFL shows the received descriptor nonblocking", label);
+    report(what, nonblocking(received));
+  }
+  char one[3] = {dir[0], '1', 0};
+  create_file(dir, one);
+  char buffer[2 * EVENT] __attribute__((aligned(8)));
+  ssize_t got = read(received, buffer, EVENT);
+  int error = got < 0 ? errno : 0;
+  ssize_t again = read(received, buffer + EVENT, EVENT);
+  int again_error = again < 0 ? errno : 0;
+  printf("%s read %zd bytes (%s), event %s; then %zd (%s)\n", label, got,
+         got < 0 ? strerrorname_np(error) : "ok", name_or_dash(buffer, got, EVENT), again,
+         again < 0 ? strerrorname_np(again_error) : "ok");
+  snprintf(what, sizeof what,
+           "%s: a read returns the queued event, then one that finds nothing queued fails with "
+           "EAGAIN",
+           label);
+  report(what, got == EVENT && is_event(buffer, 0, IN_CREATE, one) && again == -1 &&
+                   again_error == EAGAIN);
+  close(received);
+}
+
 // A blocking instance travels over a socket and is read while its event
 // comes 20 ms later: over a socketpair (`unmatched` 0), or over a datagram
 // socket to a name (1). A sibling reads it while the main thread makes the
@@ -826,6 +871,12 @@ int main(int argc, char **argv) {
   }
   if (only != NULL && strcmp(only, "received-unmatched-single-threaded") == 0) {
     received_case("received-unmatched-single-threaded", 1, 1, "u");
+  }
+  if (only != NULL && strcmp(only, "received-nonblocking") == 0) {
+    received_nonblocking_case("received-nonblocking", 1, "x");
+  }
+  if (only != NULL && strcmp(only, "received-nonblocking-read") == 0) {
+    received_nonblocking_case("received-nonblocking-read", 0, "u");
   }
   if (only != NULL && strcmp(only, "received-outside") == 0) {
     if (argc <= arg + 2) fail("received-outside: no socket name or directory");

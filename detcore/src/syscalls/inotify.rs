@@ -48,11 +48,21 @@
 //! host description is nonblocking, received without the open file
 //! description its sender modelled (an unmatched receipt, or any receipt on a
 //! backend that discovers received descriptors from the host's flags,
-//! `Detcore::mark_discovered_inotify_receipts`), may carry
-//! Detcore's own O_NONBLOCK rather than the sender's, so its blocking mode is
-//! unknown until the guest sets it (`DetFd::blocking_mode_unknown`): an
-//! `F_GETFL` of it, and a read of it that finds nothing queued, are refused
-//! by name rather than answered with a mode that may be wrong.
+//! `Detcore::mark_discovered_inotify_receipts`), has a blocking mode Detcore
+//! cannot tell: the host's O_NONBLOCK is Detcore's own on every instance it
+//! made, so an instance the guest made blocking and one it made nonblocking
+//! (`IN_NONBLOCK`, or `F_SETFL` before the send) leave the same host flags.
+//! Its mode stays unknown until the guest sets it
+//! (`DetFd::blocking_mode_unknown`): an `F_GETFL` of it, and a read of it
+//! that finds nothing queued, are refused by name rather than answered with a
+//! mode that may be wrong. That refuses a guest-nonblocking instance too,
+//! which Linux answers with `O_NONBLOCK` and `EAGAIN`, and on a backend that
+//! discovers received descriptors it refuses every received instance.
+//! Answering both as Linux does needs the receipt matched to the description
+//! its sender modelled (`kcmp(KCMP_FILE)` against the descriptors Detcore
+//! models, say; an instance has no inode of its own to tell it by), or the
+//! guest's flags carried across the receive
+//! (<https://github.com/rrnewton/hermit/issues/5016>).
 //!
 //! A read that faults: `inotify_read` copies whole events in order and
 //! returns -EFAULT when a copy faults, after the earlier events were copied
