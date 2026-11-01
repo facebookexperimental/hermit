@@ -71,22 +71,19 @@ const COLLISION_RENAMES: &[(&str, &str)] = &[(
 ///   GitHub-hosted runners lack; hosted run
 ///   <https://github.com/rrnewton/hermit/actions/runs/36485831200> failed it
 ///   with "hwmon has no readable sanitized leaf". Its two verify cells moved
-///   from the portable lane to the privileged lane.
-const LATER_LANE_MOVES: &[(&str, &str, &str, &str, &str)] = &[
-    (
-        "system-utils/sysfs-sanitized-prefixes",
-        "kvm",
-        "verify",
-        "portable",
-        "privileged",
-    ),
-    (
-        "system-utils/sysfs-sanitized-prefixes",
-        "ptrace",
-        "verify",
-        "portable",
-        "privileged",
-    ),
+///   from the portable lane to the privileged lane, and were then deselected
+///   in the hermetic image as a named loss (empty /sys until Detcore serves
+///   a rendered sysfs,
+///   https://github.com/rrnewton/hermit/issues/5015), so they are now absent
+///   from the committed plan in both lanes.
+const LATER_LANE_MOVES: &[(&str, &str, &str, &str, &str)] = &[];
+
+/// Verify cells deselected as a named loss, as (test, backend, mode): the
+/// committed plan must contain them in neither lane until the named blocker
+/// is fixed.
+const NAMED_LOSS_VERIFY_CELLS: &[(&str, &str, &str)] = &[
+    ("system-utils/sysfs-sanitized-prefixes", "kvm", "verify"),
+    ("system-utils/sysfs-sanitized-prefixes", "ptrace", "verify"),
 ];
 
 fn repo_root() -> PathBuf {
@@ -330,6 +327,22 @@ fn the_committed_plan_keeps_the_fold() {
             "{test} {mode}/{backend}: {from} -> {to}"
         );
     }
+    // Named-loss verify cells are absent from the committed plan in every
+    // lane until their named blocker is fixed.
+    for &(test, backend, mode) in NAMED_LOSS_VERIFY_CELLS {
+        let matching = cells
+            .iter()
+            .filter(|c| {
+                field(c, "test") == test
+                    && field(c, "backend") == backend
+                    && field(c, "mode") == mode
+            })
+            .count();
+        assert_eq!(
+            matching, 0,
+            "{test} {mode}/{backend}: named-loss cell in plan"
+        );
+    }
     // The folded cells now belong to c-programs.
     let retirement = retired_ids();
     let successors = retirement.successors_of(RETIRED_BUCKET).unwrap();
@@ -530,12 +543,17 @@ fn every_manifest_node_with_a_dbt_cell_orders_after_the_dbt_runtime_abi_check() 
             "e2e.manifest_util_c".to_string(),
             "privileged-e2e.manifest_applications".to_string(),
             "privileged-e2e.manifest_c_programs".to_string(),
-            "privileged-e2e.manifest_system_utils".to_string(),
         ])
     );
     // This counted integration target runs real DBT cases outside the
     // manifest buckets, so it must also wait for the same ABI check.
     let mut expected_dependents = needs;
+    // The privileged system-utils bucket keeps its ABI ordering even
+    // though its only DBT cells (the sysfs verify cells) are currently
+    // ci-disabled as a named image-mode loss
+    // (https://github.com/rrnewton/hermit/issues/5015); when they are
+    // re-enabled it joins `needs` again without a DAG change.
+    expected_dependents.insert("privileged-e2e.manifest_system_utils".to_string());
     expected_dependents.insert("test.inherited_terminal_read".to_string());
     // So does the isolation matrix node that runs the DBT cells.
     expected_dependents.insert("test.isolation_matrix_dbt_in_guest".to_string());

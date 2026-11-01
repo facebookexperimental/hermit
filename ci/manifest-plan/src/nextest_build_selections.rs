@@ -992,7 +992,8 @@ mod tests {
             // to 360 (61 + 293 + 360): 714.
             // The runtime_private maps/smaps #[ignore]s (same issue) drop
             // shard 3 to 358 (61 + 293 + 358): 712.
-            assert_eq!(population, 712);
+            // Shard 2 recounts to 294 in run1470 (61 + 294 + 358): 713.
+            assert_eq!(population, 713);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

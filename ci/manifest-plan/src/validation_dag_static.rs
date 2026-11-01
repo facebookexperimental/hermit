@@ -1241,7 +1241,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.regular_crates tight loop at 351565c0ae (1937 passed, one failed).
     // The known-gap ledger module (hermit-manifest-plan known_gaps) adds twenty
     // units: 1938 + 20 = 1958, as test.regular_crates executed in the pinned root.
-    ("test.regular_crates", 1958),
+    // Full validate run1470 at 87daeb34 executed 1959 (one more than the
+    // pin): 1958 + 1 = 1959, re-measured at this tip.
+    ("test.regular_crates", 1959),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1928,7 +1930,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1319, re-measured at 4892f76e6a (1319 passed in the full validate).
     // Recount at bc48233db5: 1323 executed (the validate measured 1323; the
     // local listing less its --skip filters agrees), all passing.
-    ("test.hermit_unit", 1323),
+    // Full validate run1470 at 87daeb34 executed 1325 (two more than the
+    // pin): 1323 + 2 = 1325, re-measured at this tip.
+    ("test.hermit_unit", 1325),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3542,7 +3546,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // guest-held-polls deselection (issue 5001) removes one from the
     // executed set: 292 + 2 - 1 = 293, re-measured at 185c2c1d3c
     // (293 passed in the shard's tight loop).
-    ("test.hermit_integration_2", 293),
+    // Full validate run1470 at 87daeb34 executed 294 (one more than the
+    // pin): 293 + 1 = 294, re-measured at this tip.
+    ("test.hermit_integration_2", 294),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -5144,8 +5150,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same twelve N3 cli cases: 683 + 12 = 695.
     ("test.cli_on_host", 695),
     // The hosted twin carries the local regular_crates selection minus its
-    // 14 PMU/timer/replay skips: 1958 - 14 = 1944, re-measured 2026-10-31.
-    ("test.regular_crates_on_host", 1944),
+    // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
+    ("test.regular_crates_on_host", 1945),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5793,7 +5799,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 61 + 293 + 360 = 714.
     // The runtime_private maps/smaps #[ignore]s (same issue) drop shard 3
     // to 358: 61 + 293 + 358 = 712.
-    ("test.hermit_integration_on_host", 712),
+    // Shard 2 recounts to 294 in run1470: 61 + 294 + 358 = 713.
+    ("test.hermit_integration_on_host", 713),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -6068,7 +6075,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same PR 4912 unit: 1282 + 1 = 1283.
     // The same H1 path-fallback unit: 1283 + 1 = 1284.
     // The same twenty-nine integrated-chain units: 1284 + 29 = 1313.
-    ("test.hermit_unit_on_host", 1317),
+    // The same +2 as test.hermit_unit in the run1470 recount: 1319.
+    ("test.hermit_unit_on_host", 1319),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6297,8 +6305,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
     // The retry stack: the same three added cases: 1932 - 14 = 1918.
     // The integrated chain: the same six added cases: 1938 - 14 = 1924.
-    // The same twenty known_gaps units, none of them hosted-excluded: 1958 - 14 = 1944.
-    ("test.regular_crates_on_host", 1944),
+    // The same twenty known_gaps units, none of them hosted-excluded: 1959 - 14 = 1945.
+    ("test.regular_crates_on_host", 1945),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
