@@ -1394,8 +1394,10 @@ mod tests {
             known_gaps::declaration_for_node("privileged-test.deadline_slice_cap_kvm").unwrap();
         let (rows, _) = read_declared(&repository(), declaration).unwrap();
         // T2 (578b92a6af) promoted the 15 rows of issue 4954 that now pass;
-        // the five lettered rows of issue 4929 remain.
-        assert_eq!(rows.len(), 5);
+        // the five lettered rows of issue 4929 remain, plus the three
+        // batch-28 gaps (H, I, J) deselected 2026-10-31 under the approval
+        // recorded on issue 4929.
+        assert_eq!(rows.len(), 8);
         for row in &rows {
             let issue = if row.gap.starts_with("T2") {
                 "4954"

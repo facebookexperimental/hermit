@@ -5997,6 +5997,13 @@ fn a_library_launch_refuses_an_unqualified_annotated_configuration() {
 }
 
 fn assert_timerless_default_and_disabled_maximum_run(backend: &str) {
+    assert_default_and_disabled_maximum_run(backend, "none");
+}
+
+/// `timer` is what the run report names for the default maximum: "none" on
+/// the timerless backends, "enabled" on KVM since Reverie 9443a6b2. A
+/// disabled maximum never arms a timer.
+fn assert_default_and_disabled_maximum_run(backend: &str, timer: &str) {
     let _guard = hermit_run_guard();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     for (label, maximum) in [
@@ -6031,7 +6038,8 @@ fn assert_timerless_default_and_disabled_maximum_run(backend: &str) {
         };
         assert!(
             stderr(&output).contains(&format!(
-                "Configured maximum timeslice: {configured_maximum}; timer: none"
+                "Configured maximum timeslice: {configured_maximum}; timer: {}",
+                if maximum.is_some() { "none" } else { timer }
             )),
             "{backend} {label}: {}",
             stderr(&output)
@@ -6080,7 +6088,7 @@ fn sabre_runs_with_a_resolved_or_explicitly_disabled_maximum() {
 #[test]
 fn run_kvm_with_a_resolved_or_explicitly_disabled_maximum() {
     if !kvm_unavailable("run_kvm_with_a_resolved_or_explicitly_disabled_maximum") {
-        assert_timerless_default_and_disabled_maximum_run("kvm");
+        assert_default_and_disabled_maximum_run("kvm", "enabled");
     }
 }
 

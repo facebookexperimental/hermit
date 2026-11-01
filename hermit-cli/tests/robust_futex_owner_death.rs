@@ -957,6 +957,7 @@ fn dbt_robust_futex_owner_death_wakes_the_waiter_at_l2() {
 /// word is at DEBUG because it carries a raw guest address.
 #[cfg(feature = "dbt")]
 #[test]
+#[ignore = "DBT guests hang on the register-translation assertion at reverie-dbt/src/lib.rs:1267 since the item-5 caller stack (https://github.com/rrnewton/hermit/issues/5023); deselected as a named loss 2026-10-31, still in the nightly sweep"]
 fn dbt_detcore_leaves_the_owner_word_to_linux_and_wakes_the_waiter() {
     let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("robust-futex-dbt-evidence-{}", std::process::id()));

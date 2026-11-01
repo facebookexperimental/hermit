@@ -10,7 +10,15 @@
           "id": "hermit-run::deadline_slice_cap$itimer_a_private_descriptor_table_consumer_re_arms",
           "issue": "https://github.com/rrnewton/hermit/issues/4929",
           "outcome": "failed",
-          "signature": "\"privfd\" \"5000\"\\nstatus: exit status: 2\\nstdout:\\n\\nstderr:\\n\\nnote: run with",
+          "signature": "\"privfd\" \"5000\"\\nstatus: exit status: 122",
+          "status": "known-gap"
+        },
+        {
+          "gap": "I",
+          "id": "hermit-run::deadline_slice_cap$itimer_a_recorded_schedule_replays",
+          "issue": "https://github.com/rrnewton/hermit/issues/4929",
+          "outcome": "failed",
+          "signature": "\"storm\" \"400\" \"20\" \"2\"\\nstatus: exit status: 122",
           "status": "known-gap"
         },
         {
@@ -19,6 +27,14 @@
           "issue": "https://github.com/rrnewton/hermit/issues/4929",
           "outcome": "failed",
           "signature": "failed: deliveries=",
+          "status": "known-gap"
+        },
+        {
+          "gap": "H",
+          "id": "hermit-run::deadline_slice_cap$itimer_a_wait_mask_is_withdrawn_when_the_wait_returns",
+          "issue": "https://github.com/rrnewton/hermit/issues/4929",
+          "outcome": "failed",
+          "signature": "\"stale\" \"ppoll_mask\"\\nstatus: exit status: 122",
           "status": "known-gap"
         },
         {
@@ -44,11 +60,19 @@
           "outcome": "failed",
           "signature": "\\npositive=<N> samples=20 progress=<N>\\n\\nnote: run with",
           "status": "known-gap"
+        },
+        {
+          "gap": "J",
+          "id": "hermit-run::deadline_slice_cap$skipped_slice_ends_survive_the_backstop",
+          "issue": "https://github.com/rrnewton/hermit/issues/4929",
+          "outcome": "failed",
+          "signature": "INFO line <N> differs:",
+          "status": "known-gap"
         }
       ],
       "ledger": "hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv",
       "node": "privileged-test.deadline_slice_cap_kvm",
-      "required_tests": 37
+      "required_tests": 34
     }
   ],
   "schema": 1

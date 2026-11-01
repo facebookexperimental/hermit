@@ -1676,18 +1676,15 @@ mod tests {
         };
         let d = signature("itimer_a_private_descriptor_table_consumer_re_arms");
         let g = signature("itimer_mixed_masks_keep_the_timer_running");
-        // The failures recorded in the node's event stream, Hermit 7fc6645c6465 in the pinned root.
-        let d_failure = "\nthread 'itimer_a_private_descriptor_table_consumer_re_arms' (2437) panicked at hermit-cli/tests/deadline_slice_cap.rs:163:5:\nguest failed: \"timeout\" \"--kill-after=2s\" \"120s\" \"/src/target/validate/hermit\" \"--backend=kvm\" \"run\" \"--base-env=minimal\" \"--strict\" \"--epoch=2026-01-01T00:00:00Z\" \"--mount=type=tmpfs,target=/test\" \"--workdir=/test\" \"--\" \"/src/target/tmp/deadline-slice-cap-2433/itimer_coalesce\" \"privfd\" \"5000\"\nstatus: exit status: 2\nstdout:\n\nstderr:\n\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
+        // The failures recorded in the node's event stream: D at bc48233db5 in the pinned root (its failure became the clone refusal, exit 122), G at Hermit 7fc6645c6465.
+        let d_failure = "\nthread 'itimer_a_private_descriptor_table_consumer_re_arms' (1270) panicked at hermit-cli/tests/deadline_slice_cap.rs:163:5:\nguest failed: HERMIT_EPOCH=\"2026-01-01T00:00:00Z\" \"timeout\" \"--kill-after=2s\" \"120s\" \"/src/target/validate/hermit\" \"--backend=kvm\" \"run\" \"--base-env=minimal\" \"--strict\" \"--epoch=2026-01-01T00:00:00Z\" \"--mount=type=tmpfs,target=/test\" \"--workdir=/test\" \"--\" \"/src/target/tmp/deadline-slice-cap-1269/itimer_coalesce\" \"privfd\" \"5000\"\nstatus: exit status: 122\nstdout:\n\nstderr:\n2026-11-01T00:59:59.862237Z ERROR detcore::syscalls::helpers: [dtid 3] clone refused by the backend: KVM cannot create a thread with a working directory or descriptor table of its own: CLONE_THREAD without CLONE_FS or CLONE_FILES (flags CloneFlags(CLONE_VM | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM), exit signal 0). No child was created.\n";
         let g_failure = "\nthread 'itimer_mixed_masks_keep_the_timer_running' (2952) panicked at hermit-cli/tests/deadline_slice_cap.rs:878:5:\npositive=3 samples=20 progress=19882\n\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
         assert!(signature_matches(&d, d_failure), "{d}");
         assert!(signature_matches(&g, g_failure), "{g}");
-        // D: exit 2 with a message (a usage error), another exit status, and output on stdout.
+        // D: exit 122 with the refusal on stderr, another exit status, and output on stdout.
         for different in [
-            d_failure.replace(
-                "stderr:\n\nnote:",
-                "stderr:\nerror: unexpected argument '--strict'\n\nnote:",
-            ),
-            d_failure.replace("exit status: 2", "exit status: 1"),
+            d_failure.replace("\"privfd\" \"5000\"", "\"privfd2\" \"5000\""),
+            d_failure.replace("exit status: 122", "exit status: 1"),
             d_failure.replace("stdout:\n\nstderr:", "stdout:\nhandled=1\n\nstderr:"),
             d_failure.replace("\"privfd\" \"5000\"", "\"private\" \"5000\""),
         ] {

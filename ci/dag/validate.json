@@ -3851,13 +3851,6 @@
           "category": "c-programs",
           "test": "c-programs/inotify-failed-protection-key",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/inotify-failed-protection-key",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -30436,7 +30429,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1319",
+        "NEXTEST_EXPECTED_EXECUTED": "1323",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -31230,7 +31223,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "6",
+        "NEXTEST_EXPECTED_EXECUTED": "3",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends\",\"--test\",\"inherited_terminal_read\"]"
       },
       "networkonly": false,
@@ -31585,7 +31578,7 @@
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
         "HERMIT_REQUIRE_DAP_GDB": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "763",
+        "NEXTEST_EXPECTED_EXECUTED": "764",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -31637,7 +31630,7 @@
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "682",
+        "NEXTEST_EXPECTED_EXECUTED": "683",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -33268,7 +33261,7 @@
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_KNOWN_GAP_LEDGER": "hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "37",
+        "NEXTEST_EXPECTED_EXECUTED": "34",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends,kvm-execution-tests\",\"--test\",\"deadline_slice_cap\"]"
       },
       "networkonly": false,
@@ -58838,7 +58831,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1313",
+        "NEXTEST_EXPECTED_EXECUTED": "1317",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -62521,13 +62514,6 @@
           "test": "c-programs/inotify-failed-protection-key",
           "mode": "verify",
           "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/inotify-failed-protection-key",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",

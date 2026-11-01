@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 3070,
-      "applicable": 2246,
-      "selectable": 1757,
+      "applicable": 2245,
+      "selectable": 1756,
       "population": 3010,
-      "population_candidate_selected": 1757,
+      "population_candidate_selected": 1756,
       "population_candidate_not_selected": 475,
-      "population_candidate_disabled": 778
+      "population_candidate_disabled": 779
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 614,
-        "applicable": 581,
-        "selectable": 574,
+        "applicable": 580,
+        "selectable": 573,
         "population": 602,
-        "population_candidate_selected": 574,
+        "population_candidate_selected": 573,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 25
+        "population_candidate_disabled": 26
       },
       "liteinst": {
         "cells": 614,
@@ -467,7 +467,7 @@
     {"test_id":"c-programs/inotify-blocking-faults","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"c-programs/inotify-failed-protection-key","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/inotify-failed-protection-key","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/inotify-failed-protection-key","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/inotify-failed-protection-key","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Deselected from the blocking validate on 2026-10-31 (owner deselect-and-fix-forward rule); KVM refuses pkey_alloc by name instead of answering it as x86 without OSPKE does, so the run aborts before the inotify checks (https://github.com/rrnewton/hermit/issues/5024). The cell stays in the nightly sweep; this is a recorded loss, not a pass."},
     {"test_id":"c-programs/inotify-failed-protection-key","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/inotify-failed-protection-key","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"c-programs/inotify-faults","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

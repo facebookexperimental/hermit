@@ -14061,10 +14061,10 @@ test:
           - ptrace
           - sabre
           - dbt
-          - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled: {}
+        backends_disabled:
+          kvm: Deselected from the blocking validate on 2026-10-31 (owner deselect-and-fix-forward rule); KVM refuses pkey_alloc by name instead of answering it as x86 without OSPKE does, so the run aborts before the inotify checks (https://github.com/rrnewton/hermit/issues/5024). The cell stays in the nightly sweep; this is a recorded loss, not a pass.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled

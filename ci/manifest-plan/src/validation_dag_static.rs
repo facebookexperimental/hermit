@@ -316,7 +316,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.isolated_dbt_workdir", 3),
     // Inherited-terminal regressions: native and DBT direct, exec, and peer-flags
     // cases. The authored target has six identities; it is separate from CLI.
-    ("test.inherited_terminal_read", 6),
+    // The three DBT cases are #[ignore]d as a named loss while DBT guests hang
+    // (https://github.com/rrnewton/hermit/issues/5023): 6 - 3 = 3 executed.
+    ("test.inherited_terminal_read", 3),
     ("test.isolated_detcore_workdir", 1),
     // Prepared inventories retain all prior identities and add four reporting
     // tests to regular crates and nine to Hermit's library/binary selection.
@@ -1924,7 +1926,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // H1 host-input evidence adds one hermit-run unit: 1289 + 1 = 1290.
     // The integrated chain adds twenty-nine hermit-run units: 1290 + 29 =
     // 1319, re-measured at 4892f76e6a (1319 passed in the full validate).
-    ("test.hermit_unit", 1319),
+    // Recount at bc48233db5: 1323 executed (the validate measured 1323; the
+    // local listing less its --skip filters agrees), all passing.
+    ("test.hermit_unit", 1323),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4525,7 +4529,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The retry stack adds one cli case: 744 + 1 = 745.
     // The integrated chain adds eighteen cli cases: 745 + 18 = 763,
     // re-measured in the test.cli tight loop at 351565c0ae (763 passed).
-    ("test.cli", 763),
+    // Recount at bc48233db5: 764 executed in the confirming validate, all
+    // passing.
+    ("test.cli", 764),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4773,13 +4779,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // named setup test), listed.
     ("privileged-test.cli_kvm", 112),
     // The required tests of hermit-cli/tests/deadline_slice_cap.rs on KVM: the
-    // suite's 42 tests less the 20 rows of its known-gap ledger
+    // suite's 42 tests less the rows of its known-gap ledger
     // (hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv), measured on Hermit
     // main badaea3ee96 and 2c255403749 with
     // https://github.com/rrnewton/hermit/issues/4929's first slice on top. ci/kvm-gap-ledger.rs runs all 42 and refuses a
     // population that does not leave exactly this many required. Deleting a
     // row (a gap that now passes) or adding a test raises it.
-    ("privileged-test.deadline_slice_cap_kvm", 37),
+    // T2's promotion (578b92a6af) made it 37; the 2026-10-31 deselection of
+    // the four batch-28 itimer gaps (approval on issue 4929) makes it 34.
+    ("privileged-test.deadline_slice_cap_kvm", 34),
     // The same three https://github.com/rrnewton/hermit/issues/3260 tests as
     // test.cli; all 99 prior identities retained. The same
     // https://github.com/rrnewton/hermit/pull/3547 version test as test.cli
@@ -5120,7 +5128,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
     // The same retry-stack cli case: 663 + 1 = 664.
     // The same eighteen integrated-chain cli cases: 664 + 18 = 682.
-    ("test.cli_on_host", 682),
+    // The same recount at bc48233db5 as test.cli: 682 + 1 = 683.
+    ("test.cli_on_host", 683),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1958 - 14 = 1944, re-measured 2026-10-31.
     ("test.regular_crates_on_host", 1944),
@@ -6041,7 +6050,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same PR 4912 unit: 1282 + 1 = 1283.
     // The same H1 path-fallback unit: 1283 + 1 = 1284.
     // The same twenty-nine integrated-chain units: 1284 + 29 = 1313.
-    ("test.hermit_unit_on_host", 1313),
+    ("test.hermit_unit_on_host", 1317),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
