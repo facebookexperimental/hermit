@@ -131,6 +131,54 @@ impl Record {
     }
 }
 
+/// Derive one `retry_attempt` record per attempt from the retry rollup
+/// (design §2). `failure_class` comes from the census; `failure_subcategory`
+/// stays `unknown` and `signature` stays null where the census carries no
+/// divergence evidence — never fabricated (§9.4).
+pub fn retry_attempts_from_rollup(
+    rollup: &crate::ledger::RetryRollupV1,
+    emitted_at: &str,
+    team: &str,
+    host: &str,
+    run_id: &str,
+    producer: &str,
+) -> Vec<Record> {
+    let mut records = Vec::new();
+    for test in &rollup.tests {
+        for (index, outcome) in test.attempt_outcomes.iter().enumerate() {
+            let mut fields = BTreeMap::new();
+            fields.insert(
+                "failure_class".into(),
+                test.attempt_classes
+                    .get(index)
+                    .cloned()
+                    .flatten()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            fields.insert(
+                "failure_subcategory".into(),
+                Value::String("unknown".into()),
+            );
+            fields.insert("signature".into(), Value::Null);
+            fields.insert("outcome".into(), Value::String(outcome.clone()));
+            fields.insert("attempt".into(), Value::Number((index as u64 + 1).into()));
+            records.push(Record {
+                kind: Kind::RetryAttempt,
+                event_id: format!("{run_id}-{}-attempt-{}", test.test, index + 1),
+                emitted_at: emitted_at.to_string(),
+                team: team.to_string(),
+                host: host.to_string(),
+                run_id: run_id.to_string(),
+                producer: producer.to_string(),
+                legacy: serde_json::to_value(test).unwrap_or(Value::Null),
+                fields,
+            });
+        }
+    }
+    records
+}
+
 pub trait Connector {
     fn authoritative(&self) -> bool {
         false
@@ -220,6 +268,34 @@ mod tests {
             None,
             "no evidence must stay null, never fabricated"
         );
+    }
+
+    #[test]
+    fn retry_rollup_derives_attempts_without_fabrication() {
+        let rollup =
+            crate::ledger::RetryRollupV1::from_records(vec![crate::ledger::RetryRecordV1 {
+                test: "test.flaky".into(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+                attempts: 2,
+                retries: 1,
+                attempt_outcomes: vec!["FAIL".into(), "PASS".into()],
+                attempt_classes: vec![Some("product_failure".into()), None],
+                final_outcome: "PASS".into(),
+                flaky_pass: true,
+            }]);
+        let records = retry_attempts_from_rollup(
+            &rollup,
+            "2026-11-01T00:00:00Z",
+            "hermit",
+            "devbig014",
+            "validate-1",
+            "hermit-validate-rs",
+        );
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.validate().is_ok()));
+        assert_eq!(records[0].fields["failure_subcategory"], "unknown");
+        assert!(records[0].fields["signature"].is_null());
     }
 
     #[test]
