@@ -207,6 +207,7 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 pub use scheduler::Priority;
+pub use scheduler::ReplayRefusalExitHook;
 pub use scheduler::TerminalDeadlockHook;
 pub use scheduler::TerminalOutcome;
 pub use scheduler::TerminalOutcomeUnwind;
@@ -215,6 +216,7 @@ pub use scheduler::VirtualTimeoutExitHook;
 pub use scheduler::runqueue::DEFAULT_PRIORITY;
 pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
+pub use scheduler::set_replay_refusal_exit_hook;
 pub use scheduler::set_terminal_deadlock_hook;
 pub use scheduler::set_virtual_timeout_exit_hook;
 pub use syscalls::chosen_ids::holder_of as chosen_id_holder;
@@ -2853,7 +2855,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
             );
         }
-        crate::scheduler::exit_on_scheduler_refusal(&message)
+        crate::scheduler::exit_on_replay_refusal(&message)
     }
 
     fn callback_checkpoint_expiry_due<G: Guest<Self>>(

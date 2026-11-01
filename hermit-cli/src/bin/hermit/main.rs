@@ -78,6 +78,7 @@ mod replay_departure_classification_tests;
 #[cfg(test)]
 #[path = "../../replay_departure_test_fixture.rs"]
 mod replay_departure_test_fixture;
+mod replay_refusal_note;
 mod run;
 mod run_config;
 mod run_timeout;

@@ -6458,6 +6458,90 @@ fn run_kvm_a_late_timer_event_is_a_verify_infrastructure_error() {
     );
 }
 
+/// A late precise timer event in a replay refuses a KVM run by name, as the
+/// same event does in any other run
+/// (run_kvm_a_late_timer_event_refuses_the_run_by_name): exit 122 with the
+/// named skid-overshoot refusal, which harnesses retry, never the untyped
+/// refusal of the schedule. The event pushes the thread past a recorded
+/// callback checkpoint, so the scheduler refuses the replay at that checkpoint
+/// and exits the run at once; before this, that exit dropped the late-event
+/// count, and the run read as a refusal of the schedule itself
+/// (itimer_a_recorded_schedule_replays failed so about 1 in 20 runs on KVM).
+/// The recording takes the normal skid margin, and `hermit()` retries its own
+/// late events; the replay takes `--skid-margin=0`, so each recorded
+/// preemption point's event is programmed at its target and is late unless an
+/// unrelated exit lands within Reverie's stepping allowance before it.
+#[test]
+fn run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name() {
+    if kvm_unavailable("run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = directory.path().join("preemptions.json");
+    let guest = replay_epoch_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let record_arg = format!("--record-preemptions-to={}", schedule.display());
+    let replay_arg = format!("--replay-preemptions-from={}", schedule.display());
+    let chaos = [
+        "--backend=kvm",
+        "run",
+        "--strict",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--chaos",
+        "--seed=1",
+        "--max-timeslice=20000000",
+    ];
+    let mut record = chaos.to_vec();
+    record.extend([record_arg.as_str(), "--", guest]);
+    let recorded = hermit(&record);
+    assert_success(&recorded, &record);
+    // The premise: recorded preemption points for the replay to stop at.
+    let json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&schedule).unwrap()).unwrap();
+    assert!(
+        json["per_thread"].as_object().is_some_and(|threads| threads
+            .values()
+            .any(|thread| thread["prio_changes"]
+                .as_array()
+                .is_some_and(|changes| !changes.is_empty()))),
+        "the recording has no preemption points, so the replay has no event to make late: {json}"
+    );
+    // Hermit is run directly: the `hermit()` helper retries exactly the
+    // refusal this checks.
+    let mut replay = chaos.to_vec();
+    replay.extend(["--skid-margin=0", replay_arg.as_str(), "--", guest]);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    append_hermit_args(&mut command, &replay);
+    let output = command
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run hermit with {replay:?}: {error}"));
+    let stderr = stderr(&output);
+    // The replay's own refusal, at a recorded checkpoint, is the path a late
+    // event used to leave untyped.
+    assert!(
+        stderr.contains("HERMIT_CALLBACK_CHECKPOINT_"),
+        "the late event did not reach the replay's checkpoint refusal; exit {:?}:\n{stderr}",
+        output.status.code()
+    );
+    // The refusal line, once the recognizer has checked the exit status, a
+    // count above zero, a HERMIT_SKID_OVERSHOOT line and no second outcome.
+    let refusal = skid_overshoot_refusal(output.status.code(), &stderr).unwrap_or_else(|| {
+        panic!(
+            "expected only a named skid refusal (exit {HERMIT_POLICY_REFUSAL_EXIT}, \
+             {SKID_OVERSHOOT_REFUSAL_PREFIX}<count>, a HERMIT_SKID_OVERSHOOT line); got exit \
+             {:?}:\n{stderr}",
+            output.status.code()
+        )
+    });
+    let count: u64 = refusal[SKID_OVERSHOOT_REFUSAL_PREFIX.len()..]
+        .parse()
+        .unwrap_or_else(|error| panic!("{refusal}: {error}"));
+    assert!(count > 0, "{stderr}");
+}
+
 #[test]
 fn ptrace_still_accepts_an_explicit_maximum() {
     let _guard = hermit_run_guard();

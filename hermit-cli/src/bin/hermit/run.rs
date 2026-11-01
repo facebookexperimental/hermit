@@ -12818,6 +12818,14 @@ impl RunOpts {
         if self.det_opts.det_config.virtual_timeout.is_some() {
             super::terminal_outcome_note::arm()?;
         }
+        // Inherited at the clone too: where the child's scheduler leaves the
+        // late timer events behind a replay refusal it exits 122 with
+        // (`classify_container_result`).
+        if self.det_opts.det_config.replay_preemptions_from.is_some()
+            || self.det_opts.det_config.replay_schedule_from.is_some()
+        {
+            super::replay_refusal_note::arm()?;
+        }
         super::owned_container::run(
             &mut container,
             (tmpfs, identity, guards, native_plan, gdbserver_port),

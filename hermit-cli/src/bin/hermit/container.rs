@@ -5530,6 +5530,19 @@ fn deadline_exit(note: Option<detcore::TerminalOutcome>) -> Error {
     }
 }
 
+/// What a container child that exited `HERMIT_POLICY_REFUSAL_EXIT` refused,
+/// given the late precise timer events its scheduler noted before refusing a
+/// replay, if any: those events' skid-overshoot refusal, which a run that
+/// finishes after a late event reports too, otherwise the refusal it printed.
+fn policy_refusal_exit(late_events: Option<u64>) -> Error {
+    match late_events {
+        Some(late_events) => {
+            Error::new(PolicyRefusal).context(hermit::SkidOvershootError::new(late_events))
+        }
+        None => Error::new(PolicyRefusal),
+    }
+}
+
 /// Preserve the primary class from a settled container result. The owned CLI
 /// adapter also calls this for its strict error-only failed-child channel.
 pub fn classify_container_result<T>(
@@ -5591,10 +5604,18 @@ pub fn classify_container_result<T>(
         // are a container child that exited. Only the status distinguishes
         // them, and only because `unrecoverable_shutdown` chose one that says
         // so.
+        //
+        // ⚠️ A LATE TIMER EVENT IN A REPLAY EXITS THE SAME STATUS. The
+        // scheduler refuses a replayed schedule's callback checkpoint that a
+        // late precise timer event pushed the thread past, and exits the child
+        // 122 at once; its exit hook first leaves the late-event count in the
+        // note (`replay_refusal_note`) the child shares with this process. The
+        // note, not the status, makes it the late event's skid-overshoot
+        // refusal rather than a refusal of the schedule.
         Err(RunError::ExitStatus(status))
             if status.code() == Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT) =>
         {
-            Err(Error::new(PolicyRefusal))
+            Err(policy_refusal_exit(super::replay_refusal_note::take()))
         }
         // A DEADLINE HERMIT ITSELF ENFORCED, and it needs its own arm for exactly
         // the reason the refusal above does: the init chose this status on
@@ -6547,6 +6568,26 @@ mod tests {
                 .expect_err("a Hermit stall is not a success");
         assert!(stall.downcast_ref::<ContainerChildExit>().is_some());
         assert!(stall.downcast_ref::<SchedulerOutcome>().is_none());
+    }
+
+    /// A child that exited the refusal status is the late timer events' skid
+    /// overshoot when its scheduler noted them before refusing a replay, and
+    /// otherwise the plain refusal it printed. Drop the note from
+    /// `policy_refusal_exit` and the first half fails; type every 122 as a
+    /// skid overshoot and the second does.
+    #[test]
+    fn a_policy_refusal_exit_is_a_skid_overshoot_only_with_its_note() {
+        let noted = policy_refusal_exit(Some(3));
+        assert_eq!(
+            noted
+                .downcast_ref::<hermit::SkidOvershootError>()
+                .map(hermit::SkidOvershootError::count),
+            Some(3)
+        );
+        assert!(noted.downcast_ref::<PolicyRefusal>().is_some());
+        let plain = policy_refusal_exit(None);
+        assert!(plain.downcast_ref::<PolicyRefusal>().is_some());
+        assert!(plain.downcast_ref::<hermit::SkidOvershootError>().is_none());
     }
 
     /// A child that exited the deadline status is `--timeout`'s deadline

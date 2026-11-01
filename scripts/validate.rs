@@ -18833,7 +18833,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "116");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "117");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -18941,10 +18941,11 @@ mod nextest_timeout_tests {
         // maximum) and adds run_kvm_refuses_preemption_stack_traces_by_name,
         // run_kvm_a_late_timer_event_refuses_the_run_by_name and
         // run_kvm_a_late_timer_event_is_a_verify_infrastructure_error: 115
-        // declarations, every one selected.
+        // declarations, every one selected. And
+        // run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name: 116.
         assert_eq!(
             names.len(),
-            115,
+            116,
             "update the exact CI inventory with new KVM tests"
         );
         let required_cases = [
@@ -18992,6 +18993,7 @@ mod nextest_timeout_tests {
             "run_kvm_refuses_preemption_stack_traces_by_name",
             "run_kvm_a_late_timer_event_refuses_the_run_by_name",
             "run_kvm_a_late_timer_event_is_a_verify_infrastructure_error",
+            "run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -20105,7 +20107,9 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // again and adds run_kvm_refuses_preemption_stack_traces_by_name,
         // run_kvm_a_late_timer_event_refuses_the_run_by_name and
         // run_kvm_a_late_timer_event_is_a_verify_infrastructure_error: 116.
-        ("privileged-only-test.cli_kvm", 116usize),
+        // And run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name:
+        // 117.
+        ("privileged-only-test.cli_kvm", 117usize),
     ] {
         let step = privileged
             .steps

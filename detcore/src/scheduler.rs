@@ -4251,6 +4251,45 @@ pub(crate) fn exit_on_scheduler_refusal(refusal: &dyn std::fmt::Display) -> ! {
     std::process::exit(detcore_model::HERMIT_POLICY_REFUSAL_EXIT);
 }
 
+/// What a process does with the number of late precise timer events it
+/// recorded (Reverie's skid-overshoot witness, `reverie::skid_overshoot_count`)
+/// just before a replay refusal exits it with `HERMIT_POLICY_REFUSAL_EXIT`
+/// (`exit_on_replay_refusal`). The status is all that crosses the process
+/// boundary, and it is every refusal's status, so a parent that forked the
+/// process learns through this hook that the refusal followed a late event.
+pub type ReplayRefusalExitHook = fn(u64);
+
+static REPLAY_REFUSAL_EXIT_HOOK: Mutex<Option<ReplayRefusalExitHook>> = Mutex::new(None);
+
+/// Install (or, with `None`, remove) the [`ReplayRefusalExitHook`]. A process
+/// forked after this inherits it.
+pub fn set_replay_refusal_exit_hook(hook: Option<ReplayRefusalExitHook>) {
+    *REPLAY_REFUSAL_EXIT_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+/// End the run on a refusal of a replayed schedule's callback checkpoints
+/// ([`exit_on_scheduler_refusal`]). A precise timer event that arrived past its
+/// target makes a replay leave its record at that checkpoint, and host timing
+/// decides when that happens. So when this process recorded any late event,
+/// their count goes to the [`ReplayRefusalExitHook`] first, and the parent
+/// reports the refusal as the late event's skid-overshoot refusal, which a run
+/// that finishes after a late event reports too, instead of as a refusal of
+/// the schedule itself.
+pub(crate) fn exit_on_replay_refusal(refusal: &dyn std::fmt::Display) -> ! {
+    let late_events = reverie::skid_overshoot_count();
+    if late_events > 0 {
+        let hook = *REPLAY_REFUSAL_EXIT_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(hook) = hook {
+            hook(late_events);
+        }
+    }
+    exit_on_scheduler_refusal(refusal)
+}
+
 /// Refuse a fail-closed run at the point where the guest would observe an
 /// expiration of a POSIX timer that notifies with real-time signal `signo`,
 /// which Detcore does not deliver from a timer (https://github.com/rrnewton/hermit/issues/3893):
@@ -16705,7 +16744,7 @@ impl Scheduler {
             // Selected now, once: acknowledge the recorded row it ends.
             if let Err(refusal) = self.acknowledge_priority_row(dettid, rs) {
                 self.callback_checkpoint_desyncs.push(refusal.clone());
-                exit_on_scheduler_refusal(&refusal);
+                exit_on_replay_refusal(&refusal);
             }
         }
         if let Some(origin) = rs.callback_checkpoint.as_deref() {
@@ -20497,7 +20536,7 @@ impl Scheduler {
             && (actual.progress > checkpoint.origin.progress
                 || actual.rcbs > checkpoint.origin.rcbs)
         {
-            exit_on_scheduler_refusal(&format!(
+            exit_on_replay_refusal(&format!(
                 "{}: {tid} went past callback checkpoint {} (expected {:?}, observed {:?}); the \
                  scheduler's custody holds {:?} first",
                 crate::preemptions::callback_history::Refusal::Overshot.name(),
