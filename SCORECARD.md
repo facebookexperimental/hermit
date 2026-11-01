@@ -94,7 +94,7 @@ Each row below is a test that a validation node runs and expects to FAIL on its 
 | `itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue` | E | https://github.com/rrnewton/hermit/issues/4929 | output showing `failed: ignored_remaining_us=` | failing (known gap) |
 | `itimer_generation_discard_follows_the_wait_mask` | E+F' | https://github.com/rrnewton/hermit/issues/4929 | output showing `failed: poll: result=0 first_us=` | failing (known gap) |
 | `itimer_mixed_masks_keep_the_timer_running` | G | https://github.com/rrnewton/hermit/issues/4929 | output showing `\npositive=<N> samples=20 progress=<N>\n\nnote: run with` | failing (known gap) |
-| `skipped_slice_ends_survive_the_backstop` | J | https://github.com/rrnewton/hermit/issues/4929 | output showing `long: backstop events\n      left: 0\n     right: 1` | failing (known gap) |
+| `skipped_slice_ends_survive_the_backstop` | J | https://github.com/rrnewton/hermit/issues/4929 | output showing `long: backstop events\n  left: 0\n right: 1` | failing (known gap) |
 
 ## Run history
 

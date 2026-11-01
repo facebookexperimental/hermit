@@ -990,7 +990,9 @@ mod tests {
             // Shard 2 then grows to 293 (61 + 293 + 361): 715.
             // The DBT robust-futex #[ignore] (issue 5023) drops shard 3
             // to 360 (61 + 293 + 360): 714.
-            assert_eq!(population, 714);
+            // The runtime_private maps/smaps #[ignore]s (same issue) drop
+            // shard 3 to 358 (61 + 293 + 358): 712.
+            assert_eq!(population, 712);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

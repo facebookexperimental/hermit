@@ -2823,12 +2823,14 @@ fn sysfs_hwmon_input_is_deterministic_when_available() {
 
 #[cfg(feature = "dbt")]
 #[test]
+#[ignore = "DBT guests hang under --verify on the register-translation assertion at reverie-dbt/src/lib.rs:1267 since the item-5 caller stack (https://github.com/rrnewton/hermit/issues/5023); deselected as a named loss 2026-10-31, still in the nightly sweep"]
 fn runtime_private_maps_keep_the_opened_targets_guest_mapping() {
     runtime_private_mapping_target_check(false);
 }
 
 #[cfg(feature = "dbt")]
 #[test]
+#[ignore = "DBT guests hang under --verify on the register-translation assertion at reverie-dbt/src/lib.rs:1267 since the item-5 caller stack (https://github.com/rrnewton/hermit/issues/5023); deselected as a named loss 2026-10-31, still in the nightly sweep"]
 fn runtime_private_smaps_keep_the_opened_targets_guest_mapping() {
     runtime_private_mapping_target_check(true);
 }
