@@ -90,7 +90,7 @@ Each row below is a test that a validation node runs and expects to FAIL on its 
 | --- | --- | --- | --- | --- |
 | `itimer_a_private_descriptor_table_consumer_re_arms` | D | https://github.com/rrnewton/hermit/issues/4929 | output showing `"privfd" "5000"\nstatus: exit status: 122\nstdout:\n\nstderr:` | failing (known gap) |
 | `itimer_a_sigsuspend_loop_takes_every_expiry` | C | https://github.com/rrnewton/hermit/issues/4929 | output showing `failed: deliveries=` | failing (known gap) |
-| `itimer_a_wait_mask_is_withdrawn_when_the_wait_returns` | H | https://github.com/rrnewton/hermit/issues/4929 | output showing `"stale" "ppoll_mask"\nstatus: exit status: 122` | failing (known gap) |
+| `itimer_a_wait_mask_is_withdrawn_when_the_wait_returns` | F' | https://github.com/rrnewton/hermit/issues/4929 | output showing `"stale" "ppoll_mask"\nstatus: exit status: 122` | failing (known gap) |
 | `itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue` | E | https://github.com/rrnewton/hermit/issues/4929 | output showing `failed: ignored_remaining_us=` | failing (known gap) |
 | `itimer_generation_discard_follows_the_wait_mask` | E+F' | https://github.com/rrnewton/hermit/issues/4929 | output showing `failed: poll: result=0 first_us=` | failing (known gap) |
 | `itimer_mixed_masks_keep_the_timer_running` | G | https://github.com/rrnewton/hermit/issues/4929 | output showing `\npositive=<N> samples=20 progress=<N>\n\nnote: run with` | failing (known gap) |

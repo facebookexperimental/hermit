@@ -1397,7 +1397,7 @@ mod tests {
         // the five lettered rows of issue 4929 remain, plus the batch-28
         // gaps (H, J) deselected 2026-10-31 under the approval recorded on
         // issue 4929 (I was promoted back out at bf80a560a9's validate, J by
-        // the rest of T2's Hermit half).
+        // the rest of T2's Hermit half, and H is that issue's gap F').
         assert_eq!(rows.len(), 6);
         for row in &rows {
             let issue = if row.gap.starts_with("T2") {
