@@ -3123,7 +3123,18 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=bca5399182dae3dc22ac959e3873e44be9271a69
+# CARRY TO 1c22faddc3d240837d2d13ab3cadd9bb7b1dfe05 (2026-11-01): from bca5399182dae3dc22ac959e3873e44be9271a69.
+# bca53991..2c42eca3 is three commits: c5c58265 (LinuxEmu answers
+# pkey_alloc, pkey_free and pkey_mprotect as Linux does on a CPU without
+# protection keys), a63aaed1 (LinuxEmu's mprotect makes Linux's checks in
+# Linux's order and accepts PROT_SEM, with more protection-key tests) and
+# 2c42eca3 (mprotect with one grows flag finds its mapping wherever the
+# range lies, past the end of the arena or a window, as Linux does).
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+expected_pin=1c22faddc3d240837d2d13ab3cadd9bb7b1dfe05
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

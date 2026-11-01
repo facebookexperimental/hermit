@@ -3862,8 +3862,8 @@ fn failure_proves_outputs_unwritten(result: &Result<i64, Error>) -> bool {
 ///   only `PROT_EXEC` the kernel's execute-only key, a page Detcore's
 ///   write-back refuses anyway, and Linux resets that key when the mapping
 ///   leaves execute-only protection, arch/x86/mm/pkeys.c);
-/// - it returned ENOSYS: it never ran (a backend without protection keys,
-///   KVM's LinuxEmu, answers every pkey_mprotect so);
+/// - it returned ENOSYS: it never ran (a backend that refuses the
+///   protection-key calls answers every pkey_mprotect so);
 /// - `len` is 0: Linux returns 0 or EINVAL having changed nothing;
 /// - it failed, and its arguments are ones `do_mprotect_pkey` refuses before
 ///   it takes the mmap lock, so before it changes any mapping: both

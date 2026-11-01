@@ -14055,16 +14055,18 @@ test:
     modes:
       verify:
         ci: true
-        # KVM qualified 2026-10-30: 21 of 21 canonical strict verify pairs (bitwise parity,
-        # 190 INFO records each side); stdout identical to ptrace's.
+        # KVM re-qualified 2026-11-01, once LinuxEmu answers the protection-key calls as Linux
+        # does on a CPU without protection keys, as the KVM vCPU is (pkey_alloc EINVAL here):
+        # 21 of 21 canonical strict verify pairs (bitwise parity, 190 INFO records each side);
+        # stdout identical to ptrace's.
         backends_enabled:
           - ptrace
           - sabre
           - dbt
+          - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          kvm: Deselected from the blocking validate on 2026-10-31 (owner deselect-and-fix-forward rule); KVM refuses pkey_alloc by name instead of answering it as x86 without OSPKE does, so the run aborts before the inotify checks (https://github.com/rrnewton/hermit/issues/5024). The cell stays in the nightly sweep; this is a recorded loss, not a pass.
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -14282,7 +14284,7 @@ test:
           - sabre
           - dbt
         backends_disabled:
-          kvm: "NAMED REFUSAL: LinuxEmu has no protection keys. Its ENOSYS for pkey_alloc carries the typed refusal ProtectionKeys, which Detcore turns into a fail-closed policy refusal that ends the run (exit 122)"
+          kvm: "The KVM vCPU has no protection keys (CR4.PKE clear), so LinuxEmu answers pkey_alloc as Linux does on such a CPU (EINVAL, then ENOSPC); this guest needs a key, so it stops (exit 9), where a native host with protection keys allocates one"
           liteinst: The in-guest runtime refuses protection keys (pkey_alloc answers EOPNOTSUPP)
           in-guest-trap: The in-guest runtime runs the guest's syscalls with its own protection-key rights, so a read into a page a key keeps the guest from writing is copied anyway (all 12 bytes changed, where Linux changes none)
       naked:
@@ -14326,7 +14328,7 @@ test:
           - sabre
           - dbt
         backends_disabled:
-          kvm: LinuxEmu has no protection keys; with --allow-unsupported-syscalls the guest gets pkey_alloc's ENOSYS, and the refusal is only logged
+          kvm: The KVM vCPU has no protection keys (CR4.PKE clear), so pkey_alloc fails as Linux's does on such a CPU (EINVAL, then ENOSPC), and this guest, which needs a key, stops (exit 9)
           liteinst: The in-guest runtime refuses protection keys (pkey_alloc answers EOPNOTSUPP)
           in-guest-trap: The in-guest runtime runs the guest's syscalls with its own protection-key rights, so a read into a page a key keeps the guest from writing is copied anyway (all 12 bytes changed, where Linux changes none)
   - id: c-programs/inotify-received-descriptor
