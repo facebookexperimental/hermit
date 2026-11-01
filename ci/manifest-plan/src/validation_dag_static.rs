@@ -4762,7 +4762,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and run_kvm_a_second_path_past_another_process_cmdline_is_refused_by_name
     // and run_kvm_argument_errors_on_another_process_procfs_answer_as_linux
     // (the KVM named refusals): 105 + 3 = 108 (107 run_kvm_), listed.
-    ("privileged-test.cli_kvm", 108),
+    // And the two https://github.com/rrnewton/reverie/issues/1225 tests
+    // (finite-RLIMIT_AS launch refusal, host-refused exec): 108 + 2 = 110.
+    // And package K slice K8-h's fdinfo and /proc/locks rendering tests
+    // (https://github.com/rrnewton/hermit/issues/4213): 110 + 2 = 112
+    // (112 run_kvm_ identities, the chaos spinner excluded, plus the
+    // named setup test), listed.
+    ("privileged-test.cli_kvm", 112),
     // The required tests of hermit-cli/tests/deadline_slice_cap.rs on KVM: the
     // suite's 42 tests less the 20 rows of its known-gap ledger
     // (hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv), measured on Hermit
@@ -5151,7 +5157,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two SCM_RIGHTS queue KVM tests (https://github.com/rrnewton/hermit/issues/4930): 103 + 2 = 105, listed.
     // And the masked-ppoll pending-signal, two-path cmdline refusal and procfs argument-error KVM
     // tests (the KVM named refusals): 105 + 3 = 108, listed.
-    ("privileged-only-test.cli_kvm", 108),
+    // And the two https://github.com/rrnewton/reverie/issues/1225 tests:
+    // 108 + 2 = 110, listed. And package K slice K8-h's fdinfo and
+    // /proc/locks rendering tests: 110 + 2 = 112, listed.
+    ("privileged-only-test.cli_kvm", 112),
     ("privileged-only-test.pmu_buck_chaos_cases_on_host", 6),
     // And the KVM unreadable futex word test: 56.
     // And run_kvm_a_parked_sleep_carries_the_deadline_cap: 57.

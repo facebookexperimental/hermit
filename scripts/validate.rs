@@ -14562,10 +14562,13 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         .find(|step| step.tag() == "e2e.manifest_compat")
         .cloned()
         .ok_or("strict-compat bucket: e2e.manifest_compat is absent")?;
+    // The host compatprep.fixtures step is retired from full/portable
+    // whenever its pinned twin exists (issue 4997, one writer), so the
+    // preparation node in the full plan is the pinned one.
     let prep = first
         .steps
         .iter()
-        .find(|step| step.tag() == "compatprep.fixtures")
+        .find(|step| step.tag() == "compatprep.fixtures_in_pinned_root")
         .ok_or("strict-compat bucket: fixture-preparation node is absent")?;
     let selector = format!(
         "target/debug/test-harness run --lane portable --category compat {}",
@@ -14597,10 +14600,10 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     // extracted from validate.sh, the 25 of
     // https://github.com/rrnewton/hermit/issues/4269, less the 4 heavy rows
     // the super run type runs (218 - 4), less the logger and pkg-config
-    // rows deselected with the pinned-image move (214 - 2), less the
-    // cargo and gcov rows deselected 2026-10-31 (212 - 2;
-    // <https://github.com/rrnewton/hermit/issues/4997>).
-    let expected = 210;
+    // rows deselected with the pinned-image move (214 - 2). The cargo and
+    // gcov rows deselected 2026-10-31 under issue 4997 came back the same
+    // day once the fixture race was fixed (271ec81bd4).
+    let expected = 212;
     if rows.len() != expected {
         return Err(format!(
             "strict-compat bucket: compat.yaml has {} CI rows; the full run has {expected}",
@@ -14660,23 +14663,22 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     }
     canonicalizing_compat_operand_bracket(root)?;
     let workload = root.join("tests/compat/real_compat_workload.sh");
-    // The cargo row was deselected 2026-10-31
-    // (<https://github.com/rrnewton/hermit/issues/4997>); df keeps the
-    // fixture/tool contract check.
-    let df_argv = rows
-        .get("df")
-        .ok_or("strict-compat bucket: fixture-backed row df is absent")?;
-    let df_want: [&OsStr; 5] = [
-        "env".as_ref(),
-        "REAL_COMPAT_FIXTURES=/run-state/strict-compat/real-compat-fixtures".as_ref(),
-        "bash".as_ref(),
-        workload.as_os_str(),
-        "df".as_ref(),
-    ];
-    if df_argv.as_slice() != df_want {
-        return Err(format!(
-            "strict-compat bucket: df does not use its explicit fixture/tool contract: {df_argv:?}"
-        ));
+    for label in ["cargo", "df"] {
+        let argv = rows
+            .get(label)
+            .ok_or_else(|| format!("strict-compat bucket: fixture-backed row {label} is absent"))?;
+        let want: [&OsStr; 5] = [
+            "env".as_ref(),
+            "REAL_COMPAT_FIXTURES=/run-state/strict-compat/real-compat-fixtures".as_ref(),
+            "bash".as_ref(),
+            workload.as_os_str(),
+            label.as_ref(),
+        ];
+        if argv.as_slice() != want {
+            return Err(format!(
+                "strict-compat bucket: {label} does not use its explicit fixture/tool contract: {argv:?}"
+            ));
+        }
     }
     for (label, path) in [
         ("seq", "/run-state/strict-compat/real-compat-fixtures"),
@@ -14753,6 +14755,10 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         ));
     }
     let mut execution_prep = prep.clone();
+    // The bracket's stand-in keeps the retired host step's tag: the two
+    // observed steps below depend on "compatprep.fixtures" by that name.
+    execution_prep.group = "compatprep".into();
+    execution_prep.job = "fixtures".into();
     execution_prep.deps.clear();
     execution_prep.cmd = "true".into();
     execution_prep.timeout = 10;
@@ -20003,12 +20009,13 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // (https://github.com/rrnewton/hermit/issues/4930): 105 selected. And
         // run_kvm_refuses_a_finite_soft_address_space_limit_before_the_guest_starts
         // and run_kvm_an_exec_the_host_refuses_memory_for_is_a_policy_refusal_not_a_guest_enomem
-        // (https://github.com/rrnewton/reverie/issues/1225): 107 selected. And
+        // (https://github.com/rrnewton/reverie/issues/1225): 110 selected
+        // (with the KVM named refusals' three: 105 + 3 + 2). And
         // package K slice K8-h's
         // run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences and
         // run_kvm_renders_proc_locks_from_the_lock_ledger
-        // (https://github.com/rrnewton/hermit/issues/4213): 109 selected.
-        ("privileged-only-test.cli_kvm", 109usize),
+        // (https://github.com/rrnewton/hermit/issues/4213): 112 selected.
+        ("privileged-only-test.cli_kvm", 112usize),
     ] {
         let step = privileged
             .steps
