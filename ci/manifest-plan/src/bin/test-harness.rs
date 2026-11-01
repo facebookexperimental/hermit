@@ -8443,13 +8443,13 @@ sys.exit(1 if failed else 0)
         // and gcov cells deselected 2026-10-31 under issue 4997 came back
         // the same day once the fixture race was fixed (271ec81bd4), so
         // they are reported again and add nothing here.
-        // 10 + 2 since the sysfs verify cells were deselected in the
+        // 10 + 2 while the sysfs verify cells were deselected in the
         // hermetic image as a named loss (empty /sys until Detcore serves
         // a rendered sysfs,
-        // https://github.com/rrnewton/hermit/issues/5015): their DBT and
-        // KVM parity cells stay applicable in the census but no full node
-        // reports them.
-        assert_eq!(unreported.len(), 12, "{unreported:?}");
+        // https://github.com/rrnewton/hermit/issues/5015); the
+        // pinned-root conversion restored them, so their DBT and KVM
+        // parity cells are reported again and add nothing here.
+        assert_eq!(unreported.len(), 10, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))

@@ -71,20 +71,31 @@ const COLLISION_RENAMES: &[(&str, &str)] = &[(
 ///   GitHub-hosted runners lack; hosted run
 ///   <https://github.com/rrnewton/hermit/actions/runs/36485831200> failed it
 ///   with "hwmon has no readable sanitized leaf". Its two verify cells moved
-///   from the portable lane to the privileged lane, and were then deselected
-///   in the hermetic image as a named loss (empty /sys until Detcore serves
-///   a rendered sysfs,
-///   https://github.com/rrnewton/hermit/issues/5015), so they are now absent
-///   from the committed plan in both lanes.
-const LATER_LANE_MOVES: &[(&str, &str, &str, &str, &str)] = &[];
+///   from the portable lane to the privileged lane. They were briefly
+///   deselected as a named image-mode loss (issue 5015) while the bucket
+///   ran via hermit --image; the pinned-root conversion restored them in
+///   the privileged lane, so the move assertion applies again.
+const LATER_LANE_MOVES: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "system-utils/sysfs-sanitized-prefixes",
+        "kvm",
+        "verify",
+        "portable",
+        "privileged",
+    ),
+    (
+        "system-utils/sysfs-sanitized-prefixes",
+        "ptrace",
+        "verify",
+        "portable",
+        "privileged",
+    ),
+];
 
 /// Verify cells deselected as a named loss, as (test, backend, mode): the
 /// committed plan must contain them in neither lane until the named blocker
 /// is fixed.
-const NAMED_LOSS_VERIFY_CELLS: &[(&str, &str, &str)] = &[
-    ("system-utils/sysfs-sanitized-prefixes", "kvm", "verify"),
-    ("system-utils/sysfs-sanitized-prefixes", "ptrace", "verify"),
-];
+const NAMED_LOSS_VERIFY_CELLS: &[(&str, &str, &str)] = &[];
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -539,22 +550,21 @@ fn every_manifest_node_with_a_dbt_cell_orders_after_the_dbt_runtime_abi_check() 
             "e2e.manifest_determinism_stress_c".to_string(),
             "e2e.manifest_language_runtimes".to_string(),
             "e2e.manifest_shared_futex_c".to_string(),
+            "e2e.manifest_system_utils".to_string(),
             "e2e.manifest_util_c".to_string(),
             "privileged-e2e.manifest_applications".to_string(),
             "privileged-e2e.manifest_c_programs".to_string(),
+            "privileged-e2e.manifest_system_utils".to_string(),
         ])
     );
     // This counted integration target runs real DBT cases outside the
     // manifest buckets, so it must also wait for the same ABI check.
     let mut expected_dependents = needs;
-    // Both system-utils buckets keep their ABI ordering even though
-    // their DBT verify cells are currently deselected as named losses:
-    // the privileged bucket's sysfs cells as an image-mode loss
-    // (https://github.com/rrnewton/hermit/issues/5015) and the portable
-    // bucket's DBT cells because hermit --image qualifies only ptrace
-    // and kvm (https://github.com/rrnewton/hermit/issues/5030). When
-    // they are re-enabled they join `needs` again without a DAG change.
-    expected_dependents.insert("e2e.manifest_system_utils".to_string());
+    // The privileged system-utils bucket keeps its ABI ordering even
+    // though its only DBT cells (the sysfs verify cells) are currently
+    // ci-disabled as a named image-mode loss
+    // (https://github.com/rrnewton/hermit/issues/5015); when they are
+    // re-enabled it joins `needs` again without a DAG change.
     expected_dependents.insert("privileged-e2e.manifest_system_utils".to_string());
     expected_dependents.insert("test.inherited_terminal_read".to_string());
     // So does the isolation matrix node that runs the DBT cells.
