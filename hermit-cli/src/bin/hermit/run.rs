@@ -10786,9 +10786,10 @@ impl RunOpts {
         if self.image.is_some() && self.namespace_only {
             anyhow::bail!("--image cannot be combined with --namespace-only");
         }
-        if self.image.is_some() && (!self.mount.is_empty() || !self.bind.is_empty()) {
+        if self.image.is_some() && !self.mount.is_empty() {
             anyhow::bail!(
-                "--image does not yet compose with custom --mount/--bind targets inside the OCI rootfs"
+                "--image does not yet compose with custom --mount targets inside the OCI rootfs; \
+                 use --bind <HOST-DIR>:<GUEST-DIR> for a work directory"
             );
         }
 
@@ -12296,6 +12297,20 @@ impl RunOpts {
                     requested
                 };
             let guest_abs = resolve_image_guest_program(requested, &guest_cwd)?;
+            // A program under a --bind target lives in the bind source, not
+            // the rootfs; validate it there.
+            for bind in &self.bind {
+                use std::os::unix::ffi::OsStringExt as _;
+                let target = PathBuf::from(std::ffi::OsString::from_vec(
+                    bind.target.as_bytes().to_vec(),
+                ));
+                if let Ok(rel) = guest_abs.strip_prefix(&target) {
+                    let source = PathBuf::from(std::ffi::OsString::from_vec(
+                        bind.source.as_bytes().to_vec(),
+                    ));
+                    return validate_executable(&source.join(rel), &guest_abs, None);
+                }
+            }
             // Resolve chroot-aware: images (nixos/nix especially) expose
             // `/bin/sh` as a symlink to an absolute `/nix/store/...` target that
             // only resolves under the image root, so a naive host `stat` would
@@ -14044,6 +14059,25 @@ impl RunOpts {
         );
         if let Some(image) = &self.image {
             let rootfs = crate::image::materialize_rootfs(image)?;
+            let workdir_binds: Vec<(PathBuf, PathBuf)> = self
+                .bind
+                .iter()
+                .map(|bind| {
+                    use std::os::unix::ffi::OsStringExt as _;
+                    (
+                        PathBuf::from(std::ffi::OsString::from_vec(
+                            bind.source.as_bytes().to_vec(),
+                        )),
+                        PathBuf::from(std::ffi::OsString::from_vec(
+                            bind.target.as_bytes().to_vec(),
+                        )),
+                    )
+                })
+                .collect();
+            for (_, target) in &workdir_binds {
+                let rel = target.strip_prefix("/").unwrap_or(target);
+                let _ = std::fs::create_dir_all(rootfs.join(rel));
+            }
             let (mut container, identity_sources) = image_container(
                 &rootfs,
                 tmpfs,
@@ -14051,7 +14085,10 @@ impl RunOpts {
                 self.det_opts.det_config.cpu_profile_source,
                 self.tmp.is_none(),
                 mounts_placeholder,
-                self.runtime_backend() == Backend::Kvm,
+                crate::container::ImageContainerOpts {
+                    bind_kvm: self.runtime_backend() == Backend::Kvm,
+                    workdir_binds: &workdir_binds,
+                },
             )?;
             self.network
                 .configure(&mut container, self.analyze_networking);

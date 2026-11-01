@@ -1546,6 +1546,12 @@ pub(super) fn container_proc_mount() -> Mount {
 /// The CLI enables this for the ptrace and KVM backends. Other backends
 /// have distinct launch/runtime-file requirements and must be qualified before
 /// they can safely share this filesystem setup.
+/// Backend/device and caller-bind choices for [`image_container`].
+pub(super) struct ImageContainerOpts<'a> {
+    pub bind_kvm: bool,
+    pub workdir_binds: &'a [(PathBuf, PathBuf)],
+}
+
 pub(super) fn image_container(
     rootfs: &Path,
     tmpfs: &Path,
@@ -1553,7 +1559,7 @@ pub(super) fn image_container(
     cpu_profile_source: Option<usize>,
     private_tmp: bool,
     placeholder: bool,
-    bind_kvm: bool,
+    opts: ImageContainerOpts<'_>,
 ) -> Result<(Container, IdentityGuard), Error> {
     let mut container = Container::new();
     container
@@ -1578,6 +1584,13 @@ pub(super) fn image_container(
     // run failed at spawn under such a cache.
     container.mount(Mount::bind(rootfs, rootfs).readonly());
     container.mount(Mount::bind(tmpfs, rootfs.join("tmp")).rshared());
+    // Caller work directories (--bind HOST:GUEST with --image): bound after
+    // the read-only root so the guest can read/write its test workdir while
+    // the image itself stays immutable. Targets are guest-absolute paths.
+    for (source, target) in opts.workdir_binds {
+        let rel = target.strip_prefix("/").unwrap_or(target);
+        container.mount(Mount::bind(source, rootfs.join(rel)));
+    }
 
     // Mount the deterministic /proc into the target root. The materializer
     // guarantees <rootfs>/proc exists, so we do not need `touch_target()` (which
@@ -1630,7 +1643,7 @@ pub(super) fn image_container(
     // The KVM backend's VMM process opens /dev/kvm after chroot, so the host
     // device must be bound inside the root for that backend only. Other
     // backends keep the materializer's empty placeholder file.
-    if bind_kvm {
+    if opts.bind_kvm {
         container.mount(Mount::bind(
             Path::new("/dev/kvm"),
             rootfs.join("dev").join("kvm"),
@@ -6232,9 +6245,19 @@ mod tests {
         let (mounts, status) = Container::new()
             .checked_run(|| {
                 readonly_proc::deny_writable_mounts().map_err(|error| error.to_string())?;
-                let (mut container, _identity) =
-                    image_container(rootfs.path(), tmpfs.path(), false, None, true, true, false)
-                        .map_err(|error| error.to_string())?;
+                let (mut container, _identity) = image_container(
+                    rootfs.path(),
+                    tmpfs.path(),
+                    false,
+                    None,
+                    true,
+                    true,
+                    ImageContainerOpts {
+                        bind_kvm: false,
+                        workdir_binds: &[],
+                    },
+                )
+                .map_err(|error| error.to_string())?;
                 // This closure is already loaded, so the image needs no executable
                 // or libraries. It reads the proc mount after entering the chroot.
                 container
@@ -6292,9 +6315,19 @@ mod tests {
                     File::create(rootfs.join("dev").join(node)).map_err(|e| e.to_string())?;
                 }
                 fs::create_dir(&tmpfs).map_err(|e| e.to_string())?;
-                let (mut container, _identity) =
-                    image_container(&rootfs, &tmpfs, false, None, true, true, false)
-                        .map_err(|error| error.to_string())?;
+                let (mut container, _identity) = image_container(
+                    &rootfs,
+                    &tmpfs,
+                    false,
+                    None,
+                    true,
+                    true,
+                    ImageContainerOpts {
+                        bind_kvm: false,
+                        workdir_binds: &[],
+                    },
+                )
+                .map_err(|error| error.to_string())?;
                 container
                     .checked_run(root_mount_flags)
                     .map_err(|error| format!("{error:?}"))?
@@ -6791,7 +6824,10 @@ mod tests {
             None,
             true,
             true,
-            false,
+            ImageContainerOpts {
+                bind_kvm: false,
+                workdir_binds: &[],
+            },
         )
         .expect("construct image container with generated tmp");
         assert_eq!(generated.mountinfo_roots.len(), 1);
@@ -6803,7 +6839,10 @@ mod tests {
             None,
             false,
             true,
-            false,
+            ImageContainerOpts {
+                bind_kvm: false,
+                workdir_binds: &[],
+            },
         )
         .expect("construct image container with user tmp");
         assert!(supplied.mountinfo_roots.is_empty());
