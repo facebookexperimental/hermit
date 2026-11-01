@@ -254,6 +254,20 @@ const LONE_BACKSTOP_CPU_SECONDS: u64 = 34;
 // stays the profile's 57 seconds.
 const SIGNAL_PERMITS_WRAPPER_NAME: &str = "hermit-signal-permits-cpu";
 const SIGNAL_PERMITS_CPU_SECONDS: u64 = 34;
+// hermit-run::cli another_processs_io_reads_with_a_full_descriptor_table_on_every_backend
+// runs five `run --strict --verify --verify-strict` legs (ptrace, sabre,
+// liteinst, in-guest-trap, e9patch), each running the guest twice. CALIBRATION
+// 2026-11-01 (coordinator-approved stopgap, not a root-cause fix): measured
+// alone in the pinned root at Hermit 8a9d035ec7 it completes at 11.20 s wall
+// and 11.19 CPU s (4.39 user, 6.80 sys), and every leg passes alone at
+// bitwise parity. In four consecutive full validates (three at 8a9d035ec7,
+// one at d192e5d72) it was stopped by the ordinary 22-second cap at 23.2,
+// 23.6, 23.6 and 24.1 s wall, at host loads from 21 to 123, serial group or
+// not: about 3x its solo cost, spent inside its own Hermit legs. The cause
+// is not yet known (tracked in the Hermit issue filed with this change).
+// ceil(1.5 * 24.1) = 36. Wall stays the profile's 57 seconds.
+const FULL_TABLE_IO_WRAPPER_NAME: &str = "hermit-full-table-io-cpu";
+const FULL_TABLE_IO_CPU_SECONDS: u64 = 36;
 const CPU_TERMINATION_GRACE_SECONDS: u64 = 2;
 
 #[derive(Clone, Copy)]
@@ -288,7 +302,7 @@ impl MeasuredCpuAllowance {
     }
 }
 
-const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
+const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_ALLOCATOR_WRAPPER_NAME,
         package: "hermit-run",
@@ -504,6 +518,14 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         binary: "hermit-run::cli",
         test: "run_ptrace_signal_permits_are_per_thread",
         cpu_seconds: SIGNAL_PERMITS_CPU_SECONDS,
+        wall_seconds: None,
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: FULL_TABLE_IO_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "another_processs_io_reads_with_a_full_descriptor_table_on_every_backend",
+        cpu_seconds: FULL_TABLE_IO_CPU_SECONDS,
         wall_seconds: None,
     },
 ];
@@ -2510,12 +2532,12 @@ mod tests {
             "package(=hermit-run) & binary_id(=hermit-run::cli) & test(=detcore_renders_its_procfs_files_on_dbt_as_on_ptrace)",
             "package(=hermit-run) & binary_id(=hermit-run::liteinst_stacks) & test(=genuine_detcore_reaches_fixed_guarded_callback_and_altstack)",
         ];
-        for mask in 0..(1 << names.len()) {
+        for mask in 0..(1u64 << names.len()) {
             let identities = MEASURED_CPU_ALLOWANCES
                 .iter()
                 .enumerate()
                 .rev()
-                .filter(|(index, _)| mask & (1 << index) != 0)
+                .filter(|(index, _)| mask & (1u64 << index) != 0)
                 .map(|(_, allowance)| allowance.identity())
                 .collect::<Vec<_>>();
             let bytes = serde_json::to_vec(&measured_inventory(&identities)).unwrap();
@@ -2741,7 +2763,7 @@ mod tests {
             prepared_selected_cpu_allowances(true, || Ok(serde_json::to_vec(&inventory).unwrap()))
                 .unwrap();
         assert_eq!(selected.len(), 15);
-        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 32);
+        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 33);
         for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5), (0.01, 0.1)] {
             let rendered = scaled_config_with_allowances(
                 include_str!("../.config/nextest.toml"),
