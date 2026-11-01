@@ -190,6 +190,15 @@ class RegistrationAuditTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ci-registered=2", result.stdout)
 
+    def test_kvm_gap_ledger_run_registers_a_binary(self) -> None:
+        result = self._plant_probe_with_dag_command(
+            "./ci/kvm-gap-ledger.rs run -- ${CI:+--profile ci} -p hermit-run "
+            "--features third-party-backends,kvm-execution-tests --test zz_probe",
+            declared=["zz_probe"],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ci-registered=2", result.stdout)
+
     def test_nextest_no_run_does_not_register_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(
             "cargo nextest run -p hermit-run --test zz_probe --no-run",

@@ -7326,8 +7326,11 @@ mod e2e_runner_tests {
                 assert!(dropped.contains(cargo_tag), "{tag} replaces nothing");
             }
         }
-        assert_eq!(dropped.len(), 22, "{dropped:?}");
-        assert_eq!(buck_tags.len(), cargo_tags.len() - 22 + 19);
+        // 21 dropped since the host compatprep.fixtures step retired from
+        // full (issue 4997, one writer): the Cargo full plan no longer
+        // carries it for the Buck plan to drop. 22 before.
+        assert_eq!(dropped.len(), 21, "{dropped:?}");
+        assert_eq!(buck_tags.len(), cargo_tags.len() - 21 + 19);
         assert_eq!(buck.profile, "full");
         assert_eq!(buck.selection_mode, "full");
         assert!(buck.suite_complete);
@@ -18749,7 +18752,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "107");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "112");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -18853,13 +18856,15 @@ mod nextest_timeout_tests {
         // (https://github.com/rrnewton/hermit/issues/4213): 109.
         // The spinner is retained but ignored and excluded because its explicit
         // maximum requests an unavailable timer: 106 selected CLI tests remain.
+        // Recount at 4e916633ca: the source holds 112 declarations (the chain
+        // above undercounts three added without moving it), 111 selected.
         assert_eq!(
             names.len(),
-            109,
+            112,
             "update the exact CI inventory with new KVM tests"
         );
         names.retain(|name| name != excluded);
-        assert_eq!(names.len(), 108);
+        assert_eq!(names.len(), 111);
         let required_cases = [
             "run_kvm_self_sigkill_from_nonleader_is_group_fatal",
             "run_kvm_synchronous_root_segv_preserves_guest_exit",
@@ -33894,16 +33899,17 @@ mod shared_consumer_tests {
         )
         .unwrap();
         let selected_tags: BTreeSet<String> = selected.steps.iter().map(Step::tag).collect();
-        for tag in [
-            "privileged-test.pmu_cli_cases",
-            "privileged-test.pmu_chaos_cli_cases",
-        ] {
-            assert!(selected_tags.contains(tag), "missing {tag}");
-        }
+        // The PMU CLI cases share the `cli` binary, so the shared-population
+        // expansion pulls them in; the PMU chaos cases left this population
+        // for the `hermit_modes` binary (privileged-test.pmu_buck_chaos_cases).
+        assert!(
+            selected_tags.contains("privileged-test.pmu_cli_cases"),
+            "missing privileged-test.pmu_cli_cases"
+        );
         let chaos = full
             .steps
             .iter()
-            .find(|step| step.tag() == "privileged-test.pmu_chaos_cli_cases")
+            .find(|step| step.tag() == "privileged-test.pmu_cli_cases")
             .unwrap();
         for dependency in &chaos.deps {
             assert!(selected_tags.contains(dependency), "missing {dependency}");
@@ -33924,7 +33930,7 @@ mod shared_consumer_tests {
         assert!(!portable
             .steps
             .iter()
-            .any(|step| step.tag() == "privileged-test.pmu_chaos_cli_cases"));
+            .any(|step| step.tag() == "privileged-test.pmu_buck_chaos_cases"));
         assert_committed_shared_integration_test_serialization(&full.steps, &full.resource_caps)
             .unwrap();
         let isolated = full

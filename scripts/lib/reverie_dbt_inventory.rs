@@ -16,4 +16,7 @@
 /// `git ls-files -- reverie-dbt` in the pinned Reverie checkout lists this
 /// many files. Reverie 78e3cadac76b added
 /// reverie-dbt/src/caller_runtime/tests/facility_admission.rs: 1044 + 1.
-pub const REVERIE_DBT_FILES: usize = 1045;
+/// The DBT caller stack (Reverie 10e2e5c389) added
+/// reverie-dbt/tests/caller_thread_start_tail.rs and
+/// reverie-dbt/tests/fixtures/thread-start-tail-entry.S: 1045 + 2.
+pub const REVERIE_DBT_FILES: usize = 1047;

@@ -5090,23 +5090,16 @@ fn a_run_draw_picks_the_maximum_and_a_replay_takes_the_recorded_one() {
         error.contains("--chaos-timeslice-draw=run") && error.contains("usable PMU"),
         "{error}"
     );
-    for backend in ["--backend=dbt", "--backend=kvm"] {
-        let mut unavailable = run_opts_for(&["hermit", backend, "run", "--chaos", run, "prog"]);
-        let error = format!(
-            "{:#}",
-            unavailable
-                .validate_args_with_perf_support(true)
-                .unwrap_err()
-        );
-        assert!(
-            error.contains("unsupported_preemption"),
-            "{backend}: {error}"
-        );
-        assert!(
-            error.contains("--chaos-timeslice-draw=run"),
-            "{backend}: {error}"
-        );
-    }
+    // KVM admits the draw since Reverie 9443a6b2; DBT still refuses.
+    let mut unavailable = run_opts_for(&["hermit", "--backend=dbt", "run", "--chaos", run, "prog"]);
+    let error = format!(
+        "{:#}",
+        unavailable
+            .validate_args_with_perf_support(true)
+            .unwrap_err()
+    );
+    assert!(error.contains("unsupported_preemption"), "{error}");
+    assert!(error.contains("--chaos-timeslice-draw=run"), "{error}");
     ro.validate_args_with_perf_support(true).unwrap();
     assert_eq!(
         ro.det_opts.det_config.max_timeslice,
@@ -5604,7 +5597,9 @@ fn run_installs_its_skid_margin() {
 
 #[test]
 fn skid_margin_override_rejects_non_ptrace_backed_backends() {
-    for backend in ["dbt", "kvm", "sabre"] {
+    // KVM delivers preemption timer events since Reverie 9443a6b2, so it
+    // admits --skid-margin like ptrace does.
+    for backend in ["dbt", "sabre"] {
         let mut opts = run_opts_for(&[
             "hermit",
             &format!("--backend={backend}"),
@@ -7636,7 +7631,9 @@ fn a_small_max_timeslice_gets_a_notice() {
         "--max-timeslice=1000",
         "fakeprog",
     ]);
-    assert_eq!(kvm.small_max_timeslice_notice(zen), None);
+    // KVM reads the branch counter since Reverie 9443a6b2, so the notice
+    // applies to it as it does to ptrace.
+    assert!(kvm.small_max_timeslice_notice(zen).is_some());
 }
 
 /// `main`'s branch-counter check: a run without `--strict` on a host whose
@@ -7741,7 +7738,8 @@ fn the_inexact_branch_counter_warning_says_what_may_not_reproduce_and_what_to_do
 
 #[test]
 fn strict_refuses_an_inexact_branch_counter_on_the_pmu_backends() {
-    for backend in ["ptrace", "e9patch"] {
+    // KVM counts retired branches since Reverie 9443a6b2.
+    for backend in ["ptrace", "e9patch", "kvm"] {
         let backend_flag = format!("--backend={backend}");
         let mut options = run_opts_for(&["hermit", &backend_flag, "run", "--strict", "fakeprog"]);
         options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
@@ -7783,7 +7781,7 @@ fn strict_refusal_needs_strict_a_pmu_backend_and_an_inexact_counter() {
         &["hermit", "--backend=ptrace", "run", "--strict", "fakeprog"],
         || None,
     );
-    for backend in ["kvm", "dbt", "sabre"] {
+    for backend in ["dbt", "sabre"] {
         let backend_flag = format!("--backend={backend}");
         check(
             &["hermit", &backend_flag, "run", "--strict", "fakeprog"],
@@ -8250,8 +8248,9 @@ fn only_instrumented_ptrace_family_runs_depend_on_host_perf() {
     let namespace_only = RunOpts::parse_from(["fakehermit", "--namespace-only", "fakeprog"]);
     assert_eq!(namespace_only.selected_backend(), Backend::Ptrace);
     assert!(!namespace_only.arms_reverie_ptrace_pmu_timer());
+    // KVM arms the timer since Reverie 9443a6b2 (its own RCB counter).
     let kvm = run_opts_for(&["hermit", "--backend=kvm", "run", "fakeprog"]);
-    assert!(!kvm.arms_reverie_ptrace_pmu_timer());
+    assert!(kvm.arms_reverie_ptrace_pmu_timer());
     let liteinst = run_opts_for(&["hermit", "--backend=liteinst", "run", "fakeprog"]);
     assert!(!liteinst.arms_reverie_ptrace_pmu_timer());
 }

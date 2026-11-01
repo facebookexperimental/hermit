@@ -3181,7 +3181,7 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// can express, which includes every backend's own constant except for
 /// capabilities added after the legacy form froze: those never enter it, as
 /// `record_host_inputs` does not, and read back as their default. There are
-/// ten. `process_exits_complete_asynchronously` and
+/// eleven. `process_exits_complete_asynchronously` and
 /// `virtualizes_guest_sigalrm` are true only for in-guest LiteInst, which
 /// never travels through this DBT-only form.
 /// `supports_blocked_wait_signal_interruption`,
@@ -3192,7 +3192,10 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// `supports_blocked_wait_signal_interruption` (`kernel_signal_state_is_guests`,
 /// `kernel_signal_targets_are_predictable`,
 /// `host_task_reads_reach_guest_threads`, `host_timed_signals_are_physical`),
-/// false for DBT too.
+/// false for DBT too. `provides_guest_backtraces` reads back as true, the
+/// ptrace value it takes from the starting constant and DBT's value; the
+/// two backends that report false (in-guest LiteInst and KVM) travel
+/// through this form only inside the versioned envelope.
 ///
 /// `cpuid_virtualized_by_backend` supplies no capability either: it said the
 /// backend installed a CPUID policy of its own, which no backend does any
@@ -3482,6 +3485,13 @@ impl LegacyBackendKeys {
         backend.reports_sigreturns = false;
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
+        // Added after the legacy form froze (Reverie 9443a6b2): it reads
+        // back as the starting constant's true, which is also DBT's value,
+        // the form's only reader, so a DBT configuration stays exact. The
+        // two backends that report false (in-guest LiteInst and KVM) are
+        // preserved exactly only by the versioned envelope of
+        // `encode_backend_config_json`, never by these keys.
+        backend.provides_guest_backtraces = true;
         // Added after the legacy form froze (Reverie 1161 made it a `u8`
         // width). The legacy form carries no width for it: by absence it
         // says the bool false, and the minimal width that represents a
@@ -4519,6 +4529,9 @@ mod tests {
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
         backend.reports_sigreturns = false;
+        // Added after the legacy form froze: it reads back as true (see
+        // `LegacyBackendKeys::capabilities`).
+        backend.provides_guest_backtraces = true;
         backend.reports_kernel_child_exit_signals = backend.reports_child_exit_publication;
         // The legacy discover_live_file_metadata bit couples three facts.
         backend.rediscovers_descriptors_after_exec = backend.tool_shares_guest_descriptor_table;
@@ -4588,7 +4601,10 @@ mod tests {
             ),
             ("SABRE", BackendCapabilities::SABRE, true),
             ("DBT", BackendCapabilities::DBT, true),
-            ("KVM", BackendCapabilities::KVM, false),
+            // KVM's `provides_guest_backtraces` is false, which the legacy
+            // form cannot express (it reads back true), so KVM needs the
+            // envelope like the others.
+            ("KVM", BackendCapabilities::KVM, true),
         ] {
             for sequentialize_threads in [false, true] {
                 let sent = Config {

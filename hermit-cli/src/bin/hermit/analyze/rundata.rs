@@ -1920,17 +1920,6 @@ mod tests {
         for (accepted, probe) in [
             (&["hermit", "analyze", "--", "/bin/true"][..], unreachable),
             (
-                &[
-                    "hermit",
-                    "--backend=kvm",
-                    "analyze",
-                    "--",
-                    "--strict",
-                    "/bin/true",
-                ][..],
-                unreachable,
-            ),
-            (
                 &["hermit", "analyze", "--", "--strict", "/bin/true"][..],
                 || None,
             ),
@@ -1939,6 +1928,28 @@ mod tests {
                 .refuse_strict_with_inexact_branch_counter()
                 .unwrap_or_else(|error| panic!("{accepted:?}: {error:#}"));
         }
+        // KVM trials read the branch counter since Reverie 9443a6b2, so a
+        // strict KVM trial on an inexact counter refuses, naming its backend.
+        let error = options(
+            &[
+                "hermit",
+                "--backend=kvm",
+                "analyze",
+                "--",
+                "--strict",
+                "/bin/true",
+            ],
+            inexact,
+        )
+        .refuse_strict_with_inexact_branch_counter()
+        .expect_err("a strict KVM trial on an inexact counter");
+        assert!(
+            error
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("`kvm` backend"), "{error:#}");
     }
 
     /// Without `--strict`, analyze and bisect trials on a counter that fails
@@ -1975,6 +1986,8 @@ mod tests {
         for warned in [
             &["hermit", "analyze", "--", "/bin/true"][..],
             &["hermit", "--backend=ptrace", "analyze", "--", "/bin/true"][..],
+            // KVM reads the counter since Reverie 9443a6b2.
+            &["hermit", "--backend=kvm", "analyze", "--", "/bin/true"][..],
         ] {
             let mut options = options(warned, inexact);
             let (result, lines) = admit(&mut options);
@@ -2008,10 +2021,6 @@ mod tests {
             (
                 &["hermit", "analyze", "--", "/bin/true"][..],
                 (|| None) as fn() -> _,
-            ),
-            (
-                &["hermit", "--backend=kvm", "analyze", "--", "/bin/true"][..],
-                unreachable,
             ),
             (
                 &[
@@ -2637,33 +2646,22 @@ mod tests {
             let workspace = tempfile::tempdir().unwrap();
             options.tmp_dir = Some(workspace.path().to_path_buf());
             let result = RunData::new_baseline(&options, "preemption".to_owned());
-            if maximum == Some("--max-timeslice=200000000") {
-                let error = result.err().expect("explicit maximum must refuse");
-                assert!(
-                    error
-                        .downcast_ref::<crate::container::PolicyRefusal>()
-                        .is_some()
-                );
-                assert!(
-                    format!("{error:#}")
-                        .contains("unsupported_preemption: --backend=kvm refuses --max-timeslice")
-                );
-            } else {
-                assert_eq!(
-                    result
-                        .unwrap()
-                        .runopts
-                        .det_opts
-                        .det_config
-                        .max_timeslice
-                        .map(u64::from),
-                    if maximum.is_none() {
-                        Some(200_000_000)
-                    } else {
-                        None
-                    }
-                );
-            }
+            // KVM delivers preemption timer events since Reverie 9443a6b2,
+            // so the explicit maximum is kept, not refused.
+            assert_eq!(
+                result
+                    .unwrap()
+                    .runopts
+                    .det_opts
+                    .det_config
+                    .max_timeslice
+                    .map(u64::from),
+                if maximum == Some("--max-timeslice=disabled") {
+                    None
+                } else {
+                    Some(200_000_000)
+                }
+            );
         }
     }
 

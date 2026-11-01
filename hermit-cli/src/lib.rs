@@ -9593,8 +9593,9 @@ mod tests {
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "host_timed_signals_are_physical":
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
+            // Reverie 9443a6b2 lets Tools rely on KVM's preemption timer too.
             "delivers_preemption_timer_events":
-                matches!(backend, Backend::Ptrace | Backend::E9patch),
+                matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Kvm),
             "runs_guest_code_between_injections": sabre || in_guest_liteinst,
             "promotes_open_files_before_native_lifecycle": dbt || in_guest_liteinst,
             // Hermit runs e9patch preprocessing as a ptrace run (empty
@@ -9611,6 +9612,11 @@ mod tests {
             } else {
                 0
             },
+            // Reverie 9443a6b2: ptrace unwinds remotely, DBT walks the frame
+            // chain, SaBRe returns the trapped site; KVM and the in-guest
+            // LiteInst runtime never return a stack.
+            "provides_guest_backtraces":
+                matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Sabre | Backend::Dbt),
         })
     }
 
@@ -9883,15 +9889,15 @@ mod tests {
         }
     }
 
-    /// Only ptrace delivers the preemption timer, so only it lets a chaos
-    /// `sched_yield` hand its turn to a thread that may never make a syscall
-    /// (https://github.com/rrnewton/hermit/issues/4068).
+    /// Only ptrace and KVM deliver the preemption timer, so only they let a
+    /// chaos `sched_yield` hand its turn to a thread that may never make a
+    /// syscall (https://github.com/rrnewton/hermit/issues/4068).
     #[test]
     fn backend_timer_delivery_is_explicit() {
         for (backend, delivers) in [
             (Backend::Ptrace, true),
             (Backend::Dbt, false),
-            (Backend::Kvm, false),
+            (Backend::Kvm, true),
             (Backend::Sabre, false),
             (Backend::Liteinst, false),
             (Backend::InGuestTrap, false),

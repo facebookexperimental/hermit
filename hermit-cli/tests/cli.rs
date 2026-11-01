@@ -5823,7 +5823,8 @@ fn backends_without_a_gdbserver_refuse_gdbserver_before_starting_the_guest() {
 #[test]
 fn timerless_backends_refuse_explicit_preemption_before_starting_the_guest() {
     let _guard = hermit_run_guard();
-    for backend in ["dbt", "sabre", "kvm", "liteinst", "in-guest-trap"] {
+    // KVM left the timerless set with Reverie 9443a6b2.
+    for backend in ["dbt", "sabre", "liteinst", "in-guest-trap"] {
         for requested in [
             vec!["--max-timeslice=200000000"],
             vec!["--preemption-timeout=1000"],

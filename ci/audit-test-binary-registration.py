@@ -46,7 +46,8 @@ DAG_GLOB = "ci/dag/*.json"
 # Restrict registration to the hermit-cli package.  A similarly named target in
 # hermit-detcore is not evidence that the hermit-cli binary ran.
 _HERMIT_INVOCATION_RE = re.compile(
-    r"(?:cargo (?:test|nextest run)|\./ci/run-nextest-counted\.sh)"
+    r"(?:cargo (?:test|nextest run)|\./ci/run-nextest-counted\.sh"
+    r"|\./ci/kvm-gap-ledger\.rs run --)"
     r"[^\"\n]*?-p hermit-run(?!-)[^\"\n]*"
 )
 _TEST_FLAG_RE = re.compile(r"--test(?:=|\s+)([A-Za-z0-9_]+)")

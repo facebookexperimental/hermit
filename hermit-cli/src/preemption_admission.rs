@@ -181,12 +181,13 @@ mod tests {
 
     use super::*;
 
-    const TIMERLESS: [Backend; 5] = [
+    // KVM left this set with Reverie 9443a6b2, which delivers preemption
+    // timer events at exact retired-branch counts.
+    const TIMERLESS: [Backend; 4] = [
         Backend::Dbt,
         Backend::Sabre,
         Backend::Liteinst,
         Backend::InGuestTrap,
-        Backend::Kvm,
     ];
 
     #[test]

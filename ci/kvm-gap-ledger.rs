@@ -36,7 +36,7 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "8770d11c9b4b6d439e7807412b41fc7d3595b007" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "381af35f50ffb3d6a7a036894cfa1479508abb73" }
 //! hermit-manifest-plan = { path = "manifest-plan" }
 //! serde_json = "1"
 //! ```
@@ -1393,7 +1393,9 @@ mod tests {
         let declaration =
             known_gaps::declaration_for_node("privileged-test.deadline_slice_cap_kvm").unwrap();
         let (rows, _) = read_declared(&repository(), declaration).unwrap();
-        assert_eq!(rows.len(), 20);
+        // T2 (578b92a6af) promoted the 15 rows of issue 4954 that now pass;
+        // the five lettered rows of issue 4929 remain.
+        assert_eq!(rows.len(), 5);
         for row in &rows {
             let issue = if row.gap.starts_with("T2") {
                 "4954"
@@ -1407,11 +1409,13 @@ mod tests {
                 row.id
             );
         }
+        // The one CpuTimeout row was a T2 row, promoted by 578b92a6af; the
+        // five remaining rows are all ordinary failures.
         assert_eq!(
             rows.iter()
                 .filter(|row| row.outcome == Outcome::CpuTimeout)
                 .count(),
-            1
+            0
         );
     }
 
