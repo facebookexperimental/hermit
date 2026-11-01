@@ -174,6 +174,39 @@ impl ScorecardWriteback {
     }
 }
 
+/// One node in a composite verdict (owner rule, 2026-11-01): red in the
+/// base full run, re-executed in the single targeted rerun.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompositionNodeV1 {
+    pub node: String,
+    pub base_attempts: Option<u64>,
+    pub base_failure_class: Option<String>,
+    pub rerun_attempts: Option<u64>,
+    pub rerun_failure_class: Option<String>,
+    pub rerun_outcome: String,
+}
+
+/// A composite verdict record: a full run at one commit plus exactly one
+/// targeted rerun of its red nodes composed into GREEN_FLAKY (or FAILED
+/// when the rerun stays red). The base run's own record is unchanged;
+/// this record references it, and the original failures stay counted in
+/// the flaky metrics.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompositionV1 {
+    pub schema: String,
+    pub verdict: String,
+    pub commit: String,
+    pub profile: String,
+    pub image_digest: Option<String>,
+    pub base_run_id: String,
+    pub rerun_run_id: String,
+    pub outer_reruns_used: u64,
+    pub nodes_rerun: Vec<CompositionNodeV1>,
+    pub original_failures_kept_in_flaky_metrics: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationServiceResult {
@@ -210,6 +243,10 @@ pub struct ValidationServiceResult {
     /// make the command fail loudly without rewriting a real tree verdict.
     #[serde(default)]
     pub scorecard_writeback: Option<ScorecardWriteback>,
+    /// Composite-verdict record when this receipt is the targeted rerun
+    /// half of a composition, or the composed receipt itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composition: Option<CompositionV1>,
 }
 
 impl ValidationServiceResult {
@@ -244,7 +281,15 @@ impl ValidationServiceResult {
             }
         };
         let actual_fields: BTreeSet<&str> = object.keys().map(String::as_str).collect();
-        if actual_fields != expected_fields {
+        // Schema 6 gained one optional field after first publication:
+        // `composition` (composite-verdict record). A schema-6 receipt
+        // either lacks it or carries exactly it in addition.
+        let with_composition: BTreeSet<&str> = expected_fields
+            .iter()
+            .copied()
+            .chain(["composition"])
+            .collect();
+        if actual_fields != expected_fields && actual_fields != with_composition {
             return Err(format!(
                 "validation-service-result-fields: schema {schema_version} expected {expected_fields:?}, got {actual_fields:?}"
             ));
@@ -512,6 +557,7 @@ mod tests {
             passed_tests: Some(2129),
             diagnostic_failed_tests: Some(0),
             scorecard_writeback: None,
+            composition: None,
         }
         .validated()
         .unwrap()
@@ -628,6 +674,7 @@ mod tests {
                 passed_tests: None,
                 diagnostic_failed_tests: None,
                 scorecard_writeback: None,
+                composition: None,
             }
             .validated()
             .unwrap();
@@ -904,6 +951,41 @@ mod tests {
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&malformed).unwrap())
                 .unwrap_err();
         assert!(error.contains("validation-service-result-shape"), "{error}");
+    }
+
+    #[test]
+    fn composition_record_round_trips_and_stays_explicit() {
+        let mut result = valid();
+        result.final_validate_status = FinalValidateStatus::Failed;
+        result.exit_code = 1;
+        result.composition = Some(CompositionV1 {
+            schema: "composite-verdict/v1".into(),
+            verdict: "GREEN_FLAKY".into(),
+            commit: result.commit.clone(),
+            profile: "full".into(),
+            image_digest: Some("sha256:deadbeef".into()),
+            base_run_id: "validate-base-1".into(),
+            rerun_run_id: "validate-rerun-1".into(),
+            outer_reruns_used: 1,
+            nodes_rerun: vec![CompositionNodeV1 {
+                node: "e2e.manifest_compat".into(),
+                base_attempts: Some(2),
+                base_failure_class: Some("understood_infrastructure_failure".into()),
+                rerun_attempts: Some(1),
+                rerun_failure_class: None,
+                rerun_outcome: "PASS".into(),
+            }],
+            original_failures_kept_in_flaky_metrics: true,
+        });
+        let bytes = serde_json::to_vec(&result).unwrap();
+        let back = ValidationServiceResult::from_json_slice(&bytes)
+            .and_then(|r| r.validated())
+            .unwrap();
+        assert_eq!(back, result);
+        assert_eq!(
+            back.composition.unwrap().nodes_rerun[0].rerun_outcome,
+            "PASS"
+        );
     }
 
     #[test]
