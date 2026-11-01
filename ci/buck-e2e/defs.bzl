@@ -96,6 +96,8 @@ def _route(cell, pmu_on_re, re_exclusions, local_candidates):
     """Returns (where, reason): where is "local" or "re"."""
     if cell.get("category") == "compat":
         return ("local", "compatibility corpus: runs in the pinned root, not on a host or RE worker")
+    if cell.get("category") == "system-utils":
+        return ("local", "system-utils: runs in the pinned root like compat, not on a host or RE worker")
     if cell["backend"] == "kvm":
         return ("local", "kvm backend: RE workers have no /dev/kvm")
     if cell["lane"] == "privileged":
@@ -132,6 +134,8 @@ def _container(cell, where):
         return ("", "")
     if cell.get("category") == "compat":
         return ("pinned-root", "compatibility corpus: the pinned image carries every program its rows name, so it runs in the pinned root like the cargo flow's e2e.manifest_compat")
+    if cell.get("category") == "system-utils":
+        return ("pinned-root", "system-utils: the pinned image carries its programs, so it runs in the pinned root like compat (hermit in open mode inside the image root)")
     if cell["lane"] == "privileged":
         return ("pinned-root", "privileged lane: the cargo flow runs it in the privileged pinned-root container")
     pinned = PINNED_ROOT_ONLY.get("{}/{}".format(cell["test"], cell["mode"]))
