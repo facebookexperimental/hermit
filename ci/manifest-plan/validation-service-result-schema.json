@@ -1,5 +1,5 @@
 {
-  "schema_version": 6,
+  "schema_version": 7,
   "fields": [
     "schema_version",
     "commit",
@@ -11,6 +11,7 @@
     "executed_nodes",
     "executed_tests",
     "passed_tests",
+    "diagnostic_failed_tests",
     "scorecard_writeback"
   ],
   "outcomes": {

@@ -2276,6 +2276,7 @@ fn run_scorecard_owner_reexec_probe(
     // state exact test counts, and this probe ran none.
     summary.executed_tests = Some(0);
     summary.passed_tests = Some(0);
+    summary.diagnostic_failed_tests = Some(0);
     // Record the write-back through the decision a full run makes. The probe
     // has no finalized ledger row, so a run that still owns its write-back
     // reaches the real projection and records that refusal before it touches
@@ -3985,6 +3986,7 @@ fn self_test() -> Result<(), String> {
     let mut writeback_failed = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
     writeback_failed.executed_tests = Some(1);
     writeback_failed.passed_tests = Some(1);
+    writeback_failed.diagnostic_failed_tests = Some(0);
     record_scorecard_writeback(
         &mut writeback_failed,
         Some(ScorecardWriteback::Failed {
@@ -4031,6 +4033,7 @@ fn self_test() -> Result<(), String> {
     let mut writeback_delegated = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
     writeback_delegated.executed_tests = Some(1);
     writeback_delegated.passed_tests = Some(1);
+    writeback_delegated.diagnostic_failed_tests = Some(0);
     record_scorecard_writeback(
         &mut writeback_delegated,
         Some(ScorecardWriteback::Delegated),
@@ -4072,6 +4075,7 @@ fn self_test() -> Result<(), String> {
     genuine_could_not_run.nodes_executed = 1;
     genuine_could_not_run.executed_tests = Some(0);
     genuine_could_not_run.passed_tests = Some(0);
+    genuine_could_not_run.diagnostic_failed_tests = Some(0);
     let could_not_run_path = writeback_result_dir.path().join("could-not-run.json");
     write_validation_service_result(&could_not_run_path, &genuine_could_not_run)?;
     let could_not_run = ValidationServiceResult::from_json_slice(
@@ -4098,6 +4102,7 @@ fn self_test() -> Result<(), String> {
     service_summary.nodes_executed = 76;
     service_summary.executed_tests = Some(2129);
     service_summary.passed_tests = Some(2129);
+    service_summary.diagnostic_failed_tests = Some(0);
     write_validation_service_result(&service_result_path, &service_summary)?;
     let service_result = ValidationServiceResult::from_json_slice(
         &std::fs::read(&service_result_path)
@@ -4143,6 +4148,7 @@ fn self_test() -> Result<(), String> {
     failed_summary.nodes_executed = 1;
     failed_summary.executed_tests = Some(2);
     failed_summary.passed_tests = Some(1);
+    failed_summary.diagnostic_failed_tests = Some(0);
     let failed_result_path = service_result_dir.path().join("failed.json");
     write_validation_service_result(&failed_result_path, &failed_summary)?;
     let failed_result = ValidationServiceResult::from_json_slice(
@@ -4163,6 +4169,7 @@ fn self_test() -> Result<(), String> {
     permissionless_summary.nodes_executed = 1;
     permissionless_summary.executed_tests = Some(1);
     permissionless_summary.passed_tests = Some(1);
+    permissionless_summary.diagnostic_failed_tests = Some(0);
     let permission_error = publish_validation_service_result_or_refuse(
         Some(permissionless_path),
         &mut permissionless_summary,
@@ -4305,15 +4312,59 @@ fn self_test() -> Result<(), String> {
     }
 
     service_summary.passed_tests = Some(2128);
+    service_summary.diagnostic_failed_tests = Some(0);
     let mismatch_path = service_result_dir.path().join("mismatch.json");
     let mismatch_error = write_validation_service_result(&mismatch_path, &service_summary)
         .expect_err("a successful service result must reject a mismatched passed count");
-    if !mismatch_error.contains("requires passed_tests == executed_tests") {
+    if !mismatch_error.contains("passed_tests + diagnostic_failed_tests == executed_tests") {
         return Err(format!(
             "summary: service result did not refuse a mismatched passed count: {mismatch_error}"
         ));
     }
     service_summary.passed_tests = Some(2129);
+    service_summary.diagnostic_failed_tests = Some(0);
+    // A passing run with producer-declared diagnostics and bounded retries
+    // publishes them explicitly: 42 executed = 35 passed + 7 diagnostics,
+    // with one test that failed and then passed on its granted retry. The
+    // diagnostics are not passes and are not dropped from the count.
+    let mut diagnostic_summary = RunSummary::new(Verdict::Pass, 0, "full", Vec::new());
+    diagnostic_summary.nodes_executed = 1;
+    diagnostic_summary.executed_tests = Some(42);
+    diagnostic_summary.passed_tests = Some(35);
+    diagnostic_summary.diagnostic_failed_tests = Some(7);
+    diagnostic_summary.retry_occurrences = 1;
+    diagnostic_summary.flaky = vec![TestIdRetry {
+        node: "e2e.deadline".into(),
+        id: "flaky-cell".into(),
+        retry_classes: Vec::new(),
+        inner_retry_occurrences: 1,
+    }];
+    let diagnostic_path = service_result_dir.path().join("diagnostic.json");
+    write_validation_service_result(&diagnostic_path, &diagnostic_summary)?;
+    let diagnostic_result = ValidationServiceResult::from_json_slice(
+        &std::fs::read(&diagnostic_path)
+            .map_err(|error| format!("summary: cannot read diagnostic result: {error}"))?,
+    )?;
+    if diagnostic_result.executed_tests != Some(42)
+        || diagnostic_result.passed_tests != Some(35)
+        || diagnostic_result.diagnostic_failed_tests != Some(7)
+    {
+        return Err(format!(
+            "summary: diagnostic service result lost its explicit counts: {diagnostic_result:?}"
+        ));
+    }
+    // One of the diagnostics silently reclassified as a pass is refused.
+    diagnostic_summary.passed_tests = Some(36);
+    let diagnostic_mismatch = write_validation_service_result(
+        &service_result_dir.path().join("diagnostic-mismatch.json"),
+        &diagnostic_summary,
+    )
+    .expect_err("a diagnostic counted as a pass must be refused");
+    if !diagnostic_mismatch.contains("passed_tests + diagnostic_failed_tests") {
+        return Err(format!(
+            "summary: diagnostic-as-pass was not refused by name: {diagnostic_mismatch}"
+        ));
+    }
     let overwrite_error = write_validation_service_result(&service_result_path, &service_summary)
         .expect_err("a second writer must not replace the first service result");
     if !overwrite_error.contains("without replacing an existing result") {
@@ -23219,6 +23270,43 @@ fn exact_passed_test_count(outcomes: &[StepOutcome]) -> Option<i64> {
     seen.then(|| i64::try_from(passed).ok()).flatten()
 }
 
+/// Exact count of producer-declared non-blocking diagnostic failures, with
+/// the same unknown rules as [`exact_passed_test_count`]: a count-bearing
+/// outcome without retained rows can only contribute zero when it executed
+/// nothing or passed outright.
+fn exact_diagnostic_test_count(outcomes: &[StepOutcome]) -> Option<i64> {
+    let mut seen = false;
+    let mut diagnostic = 0u64;
+    for outcome in outcomes {
+        let count_bearing = outcome.executed_tests.is_some()
+            || outcome.filtered_tests.is_some()
+            || outcome.test_results.is_some();
+        if !count_bearing {
+            continue;
+        }
+        seen = true;
+        let executed = outcome.executed_tests?;
+        let outcome_diagnostic = match &outcome.test_results {
+            Some(results) => {
+                if u64::try_from(results.len()).ok()? != executed {
+                    return None;
+                }
+                u64::try_from(
+                    results
+                        .iter()
+                        .filter(|result| result.is_diagnostic_failure())
+                        .count(),
+                )
+                .ok()?
+            }
+            None if executed == 0 || outcome.ok => 0,
+            None => return None,
+        };
+        diagnostic = diagnostic.checked_add(outcome_diagnostic)?;
+    }
+    seen.then(|| i64::try_from(diagnostic).ok()).flatten()
+}
+
 /// The run's test counts, derived in one place so run() cannot count from a
 /// different set of outcomes than the self-tests check. An unknown count stays
 /// `None`: whether a count qualifies a receipt is the qualifying-receipt
@@ -23226,6 +23314,7 @@ fn exact_passed_test_count(outcomes: &[StepOutcome]) -> Option<i64> {
 struct RunCounts {
     executed_tests: Option<i64>,
     passed_tests: Option<i64>,
+    diagnostic_failed_tests: Option<i64>,
     filtered_tests: Option<i64>,
     compatibility_count_error: Option<String>,
 }
@@ -23247,6 +23336,7 @@ fn derive_run_counts(
     RunCounts {
         executed_tests,
         passed_tests,
+        diagnostic_failed_tests: exact_diagnostic_test_count(outcomes),
         filtered_tests,
         compatibility_count_error,
     }
@@ -26333,6 +26423,9 @@ struct RunSummary {
     /// Exact terminal passes from those same typed framework outcomes. This is
     /// never reconstructed from the validation verdict or executed-test count.
     passed_tests: Option<i64>,
+    /// Exact producer-declared non-blocking diagnostic failures from those
+    /// same outcomes. Counted apart: never a pass, never dropped.
+    diagnostic_failed_tests: Option<i64>,
     /// Individual test ids that failed and then passed, with the retry grants
     /// that followed their failed attempts. Rendered even on a green run.
     flaky: Vec<TestIdRetry>,
@@ -26395,6 +26488,7 @@ impl RunSummary {
             nodes_host_inapplicable: 0,
             executed_tests: None,
             passed_tests: None,
+            diagnostic_failed_tests: None,
             flaky: Vec::new(),
             failed_ids: Vec::new(),
             failed_nodes_without_test_ids: Vec::new(),
@@ -26467,6 +26561,9 @@ fn cache_hit_run_summary(
             .map_err(|_| format!("cached executed_nodes {nodes} does not fit this platform"))?;
         summary.executed_tests = Some(executed);
         summary.passed_tests = Some(passed);
+        // A cached exact pass count already required executed == passed,
+        // so its diagnostic count is exactly zero.
+        summary.diagnostic_failed_tests = Some(0);
     }
     Ok(summary)
 }
@@ -27218,6 +27315,7 @@ fn write_validation_service_result(path: &Path, summary: &RunSummary) -> Result<
             .map_err(|_| "validation-service-result-executed_nodes exceeds u64".to_string())?,
         executed_tests: summary.executed_tests,
         passed_tests: summary.passed_tests,
+        diagnostic_failed_tests: summary.diagnostic_failed_tests,
         scorecard_writeback: summary.scorecard_writeback.clone(),
     }
     .validated()?;
@@ -29751,6 +29849,7 @@ fn run(
     let run_counts = derive_run_counts(&outcomes, &attempts, plan.compat, plan.compat_prefix);
     let executed_tests = run_counts.executed_tests;
     let passed_tests = run_counts.passed_tests;
+    let diagnostic_failed_tests = run_counts.diagnostic_failed_tests;
     let filtered_tests = run_counts.filtered_tests;
     let compatibility_count_error = run_counts.compatibility_count_error.clone();
     if let Some(error) = &compatibility_count_error {
@@ -30063,6 +30162,7 @@ fn run(
         s.nodes_host_inapplicable = plan.host_inapplicable.iter().filter(|n| !n.runs()).count();
         s.executed_tests = executed_tests;
         s.passed_tests = passed_tests;
+        s.diagnostic_failed_tests = diagnostic_failed_tests;
         s.selection_mode = Some(plan.selection_mode.into());
         s.wall_s = Some(wall);
         s.jobs = Some(jobs);
@@ -30666,6 +30766,7 @@ fn run(
     s.nodes_host_inapplicable = plan.host_inapplicable.iter().filter(|n| !n.runs()).count();
     s.executed_tests = executed_tests;
     s.passed_tests = passed_tests;
+    s.diagnostic_failed_tests = diagnostic_failed_tests;
     s.selection_mode = Some(plan.selection_mode.into());
     s.wall_s = Some(wall);
     s.jobs = Some(jobs);
