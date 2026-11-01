@@ -5546,12 +5546,17 @@ pub fn build_spec(
         // home; the cell's isolated HOME would hide it. The store is a
         // host input like the Hermit binary itself.
         if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
             env.insert(
                 "XDG_DATA_HOME".into(),
-                PathBuf::from(home)
-                    .join(".local/share")
-                    .to_string_lossy()
-                    .into_owned(),
+                home.join(".local/share").to_string_lossy().into_owned(),
+            );
+            // Share the materialized-rootfs cache across cells (keyed by
+            // resolved image ID; roots are read-only), so each cell does
+            // not copy the image again inside its CPU budget.
+            env.insert(
+                "XDG_CACHE_HOME".into(),
+                home.join(".cache").to_string_lossy().into_owned(),
             );
         }
     }
@@ -6087,8 +6092,8 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
             argv.push(format!("--bind={}:/work", source.display()));
         }
         if guest_argv
-            .first()
-            .is_some_and(|program| program.starts_with(REPOSITORY_GUEST_PATH))
+            .iter()
+            .any(|arg| arg.starts_with(REPOSITORY_GUEST_PATH) || arg.starts_with("./"))
         {
             argv.push(format!("--bind={}:/repo", context.root.display()));
         }
@@ -6122,13 +6127,16 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     if cell_image.is_some() {
         // Inside the image the guest binary is reached through /work.
         let mut guest = guest_argv.to_vec();
-        if let Some(program) = guest.first_mut() {
-            // Only the host-built cell program moves to /work; image
-            // programs (shells, coreutils) keep their image paths.
-            if program.ends_with("/program") || program == "program" {
-                *program = "/work/program".into();
-            } else if let Some(rest) = program.strip_prefix(REPOSITORY_GUEST_PATH) {
-                *program = format!("/repo{rest}");
+        // Only the host-built cell program moves to /work; image programs
+        // (shells, coreutils) keep their image paths. Any argument naming
+        // the repository (direct shell commands) is remapped to /repo.
+        for arg in guest.iter_mut() {
+            if arg.ends_with("/program") || arg.as_str() == "program" {
+                *arg = "/work/program".into();
+            } else if let Some(rest) = arg.strip_prefix(REPOSITORY_GUEST_PATH) {
+                *arg = format!("/repo{rest}");
+            } else if let Some(rest) = arg.strip_prefix("./") {
+                *arg = format!("/repo/{rest}");
             }
         }
         argv.extend(guest);

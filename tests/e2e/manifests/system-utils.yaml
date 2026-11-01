@@ -1,6 +1,6 @@
 schema: 3
 bucket: system-utils
-image: docker.io/library/debian@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+image: localhost/hermit-hermetic-validate@sha256:011aecae1f6ce06c0b2e07a5cfc8627f7621f8104712bd50aefd7302e47781a9
 test:
   - id: system-utils/clock-determinism
     description: clock_gettime/gettimeofday output is identical across repeated Hermit runs
