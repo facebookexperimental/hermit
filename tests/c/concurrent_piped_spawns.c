@@ -18,8 +18,8 @@
  * the other thread is doing.
  *
  * The program is its own oracle: it exits 1 unless every spawn read exactly
- * its child's word to EOF and every child exited 0, and it prints how many
- * spawns did.
+ * its child's line ("child-T-R\n", every byte and the count) to EOF and every
+ * child exited 0, and it prints how many spawns did.
  */
 
 #include <fcntl.h>
@@ -37,7 +37,7 @@
 extern char** environ;
 
 static pthread_barrier_t barrier;
-static char results[THREADS][ROUNDS][160];
+static char results[THREADS][ROUNDS][256];
 static int succeeded[THREADS][ROUNDS];
 
 static void fail(const char* what) {
@@ -67,35 +67,65 @@ static void spawn_and_read(int thread, int round) {
   posix_spawn_file_actions_destroy(&actions);
   if (close(fds[1]) != 0)
     fail("close write end");
+  /* Everything the child writes, to EOF. Bytes past the buffer are read and
+   * counted too (a full buffer never asks read for zero bytes, which would
+   * look like EOF), so a longer output is a wrong one. */
   char line[64];
   size_t got = 0;
+  size_t extra = 0;
   for (;;) {
-    ssize_t n = read(fds[0], line + got, sizeof line - 1 - got);
+    char spill;
+    char* into = got < sizeof line ? line + got : &spill;
+    size_t room = got < sizeof line ? sizeof line - got : 1;
+    ssize_t n = read(fds[0], into, room);
     if (n < 0)
       fail("read");
     if (n == 0)
       break;
-    got += (size_t)n;
+    if (got < sizeof line)
+      got += (size_t)n;
+    else
+      extra += (size_t)n;
   }
-  line[got] = '\0';
-  if (got > 0 && line[got - 1] == '\n')
-    line[got - 1] = '\0';
   if (close(fds[0]) != 0)
     fail("close read end");
   int status;
   if (waitpid(child, &status, 0) != child)
     fail("waitpid");
   int exited = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-  succeeded[thread][round] = exited == 0 && strcmp(line, word) == 0;
-  snprintf(
-      results[thread][round],
-      sizeof results[thread][round],
-      "thread %d round %d read \"%s\" to EOF, child exit %d%s",
-      thread,
-      round,
-      line,
-      exited,
-      succeeded[thread][round] ? "" : " (WRONG)");
+  /* The exact bytes /bin/echo writes: the word and one newline. */
+  char expected[40];
+  int expected_length = snprintf(expected, sizeof expected, "%s\n", word);
+  succeeded[thread][round] = exited == 0 && extra == 0 &&
+      got == (size_t)expected_length && memcmp(line, expected, got) == 0;
+  /* What was read, for the report: printable bytes as they are, the final
+   * newline dropped, any other byte as \xNN, and the overflow counted. */
+  char shown[100];
+  size_t at = 0;
+  for (size_t i = 0; i < got && at + 5 < sizeof shown; i++) {
+    unsigned char byte = (unsigned char)line[i];
+    if (byte == '\n' && i + 1 == got && extra == 0)
+      break;
+    if (byte >= 0x20 && byte < 0x7f && byte != '"' && byte != '\\')
+      shown[at++] = (char)byte;
+    else
+      at += (size_t)snprintf(shown + at, sizeof shown - at, "\\x%02x", byte);
+  }
+  shown[at] = '\0';
+  if (extra != 0)
+    snprintf(results[thread][round], sizeof results[thread][round],
+             "thread %d round %d read \"%s\" and %zu more bytes to EOF, child exit %d (WRONG)",
+             thread, round, shown, extra, exited);
+  else
+    snprintf(
+        results[thread][round],
+        sizeof results[thread][round],
+        "thread %d round %d read \"%s\" to EOF, child exit %d%s",
+        thread,
+        round,
+        shown,
+        exited,
+        succeeded[thread][round] ? "" : " (WRONG)");
 }
 
 static void* worker(void* argument) {
