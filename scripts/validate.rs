@@ -6941,14 +6941,21 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         .map(Step::tag)
         .collect::<BTreeSet<_>>();
     // The pinned-root command consumes its prepared script producer and locked
-    // input fetch even off record. Ordinary artifact/manifest builds remain
-    // outside this focused selection; name the exact required set explicitly.
+    // input fetch even off record. test.detcore_unit also requires the
+    // prepared-nextest record, so its declared build chain is retained.
+    // Unrelated manifest builds remain outside this focused selection; name
+    // the exact required set explicitly.
     let expected_off_record = [
         "pre.submodules".to_string(),
         PIN_GATE_TAG.to_string(),
         "test.detcore_unit".to_string(),
         "build.rust_scripts_in_pinned_root".to_string(),
         "setup.pinned_root_fetch".to_string(),
+        "build.buck_release_artifact".to_string(),
+        "build.e2e_artifact_in_pinned_root".to_string(),
+        "build.liteinst_runtime_in_pinned_root".to_string(),
+        "build.workspace_compile_in_pinned_root".to_string(),
+        "build.workspace_in_pinned_root".to_string(),
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
@@ -6964,6 +6971,8 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
     for required in [
         "build.rust_scripts_in_pinned_root",
         "setup.pinned_root_fetch",
+        "build.workspace_in_pinned_root",
+        "build.e2e_artifact_in_pinned_root",
     ] {
         let mut missing = off_record_tags.clone();
         if !missing.remove(required) || check_off_record_tags(&missing).is_ok() {
@@ -7209,6 +7218,41 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
                 ));
             }
         }
+    }
+
+    // A focused test.cli consumes the prepared-nextest record from disk, so
+    // its declared build chain must survive --only pruning.
+    let cli_args = parse_argv(&[
+        ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
+        "--only".into(),
+        "portable".into(),
+        "test.cli".into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("only bracket: test.cli selection was refused with exit {code}"))?;
+    let cli_plan = build_plan(root, &cli_args, &std::env::temp_dir())?;
+    let cli_tags: BTreeSet<String> = cli_plan
+        .cfg
+        .steps
+        .iter()
+        .map(|step| step.tag())
+        .collect();
+    for required in [
+        "test.cli",
+        "build.e2e_artifact_in_pinned_root",
+        "build.workspace_in_pinned_root",
+    ] {
+        if !cli_tags.contains(required) {
+            return Err(format!(
+                "only bracket: focused test.cli selection omitted required producer {required}: {cli_tags:?}"
+            ));
+        }
+    }
+    if !dagrun::model::graph_structure_violations(&cli_plan.cfg).is_empty() {
+        return Err(
+            "only bracket: focused test.cli selection is not dependency-closed and schedulable"
+                .into(),
+        );
     }
 
     let source_after = std::fs::read(&source_path)
@@ -13334,6 +13378,39 @@ fn select_from_committed_decision(
 /// dependency retained here is read from the committed source without rewriting.
 fn retain_focused_manifest_producers(cfg: &DagConfig, tags: &mut BTreeSet<String>) {
     let available = cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    // A node that requires the prepared-nextest record consumes
+    // target/ci/nextest-binaries/current.json from disk. That file is written
+    // only by build.workspace_in_pinned_root, reached through
+    // build.e2e_artifact_in_pinned_root. Dropping that declared chain leaves
+    // the node to fail in seconds with a missing-file error, so retain the
+    // full transitive build closure of any such consumer.
+    let consumes_prepared_nextest = cfg
+        .steps
+        .iter()
+        .filter(|step| tags.contains(&step.tag()))
+        .any(|step| step.cmd.contains("HERMIT_PREPARED_NEXTEST_REQUIRED"));
+    if consumes_prepared_nextest {
+        let by_tag: std::collections::BTreeMap<String, &Step> = cfg
+            .steps
+            .iter()
+            .map(|step| (step.tag(), step))
+            .collect();
+        let mut stack: Vec<String> = tags.iter().cloned().collect();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        while let Some(tag) = stack.pop() {
+            if !seen.insert(tag.clone()) {
+                continue;
+            }
+            if let Some(step) = by_tag.get(&tag) {
+                for dep in &step.deps {
+                    if dep.starts_with("build.") && available.contains(dep) {
+                        tags.insert(dep.clone());
+                        stack.push(dep.clone());
+                    }
+                }
+            }
+        }
+    }
     let twins = cfg
         .steps
         .iter()
