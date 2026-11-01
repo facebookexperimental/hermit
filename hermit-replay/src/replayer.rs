@@ -337,6 +337,28 @@ fn unix_table_lists_inode(table: &[u8], inode: u64) -> bool {
     })
 }
 
+/// Whether the regular file behind a guest descriptor lives beneath the
+/// guest's replay root, judged by directory ancestry rather than path text
+/// (the guest may live in a mount namespace the replayer cannot name).
+fn file_is_beneath_replay_root(pid: Pid, fd: libc::c_int) -> bool {
+    let Ok(link) = std::fs::read_link(format!("/proc/{}/fd/{fd}", pid.as_raw())) else {
+        return false;
+    };
+    let link = link.to_string_lossy().into_owned();
+    let link = link.strip_suffix(" (deleted)").unwrap_or(&link);
+    let Some(parent) = std::path::Path::new(link).parent() else {
+        return false;
+    };
+    let host_parent = format!("/proc/{}/root{}", pid.as_raw(), parent.display());
+    let (Ok(root), Ok(directory)) = (
+        crate::record_replay_path::open_process_root(pid),
+        std::fs::File::open(&host_parent).map(std::os::fd::OwnedFd::from),
+    ) else {
+        return false;
+    };
+    crate::record_replay_path::directory_is_beneath(&root, &directory).unwrap_or(false)
+}
+
 fn remember_materialized_file(pid: Pid, fd: libc::c_int) {
     let Ok(metadata) = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())) else {
         return;
@@ -2284,9 +2306,9 @@ impl Replayer {
     /// descriptor; the others are eventfd placeholders standing in for opens that
     /// replay serves from the log (see `handle_virtual_fd_create`). Locking a
     /// placeholder would lock the wrong object. A real file the guest created
-    /// itself is registered on demand here (and at its open), so the lock is
-    /// really taken; only a placeholder with no lockable object falls back to
-    /// the recorded result, and never a panic (issue 5007).
+    /// itself beneath the replay root is registered on demand here (and at
+    /// its open), so the lock is really taken (issue 5007); a descriptor
+    /// outside the root still fails closed rather than claim a lock.
     ///
     /// Unlike `handle_replayed_side_effect`, this re-issues the call even when
     /// the recording FAILED, and that is the load-bearing part. A recorded
@@ -2315,21 +2337,23 @@ impl Replayer {
     ) -> Result<i64, Errno> {
         // Never panic on an unregistered descriptor (issue 5007): a file the
         // guest created itself can reach flock before replay registered it.
-        // Register it now; only a descriptor with no real file in the replay
-        // (an eventfd placeholder for a virtually served open) falls back to
-        // the recorded result, since there is no lockable object a contender
-        // could observe inside the replay root.
-        if !self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
+        // Register it now when it lives beneath the replay root. A descriptor
+        // whose file is outside the root (an external file, or an eventfd
+        // placeholder for a virtually served open) still fails closed:
+        // returning the recorded result would falsely claim a lock was
+        // acquired on an object no contender inside the replay can observe.
+        if !self.fd_is_in_replay_root(guest.pid(), syscall.fd())
+            && file_is_beneath_replay_root(guest.pid(), syscall.fd())
+        {
             remember_materialized_file(guest.pid(), syscall.fd());
         }
+        assert!(
+            self.fd_is_in_replay_root(guest.pid(), syscall.fd()),
+            "cannot replay flock side effects for descriptor {} outside the replay root; \
+             returning the recorded result would falsely claim a lock was acquired",
+            syscall.fd()
+        );
         let recorded = next_event!(guest, Return);
-        if !self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
-            tracing::debug!(
-                fd = syscall.fd(),
-                "flock on an unmaterialized replay descriptor; returning the recorded result"
-            );
-            return recorded;
-        }
         let call = Syscall::from(syscall);
         let actual = guest.inject_with_retry(call).await;
         assert_eq!(

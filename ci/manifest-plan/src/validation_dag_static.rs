@@ -3763,7 +3763,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And record_replay_keeps_the_ownership_recordings_were_made_with and
     // record_replay_keeps_the_receive_rules_recordings_were_made_with
     // (https://github.com/rrnewton/hermit/issues/4930): 226 + 2 = 228.
-    ("test.record_replay", 228),
+    // And record_replay_flocks_a_self_created_file_opened_by_relative_path
+    // (https://github.com/rrnewton/hermit/issues/5007): 228 + 1 = 229.
+    ("test.record_replay", 229),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
