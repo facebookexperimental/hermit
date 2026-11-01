@@ -268,7 +268,7 @@
       "disposition": "manifest-test",
       "path": "tests/c/concurrent_piped_spawns.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify mode; ci=true, ptrace and kvm)",
-      "why": "tests/c/concurrent_piped_spawns.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify mode; ci=true, ptrace and kvm): Two threads spawn children whose stdout is a pipe, each holding the other's write end while it reads its own pipe to EOF, and the main thread waits in pthread_join. It guards KVM's handling of a closed descriptor that other threads of the process had copied: without it each read waits for an EOF that never comes. The guest prints every result after the threads join, so its output is its own oracle."
+      "why": "tests/c/concurrent_piped_spawns.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify mode; ci=true, ptrace and kvm): Two threads spawn children whose stdout is a pipe, each holding the other's write end while it reads its own pipe to EOF, and the main thread waits in pthread_join. It guards KVM's handling of a closed descriptor that other threads of the process had copied: without it each read waits for an EOF that never comes. The guest prints every result after the threads join and exits 1 unless every spawn read its child's exact word from a child that exited 0, so its output is its own oracle."
     },
     {
       "disposition": "guest-fixture",
@@ -3850,7 +3850,7 @@
       "disposition": "manifest-test",
       "path": "tests/e2e/language-runtimes/go-os-exec-output.sh",
       "runner": "target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml (verify mode; ci=false)",
-      "why": "tests/e2e/language-runtimes/go-os-exec-output.sh is owned by target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml (verify mode; ci=false): It runs Go os/exec Cmd.Output from four goroutines at once under strict verification, so every child's output and exec-error pipes must reach EOF while the runtime's other threads share their write ends. It stays outside blocking CI until the pinned validation root carries a Go toolchain."
+      "why": "tests/e2e/language-runtimes/go-os-exec-output.sh is owned by target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml (verify mode; ci=false): It runs Go os/exec Cmd.Output from four goroutines at once under strict verification, so every child's output and exec-error pipes must reach EOF while the runtime's other threads share their write ends; it exits 1 unless all 20 spawns read their child's exact line from a child that exited 0. It stays outside blocking CI until the pinned validation root carries a Go toolchain."
     },
     {
       "disposition": "guest-fixture",
@@ -3928,7 +3928,7 @@
       "disposition": "manifest-test",
       "path": "tests/e2e/language-runtimes/python-subprocess-capture.sh",
       "runner": "target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml",
-      "why": "tests/e2e/language-runtimes/python-subprocess-capture.sh is owned by target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml: It runs Python subprocess.run with captured output from four threads at once under strict verification, so every child's output and exec-error pipes must reach EOF while the other threads share their write ends."
+      "why": "tests/e2e/language-runtimes/python-subprocess-capture.sh is owned by target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml: It runs Python subprocess.run with captured output from four threads at once under strict verification, so every child's output and exec-error pipes must reach EOF while the other threads share their write ends; it exits 1 unless all 20 spawns captured their child's exact line from a child that exited 0 and no worker raised."
     },
     {
       "disposition": "guest-fixture",

@@ -16,6 +16,10 @@
  * thread closes after the spawn. The other thread's view of that write end is
  * the same descriptor (CLONE_FILES), so it must go with that close, whatever
  * the other thread is doing.
+ *
+ * The program is its own oracle: it exits 1 unless every spawn read exactly
+ * its child's word to EOF and every child exited 0, and it prints how many
+ * spawns did.
  */
 
 #include <fcntl.h>
@@ -34,6 +38,7 @@ extern char** environ;
 
 static pthread_barrier_t barrier;
 static char results[THREADS][ROUNDS][160];
+static int succeeded[THREADS][ROUNDS];
 
 static void fail(const char* what) {
   perror(what);
@@ -80,14 +85,17 @@ static void spawn_and_read(int thread, int round) {
   int status;
   if (waitpid(child, &status, 0) != child)
     fail("waitpid");
+  int exited = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+  succeeded[thread][round] = exited == 0 && strcmp(line, word) == 0;
   snprintf(
       results[thread][round],
       sizeof results[thread][round],
-      "thread %d round %d read \"%s\" to EOF, child exit %d",
+      "thread %d round %d read \"%s\" to EOF, child exit %d%s",
       thread,
       round,
       line,
-      WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+      exited,
+      succeeded[thread][round] ? "" : " (WRONG)");
 }
 
 static void* worker(void* argument) {
@@ -109,9 +117,21 @@ int main(void) {
   for (int thread = 0; thread < THREADS; thread++)
     if (pthread_join(threads[thread], NULL) != 0)
       fail("pthread_join");
+  int spawns = 0;
   for (int thread = 0; thread < THREADS; thread++)
-    for (int round = 0; round < ROUNDS; round++)
+    for (int round = 0; round < ROUNDS; round++) {
       printf("%s\n", results[thread][round]);
-  printf("concurrent-piped-spawns: %d spawns, every pipe reached EOF\n", THREADS * ROUNDS);
+      spawns += succeeded[thread][round];
+    }
+  if (spawns != THREADS * ROUNDS) {
+    printf(
+        "concurrent-piped-spawns: FAILED, %d of %d spawns read their child's word to EOF from a child that exited 0\n",
+        spawns,
+        THREADS * ROUNDS);
+    return 1;
+  }
+  printf(
+      "concurrent-piped-spawns: %d spawns, every pipe reached EOF with its child's word\n",
+      spawns);
   return 0;
 }

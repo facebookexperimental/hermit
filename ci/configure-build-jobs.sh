@@ -3202,8 +3202,18 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 53e1a819e65ffcf3ec4292c8ae5ab602c5bc3f6e ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 53e1a819e65ffcf3ec4292c8ae5ab602c5bc3f6e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 91e700e3930702b97492b4737dda10fcc4e4607f (2026-11-01): from 53e1a819e65ffcf3ec4292c8ae5ab602c5bc3f6e.
+# 53e1a819..91e700e3 is one commit: 91e700e3 (a descriptor copy that a call is
+# using stays that call's until it returns; fork and exec copy the shared table
+# under its lock; a retirement needs no spare descriptor, and when this
+# process's limits would not let it replace a copy, it ends the run by name
+# before changing anything).
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 91e700e3930702b97492b4737dda10fcc4e4607f ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 91e700e3930702b97492b4737dda10fcc4e4607f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

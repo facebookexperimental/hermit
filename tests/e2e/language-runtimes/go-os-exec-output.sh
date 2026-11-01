@@ -10,8 +10,10 @@
 # through which the child reports a failed exec; the parent reads both to EOF.
 # Goroutines run on several threads, which share those write ends
 # (CLONE_FILES), so each must go with the close of the thread that made it, or
-# a reader never sees EOF. --prepare builds the program with the go toolchain
-# into the persisted E2E_FIXTURE_DIR, and --run execs the prebuilt binary.
+# a reader never sees EOF. The program exits 1 unless every spawn read
+# exactly its child's line from a child that exited 0. --prepare builds the
+# program with the go toolchain into the persisted E2E_FIXTURE_DIR, and --run
+# execs the prebuilt binary.
 
 set -euo pipefail
 
@@ -26,6 +28,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -36,28 +39,43 @@ const spawns = 5
 
 func main() {
 	var results [goroutines][spawns]string
+	var correct [goroutines][spawns]bool
 	var wg sync.WaitGroup
 	for g := 0; g < goroutines; g++ {
 		wg.Add(1)
 		go func(g int) {
 			defer wg.Done()
 			for s := 0; s < spawns; s++ {
-				out, err := exec.Command("/bin/echo", fmt.Sprintf("child %d.%d", g, s)).Output()
+				expected := fmt.Sprintf("child %d.%d", g, s)
+				// Output returns an error for a child that exited nonzero.
+				out, err := exec.Command("/bin/echo", expected).Output()
 				if err != nil {
-					results[g][s] = fmt.Sprintf("error: %v", err)
+					results[g][s] = fmt.Sprintf("error: %v (WRONG)", err)
 					continue
 				}
+				correct[g][s] = string(out) == expected+"\n"
 				results[g][s] = fmt.Sprintf("%q", strings.TrimSpace(string(out)))
+				if !correct[g][s] {
+					results[g][s] += " (WRONG)"
+				}
 			}
 		}(g)
 	}
 	wg.Wait()
+	completed := 0
 	for g := 0; g < goroutines; g++ {
 		for s := 0; s < spawns; s++ {
 			fmt.Printf("goroutine %d spawn %d: %s\n", g, s, results[g][s])
+			if correct[g][s] {
+				completed++
+			}
 		}
 	}
-	fmt.Printf("go-os-exec-output: %d spawns from %d goroutines, every pipe reached EOF\n", goroutines*spawns, goroutines)
+	if completed != goroutines*spawns {
+		fmt.Printf("go-os-exec-output: FAILED, %d of %d spawns read their child's line\n", completed, goroutines*spawns)
+		os.Exit(1)
+	}
+	fmt.Printf("go-os-exec-output: %d spawns from %d goroutines, every pipe reached EOF with its child's line\n", completed, goroutines)
 }
 GO
         printf 'module example.com/goosexecoutput\n\ngo 1.21\n' >"$E2E_FIXTURE_DIR/src/go.mod"
