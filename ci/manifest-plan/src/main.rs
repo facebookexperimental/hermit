@@ -311,7 +311,14 @@ fn main() {
         let location = path.file_name().unwrap().to_string_lossy().to_string();
         ensure_keys(
             &document,
-            &["schema", "bucket", "timeout_seconds", "slow_reason", "test"],
+            &[
+                "schema",
+                "bucket",
+                "timeout_seconds",
+                "slow_reason",
+                "image",
+                "test",
+            ],
             &location,
         );
 

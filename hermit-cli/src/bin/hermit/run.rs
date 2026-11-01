@@ -12298,18 +12298,27 @@ impl RunOpts {
                 };
             let guest_abs = resolve_image_guest_program(requested, &guest_cwd)?;
             // A program under a --bind target lives in the bind source, not
-            // the rootfs; validate it there.
+            // the rootfs; validate it there. The longest matching target
+            // wins (binds may nest, e.g. /work and /work/repo).
+            let mut best: Option<(PathBuf, PathBuf)> = None;
             for bind in &self.bind {
                 use std::os::unix::ffi::OsStringExt as _;
                 let target = PathBuf::from(std::ffi::OsString::from_vec(
                     bind.target.as_bytes().to_vec(),
                 ));
-                if let Ok(rel) = guest_abs.strip_prefix(&target) {
+                if let Ok(rel) = guest_abs.strip_prefix(&target)
+                    && best.as_ref().is_none_or(|(current, _)| {
+                        target.as_os_str().len() > current.as_os_str().len()
+                    })
+                {
                     let source = PathBuf::from(std::ffi::OsString::from_vec(
                         bind.source.as_bytes().to_vec(),
                     ));
-                    return validate_executable(&source.join(rel), &guest_abs, None);
+                    best = Some((target, source.join(rel)));
                 }
+            }
+            if let Some((_, host)) = best {
+                return validate_executable(&host, &guest_abs, None);
             }
             // Resolve chroot-aware: images (nixos/nix especially) expose
             // `/bin/sh` as a symlink to an absolute `/nix/store/...` target that

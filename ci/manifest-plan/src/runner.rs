@@ -453,6 +453,10 @@ pub struct ManifestDocument {
     pub bucket: String,
     pub timeout_seconds: Option<u64>,
     pub slow_reason: Option<String>,
+    /// Hermetic OCI image (`name@sha256:<digest>`) every cell in this bucket
+    /// runs inside via `hermit run --image`, with its workdir bound at /work.
+    #[serde(default)]
+    pub image: Option<String>,
     pub test: Vec<TestRecipe>,
 }
 
@@ -1811,6 +1815,8 @@ pub struct SelectedCell {
     pub test: TestRecipe,
     pub id: CellId,
     pub enabled: bool,
+    /// Bucket hermetic image from [`ManifestDocument::image`], if any.
+    pub image: Option<String>,
     pub timeout_seconds: u64,
     pub cpu_timeout_seconds: u64,
     /// The strictness level of the host that runs this cell
@@ -2154,6 +2160,13 @@ impl ManifestInputs {
     }
 }
 
+fn bucket_image(set: &ManifestSet, category: &str) -> Option<String> {
+    set.documents
+        .iter()
+        .find(|document| document.bucket == category)
+        .and_then(|document| document.image.clone())
+}
+
 impl ManifestSet {
     pub fn load(root: &Path) -> Result<Self, String> {
         Self::from_inputs(root, &ManifestInputs::read(root)?)
@@ -2342,6 +2355,7 @@ impl ManifestSet {
                         continue;
                     }
                     cells.push(SelectedCell {
+                        image: bucket_image(self, category),
                         category: category.clone(),
                         test: test.clone(),
                         id: CellId {
@@ -2407,6 +2421,7 @@ impl ManifestSet {
                         .copied()
                         .unwrap_or(*default_cpu_timeout_seconds);
                     cells.push(SelectedCell {
+                        image: bucket_image(self, category),
                         category: category.clone(),
                         test: cell_test.clone(),
                         id: CellId {
@@ -5526,6 +5541,20 @@ pub fn build_spec(
     };
     let mode_recipe = &cell.test.modes[&cell.id.mode];
     let mut env = execution_cell_env(context, &dir, cell.id.mode != "naked");
+    if cell.image.is_some() {
+        // Hermit finds the podman store under the invoking user's data
+        // home; the cell's isolated HOME would hide it. The store is a
+        // host input like the Hermit binary itself.
+        if let Some(home) = std::env::var_os("HOME") {
+            env.insert(
+                "XDG_DATA_HOME".into(),
+                PathBuf::from(home)
+                    .join(".local/share")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
     if cell.id.mode != "naked" {
         // An environment input preserves explicit custom --epoch precedence.
         // append_guest_env_args intentionally does not forward this CLI input.
@@ -5950,6 +5979,17 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
         }
     };
     argv.extend(["--base-env=minimal".into(), "--strict".into()]);
+    // A bucket with a hermetic image runs the cell inside it: Hermit is the
+    // container, the cell workdir is bound at /work, and the image root
+    // stays read-only. Native cells keep the host execution.
+    let cell_image = if backend == "native" {
+        None
+    } else {
+        cell.image.as_deref()
+    };
+    if let Some(image) = cell_image {
+        argv.extend(["--image".into(), image.to_owned()]);
+    }
     argv.extend(cell.test.proc.map(|level| level.flag().to_string()));
     if verify_strict && mode_recipe.comparator != Some(Comparator::Stripped) {
         argv.push("--verify-strict".into());
@@ -6037,15 +6077,39 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
             .iter()
             .map(|directory| directory.to_string_lossy().into_owned()),
     );
-    append_execution_root_args(
-        &mut argv,
-        backend,
-        context.isolated_workdir.as_deref(),
-        cell_workdir(cell).as_deref(),
-        bound_workdir_source,
-    );
+    if cell_image.is_some() {
+        // The built guest program lives in the cell's fixtures directory;
+        // bind it at /work (the program is /work/program). The repository
+        // (for script cells) is bound beside it at /work/repo.
+        if let Some(source) = env.get("E2E_FIXTURE_DIR") {
+            argv.push(format!("--bind={source}:/work"));
+        } else if let Some(source) = bound_workdir_source.or(context.isolated_workdir.as_deref()) {
+            argv.push(format!("--bind={}:/work", source.display()));
+        }
+        if guest_argv
+            .first()
+            .is_some_and(|program| program.starts_with(REPOSITORY_GUEST_PATH))
+        {
+            argv.push(format!("--bind={}:/repo", context.root.display()));
+        }
+        argv.extend(["--workdir".into(), "/work".into()]);
+    } else {
+        append_execution_root_args(
+            &mut argv,
+            backend,
+            context.isolated_workdir.as_deref(),
+            cell_workdir(cell).as_deref(),
+            bound_workdir_source,
+        );
+    }
     let isolated = context.isolated_workdir.is_some();
-    if let Some(cell_dir) = equalized_inputs_dir {
+    if cell_image.is_some() {
+        // No equalized-input binds inside the image (their /tmp/e2e targets
+        // do not exist there); /work is the equalized fixture path.
+        let mut guest_env = env.clone();
+        guest_env.insert("E2E_FIXTURE_DIR".into(), "/work".into());
+        append_guest_env_args(&mut argv, &guest_env, isolated);
+    } else if let Some(cell_dir) = equalized_inputs_dir {
         append_equalized_input_binds(&mut argv, cell_dir, equalized_roots);
         append_guest_env_args(&mut argv, &equalized_guest_env(env), isolated);
     } else {
@@ -6055,7 +6119,22 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
         argv.extend(["--env".into(), format!("{name}={value}")]);
     }
     argv.push("--".into());
-    argv.extend(guest_argv.iter().cloned());
+    if cell_image.is_some() {
+        // Inside the image the guest binary is reached through /work.
+        let mut guest = guest_argv.to_vec();
+        if let Some(program) = guest.first_mut() {
+            // Only the host-built cell program moves to /work; image
+            // programs (shells, coreutils) keep their image paths.
+            if program.ends_with("/program") || program == "program" {
+                *program = "/work/program".into();
+            } else if let Some(rest) = program.strip_prefix(REPOSITORY_GUEST_PATH) {
+                *program = format!("/repo{rest}");
+            }
+        }
+        argv.extend(guest);
+    } else {
+        argv.extend(guest_argv.iter().cloned());
+    }
     let paired = paired_verification_argv(comparison, argv);
     if shares_ld_so_cache {
         shared_inputs_argv(&hermit, paired)
@@ -11500,6 +11579,7 @@ corpus:
         // Each cell's relaxation names its own flags with its own reason.
         let relaxations = |backend: &str| {
             cell_relaxations(&SelectedCell {
+                image: None,
                 category: "fixture".into(),
                 test: document.test[0].clone(),
                 id: CellId {
@@ -11863,6 +11943,7 @@ corpus:
             test
         };
         let document = ManifestDocument {
+            image: None,
             schema: MANIFEST_SCHEMA,
             bucket: "fixture".into(),
             timeout_seconds: None,
@@ -11922,6 +12003,7 @@ corpus:
         mode.comparator = Some(Comparator::Stripped);
         mode.comparator_reason = Some("corpus verdict policy".into());
         let cell = SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: test.id.clone(),
@@ -12678,6 +12760,7 @@ corpus:
         mode.comparator = comparator;
         mode.comparator_reason = comparator.map(|_| "fixture policy".into());
         SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: test.id.clone(),
@@ -14066,6 +14149,7 @@ esac
             test.modes.insert(mode.into(), mode_recipe);
         }
         SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: test.id.clone(),
@@ -15906,6 +15990,7 @@ fi
     #[test]
     fn bucket_timeout_requires_a_reason_and_must_change_the_global_default() {
         let mut document = ManifestDocument {
+            image: None,
             schema: MANIFEST_SCHEMA,
             bucket: "fixture".into(),
             timeout_seconds: Some(20),
@@ -19436,6 +19521,7 @@ int main(int argc, char **argv) {
         // carry several seconds of margin. The lower bound of 2_000 ms still
         // proves that wall time exceeded the CPU budget.
         let cell = SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: test.id.clone(),
@@ -19515,6 +19601,7 @@ int main(int argc, char **argv) {
         let mut test = recipe(true);
         test.requires = vec!["cpuid".into()];
         let cell = SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: test.id.clone(),
@@ -19644,6 +19731,7 @@ int main(int argc, char **argv) {
         fs::create_dir_all(&root).unwrap();
         let test = recipe(true);
         let cell = SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: test.id.clone(),
@@ -19925,6 +20013,7 @@ backends_disabled:
             let recipe_mode = test.modes["verify"].clone();
             test.modes = BTreeMap::from([(mode.to_string(), recipe_mode)]);
             let cell = SelectedCell {
+                image: None,
                 category: "fixture".into(),
                 id: CellId {
                     test: test.id.clone(),
@@ -20005,6 +20094,7 @@ backends_disabled:
         let mut test = recipe(true);
         test.modes.get_mut("verify").unwrap().workdir = Some("/tmp".into());
         let cell = SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: test.id.clone(),
@@ -20067,6 +20157,7 @@ backends_disabled:
     fn hermetic_spec_mounts_a_fresh_test_root_and_limits_guest_environment() {
         let test = recipe(true);
         let cell = SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: test.id.clone(),
@@ -20134,6 +20225,7 @@ backends_disabled:
         let replay_mode = replay_test.modes.remove("verify").unwrap();
         replay_test.modes.insert("replay".into(), replay_mode);
         let replay_cell = SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: replay_test.id.clone(),
@@ -20177,6 +20269,7 @@ backends_disabled:
         custom_mode.args = vec!["--base-env".into(), "minimal".into()];
         custom_test.modes.insert("custom".into(), custom_mode);
         let custom_cell = SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: custom_test.id.clone(),
@@ -20216,6 +20309,7 @@ backends_disabled:
         let naked_mode = naked_test.modes.remove("verify").unwrap();
         naked_test.modes.insert("naked".into(), naked_mode);
         let naked_cell = SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: naked_test.id.clone(),
@@ -20485,6 +20579,7 @@ backends_disabled:
         mode.compare_io_buffers = Some(false);
         mode.compare_io_buffers_disabled_reason = Some(io_reason.into());
         let cell = SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: test.id.clone(),
@@ -20985,6 +21080,7 @@ backends_disabled:
     fn run_spec_records_correct_policy_without_hidden_portable_flags() {
         let test = recipe(true);
         let cell = SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: test.id.clone(),
@@ -21062,6 +21158,7 @@ backends_disabled:
         let replay_mode = replay_test.modes.remove("verify").unwrap();
         replay_test.modes.insert("replay".into(), replay_mode);
         let replay_cell = SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: replay_test.id.clone(),
@@ -21115,6 +21212,7 @@ backends_disabled:
         custom_mode.args = vec!["--base-env=minimal".into()];
         custom_test.modes.insert("custom".into(), custom_mode);
         let custom_cell = SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: custom_test.id.clone(),
@@ -27852,6 +27950,7 @@ cp "{}" "$verdict"
         };
         let test = recipe(true);
         let cell = SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: test.id.clone(),
@@ -27946,6 +28045,7 @@ cp "{}" "$verdict"
         });
         test.modes.insert("naked".into(), mode);
         let cell = SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: test.id.clone(),
@@ -27999,6 +28099,7 @@ cp "{}" "$verdict"
         test.program = Some("tests/fixture.c".into());
         test.direct = None;
         let cell = SelectedCell {
+            image: None,
             category: "fixture".into(),
             id: CellId {
                 test: test.id.clone(),
