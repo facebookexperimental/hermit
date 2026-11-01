@@ -59,3 +59,19 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = "package(=hermit-run) & binary(=cli) & (test(=record_classifies_a_gdbserver_replay_stage_container_child_failure) | test(=every_record_container_site_classifies_a_child_fault_by_name))"
 test-group = "cli-gdbserver-port"
+
+# another_processs_io_reads_with_a_full_descriptor_table_on_every_backend runs
+# five --verify legs (ptrace, sabre, liteinst, in-guest-trap, e9patch) in one
+# test process. Measured 2026-11-01 in the pinned root, alone: 11.20 s wall,
+# 11.19 CPU s, inside the ordinary 22 CPU-s cap; in three full validates at
+# 8a9d035ec7 it was killed at 23.2-23.6 s wall by that cap (exit 124) while
+# running at the test.cli node's width of 16. Every leg passes alone at
+# bitwise parity, so the test is sound; it is serialized instead of raising
+# its bound (coordinator, 2026-11-01). ci/nextest-timeout-config.rs accepts
+# exactly this filter.
+[test-groups.cli-full-table-io]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "package(=hermit-run) & binary(=cli) & test(=another_processs_io_reads_with_a_full_descriptor_table_on_every_backend)"
+test-group = "cli-full-table-io"

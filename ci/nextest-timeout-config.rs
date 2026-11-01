@@ -992,10 +992,16 @@ fn prepared_selected_cpu_allowances(
 
 /// The only overrides a regular configuration may carry, as (filter,
 /// test-group) pairs. Each group only lowers how many of its tests run at once.
-const REGULAR_GROUP_OVERRIDES: [(&str, &str); 1] = [(
-    "package(=hermit-run) & binary(=cli) & (test(=record_classifies_a_gdbserver_replay_stage_container_child_failure) | test(=every_record_container_site_classifies_a_child_fault_by_name))",
-    "cli-gdbserver-port",
-)];
+const REGULAR_GROUP_OVERRIDES: [(&str, &str); 2] = [
+    (
+        "package(=hermit-run) & binary(=cli) & (test(=record_classifies_a_gdbserver_replay_stage_container_child_failure) | test(=every_record_container_site_classifies_a_child_fault_by_name))",
+        "cli-gdbserver-port",
+    ),
+    (
+        "package(=hermit-run) & binary(=cli) & test(=another_processs_io_reads_with_a_full_descriptor_table_on_every_backend)",
+        "cli-full-table-io",
+    ),
+];
 
 fn regular_config_compatible(document: &DocumentMut) -> bool {
     let Some(default_timeout) = document
@@ -2859,7 +2865,7 @@ mod tests {
         )
         .unwrap();
         let document = rendered.parse::<DocumentMut>().unwrap();
-        for (profile, old_period, old_index) in [("default", "75s", 2), ("ci", "113s", 1)] {
+        for (profile, old_period, old_index) in [("default", "75s", 3), ("ci", "113s", 1)] {
             let entries = document["profile"][profile]["overrides"]
                 .as_array_of_tables()
                 .unwrap();
