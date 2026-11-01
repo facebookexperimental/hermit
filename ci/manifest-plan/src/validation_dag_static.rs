@@ -1935,12 +1935,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // local listing less its --skip filters agrees), all passing.
     // Full validate run1470 at 87daeb34 executed 1325 (two more than the
     // pin): 1323 + 2 = 1325, re-measured at this tip. The rest of the KVM
-    // preemption timer flip (T2) adds two preemption_admission units and
-    // a late timer event's replay refusal adds two more (the replay
-    // refusal note and its container classification), as measured on the
-    // stack's own base; the merged selection is re-measured in the
-    // batched round's targeted rerun.
-    ("test.hermit_unit", 1327),
+    // preemption timer flip (T2) and a late timer event's replay refusal
+    // add four more in the merged selection: 1325 + 4 = 1329, executed
+    // in the batched round's targeted rerun at the merged head (the six
+    // forced-gate rows fail only for want of a locally built liteinst
+    // runtime, which the validate builds; they pass there).
+    ("test.hermit_unit", 1329),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6103,11 +6103,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same H1 path-fallback unit: 1283 + 1 = 1284.
     // The same twenty-nine integrated-chain units: 1284 + 29 = 1313.
     // The same +2 as test.hermit_unit in the run1470 recount: 1319.
-    // The same two KVM timer-flip (T2) preemption_admission units and
-    // the same two replay refusal units are in this twin's selection
-    // as well (carried: the hosted lane did not run here); the merged
-    // selection is re-measured with its twin.
-    ("test.hermit_unit_on_host", 1321),
+    // The same four T2 and replay-refusal units as test.hermit_unit:
+    // 1319 + 4 = 1323 (carried: the hosted lane did not run here; the
+    // portable twin executed 1329 in the targeted rerun).
+    ("test.hermit_unit_on_host", 1323),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
