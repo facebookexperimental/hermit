@@ -18,7 +18,14 @@
 //! | [`flock_excludes_a_second_open_and_a_second_process`] | the no-op: every `flock` returned 0 |
 //! | [`contended_blocking_upgrade_waits_for_the_release`] | a contended blocking flock was refused, where Linux waits (Detcore's flock model, the kvm lane's slice SP2) |
 //! | [`contended_blocking_upgrade_waits_at_l2_under_strict`] | the same wait, deterministic at L2 |
+//! | [`kernel_path_contended_blocking_upgrade_restores_the_shared_lock_and_is_refused`] | on a file the kernel decides, the `LOCK_NB` probe of a refused blocking conversion destroyed the shared lock the caller held |
+//! | [`kernel_path_contended_blocking_upgrade_is_fail_closed_under_strict`] | the same refusal handed back an errno, or a timeout, under a fail-closed run |
+//! | [`kernel_path_unknown_state_blocking_upgrade_is_refused_before_any_probe`] | a blocking conversion through a description of unknown mode was probed, which could delete a lock Detcore cannot restore |
+//! | [`an_outside_lock_refuses_the_mirror_and_the_model_lets_the_grant_go`] | after a refused mirror the model kept the grant the guest was told it did not get |
 //! | [`a_received_description_holds_the_senders_lock`] | a description received through `SCM_RIGHTS` lost, or kept, its lock other than as Linux does |
+//! | [`a_private_table_closing_every_descriptor_frees_the_lock_on_ptrace`] | a description a private-table thread had referenced kept its lock in the model after every descriptor closed |
+//! | [`a_job_control_stop_of_a_waiter_is_refused_by_name_on_ptrace`] | a stopped waiter stayed queued, and was granted while Linux kept it stopped |
+//! | [`an_exec_ends_the_flock_wait_of_a_thread_it_kills_on_ptrace`] | a waiter an exec killed stayed queued, took the lock, and kept it for the rest of the run, or left a request blocked under its own forever |
 //! | [`dbt_copied_vfork_child_refuses_every_flock_by_name`] | a copied DBT vfork child ran `LOCK_NB` and `LOCK_UN` natively, changing locks behind the flock model |
 //! | [`dbt_forked_child_preserves_safe_flock_operations`] | copied-child refusal overmatched malformed, nonblocking, and unlock operations; a DBT fork child's calls now reach the flock model |
 //! | [`dbt_nested_vfork_child_blocking_flock_reaches_the_copied_policy`] | a copied fork child's vfork path was assumed to bypass the copied-syscall flock guard |
@@ -52,6 +59,7 @@
 mod hermit_test;
 
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -379,6 +387,193 @@ fn contended_blocking_upgrade_waits_at_l2_under_strict() {
     );
 }
 
+const KERNEL_UPGRADE_REFUSAL: &str = "Refusing rather than granting a lock another guest holds. \
+     LOCK_NB is the supported form where the backend supports flock at all; ENOLCK is returned \
+     instead only under --allow-unsupported-syscalls.";
+
+/// On a file the kernel decides (a description of it was shared with a child
+/// before its first flock, which Detcore's flock model cannot follow), a
+/// contended BLOCKING `LOCK_SH` -> `LOCK_EX` conversion is still probed with
+/// `LOCK_NB`, as before the model: Linux's conversion deletes the caller's
+/// shared lock before it finds the conflict (`flock_lock_inode`), so Detcore
+/// restores that lock and then refuses the call by name. The guest proves
+/// the restored lock through a fresh open after the contender's release.
+/// Pre-fix control: with the restore suppressed, the probe acquires and the
+/// guest prints `FAIL: the refused upgrade destroyed this description's
+/// shared lock`. (The Claude review of the kvm lane's slice SP2: the model's
+/// tests had moved off this path.)
+#[test]
+fn kernel_path_contended_blocking_upgrade_restores_the_shared_lock_and_is_refused() {
+    let run = hermit_run("error", &["--allow-unsupported-syscalls"], "kernel-upgrade");
+    assert!(
+        run.status.success(),
+        "kernel-path upgrade run failed\n{}",
+        run.combined()
+    );
+    for marker in [
+        "flock-kernel-upgrade-contender-holds-shared",
+        "flock-kernel-upgrade-holds-shared",
+        // ENOLCK is 37 on Linux/x86_64.
+        "flock-kernel-upgrade-refused errno=37",
+        "flock-kernel-upgrade-preserved-shared-lock",
+        "flock-kernel-upgrade-ok",
+    ] {
+        assert!(
+            run.stdout.contains(marker),
+            "missing {marker}\n{}",
+            run.combined()
+        );
+    }
+    assert!(
+        run.stderr.contains("blocking flock(fd=") && run.stderr.contains(KERNEL_UPGRADE_REFUSAL),
+        "the run did not take the kernel path's contended refusal\n{}",
+        run.combined()
+    );
+}
+
+/// The same contention under a fail-closed run stops the run as a policy
+/// refusal, with its reason, rather than hand back an errno.
+#[test]
+fn kernel_path_contended_blocking_upgrade_is_fail_closed_under_strict() {
+    let run = hermit_run("error", &["--strict"], "kernel-upgrade");
+    assert_eq!(
+        run.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "a contended blocking flock upgrade on the kernel path must fail closed as a policy \
+         refusal\n{}",
+        run.combined()
+    );
+    assert!(
+        run.combined()
+            .contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "the refusal must be machine-readable as a refusal\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stdout.contains("flock-kernel-upgrade-holds-shared")
+            && !run.stdout.contains("flock-kernel-upgrade-ok"),
+        "the strict run did not stop at the contended upgrade\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stderr.contains(KERNEL_UPGRADE_REFUSAL),
+        "the strict run did not report the kernel path's contended refusal\n{}",
+        run.combined()
+    );
+}
+
+/// A blocking conversion through a description shared before its first
+/// flock, whose shared lock a child took through that same description: the
+/// caller's Detcore cannot know the description's mode, so a `LOCK_NB` probe
+/// could delete a lock it cannot restore, and the kernel path refuses the
+/// call by name before any probe. The child's shared lock still excludes a
+/// fresh open after the contender's release.
+#[test]
+fn kernel_path_unknown_state_blocking_upgrade_is_refused_before_any_probe() {
+    let run = hermit_run("error", &["--allow-unsupported-syscalls"], "kernel-unknown");
+    assert!(
+        run.status.success(),
+        "kernel-path unknown-state run failed\n{}",
+        run.combined()
+    );
+    for marker in [
+        "flock-kernel-unknown-child-holds-shared",
+        "flock-kernel-unknown-contender-holds-shared",
+        "flock-kernel-unknown-refused errno=37",
+        "flock-kernel-unknown-preserved-shared-lock",
+        "flock-kernel-unknown-ok",
+    ] {
+        assert!(
+            run.stdout.contains(marker),
+            "missing {marker}\n{}",
+            run.combined()
+        );
+    }
+    assert!(
+        run.stderr.contains(
+            "existed before Detcore observed its lock state, so a nonblocking probe could \
+             destroy a lock that cannot be restored. LOCK_NB is the supported form where the \
+             backend supports flock at all; ENOLCK is returned instead only under \
+             --allow-unsupported-syscalls."
+        ),
+        "the run did not take the unknown-state refusal\n{}",
+        run.combined()
+    );
+}
+
+/// A process outside the run (this test) holds `LOCK_EX` on the file. The
+/// flock model grants the guest's `LOCK_EX|LOCK_NB`, its host mirror finds the
+/// outside lock, and the call is refused by name, `ENOLCK` under
+/// `--allow-unsupported-syscalls`. The model then lets its grant go, as the
+/// guest holds no lock, so a second description's `LOCK_SH|LOCK_NB` is granted
+/// by the model and refused the same way, never answered EWOULDBLOCK from a
+/// lock the first description does not hold (the Claude review of the kvm
+/// lane's slice SP2: the model kept the grant). A fail-closed run ends at the
+/// first refusal.
+#[test]
+fn an_outside_lock_refuses_the_mirror_and_the_model_lets_the_grant_go() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the outside-holder directory");
+    let path = directory.path().join("outside-holder");
+    let holder = fs::File::create(&path).expect("failed to create the outside-holder file");
+    // SAFETY: `holder` owns a valid descriptor.
+    assert_eq!(
+        unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "the outside holder's LOCK_EX: {}",
+        std::io::Error::last_os_error()
+    );
+    let run_with = |policy: &str| {
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after", "10s", "120s"])
+            .arg(hermit_test::hermit_binary())
+            .arg("--log=error")
+            .args(["--backend=ptrace", "run", "--base-env=minimal", policy])
+            .arg("--")
+            .arg(guest())
+            .arg("outside-holder")
+            .arg(&path);
+        hermit_test::configure_guest_execution(&mut command);
+        finish(hermit_test::hermit_output(
+            &format!("{command:?}"),
+            &mut command,
+        ))
+    };
+    let run = run_with("--allow-unsupported-syscalls");
+    assert!(
+        run.status.success(),
+        "outside-holder run failed\n{}",
+        run.combined()
+    );
+    for marker in [
+        "flock-outside-first errno=37",
+        "flock-outside-second errno=37",
+        "flock-outside-holder-ok",
+    ] {
+        assert!(
+            run.stdout.contains(marker),
+            "missing {marker}\n{}",
+            run.combined()
+        );
+    }
+    let run = run_with("--strict");
+    assert_eq!(
+        run.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "the refused mirror must end a fail-closed run\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stderr
+            .contains("a lock its model does not know holds the file on the host")
+            && !run.stdout.contains("flock-outside-first"),
+        "the fail-closed run did not stop at the refused mirror\n{}",
+        run.combined()
+    );
+    drop(holder);
+}
+
 /// A description received through `SCM_RIGHTS` is the sender's: it holds
 /// the sender's shared lock, which excludes a fresh open's exclusive lock, and
 /// a contended nonblocking conversion through it deletes that lock before it
@@ -575,7 +770,7 @@ fn failed_send_preserves_known_flock_state() {
 /// follows both, and grants each one's uncontended blocking conversion, as
 /// Linux does. Before the model the conservative rule refused both.
 #[test]
-fn partial_sendmmsg_invalidates_all_flock_state() {
+fn partial_sendmmsg_keeps_both_descriptions_in_the_flock_model() {
     let run = hermit_run(
         "error",
         &["--allow-unsupported-syscalls"],
@@ -1059,9 +1254,16 @@ fn find_metadata(data_dir: &Path) -> PathBuf {
 /// ones, the rows `/proc/locks` shows (a blocked request's `->` row
 /// included), a lock taken before children are forked and exec'd (rustup's
 /// pattern), a signal that ends a waiting call with `EINTR` or restarts it
-/// under `SA_RESTART`, and a waiting thread woken by a release in another
-/// thread of its process. Before Detcore's flock model a blocking waiter was
-/// refused on every backend, and KVM refused every flock.
+/// under `SA_RESTART`, a waiting thread woken by a release in another
+/// thread of its process, a waiting call whose descriptor a sibling closes or
+/// replaces, and the Claude review's wake-order cases (a blocking upgrade that
+/// blocks ahead of the waiter its conversion woke, a cancelled waiter that
+/// wakes the requests blocked under it, a retry that converts its
+/// description's lock, and a release through the waiting call's own
+/// description before its retry). Before Detcore's flock model a blocking
+/// waiter was refused on every backend, and KVM refused every flock; before
+/// the review, a release handed the lock to waiters in its own turn, in the
+/// order they first blocked, which no Linux schedule does.
 fn assert_flock_model_matches_linux_at_l2(backend: &str) {
     let native = native_model_run("all");
     let run = hermit_run_model(
@@ -1100,6 +1302,107 @@ fn flock_model_matches_linux_at_l2_on_kvm() {
         return;
     }
     assert_flock_model_matches_linux_at_l2("kvm");
+}
+
+/// A thread with a descriptor table of its own (`CLONE_THREAD` without
+/// `CLONE_FILES`), its process and a forked child close every descriptor of a
+/// locked description, and a fresh open then takes the lock, natively. The
+/// lock ledger cannot tell such a process's tables apart, so the file leaves
+/// the model, and the kernel, which knows the lock went, decides it, where a
+/// model answer resting on a reference the ledger never saw go said
+/// EWOULDBLOCK (Codex review of the kvm lane's slice SP2). KVM refuses the
+/// thread by name.
+#[test]
+fn a_private_table_closing_every_descriptor_frees_the_lock_on_ptrace() {
+    let native = native_model_run("private-table-close");
+    let run = hermit_run_model(
+        "ptrace",
+        "info",
+        &["--strict", "--verify", "--verify-strict"],
+        "private-table-close",
+    );
+    assert!(
+        run.status.success(),
+        "ptrace private-table-close run failed\n{}",
+        run.combined()
+    );
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "ptrace printed other answers than native Linux\n{}",
+        run.combined()
+    );
+}
+
+/// A job-control stop takes a waiter out of the queue, and Linux queues the
+/// call again only once SIGCONT continues it (the guest's `stopped-waiter`,
+/// natively). Detcore does not represent job-control stops
+/// (https://github.com/rrnewton/hermit/issues/4944): on ptrace the stopped
+/// thread is not held, and would restart the call and retry for the lock at
+/// once, so the interrupted wait is refused by name instead (Codex review of
+/// the kvm lane's slice SP2). KVM refuses the stop by name.
+#[test]
+fn a_job_control_stop_of_a_waiter_is_refused_by_name_on_ptrace() {
+    let native = native_model_run("stopped-waiter");
+    assert!(
+        native
+            .stdout
+            .contains("stopped-waiter: rows while the second waiter is stopped = WRITE ->READ"),
+        "natively the stopped waiter left the queue\n{}",
+        native.combined()
+    );
+    let run = hermit_run_model("ptrace", "error", &["--strict"], "stopped-waiter");
+    assert_eq!(
+        run.status.code(),
+        Some(122),
+        "ptrace must refuse the stopped waiter's call by name\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stderr
+            .contains("a job-control stop interrupted this waiting flock"),
+        "ptrace refused the stopped waiter's call without its reason\n{}",
+        run.combined()
+    );
+}
+
+/// An exec kills the caller's other threads before it closes the
+/// close-on-exec descriptors (`de_thread`): a thread waiting for `LOCK_EX`
+/// behind its process's lock leaves the queue with it, which wakes another
+/// process's request blocked under the thread's, and that process takes the
+/// lock once the exec closes the holder's descriptor (the guest's
+/// `exec-waiter`, natively). Before the Claude review of the kvm lane's slice
+/// SP2, the killed thread's request stayed queued and took the lock at the
+/// exec's close, for the rest of the run; with waiters that retry in their
+/// own turns and without the exec taking the request out, the other process
+/// would wait forever under it. KVM hangs at an exec while another thread of
+/// the process is blocked, in a flock or a pipe read alike
+/// (KVM-EXEC-BLOCKED-SIBLING-ISSUE), so this runs on ptrace.
+#[test]
+fn an_exec_ends_the_flock_wait_of_a_thread_it_kills_on_ptrace() {
+    let native = native_model_run("exec-waiter");
+    let run = hermit_run_model(
+        "ptrace",
+        "info",
+        &["--strict", "--verify", "--verify-strict"],
+        "exec-waiter",
+    );
+    assert!(
+        run.status.success(),
+        "ptrace exec-waiter run failed\n{}",
+        run.combined()
+    );
+    assert!(
+        run.combined().contains("bitwise parity established"),
+        "ptrace exec-waiter run did not verify at L2\n{}",
+        run.combined()
+    );
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "ptrace printed other answers than native Linux\n{}",
+        run.combined()
+    );
 }
 
 /// A mapping keeps a description, and its flock lock, after the description's

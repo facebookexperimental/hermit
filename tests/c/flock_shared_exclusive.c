@@ -14,15 +14,24 @@
  * a fork's copy of a locked description, the wake order of queued waiters, the
  * rows /proc/locks shows, waiters (`->`) included, a lock taken before
  * children are forked (the way rustup holds its lock while cargo runs), a
- * signal that ends or restarts a waiting call, and a waiting thread woken by a
- * release in another thread of its process.
+ * signal that ends or restarts a waiting call, a waiting thread woken by a
+ * release in another thread of its process, a waiting call whose descriptor a
+ * sibling closes or replaces with another file's, which keeps the open file
+ * description it took, and the wake order of Linux's tree of blocked requests
+ * after a blocking upgrade, an interrupted waiter, a retry that converts its
+ * description's lock, and a release through a waiting call's own description.
  *
  * Every line printed is the same natively and under Hermit, on every backend:
  * all output comes from the parent, at points its pipes order, and no outcome
  * depends on timing (a sleep only makes a waiter likely to block before the
- * release natively; it acquires after the release either way). The wake
- * order is Linux's too: a second exclusive waiter blocks under the first
- * (`__locks_insert_block`), so the first is granted first.
+ * release natively; it acquires after the release either way; where the
+ * order matters, the parent waits until /proc/locks shows the request
+ * blocked). Where two outcomes are Linux's, as the schedule has it, the guest
+ * prints whether it saw one of them. The wake order is Linux's too: a release
+ * wakes the requests blocked directly under the lock, each of which retries,
+ * and a request blocks under the first granted lock it conflicts with, below
+ * the requests there that conflict with it (`__locks_insert_block`), so a
+ * second exclusive waiter is granted after the first.
  *
  * Scenarios (argv[1]):
  *   all          every scenario of the table before main, in order; the
@@ -33,6 +42,27 @@
  *                (`exec 9>lockfile; flock -n 9`). Hermit leaves it to the
  *                kernel where the backend has host descriptions, and refuses
  *                it by name on KVM.
+ *   private-table-close  a thread with a descriptor table of its own, the
+ *                parent and a forked child close every descriptor of a locked
+ *                description, after which a fresh open takes the lock.
+ *                Hermit leaves the file to the kernel where the backend has
+ *                host descriptions, and KVM refuses the thread by name.
+ *   exec-waiter  a thread waits for LOCK_EX behind its process's lock,
+ *                another process waits behind that thread's request, and
+ *                the first process execs: the exec kills the waiting thread,
+ *                which wakes the other process's request, and closes the
+ *                lock's descriptor, so the other process takes the lock. KVM
+ *                hangs at an exec while another thread of the process is
+ *                blocked, flock or not.
+ *   exec-report FD  (internal) the new image of exec-waiter's exec, which
+ *                reports on FD.
+ *   stopped-waiter  a job-control stop takes a waiter out of the queue: a
+ *                release grants the other waiter alone, and the stopped one
+ *                queues again once SIGCONT continues it. Hermit refuses the
+ *                stopped waiter's call by name where the stop reaches it, as
+ *                Detcore does not represent job-control stops
+ *                (https://github.com/rrnewton/hermit/issues/4944), and KVM
+ *                refuses the stop by name.
  *   probe PATH   (internal) a LOCK_EX|LOCK_NB probe of PATH by an exec'd
  *                child.
  *
@@ -45,7 +75,9 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/futex.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +85,7 @@
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -838,6 +871,674 @@ static void scenario_signal_restarts(void) {
   scenario_signal_ends_or_restarts_a_wait(1);
 }
 
+/* A waiting thread that waits on a descriptor the main thread opened for it,
+   and leaves the descriptor to the main thread. */
+struct fd_wait {
+  struct channel report;
+  int fd;
+};
+
+static void* wait_on_descriptor(void* argument) {
+  struct fd_wait* wait = argument;
+  say(wait->report, "blocking");
+  say(wait->report, attempt(wait->fd, LOCK_EX));
+  return NULL;
+}
+
+static pthread_t start_descriptor_waiter(struct fd_wait* wait) {
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, wait_on_descriptor, wait) != 0) {
+    harness("pthread_create");
+  }
+  char line[64];
+  hear(wait->report, line, sizeof(line));
+  return thread;
+}
+
+/* A child's LOCK_NB attempt through its own open of `path`. */
+static void probe_path(const char* s, const char* what, const char* path, int operation,
+                       const char* want) {
+  char saved[sizeof(lock_path)];
+  memcpy(saved, lock_path, sizeof(lock_path));
+  snprintf(lock_path, sizeof(lock_path), "%s", path);
+  probe(s, what, operation, want);
+  memcpy(lock_path, saved, sizeof(lock_path));
+}
+
+/* A sibling closes, or replaces with another file's, the descriptor a waiting
+   call took. Linux's call holds the open file description it took
+   (`fdget`): it is granted at the release and returns 0, and its lock goes
+   with its own reference, the description's last; the other file is never
+   locked. */
+static void scenario_waiter_descriptor_gone(int replaced) {
+  const char* s = replaced ? "waiter-replaced" : "waiter-closed";
+  char rows[128];
+  char other[sizeof(lock_path)];
+  snprintf(other, sizeof(other), "%s/lock-other", lock_dir);
+  learn_whose_rows_show();
+  int held = open_lock();
+  expect(s, "main thread LOCK_EX", attempt(held, LOCK_EX), "ok");
+  struct fd_wait wait = {channel(), open_lock()};
+  pthread_t thread = start_descriptor_waiter(&wait);
+  proc_locks_rows_once(rows, sizeof(rows), "WRITE ->WRITE");
+  expect(s, "rows while the other thread waits", rows, "WRITE ->WRITE");
+  if (replaced) {
+    int replacement = open(other, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (replacement < 0 || dup2(replacement, wait.fd) != wait.fd) {
+      harness("replace the waiting descriptor");
+    }
+    close(replacement);
+    printf("%s: main thread replaced the waiting descriptor with another file's\n", s);
+  } else {
+    if (close(wait.fd) != 0) {
+      harness("close the waiting descriptor");
+    }
+    printf("%s: main thread closed the waiting descriptor\n", s);
+  }
+  expect(s, "main thread LOCK_UN", attempt(held, LOCK_UN), "ok");
+  char line[64];
+  hear(wait.report, line, sizeof(line));
+  expect(s, "the waiting call after the release", line, "ok");
+  if (pthread_join(thread, NULL) != 0) {
+    harness("pthread_join");
+  }
+  close_channel(wait.report);
+  /* The call's own reference was the description's last. */
+  probe(s, "child LOCK_EX|LOCK_NB after the call returned", LOCK_EX | LOCK_NB, "ok");
+  if (replaced) {
+    probe_path(s, "child LOCK_EX|LOCK_NB on the other file", other, LOCK_EX | LOCK_NB, "ok");
+    close(wait.fd);
+    unlink(other);
+  }
+  close(held);
+}
+
+static void scenario_waiter_closed(void) {
+  scenario_waiter_descriptor_gone(0);
+}
+
+static void scenario_waiter_replaced(void) {
+  scenario_waiter_descriptor_gone(1);
+}
+
+/* The thread of private-table-close: CLONE_THREAD without CLONE_FILES gives it
+   a copy of the descriptor table, in which it closes the parent's
+   descriptor. */
+static volatile int private_tid = 1;
+static int private_close_status = -1;
+static char private_stack[256 * 1024] __attribute__((aligned(16)));
+
+static int close_in_private_table(void* argument) {
+  private_close_status = close(*(int*)argument);
+  return 0;
+}
+
+static void scenario_private_table_close(void) {
+  const char* s = "private-table-close";
+  int held = open_lock();
+  expect(s, "parent LOCK_EX", attempt(held, LOCK_EX), "ok");
+  struct channel report = channel();
+  struct channel go = channel();
+  pid_t child = start();
+  if (child == 0) {
+    char line[64];
+    hear(go, line, sizeof(line));
+    close(held);
+    int fd = open_lock();
+    say(report, attempt(fd, LOCK_EX | LOCK_NB));
+    _exit(0);
+  }
+  int created = clone(close_in_private_table, private_stack + sizeof(private_stack),
+                      CLONE_VM | CLONE_SIGHAND | CLONE_THREAD | CLONE_CHILD_SETTID |
+                          CLONE_CHILD_CLEARTID,
+                      &held, NULL, NULL, (pid_t*)&private_tid);
+  if (created < 0) {
+    harness("clone a thread with a descriptor table of its own");
+  }
+  for (int current = private_tid; current != 0; current = private_tid) {
+    syscall(SYS_futex, (int*)&private_tid, FUTEX_WAIT, current, NULL, NULL, 0);
+  }
+  expect(s, "the private-table thread's close", private_close_status == 0 ? "ok" : "failed", "ok");
+  close(held);
+  printf("%s: parent closed its descriptor\n", s);
+  say(go, "close");
+  char line[64];
+  hear(report, line, sizeof(line));
+  expect(s, "child's fresh LOCK_EX|LOCK_NB after every descriptor closed", line, "ok");
+  reap(child);
+  close_channel(report);
+  close_channel(go);
+}
+
+/* A job-control stop takes a waiter out of the queue (`flock_lock_inode_wait`
+   returns -ERESTARTSYS and the stopped task waits for SIGCONT before the call
+   restarts): /proc/locks shows the other waiter alone, the release grants it
+   alone, and the stopped waiter queues again once SIGCONT continues it. */
+static void scenario_stopped_waiter(void) {
+  const char* s = "stopped-waiter";
+  char rows[128];
+  learn_whose_rows_show();
+  int held = open_lock();
+  expect(s, "parent LOCK_EX", attempt(held, LOCK_EX), "ok");
+  struct channel reports[2] = {channel(), channel()};
+  struct channel goes[2] = {channel(), channel()};
+  pid_t waiters[2];
+  const char* queued[2] = {"WRITE ->READ", "WRITE ->READ ->READ"};
+  for (int index = 0; index < 2; index++) {
+    waiters[index] = start();
+    if (waiters[index] == 0) {
+      int fd = open_lock();
+      char line[64];
+      say(reports[index], attempt(fd, LOCK_SH));
+      hear(goes[index], line, sizeof(line));
+      _exit(0);
+    }
+    proc_locks_rows_once(rows, sizeof(rows), queued[index]);
+    expect(s, index == 0 ? "rows with one waiter" : "rows with two waiters", rows, queued[index]);
+  }
+  int status;
+  if (kill(waiters[1], SIGSTOP) != 0 || waitpid(waiters[1], &status, WUNTRACED) != waiters[1] ||
+      !WIFSTOPPED(status)) {
+    harness("stop the second waiter");
+  }
+  proc_locks_rows_once(rows, sizeof(rows), "WRITE ->READ");
+  expect(s, "rows while the second waiter is stopped", rows, "WRITE ->READ");
+  expect(s, "parent LOCK_UN", attempt(held, LOCK_UN), "ok");
+  char line[64];
+  hear(reports[0], line, sizeof(line));
+  expect(s, "first waiter's LOCK_SH after the release", line, "ok");
+  proc_locks_rows_once(rows, sizeof(rows), "READ");
+  expect(s, "rows while the second waiter is still stopped", rows, "READ");
+  if (kill(waiters[1], SIGCONT) != 0) {
+    harness("continue the second waiter");
+  }
+  hear(reports[1], line, sizeof(line));
+  expect(s, "second waiter's LOCK_SH once continued", line, "ok");
+  for (int index = 0; index < 2; index++) {
+    say(goes[index], "exit");
+    reap(waiters[index]);
+    close_channel(reports[index]);
+    close_channel(goes[index]);
+  }
+  close(held);
+}
+
+/* proc_locks_rows with the waiter rows (`->`) after each granted lock sorted.
+   Linux lists a lock's blocked requests depth first, each list in the order
+   its requests blocked (`locks_show`), with a waiter's depth in its
+   indentation; Detcore's /proc/locks sanitizer orders a lock's waiter rows
+   by their fields and indents each by one level (`sanitize_locks`, older
+   than the flock model). So the scenarios below with more than one waiter
+   compare this form, whose rows show which locks are granted and which
+   requests wait under them, and whose events show the order of the grants. */
+static void proc_locks_sorted(char* out, size_t size) {
+  char rows[256];
+  proc_locks_rows(rows, sizeof(rows));
+  char* tokens[32];
+  int count = 0;
+  for (char* token = strtok(rows, " "); token != NULL && count < 32; token = strtok(NULL, " ")) {
+    tokens[count++] = token;
+  }
+  for (int start = 0; start < count; start++) {
+    if (strncmp(tokens[start], "->", 2) == 0) {
+      continue;
+    }
+    int end = start + 1;
+    while (end < count && strncmp(tokens[end], "->", 2) == 0) {
+      end++;
+    }
+    for (int i = start + 1; i < end; i++) {
+      for (int j = i + 1; j < end; j++) {
+        if (strcmp(tokens[j], tokens[i]) < 0) {
+          char* swap = tokens[i];
+          tokens[i] = tokens[j];
+          tokens[j] = swap;
+        }
+      }
+    }
+  }
+  out[0] = '\0';
+  for (int index = 0; index < count; index++) {
+    if (index > 0) {
+      strncat(out, " ", size - strlen(out) - 1);
+    }
+    strncat(out, tokens[index], size - strlen(out) - 1);
+  }
+}
+
+/* proc_locks_sorted once it is `want`, or after 5 seconds. */
+static void proc_locks_sorted_once(char* out, size_t size, const char* want) {
+  for (int attempt = 0; attempt < 500; attempt++) {
+    proc_locks_sorted(out, size);
+    if (strcmp(out, want) == 0) {
+      return;
+    }
+    sleep_ms(10);
+  }
+}
+
+/* The number of waiter rows (`->`) /proc/locks shows for the lock file:
+   synchronization where more than one lock is granted, whose rows the kernel
+   lists in an order of its own (its per-CPU lists of granted locks). */
+static int waiter_rows(void) {
+  char rows[256];
+  proc_locks_rows(rows, sizeof(rows));
+  int count = 0;
+  for (const char* at = strstr(rows, "->"); at != NULL; at = strstr(at + 2, "->")) {
+    count++;
+  }
+  return count;
+}
+
+/* Wait until /proc/locks shows `want` waiter rows for the lock file, for at
+   most 5 seconds, as proc_locks_rows_once does. */
+static void waiter_rows_once(const char* s, int want) {
+  for (int attempt = 0; attempt < 500; attempt++) {
+    if (waiter_rows() == want) {
+      return;
+    }
+    sleep_ms(10);
+  }
+  printf("FAIL %s: /proc/locks never showed %d waiter rows\n", s, want);
+  failures++;
+}
+
+/* A child with an open file description of the lock file of its own, which
+   runs the flock operations the parent orders, one line each ("sh", "ex",
+   "un"), and reports each answer as `NAME:ANSWER` on the shared `events`
+   channel once the call returns, until "exit". */
+struct locker {
+  const char* name;
+  pid_t pid;
+  struct channel orders;
+};
+
+static struct locker start_locker(const char* name, struct channel events) {
+  struct locker made = {name, 0, channel()};
+  made.pid = start();
+  if (made.pid == 0) {
+    int fd = open_lock();
+    char line[64];
+    for (;;) {
+      hear(made.orders, line, sizeof(line));
+      int operation = strcmp(line, "sh") == 0   ? LOCK_SH
+                      : strcmp(line, "ex") == 0 ? LOCK_EX
+                      : strcmp(line, "un") == 0 ? LOCK_UN
+                                                : -1;
+      if (operation < 0) {
+        _exit(0);
+      }
+      char event[64];
+      snprintf(event, sizeof(event), "%s:%s", name, attempt(fd, operation));
+      say(events, event);
+    }
+  }
+  return made;
+}
+
+static void order(struct locker* locker, const char* operation) {
+  say(locker->orders, operation);
+}
+
+static void stop_locker(struct locker* locker) {
+  say(locker->orders, "exit");
+  reap(locker->pid);
+  close_channel(locker->orders);
+}
+
+/* The next `count` events, sorted and joined by spaces: the calls a step
+   completes, whose reports race natively. */
+static void events_of(struct channel events, int count, char* out, size_t size) {
+  char lines[4][64];
+  for (int index = 0; index < count; index++) {
+    hear(events, lines[index], sizeof(lines[index]));
+  }
+  for (int i = 0; i < count; i++) {
+    for (int j = i + 1; j < count; j++) {
+      if (strcmp(lines[j], lines[i]) < 0) {
+        char swap[64];
+        memcpy(swap, lines[i], sizeof(swap));
+        memcpy(lines[i], lines[j], sizeof(swap));
+        memcpy(lines[j], swap, sizeof(swap));
+      }
+    }
+  }
+  out[0] = '\0';
+  for (int index = 0; index < count; index++) {
+    if (index > 0) {
+      strncat(out, " ", size - strlen(out) - 1);
+    }
+    strncat(out, lines[index], size - strlen(out) - 1);
+  }
+}
+
+/* The wake order after a blocking conversion (the Claude review of slice
+   SP2): A and B hold LOCK_SH, X waits for LOCK_EX under A's lock, and A
+   converts with a blocking LOCK_EX. The conversion deletes A's shared lock,
+   which wakes X, and blocks A's request under B's lock; X's retry finds B's
+   lock and blocks under A's request, which conflicts with it
+   (`__locks_insert_block`). B's release then wakes A's request alone, so A
+   holds LOCK_EX before X, in every schedule. The parent goes on only once
+   /proc/locks shows each request blocked. */
+static void scenario_upgrade_order(void) {
+  const char* s = "upgrade-order";
+  char rows[128];
+  char line[128];
+  learn_whose_rows_show();
+  struct channel events = channel();
+  struct locker a = start_locker("A", events);
+  struct locker b = start_locker("B", events);
+  struct locker x = start_locker("X", events);
+  order(&a, "sh");
+  hear(events, line, sizeof(line));
+  expect(s, "A's LOCK_SH", line, "A:ok");
+  order(&b, "sh");
+  hear(events, line, sizeof(line));
+  expect(s, "B's LOCK_SH", line, "B:ok");
+  order(&x, "ex");
+  waiter_rows_once(s, 1);
+  printf("%s: X waits for LOCK_EX under A's lock\n", s);
+  order(&a, "ex");
+  proc_locks_rows_once(rows, sizeof(rows), "READ ->WRITE ->WRITE");
+  expect(s, "rows once A's conversion and X's retry blocked", rows, "READ ->WRITE ->WRITE");
+  order(&b, "un");
+  events_of(events, 2, line, sizeof(line));
+  expect(s, "the calls B's LOCK_UN completes", line, "A:ok B:ok");
+  proc_locks_rows_once(rows, sizeof(rows), "WRITE ->WRITE");
+  expect(s, "rows while A holds LOCK_EX", rows, "WRITE ->WRITE");
+  order(&a, "un");
+  events_of(events, 2, line, sizeof(line));
+  expect(s, "the calls A's LOCK_UN completes", line, "A:ok X:ok");
+  order(&x, "un");
+  hear(events, line, sizeof(line));
+  expect(s, "X's LOCK_UN", line, "X:ok");
+  stop_locker(&a);
+  stop_locker(&b);
+  stop_locker(&x);
+  close_channel(events);
+}
+
+/* A thread of the parent that waits for LOCK_SH through a description of its
+   own, and reports its answer. */
+static void* wait_for_shared_lock(void* argument) {
+  struct thread_wait* wait = argument;
+  int fd = open_lock();
+  say(wait->report, "blocking");
+  say(wait->report, attempt(fd, LOCK_SH));
+  close(fd);
+  return NULL;
+}
+
+/* The wake order after a waiter is interrupted (the Claude review of slice
+   SP2): G holds LOCK_EX; X, a thread of the parent, waits for LOCK_SH under
+   G; V waits for LOCK_EX under X, which conflicts with it; Y waits for
+   LOCK_SH under G, after X, which does not conflict with it. A signal ends
+   X's wait with EINTR, which wakes V (`locks_delete_block`), whose retry
+   blocks under Y. G's release then wakes Y alone, so Y holds the lock before
+   V, in every schedule. */
+static void scenario_interrupted_waiter(void) {
+  const char* s = "interrupted-waiter";
+  char rows[128];
+  char line[128];
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = on_signal;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGUSR1, &action, NULL) != 0) {
+    harness("sigaction");
+  }
+  learn_whose_rows_show();
+  struct channel events = channel();
+  struct locker g = start_locker("G", events);
+  struct locker v = start_locker("V", events);
+  struct locker y = start_locker("Y", events);
+  order(&g, "ex");
+  hear(events, line, sizeof(line));
+  expect(s, "G's LOCK_EX", line, "G:ok");
+  struct thread_wait wait = {channel()};
+  pthread_t x;
+  if (pthread_create(&x, NULL, wait_for_shared_lock, &wait) != 0) {
+    harness("pthread_create");
+  }
+  hear(wait.report, line, sizeof(line));
+  proc_locks_rows_once(rows, sizeof(rows), "WRITE ->READ");
+  expect(s, "rows while X waits", rows, "WRITE ->READ");
+  order(&v, "ex");
+  proc_locks_sorted_once(rows, sizeof(rows), "WRITE ->READ ->WRITE");
+  expect(s, "rows while V waits under X", rows, "WRITE ->READ ->WRITE");
+  order(&y, "sh");
+  proc_locks_sorted_once(rows, sizeof(rows), "WRITE ->READ ->READ ->WRITE");
+  expect(s, "rows while Y waits under G, sorted", rows, "WRITE ->READ ->READ ->WRITE");
+  if (pthread_kill(x, SIGUSR1) != 0) {
+    harness("pthread_kill");
+  }
+  hear(wait.report, line, sizeof(line));
+  expect(s, "X's interrupted LOCK_SH", line, "errno=4");
+  proc_locks_sorted_once(rows, sizeof(rows), "WRITE ->READ ->WRITE");
+  expect(s, "rows once V's retry blocked under Y", rows, "WRITE ->READ ->WRITE");
+  order(&g, "un");
+  events_of(events, 2, line, sizeof(line));
+  expect(s, "the calls G's LOCK_UN completes", line, "G:ok Y:ok");
+  proc_locks_rows_once(rows, sizeof(rows), "READ ->WRITE");
+  expect(s, "rows while Y holds LOCK_SH", rows, "READ ->WRITE");
+  order(&y, "un");
+  events_of(events, 2, line, sizeof(line));
+  expect(s, "the calls Y's LOCK_UN completes", line, "V:ok Y:ok");
+  order(&v, "un");
+  hear(events, line, sizeof(line));
+  expect(s, "V's LOCK_UN", line, "V:ok");
+  if (pthread_join(x, NULL) != 0) {
+    harness("pthread_join");
+  }
+  close_channel(wait.report);
+  stop_locker(&g);
+  stop_locker(&v);
+  stop_locker(&y);
+  close_channel(events);
+  action.sa_handler = SIG_DFL;
+  if (sigaction(SIGUSR1, &action, NULL) != 0) {
+    harness("sigaction");
+  }
+}
+
+/* A waiting thread of retain-conversion: a blocking flock of `fd` in `mode`,
+   reported on `report`. */
+struct mode_wait {
+  struct channel report;
+  int fd;
+  int mode;
+};
+
+static void* wait_in_mode(void* argument) {
+  struct mode_wait* wait = argument;
+  say(wait->report, "blocking");
+  say(wait->report, attempt(wait->fd, wait->mode));
+  return NULL;
+}
+
+static pthread_t start_mode_waiter(struct mode_wait* wait) {
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, wait_in_mode, wait) != 0) {
+    harness("pthread_create");
+  }
+  char line[64];
+  hear(wait->report, line, sizeof(line));
+  return thread;
+}
+
+/* A retry that converts its description's lock (the Claude review of slice
+   SP2): threads T2 and T1 share description d and wait for LOCK_EX and
+   LOCK_SH behind the parent's LOCK_EX, with W0 (LOCK_SH, a description of its
+   own) blocked between them, under T2's request. The release wakes T2 and T1,
+   whose retries race. Where T2's comes first, T1's converts d's lock to
+   LOCK_SH, which deletes the exclusive lock W0 is blocked under, and W0's
+   retry takes LOCK_SH: two shared locks. Where T1's comes first, T2's
+   conversion leaves W0 blocked under d's LOCK_EX. Which it is depends on the
+   schedule, so the guest prints whether the state it settles in is one of the
+   two, and whether a fresh LOCK_SH|LOCK_NB agrees with it. */
+static void scenario_retain_conversion(void) {
+  const char* s = "retain-conversion";
+  char rows[128];
+  char line[64];
+  learn_whose_rows_show();
+  int held = open_lock();
+  expect(s, "parent LOCK_EX", attempt(held, LOCK_EX), "ok");
+  int shared = open_lock();
+  struct mode_wait t2 = {channel(), shared, LOCK_EX};
+  struct mode_wait w0 = {channel(), open_lock(), LOCK_SH};
+  struct mode_wait t1 = {channel(), shared, LOCK_SH};
+  pthread_t t2_thread = start_mode_waiter(&t2);
+  proc_locks_rows_once(rows, sizeof(rows), "WRITE ->WRITE");
+  expect(s, "rows while T2 waits", rows, "WRITE ->WRITE");
+  pthread_t w0_thread = start_mode_waiter(&w0);
+  proc_locks_sorted_once(rows, sizeof(rows), "WRITE ->READ ->WRITE");
+  expect(s, "rows while W0 waits under T2, sorted", rows, "WRITE ->READ ->WRITE");
+  pthread_t t1_thread = start_mode_waiter(&t1);
+  proc_locks_sorted_once(rows, sizeof(rows), "WRITE ->READ ->READ ->WRITE");
+  expect(s, "rows while T1 waits under the parent, sorted", rows, "WRITE ->READ ->READ ->WRITE");
+  expect(s, "parent LOCK_UN", attempt(held, LOCK_UN), "ok");
+  hear(t2.report, line, sizeof(line));
+  expect(s, "T2's LOCK_EX", line, "ok");
+  hear(t1.report, line, sizeof(line));
+  expect(s, "T1's LOCK_SH", line, "ok");
+  if (pthread_join(t2_thread, NULL) != 0 || pthread_join(t1_thread, NULL) != 0) {
+    harness("pthread_join");
+  }
+  for (int attempt_index = 0; attempt_index < 500; attempt_index++) {
+    proc_locks_rows(rows, sizeof(rows));
+    if (strcmp(rows, "READ READ") == 0 || strcmp(rows, "WRITE ->READ") == 0) {
+      break;
+    }
+    sleep_ms(10);
+  }
+  int two_shared = strcmp(rows, "READ READ") == 0;
+  int w0_waits = strcmp(rows, "WRITE ->READ") == 0;
+  expect(s, "settled in a state Linux reaches", two_shared || w0_waits ? "yes" : rows, "yes");
+  int fresh = open_lock();
+  const char* got = attempt(fresh, LOCK_SH | LOCK_NB);
+  int agrees = (two_shared && strcmp(got, "ok") == 0) || (w0_waits && strcmp(got, "EWOULDBLOCK") == 0);
+  expect(s, "a fresh LOCK_SH|LOCK_NB agrees with it", agrees ? "yes" : got, "yes");
+  close(fresh);
+  /* d's release lets W0 take its lock if it still waits. */
+  expect(s, "d's LOCK_UN", attempt(shared, LOCK_UN), "ok");
+  hear(w0.report, line, sizeof(line));
+  expect(s, "W0's LOCK_SH", line, "ok");
+  if (pthread_join(w0_thread, NULL) != 0) {
+    harness("pthread_join");
+  }
+  close_channel(t2.report);
+  close_channel(w0.report);
+  close_channel(t1.report);
+  close(w0.fd);
+  close(shared);
+  close(held);
+}
+
+/* A release through the waiting call's own description, right after the
+   release that woke it (the Claude review of slice SP2): a thread waits for
+   LOCK_EX through the parent's descriptor d behind the parent's other lock,
+   and the parent releases that lock and then d's. The waiting call takes d's
+   lock after or before d's release, as the schedule has it: afterwards d
+   holds LOCK_EX until the parent closes it, otherwise nothing. Either is
+   Linux's, and the guest prints whether a child's probe saw one of them. */
+static void scenario_unlock_before_retry(void) {
+  const char* s = "unlock-before-retry";
+  char rows[128];
+  char line[64];
+  learn_whose_rows_show();
+  int held = open_lock();
+  expect(s, "parent LOCK_EX", attempt(held, LOCK_EX), "ok");
+  struct fd_wait wait = {channel(), open_lock()};
+  pthread_t thread = start_descriptor_waiter(&wait);
+  proc_locks_rows_once(rows, sizeof(rows), "WRITE ->WRITE");
+  expect(s, "rows while the other thread waits", rows, "WRITE ->WRITE");
+  int released = flock(held, LOCK_UN);
+  int released_d = flock(wait.fd, LOCK_UN);
+  expect(s, "parent LOCK_UN, then d's LOCK_UN", released == 0 && released_d == 0 ? "ok" : "failed",
+         "ok");
+  hear(wait.report, line, sizeof(line));
+  expect(s, "the waiting call", line, "ok");
+  if (pthread_join(thread, NULL) != 0) {
+    harness("pthread_join");
+  }
+  struct channel report = channel();
+  probe_into(report, LOCK_EX | LOCK_NB);
+  hear(report, line, sizeof(line));
+  int linux_outcome = strcmp(line, "ok") == 0 || strcmp(line, "EWOULDBLOCK") == 0;
+  expect(s, "a child's LOCK_EX|LOCK_NB saw a Linux outcome", linux_outcome ? "yes" : line, "yes");
+  close_channel(report);
+  close(wait.fd);
+  probe(s, "a child's LOCK_EX|LOCK_NB after d's close", LOCK_EX | LOCK_NB, "ok");
+  close_channel(wait.report);
+  close(held);
+}
+
+/* An exec kills the caller's other threads (the Claude review of slice SP2):
+   in a child, a thread waits for LOCK_EX behind the lock the child holds
+   through a close-on-exec descriptor, and another process, P, waits for
+   LOCK_EX behind that thread's request (`__locks_insert_block` puts it
+   under the request, which conflicts with it). Then the child's main thread
+   execs. The exec kills the waiting thread (`de_thread`), whose request
+   leaves the tree and wakes P's (`locks_delete_block`), and closes the
+   child's descriptors, which releases its lock, so P takes the lock. The new
+   image reports through a pipe that survives the exec. */
+static void scenario_exec_waiter(void) {
+  const char* s = "exec-waiter";
+  char rows[128];
+  char line[64];
+  learn_whose_rows_show();
+  struct channel report = channel();
+  struct channel go = channel();
+  pid_t child = start();
+  if (child == 0) {
+    int held = open_lock();
+    if (flock(held, LOCK_EX) != 0) {
+      _exit(HARNESS_FAILURE);
+    }
+    struct fd_wait wait = {channel(), open_lock()};
+    start_descriptor_waiter(&wait);
+    hear(go, line, sizeof(line));
+    char fd_text[16];
+    snprintf(fd_text, sizeof(fd_text), "%d", report.write_end);
+    int flags = fcntl(report.write_end, F_GETFD);
+    fcntl(report.write_end, F_SETFD, flags & ~FD_CLOEXEC);
+    const char* image = strchr(self_path, '/') != NULL ? self_path : "/proc/self/exe";
+    char* argv[] = {(char*)self_path, "exec-report", fd_text, NULL};
+    execv(image, argv);
+    _exit(HARNESS_FAILURE);
+  }
+  proc_locks_rows_once(rows, sizeof(rows), "WRITE ->WRITE");
+  expect(s, "rows while the child's thread waits", rows, "WRITE ->WRITE");
+  struct channel events = channel();
+  struct locker p = start_locker("P", events);
+  order(&p, "ex");
+  proc_locks_rows_once(rows, sizeof(rows), "WRITE ->WRITE ->WRITE");
+  expect(s, "rows once P waits under the thread's request", rows, "WRITE ->WRITE ->WRITE");
+  say(go, "exec");
+  hear(report, line, sizeof(line));
+  expect(s, "the new image", line, "running");
+  hear(events, line, sizeof(line));
+  expect(s, "P's LOCK_EX after the exec", line, "P:ok");
+  order(&p, "un");
+  hear(events, line, sizeof(line));
+  expect(s, "P's LOCK_UN", line, "P:ok");
+  stop_locker(&p);
+  reap(child);
+  close_channel(events);
+  close_channel(report);
+  close_channel(go);
+}
+
+/* (internal, after exec-waiter's exec) Report that the new image runs. */
+static int scenario_exec_report(const char* fd_text) {
+  int report = atoi(fd_text);
+  static const char running[] = "running\n";
+  if (write(report, running, sizeof(running) - 1) != (ssize_t)(sizeof(running) - 1)) {
+    return HARNESS_FAILURE;
+  }
+  return 0;
+}
+
 /* The scenarios `all` runs, in order; each also runs alone by its name. */
 static const struct {
   const char* name;
@@ -858,6 +1559,12 @@ static const struct {
     {"signal-interrupts", scenario_signal_interrupts},
     {"signal-restarts", scenario_signal_restarts},
     {"thread-waiter", scenario_thread_waiter},
+    {"waiter-closed", scenario_waiter_closed},
+    {"waiter-replaced", scenario_waiter_replaced},
+    {"upgrade-order", scenario_upgrade_order},
+    {"interrupted-waiter", scenario_interrupted_waiter},
+    {"retain-conversion", scenario_retain_conversion},
+    {"unlock-before-retry", scenario_unlock_before_retry},
 };
 
 int main(int argc, char** argv) {
@@ -866,6 +1573,9 @@ int main(int argc, char** argv) {
   const char* scenario = argc > 1 ? argv[1] : "all";
   if (strcmp(scenario, "probe") == 0) {
     return argc > 3 ? scenario_probe(argv[2], argv[3]) : HARNESS_FAILURE;
+  }
+  if (strcmp(scenario, "exec-report") == 0) {
+    return argc > 2 ? scenario_exec_report(argv[2]) : HARNESS_FAILURE;
   }
   const char* tmp = getenv("TMPDIR");
   snprintf(lock_dir, sizeof(lock_dir), "%s/flock-se-XXXXXX", tmp != NULL && tmp[0] != '\0' ? tmp : "/tmp");
@@ -889,6 +1599,12 @@ int main(int argc, char** argv) {
     scenario_mmap_close();
   } else if (!ran && strcmp(scenario, "shell") == 0) {
     scenario_shell();
+  } else if (!ran && strcmp(scenario, "private-table-close") == 0) {
+    scenario_private_table_close();
+  } else if (!ran && strcmp(scenario, "stopped-waiter") == 0) {
+    scenario_stopped_waiter();
+  } else if (!ran && strcmp(scenario, "exec-waiter") == 0) {
+    scenario_exec_waiter();
   } else if (!ran) {
     printf("HARNESS: unknown scenario %s\n", scenario);
     failures = -1;

@@ -1706,9 +1706,9 @@ static int lock_after_fork_vfork_unlock_scenario(const char* path, int use_flock
     die("unlocker");
   }
   // 10: the unlock was refused with ENOLCK and the lock is still held (DBT's
-  // copied child: an OFD unlock under --allow-unsupported-syscalls, and every
-  // flock operation, which Detcore's flock model decides). Reported on stderr,
-  // outside the snapshots.
+  // copied child under --allow-unsupported-syscalls: an OFD unlock, and every
+  // flock operation, which Detcore's flock model decides; the default policy
+  // ends the run there instead). Reported on stderr, outside the snapshots.
   fprintf(stderr, "unlocker-status=%d\n", WEXITSTATUS(status));
   snapshot("after-vfork-unlock");
   byte_out(go[1]);
@@ -2753,9 +2753,11 @@ fn a_copied_childs_ofd_unlock_is_refused_on_dbt_and_seen_on_ptrace() {
 /// ptrace the unlock is mediated, and both snapshots show the sibling's flock
 /// (its taker is a guest process) and then nothing. On DBT the copied vfork
 /// child cannot reach Detcore's flock model, so its copied policy refuses the
-/// unlock with ENOLCK (before the model, it ran natively and left the
-/// ledger's record of the sibling's flock stale): the sibling's flock row
-/// stays in the second snapshot, and the host's still does not appear.
+/// unlock by name, which under `--panic-on-unsupported-syscalls` ends the run
+/// (exit 101) after the first snapshot, where the sibling's flock shows and
+/// the host's does not. Before the model the unlock ran natively and left the
+/// ledger's record of the sibling's flock stale; no lock is left held behind
+/// an unlock the guest made.
 ///
 /// Relaxation: `--strict` refuses `--no-namespace`, so these runs are not
 /// strict, and their task ids are the host's; the sections are compared,
@@ -2801,21 +2803,30 @@ fn a_stale_flock_record_admits_no_host_row_without_a_namespace() {
             None,
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if backend == "dbt" {
+            assert!(
+                output.status.code() == Some(DBT_REFUSAL_EXIT)
+                    && stderr.contains("detcore-dbt: refusing flock in copied child"),
+                "dbt: the copied vfork child's unlock was not refused by name\nstdout:\n{stdout}\n\
+                 stderr:\n{stderr}"
+            );
+            assert_eq!(
+                sections(&stdout),
+                expected(vec![("child-holds", vec!["FLOCK"])]),
+                "dbt: the host's identical flock reached the guest\n{stdout}"
+            );
+            continue;
+        }
         assert!(
             output.status.success(),
-            "{backend}: run failed\nstdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stderr)
+            "{backend}: run failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
-        let after_unlock = if backend == "dbt" {
-            vec!["FLOCK"]
-        } else {
-            vec![]
-        };
         assert_eq!(
             sections(&stdout),
             expected(vec![
                 ("child-holds", vec!["FLOCK"]),
-                ("after-vfork-unlock", after_unlock),
+                ("after-vfork-unlock", vec![]),
             ]),
             "{backend}: the host's identical flock reached the guest\n{stdout}"
         );

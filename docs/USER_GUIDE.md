@@ -348,6 +348,15 @@ process, plus 3 GiB for each exec in flight, so Hermit refuses to start it under
 `RLIMIT_AS` (`kvm_address_space_limit`, exit 122; see
 [ERROR_CATALOG.md](ERROR_CATALOG.md)). Bound its memory with a cgroup instead.
 
+On KVM, Detcore decides a guest's `flock(2)` locks inside the run and does not
+place them on the host: a guest's lock does not exclude a process outside the
+run, such as a writer on the host or another Hermit run, and theirs do not
+exclude the guest. Files that only the run uses are not affected. Run a guest
+that shares flock-protected files with processes outside the run, such as a
+`cargo` home or a `~/.rustup` that a host process also uses, on the ptrace
+backend, which places each of the run's locks on the host
+(https://github.com/rrnewton/hermit/issues/5043).
+
 See [SaBRe backend compatibility](SABRE_COMPATIBILITY.md) for the measured
 `Stripped` allowlist, build commands, and known gaps. An enabled probe is
 not a blanket support claim for every workload in its subsystem.

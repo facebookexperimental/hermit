@@ -34,12 +34,41 @@
  *              before it fails, as Linux's conversion does. Matches native
  *              Linux.
  *
+ *   kernel-upgrade  A contended BLOCKING LOCK_SH -> LOCK_EX conversion on
+ *              a file the kernel decides (a description of it was shared with
+ *              a child before its first flock, which Detcore's flock model
+ *              cannot follow), through a description whose mode Detcore saw
+ *              the kernel grant. Detcore probes with LOCK_NB, whose conversion
+ *              deletes the shared lock before it finds the conflict, restores
+ *              that lock, and refuses the call by name: the default policy
+ *              ends the run; --allow-unsupported-syscalls answers ENOLCK, and
+ *              the restored shared lock still excludes a fresh open. HERMIT
+ *              ONLY: natively the call waits for a release that never comes.
+ *
+ *   kernel-unknown  A blocking LOCK_EX conversion through a description
+ *              shared before its first flock, whose shared lock a child took
+ *              through that same description: its mode is unknown to the
+ *              caller's Detcore, so a LOCK_NB probe could delete a lock it
+ *              cannot restore, and the call is refused by name before any
+ *              probe; the child's shared lock still excludes a fresh open.
+ *              HERMIT ONLY.
+ *
+ *   outside-holder  With a process outside the run holding LOCK_EX on
+ *              argv[2]: a LOCK_EX|LOCK_NB the flock model grants is refused by
+ *              name when its host mirror finds that lock (ENOLCK under
+ *              --allow-unsupported-syscalls), after which the model holds no
+ *              lock for the description, so a second description's
+ *              LOCK_SH|LOCK_NB is refused the same way rather than answered
+ *              EWOULDBLOCK. HERMIT ONLY.
+ *
  *   vfork-refusal  A vfork child of a parent that holds no lock: DBT's
  *              copied vfork child cannot reach Detcore's flock model, which
  *              decides every lock operation, so it refuses each valid one
- *              (LOCK_EX|LOCK_NB, a blocking LOCK_SH, LOCK_UN) with ENOLCK and
- *              keeps the kernel's EINVAL for a malformed one, and no lock
- *              changes: the parent's second description then takes
+ *              (LOCK_EX|LOCK_NB, a blocking LOCK_SH, LOCK_UN) by name, through
+ *              the unsupported-operation policy: the default policy ends the
+ *              run at the first; --allow-unsupported-syscalls answers ENOLCK,
+ *              the kernel's EINVAL stays for a malformed one, and no lock
+ *              changes, so the parent's second description then takes
  *              LOCK_EX|LOCK_NB. DBT only: on Linux, and wherever a vfork child
  *              reaches Detcore, the valid calls succeed.
  *
@@ -359,6 +388,149 @@ static int scenario_upgrade_waits(void) {
   printf("flock-upgrade-ok\n");
   close(probe);
   close(held);
+  return 0;
+}
+
+/* Whether a fresh open file description of `path` is refused LOCK_EX|LOCK_NB:
+ * whether some description still holds a lock on the file. */
+static int fresh_open_excluded(const char* path) {
+  int probe = open_lock(path);
+  if (probe < 0) {
+    return -1;
+  }
+  errno = 0;
+  int excluded = flock(probe, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+  close(probe);
+  return excluded;
+}
+
+static int reap_child(pid_t child) {
+  int status = 0;
+  return waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+/* A description shared with a child before its first flock, which Detcore's
+ * flock model cannot follow: where the backend's descriptions are the host's,
+ * the kernel decides its file from its first lock on, for every description
+ * of it. */
+static int open_shared_before_its_first_flock(const char* path) {
+  int shared = open_lock(path);
+  if (shared < 0) {
+    return -1;
+  }
+  fflush(stdout);
+  pid_t copy = fork();
+  if (copy == 0) {
+    _exit(0);
+  }
+  if (copy < 0 || !reap_child(copy)) {
+    return -1;
+  }
+  return shared;
+}
+
+/* A contended blocking LOCK_SH -> LOCK_EX conversion on a file the kernel
+ * decides, through a description whose mode Detcore saw the kernel grant.
+ * Hermit only: natively the call waits, and here nothing releases. */
+static int scenario_kernel_upgrade(void) {
+  const char* path = lock_path("kernel-upgrade");
+  int contender = open_shared_before_its_first_flock(path);
+  if (contender < 0) {
+    printf("FAIL: could not open %s (errno=%d)\n", path, errno);
+    return HARNESS_FAILURE;
+  }
+  if (flock(contender, LOCK_SH | LOCK_NB) != 0) {
+    printf("FAIL: the contender's LOCK_SH|LOCK_NB was refused (errno=%d)\n", errno);
+    return 1;
+  }
+  printf("flock-kernel-upgrade-contender-holds-shared\n");
+  int held = open_lock(path);
+  if (held < 0 || flock(held, LOCK_SH | LOCK_NB) != 0) {
+    printf("FAIL: LOCK_SH|LOCK_NB beside a shared lock was refused (errno=%d)\n", errno);
+    return 1;
+  }
+  printf("flock-kernel-upgrade-holds-shared\n");
+  errno = 0;
+  if (flock(held, LOCK_EX) == 0) {
+    printf("FAIL: the contended blocking LOCK_EX upgrade was granted against the contender\n");
+    return 1;
+  }
+  printf("flock-kernel-upgrade-refused errno=%d\n", errno);
+  if (flock(contender, LOCK_UN) != 0) {
+    return HARNESS_FAILURE;
+  }
+  /* Only the shared lock the refusal restored can exclude now. */
+  if (fresh_open_excluded(path) != 1) {
+    printf("FAIL: the refused upgrade destroyed this description's shared lock\n");
+    return 1;
+  }
+  printf("flock-kernel-upgrade-preserved-shared-lock\n");
+  printf("flock-kernel-upgrade-ok\n");
+  close(held);
+  close(contender);
+  return 0;
+}
+
+/* A blocking conversion through a description shared before its first flock,
+ * whose shared lock its child took through that same description: Detcore
+ * cannot know the description's mode, so a LOCK_NB probe could delete a lock
+ * it cannot restore, and the call is refused before any probe. Hermit only:
+ * natively the call waits. */
+static int scenario_kernel_unknown(void) {
+  const char* path = lock_path("kernel-unknown");
+  int shared = open_lock(path);
+  if (shared < 0) {
+    printf("FAIL: could not open %s (errno=%d)\n", path, errno);
+    return HARNESS_FAILURE;
+  }
+  int ready[2];
+  int finish[2];
+  if (pipe(ready) != 0 || pipe(finish) != 0) {
+    return HARNESS_FAILURE;
+  }
+  fflush(stdout);
+  pid_t holder = fork();
+  if (holder == 0) {
+    char token = 0;
+    if (flock(shared, LOCK_SH | LOCK_NB) != 0 || write(ready[1], "r", 1) != 1 ||
+        read(finish[0], &token, 1) != 1) {
+      _exit(HARNESS_FAILURE);
+    }
+    _exit(0);
+  }
+  char token = 0;
+  if (holder < 0 || read(ready[0], &token, 1) != 1) {
+    return HARNESS_FAILURE;
+  }
+  printf("flock-kernel-unknown-child-holds-shared\n");
+  int contender = open_lock(path);
+  if (contender < 0 || flock(contender, LOCK_SH | LOCK_NB) != 0) {
+    printf("FAIL: the contender's LOCK_SH|LOCK_NB was refused (errno=%d)\n", errno);
+    return 1;
+  }
+  printf("flock-kernel-unknown-contender-holds-shared\n");
+  errno = 0;
+  if (flock(shared, LOCK_EX) == 0) {
+    printf("FAIL: the blocking LOCK_EX upgrade was granted against the contender\n");
+    return 1;
+  }
+  printf("flock-kernel-unknown-refused errno=%d\n", errno);
+  if (flock(contender, LOCK_UN) != 0) {
+    return HARNESS_FAILURE;
+  }
+  /* The child's shared lock, on the description the refused call named,
+   * still excludes: no probe deleted it. */
+  if (fresh_open_excluded(path) != 1) {
+    printf("FAIL: the refused upgrade destroyed the description's shared lock\n");
+    return 1;
+  }
+  printf("flock-kernel-unknown-preserved-shared-lock\n");
+  if (write(finish[1], "x", 1) != 1 || !reap_child(holder)) {
+    return HARNESS_FAILURE;
+  }
+  printf("flock-kernel-unknown-ok\n");
+  close(contender);
+  close(shared);
   return 0;
 }
 
@@ -1619,6 +1791,39 @@ static int scenario_copied_native_locks(void) {
   return 0;
 }
 
+/* A process outside the run holds LOCK_EX on argv[2]. The first description's
+ * LOCK_EX|LOCK_NB, which Detcore's flock model grants, finds that lock when
+ * Detcore mirrors it on the host, and is refused by name (ENOLCK under
+ * --allow-unsupported-syscalls); the model then holds no lock for it, so a
+ * second description's LOCK_SH|LOCK_NB is granted by the model too, and
+ * refused the same way, never answered EWOULDBLOCK from a lock the first
+ * description does not hold. HERMIT ONLY: natively both get EWOULDBLOCK. */
+static int scenario_outside_holder(void) {
+  const char* path = lock_path("outside-holder");
+  int first = open(path, O_RDWR);
+  int second = open(path, O_RDWR);
+  if (first < 0 || second < 0) {
+    printf("FAIL: could not open %s (errno=%d)\n", path, errno);
+    return HARNESS_FAILURE;
+  }
+  errno = 0;
+  if (flock(first, LOCK_EX | LOCK_NB) == 0) {
+    printf("FAIL: LOCK_EX|LOCK_NB was granted against the outside holder\n");
+    return 1;
+  }
+  printf("flock-outside-first errno=%d\n", errno);
+  errno = 0;
+  if (flock(second, LOCK_SH | LOCK_NB) == 0) {
+    printf("FAIL: LOCK_SH|LOCK_NB was granted against the outside holder\n");
+    return 1;
+  }
+  printf("flock-outside-second errno=%d\n", errno);
+  printf("flock-outside-holder-ok\n");
+  close(first);
+  close(second);
+  return 0;
+}
+
 static int scenario_holder(void) {
   const char* path = lock_path("holder");
   int fd = lock_override != NULL ? open(path, O_RDONLY) : open_lock(path);
@@ -1656,6 +1861,15 @@ int main(int argc, char** argv) {
   }
   if (strcmp(scenario, "received") == 0) {
     return scenario_received();
+  }
+  if (strcmp(scenario, "kernel-upgrade") == 0) {
+    return scenario_kernel_upgrade();
+  }
+  if (strcmp(scenario, "kernel-unknown") == 0) {
+    return scenario_kernel_unknown();
+  }
+  if (strcmp(scenario, "outside-holder") == 0) {
+    return scenario_outside_holder();
   }
   if (strcmp(scenario, "vfork-refusal") == 0) {
     return scenario_vfork_refusal();

@@ -5094,6 +5094,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     signal_task_identity: None,
                     open_file_creator: None,
                     receive_geometry: None,
+                    flock_waiting_description: None,
                     entry_import: None,
                     send_inspection: None,
                     inotify_queue: None,

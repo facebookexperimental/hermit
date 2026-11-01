@@ -21,22 +21,25 @@
 //!   once;
 //! - a blocking call that finds a conflict waits in Detcore's schedule, as a
 //!   pipe read does (`retry_nonblocking_syscall`), asking the model at each of
-//!   its turns ([`Detcore::flock_wait_attempt`]); a release hands the lock, in
-//!   the releaser's turn, to the waiters in the order they blocked, each that
-//!   conflicts with no granted lock; a signal ends the wait with
+//!   its turns ([`Detcore::flock_wait_attempt`]); its request is blocked in
+//!   Linux's tree of blocked requests, and a release grants nothing but wakes
+//!   the requests blocked under the lock it deleted, each of which retries in
+//!   its own call's next turn, taking the lock or blocking again, as Linux's
+//!   woken waiter retries in its own run; a signal ends a blocked wait with
 //!   `ERESTARTSYS`, as Linux's `wait_event_interruptible` does.
 //!
 //! On every backend but KVM the guest's descriptor is a host description with
-//! the guest's own lifetime, so each decision is mirrored on it, in the
-//! taker's turn: `flock(fd, mode | LOCK_NB)` after a grant, `LOCK_UN` after a
-//! release ([`Detcore::flock_mirror`]). The kernel's conflict test is the
-//! model's and every lock the model holds is mirrored, so a mirror fails only
-//! on a host lock the model does not know (a process outside the run, a
-//! description the guest inherited locked): that call is refused by name,
-//! never granted against the host's lock and never left waiting on host
-//! timing. KVM's host descriptions do not follow guest lifetimes, so it keeps
-//! no mirror: processes outside the run neither see nor affect the guest's
-//! locks there (a named limitation).
+//! the guest's own lifetime, so each decision is mirrored on it, in the turn
+//! of the call that made it: `flock(fd, mode | LOCK_NB)` after a grant,
+//! `LOCK_UN` after a release ([`Detcore::flock_mirror`]). The kernel's
+//! conflict test is the model's and every lock the model holds is mirrored, so
+//! a mirror fails only on a host lock the model does not know (a process
+//! outside the run, a description the guest inherited locked): that call is
+//! refused by name, never granted against the host's lock and never left
+//! waiting on host timing. KVM's host descriptions do not follow guest
+//! lifetimes, so it keeps no mirror: processes outside the run neither see nor
+//! affect the guest's locks there (a named limitation,
+//! <https://github.com/rrnewton/hermit/issues/5043>).
 //!
 //! Detcore leaves to the kernel, as before the model, on the backends with
 //! host descriptions, and refuses by name on KVM:
@@ -68,6 +71,7 @@ use reverie::syscalls::Sysno;
 
 use super::StatFailure;
 use crate::Detcore;
+use crate::fd::DetFd;
 use crate::fd::FlockIdentity;
 use crate::procfs::locks::FlockInodeKey;
 use crate::procfs::locks::FlockMode;
@@ -87,9 +91,11 @@ use crate::types::OpenFileId;
 /// else (`sys_flock`).
 const LOCK_MAND: i32 = 32;
 
-/// How long a mirror after a release by an exit waits at most for the host
-/// teardown of the process that held the lock before it refuses the call by
-/// name: a backstop, not the mechanism ([`Detcore::flock_mirror_after_teardown`]).
+/// How long a grant's mirror after a release by an exit waits at most for the
+/// host teardown of the process that held the lock: then it mirrors anyway
+/// where the backend reports teardowns, and refuses the call by name on DBT,
+/// whose retried mirror kept failing. A backstop, not the mechanism
+/// ([`Detcore::flock_mirror_after_teardown`]).
 const TEARDOWN_BACKSTOP: Duration = Duration::from_secs(30);
 
 /// How often such a mirror looks again.
@@ -123,6 +129,115 @@ const ESCAPED_REFUSAL: &str = "this open file description was shared with anothe
      made: the launcher's standard streams, or a descriptor found in the table), so Detcore \
      cannot follow its references to place the lock's release, and on this backend no host lock \
      can decide the file";
+
+/// Why a call that waited is refused when its retry changed the lock of the
+/// description it took (a grant, or the release of the other mode), which
+/// another reference keeps, and no descriptor of the caller's table names
+/// that description any longer (`Detcore::flock_mirror_waited`).
+const WAITER_DESCRIPTOR_GONE_REFUSAL: &str = "the waiting call's descriptor was closed or \
+     replaced while it waited, and another reference (another process's table, a mapping, a \
+     copy in flight) keeps the open file description the call took, whose lock the call's retry \
+     changed: the caller's process has no descriptor of it to change the lock on the host \
+     through";
+
+/// Why a call that waited is refused when its file left the model meanwhile
+/// and no descriptor of the caller's table names the description the call
+/// took any longer, so the kernel cannot be asked to decide it
+/// (`Detcore::flock_wait_attempt`).
+const WAITER_DESCRIPTOR_GONE_KERNEL_REFUSAL: &str = "the waiting call's descriptor was closed \
+     or replaced while it waited, and its file left Detcore's model meanwhile: the kernel would \
+     decide the call, but the caller's process has no descriptor of the open file description \
+     the call took to ask it through";
+
+/// Why a waiting call a job-control stop interrupted is refused
+/// (`Detcore::flock_wait`).
+const STOPPED_WAITER_REFUSAL: &str = "a job-control stop interrupted this waiting flock: Linux \
+     takes the waiter out of the queue for the stop and queues the call again only once SIGCONT \
+     continues it, but Detcore does not represent job-control stops \
+     (https://github.com/rrnewton/hermit/issues/4944), so the stopped thread would restart the \
+     call, and retry for the lock, while Linux keeps it stopped";
+
+/// The mode `description` now holds, in its cache of the kernel's
+/// (`DetFd::set_flock_mode`), which the vfork guards read.
+fn note_flock_mode(description: Option<&DetFd>, mode: Option<FlockMode>) {
+    let held = mode.map(|mode| match mode {
+        FlockMode::Shared => libc::LOCK_SH,
+        FlockMode::Exclusive => libc::LOCK_EX,
+    });
+    if let Some(description) = description {
+        description.set_flock_mode(held);
+    }
+}
+
+/// What a mirror after a holder's exit does next
+/// (`Detcore::flock_mirror_after_teardown`, [`TeardownWait`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TeardownStep {
+    /// Ask whether the host teardown of the lagging processes is still to be
+    /// reported.
+    AskPending,
+    /// Make the mirror once more.
+    Attempt,
+    /// Wait [`TEARDOWN_POLL`] before the next step.
+    Pause,
+    /// The mirror's answer: `EWOULDBLOCK` past the backstop.
+    Done(Result<i64, Errno>),
+}
+
+/// The waiting of a mirror after a holder's exit, apart from its calls and
+/// its clock, so that a test can drive both: where the backend reports the
+/// host teardown (`reported`), it asks until the teardown is reported, or
+/// `deadline` passes, and then mirrors once, whatever the answer; where it
+/// does not (DBT), it mirrors again until the mirror stops answering
+/// `EWOULDBLOCK`, at most until `deadline`, after which the answer is
+/// `EWOULDBLOCK`.
+struct TeardownWait {
+    reported: bool,
+    deadline: Instant,
+    /// How many pauses the wait made.
+    polls: u32,
+}
+
+impl TeardownWait {
+    fn new(reported: bool, deadline: Instant) -> Self {
+        Self {
+            reported,
+            deadline,
+            polls: 0,
+        }
+    }
+
+    fn first(&self) -> TeardownStep {
+        if self.reported {
+            TeardownStep::AskPending
+        } else {
+            TeardownStep::Attempt
+        }
+    }
+
+    fn after_pending(&self, pending: bool, now: Instant) -> TeardownStep {
+        if !pending || now >= self.deadline {
+            TeardownStep::Attempt
+        } else {
+            TeardownStep::Pause
+        }
+    }
+
+    fn after_attempt(&self, answer: Result<i64, Errno>, now: Instant) -> TeardownStep {
+        if self.reported || answer != Err(Errno::EWOULDBLOCK) {
+            TeardownStep::Done(answer)
+        } else if now >= self.deadline {
+            TeardownStep::Done(Err(Errno::EWOULDBLOCK))
+        } else {
+            TeardownStep::Pause
+        }
+    }
+
+    fn after_pause(&mut self) -> TeardownStep {
+        self.polls += 1;
+        self.first()
+    }
+}
 
 /// The name of the filesystem `f_type` names, where its own `f_op->flock`
 /// decides a flock ([`OWN_FLOCK_FILESYSTEMS`]).
@@ -173,7 +288,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// the guest's own lifetime, on which Detcore mirrors its decisions and
     /// the kernel can decide a file the model leaves: wherever guest threads
     /// are host tasks (`procfs_inode::tool_can_name_guest_descriptors`), so
-    /// every backend but KVM.
+    /// every backend but KVM. No backend capability states that fact itself:
+    /// one would be a field of Reverie's `BackendCapabilities`. Until it
+    /// exists this reads the fact Detcore's procfs reads guest descriptors
+    /// by, whose only backend without it, KVM, runs guest threads that are
+    /// not host tasks (`provides_process_signal_control`).
     pub(crate) fn flock_mirrors(&self) -> bool {
         procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend)
     }
@@ -206,13 +325,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         let nonblocking = operation & libc::LOCK_NB != 0;
         // A promoted description (DBT's shared model of a timerfd or a random
         // device, `DetFd::promote`) spans processes by construction: escaped.
-        let Ok((open_file, status_flags, escaped, cached)) =
+        let Ok((open_file, status_flags, escaped, cached, taken)) =
             guest.thread_state().with_detfd(fd, |detfd| {
                 (
                     detfd.open_file_id(),
                     detfd.status_flags(),
                     detfd.references_escaped() || detfd.is_shared(),
                     detfd.flock_identity(),
+                    detfd.clone(),
                 )
             })
         else {
@@ -319,12 +439,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if dropped
                     && let Err(error) = self.flock_mirror(guest, call, None, Vec::new()).await
                 {
-                    let _ = crate::tool_global::flock_cancel(guest).await;
+                    crate::tool_global::flock_cancel(guest).await;
                     return Ok(FlockRoute::Decided(Err(error)));
                 }
                 if !self.cfg.sequentialize_threads {
                     // KVM without sequentialized threads: no turns to wait in.
-                    let _ = crate::tool_global::flock_cancel(guest).await;
+                    crate::tool_global::flock_cancel(guest).await;
                     let reason = "another open file description holds a conflicting lock, and \
                                   without sequentialized threads Detcore has no turns to wait for \
                                   its release in";
@@ -332,7 +452,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         self.refuse_flock(guest, call, reason).await,
                     ));
                 }
-                FlockRoute::Decided(self.flock_wait(guest, call, mode).await)
+                FlockRoute::Decided(self.flock_wait(guest, call, taken).await)
             }
             FlockOutcome::HostDecided => FlockRoute::Kernel,
             FlockOutcome::Refused(reason) => {
@@ -421,11 +541,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// where the backend has one ([`Self::flock_mirrors`]): a grant of `mode`
     /// as `flock(fd, mode | LOCK_NB)`, a release (`None`) as `LOCK_UN`,
     /// through the recording. `lagging` names the processes whose exit
-    /// released a lock on the file since the previous grant: the host keeps
-    /// their locks until their teardown, which a failed grant mirror waits for
-    /// ([`Self::flock_mirror_after_teardown`]). A mirror that still fails
-    /// found a host lock the model does not know, and the call is refused by
-    /// name.
+    /// released a lock on the file and whose host teardown the backend has
+    /// not reported: the host keeps their locks until then, which a grant's
+    /// mirror waits for ([`Self::flock_mirror_after_teardown`]). A mirror that
+    /// fails found a host lock the model does not know, and the call is
+    /// refused by name.
     async fn flock_mirror<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -433,8 +553,36 @@ impl<T: RecordOrReplay> Detcore<T> {
         mode: Option<FlockMode>,
         lagging: Vec<DetPid>,
     ) -> Result<i64, Error> {
+        let description = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.clone())
+            .ok();
+        self.flock_mirror_on(guest, call, call.fd(), description, mode, lagging)
+            .await
+    }
+
+    /// [`Self::flock_mirror`] on descriptor `fd`, which names the description
+    /// the call took (`description`), whose cache of the kernel's mode it
+    /// updates: the call's own descriptor, or, for a call that waited, another
+    /// descriptor of the caller's table that names that description
+    /// ([`Self::flock_mirror_waited`]). Where the refusal of a failed grant
+    /// mirror lets the run go on (`--allow-unsupported-syscalls`: the guest
+    /// gets `ENOLCK`, holding no lock), the model lets the grant go too
+    /// ([`Self::flock_revoke`]), so that the guest, the model and the host
+    /// agree that the description holds none.
+    async fn flock_mirror_on<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Flock,
+        fd: RawFd,
+        description: Option<DetFd>,
+        mode: Option<FlockMode>,
+        lagging: Vec<DetPid>,
+    ) -> Result<i64, Error> {
         if !self.flock_mirrors() {
-            self.note_flock_mode(guest, call.fd(), mode);
+            // KVM keeps no mirror: its host descriptions do not follow guest
+            // lifetimes (https://github.com/rrnewton/hermit/issues/5043).
+            note_flock_mode(description.as_ref(), mode);
             return Ok(0);
         }
         let operation = match mode {
@@ -442,44 +590,113 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(FlockMode::Exclusive) => libc::LOCK_EX | libc::LOCK_NB,
             None => libc::LOCK_UN,
         };
-        let mirror = call.with_operation(operation);
-        let mut result = self.flock_mirror_attempt(guest, mirror).await;
-        if result == Err(Errno::EWOULDBLOCK) && mode.is_some() && !lagging.is_empty() {
-            result = self
-                .flock_mirror_after_teardown(guest, mirror, lagging)
-                .await;
-        }
-        match result {
+        let mirror = call.with_fd(fd).with_operation(operation);
+        let result = if mode.is_some() && !lagging.is_empty() {
+            self.flock_mirror_after_teardown(guest, mirror, lagging)
+                .await
+        } else {
+            self.flock_mirror_attempt(guest, mirror).await
+        };
+        let reason = match result {
             Ok(_) => {
-                self.note_flock_mode(guest, call.fd(), mode);
-                Ok(0)
+                note_flock_mode(description.as_ref(), mode);
+                return Ok(0);
             }
-            Err(Errno::EWOULDBLOCK) => {
-                let reason = "Detcore granted the lock, and a lock its model does not know holds \
-                              the file on the host: a process outside the run, or an open file \
-                              description the guest inherited locked";
-                self.refuse_flock(guest, call, reason).await
-            }
-            Err(errno) => {
-                let reason = format!(
-                    "Detcore decided the call, and mirroring the decision on the host failed \
-                     ({errno})"
-                );
-                self.refuse_flock(guest, call, &reason).await
-            }
+            Err(Errno::EWOULDBLOCK) => "Detcore granted the lock, and a lock its model does not \
+                                        know holds the file on the host: a process outside the \
+                                        run, or an open file description the guest inherited \
+                                        locked"
+                .to_owned(),
+            Err(errno) => format!(
+                "Detcore decided the call, and mirroring the decision on the host failed \
+                 ({errno})"
+            ),
+        };
+        let refused = self.refuse_flock(guest, call, &reason).await;
+        if mode.is_some() && matches!(refused, Err(Error::Errno(_))) {
+            self.flock_revoke(guest, description).await;
         }
+        refused
     }
 
-    /// The mode the description now holds, in its cache of the kernel's
-    /// (`DetFd::set_flock_mode`), which the vfork guards read.
-    fn note_flock_mode<G: Guest<Self>>(&self, guest: &G, fd: RawFd, mode: Option<FlockMode>) {
-        let held = mode.map(|mode| match mode {
-            FlockMode::Shared => libc::LOCK_SH,
-            FlockMode::Exclusive => libc::LOCK_EX,
-        });
-        let _ = guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.set_flock_mode(held));
+    /// The model lets go of the lock it granted `description`, as a `LOCK_UN`
+    /// through it would, after the guest got `ENOLCK` for the call that took
+    /// it ([`Self::flock_mirror_on`]); the requests blocked under the lock are
+    /// woken. Nothing where Detcore never named the description's file.
+    async fn flock_revoke<G: Guest<Self>>(&self, guest: &mut G, description: Option<DetFd>) {
+        let Some(description) = description else {
+            return;
+        };
+        let Some(identity) = description.flock_identity() else {
+            return;
+        };
+        let open_file = description.open_file_id();
+        let request = FlockRequest {
+            inode: FlockInodeKey {
+                dev: identity.dev,
+                ino: identity.ino,
+            },
+            object: flock_object(identity.dev, identity.ino),
+            open_file,
+            slots: guest.thread_state().slots_naming(open_file),
+            mode: None,
+            nonblocking: false,
+            mapped: guest.thread_state().maps_open_file(open_file),
+            host_fallback: self.flock_mirrors(),
+        };
+        let _ = crate::tool_global::flock(guest, request).await;
+        note_flock_mode(Some(&description), None);
+    }
+
+    /// A change the model made, in a waiting call's own turn, to the lock of
+    /// the description the call took at its entry (`taken`): a grant of
+    /// `mode`, or the release of the lock of the other mode its retry deleted
+    /// (`None`). It is mirrored on that description, through a descriptor of
+    /// the caller's table that still names it, as Linux's call changes the
+    /// lock of the `struct file` it took, whatever a sibling did to its
+    /// descriptor meanwhile. Where none does any longer, a grant may have been
+    /// to the description's last reference, the call's own, which the model
+    /// released with the call ([`crate::procfs::locks::LockLedger::flock_poll`]),
+    /// so the host has no lock to take (the call returns 0, as Linux's does
+    /// before its last `fput` releases the lock). Otherwise another reference
+    /// (another process's table, a mapping, a copy in flight) keeps the
+    /// description, whose lock changed, and the caller has no descriptor to
+    /// change it on the host through: the call is refused by name. (The model
+    /// reports a release only while such a reference remains, as with none the
+    /// host's description, and its lock, went with its last descriptor.)
+    async fn flock_mirror_waited<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Flock,
+        taken: DetFd,
+        mode: Option<FlockMode>,
+        lagging: Vec<DetPid>,
+    ) -> Result<i64, Error> {
+        let open_file = taken.open_file_id();
+        if let Some(fd) = guest.thread_state().slot_naming(open_file, call.fd()) {
+            return self
+                .flock_mirror_on(guest, call, fd, Some(taken), mode, lagging)
+                .await;
+        }
+        if !self.flock_mirrors() {
+            note_flock_mode(Some(&taken), mode);
+            return Ok(0);
+        }
+        if mode.is_some()
+            && crate::tool_global::flock_held_by(guest, open_file)
+                .await
+                .is_none()
+        {
+            note_flock_mode(Some(&taken), None);
+            return Ok(0);
+        }
+        let refused = self
+            .refuse_flock(guest, call, WAITER_DESCRIPTOR_GONE_REFUSAL)
+            .await;
+        if mode.is_some() && matches!(refused, Err(Error::Errno(_))) {
+            self.flock_revoke(guest, Some(taken)).await;
+        }
+        refused
     }
 
     /// One mirror, through the recording, made again while a signal stops it
@@ -499,130 +716,211 @@ impl<T: RecordOrReplay> Detcore<T> {
         Err(last)
     }
 
-    /// A grant mirror failed while processes whose exit released a lock on
-    /// the file (`lagging`) may not be torn down on the host yet: Detcore's
+    /// A grant's mirror while processes whose exit released a lock on the
+    /// file (`lagging`) may not be torn down on the host yet: Detcore's
     /// logical exit precedes the host's. Holding the caller's turn, so that no
     /// other guest thread runs meanwhile and the host's timing decides only
     /// how long this lasts, never which turn is next, it waits for that
-    /// teardown as an event where the backend reports it (ptrace and e9patch
-    /// with ptrace when the tracer consumes the final status, SaBRe at the
-    /// physical exit, LiteInst and in-guest-trap, whose scheduler holds every
-    /// turn until then), and mirrors once more. DBT reports no teardown: there
-    /// the mirror is made again until it succeeds. Either way at most for
-    /// [`TEARDOWN_BACKSTOP`], after which the call is refused by name.
+    /// teardown as an event where the backend reports it to the ledger
+    /// (ptrace and e9patch with ptrace when the tracer consumes the final
+    /// status, LiteInst and in-guest-trap at the physical exit, whose
+    /// scheduler also holds every turn until then), or for
+    /// [`TEARDOWN_BACKSTOP`] at most, and then mirrors once: so a recording,
+    /// which only ptrace makes, holds that one mirror, made after the
+    /// teardown, and no attempt whose answer was the host's timing. DBT
+    /// reports no teardown, and SaBRe reports it to the scheduler alone,
+    /// which holds every turn until it: there the mirror is made, and made
+    /// again while it answers `EWOULDBLOCK`, at most for
+    /// [`TEARDOWN_BACKSTOP`], after which the answer is `EWOULDBLOCK`. A
+    /// mirror that fails is refused by name.
     async fn flock_mirror_after_teardown<G: Guest<Self>>(
         &self,
         guest: &mut G,
         mirror: syscalls::Flock,
         lagging: Vec<DetPid>,
     ) -> Result<i64, Errno> {
+        // The backends that report each host teardown to the ledger
+        // (`GlobalTool::on_backend_process_exited`, `LockLedger::flock_torn_down`).
+        // SaBRe's ptrace supervisor reports physical exits to the scheduler
+        // alone, which holds every turn until one completes
+        // (`reports_physical_process_exits`): a later grant finds the holder
+        // torn down, and its mirror is made as DBT's is.
         let backend = &self.cfg.backend;
-        let reported = backend.reports_child_exit_publication
-            || backend.reports_physical_process_exits
-            || backend.process_exits_complete_asynchronously;
+        let reported =
+            backend.reports_child_exit_publication || backend.process_exits_complete_asynchronously;
         let in_guest = backend.tool_shares_guest_descriptor_table
             || backend.runs_guest_code_between_injections;
         let started = Instant::now();
-        let deadline = started + TEARDOWN_BACKSTOP;
+        let mut wait = TeardownWait::new(reported, started + TEARDOWN_BACKSTOP);
+        let mut step = wait.first();
+        let answer = loop {
+            step = match step {
+                TeardownStep::AskPending => {
+                    let pending =
+                        crate::tool_global::flock_teardown_pending(guest, lagging.clone()).await;
+                    wait.after_pending(pending, Instant::now())
+                }
+                TeardownStep::Attempt => {
+                    let answer = self.flock_mirror_attempt(guest, mirror).await;
+                    wait.after_attempt(answer, Instant::now())
+                }
+                TeardownStep::Pause => {
+                    // The ptrace tracer serves every guest task from one Tokio
+                    // thread, so only this task may wait there; an in-guest
+                    // tool blocks its own thread, as
+                    // `race_probe::delay_on_any_backend` does.
+                    if !in_guest && tokio::runtime::Handle::try_current().is_ok() {
+                        tokio::time::sleep(TEARDOWN_POLL).await;
+                    } else {
+                        std::thread::sleep(TEARDOWN_POLL);
+                    }
+                    wait.after_pause()
+                }
+                TeardownStep::Done(answer) => break answer,
+            };
+        };
         // How long the host's teardown took, at debug level only: it is host
         // time, which no INFO record may carry.
-        let waited = |polls: u32, answer: &Result<i64, Errno>| {
-            tracing::debug!(
-                "[detcore] flock mirror after the host teardown of {lagging:?}: {answer:?} after \
-                 {:?} and {polls} poll(s) ({})",
-                started.elapsed(),
-                if reported {
-                    "teardown event"
-                } else {
-                    "retried mirror"
-                }
-            );
-        };
-        let mut polls = 0_u32;
-        loop {
+        tracing::debug!(
+            "[detcore] flock mirror after the host teardown of {lagging:?}: {answer:?} after {:?} \
+             and {} poll(s) ({})",
+            started.elapsed(),
+            wait.polls,
             if reported {
-                if !crate::tool_global::flock_teardown_pending(guest, lagging.clone()).await {
-                    let answer = self.flock_mirror_attempt(guest, mirror).await;
-                    waited(polls, &answer);
-                    return answer;
-                }
+                "teardown event"
             } else {
-                match self.flock_mirror_attempt(guest, mirror).await {
-                    Err(Errno::EWOULDBLOCK) => {}
-                    answer => {
-                        waited(polls, &answer);
-                        return answer;
-                    }
-                }
+                "retried mirror"
             }
-            if Instant::now() >= deadline {
-                let answer = Err(Errno::EWOULDBLOCK);
-                waited(polls, &answer);
-                return answer;
-            }
-            polls += 1;
-            // The ptrace tracer serves every guest task from one Tokio thread,
-            // so only this task may wait there; an in-guest tool blocks its own
-            // thread, as `race_probe::delay_on_any_backend` does.
-            if !in_guest && tokio::runtime::Handle::try_current().is_ok() {
-                tokio::time::sleep(TEARDOWN_POLL).await;
-            } else {
-                std::thread::sleep(TEARDOWN_POLL);
-            }
-        }
+        );
+        answer
     }
 
     /// A blocking `call` the model queued: it waits in Detcore's schedule as
     /// a pipe read does, a guest-state wait (only a guest's release can end
     /// it), asking the model at each turn ([`Self::flock_wait_attempt`]),
-    /// until it is granted (0), the file leaves the model, or a signal ends it
-    /// (`ERESTARTSYS`), at which it leaves the queue, unless a release had
-    /// already handed it its lock, which it then returns, as Linux's woken
-    /// waiter takes the lock before it acts on the signal.
+    /// which retries the call once a release woke it, until a retry takes the
+    /// lock (0), the file leaves the model, or a signal ends the wait while
+    /// the call is blocked (`ERESTARTSYS`, as Linux's
+    /// `wait_event_interruptible` ends it): the attempt of that turn is made
+    /// first, as Linux's woken waiter retries before it acts on the signal,
+    /// and a call that is still blocked leaves the queue.
     async fn flock_wait<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Flock,
-        mode: Option<FlockMode>,
+        taken: DetFd,
     ) -> Result<i64, Error> {
         let mut rsrc = Resources::new(guest.thread_state().dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("flock");
         rsrc.polls_guest_state_only = true;
+        // The description the call took at its entry, which each attempt's
+        // grant is mirrored on (`ThreadState::flock_waiting_description`).
+        guest.thread_state_mut().flock_waiting_description = Some(taken);
         let result =
             crate::syscalls::helpers::retry_nonblocking_syscall(guest, call, rsrc, Some(self))
                 .await;
+        guest.thread_state_mut().flock_waiting_description = None;
         if result.is_ok() {
             return result;
         }
-        // The wait ended without an attempt that returned a lock (a signal):
-        // the caller leaves the queue, unless a release handed it the lock.
-        match crate::tool_global::flock_cancel(guest).await {
-            Some(lagging) => self.flock_mirror(guest, call, mode, lagging).await,
-            None => result,
+        // The wait ended without a lock: the caller's request leaves the
+        // model, if a refusal or the file's leaving it did not take it out
+        // already.
+        let interrupted = matches!(&result, Err(Error::Errno(Errno::ERESTARTSYS)));
+        crate::tool_global::flock_cancel(guest).await;
+        if interrupted && self.flock_wait_stopped(guest) {
+            return self.refuse_flock(guest, call, STOPPED_WAITER_REFUSAL).await;
         }
+        result
+    }
+
+    /// Whether a default job-control stop is pending for the caller, whose
+    /// wait a signal just ended without a lock: `SIGSTOP`, or `SIGTSTP`,
+    /// `SIGTTIN` or `SIGTTOU` while their disposition is `SIG_DFL`, read from
+    /// the kernel's signal state of the thread where guest threads are host
+    /// tasks. The scheduler ended the wait for that signal in this turn, and a
+    /// guest's own call alone changes a pending bit Detcore recorded the send
+    /// of, so the read decides as the scheduler did.
+    fn flock_wait_stopped<G: Guest<Self>>(&self, guest: &G) -> bool {
+        let Some((pid, tid)) = crate::syscalls::helpers::guest_signal_state_task(guest) else {
+            return false;
+        };
+        let Ok(state) = crate::syscalls::read_thread_signal_state(
+            reverie::Pid::from_raw(pid),
+            reverie::Pid::from_raw(tid),
+        ) else {
+            return false;
+        };
+        let stops =
+            crate::syscalls::kernel_sigset_bit(libc::SIGSTOP) | state.default_job_control_stops();
+        state.pending & !state.blocked & stops != 0
     }
 
     /// One turn of a waiting `call` ([`Self::flock_wait`]), made in place of
     /// the kernel attempt `retry_nonblocking_syscall` makes for a pipe: the
-    /// lock and its mirror when a release handed it over, `EWOULDBLOCK` while
-    /// it waits, the kernel's path where the file left the model, a refusal
-    /// by name where the model refuses it.
+    /// model's answer to the call's retry where a release woke it
+    /// ([`crate::procfs::locks::LockLedger::flock_poll`]), with its mirror, so
+    /// that a lock is placed on the host in the turn that takes it;
+    /// `EWOULDBLOCK` while the call waits; the kernel's path where the file
+    /// left the model; a refusal by name where the model refuses it.
     pub(crate) async fn flock_wait_attempt<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Flock,
     ) -> Result<i64, Error> {
+        // The description the call took at its entry (`Self::flock_wait`).
+        let taken = guest.thread_state().flock_waiting_description.clone();
         match crate::tool_global::flock_poll(guest).await {
             FlockPoll::Granted { lagging } => {
                 let mode = match call.operation() & !libc::LOCK_NB {
                     libc::LOCK_SH => FlockMode::Shared,
                     _ => FlockMode::Exclusive,
                 };
-                self.flock_mirror(guest, call, Some(mode), lagging).await
+                match taken {
+                    Some(taken) => {
+                        self.flock_mirror_waited(guest, call, taken, Some(mode), lagging)
+                            .await
+                    }
+                    None => self.flock_mirror(guest, call, Some(mode), lagging).await,
+                }
             }
-            FlockPoll::Waiting => Err(Errno::EWOULDBLOCK.into()),
-            FlockPoll::HostDecided => self.flock_through_the_kernel(guest, call).await,
+            FlockPoll::Waiting { dropped } => {
+                // The retry deleted the description's lock of the other mode
+                // before it found its conflict, as a conversion does: the
+                // host's goes in this turn too.
+                if dropped {
+                    let mirrored = match taken {
+                        Some(taken) => {
+                            self.flock_mirror_waited(guest, call, taken, None, Vec::new())
+                                .await
+                        }
+                        None => self.flock_mirror(guest, call, None, Vec::new()).await,
+                    };
+                    if let Err(error) = mirrored {
+                        crate::tool_global::flock_cancel(guest).await;
+                        return Err(error);
+                    }
+                }
+                Err(Errno::EWOULDBLOCK.into())
+            }
+            FlockPoll::HostDecided => {
+                // The kernel decides the call from now on, through a
+                // descriptor that names the description the call took.
+                let fd = match &taken {
+                    Some(taken) => guest
+                        .thread_state()
+                        .slot_naming(taken.open_file_id(), call.fd()),
+                    None => Some(call.fd()),
+                };
+                match fd {
+                    Some(fd) => self.flock_through_the_kernel(guest, call.with_fd(fd)).await,
+                    None => {
+                        self.refuse_flock(guest, call, WAITER_DESCRIPTOR_GONE_KERNEL_REFUSAL)
+                            .await
+                    }
+                }
+            }
             FlockPoll::Refused(reason) => self.refuse_flock(guest, call, &reason).await,
         }
     }
@@ -824,5 +1122,102 @@ mod tests {
     fn a_flock_object_is_spelled_as_proc_locks_spells_it() {
         assert_eq!(flock_object(libc::makedev(0, 0x2a), 1001), "00:2a:1001");
         assert_eq!(flock_object(libc::makedev(259, 3), 7), "103:03:7");
+    }
+
+    /// Drive a [`TeardownWait`] to its answer with scripted calls: `pending`
+    /// answers each question whether the teardown is still to be reported,
+    /// `attempts` each mirror, and every pause moves the clock a millisecond.
+    /// Returns the answer, the number of mirrors made and the pauses.
+    fn drive(
+        reported: bool,
+        deadline_ms: u64,
+        mut pending: impl FnMut() -> bool,
+        mut attempts: impl FnMut() -> Result<i64, Errno>,
+    ) -> (Result<i64, Errno>, u32, u32) {
+        let start = Instant::now();
+        let mut now = start;
+        let mut wait = TeardownWait::new(reported, start + Duration::from_millis(deadline_ms));
+        let mut step = wait.first();
+        let mut mirrors = 0;
+        loop {
+            step = match step {
+                TeardownStep::AskPending => wait.after_pending(pending(), now),
+                TeardownStep::Attempt => {
+                    mirrors += 1;
+                    wait.after_attempt(attempts(), now)
+                }
+                TeardownStep::Pause => {
+                    now += Duration::from_millis(1);
+                    wait.after_pause()
+                }
+                TeardownStep::Done(answer) => return (answer, mirrors, wait.polls),
+            };
+        }
+    }
+
+    /// DBT reports no teardown: a mirror the host's lingering lock refuses is
+    /// made again, a pause apart, until it succeeds (the 90 hand-offs the
+    /// campaign measured never needed a second mirror; Codex review of the kvm
+    /// lane's slice SP2).
+    #[test]
+    fn without_a_teardown_report_the_mirror_is_retried_until_it_succeeds() {
+        let mut answers = vec![Err(Errno::EWOULDBLOCK), Err(Errno::EWOULDBLOCK), Ok(0)].into_iter();
+        assert_eq!(
+            drive(false, 30_000, || unreachable!(), || answers.next().unwrap()),
+            (Ok(0), 3, 2)
+        );
+        // Another errno ends the wait at once: the mirror failed otherwise.
+        assert_eq!(
+            drive(false, 30_000, || unreachable!(), || Err(Errno::EBADF)),
+            (Err(Errno::EBADF), 1, 0)
+        );
+    }
+
+    /// The backstop: a mirror that keeps failing ends with `EWOULDBLOCK` at the
+    /// deadline, which `Detcore::flock_mirror` refuses by name. Where the
+    /// teardown is never reported, the mirror is made once at the deadline,
+    /// so a host lock already gone grants the call rather than a refusal.
+    #[test]
+    fn a_mirror_that_keeps_failing_stops_at_the_backstop() {
+        let (answer, mirrors, polls) =
+            drive(false, 5, || unreachable!(), || Err(Errno::EWOULDBLOCK));
+        assert_eq!(answer, Err(Errno::EWOULDBLOCK));
+        assert_eq!((mirrors, polls), (6, 5));
+        for (host, expected) in [
+            (Err(Errno::EWOULDBLOCK), Err(Errno::EWOULDBLOCK)),
+            (Ok(0), Ok(0)),
+        ] {
+            let mut asked = 0;
+            let (answer, mirrors, _) = drive(
+                true,
+                5,
+                || {
+                    asked += 1;
+                    true
+                },
+                || host,
+            );
+            assert_eq!(answer, expected);
+            assert_eq!(mirrors, 1);
+            assert_eq!(asked, 6);
+        }
+    }
+
+    /// Where the backend reports the teardown to the ledger (ptrace,
+    /// LiteInst, in-guest-trap), the wait asks until it is reported and
+    /// mirrors once, whatever that mirror answers.
+    #[test]
+    fn with_a_teardown_report_the_mirror_waits_for_it_and_is_made_once() {
+        let mut pending = vec![true, true, false].into_iter();
+        assert_eq!(
+            drive(
+                true,
+                30_000,
+                || pending.next().unwrap(),
+                || Err(Errno::EWOULDBLOCK)
+            ),
+            (Err(Errno::EWOULDBLOCK), 1, 2)
+        );
+        assert_eq!(drive(true, 30_000, || false, || Ok(0)), (Ok(0), 1, 0));
     }
 }

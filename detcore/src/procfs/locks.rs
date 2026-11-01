@@ -188,7 +188,6 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::VecDeque;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -572,9 +571,6 @@ pub(crate) struct LockLedger {
     flock_inodes: BTreeMap<FlockInodeKey, FlockInode>,
     /// The inode each description the model follows locks on.
     flock_inode_of: BTreeMap<OpenFileId, FlockInodeKey>,
-    /// Waiters a release handed a lock to, until their call returns
-    /// ([`LockLedger::flock_poll`]).
-    flock_granted_waiters: BTreeMap<DetTid, FlockGrantedWaiter>,
     /// The processes that map each followed description, which keeps its locks
     /// as Linux's mapping keeps the `struct file` (`vm_file`): reported at the
     /// first flock and at each mmap of a followed description, copied at fork,
@@ -642,8 +638,9 @@ pub struct FlockRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FlockOutcome {
     /// Granted, or already held in that mode. `lagging`: the processes whose
-    /// exit released a lock on the inode since the last grant, whose host
-    /// teardown the mirror may have to wait for.
+    /// exit released a lock on the inode and whose host teardown the backend
+    /// has not reported, which the mirror of a grant may have to wait for
+    /// (empty where the lock was held already).
     Granted {
         /// See above.
         lagging: Vec<DetPid>,
@@ -671,16 +668,24 @@ pub enum FlockOutcome {
     Refused(String),
 }
 
-/// What [`LockLedger::flock_poll`] found for a waiter.
+/// What [`LockLedger::flock_poll`] found for a waiter, in its own turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FlockPoll {
-    /// A release handed the waiter its lock (see [`FlockOutcome::Granted`]).
+    /// The waiter's retry took its lock, or found its description holding
+    /// that mode already (see [`FlockOutcome::Granted`]).
     Granted {
         /// See [`FlockOutcome::Granted`].
         lagging: Vec<DetPid>,
     },
-    /// Still waiting.
-    Waiting,
+    /// Still waiting: blocked, or retried and blocked again. A retry that
+    /// found the description holding the other mode deleted that lock first,
+    /// as a conversion does (`dropped`, while a table, a copy in flight or a
+    /// mapping keeps the description, and so the host's lock).
+    Waiting {
+        /// Whether the description's lock of the other mode was deleted
+        /// while the host keeps the description.
+        dropped: bool,
+    },
     /// The inode became host-decided while the caller waited: it leaves the
     /// queue and takes the host path.
     HostDecided,
@@ -696,13 +701,18 @@ struct FlockInode {
     /// The granted locks, in grant order, as Linux appends each to the inode's
     /// list (`locks_insert_lock_ctx`).
     granted: Vec<FlockGrant>,
-    /// The waiters, in the order they blocked.
-    waiters: VecDeque<FlockWaiter>,
+    /// The requests of the calls waiting on this inode, in the order they
+    /// first blocked. Each is blocked under a granted lock or another request
+    /// (its blocker), or has been woken off its blocker's list and retries in
+    /// its own turn ([`FlockWaiter::blocker`]).
+    waiters: Vec<FlockWaiter>,
     /// The kernel decides this inode for the rest of the run.
     host_decided: bool,
     /// Every later call on this inode is refused, for this reason.
     refused: Option<String>,
-    /// The processes whose exit released a lock here since the last grant.
+    /// The processes whose exit released a lock here and whose host teardown
+    /// the backend has not reported ([`LockLedger::flock_torn_down`]): every
+    /// grant's mirror may have to wait for it.
     lagging: BTreeSet<DetPid>,
 }
 
@@ -712,24 +722,48 @@ struct FlockGrant {
     mode: FlockMode,
     /// The process whose call took the lock (Linux's `flc_pid`).
     taker: DetPid,
+    /// The requests blocked under this lock, in the order they were inserted
+    /// (`flc_blocked_requests`).
+    blocked: Vec<DetTid>,
 }
 
+/// The request of a waiting call (the `struct file_lock` its
+/// `flock_lock_inode_wait` passes to each attempt).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FlockWaiter {
     thread: DetTid,
     process: DetPid,
     open_file: OpenFileId,
     mode: FlockMode,
+    /// What the request is blocked under (`flc_blocker`): `None` once a
+    /// wake-up took it off its blocker's list, until its call retries.
+    blocker: Option<FlockBlocker>,
+    /// The requests blocked under this one, in the order they were inserted.
+    blocked: Vec<DetTid>,
 }
 
-/// A waiter a release handed its lock to, whose call has not returned yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FlockGrantedWaiter {
-    process: DetPid,
-    open_file: OpenFileId,
-    /// The processes whose exit released a lock on the inode since the grant
-    /// before, whose host teardown the waiter's mirror may wait for.
-    lagging: Vec<DetPid>,
+/// What a waiting request is blocked under (`flc_blocker`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlockBlocker {
+    /// A granted lock, by the description that holds it.
+    Lock(OpenFileId),
+    /// Another waiting request, by its thread.
+    Request(DetTid),
+}
+
+/// What one attempt of `flock_lock_inode` did ([`LockLedger::flock_attempt`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlockAttempt {
+    /// Granted now.
+    Granted,
+    /// The description holds the mode asked for already.
+    AlreadyHeld,
+    /// `LOCK_UN`: released, or nothing was held.
+    Unlocked,
+    /// A conflict, and the caller asked not to wait (`EWOULDBLOCK`).
+    WouldBlock,
+    /// A conflict: the request is blocked under it (`FILE_LOCK_DEFERRED`).
+    Blocked,
 }
 
 impl FlockMode {
@@ -746,6 +780,14 @@ impl FlockMode {
 pub(crate) const FLOCK_MAPPED_RELEASE_REFUSAL: &str = "the last descriptor of an open file \
      description that held a flock lock closed while a mapping of it may remain: Linux keeps \
      the lock until the last mapping goes, which Detcore cannot place on this backend";
+
+/// Why the model refuses a call on an inode a description of which a
+/// process with a private descriptor table references, where no host lock
+/// can decide it (`LockLedger::flock_uncertain`).
+const FLOCK_PRIVATE_TABLE_REFUSAL: &str = "a process that holds, waits for or asks for a flock \
+     lock on this file has a thread with a descriptor table of its own, so Detcore cannot follow \
+     the references of its open file descriptions to place a lock's release, and on this backend \
+     no host lock can decide the file";
 
 /// Why the model refuses a call on an inode one of whose lock-holding
 /// descriptions it can no longer follow, where no host lock can decide it.
@@ -1417,7 +1459,15 @@ impl LockLedger {
     /// `exec_kept`: a backend that rediscovers its descriptor table after an
     /// exec (the in-guest backends, where no placeholder is served) names no
     /// survivor, and the exec then leaves none of them referenced.
+    ///
+    /// The exec killed the process's other threads first (`de_thread`, before
+    /// the exec unshares the table and closes its close-on-exec slots), so a
+    /// flock call any of them waited in ended with them: each request leaves
+    /// the model, as a killed waiter's `locks_delete_block` takes it out of
+    /// its blocker's list and wakes the requests blocked under it, and the
+    /// call's own reference on its description goes.
     pub(crate) fn exec(&mut self, process: DetPid) {
+        self.flock_drop_waiters(|waiter| waiter.process == process);
         for mappers in self.flock_mappers.values_mut() {
             mappers.remove(&process);
         }
@@ -1538,11 +1588,6 @@ impl LockLedger {
                     .values()
                     .flat_map(|inode| inode.waiters.iter().map(|waiter| &waiter.process)),
             )
-            .chain(
-                self.flock_granted_waiters
-                    .values()
-                    .map(|granted| &granted.process),
-            )
         {
             if !alive(*process) {
                 exiting.insert(*process);
@@ -1552,26 +1597,10 @@ impl LockLedger {
         for mappers in self.flock_mappers.values_mut() {
             mappers.retain(|process| !exiting.contains(process));
         }
-        let mut left = Vec::new();
-        for inode in self.flock_inodes.values_mut() {
-            inode.waiters.retain(|waiter| {
-                let gone = exiting.contains(&waiter.process);
-                if gone {
-                    left.push(waiter.open_file);
-                }
-                !gone
-            });
-        }
-        // A waiter killed after a release handed it its lock: the lock stays
-        // its description's, as Linux's woken waiter took it, and the call's
-        // own reference goes.
-        self.flock_granted_waiters.retain(|_, granted| {
-            let gone = exiting.contains(&granted.process);
-            if gone {
-                left.push(granted.open_file);
-            }
-            !gone
-        });
+        // A waiting call ended with its process: its request leaves the model
+        // now, and its own reference once the tables below are gone, so that
+        // the description's last reference is placed with them.
+        let left = self.flock_remove_waiters(|waiter| exiting.contains(&waiter.process));
         self.opaque.retain(|process| alive(*process));
         self.tainted.retain(|process| alive(*process));
         self.after_exec.retain(|process, _| alive(*process));
@@ -1650,6 +1679,7 @@ impl LockLedger {
     pub(crate) fn mark_private_tables(&mut self, process: DetPid) {
         self.mark_opaque(process);
         self.tainted.insert(process);
+        self.flock_tables_became_uncertain(process);
     }
 
     /// A lock or unlock went through a descriptor whose description the
@@ -1819,39 +1849,193 @@ impl FlockInode {
         Self {
             object,
             granted: Vec::new(),
-            waiters: VecDeque::new(),
+            waiters: Vec::new(),
             host_decided: false,
             refused: None,
             lagging: BTreeSet::new(),
         }
     }
 
-    /// Whether a lock of `mode` through `open_file` conflicts with a lock
-    /// another description holds (`flock_locks_conflict`: a description never
-    /// conflicts with itself). Waiters are not looked at, as
-    /// `flock_lock_inode` looks only at the granted list.
-    fn conflicts(&self, open_file: OpenFileId, mode: FlockMode) -> bool {
+    /// The description holding the first granted lock, in grant order, that a
+    /// lock of `mode` through `open_file` conflicts with
+    /// (`flock_locks_conflict`: a description never conflicts with itself, and
+    /// an exclusive lock conflicts with any other). Waiting requests are not
+    /// looked at, as `flock_lock_inode` looks only at the granted list.
+    fn first_conflict(&self, open_file: OpenFileId, mode: FlockMode) -> Option<OpenFileId> {
         self.granted
             .iter()
-            .any(|grant| grant.open_file != open_file && mode.conflicts_with(grant.mode))
+            .find(|grant| grant.open_file != open_file && mode.conflicts_with(grant.mode))
+            .map(|grant| grant.open_file)
+    }
+
+    fn waiter(&self, thread: DetTid) -> Option<&FlockWaiter> {
+        self.waiters.iter().find(|waiter| waiter.thread == thread)
+    }
+
+    fn waiter_mut(&mut self, thread: DetTid) -> Option<&mut FlockWaiter> {
+        self.waiters
+            .iter_mut()
+            .find(|waiter| waiter.thread == thread)
+    }
+
+    /// The requests blocked under `node` (`flc_blocked_requests`).
+    fn blocked_list(&self, node: FlockBlocker) -> &[DetTid] {
+        match node {
+            FlockBlocker::Lock(open_file) => self
+                .granted
+                .iter()
+                .find(|grant| grant.open_file == open_file)
+                .map_or(&[], |grant| grant.blocked.as_slice()),
+            FlockBlocker::Request(thread) => self
+                .waiter(thread)
+                .map_or(&[], |waiter| waiter.blocked.as_slice()),
+        }
+    }
+
+    fn blocked_list_mut(&mut self, node: FlockBlocker) -> Option<&mut Vec<DetTid>> {
+        match node {
+            FlockBlocker::Lock(open_file) => self
+                .granted
+                .iter_mut()
+                .find(|grant| grant.open_file == open_file)
+                .map(|grant| &mut grant.blocked),
+            FlockBlocker::Request(thread) => {
+                self.waiter_mut(thread).map(|waiter| &mut waiter.blocked)
+            }
+        }
+    }
+
+    /// Wake the requests blocked under `node` (`__locks_wake_up_blocks`):
+    /// each leaves the list, keeping the requests blocked under it, and its
+    /// call retries in its own turn.
+    fn wake_blocked_under(&mut self, node: FlockBlocker) {
+        let woken = self
+            .blocked_list_mut(node)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        for thread in woken {
+            if let Some(waiter) = self.waiter_mut(thread) {
+                waiter.blocker = None;
+            }
+        }
+    }
+
+    /// Block `thread`'s request, which is on no list, under the lock that
+    /// `first` holds, the first granted lock it conflicts with
+    /// (`__locks_insert_block`): where a request already blocked there
+    /// conflicts with it, under that request instead, and so on down, at the
+    /// tail of the list it ends at, so that no wake-up reaches it before the
+    /// requests in its way have gone. The requests that were blocked under it
+    /// are woken: they conflict with it, but perhaps not with its new
+    /// blocker.
+    fn insert_block(&mut self, thread: DetTid, first: OpenFileId) {
+        let Some((open_file, mode)) = self
+            .waiter(thread)
+            .map(|waiter| (waiter.open_file, waiter.mode))
+        else {
+            return;
+        };
+        let mut blocker = FlockBlocker::Lock(first);
+        while let Some(next) = self.blocked_list(blocker).iter().copied().find(|other| {
+            self.waiter(*other).is_some_and(|other| {
+                other.open_file != open_file && other.mode.conflicts_with(mode)
+            })
+        }) {
+            blocker = FlockBlocker::Request(next);
+        }
+        if let Some(blocked) = self.blocked_list_mut(blocker) {
+            blocked.push(thread);
+        }
+        if let Some(waiter) = self.waiter_mut(thread) {
+            waiter.blocker = Some(blocker);
+        }
+        self.wake_blocked_under(FlockBlocker::Request(thread));
+    }
+
+    /// Take `thread`'s request out of the inode, as its call's
+    /// `locks_delete_block` does when the call ends: off its blocker's list,
+    /// with the requests blocked under it woken.
+    fn remove_waiter(&mut self, thread: DetTid) -> Option<FlockWaiter> {
+        self.wake_blocked_under(FlockBlocker::Request(thread));
+        let index = self
+            .waiters
+            .iter()
+            .position(|waiter| waiter.thread == thread)?;
+        let waiter = self.waiters.remove(index);
+        if let Some(blocker) = waiter.blocker
+            && let Some(blocked) = self.blocked_list_mut(blocker)
+        {
+            blocked.retain(|other| *other != thread);
+        }
+        Some(waiter)
+    }
+
+    /// Delete the lock `open_file` holds, if it holds one, waking the requests
+    /// blocked under it (`locks_delete_lock_ctx`). Whether it held one.
+    fn delete_lock(&mut self, open_file: OpenFileId) -> bool {
+        let Some(index) = self
+            .granted
+            .iter()
+            .position(|grant| grant.open_file == open_file)
+        else {
+            return false;
+        };
+        self.wake_blocked_under(FlockBlocker::Lock(open_file));
+        self.granted.remove(index);
+        true
+    }
+
+    /// Append a lock of `mode` held through `open_file`, taken by `taker`
+    /// (`locks_insert_lock_ctx`). Where `thread`'s request waited, the
+    /// requests blocked under it are blocked under the lock now
+    /// (`locks_move_blocks`): they conflict with it as with the request.
+    fn grant(&mut self, open_file: OpenFileId, mode: FlockMode, taker: DetPid, thread: DetTid) {
+        let moved = self
+            .waiter_mut(thread)
+            .map(|waiter| std::mem::take(&mut waiter.blocked))
+            .unwrap_or_default();
+        for other in &moved {
+            if let Some(waiter) = self.waiter_mut(*other) {
+                waiter.blocker = Some(FlockBlocker::Lock(open_file));
+            }
+        }
+        self.granted.push(FlockGrant {
+            open_file,
+            mode,
+            taker,
+            blocked: moved,
+        });
     }
 }
 
 /// Detcore's model of `flock(2)` on files the kernel serves (the kvm lane's
-/// slice SP2). Linux keeps an inode's flock locks in one list, each owned by
-/// an open file description, never by a process (`flock_make_lock`,
-/// `flock_lock_inode` in fs/locks.c): a call asking for the mode its
-/// description holds changes nothing; one asking for the other mode deletes
-/// the held lock before it looks for a conflict, so a conversion is a release
-/// and an acquisition; a conflict is a lock of another description, either of
-/// them exclusive; with `LOCK_NB` a conflict fails with `EWOULDBLOCK`, and
-/// without it the caller waits. The model keeps the same list per inode,
-/// follows each description's references as the ledger follows them (a
-/// description's last reference releases its lock, as `locks_remove_file`
-/// does at the last `fput`), and hands a released lock to the waiters in the
-/// order they blocked, each one that conflicts with no granted lock, in the
-/// turn of the call that released it: the Linux schedule in which the woken
-/// waiters run in the order they blocked before any other task.
+/// slice SP2), which follows Linux's (fs/locks.c, v6.17). Linux keeps an
+/// inode's flock locks in one list, each owned by an open file description,
+/// never by a process (`flock_make_lock`). A call (`flock_lock_inode`) asking
+/// for the mode its description holds changes nothing; one asking for the
+/// other mode deletes the held lock before it looks for a conflict, so a
+/// conversion is a release and an acquisition; a conflict is a granted lock of
+/// another description, either of them exclusive; with `LOCK_NB` a conflict
+/// fails with `EWOULDBLOCK`, and without it the call's request is blocked
+/// under the first conflicting lock, below the requests already blocked there
+/// that conflict with it (`__locks_insert_block`), so that each lock heads a
+/// tree of blocked requests. Deleting a lock, by a release, a conversion or
+/// the description's last reference (`locks_remove_file`), wakes the requests
+/// blocked directly under it (`__locks_wake_up_blocks`), granting none of
+/// them: each woken call retries in its own run (`flock_lock_inode_wait`),
+/// taking the lock where nothing conflicts, the requests blocked under it
+/// following onto the lock (`locks_move_blocks`), and otherwise blocking again
+/// under the conflicting lock, at the tail, which wakes the requests blocked
+/// under it. A call that ends without the lock (a signal, its thread's death)
+/// takes its request out of the tree and wakes the requests blocked under it
+/// (`locks_delete_block`).
+///
+/// The model keeps the same list and trees per inode, follows each
+/// description's references as the ledger follows them, and makes every
+/// change in the turn of the call that causes it: a woken call's retry is its
+/// own next turn ([`LockLedger::flock_poll`]), whose order among the woken
+/// calls and every other thread's turns Detcore's scheduler decides, as the
+/// CPU scheduler decides it on Linux.
 impl LockLedger {
     /// Follow `open_file`'s references from a call through a descriptor of
     /// `process`'s table, `slots` of which name it, without touching the locks
@@ -1861,7 +2045,79 @@ impl LockLedger {
         self.set_references(open_file, table, slots);
     }
 
-    /// A `flock` through `request.open_file` by `thread` of `process`.
+    /// Whether a granted lock on `key`'s inode that `request` could conflict
+    /// with belongs to another description a table of a process with a
+    /// private descriptor table references ([`Self::referenced_by_tainted`]):
+    /// whether it is still held is unknown, its last reference may have gone
+    /// with a table the ledger cannot follow.
+    fn flock_conflicts_uncertain(&self, key: FlockInodeKey, request: &FlockRequest) -> bool {
+        let Some(mode) = request.mode else {
+            return false;
+        };
+        self.flock_inodes.get(&key).is_some_and(|inode| {
+            inode.granted.iter().any(|grant| {
+                grant.open_file != request.open_file
+                    && mode.conflicts_with(grant.mode)
+                    && self.referenced_by_tainted(grant.open_file)
+            })
+        })
+    }
+
+    /// `key`'s inode can no longer be decided from the model: the kernel
+    /// decides it for the rest of the run where the backend's descriptors are
+    /// host descriptions (every lock the model granted on it is mirrored
+    /// there), and every later call on it is refused by name where they are
+    /// not.
+    fn flock_uncertain(&mut self, key: FlockInodeKey) {
+        let host_fallback = self.flock_host_fallback;
+        if let Some(inode) = self.flock_inodes.get_mut(&key) {
+            if host_fallback {
+                inode.host_decided = true;
+            } else {
+                inode
+                    .refused
+                    .get_or_insert_with(|| FLOCK_PRIVATE_TABLE_REFUSAL.to_owned());
+            }
+        }
+    }
+
+    /// `process` has just become one whose tables the ledger cannot tell
+    /// apart ([`Self::mark_private_tables`]): every inode on which a
+    /// description its tables reference holds or waits for a lock leaves the
+    /// model ([`Self::flock_uncertain`]), so that no waiter waits for a release
+    /// the model cannot place and no answer rests on one.
+    fn flock_tables_became_uncertain(&mut self, process: DetPid) {
+        let referenced = |ledger: &Self, open_file: OpenFileId| {
+            ledger.references.get(&open_file).is_some_and(|tables| {
+                tables.keys().any(|table| {
+                    ledger
+                        .owners
+                        .get(table)
+                        .is_some_and(|owners| owners.contains(&process))
+                })
+            })
+        };
+        let keys = self
+            .flock_inodes
+            .iter()
+            .filter(|(_, inode)| !inode.host_decided && inode.refused.is_none())
+            .filter(|(_, inode)| {
+                inode
+                    .granted
+                    .iter()
+                    .map(|grant| grant.open_file)
+                    .chain(inode.waiters.iter().map(|waiter| waiter.open_file))
+                    .any(|open_file| referenced(self, open_file))
+            })
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.flock_uncertain(key);
+        }
+    }
+
+    /// A `flock` through `request.open_file` by `thread` of `process`: its
+    /// first attempt ([`Self::flock_attempt`]).
     pub(crate) fn flock(
         &mut self,
         process: DetPid,
@@ -1869,18 +2125,21 @@ impl LockLedger {
         request: FlockRequest,
     ) -> FlockOutcome {
         self.flock_host_fallback = request.host_fallback;
-        if request.mode.is_some() && self.tainted.contains(&process) {
-            return FlockOutcome::Refused(
-                "a thread of the caller's process has a descriptor table of its own, so \
-                 Detcore cannot follow this open file description's references"
-                    .to_owned(),
-            );
-        }
         let key = request.inode;
-        let inode = self
-            .flock_inodes
+        self.flock_inodes
             .entry(key)
             .or_insert_with(|| FlockInode::new(request.object.clone()));
+        // A process whose tables the ledger cannot tell apart ([`Self::tainted`])
+        // may hold a reference the ledger never sees go: the inode's answers
+        // would rest on a release the model cannot place, so they are the
+        // kernel's from now on, or refused by name where no host lock can
+        // decide them. So when the caller is such a process, and when a lock it
+        // could conflict with belongs to a description such a process's tables
+        // reference.
+        if self.tainted.contains(&process) || self.flock_conflicts_uncertain(key, &request) {
+            self.flock_uncertain(key);
+        }
+        let inode = self.flock_inodes.get(&key).expect("inserted above");
         if let Some(reason) = &inode.refused {
             return FlockOutcome::Refused(reason.clone());
         }
@@ -1896,167 +2155,205 @@ impl LockLedger {
                 .or_default()
                 .insert(process);
         }
-        let inode = self.flock_inodes.get_mut(&key).expect("inserted above");
+        // A thread waits in one call at a time: a request left under its number
+        // by a thread that is gone is no longer anyone's.
+        self.flock_drop_waiters(|waiter| waiter.thread == thread);
+        let (attempt, dropped) = self.flock_attempt(
+            key,
+            thread,
+            process,
+            open_file,
+            request.mode,
+            request.nonblocking,
+        );
+        match attempt {
+            FlockAttempt::Granted => FlockOutcome::Granted {
+                lagging: self.flock_lagging(key),
+            },
+            FlockAttempt::AlreadyHeld => FlockOutcome::Granted {
+                lagging: Vec::new(),
+            },
+            FlockAttempt::Unlocked => FlockOutcome::Released,
+            FlockAttempt::WouldBlock => FlockOutcome::WouldBlock { dropped },
+            FlockAttempt::Blocked => FlockOutcome::Queued { dropped },
+        }
+    }
+
+    /// One attempt of `flock_lock_inode` on `key`'s inode, which the caller
+    /// keeps in the model, by the call of `thread` of `process` through
+    /// `open_file`, asking for `mode` (`None` for `LOCK_UN`): the call's first,
+    /// or the retry of its woken request. The same mode as the description
+    /// holds is held already; another mode, or `LOCK_UN`, deletes the held
+    /// lock first (`dropped`), waking the requests blocked under it; then the
+    /// lock is granted where no granted lock of another description conflicts,
+    /// and otherwise `LOCK_NB` fails and a blocking call's request is blocked
+    /// under the first conflicting lock.
+    fn flock_attempt(
+        &mut self,
+        key: FlockInodeKey,
+        thread: DetTid,
+        process: DetPid,
+        open_file: OpenFileId,
+        mode: Option<FlockMode>,
+        nonblocking: bool,
+    ) -> (FlockAttempt, bool) {
+        let inode = self
+            .flock_inodes
+            .get_mut(&key)
+            .expect("the caller keeps the inode");
         let held = inode
             .granted
             .iter()
-            .position(|grant| grant.open_file == open_file);
-        let Some(mode) = request.mode else {
-            if let Some(index) = held {
-                inode.granted.remove(index);
-                self.flock_hand_off(key);
-            }
-            return FlockOutcome::Released;
-        };
-        let mut dropped = false;
-        if let Some(index) = held {
-            if inode.granted[index].mode == mode {
-                return FlockOutcome::Granted {
-                    lagging: Vec::new(),
-                };
-            }
-            // The conversion deletes the held lock first (`flock_lock_inode`).
-            inode.granted.remove(index);
-            dropped = true;
+            .find(|grant| grant.open_file == open_file)
+            .map(|grant| grant.mode);
+        if held.is_some() && held == mode {
+            return (FlockAttempt::AlreadyHeld, false);
         }
-        let outcome = if !inode.conflicts(open_file, mode) {
-            inode.granted.push(FlockGrant {
-                open_file,
-                mode,
-                taker: process,
-            });
-            FlockOutcome::Granted {
-                lagging: std::mem::take(&mut inode.lagging).into_iter().collect(),
-            }
-        } else if request.nonblocking {
-            FlockOutcome::WouldBlock { dropped }
-        } else {
-            inode.waiters.push_back(FlockWaiter {
-                thread,
-                process,
-                open_file,
-                mode,
-            });
-            FlockOutcome::Queued { dropped }
+        let dropped = inode.delete_lock(open_file);
+        let Some(mode) = mode else {
+            return (FlockAttempt::Unlocked, dropped);
         };
-        if dropped {
-            self.flock_hand_off(key);
-        }
-        outcome
+        let attempt = match inode.first_conflict(open_file, mode) {
+            None => {
+                inode.grant(open_file, mode, process, thread);
+                FlockAttempt::Granted
+            }
+            Some(_) if nonblocking => FlockAttempt::WouldBlock,
+            Some(first) => {
+                if inode.waiter(thread).is_none() {
+                    inode.waiters.push(FlockWaiter {
+                        thread,
+                        process,
+                        open_file,
+                        mode,
+                        blocker: None,
+                        blocked: Vec::new(),
+                    });
+                }
+                inode.insert_block(thread, first);
+                FlockAttempt::Blocked
+            }
+        };
+        (attempt, dropped)
     }
 
-    /// Hand the locks of `key`'s inode to its waiters, in the order they
-    /// blocked: each waiter whose mode conflicts with no granted lock takes
-    /// its lock, after any lock of the other mode its own description holds.
-    fn flock_hand_off(&mut self, key: FlockInodeKey) {
-        let Some(inode) = self.flock_inodes.get_mut(&key) else {
-            return;
-        };
-        if inode.host_decided || inode.refused.is_some() {
-            return;
-        }
-        let mut granted: Vec<(DetTid, DetPid, OpenFileId)> = Vec::new();
-        let mut index = 0;
-        while index < inode.waiters.len() {
-            let waiter = &inode.waiters[index];
-            if inode.conflicts(waiter.open_file, waiter.mode) {
-                index += 1;
-                continue;
-            }
-            let waiter = inode.waiters.remove(index).expect("in range");
+    /// The processes whose exit released a lock on `key`'s inode and whose
+    /// host teardown has not been reported: a grant's mirror may have to wait
+    /// for it.
+    fn flock_lagging(&self, key: FlockInodeKey) -> Vec<DetPid> {
+        self.flock_inodes.get(&key).map_or_else(Vec::new, |inode| {
             inode
-                .granted
-                .retain(|grant| grant.open_file != waiter.open_file);
-            inode.granted.push(FlockGrant {
-                open_file: waiter.open_file,
-                mode: waiter.mode,
-                taker: waiter.process,
-            });
-            granted.push((waiter.thread, waiter.process, waiter.open_file));
-        }
-        if granted.is_empty() {
-            return;
-        }
-        let lagging: Vec<DetPid> = std::mem::take(&mut inode.lagging).into_iter().collect();
-        for (thread, process, open_file) in granted {
-            self.flock_granted_waiters.insert(
-                thread,
-                FlockGrantedWaiter {
-                    process,
-                    open_file,
-                    lagging: lagging.clone(),
-                },
-            );
-        }
+                .lagging
+                .iter()
+                .copied()
+                .filter(|process| !self.flock_torn_down.contains(process))
+                .collect()
+        })
     }
 
-    /// Where `thread`'s queued `flock` stands, in its own turn.
+    /// One turn of `thread`'s waiting `flock` call. While its request is
+    /// blocked, it goes on waiting. Once a wake-up took the request off its
+    /// blocker's list, this turn is its retry ([`Self::flock_attempt`]):
+    /// granted, the call returns with its lock, the requests still blocked
+    /// under its request are woken (`locks_delete_block` at the end of
+    /// `flock_lock_inode_wait`), and its own reference on the description
+    /// goes; in conflict, the request is blocked again.
     pub(crate) fn flock_poll(&mut self, thread: DetTid) -> FlockPoll {
-        if let Some(granted) = self.flock_granted_waiters.remove(&thread) {
-            // The call returns with its lock; its own reference goes with it.
-            self.flock_waiter_left(granted.open_file);
-            return FlockPoll::Granted {
-                lagging: granted.lagging,
-            };
-        }
-        let Some((key, index)) = self.flock_waiter(thread) else {
+        let Some(key) = self.flock_waiter_inode(thread) else {
             return FlockPoll::Refused(
                 "the caller's queued flock is no longer in Detcore's model".to_owned(),
             );
         };
         let inode = self.flock_inodes.get_mut(&key).expect("found above");
-        if inode.refused.is_none() && !inode.host_decided {
-            return FlockPoll::Waiting;
+        if inode.refused.is_some() || inode.host_decided {
+            let poll = match &inode.refused {
+                Some(reason) => FlockPoll::Refused(reason.clone()),
+                None => FlockPoll::HostDecided,
+            };
+            if let Some(waiter) = inode.remove_waiter(thread) {
+                self.flock_waiter_left(waiter.open_file);
+            }
+            return poll;
         }
-        let waiter = inode.waiters.remove(index).expect("in range");
-        let poll = match &inode.refused {
-            Some(reason) => FlockPoll::Refused(reason.clone()),
-            None => FlockPoll::HostDecided,
+        let waiter = inode.waiter(thread).expect("found above");
+        if waiter.blocker.is_some() {
+            return FlockPoll::Waiting { dropped: false };
+        }
+        let (process, open_file, mode) = (waiter.process, waiter.open_file, waiter.mode);
+        let (attempt, dropped) =
+            self.flock_attempt(key, thread, process, open_file, Some(mode), false);
+        let lagging = match attempt {
+            FlockAttempt::Blocked => {
+                // A lock the retry deleted is the host's too only while a table,
+                // a copy in flight or a mapping keeps the description: the
+                // host's description went with its last descriptor otherwise.
+                let host_keeps = self.references.contains_key(&open_file)
+                    || self.in_flight.contains_key(&open_file)
+                    || self.flock_mappers.contains_key(&open_file);
+                return FlockPoll::Waiting {
+                    dropped: dropped && host_keeps,
+                };
+            }
+            FlockAttempt::Granted => self.flock_lagging(key),
+            _ => Vec::new(),
         };
-        self.flock_waiter_left(waiter.open_file);
-        poll
+        self.flock_drop_waiters(|waiter| waiter.thread == thread);
+        FlockPoll::Granted { lagging }
     }
 
-    /// `thread`'s queued `flock` ends without returning a lock, at a signal:
-    /// it leaves the queue. Where a release had already handed it its lock,
-    /// which the call then returns (`Ok(0)`), as Linux's woken waiter takes
-    /// the lock before it acts on the signal, the processes whose teardown
-    /// its mirror may wait for (as [`FlockPoll::Granted`]).
-    pub(crate) fn flock_cancel(&mut self, thread: DetTid) -> Option<Vec<DetPid>> {
-        if let Some(granted) = self.flock_granted_waiters.remove(&thread) {
-            self.flock_waiter_left(granted.open_file);
-            return Some(granted.lagging);
-        }
-        if let Some((key, index)) = self.flock_waiter(thread) {
-            let inode = self.flock_inodes.get_mut(&key).expect("found above");
-            let waiter = inode.waiters.remove(index).expect("in range");
-            self.flock_waiter_left(waiter.open_file);
-        }
-        None
+    /// `thread`'s waiting `flock` call ends without a lock, at a signal: its
+    /// request leaves the model, as its `locks_delete_block` takes it out of
+    /// its blocker's list and wakes the requests blocked under it, and its own
+    /// reference on the description goes.
+    pub(crate) fn flock_cancel(&mut self, thread: DetTid) {
+        self.flock_drop_waiters(|waiter| waiter.thread == thread);
     }
 
-    fn flock_waiter(&self, thread: DetTid) -> Option<(FlockInodeKey, usize)> {
-        self.flock_inodes.iter().find_map(|(key, inode)| {
-            inode
+    /// The inode `thread`'s waiting request is kept on.
+    fn flock_waiter_inode(&self, thread: DetTid) -> Option<FlockInodeKey> {
+        self.flock_inodes
+            .iter()
+            .find(|(_, inode)| inode.waiter(thread).is_some())
+            .map(|(key, _)| *key)
+    }
+
+    /// Take every waiting request that `gone` selects out of the model
+    /// ([`FlockInode::remove_waiter`]), returning the descriptions whose calls
+    /// they were, whose own references are to go.
+    fn flock_remove_waiters(&mut self, gone: impl Fn(&FlockWaiter) -> bool) -> Vec<OpenFileId> {
+        let mut left = Vec::new();
+        for inode in self.flock_inodes.values_mut() {
+            let threads = inode
                 .waiters
                 .iter()
-                .position(|waiter| waiter.thread == thread)
-                .map(|index| (*key, index))
-        })
+                .filter(|waiter| gone(waiter))
+                .map(|waiter| waiter.thread)
+                .collect::<Vec<_>>();
+            for thread in threads {
+                if let Some(waiter) = inode.remove_waiter(thread) {
+                    left.push(waiter.open_file);
+                }
+            }
+        }
+        left
+    }
+
+    /// [`Self::flock_remove_waiters`], and each call's own reference goes.
+    fn flock_drop_waiters(&mut self, gone: impl Fn(&FlockWaiter) -> bool) {
+        for open_file in self.flock_remove_waiters(gone) {
+            self.flock_waiter_left(open_file);
+        }
     }
 
     /// Whether a waiting call, which holds its own reference on the
     /// description, still names `open_file`.
     fn flock_waited_on(&self, open_file: OpenFileId) -> bool {
-        self.flock_granted_waiters
-            .values()
-            .any(|granted| granted.open_file == open_file)
-            || self.flock_inodes.values().any(|inode| {
-                inode
-                    .waiters
-                    .iter()
-                    .any(|waiter| waiter.open_file == open_file)
-            })
+        self.flock_inodes.values().any(|inode| {
+            inode
+                .waiters
+                .iter()
+                .any(|waiter| waiter.open_file == open_file)
+        })
     }
 
     /// A waiter on `open_file` left its call: if no table, copy in flight or
@@ -2072,11 +2369,11 @@ impl LockLedger {
     }
 
     /// `open_file`'s last table reference and last copy in flight are gone:
-    /// its `flock` locks go, as Linux's last `fput` releases them
-    /// (`locks_remove_file`), unless a waiting call or a mapping still holds
-    /// the description. A mapping the model cannot place the end of makes the
-    /// inode host-decided where the kernel can decide it, and refused by name
-    /// where it cannot.
+    /// its `flock` lock goes, as Linux's last `fput` releases it
+    /// (`locks_remove_file`), waking the requests blocked under it, unless a
+    /// waiting call still holds the description. A mapping the model cannot
+    /// place the end of makes the inode host-decided where the kernel can
+    /// decide it, and refused by name where it cannot.
     fn flock_last_reference(&mut self, open_file: OpenFileId) {
         let Some(key) = self.flock_inode_of.get(&open_file).copied() else {
             return;
@@ -2094,17 +2391,13 @@ impl LockLedger {
             .collect::<Vec<_>>();
         self.flock_inode_of.remove(&open_file);
         let host_fallback = self.flock_host_fallback;
+        let torn_down = &self.flock_torn_down;
         let Some(inode) = self.flock_inodes.get_mut(&key) else {
             return;
         };
-        let held = inode
-            .granted
-            .iter()
-            .any(|grant| grant.open_file == open_file);
-        if !held {
+        if !inode.delete_lock(open_file) {
             return;
         }
-        inode.granted.retain(|grant| grant.open_file != open_file);
         if !mappers.is_empty() {
             if host_fallback {
                 inode.host_decided = true;
@@ -2115,8 +2408,11 @@ impl LockLedger {
             }
             return;
         }
-        inode.lagging.extend(exiting);
-        self.flock_hand_off(key);
+        inode.lagging.extend(
+            exiting
+                .into_iter()
+                .filter(|process| !torn_down.contains(process)),
+        );
     }
 
     /// Why closing a descriptor of `process`'s table, after which `remaining`
@@ -2125,9 +2421,12 @@ impl LockLedger {
     /// close would drop the description's last reference while a mapping of
     /// it may remain, another process's, or the caller's own (`mapped`), which
     /// its memory map still shows (`maps_inode`). `None` when the close may
-    /// go on.
+    /// go on: then a mapping of the caller's own that its memory map no longer
+    /// shows (an `munmap`, which the model does not follow) holds the
+    /// description no longer, so that the close releases the lock, waking its
+    /// waiters (`flock_last_reference`).
     pub(crate) fn flock_close_refusal(
-        &self,
+        &mut self,
         process: DetPid,
         open_file: OpenFileId,
         remaining: u32,
@@ -2160,7 +2459,16 @@ impl LockLedger {
             .flock_mappers
             .get(&open_file)
             .is_some_and(|mappers| mappers.iter().any(|mapper| *mapper != process));
-        (others || (mapped && maps_inode)).then(|| FLOCK_MAPPED_RELEASE_REFUSAL.to_owned())
+        if others || (mapped && maps_inode) {
+            return Some(FLOCK_MAPPED_RELEASE_REFUSAL.to_owned());
+        }
+        if let Some(mappers) = self.flock_mappers.get_mut(&open_file) {
+            mappers.remove(&process);
+            if mappers.is_empty() {
+                self.flock_mappers.remove(&open_file);
+            }
+        }
+        None
     }
 
     /// `process` maps `open_file`, a description the model follows (an mmap
@@ -2234,6 +2542,9 @@ impl LockLedger {
     /// exit, which the backend's report follows).
     pub(crate) fn flock_torn_down(&mut self, process: DetPid) {
         self.flock_torn_down.insert(process);
+        for inode in self.flock_inodes.values_mut() {
+            inode.lagging.remove(&process);
+        }
     }
 
     /// The lock the flock model holds through `open_file`, with its taker,
@@ -2291,16 +2602,15 @@ impl LockLedger {
             .collect()
     }
 
-    /// The rows of `inode`'s granted locks and waiters: each granted lock
-    /// whose taker `listed` says the reader's PID namespace has (a lock Linux
-    /// shows with pid 0 is left out, with its waiters, as `locks_show` skips a
-    /// lock whose pid it cannot translate), in grant order, each followed by
-    /// the tree of the waiters blocked on it, at their depths. Linux blocks a
-    /// waiter on the first granted lock it conflicts with and, below it, on the
-    /// first earlier waiter it conflicts with (`flock_lock_inode`,
-    /// `__locks_insert_block`), so the tree is rebuilt here from the grant
-    /// order and the order the waiters blocked in. A row's owner is its
-    /// process's number, or 0 where `listed` says the reader cannot see it.
+    /// The rows of `inode`'s granted locks and waiting requests: each granted
+    /// lock whose taker `listed` says the reader's PID namespace has (a lock
+    /// Linux shows with pid 0 is left out, with its waiters, as `locks_show`
+    /// skips a lock whose pid it cannot translate), in grant order, each
+    /// followed by the tree of the requests blocked under it, depth first, in
+    /// list order, at their depths, as `locks_show` walks it. A woken request,
+    /// on no list until its call retries, is not shown, nor are the requests
+    /// still blocked under it, as on Linux. A row's owner is its process's
+    /// number, or 0 where `listed` says the reader cannot see it.
     fn flock_inode_rows(
         inode: &FlockInode,
         listed: &dyn Fn(DetPid) -> bool,
@@ -2317,62 +2627,37 @@ impl LockLedger {
             start: "0".to_owned(),
             end: "EOF".to_owned(),
         };
-        // The tree: a node per granted lock and per waiter, each with its
-        // children in the order they were inserted.
-        let granted = inode.granted.len();
-        let mut children: Vec<Vec<usize>> = vec![Vec::new(); granted + inode.waiters.len()];
-        let mode_of = |node: usize| {
-            if node < granted {
-                inode.granted[node].mode
+        let owner = |process: DetPid| {
+            if listed(process) {
+                i64::from(process.as_raw())
             } else {
-                inode.waiters[node - granted].mode
+                0
             }
         };
-        let open_file_of = |node: usize| {
-            if node < granted {
-                inode.granted[node].open_file
-            } else {
-                inode.waiters[node - granted].open_file
-            }
-        };
-        let conflicts = |left: usize, right: usize| {
-            open_file_of(left) != open_file_of(right)
-                && mode_of(left).conflicts_with(mode_of(right))
-        };
-        for waiter in granted..granted + inode.waiters.len() {
-            let Some(mut blocker) = (0..granted).find(|grant| conflicts(*grant, waiter)) else {
-                continue;
-            };
-            while let Some(next) = children[blocker]
-                .iter()
-                .copied()
-                .find(|child| conflicts(*child, waiter))
-            {
-                blocker = next;
-            }
-            children[blocker].push(waiter);
-        }
         let mut rows = Vec::new();
-        for grant in 0..granted {
-            if !listed(inode.granted[grant].taker) {
+        for grant in &inode.granted {
+            if !listed(grant.taker) {
                 continue;
             }
-            let mut stack = vec![(grant, 0_u32)];
-            while let Some((node, depth)) = stack.pop() {
-                let taker = if node < granted {
-                    inode.granted[node].taker
-                } else {
-                    inode.waiters[node - granted].process
+            rows.push((lock(grant.mode), owner(grant.taker), 0));
+            let mut stack = grant
+                .blocked
+                .iter()
+                .rev()
+                .map(|thread| (*thread, 1_u32))
+                .collect::<Vec<_>>();
+            while let Some((thread, depth)) = stack.pop() {
+                let Some(waiter) = inode.waiter(thread) else {
+                    continue;
                 };
-                let owner = if listed(taker) {
-                    i64::from(taker.as_raw())
-                } else {
-                    0
-                };
-                rows.push((lock(mode_of(node)), owner, depth));
-                for child in children[node].iter().rev() {
-                    stack.push((*child, depth + 1));
-                }
+                rows.push((lock(waiter.mode), owner(waiter.process), depth));
+                stack.extend(
+                    waiter
+                        .blocked
+                        .iter()
+                        .rev()
+                        .map(|thread| (*thread, depth + 1)),
+                );
             }
         }
         rows
@@ -2390,55 +2675,117 @@ impl LockLedger {
     /// takers' turns, and a mirror the host keeps after the model released
     /// the lock (a holder's exit, before its teardown) is not a row.
     ///
-    /// The capture spells a decided inode as its object where a row (of any
-    /// class) has it, and otherwise as the one object the rows with its inode
-    /// number have, as the device a `stat` reports, which keys the model, can
+    /// Only the FLOCK rows the guest owns can be the model's mirrors, so only
+    /// they spell an inode: a row the guest does not own (an outside
+    /// process's, whose presence is host timing) never does. The capture
+    /// spells a decided inode as its own object where such a row has it, and
+    /// otherwise, as the device a `stat` reports, which keys the model, can
     /// differ from the superblock's that `/proc/locks` prints (a btrfs
-    /// subvolume's); where no row, or rows of several objects, have that
-    /// number, the capture does not spell it. The FLOCK rows dropped are those
+    /// subvolume's), as the one object of the such rows with its inode number
+    /// that no other decided inode spells exactly, those whose owner is one of
+    /// the inode's takers first. Where those rows name several objects, or two
+    /// decided inodes would take one object, which row is whose cannot be told,
+    /// and the snapshot is refused by name (`Err`) rather than show a lock
+    /// twice or another file's as the guest's. Where no such row has the
+    /// number, the model's spelling is used. The FLOCK rows dropped are those
     /// of a spelled inode, and a replacement row is spelled the same way, so
-    /// one file stays one object, or as the model spells it. Its owner is the
-    /// kernel's number for its process (`kernel_pid`), or 0 where `listed`
-    /// says the reader cannot see it. Each granted lock and its waiters take a
-    /// sequence number after the capture's last.
+    /// one file stays one object. Its owner is the kernel's number for its
+    /// process (`kernel_pid`), or 0 where `listed` says the reader cannot see
+    /// it. Each granted lock and its waiters take a sequence number after the
+    /// capture's last.
     pub(crate) fn flock_kernel_rows(
         &self,
         rows: &[LockRowFacts],
         keep: &mut [bool],
         listed: &dyn Fn(DetPid) -> bool,
         kernel_pid: &dyn Fn(DetPid) -> Option<i64>,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>, String> {
         let decided = self
             .flock_inodes
             .values()
             .filter(|inode| !inode.host_decided && inode.refused.is_none())
             .collect::<Vec<_>>();
         if decided.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        // How the capture spells each decided inode: its own object where a
-        // row has it; otherwise the one object the rows with its inode number
-        // spell, unless no row or rows of several objects have that number.
         let inode_number = |object: &str| object.rsplit(':').next().map(str::to_owned);
+        // The rows that can be the model's mirrors: FLOCK rows the guest owns.
+        let mirrors = rows
+            .iter()
+            .enumerate()
+            .filter(|(index, row)| {
+                keep.get(*index).copied().unwrap_or(false) && row.lock.is_flock()
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        // An inode's own object first; an object one inode spells exactly is
+        // no other inode's.
         let mut spelled: BTreeMap<usize, String> = BTreeMap::new();
         for (index, inode) in decided.iter().enumerate() {
-            if rows.iter().any(|row| row.lock.object == inode.object) {
+            if mirrors
+                .iter()
+                .any(|row| rows[*row].lock.object == inode.object)
+            {
                 spelled.insert(index, inode.object.clone());
+            }
+        }
+        let exact = spelled.values().cloned().collect::<BTreeSet<_>>();
+        let mut takers_of: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (index, inode) in decided.iter().enumerate() {
+            if spelled.contains_key(&index) {
                 continue;
             }
             let number = inode_number(&inode.object);
-            let objects = rows
+            let same_number = mirrors
                 .iter()
-                .filter(|row| inode_number(&row.lock.object) == number)
-                .map(|row| row.lock.object.clone())
+                .copied()
+                .filter(|row| {
+                    inode_number(&rows[*row].lock.object) == number
+                        && !exact.contains(&rows[*row].lock.object)
+                })
+                .collect::<Vec<_>>();
+            let takers = inode
+                .granted
+                .iter()
+                .filter_map(|grant| kernel_pid(grant.taker))
                 .collect::<BTreeSet<_>>();
-            if objects.len() == 1 {
-                spelled.insert(index, objects.into_iter().next().unwrap_or_default());
+            let taken = same_number
+                .iter()
+                .copied()
+                .filter(|row| takers.contains(&rows[*row].owner))
+                .collect::<Vec<_>>();
+            let candidates = if taken.is_empty() { same_number } else { taken };
+            let objects = candidates
+                .iter()
+                .map(|row| rows[*row].lock.object.clone())
+                .collect::<BTreeSet<_>>();
+            if objects.len() > 1 {
+                return Err(format!(
+                    "the guest's flock rows name {} files with inode number {}, and Detcore \
+                     cannot tell which of them is the file its model locks ({}), whose device \
+                     /proc/locks may spell otherwise",
+                    objects.len(),
+                    number.unwrap_or_default(),
+                    inode.object
+                ));
+            }
+            if let Some(object) = objects.into_iter().next() {
+                takers_of.entry(object.clone()).or_default().push(index);
+                spelled.insert(index, object);
             }
         }
-        for (row, kept) in rows.iter().zip(keep.iter_mut()) {
-            if row.lock.is_flock() && spelled.values().any(|object| *object == row.lock.object) {
-                *kept = false;
+        if let Some((object, _)) = takers_of.iter().find(|(_, inodes)| inodes.len() > 1) {
+            return Err(format!(
+                "two files Detcore's flock model locks would both be the guest's row file \
+                 {object}, and Detcore cannot tell which it is"
+            ));
+        }
+        for row in &mirrors {
+            if spelled
+                .values()
+                .any(|object| *object == rows[*row].lock.object)
+            {
+                keep[*row] = false;
             }
         }
         let mut sequence = rows
@@ -2472,7 +2819,7 @@ impl LockLedger {
                 ));
             }
         }
-        lines
+        Ok(lines)
     }
 }
 
@@ -4316,6 +4663,96 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         }
     }
 
+    /// A poll of a call still blocked, or blocked again.
+    const WAITING: FlockPoll = FlockPoll::Waiting { dropped: false };
+
+    /// A poll whose retry took the lock, naming `lagging`.
+    fn granted_poll(lagging: &[DetPid]) -> FlockPoll {
+        FlockPoll::Granted {
+            lagging: lagging.to_vec(),
+        }
+    }
+
+    /// A process with a thread whose descriptor table is its own
+    /// (`LockLedger::mark_private_tables`) may drop a description's last
+    /// reference where the ledger cannot see it. So an inode on which a
+    /// description its tables reference holds or waits for a lock leaves the
+    /// model at once: a waiter takes the host path, and a fresh request is the
+    /// kernel's, which knows whether the lock is still held, where the model
+    /// would answer from a reference that may be gone (Codex review of slice
+    /// SP2: after every real reference closed, a fresh opener got
+    /// EWOULDBLOCK).
+    #[test]
+    fn a_private_table_makes_its_locks_inodes_the_kernels() {
+        let [parent, waiter, opener] = [3, 4, 5].map(DetPid::from_raw);
+        let mut ledger = LockLedger::default();
+        assert_eq!(
+            ledger.flock(parent, parent, flock_request(description(0), EX, false)),
+            granted()
+        );
+        assert_eq!(
+            ledger.flock(waiter, waiter, flock_request(description(1), EX, false)),
+            FlockOutcome::Queued { dropped: false }
+        );
+        ledger.mark_private_tables(parent);
+        assert_eq!(ledger.flock_poll(waiter), FlockPoll::HostDecided);
+        assert_eq!(
+            ledger.flock(opener, opener, flock_request(description(2), EX, true)),
+            FlockOutcome::HostDecided
+        );
+        assert!(flock_rows_of(&ledger).is_empty());
+    }
+
+    /// The same where no host lock can decide the file (KVM), refused by name;
+    /// and a caller with a private table is never answered from the model.
+    #[test]
+    fn a_private_table_refuses_its_locks_inodes_without_a_host_lock() {
+        let [parent, opener] = [3, 5].map(DetPid::from_raw);
+        let mut ledger = LockLedger::default();
+        let request = |open_file, mode| FlockRequest {
+            host_fallback: false,
+            ..flock_request(open_file, mode, true)
+        };
+        assert_eq!(
+            ledger.flock(parent, parent, request(description(0), EX)),
+            granted()
+        );
+        ledger.mark_private_tables(parent);
+        assert_eq!(
+            ledger.flock(opener, opener, request(description(2), EX)),
+            FlockOutcome::Refused(FLOCK_PRIVATE_TABLE_REFUSAL.to_owned())
+        );
+        let mut ledger = LockLedger::default();
+        ledger.mark_private_tables(parent);
+        assert_eq!(
+            ledger.flock(parent, parent, request(description(0), SH)),
+            FlockOutcome::Refused(FLOCK_PRIVATE_TABLE_REFUSAL.to_owned())
+        );
+    }
+
+    /// A lock whose description a private-table process's tables reference,
+    /// whichever process took it, answers no conflicting request from the
+    /// model; a request it cannot conflict with is the model's as before.
+    #[test]
+    fn a_conflict_with_a_description_a_private_table_references_is_the_kernels() {
+        let [holder, private, opener] = [3, 6, 5].map(DetPid::from_raw);
+        let mut ledger = LockLedger::default();
+        assert_eq!(
+            ledger.flock(holder, holder, flock_request(description(0), SH, false)),
+            granted()
+        );
+        ledger.mark_private_tables(private);
+        ledger.follow(private, description(0), 1);
+        assert_eq!(
+            ledger.flock(opener, opener, flock_request(description(2), SH, true)),
+            granted()
+        );
+        assert_eq!(
+            ledger.flock(opener, opener, flock_request(description(3), EX, true)),
+            FlockOutcome::HostDecided
+        );
+    }
+
     /// `flock_lock_inode`: a description never conflicts with itself, the
     /// same mode again changes nothing, and an exclusive lock conflicts with
     /// any other description's lock; `LOCK_NB` fails with `EWOULDBLOCK`.
@@ -4377,23 +4814,21 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
             flock_rows_of(&ledger),
             [row("READ", 3, 0), row("WRITE", 4, 1)]
         );
-        assert_eq!(ledger.flock_poll(b), FlockPoll::Waiting);
+        assert_eq!(ledger.flock_poll(b), WAITING);
         ledger.flock(a, a, flock_request(description(0), UN, false));
-        assert_eq!(
-            ledger.flock_poll(b),
-            FlockPoll::Granted {
-                lagging: Vec::new()
-            }
-        );
+        assert_eq!(ledger.flock_poll(b), granted_poll(&[]));
         assert_eq!(flock_rows_of(&ledger), [row("WRITE", 4, 0)]);
     }
 
-    /// A release hands the lock, in the releaser's turn, to the waiters in
-    /// the order they blocked, each that conflicts with no granted lock: a
-    /// shared waiter queued behind an exclusive one is granted with the
-    /// shared waiters before it, the exclusive one waits.
+    /// A release grants nothing: it wakes the requests blocked directly under
+    /// the lock (`__locks_wake_up_blocks`), each of which retries in its own
+    /// call's turn, taking the lock where nothing conflicts, with the requests
+    /// blocked under it following onto the lock (`locks_move_blocks`). A
+    /// request blocked under another stays blocked, and a woken request shows
+    /// in no row until its retry, as Linux's `/proc/locks` walks only the
+    /// trees under granted locks.
     #[test]
-    fn a_release_hands_off_in_blocking_order() {
+    fn a_release_wakes_its_waiters_to_retry_in_their_own_turns() {
         let [h, w1, w2, w3, w4] = [3, 4, 5, 6, 7].map(DetPid::from_raw);
         let mut ledger = LockLedger::default();
         ledger.flock(h, h, flock_request(description(0), EX, false));
@@ -4419,41 +4854,231 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
             ]
         );
         ledger.flock(h, h, flock_request(description(0), UN, false));
-        assert_eq!(ledger.flock_poll(w2), FlockPoll::Waiting);
+        // Woken, w1 and w3 are on no list until they retry, w2 and w4 with
+        // them under w1: no row.
+        assert!(flock_rows_of(&ledger).is_empty());
+        assert_eq!(ledger.flock_poll(w2), WAITING);
+        assert_eq!(ledger.flock_poll(w3), granted_poll(&[]));
+        assert_eq!(flock_rows_of(&ledger), [row("READ", 6, 0)]);
+        assert_eq!(ledger.flock_poll(w1), granted_poll(&[]));
         assert_eq!(
-            ledger.flock_poll(w1),
-            FlockPoll::Granted {
-                lagging: Vec::new()
-            }
+            flock_rows_of(&ledger),
+            [
+                row("READ", 6, 0),
+                row("READ", 4, 0),
+                row("WRITE", 5, 1),
+                row("WRITE", 7, 2),
+            ]
         );
-        assert_eq!(
-            ledger.flock_poll(w3),
-            FlockPoll::Granted {
-                lagging: Vec::new()
-            }
-        );
-        assert_eq!(ledger.flock_poll(w4), FlockPoll::Waiting);
-        // The two shared holders release, in either order: the first queued
-        // exclusive waiter is next.
+        assert_eq!(ledger.flock_poll(w4), WAITING);
+        // w3's release wakes nothing; w1's wakes w2, whose retry takes the
+        // lock, w4 following it.
         ledger.flock(w3, w3, flock_request(description(3), UN, false));
-        assert_eq!(ledger.flock_poll(w2), FlockPoll::Waiting);
+        assert_eq!(ledger.flock_poll(w2), WAITING);
         ledger.flock(w1, w1, flock_request(description(1), UN, false));
-        assert_eq!(ledger.flock_poll(w4), FlockPoll::Waiting);
+        assert_eq!(ledger.flock_poll(w4), WAITING);
+        assert_eq!(ledger.flock_poll(w2), granted_poll(&[]));
         assert_eq!(
-            ledger.flock_poll(w2),
-            FlockPoll::Granted {
-                lagging: Vec::new()
-            }
+            flock_rows_of(&ledger),
+            [row("WRITE", 5, 0), row("WRITE", 7, 1)]
+        );
+    }
+
+    /// The Claude review's upgrade case: A and B hold `LOCK_SH`, X waits for
+    /// `LOCK_EX` under A's lock, and A converts with a blocking `LOCK_EX`.
+    /// The conversion deletes A's lock, which wakes X, and blocks A's request
+    /// under B's lock; X's retry finds B's lock and blocks under A's request,
+    /// which conflicts with it (`__locks_insert_block`). B's release then
+    /// wakes A's request alone: A takes the lock and X follows it, as natively.
+    /// Had X not retried before B's release, both retry, and the first to run
+    /// takes the lock: the order of their turns decides, as Linux's scheduler
+    /// decides it.
+    #[test]
+    fn a_blocking_upgrade_blocks_ahead_of_the_waiter_its_conversion_woke() {
+        let [a, b, x] = [3, 4, 5].map(DetPid::from_raw);
+        let setup = || {
+            let mut ledger = LockLedger::default();
+            ledger.flock(a, a, flock_request(description(0), SH, false));
+            ledger.flock(b, b, flock_request(description(1), SH, false));
+            assert_eq!(
+                ledger.flock(x, x, flock_request(description(2), EX, false)),
+                FlockOutcome::Queued { dropped: false }
+            );
+            assert_eq!(
+                ledger.flock(a, a, flock_request(description(0), EX, false)),
+                FlockOutcome::Queued { dropped: true }
+            );
+            ledger
+        };
+        let mut ledger = setup();
+        assert_eq!(ledger.flock_poll(x), WAITING);
+        assert_eq!(
+            flock_rows_of(&ledger),
+            [row("READ", 4, 0), row("WRITE", 3, 1), row("WRITE", 5, 2)]
+        );
+        ledger.flock(b, b, flock_request(description(1), UN, false));
+        assert_eq!(ledger.flock_poll(x), WAITING);
+        assert_eq!(ledger.flock_poll(a), granted_poll(&[]));
+        assert_eq!(
+            flock_rows_of(&ledger),
+            [row("WRITE", 3, 0), row("WRITE", 5, 1)]
+        );
+        // X's retry comes after B's release: whichever turn comes first wins.
+        let mut ledger = setup();
+        ledger.flock(b, b, flock_request(description(1), UN, false));
+        assert_eq!(ledger.flock_poll(x), granted_poll(&[]));
+        assert_eq!(ledger.flock_poll(a), WAITING);
+        assert_eq!(
+            flock_rows_of(&ledger),
+            [row("WRITE", 5, 0), row("WRITE", 3, 1)]
+        );
+    }
+
+    /// The Claude review's interrupted-waiter case: G holds `LOCK_EX`; X
+    /// (`LOCK_SH`) waits under G, V (`LOCK_EX`) under X, and Y (`LOCK_SH`)
+    /// under G after X, which it does not conflict with. A signal ends X's
+    /// wait, which wakes V (`locks_delete_block`); V's retry blocks under Y.
+    /// G's release wakes Y alone, which takes the lock before V, as natively.
+    #[test]
+    fn a_cancelled_waiter_wakes_the_requests_blocked_under_it() {
+        let [g, x, v, y] = [3, 4, 5, 6].map(DetPid::from_raw);
+        let mut ledger = LockLedger::default();
+        ledger.flock(g, g, flock_request(description(0), EX, false));
+        for (waiter, sequence, mode) in [(x, 1, SH), (v, 2, EX), (y, 3, SH)] {
+            ledger.flock(
+                waiter,
+                waiter,
+                flock_request(description(sequence), mode, false),
+            );
+        }
+        assert_eq!(
+            flock_rows_of(&ledger),
+            [
+                row("WRITE", 3, 0),
+                row("READ", 4, 1),
+                row("WRITE", 5, 2),
+                row("READ", 6, 1),
+            ]
+        );
+        ledger.flock_cancel(x);
+        assert_eq!(
+            flock_rows_of(&ledger),
+            [row("WRITE", 3, 0), row("READ", 6, 1)]
+        );
+        assert_eq!(ledger.flock_poll(v), WAITING);
+        assert_eq!(
+            flock_rows_of(&ledger),
+            [row("WRITE", 3, 0), row("READ", 6, 1), row("WRITE", 5, 2)]
+        );
+        ledger.flock(g, g, flock_request(description(0), UN, false));
+        assert_eq!(ledger.flock_poll(v), WAITING);
+        assert_eq!(ledger.flock_poll(y), granted_poll(&[]));
+        assert_eq!(
+            flock_rows_of(&ledger),
+            [row("READ", 6, 0), row("WRITE", 5, 1)]
+        );
+        ledger.flock(y, y, flock_request(description(3), UN, false));
+        assert_eq!(ledger.flock_poll(v), granted_poll(&[]));
+    }
+
+    /// The Claude review's conversion case: threads T2 and T1 of one process
+    /// share description d and wait for `LOCK_EX` and `LOCK_SH` behind y's
+    /// lock, with W0 (`LOCK_SH`, its own description) queued between them,
+    /// under T2's request. y's release wakes T2 and T1. Where T2 retries first
+    /// it takes `LOCK_EX`, W0 following it, and T1's retry converts d's lock to
+    /// `LOCK_SH`, which deletes the exclusive lock and wakes W0, whose retry
+    /// then takes `LOCK_SH`. Where T1 retries first, T2's conversion leaves W0
+    /// blocked under d's `LOCK_EX`. Either way a state Linux reaches.
+    #[test]
+    fn a_retry_that_converts_its_descriptions_lock_wakes_that_locks_waiters() {
+        let [holder, process] = [3, 4].map(DetPid::from_raw);
+        let [t2, w0, t1] = [40, 41, 42].map(DetTid::from_raw);
+        let d = description(1);
+        let setup = || {
+            let mut ledger = LockLedger::default();
+            ledger.flock(holder, holder, flock_request(description(0), EX, false));
+            ledger.flock(process, t2, flock_request(d, EX, false));
+            ledger.flock(process, w0, flock_request(description(2), SH, false));
+            ledger.flock(process, t1, flock_request(d, SH, false));
+            assert_eq!(
+                flock_rows_of(&ledger),
+                [
+                    row("WRITE", 3, 0),
+                    row("WRITE", 4, 1),
+                    row("READ", 4, 2),
+                    row("READ", 4, 1),
+                ]
+            );
+            ledger.flock(holder, holder, flock_request(description(0), UN, false));
+            ledger
+        };
+        let mut ledger = setup();
+        assert_eq!(ledger.flock_poll(t2), granted_poll(&[]));
+        assert_eq!(ledger.flock_poll(t1), granted_poll(&[]));
+        assert_eq!(ledger.flock_poll(w0), granted_poll(&[]));
+        assert_eq!(
+            flock_rows_of(&ledger),
+            [row("READ", 4, 0), row("READ", 4, 0)]
+        );
+        assert_eq!(
+            ledger.flock(holder, holder, flock_request(description(3), SH, true)),
+            granted()
+        );
+        let mut ledger = setup();
+        assert_eq!(ledger.flock_poll(t1), granted_poll(&[]));
+        assert_eq!(ledger.flock_poll(t2), granted_poll(&[]));
+        assert_eq!(ledger.flock_poll(w0), WAITING);
+        assert_eq!(
+            flock_rows_of(&ledger),
+            [row("WRITE", 4, 0), row("READ", 4, 1)]
+        );
+        assert_eq!(
+            ledger.flock(holder, holder, flock_request(description(3), SH, true)),
+            FlockOutcome::WouldBlock { dropped: false }
+        );
+    }
+
+    /// A woken request whose retry finds its description holding the other
+    /// mode deletes that lock before it blocks again, as a conversion does:
+    /// the poll says so while the host keeps the description, so that the
+    /// caller mirrors the release.
+    #[test]
+    fn a_retry_that_blocks_again_after_deleting_its_descriptions_lock_says_so() {
+        let [holder, other, process] = [3, 4, 5].map(DetPid::from_raw);
+        let [waiter, sibling] = [50, 51].map(DetTid::from_raw);
+        let d = description(1);
+        let mut ledger = LockLedger::default();
+        ledger.flock(holder, holder, flock_request(description(0), EX, false));
+        ledger.flock(process, waiter, flock_request(d, EX, false));
+        ledger.flock(holder, holder, flock_request(description(0), UN, false));
+        // Before the waiter retries, its sibling takes LOCK_SH through d, and
+        // another description LOCK_SH too.
+        assert_eq!(
+            ledger.flock(process, sibling, flock_request(d, SH, false)),
+            granted()
+        );
+        assert_eq!(
+            ledger.flock(other, other, flock_request(description(2), SH, false)),
+            granted()
+        );
+        assert_eq!(
+            ledger.flock_poll(waiter),
+            FlockPoll::Waiting { dropped: true }
+        );
+        assert_eq!(
+            flock_rows_of(&ledger),
+            [row("READ", 4, 0), row("WRITE", 5, 1)]
         );
     }
 
     /// Linux releases a description's flock at its last reference: a fork's
     /// copy keeps it after the parent's close, and the child's exit releases
-    /// it, handing it to the waiter with the exited process as the one whose
-    /// teardown its mirror may wait for.
+    /// it, waking the waiter, whose grant names the exited process as the one
+    /// whose host teardown its mirror may wait for, as does every grant on the
+    /// inode until that teardown is reported.
     #[test]
     fn the_last_reference_releases_and_names_the_exited_holder() {
-        let [parent, child, waiter] = [3, 4, 5].map(DetPid::from_raw);
+        let [parent, child, waiter, later] = [3, 4, 5, 6].map(DetPid::from_raw);
         let mut ledger = LockLedger::default();
         ledger.flock(parent, parent, flock_request(description(0), EX, false));
         ledger.fork(parent, child, false);
@@ -4462,17 +5087,23 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
             ledger.flock(waiter, waiter, flock_request(description(1), EX, false)),
             FlockOutcome::Queued { dropped: false }
         );
-        assert_eq!(ledger.flock_poll(waiter), FlockPoll::Waiting);
+        assert_eq!(ledger.flock_poll(waiter), WAITING);
         ledger.prune(|process| process != child);
+        assert_eq!(ledger.flock_poll(waiter), granted_poll(&[child]));
+        ledger.flock(waiter, waiter, flock_request(description(1), UN, false));
         assert_eq!(
-            ledger.flock_poll(waiter),
-            FlockPoll::Granted {
+            ledger.flock(later, later, flock_request(description(2), SH, false)),
+            FlockOutcome::Granted {
                 lagging: vec![child]
             }
         );
         assert!(ledger.flock_teardown_pending(&[child]));
         ledger.flock_torn_down(child);
         assert!(!ledger.flock_teardown_pending(&[child]));
+        assert_eq!(
+            ledger.flock(waiter, waiter, flock_request(description(1), SH, false)),
+            granted()
+        );
         // A later process with the same number has not been torn down.
         ledger.fork(parent, child, false);
         assert!(ledger.flock_teardown_pending(&[child]));
@@ -4485,25 +5116,20 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
     #[test]
     fn a_waiting_call_keeps_its_description() {
         let [holder, process] = [3, 4].map(DetPid::from_raw);
-        let [waiter, sibling] = [4, 40].map(DetTid::from_raw);
+        let waiter = DetTid::from_raw(4);
         let mut ledger = LockLedger::default();
         ledger.flock(holder, holder, flock_request(description(0), EX, false));
         ledger.flock(process, waiter, flock_request(description(1), EX, false));
-        let _ = sibling;
         ledger.release(process, description(1), 0);
-        assert_eq!(ledger.flock_poll(waiter), FlockPoll::Waiting);
+        assert_eq!(ledger.flock_poll(waiter), WAITING);
         ledger.flock(holder, holder, flock_request(description(0), UN, false));
-        assert_eq!(
-            ledger.flock_poll(waiter),
-            FlockPoll::Granted {
-                lagging: Vec::new()
-            }
-        );
+        assert_eq!(ledger.flock_poll(waiter), granted_poll(&[]));
         assert!(flock_rows_of(&ledger).is_empty());
     }
 
-    /// A signal ends a wait: the waiter leaves the queue, and a release later
-    /// skips it. One a release already handed its lock keeps it.
+    /// A signal ends a wait: the request leaves the tree, and a later release
+    /// wakes the requests that remain. A request woken but not yet retried
+    /// whose call a signal ends leaves without the lock.
     #[test]
     fn a_cancelled_waiter_leaves_the_queue() {
         let [holder, first, second] = [3, 4, 5].map(DetPid::from_raw);
@@ -4511,24 +5137,20 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         ledger.flock(holder, holder, flock_request(description(0), EX, false));
         ledger.flock(first, first, flock_request(description(1), EX, false));
         ledger.flock(second, second, flock_request(description(2), EX, false));
-        assert_eq!(ledger.flock_cancel(first), None);
+        ledger.flock_cancel(first);
         ledger.flock(holder, holder, flock_request(description(0), UN, false));
-        assert_eq!(
-            ledger.flock_poll(second),
-            FlockPoll::Granted {
-                lagging: Vec::new()
-            }
-        );
+        assert_eq!(ledger.flock_poll(second), granted_poll(&[]));
         ledger.flock(first, first, flock_request(description(1), EX, false));
         ledger.flock(second, second, flock_request(description(2), UN, false));
-        // Handed the lock before its signal was acted on: it keeps it.
-        assert_eq!(ledger.flock_cancel(first), Some(Vec::new()));
-        assert_eq!(flock_rows_of(&ledger), [row("WRITE", 4, 0)]);
+        ledger.flock_cancel(first);
+        assert!(flock_rows_of(&ledger).is_empty());
+        assert!(matches!(ledger.flock_poll(first), FlockPoll::Refused(_)));
     }
 
-    /// A waiting process that exits leaves the queue; one a release handed
-    /// the lock to and that exits before its call returns took the lock, which
-    /// its exit then releases to the next waiter.
+    /// A waiting process that exits leaves the tree, waking the requests
+    /// blocked under its request: a woken one that exits before its retry
+    /// took no lock, and one that took the lock before it exits releases it
+    /// at its exit, its waiters' grants naming it as an exited holder.
     #[test]
     fn an_exited_waiter_leaves_the_queue_and_its_lock() {
         let [holder, first, second] = [3, 4, 5].map(DetPid::from_raw);
@@ -4537,52 +5159,98 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         ledger.flock(first, first, flock_request(description(1), EX, false));
         ledger.flock(second, second, flock_request(description(2), EX, false));
         ledger.flock(holder, holder, flock_request(description(0), UN, false));
+        // first, woken, exits before it retries: second, blocked under it, is
+        // woken in its turn and takes the lock no exited process held.
         ledger.prune(|process| process != first);
+        assert_eq!(ledger.flock_poll(second), granted_poll(&[]));
+        let third = DetPid::from_raw(6);
+        let mut ledger = LockLedger::default();
+        ledger.flock(holder, holder, flock_request(description(0), EX, false));
+        ledger.flock(first, first, flock_request(description(1), EX, false));
+        ledger.flock(third, third, flock_request(description(3), EX, false));
+        ledger.flock(holder, holder, flock_request(description(0), UN, false));
+        assert_eq!(ledger.flock_poll(first), granted_poll(&[]));
+        ledger.prune(|process| process != first);
+        assert_eq!(ledger.flock_poll(third), granted_poll(&[first]));
+    }
+
+    /// An exec kills the caller's other threads before it closes the
+    /// close-on-exec descriptors (`de_thread`): a sibling waiting in a flock
+    /// leaves the tree, so the lock its process held goes at the exec, and a
+    /// request another process blocked under the sibling's is woken. The
+    /// review's exec case: the new image's `LOCK_EX|LOCK_NB` is granted.
+    #[test]
+    fn an_exec_ends_the_waits_of_the_threads_it_killed() {
+        let [process, other] = [3, 4].map(DetPid::from_raw);
+        let sibling = DetTid::from_raw(30);
+        let mut ledger = LockLedger::default();
+        ledger.flock(process, process, flock_request(description(0), EX, false));
         assert_eq!(
-            ledger.flock_poll(second),
-            FlockPoll::Granted {
-                lagging: vec![first]
-            }
+            ledger.flock(process, sibling, flock_request(description(1), EX, false)),
+            FlockOutcome::Queued { dropped: false }
+        );
+        ledger.flock(other, other, flock_request(description(2), EX, false));
+        assert_eq!(
+            flock_rows_of(&ledger),
+            [row("WRITE", 3, 0), row("WRITE", 3, 1), row("WRITE", 4, 2)]
+        );
+        ledger.exec(process);
+        ledger.exec_kept(process, &[]);
+        assert!(matches!(ledger.flock_poll(sibling), FlockPoll::Refused(_)));
+        assert!(flock_rows_of(&ledger).is_empty());
+        assert_eq!(
+            ledger.flock(process, process, flock_request(description(5), EX, true)),
+            granted()
+        );
+        assert_eq!(ledger.flock_poll(other), WAITING);
+        assert_eq!(
+            flock_rows_of(&ledger),
+            [row("WRITE", 3, 0), row("WRITE", 4, 1)]
         );
     }
 
     /// A mapping keeps a description's lock after its last descriptor goes:
-    /// where the kernel can decide the inode it does so from then on, and
-    /// where it cannot every later call on the inode is refused by name. A
-    /// close on KVM that would drop the last reference while a mapping may
-    /// remain is refused first.
+    /// where the kernel can decide the inode it does so from then on. Where it
+    /// cannot (KVM), a close that would drop the last reference while the
+    /// caller's memory map still shows a mapping is refused by name; once the
+    /// map shows none, the close goes on and releases the lock, waking its
+    /// waiters, as the design says.
     #[test]
     fn a_mapped_description_leaves_the_model_at_its_last_close() {
         let [mapper, other] = [3, 4].map(DetPid::from_raw);
-        for host_fallback in [true, false] {
-            let mut ledger = LockLedger::default();
-            let mut request = flock_request(description(0), EX, false);
-            request.mapped = true;
-            request.host_fallback = host_fallback;
-            ledger.flock(mapper, mapper, request);
-            assert!(
-                ledger
-                    .flock_close_refusal(mapper, description(0), 0, true, true)
-                    .is_some()
-            );
-            assert!(
-                ledger
-                    .flock_close_refusal(mapper, description(0), 0, true, false)
-                    .is_none()
-            );
-            ledger.release(mapper, description(0), 0);
-            let mut request = flock_request(description(1), EX, true);
-            request.host_fallback = host_fallback;
-            let outcome = ledger.flock(other, other, request);
-            if host_fallback {
-                assert_eq!(outcome, FlockOutcome::HostDecided);
-            } else {
-                assert_eq!(
-                    outcome,
-                    FlockOutcome::Refused(FLOCK_MAPPED_RELEASE_REFUSAL.to_owned())
-                );
-            }
-        }
+        let mut ledger = LockLedger::default();
+        let mut request = flock_request(description(0), EX, false);
+        request.mapped = true;
+        ledger.flock(mapper, mapper, request);
+        ledger.release(mapper, description(0), 0);
+        assert_eq!(
+            ledger.flock(other, other, flock_request(description(1), EX, true)),
+            FlockOutcome::HostDecided
+        );
+
+        let kvm = |open_file, mode, nonblocking| FlockRequest {
+            host_fallback: false,
+            ..flock_request(open_file, mode, nonblocking)
+        };
+        let mut ledger = LockLedger::default();
+        let mut request = kvm(description(0), EX, false);
+        request.mapped = true;
+        ledger.flock(mapper, mapper, request);
+        assert_eq!(
+            ledger.flock(other, other, kvm(description(1), EX, false)),
+            FlockOutcome::Queued { dropped: false }
+        );
+        assert_eq!(
+            ledger.flock_close_refusal(mapper, description(0), 0, true, true),
+            Some(FLOCK_MAPPED_RELEASE_REFUSAL.to_owned())
+        );
+        assert_eq!(
+            ledger.flock_close_refusal(mapper, description(0), 0, true, false),
+            None
+        );
+        ledger.release(mapper, description(0), 0);
+        assert_eq!(ledger.flock_poll(other), granted_poll(&[]));
+        assert_eq!(flock_rows_of(&ledger), [row("WRITE", 4, 0)]);
     }
 
     /// A mapping of a description the model follows that another process
@@ -4679,8 +5347,9 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
             4 => Some(104),
             _ => None,
         };
-        let replacement =
-            ledger.flock_kernel_rows(&rows, &mut keep, &|process| process != exited, &kernel_pid);
+        let replacement = ledger
+            .flock_kernel_rows(&rows, &mut keep, &|process| process != exited, &kernel_pid)
+            .unwrap();
         assert_eq!(keep, [false, false, true, true]);
         assert_eq!(
             replacement,
@@ -4701,33 +5370,91 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         );
     }
 
-    /// Where the capture's rows with a decided inode's number spell several
-    /// objects, which of them is the inode's cannot be told: none of their
-    /// rows is dropped, and the model's rows are spelled as the model spells
-    /// the file. Where no row has the number, the model's spelling is used
-    /// too.
+    /// A decided inode's mirror spelled with the superblock's device (a btrfs
+    /// subvolume's) is found among the guest's FLOCK rows with its inode
+    /// number, after every other decided inode took its own object, its
+    /// takers' rows first, and a row the guest does not own never counts: one
+    /// row per lock, never a mirror kept beside the model's row (Codex review
+    /// of slice SP2). Where the rows that remain name several files, or two
+    /// inodes would take one row's file, the snapshot is refused by name.
+    /// Where no row has the number, the model's spelling is used.
     #[test]
-    fn an_inode_number_two_files_share_spells_no_kernel_row() {
-        let holder = DetPid::from_raw(3);
+    fn kernel_rows_spell_each_modelled_inode_once_or_refuse_the_snapshot() {
+        let [btrfs, ext4] = [3, 4].map(DetPid::from_raw);
+        let kernel_pid = |process: DetPid| Some(100 + i64::from(process.as_raw()));
+        let request = |dev: u64, object: &str, open_file: OpenFileId| FlockRequest {
+            inode: FlockInodeKey { dev, ino: 1001 },
+            object: object.to_owned(),
+            ..flock_request(open_file, EX, false)
+        };
+        let replace = |ledger: &LockLedger, snapshot: &[u8], keep: Option<Vec<bool>>| {
+            let rows = lock_rows(snapshot).unwrap();
+            let mut keep = keep.unwrap_or_else(|| vec![true; rows.len()]);
+            let replacement = ledger.flock_kernel_rows(&rows, &mut keep, &|_| true, &kernel_pid);
+            (keep, replacement)
+        };
+        // A btrfs file the model spells 00:2b:1001 and the kernel 00:2a:1001,
+        // and an ext4 file with the same inode number, each locked.
         let mut ledger = LockLedger::default();
-        let mut request = flock_request(description(0), EX, false);
-        request.object = "00:2b:1001".to_owned();
-        ledger.flock(holder, holder, request);
-        let snapshot = b"\
-1: FLOCK  ADVISORY  WRITE 103 00:2a:1001 0 EOF
-2: FLOCK  ADVISORY  WRITE 104 00:2c:1001 0 EOF
-";
-        let rows = lock_rows(snapshot).unwrap();
-        let mut keep = vec![true; rows.len()];
-        let replacement = ledger.flock_kernel_rows(&rows, &mut keep, &|_| true, &|_| Some(103));
-        assert_eq!(keep, [true, true]);
-        assert_eq!(
-            replacement,
-            ["3: FLOCK ADVISORY WRITE 103 00:2b:1001 0 EOF"]
+        ledger.flock(btrfs, btrfs, request(0x2b, "00:2b:1001", description(0)));
+        ledger.flock(ext4, ext4, request(0x801, "08:01:1001", description(1)));
+        let (keep, replacement) = replace(
+            &ledger,
+            b"1: FLOCK  ADVISORY  WRITE 103 00:2a:1001 0 EOF\n\
+              2: FLOCK  ADVISORY  WRITE 104 08:01:1001 0 EOF\n",
+            None,
         );
+        assert_eq!(keep, [false, false]);
+        assert_eq!(
+            replacement.unwrap(),
+            [
+                "3: FLOCK ADVISORY WRITE 103 00:2a:1001 0 EOF",
+                "4: FLOCK ADVISORY WRITE 104 08:01:1001 0 EOF",
+            ]
+        );
+        // Only the btrfs file: the guest's other file with that number, which
+        // the model does not decide, is not the inode's, as its owner says.
+        let mut ledger = LockLedger::default();
+        ledger.flock(btrfs, btrfs, request(0x2b, "00:2b:1001", description(0)));
+        let (keep, replacement) = replace(
+            &ledger,
+            b"1: FLOCK  ADVISORY  WRITE 103 00:2a:1001 0 EOF\n\
+              2: FLOCK  ADVISORY  WRITE 104 00:2c:1001 0 EOF\n",
+            None,
+        );
+        assert_eq!(keep, [false, true]);
+        assert_eq!(
+            replacement.unwrap(),
+            ["3: FLOCK ADVISORY WRITE 103 00:2a:1001 0 EOF"]
+        );
+        // A row the guest does not own, an outside process's OFD lock on a
+        // third file with that number, changes nothing.
+        let (keep, replacement) = replace(
+            &ledger,
+            b"1: FLOCK  ADVISORY  WRITE 103 00:2a:1001 0 EOF\n\
+              2: OFDLCK ADVISORY  WRITE -1 00:2d:1001 0 EOF\n",
+            Some(vec![true, false]),
+        );
+        assert_eq!(keep, [false, false]);
+        assert_eq!(
+            replacement.unwrap(),
+            ["3: FLOCK ADVISORY WRITE 103 00:2a:1001 0 EOF"]
+        );
+        // The same taker holds flocks on two such files: which is the inode's
+        // cannot be told, and the snapshot is refused.
+        let (_, replacement) = replace(
+            &ledger,
+            b"1: FLOCK  ADVISORY  WRITE 103 00:2a:1001 0 EOF\n\
+              2: FLOCK  ADVISORY  WRITE 103 00:2c:1001 0 EOF\n",
+            None,
+        );
+        assert!(replacement.is_err(), "{replacement:?}");
+        // No row with the number: the model's spelling.
         let mut keep = Vec::new();
         assert_eq!(
-            ledger.flock_kernel_rows(&[], &mut keep, &|_| true, &|_| Some(103)),
+            ledger
+                .flock_kernel_rows(&[], &mut keep, &|_| true, &kernel_pid)
+                .unwrap(),
             ["1: FLOCK ADVISORY WRITE 103 00:2b:1001 0 EOF"]
         );
     }
@@ -4741,6 +5468,7 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         assert!(
             ledger
                 .flock_kernel_rows(&rows, &mut keep, &|_| true, &|_| None)
+                .unwrap()
                 .is_empty()
         );
         assert_eq!(keep, [true]);

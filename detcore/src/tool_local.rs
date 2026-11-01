@@ -5898,6 +5898,16 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) receive_geometry: Option<Option<crate::syscalls::scm_rights::ReceiveGeometry>>,
 
+    /// The open file description a `flock` this thread is waiting in took at
+    /// its entry, as Linux's call holds the `struct file` its descriptor
+    /// named then (`fdget` in `sys_flock`): `Some` while the call waits in
+    /// Detcore's flock model, so that its grant is mirrored on that
+    /// description and noted in its cache even when a sibling closed or
+    /// replaced the descriptor meanwhile (`Detcore::flock_wait`). Never
+    /// carried across a fork or a migration.
+    #[serde(skip)]
+    pub(crate) flock_waiting_description: Option<crate::fd::DetFd>,
+
     /// Retained metadata for the vectored call's observers. Original entry
     /// regions preserve the existing outbound and exit-dependency overlays.
     /// When buffer logging is observed, generic readv/recvmsg also retain a
@@ -7187,6 +7197,7 @@ impl<T> ThreadState<T> {
             signal_task_identity: None,
             open_file_creator: None,
             receive_geometry: None,
+            flock_waiting_description: None,
             entry_import: None,
             send_inspection: None,
             inotify_queue: None,
@@ -8520,6 +8531,24 @@ impl<T> ThreadState<T> {
             }
         }
         metadata.remove_fd_range(first, last)
+    }
+
+    /// A descriptor of this thread's table that names the open file
+    /// description `open_file`: `preferred` where it does, else the lowest
+    /// that does (`Detcore::flock_wait`).
+    pub(crate) fn slot_naming(&self, open_file: OpenFileId, preferred: RawFd) -> Option<RawFd> {
+        let handles = &self.metadata().file_handles;
+        if handles
+            .get(&preferred)
+            .is_some_and(|detfd| detfd.open_file_id() == open_file)
+        {
+            return Some(preferred);
+        }
+        handles
+            .iter()
+            .filter(|(_, detfd)| detfd.open_file_id() == open_file)
+            .map(|(fd, _)| *fd)
+            .min()
     }
 
     /// How many slots of this thread's table name the open file description
