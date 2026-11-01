@@ -1,6 +1,9 @@
 schema: 3
 bucket: system-utils
-image: localhost/hermit-hermetic-validate@sha256:f497f81a4778e6f3f56c29aacfdd153abfdfadfe4f10f0521abadb489c24c7a0
+# Image-bucket backend loss: hermit --image is qualified only for ptrace and
+# kvm, so verify cells on dbt, sabre, liteinst and in-guest-trap are deselected
+# below as a named loss (https://github.com/rrnewton/hermit/issues/5030), not faked.
+image: localhost/hermit-hermetic-validate@sha256:786a9fd2a7ad03dc7c58b385ae9e64c8c1628dc5a0815b25ebb13b1aa9aaa7da
 test:
   - id: system-utils/clock-determinism
     description: clock_gettime/gettimeofday output is identical across repeated Hermit runs
@@ -31,11 +34,16 @@ test:
       verify:
         ci:
           ptrace: true
-          sabre: true
+          sabre: false
           kvm: true
-          dbt: true
-          liteinst: true
-          in-guest-trap: true
+          dbt: false
+          liteinst: false
+          in-guest-trap: false
+        ci_disabled_reason:
+          sabre: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          liteinst: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          in-guest-trap: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - sabre
@@ -118,7 +126,9 @@ test:
         ci:
           ptrace: true
           kvm: true
-          dbt: true
+          dbt: false
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - kvm
@@ -179,7 +189,12 @@ test:
         backends_disabled:
           native: The existing date-nanoseconds test owns the native-variation assertion
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
+          dbt: false
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - kvm
@@ -242,7 +257,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
+          dbt: false
           kvm: true
           sabre: false
         backends_enabled:
@@ -255,6 +270,7 @@ test:
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
       replay:
         ci: true
         backends_enabled: [ptrace]
@@ -310,7 +326,12 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
+          dbt: false
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - kvm
@@ -374,7 +395,12 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -444,7 +470,9 @@ test:
         ci:
           ptrace: true
           kvm: true
-          dbt: true
+          dbt: false
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - kvm
@@ -509,7 +537,12 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -573,7 +606,12 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -638,7 +676,12 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -704,7 +747,12 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -759,7 +807,12 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         # KVM qualified 2026-10-29: 21 of 21 canonical strict verify pairs at Hermit
         # a69361ae, the tree that enabled this cell (bitwise parity, 1185 INFO records
         # each side); stdout and every syscall return value identical to ptrace's.
@@ -838,7 +891,12 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -902,7 +960,12 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -968,10 +1031,15 @@ test:
         ci:
           ptrace: true
           kvm: true
-          sabre: true
-          dbt: true
-          liteinst: true
-          in-guest-trap: true
+          sabre: false
+          dbt: false
+          liteinst: false
+          in-guest-trap: false
+        ci_disabled_reason:
+          sabre: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          liteinst: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          in-guest-trap: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - kvm
@@ -1042,7 +1110,12 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -1106,7 +1179,12 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -1172,8 +1250,10 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
+          dbt: false
           kvm: true
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -1237,7 +1317,12 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -1303,7 +1388,12 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         # KVM qualified 2026-10-29: 21 of 21 canonical strict verify pairs at Hermit
         # a69361ae, the tree that enabled this cell (bitwise parity, 668 INFO records
         # each side); stdout and every syscall return value identical to ptrace's.
@@ -1376,7 +1466,9 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
+          dbt: false
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         compare_io_buffers: true
         rcb_time: false
         rcb_time_disabled_reason: The guest intentionally parses sanitizer outputs whose non-sanitized fields may vary; RCB-derived virtual time would turn legitimate data-dependent assertion work into unrelated INFO timestamp divergence.
@@ -1446,7 +1538,16 @@ test:
         backends_disabled:
           native: The checkout byte count is deterministic by construction; this row establishes the ptrace execution reference
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
+          dbt: false
+          liteinst: false
+          in-guest-trap: false
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          liteinst: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          in-guest-trap: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - kvm
@@ -1523,7 +1624,18 @@ test:
         backends_disabled:
           native: The checkout path/size inventory is deterministic by construction; this row establishes the ptrace execution reference
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          sabre: false
+          kvm: true
+          dbt: false
+          liteinst: false
+          in-guest-trap: false
+        ci_disabled_reason:
+          sabre: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          liteinst: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          in-guest-trap: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - sabre
@@ -1589,7 +1701,18 @@ test:
         - -D_GNU_SOURCE
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          sabre: false
+          kvm: true
+          dbt: false
+          liteinst: false
+          in-guest-trap: false
+        ci_disabled_reason:
+          sabre: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          liteinst: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          in-guest-trap: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - sabre
@@ -1660,7 +1783,18 @@ test:
         - -D_GNU_SOURCE
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: false
+          kvm: true
+          liteinst: false
+          in-guest-trap: false
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          sabre: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          liteinst: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          in-guest-trap: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -1733,8 +1867,11 @@ test:
         ci:
           ptrace: true
           kvm: true
-          sabre: true
-          dbt: true
+          sabre: false
+          dbt: false
+        ci_disabled_reason:
+          sabre: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - kvm
@@ -1804,11 +1941,16 @@ test:
       verify:
         ci:
           ptrace: true
-          sabre: true
+          sabre: false
           kvm: true
-          dbt: true
-          liteinst: true
-          in-guest-trap: true
+          dbt: false
+          liteinst: false
+          in-guest-trap: false
+        ci_disabled_reason:
+          sabre: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          liteinst: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          in-guest-trap: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - sabre
@@ -1885,7 +2027,12 @@ test:
         backends_disabled:
           native: The guard asserts Hermit's virtual clock; the host clock is not the contract
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         # KVM qualified 2026-10-29: the KVM launch now keeps the program's file as
         # its executable (Reverie d97e8895), so the guest's execv of /proc/self/exe
         # works, as under ptrace; before, it failed with ENOENT. 21 of 21 canonical
@@ -1955,7 +2102,18 @@ test:
         - -D_GNU_SOURCE
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          sabre: false
+          kvm: true
+          dbt: false
+          liteinst: false
+          in-guest-trap: false
+        ci_disabled_reason:
+          sabre: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          liteinst: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          in-guest-trap: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - sabre
@@ -2027,7 +2185,12 @@ test:
           native: AT_RANDOM and the vdso base vary on every native execution by design; native repetition is not a contract
         ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
+          dbt: false
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - kvm
@@ -2090,7 +2253,11 @@ test:
           native: The host process table changes continuously, so native repetition is not a contract
         ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -2154,7 +2321,12 @@ test:
           native: Natively the control is absent by definition, so this is the cell's RED arm and must not run as a green cell
         ci_disabled_reason: 'NOT-EXERCISED: running natively removes the control under test; that arm is the demonstrated red, not a passing cell.'
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
+          dbt: false
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - kvm
@@ -2283,7 +2455,12 @@ test:
           native: The contract describes test-harness scheduling, not native guest behavior
         ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the harness-width contract.'
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -2344,7 +2521,18 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: false
+          kvm: true
+          liteinst: false
+          in-guest-trap: false
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          sabre: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          liteinst: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          in-guest-trap: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -2417,7 +2605,18 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: false
+          kvm: true
+          liteinst: false
+          in-guest-trap: false
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          sabre: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          liteinst: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          in-guest-trap: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -2492,7 +2691,16 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+          liteinst: false
+          in-guest-trap: false
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          liteinst: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          in-guest-trap: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -2571,7 +2779,18 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: false
+          kvm: true
+          liteinst: false
+          in-guest-trap: false
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          sabre: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          liteinst: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          in-guest-trap: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -2644,7 +2863,16 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+          in-guest-trap: false
+          liteinst: false
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          in-guest-trap: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          liteinst: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt
@@ -2721,7 +2949,16 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: true
+          in-guest-trap: false
+          liteinst: false
+        ci_disabled_reason:
+          dbt: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          in-guest-trap: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
+          liteinst: {"evidence": "https://github.com/rrnewton/hermit/issues/5030", "reason": "IMAGE-MODE LOSS: hermit --image refuses this backend at argument validation; only ptrace and kvm are qualified inside the OCI rootfs, so this image-bucket cell is deselected until that backend is qualified inside an image root. Not faked.", "result": "unavailable"}
         backends_enabled:
           - ptrace
           - dbt

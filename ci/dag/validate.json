@@ -28810,13 +28810,6 @@
           "category": "system-utils",
           "test": "system-utils/auxv-loader-dump",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/auxv-loader-dump",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -28838,28 +28831,7 @@
           "category": "system-utils",
           "test": "system-utils/cat-file-read",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/cat-file-read",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/cat-file-read",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/cat-file-read",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -28887,28 +28859,7 @@
           "category": "system-utils",
           "test": "system-utils/clock-determinism",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/clock-determinism",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/clock-determinism",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/clock-determinism",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -28923,13 +28874,6 @@
           "test": "system-utils/clock-exec-continuity",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/clock-exec-continuity",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -28957,13 +28901,6 @@
           "category": "system-utils",
           "test": "system-utils/date-nanoseconds",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/date-nanoseconds",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -28985,28 +28922,7 @@
           "category": "system-utils",
           "test": "system-utils/du-tree-summary",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/du-tree-summary",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/du-tree-summary",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/du-tree-summary",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -29027,28 +28943,7 @@
           "category": "system-utils",
           "test": "system-utils/errno-path-identity",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/errno-path-identity",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/errno-path-identity",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/errno-path-identity",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -29063,13 +28958,6 @@
           "test": "system-utils/example-date",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/example-date",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -29097,13 +28985,6 @@
           "category": "system-utils",
           "test": "system-utils/example-devrand",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/example-devrand",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -29125,28 +29006,7 @@
           "category": "system-utils",
           "test": "system-utils/file-timestamp-identity",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/file-timestamp-identity",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/file-timestamp-identity",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/file-timestamp-identity",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -29167,28 +29027,7 @@
           "category": "system-utils",
           "test": "system-utils/find-tree-metadata",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/find-tree-metadata",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/find-tree-metadata",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/find-tree-metadata",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -29203,13 +29042,6 @@
           "test": "system-utils/harness-width-contract",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/harness-width-contract",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -29237,13 +29069,6 @@
           "category": "system-utils",
           "test": "system-utils/mcookie-random",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/mcookie-random",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -29265,13 +29090,6 @@
           "category": "system-utils",
           "test": "system-utils/mktemp-name",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/mktemp-name",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -29293,13 +29111,6 @@
           "category": "system-utils",
           "test": "system-utils/nscd-neutralised",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/nscd-neutralised",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -29321,13 +29132,6 @@
           "category": "system-utils",
           "test": "system-utils/openssl-enc",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-enc",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -29349,13 +29153,6 @@
           "category": "system-utils",
           "test": "system-utils/openssl-genpkey",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-genpkey",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -29377,13 +29174,6 @@
           "category": "system-utils",
           "test": "system-utils/openssl-passwd",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-passwd",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -29405,13 +29195,6 @@
           "category": "system-utils",
           "test": "system-utils/openssl-rand",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-rand",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -29433,13 +29216,6 @@
           "category": "system-utils",
           "test": "system-utils/openssl-x509",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-x509",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -29455,13 +29231,6 @@
           "test": "system-utils/overflow-gid-resolves",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/overflow-gid-resolves",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -29489,28 +29258,7 @@
           "category": "system-utils",
           "test": "system-utils/printf-argument-forwarding",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/printf-argument-forwarding",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/printf-argument-forwarding",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/printf-argument-forwarding",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -29525,13 +29273,6 @@
           "test": "system-utils/proc-random-uuid",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/proc-random-uuid",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -29553,13 +29294,6 @@
           "test": "system-utils/proc-uptime",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/proc-uptime",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -29587,13 +29321,6 @@
           "category": "system-utils",
           "test": "system-utils/procfs-sanitized-paths",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/procfs-sanitized-paths",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -29608,13 +29335,6 @@
           "category": "system-utils",
           "test": "system-utils/ps-proc-table",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/ps-proc-table",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -29623,13 +29343,6 @@
           "test": "system-utils/random-device",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/random-device",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -29657,28 +29370,7 @@
           "category": "system-utils",
           "test": "system-utils/record-getpid",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/record-getpid",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/record-getpid",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/record-getpid",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -29692,28 +29384,7 @@
           "category": "system-utils",
           "test": "system-utils/sh-exit-status",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/sh-exit-status",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/sh-exit-status",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/sh-exit-status",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -29734,28 +29405,7 @@
           "category": "system-utils",
           "test": "system-utils/shm-coherency-identity",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/shm-coherency-identity",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/shm-coherency-identity",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/shm-coherency-identity",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -29770,13 +29420,6 @@
           "test": "system-utils/shuf-permutation",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/shuf-permutation",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -29804,13 +29447,6 @@
           "category": "system-utils",
           "test": "system-utils/sort-random",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/sort-random",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -29832,13 +29468,6 @@
           "category": "system-utils",
           "test": "system-utils/ssh-keygen-ed25519",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/ssh-keygen-ed25519",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -29860,28 +29489,7 @@
           "category": "system-utils",
           "test": "system-utils/startup-surface-identity",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/startup-surface-identity",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/startup-surface-identity",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/startup-surface-identity",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -29896,13 +29504,6 @@
           "test": "system-utils/startup-tls-guards",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/startup-tls-guards",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -29930,28 +29531,7 @@
           "category": "system-utils",
           "test": "system-utils/stat-alias-root",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/stat-alias-root",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/stat-alias-root",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/stat-alias-root",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -29972,28 +29552,7 @@
           "category": "system-utils",
           "test": "system-utils/stat-script-root",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/stat-script-root",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/stat-script-root",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/stat-script-root",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -30014,28 +29573,7 @@
           "category": "system-utils",
           "test": "system-utils/true-exit-zero",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/true-exit-zero",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/true-exit-zero",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/true-exit-zero",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -30050,13 +29588,6 @@
           "test": "system-utils/uuidgen-random",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/uuidgen-random",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -50556,13 +50087,6 @@
           "category": "system-utils",
           "test": "system-utils/auxv-loader-dump",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/auxv-loader-dump",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -50571,13 +50095,6 @@
           "test": "system-utils/cat-file-read",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/cat-file-read",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -50605,13 +50122,6 @@
           "category": "system-utils",
           "test": "system-utils/clock-determinism",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/clock-determinism",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -50620,13 +50130,6 @@
           "test": "system-utils/clock-exec-continuity",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/clock-exec-continuity",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -50647,13 +50150,6 @@
           "category": "system-utils",
           "test": "system-utils/date-nanoseconds",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/date-nanoseconds",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -50662,13 +50158,6 @@
           "test": "system-utils/du-tree-summary",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/du-tree-summary",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -50689,13 +50178,6 @@
           "category": "system-utils",
           "test": "system-utils/errno-path-identity",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/errno-path-identity",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -50704,13 +50186,6 @@
           "test": "system-utils/example-date",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/example-date",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -50731,13 +50206,6 @@
           "category": "system-utils",
           "test": "system-utils/example-devrand",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/example-devrand",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -50746,13 +50214,6 @@
           "test": "system-utils/file-timestamp-identity",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/file-timestamp-identity",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -50773,13 +50234,6 @@
           "category": "system-utils",
           "test": "system-utils/find-tree-metadata",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/find-tree-metadata",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -50788,13 +50242,6 @@
           "test": "system-utils/harness-width-contract",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/harness-width-contract",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -50815,13 +50262,6 @@
           "category": "system-utils",
           "test": "system-utils/mcookie-random",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/mcookie-random",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -50830,13 +50270,6 @@
           "test": "system-utils/mktemp-name",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/mktemp-name",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -50857,13 +50290,6 @@
           "category": "system-utils",
           "test": "system-utils/nscd-neutralised",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/nscd-neutralised",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -50872,13 +50298,6 @@
           "test": "system-utils/openssl-enc",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-enc",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -50899,13 +50318,6 @@
           "category": "system-utils",
           "test": "system-utils/openssl-genpkey",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-genpkey",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -50914,13 +50326,6 @@
           "test": "system-utils/openssl-passwd",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-passwd",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -50941,13 +50346,6 @@
           "category": "system-utils",
           "test": "system-utils/openssl-rand",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-rand",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -50956,13 +50354,6 @@
           "test": "system-utils/openssl-x509",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-x509",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -50983,13 +50374,6 @@
           "category": "system-utils",
           "test": "system-utils/overflow-gid-resolves",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/overflow-gid-resolves",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -50998,13 +50382,6 @@
           "test": "system-utils/printf-argument-forwarding",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/printf-argument-forwarding",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -51025,13 +50402,6 @@
           "category": "system-utils",
           "test": "system-utils/proc-random-uuid",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/proc-random-uuid",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -51040,13 +50410,6 @@
           "test": "system-utils/proc-uptime",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/proc-uptime",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -51067,13 +50430,6 @@
           "category": "system-utils",
           "test": "system-utils/procfs-sanitized-paths",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/procfs-sanitized-paths",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -51082,13 +50438,6 @@
           "test": "system-utils/ps-proc-table",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/ps-proc-table",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -51109,13 +50458,6 @@
           "category": "system-utils",
           "test": "system-utils/random-device",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/random-device",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -51130,21 +50472,7 @@
           "category": "system-utils",
           "test": "system-utils/record-getpid",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/record-getpid",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/sh-exit-status",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -51165,13 +50493,6 @@
           "category": "system-utils",
           "test": "system-utils/shm-coherency-identity",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/shm-coherency-identity",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -51186,13 +50507,6 @@
           "category": "system-utils",
           "test": "system-utils/shuf-permutation",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/shuf-permutation",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -51201,13 +50515,6 @@
           "test": "system-utils/sort-random",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/sort-random",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -51222,13 +50529,6 @@
           "test": "system-utils/ssh-keygen-ed25519",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/ssh-keygen-ed25519",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -51243,13 +50543,6 @@
           "test": "system-utils/startup-surface-identity",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/startup-surface-identity",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -51264,13 +50557,6 @@
           "test": "system-utils/startup-tls-guards",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/startup-tls-guards",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -51285,13 +50571,6 @@
           "test": "system-utils/stat-alias-root",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/stat-alias-root",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -51306,13 +50585,6 @@
           "test": "system-utils/stat-script-root",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/stat-script-root",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -51327,13 +50599,6 @@
           "test": "system-utils/true-exit-zero",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/true-exit-zero",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -51348,13 +50613,6 @@
           "test": "system-utils/uuidgen-random",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/uuidgen-random",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -79302,13 +78560,6 @@
           "category": "system-utils",
           "test": "system-utils/auxv-loader-dump",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/auxv-loader-dump",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -79330,28 +78581,7 @@
           "category": "system-utils",
           "test": "system-utils/cat-file-read",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/cat-file-read",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/cat-file-read",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/cat-file-read",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -79379,28 +78609,7 @@
           "category": "system-utils",
           "test": "system-utils/clock-determinism",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/clock-determinism",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/clock-determinism",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/clock-determinism",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -79415,13 +78624,6 @@
           "test": "system-utils/clock-exec-continuity",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/clock-exec-continuity",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -79449,13 +78651,6 @@
           "category": "system-utils",
           "test": "system-utils/date-nanoseconds",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/date-nanoseconds",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -79477,28 +78672,7 @@
           "category": "system-utils",
           "test": "system-utils/du-tree-summary",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/du-tree-summary",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/du-tree-summary",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/du-tree-summary",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -79519,28 +78693,7 @@
           "category": "system-utils",
           "test": "system-utils/errno-path-identity",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/errno-path-identity",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/errno-path-identity",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/errno-path-identity",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -79555,13 +78708,6 @@
           "test": "system-utils/example-date",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/example-date",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -79589,13 +78735,6 @@
           "category": "system-utils",
           "test": "system-utils/example-devrand",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/example-devrand",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -79617,28 +78756,7 @@
           "category": "system-utils",
           "test": "system-utils/file-timestamp-identity",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/file-timestamp-identity",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/file-timestamp-identity",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/file-timestamp-identity",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -79659,28 +78777,7 @@
           "category": "system-utils",
           "test": "system-utils/find-tree-metadata",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/find-tree-metadata",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/find-tree-metadata",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/find-tree-metadata",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -79695,13 +78792,6 @@
           "test": "system-utils/harness-width-contract",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/harness-width-contract",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -79729,13 +78819,6 @@
           "category": "system-utils",
           "test": "system-utils/mcookie-random",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/mcookie-random",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -79757,13 +78840,6 @@
           "category": "system-utils",
           "test": "system-utils/mktemp-name",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/mktemp-name",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -79785,13 +78861,6 @@
           "category": "system-utils",
           "test": "system-utils/nscd-neutralised",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/nscd-neutralised",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -79813,13 +78882,6 @@
           "category": "system-utils",
           "test": "system-utils/openssl-enc",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-enc",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -79841,13 +78903,6 @@
           "category": "system-utils",
           "test": "system-utils/openssl-genpkey",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-genpkey",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -79869,13 +78924,6 @@
           "category": "system-utils",
           "test": "system-utils/openssl-passwd",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-passwd",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -79897,13 +78945,6 @@
           "category": "system-utils",
           "test": "system-utils/openssl-rand",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-rand",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -79925,13 +78966,6 @@
           "category": "system-utils",
           "test": "system-utils/openssl-x509",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-x509",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -79947,13 +78981,6 @@
           "test": "system-utils/overflow-gid-resolves",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/overflow-gid-resolves",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -79981,28 +79008,7 @@
           "category": "system-utils",
           "test": "system-utils/printf-argument-forwarding",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/printf-argument-forwarding",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/printf-argument-forwarding",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/printf-argument-forwarding",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -80017,13 +79023,6 @@
           "test": "system-utils/proc-random-uuid",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/proc-random-uuid",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -80045,13 +79044,6 @@
           "test": "system-utils/proc-uptime",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/proc-uptime",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -80079,13 +79071,6 @@
           "category": "system-utils",
           "test": "system-utils/procfs-sanitized-paths",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/procfs-sanitized-paths",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -80100,13 +79085,6 @@
           "category": "system-utils",
           "test": "system-utils/ps-proc-table",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/ps-proc-table",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -80115,13 +79093,6 @@
           "test": "system-utils/random-device",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/random-device",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -80149,28 +79120,7 @@
           "category": "system-utils",
           "test": "system-utils/record-getpid",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/record-getpid",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/record-getpid",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/record-getpid",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -80184,28 +79134,7 @@
           "category": "system-utils",
           "test": "system-utils/sh-exit-status",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/sh-exit-status",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/sh-exit-status",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/sh-exit-status",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -80226,28 +79155,7 @@
           "category": "system-utils",
           "test": "system-utils/shm-coherency-identity",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/shm-coherency-identity",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/shm-coherency-identity",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/shm-coherency-identity",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -80262,13 +79170,6 @@
           "test": "system-utils/shuf-permutation",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/shuf-permutation",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -80296,13 +79197,6 @@
           "category": "system-utils",
           "test": "system-utils/sort-random",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/sort-random",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -80324,13 +79218,6 @@
           "category": "system-utils",
           "test": "system-utils/ssh-keygen-ed25519",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/ssh-keygen-ed25519",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -80352,28 +79239,7 @@
           "category": "system-utils",
           "test": "system-utils/startup-surface-identity",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/startup-surface-identity",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/startup-surface-identity",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/startup-surface-identity",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -80388,13 +79254,6 @@
           "test": "system-utils/startup-tls-guards",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/startup-tls-guards",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -80422,28 +79281,7 @@
           "category": "system-utils",
           "test": "system-utils/stat-alias-root",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/stat-alias-root",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/stat-alias-root",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/stat-alias-root",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -80464,28 +79302,7 @@
           "category": "system-utils",
           "test": "system-utils/stat-script-root",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/stat-script-root",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/stat-script-root",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/stat-script-root",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -80506,28 +79323,7 @@
           "category": "system-utils",
           "test": "system-utils/true-exit-zero",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/true-exit-zero",
-          "mode": "verify",
-          "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/true-exit-zero",
-          "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/true-exit-zero",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -80542,13 +79338,6 @@
           "test": "system-utils/uuidgen-random",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/uuidgen-random",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",

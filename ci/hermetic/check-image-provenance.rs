@@ -36,12 +36,12 @@ use sha2::Sha256;
 const PROVENANCE: &str = "ci/hermetic/image.provenance.json";
 const PIN: &str = "ci/hermetic/image.digest";
 const METHOD: &str = "two-clean-isolated-nix-stores-v1";
-const SUPERSEDED_REFERENCE: &str = "localhost/hermit-hermetic-validate@sha256:e8aebfbbf458276fc63e10bb04d29e20c4e8b3bce7bee133c11231f71349f6e2";
+const SUPERSEDED_REFERENCE: &str = "localhost/hermit-hermetic-validate@sha256:f497f81a4778e6f3f56c29aacfdd153abfdfadfe4f10f0521abadb489c24c7a0";
 const SUPERSEDED_ARCHIVE_SHA256: &str =
-    "a44922e461660d087d697dcdbe34da04ca82257b6bafe7c21ab756288d06d36c";
-/// The replaced 29a8 root lacked the compat corpus programs, including the clang executable; the rationale must name
-/// the executable whose absence this repin repairs.
-const RATIONALE_MARKER: &str = "clang";
+    "f45bbdc10649f9071faa5d07f73103667aaeac7925cb30f3f993bab9e551d54c";
+/// The replaced f497f81a root was a single host-store build; the rationale must name the property
+/// this repin repairs (the pin is now the reproducible isolated build).
+const RATIONALE_MARKER: &str = "reproducible";
 /// Both isolated builds recorded `nix --version` before building.
 const RECORDED_NIX_VERSION: &str = "nix (Nix) 2.35.2";
 const INPUT_PATHS: [&str; 4] = [
@@ -51,11 +51,11 @@ const INPUT_PATHS: [&str; 4] = [
     "ci/hermetic/guest-paths.txt",
 ];
 const EVIDENCE_LIMITATIONS: [&str; 6] = [
-    "Each service ran with the systemd user manager's environment plus PATH, HOME and NIX_SSL_CERT_FILE; only those variable names were recorded, not their values.",
-    "Each build fetched signed cache inputs through the host forward proxy; each new store could substitute only from the build host's default Nix store, and only paths signed with the cache.nixos.org key, the one key trusted, or content-addressed (derivation files and fixed-output sources, which Nix checks by hash); substituted paths are trusted by Nix signature or content hash and NAR hash, not rebuilt. Every unsigned path in the closure, including rust-script, cargo-nextest and coreutils, was rebuilt in each store.",
-    "Both builds ran in the Nix build sandbox with /bin/sh bound to the static busybox from the host Nix store, because the build host's /bin/sh links to a dynamically linked bash; that shell is unsigned and is not in the image.",
+    "Each service ran with the systemd user manager's environment plus PATH, HOME, NIX_SSL_CERT_FILE and the host forward-proxy variables; only those variable names were recorded, not their values.",
+    "Each build substituted first from a file binary cache copied from the build host's default Nix store with the three unsigned realized inputs and the image output itself removed, and second from cache.nixos.org under its trusted key for paths the host store no longer held; the removed realized inputs (rust-script, cargo-nextest and coreutils) were rebuilt in each store. Substituted paths are trusted by Nix signature or content hash and NAR hash, not rebuilt.",
+    "Both builds used this host's Nix configuration with the build sandbox disabled, so builders ran on the host with its /bin/sh (a dynamically linked bash); that shell is unsigned and is not in the image.",
     "Build logs, unit records and Nix path-info records were retained only on the build host; this receipt does not authenticate them.",
-    "The superseded e8aebfbb archive was not rebuilt for this receipt; its a44922e4 SHA-256 is carried from the host-store build that produced the replaced pin.",
+    "The superseded f497f81a archive was not rebuilt for this receipt; its f45bbdc1 SHA-256 is carried from the host-store build that produced the replaced pin.",
     "The recorded build-source commit and tree are historical review evidence. Rebases can rewrite their ancestry; live verification establishes equivalence only for the four enumerated image input files, not the complete source tree or archive.",
 ];
 
@@ -70,20 +70,20 @@ struct ExpectedRun {
 
 const EXPECTED_RUNS: [ExpectedRun; 2] = [
     ExpectedRun {
-        run_id: "hermetic-repin-g.service",
-        source_snapshot_identity: "src@50:3075332951",
-        nix_store_identity: "nix-root/nix@50:3075339478",
-        podman_store_identity: "repin-g/podman",
-        memory_peak_bytes: 8_589_934_592,
-        cpu_nanoseconds: 1_297_920_789_000,
+        run_id: "hermetic-repin3-i.service",
+        source_snapshot_identity: "src@48:5320702456",
+        nix_store_identity: "nix-root/nix@48:5320892374",
+        podman_store_identity: "repin3-i/podman-data",
+        memory_peak_bytes: 3_684_745_216,
+        cpu_nanoseconds: 1_289_993_641_000,
     },
     ExpectedRun {
-        run_id: "hermetic-repin-h.service",
-        source_snapshot_identity: "src@50:3075332953",
-        nix_store_identity: "nix-root/nix@50:3075339519",
-        podman_store_identity: "repin-h/podman",
-        memory_peak_bytes: 8_589_934_592,
-        cpu_nanoseconds: 1_292_173_670_000,
+        run_id: "hermetic-repin3-j.service",
+        source_snapshot_identity: "src@48:5320702470",
+        nix_store_identity: "nix-root/nix@48:5320892426",
+        podman_store_identity: "repin3-j/podman-data",
+        memory_peak_bytes: 3_653_799_936,
+        cpu_nanoseconds: 1_292_699_038_000,
     },
 ];
 
@@ -507,18 +507,18 @@ fn validate_semantics(root: &Value) -> Result<(), String> {
     let new = string(repin, "replacement_reference", "repin")?;
     if old != SUPERSEDED_REFERENCE {
         return Err(format!(
-            "repin.superseded_reference must retain the replaced e8aebfbb reference {SUPERSEDED_REFERENCE:?}"
+            "repin.superseded_reference must retain the replaced f497f81a reference {SUPERSEDED_REFERENCE:?}"
         ));
     }
     let old_archive = string(repin, "superseded_archive_sha256", "repin")?;
     if old_archive != SUPERSEDED_ARCHIVE_SHA256 {
         return Err(format!(
-            "repin.superseded_archive_sha256 must retain the e8aebfbb build's a44922e4 archive SHA-256 {SUPERSEDED_ARCHIVE_SHA256:?}"
+            "repin.superseded_archive_sha256 must retain the f497f81a build's f45bbdc1 archive SHA-256 {SUPERSEDED_ARCHIVE_SHA256:?}"
         ));
     }
     if old == new || !string(repin, "rationale", "repin")?.contains(RATIONALE_MARKER) {
         return Err(format!(
-            "repin must explain the real change: its rationale must name {RATIONALE_MARKER}, the executable the 29a8 root lacked"
+            "repin must explain the real change: its rationale must name {RATIONALE_MARKER}, the property this repin repairs"
         ));
     }
     for (reference, context) in [
@@ -955,7 +955,7 @@ mod tests {
         assert!(
             validate_semantics(&reference)
                 .unwrap_err()
-                .contains("must retain the replaced e8aebfbb reference")
+                .contains("must retain the replaced f497f81a reference")
         );
 
         let mut archive = record();
@@ -963,7 +963,7 @@ mod tests {
         assert!(
             validate_semantics(&archive)
                 .unwrap_err()
-                .contains("must retain the e8aebfbb build's a44922e4 archive SHA-256")
+                .contains("must retain the f497f81a build's f45bbdc1 archive SHA-256")
         );
     }
 
@@ -1010,7 +1010,7 @@ mod tests {
         assert!(
             validate_semantics(&rationale)
                 .unwrap_err()
-                .contains("rationale must name clang")
+                .contains("rationale must name reproducible")
         );
     }
 
