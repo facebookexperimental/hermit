@@ -27,7 +27,9 @@
 //               poll is classified.
 //   listener-export a second listener, passed to a forked child over a
 //               plain connection, which accepts this process's connection
-//               to it: classified, and the export revokes every mark.
+//               to it: not classified, since export clears the listener's
+//               guest-created provenance. Matching peer credentials do not
+//               prove that only guests hold it; the export revokes every mark.
 //   dgram-named a same-process pair, polled after the process passes an
 //               eventfd on a datagram socketpair end to a named socket of a
 //               forked child: a datagram end is never guest-held, since it can

@@ -545,7 +545,6 @@ lit_cases! {
     lit_hello_world_c_hermit_run => "hello_world_c/hermit-run.lit",
     lit_hello_world_c_hermit_run_strict => "hello_world_c/hermit-run-strict.lit",
     lit_guest_held_polls_main => "guest_held_polls/main.c",
-    #[ignore = "listener-export polls are no longer classified guest-state-only since 440ff499a5; classification-vs-fixture is the change owner's call (https://github.com/rrnewton/hermit/issues/5001)"]
     lit_guest_held_polls_hermit_run => "guest_held_polls/hermit-run.lit",
     lit_networking_main => "networking/main.c",
     lit_networking_hermit_run => "networking/hermit-run.lit",

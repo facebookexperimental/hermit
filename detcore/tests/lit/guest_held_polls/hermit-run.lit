@@ -20,7 +20,7 @@ CONNECT-NEXT: classified polls: some
 CONNECT-NEXT: marks revoked: no
 RUN: %hermit --log info run -- %me listener-export |& awk '/^listener-export:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=LEXPORT %s
 LEXPORT: listener-export: readable 1
-LEXPORT-NEXT: classified polls: some
+LEXPORT-NEXT: classified polls: none
 LEXPORT-NEXT: marks revoked: yes
 RUN: %hermit --log info run -- %me dgram-named |& awk '/^dgram-named:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=DGRAM %s
 DGRAM: dgram-named: revents 0x1
