@@ -53,4 +53,7 @@ system-utils/random-device naked -
 system-utils/shuf-permutation naked -
 system-utils/sort-random naked -
 system-utils/ssh-keygen-ed25519 naked -
+system-utils/sysfs-sanitized-prefixes verify dbt
+system-utils/sysfs-sanitized-prefixes verify kvm
+system-utils/sysfs-sanitized-prefixes verify ptrace
 system-utils/uuidgen-random naked -

@@ -16151,14 +16151,43 @@ fn manifest_node_vacuity_profile_bracket(
             ));
         }
     }
+    // Every bucket node this graph carries whose whole selected population
+    // needs an absent capability is withheld, not just the bracket's own:
+    // computed from the checked-in plan rows, so a bucket that becomes
+    // vacuous later (the privileged system-utils bucket did, when its
+    // sysfs cells were deselected as a named loss) is expected here rather
+    // than failing the bracket. The bracket's own tag must be among them:
+    // that is the load-bearing case.
+    let vacuous_buckets = read_bucket_cells(root, absent)?
+        .iter()
+        .filter(|bucket| bucket.withheld > 0 && bucket_runs_nothing(bucket))
+        .map(|bucket| (bucket.lane.clone(), bucket.category.clone()))
+        .collect::<BTreeSet<_>>();
+    let withheld_tags = steps
+        .iter()
+        .filter_map(|step| {
+            let bucket = manifest_bucket_of(step)?;
+            vacuous_buckets
+                .contains(&bucket)
+                .then(|| step.tag().to_string())
+        })
+        .collect::<BTreeSet<_>>();
+    if !withheld_tags.contains(withheld_tag) {
+        return Err(format!(
+            "node vacuity: {label} bracket bucket {withheld_tag} is not vacuous under the \
+             planted absences; vacuous nodes are {withheld_tags:?}"
+        ));
+    }
     let mut expected = before.clone();
-    expected.remove(withheld_tag);
+    for tag in &withheld_tags {
+        expected.remove(tag.as_str());
+    }
     {
         let consumer = committed_scorecard_tag;
         let deps = expected
             .get_mut(consumer)
             .ok_or_else(|| format!("node vacuity: {label} lost result consumer {consumer}"))?;
-        deps.retain(|dep| dep != withheld_tag);
+        deps.retain(|dep| !withheld_tags.contains(dep));
     }
     let mut actual = Plan {
         cfg: DagConfig {
@@ -16179,8 +16208,9 @@ fn manifest_node_vacuity_profile_bracket(
         .iter()
         .filter(|node| !node.runs())
         .map(|node| node.tag.as_str())
-        .collect::<Vec<_>>();
-    if after != expected || wholly != [withheld_tag] {
+        .collect::<BTreeSet<_>>();
+    let expected_wholly = withheld_tags.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    if after != expected || wholly != expected_wholly {
         return Err(format!(
             "node vacuity: {label} withholding changed the wrong graph state: withheld \
              {wholly:?}, graph {after:?}"

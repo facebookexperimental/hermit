@@ -81,7 +81,7 @@ const DEV_SYMLINKS: &[(&str, &str)] = &[
 /// sub-UIDs, so hermit cannot reliably rewrite or delete a tree it already
 /// produced -- but it can always create a new one beside it. Superseded trees are
 /// left on disk; clearing `~/.cache/hermit/oci-rootfs` reclaims them.
-const ROOTFS_LAYOUT_VERSION: &str = "rootfs-layout-v3-dev";
+const ROOTFS_LAYOUT_VERSION: &str = "rootfs-layout-v4-dev";
 
 /// Basename of the captured `Config.Env` file (one `KEY=VALUE` per line).
 const ENV_BASENAME: &str = ".hermit-oci-env";
@@ -381,6 +381,15 @@ fn materialize_via_podman_store(
     for dir in REQUIRED_DIRS {
         std::fs::create_dir_all(rootfs.join(dir))
             .with_context(|| format!("Failed to create rootfs mount point {dir}"))?;
+    }
+    // Container runtimes provide /etc/hostname; images often omit it.
+    let hostname_path = rootfs.join("etc/hostname");
+    if !hostname_path.exists() {
+        if let Some(parent) = hostname_path.parent() {
+            std::fs::create_dir_all(parent).context("Failed to create rootfs etc directory")?;
+        }
+        std::fs::write(&hostname_path, b"hermetic-container.local\n")
+            .context("Failed to write rootfs /etc/hostname")?;
     }
     for node in DEV_BIND_TARGETS.iter().chain(KVM_DEV_TARGETS.iter()) {
         let target = rootfs.join("dev").join(node);

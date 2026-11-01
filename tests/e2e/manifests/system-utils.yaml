@@ -1,6 +1,6 @@
 schema: 3
 bucket: system-utils
-image: localhost/hermit-hermetic-validate@sha256:011aecae1f6ce06c0b2e07a5cfc8627f7621f8104712bd50aefd7302e47781a9
+image: localhost/hermit-hermetic-validate@sha256:f497f81a4778e6f3f56c29aacfdd153abfdfadfe4f10f0521abadb489c24c7a0
 test:
   - id: system-utils/clock-determinism
     description: clock_gettime/gettimeofday output is identical across repeated Hermit runs
@@ -2195,7 +2195,7 @@ test:
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
         ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the nscd neutralisation contract.'
   - id: system-utils/sysfs-sanitized-prefixes
-    description: One guest asserts readable stable leaves under the eight previously untouched sanitized sysfs prefixes; it needs host hwmon sensors, which GitHub-hosted runners lack (the hosted workflow can loop-mount a btrfs for the btrfs prefix but cannot supply hwmon), so it runs in the privileged lane
+    description: One guest asserts readable stable leaves under the eight previously untouched sanitized sysfs prefixes; it needs host hwmon sensors, which GitHub-hosted runners lack (the hosted workflow can loop-mount a btrfs for the btrfs prefix but cannot supply hwmon), so it runs in the privileged lane. (IMAGE-MODE LOSS -- deselected in the hermetic image; empty /sys until Detcore serves a rendered sysfs, issue 5015)
     lane: privileged
     requires:
       - linux
@@ -2218,7 +2218,8 @@ test:
           native: Native execution removes all eight sanitizers together and is the demonstrated red arm, not a green cell
         ci_disabled_reason: 'NOT-EXERCISED: native execution removes every sanitizer under test and fails the guest assertion.'
       verify:
-        ci: true
+        ci: false
+        ci_disabled_reason: 'IMAGE-MODE LOSS: image roots have an empty /sys until Detcore serves a rendered sysfs (https://github.com/rrnewton/hermit/issues/5015); not faked.'
         backends_enabled:
           - ptrace
           - dbt

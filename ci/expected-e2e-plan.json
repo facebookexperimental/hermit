@@ -11042,43 +11042,6 @@
       "timeout_seconds": 57
     },
     {
-      "backend": "kvm",
-      "category": "system-utils",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "privileged",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "bash"
-      ],
-      "requires_host_capabilities": [
-        "kvm"
-      ],
-      "test": "system-utils/sysfs-sanitized-prefixes",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "ptrace",
-      "category": "system-utils",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "privileged",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "bash"
-      ],
-      "test": "system-utils/sysfs-sanitized-prefixes",
-      "timeout_seconds": 57
-    },
-    {
       "backend": "ptrace",
       "category": "compat",
       "classification": "required",
@@ -47156,23 +47119,6 @@
         "kvm"
       ],
       "test": "applications/kvm-shell-environment",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "dbt",
-      "category": "system-utils",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "privileged",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "bash"
-      ],
-      "test": "system-utils/sysfs-sanitized-prefixes",
       "timeout_seconds": 57
     },
     {

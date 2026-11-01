@@ -10,19 +10,19 @@
     "all": {
       "cells": 3070,
       "applicable": 2246,
-      "selectable": 1757,
-      "population": 3010,
-      "population_candidate_selected": 1757,
+      "selectable": 1755,
+      "population": 3005,
+      "population_candidate_selected": 1755,
       "population_candidate_not_selected": 475,
-      "population_candidate_disabled": 778
+      "population_candidate_disabled": 775
     },
     "by_backend": {
       "dbt": {
         "cells": 614,
         "applicable": 559,
-        "selectable": 554,
-        "population": 602,
-        "population_candidate_selected": 554,
+        "selectable": 553,
+        "population": 601,
+        "population_candidate_selected": 553,
         "population_candidate_not_selected": 2,
         "population_candidate_disabled": 46
       },
@@ -30,17 +30,17 @@
         "cells": 614,
         "applicable": 314,
         "selectable": 314,
-        "population": 602,
+        "population": 601,
         "population_candidate_selected": 314,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 288
+        "population_candidate_disabled": 287
       },
       "kvm": {
         "cells": 614,
         "applicable": 581,
-        "selectable": 574,
-        "population": 602,
-        "population_candidate_selected": 574,
+        "selectable": 573,
+        "population": 601,
+        "population_candidate_selected": 573,
         "population_candidate_not_selected": 3,
         "population_candidate_disabled": 25
       },
@@ -48,19 +48,19 @@
         "cells": 614,
         "applicable": 315,
         "selectable": 315,
-        "population": 602,
+        "population": 601,
         "population_candidate_selected": 315,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 287
+        "population_candidate_disabled": 286
       },
       "sabre": {
         "cells": 614,
         "applicable": 477,
         "selectable": 0,
-        "population": 602,
+        "population": 601,
         "population_candidate_selected": 0,
         "population_candidate_not_selected": 470,
-        "population_candidate_disabled": 132
+        "population_candidate_disabled": 131
       }
     }
   },
@@ -3115,11 +3115,11 @@
     {"test_id":"system-utils/stat-script-root","backend":"kvm","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/stat-script-root","backend":"liteinst","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/stat-script-root","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: NOT-QUALIFIED: this cell checks the name Detcore's rendered stat gives a #! script root against the kernel's status and comm; SaBRe has not been run on it, and SaBRe is a drop candidate under the owner's ruling."},
-    {"test_id":"system-utils/sysfs-sanitized-prefixes","backend":"dbt","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"system-utils/sysfs-sanitized-prefixes","backend":"in-guest-trap","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
-    {"test_id":"system-utils/sysfs-sanitized-prefixes","backend":"kvm","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"system-utils/sysfs-sanitized-prefixes","backend":"liteinst","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness"},
-    {"test_id":"system-utils/sysfs-sanitized-prefixes","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness"},
+    {"test_id":"system-utils/sysfs-sanitized-prefixes","backend":"dbt","category":"system-utils","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: IMAGE-MODE LOSS: image roots have an empty /sys until Detcore serves a rendered sysfs (https://github.com/rrnewton/hermit/issues/5015); not faked."},
+    {"test_id":"system-utils/sysfs-sanitized-prefixes","backend":"in-guest-trap","category":"system-utils","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: IMAGE-MODE LOSS: image roots have an empty /sys until Detcore serves a rendered sysfs (https://github.com/rrnewton/hermit/issues/5015); not faked."},
+    {"test_id":"system-utils/sysfs-sanitized-prefixes","backend":"kvm","category":"system-utils","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: IMAGE-MODE LOSS: image roots have an empty /sys until Detcore serves a rendered sysfs (https://github.com/rrnewton/hermit/issues/5015); not faked."},
+    {"test_id":"system-utils/sysfs-sanitized-prefixes","backend":"liteinst","category":"system-utils","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: IMAGE-MODE LOSS: image roots have an empty /sys until Detcore serves a rendered sysfs (https://github.com/rrnewton/hermit/issues/5015); not faked."},
+    {"test_id":"system-utils/sysfs-sanitized-prefixes","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: IMAGE-MODE LOSS: image roots have an empty /sys until Detcore serves a rendered sysfs (https://github.com/rrnewton/hermit/issues/5015); not faked."},
     {"test_id":"system-utils/true-exit-zero","backend":"dbt","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/true-exit-zero","backend":"in-guest-trap","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/true-exit-zero","backend":"kvm","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

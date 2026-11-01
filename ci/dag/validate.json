@@ -33129,27 +33129,6 @@
           "backend": "ptrace"
         },
         {
-          "lane": "privileged",
-          "category": "system-utils",
-          "test": "system-utils/sysfs-sanitized-prefixes",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "privileged",
-          "category": "system-utils",
-          "test": "system-utils/sysfs-sanitized-prefixes",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "privileged",
-          "category": "system-utils",
-          "test": "system-utils/sysfs-sanitized-prefixes",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
           "kind": "structured-test-results",
           "schema": 2,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
@@ -38012,27 +37991,6 @@
           "category": "system-utils",
           "test": "system-utils/sysfs-sanitized-prefixes",
           "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "privileged",
-          "category": "system-utils",
-          "test": "system-utils/sysfs-sanitized-prefixes",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "privileged",
-          "category": "system-utils",
-          "test": "system-utils/sysfs-sanitized-prefixes",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "privileged",
-          "category": "system-utils",
-          "test": "system-utils/sysfs-sanitized-prefixes",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -52065,27 +52023,6 @@
           "category": "system-utils",
           "test": "system-utils/sysfs-sanitized-prefixes",
           "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "privileged",
-          "category": "system-utils",
-          "test": "system-utils/sysfs-sanitized-prefixes",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "privileged",
-          "category": "system-utils",
-          "test": "system-utils/sysfs-sanitized-prefixes",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "privileged",
-          "category": "system-utils",
-          "test": "system-utils/sysfs-sanitized-prefixes",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -80946,27 +80883,6 @@
           "category": "system-utils",
           "test": "system-utils/sysfs-sanitized-prefixes",
           "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "privileged",
-          "category": "system-utils",
-          "test": "system-utils/sysfs-sanitized-prefixes",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "privileged",
-          "category": "system-utils",
-          "test": "system-utils/sysfs-sanitized-prefixes",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "privileged",
-          "category": "system-utils",
-          "test": "system-utils/sysfs-sanitized-prefixes",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {

@@ -227,7 +227,7 @@
             chmod 1777 tmp var/tmp
             chmod 0700 root
             printf 'root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n' > etc/passwd
-            printf 'root:x:0:\nnobody:x:65534:\n' > etc/group
+            printf 'root:x:0:\nnogroup:x:65534:\nnobody:x:65534:\n' > etc/group
             ln -s "${pkgs.glibc}/lib/ld-linux-x86-64.so.2" lib64/ld-linux-x86-64.so.2
 
             # Selected portable cells name these FHS paths literally. Nix
