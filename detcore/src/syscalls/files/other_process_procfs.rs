@@ -100,7 +100,10 @@
 //!
 //! The one task Linux's lookup finds that no guest process holds is Hermit's
 //! own init, pid 1 where no guest holds it (`procfs::listing::task_exists`).
-//! Its files are left to the backend, as before. That is a KNOWN LIMITATION,
+//! Its files are left to the backend, as before, apart from a descriptor's
+//! fdinfo (`/proc/1[/task/1]/fdinfo/<N>`), which is refused by name: the
+//! backend has no fdinfo of its own any more, and its procfs would answer
+//! from the supervisor's descriptor table. The rest is a KNOWN LIMITATION,
 //! not a determinism guarantee: on KVM pid 1 is the supervisor, whose
 //! descriptor table also holds each child VM's descriptors, so which of its
 //! descriptor entries exist changes with host timing, right after a child is
@@ -340,6 +343,21 @@ pub(crate) fn other_process_refusal_reason(path: &Path) -> String {
         "another guest process's {} cannot be served: on this backend /proc/<pid> names the \
          host task with that number, if any, not the guest's process \
          (https://github.com/rrnewton/hermit/issues/4564)",
+        path.display()
+    )
+}
+
+/// The reason a descriptor's fdinfo of Hermit's own init, at `path`, is
+/// refused by name where the guest's procfs is not the kernel's. On KVM pid 1
+/// is the supervisor, whose descriptors no guest process holds and whose
+/// descriptor table changes with host timing (see the module
+/// documentation), so no fixed answer is Linux's; the backend's own procfs
+/// would answer from the supervisor's table, which is host state.
+pub(crate) fn init_fdinfo_refusal_reason(path: &Path) -> String {
+    format!(
+        "{}, a descriptor's fdinfo of Hermit's own init, cannot be served: on this backend its \
+         descriptors are the supervisor's, which no guest process holds, and which of them \
+         exist changes with host timing (https://github.com/rrnewton/hermit/issues/4071)",
         path.display()
     )
 }
@@ -614,7 +632,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// process, or for either as the second path of a call with two. `None`
     /// on every other backend, for every other path, for the caller's own
     /// process, which its handler answers as before, and for Hermit's own
-    /// init, which the backend answers (see the module documentation).
+    /// init, which the backend answers, apart from a descriptor's fdinfo,
+    /// refused by name (see the module documentation).
     pub(crate) async fn other_process_procfs_answer<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -704,11 +723,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else {
                 // The process the number names (a thread's number names its
                 // process), or none for Hermit's own init, which is left to
-                // the backend (see the module documentation).
+                // the backend (see the module documentation), apart from a
+                // descriptor's fdinfo, which the backend no longer answers.
                 match crate::tool_global::task_stat_facts(guest, task)
                     .await
                     .process
                 {
+                    None if file == TaskFile::DescriptorInfo => Verdict::InitDescriptorInfo,
                     None => continue,
                     Some(process) if process == self.own_detpid(guest).as_raw() => continue,
                     // Past another process's cmdline, which every task has
@@ -778,6 +799,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Verdict::NotADirectory => (Errno::ENOTDIR, None),
                 Verdict::OtherProcess => {
                     (Errno::EACCES, Some(other_process_refusal_reason(&named)))
+                }
+                Verdict::InitDescriptorInfo => {
+                    (Errno::EACCES, Some(init_fdinfo_refusal_reason(&named)))
                 }
             };
             // The second path of a call with two: Linux walks the first one
@@ -864,6 +888,9 @@ enum Verdict {
     NotADirectory,
     /// A file of another guest process: refused by name.
     OtherProcess,
+    /// A descriptor's fdinfo of Hermit's own init: refused by name, as no
+    /// guest process holds its descriptors ([`init_fdinfo_refusal_reason`]).
+    InitDescriptorInfo,
 }
 
 #[cfg(test)]

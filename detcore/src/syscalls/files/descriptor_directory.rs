@@ -647,7 +647,9 @@ const PATH_LIMIT: usize = libc::PATH_MAX as usize;
 /// How many descriptor links to placeholder directories a respelled path may
 /// lead through, as Linux's lookup follows at most `MAXSYMLINKS` links
 /// (<https://github.com/torvalds/linux/blob/v6.17/include/linux/namei.h>).
-const LINK_LIMIT: usize = 40;
+/// The same bound limits the `self` and `thread-self` links a `..` spelling
+/// of a rendered file passes (`walk_lock_or_fdinfo_alias`).
+pub(super) const LINK_LIMIT: usize = 40;
 
 /// One path operand of a call, respelled as Linux resolves it below a
 /// placeholder directory ([`Detcore::respelled_below_descriptor_directory`]).

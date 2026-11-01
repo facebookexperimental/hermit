@@ -857,23 +857,48 @@ async fn the_callers_own_process_and_other_files_are_left_to_their_handlers() {
     }
 }
 
-/// Hermit's own init is left to the backend, its cmdline and its
-/// descriptor directories and entries alike: nothing is decided and nothing
-/// injected. On KVM which of its descriptor entries exist changes with host
-/// timing, a known limitation owned by D-PID1
-/// (https://github.com/rrnewton/hermit/issues/4071).
+/// Hermit's own init is left to the backend, its cmdline, its descriptor
+/// links and its descriptor directories alike: nothing is decided and
+/// nothing injected. On KVM which of its descriptor entries exist changes
+/// with host timing, a known limitation owned by D-PID1
+/// (https://github.com/rrnewton/hermit/issues/4071). A descriptor's fdinfo
+/// is the exception (`hermits_inits_fdinfo_is_refused_by_name`).
 #[tokio::test]
 async fn hermits_init_is_left_to_the_backend() {
     for path in [
         "/proc/1/cmdline",
         "/proc/1/fd/3",
         "/proc/1/fd",
-        "/proc/1/fdinfo/0",
+        "/proc/1/fdinfo",
         "/proc/1/task/1/fd/3",
     ] {
         let (answer, reached) = open(path, Err(Errno::ENOENT)).await;
         assert!(answer.is_none(), "{path}: {answer:?}");
         assert!(reached.is_empty(), "{path}: {reached:?}");
+    }
+}
+
+/// A descriptor's fdinfo of Hermit's own init, by pid 1, through `task/1`,
+/// past the file, and through `..`: the backend has no fdinfo of its own,
+/// and its procfs would answer from the supervisor's descriptor table, host
+/// state. So, as for another guest process's, the kernel is given the call
+/// with the process's directory spelled as a name procfs does not have, and
+/// once it answers ENOENT the call is refused by name.
+#[tokio::test]
+async fn hermits_inits_fdinfo_is_refused_by_name() {
+    for (path, respelled) in [
+        ("/proc/1/fdinfo/0", "/proc/-/fdinfo/0"),
+        ("/proc/1/task/1/fdinfo/0", "/proc/-/task/1/fdinfo/0"),
+        ("/proc/1/fdinfo/0/..", "/proc/-/fdinfo/0/.."),
+        ("/proc/self/../1/fdinfo/0", "/proc/-/fdinfo/0"),
+    ] {
+        let (answer, reached) = open(path, Err(Errno::ENOENT)).await;
+        assert_refused(&answer, Sysno::openat, path);
+        assert_eq!(
+            reached,
+            vec![(Sysno::openat, respelled.to_owned())],
+            "{path}"
+        );
     }
 }
 

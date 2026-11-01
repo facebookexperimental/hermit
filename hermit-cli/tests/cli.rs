@@ -62500,15 +62500,17 @@ fn procfs_dotdot_spellings_guest() -> &'static Path {
 }
 
 /// The spellings guest's transcript under Hermit on `backend` at
-/// `--proc=level`, at L2: two runs at bitwise parity under `--verify-strict`,
-/// with the same nonzero number of INFO records compared.
-fn procfs_dotdot_spellings_at_l2(backend: &str, level: &str) -> String {
+/// `--proc=level`, in the guest's `modes`, at L2: two runs at bitwise parity
+/// under `--verify-strict`, with the same nonzero number of INFO records
+/// compared. Never in the guest's `native` mode, so under Hermit each
+/// comparison the guest makes must agree the first time.
+fn procfs_dotdot_spellings_at_l2(backend: &str, level: &str, modes: &[&str]) -> String {
     let guest = procfs_dotdot_spellings_guest();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let report = directory.path().join(format!("{backend}.json"));
     let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
     let level_arg = format!("--proc={level}");
-    let args = [
+    let mut args = vec![
         "--backend",
         backend,
         "run",
@@ -62524,6 +62526,8 @@ fn procfs_dotdot_spellings_at_l2(backend: &str, level: &str) -> String {
         guest.to_str().expect("guest path is UTF-8"),
         directory.path().to_str().expect("directory path is UTF-8"),
     ];
+    assert!(!modes.contains(&"native"), "{modes:?}");
+    args.extend_from_slice(modes);
     let output = hermit(&args);
     assert_success(&output, &args);
     let verdict: serde_json::Value =
@@ -62553,19 +62557,11 @@ fn procfs_dotdot_spellings_at_l2(backend: &str, level: &str) -> String {
 /// At `--proc=minimal`, which has no `/proc/locks`, every spelling of it
 /// fails with ENOENT, as before.
 fn read_the_dotdot_spellings_of_proc_locks_and_fdinfo(backend: &str) {
-    let guest = procfs_dotdot_spellings_guest();
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let native = Command::new(guest)
-        .arg(directory.path())
-        .stdin(Stdio::null())
-        .output()
-        .expect("run the dot-dot spellings guest natively");
-    assert!(native.status.success(), "native: {native:?}");
-    let native = stdout(&native);
+    let native = procfs_dotdot_spellings_native(&[]);
     assert_eq!(native.lines().count(), 39, "{native}");
     assert!(native.ends_with("done\n"), "{native}");
     assert_eq!(
-        procfs_dotdot_spellings_at_l2(backend, "standard"),
+        procfs_dotdot_spellings_at_l2(backend, "standard", &[]),
         native,
         "{backend} at --proc=standard"
     );
@@ -62583,19 +62579,88 @@ fn read_the_dotdot_spellings_of_proc_locks_and_fdinfo(backend: &str) {
         })
         .collect();
     assert_eq!(
-        procfs_dotdot_spellings_at_l2(backend, "minimal"),
+        procfs_dotdot_spellings_at_l2(backend, "minimal", &[]),
         minimal,
         "{backend} at --proc=minimal"
     );
 }
 
-/// [`read_the_dotdot_spellings_of_proc_locks_and_fdinfo`] on ptrace.
+/// The spellings guest's transcript run natively in `modes`, in its `native`
+/// mode, which tries a comparison that mismatches, or an ELOOP, again. The
+/// ELOOP retry is for a known divergence,
+/// https://github.com/rrnewton/hermit/issues/5045: Linux 7.1.3 keeps the link
+/// count across its RCU-walk retry.
+fn procfs_dotdot_spellings_native(modes: &[&str]) -> String {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let output = Command::new(procfs_dotdot_spellings_guest())
+        .arg(directory.path())
+        .arg("native")
+        .args(modes)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the dot-dot spellings guest natively");
+    assert!(output.status.success(), "native {modes:?}: {output:?}");
+    stdout(&output)
+}
+
+/// Linux's limit on the links one lookup follows, through the spellings
+/// guest's links mode at `--proc=standard` on `backend`, at L2: 40 passes
+/// through `/proc/self` resolve, the 41st is ELOOP, and a missing task or a
+/// file before the 41st decides first, as natively.
+///
+/// Only where Detcore's walk resolves these spellings (KVM, package K slice
+/// K8-d). Not at `--proc=minimal`, where the level's own check answers a
+/// spelling of `/proc/locks` before any walk, on every backend alike. Nor on
+/// ptrace, a known divergence, https://github.com/rrnewton/hermit/issues/5045:
+/// Linux 7.1.3 keeps the link count across its RCU-walk retry. On ptrace the
+/// kernel walks these spellings, and its answer for a path that follows
+/// more than 20 links depends on host timing: when its lockless (RCU) walk
+/// falls back to a reference walk, as a mount anywhere on the host can make it
+/// do, the second walk counts again the links the first one followed
+/// (`filename_lookup` and `do_file_open` set `nd->total_link_count` once, in
+/// `set_nameidata`), so it can fail with ELOOP within the limit. That reaches
+/// the guest's own call, and Detcore's open of the guest's path again after a
+/// stat (to number a procfs inode), which records a determinism loss. Measured
+/// natively on Linux 7.1.3 beside a loop of tmpfs mounts: no ELOOP in 400,000
+/// lookups at 20 links, 101 at 21, and about 1 in 60 at 40. The native run
+/// tries an ELOOP again.
+fn read_the_link_limit_spellings(backend: &str) {
+    let native = procfs_dotdot_spellings_native(&["links"]);
+    assert_eq!(native.lines().count(), 21, "{native}");
+    for line in [
+        "/proc/(self/..)x40/locks: read the plain spelling's bytes",
+        "/proc/(self/..)x41/locks: open or read ELOOP",
+        "/proc/4194305/../(self/..)x41/locks: open or read ENOENT",
+        "/proc/locks/../(self/..)x41/locks: open or read ENOTDIR",
+    ] {
+        assert!(
+            native.lines().any(|native| native == line),
+            "{line}: {native}"
+        );
+    }
+    assert_eq!(
+        procfs_dotdot_spellings_at_l2(backend, "standard", &["links"]),
+        native,
+        "{backend} links at --proc=standard"
+    );
+}
+
+/// [`read_the_dotdot_spellings_of_proc_locks_and_fdinfo`] on ptrace. Not
+/// [`read_the_link_limit_spellings`], a known divergence,
+/// https://github.com/rrnewton/hermit/issues/5045: Linux 7.1.3 keeps the link
+/// count across its RCU-walk retry, so ptrace's answer at 21 to 40 links
+/// depends on host timing.
 #[test]
 fn the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux() {
     read_the_dotdot_spellings_of_proc_locks_and_fdinfo("ptrace");
 }
 
-/// [`read_the_dotdot_spellings_of_proc_locks_and_fdinfo`] on KVM.
+/// [`read_the_dotdot_spellings_of_proc_locks_and_fdinfo`] and
+/// [`read_the_link_limit_spellings`] on KVM. Then the one other path that
+/// reached the backend's own fdinfo, a descriptor's fdinfo of the run's pid 1,
+/// Hermit's own init: KVM's backend no longer has an fdinfo of its own, and
+/// its procfs would answer from the supervisor's descriptor table, host
+/// state, so the run stops with the policy's exit and names why.
 #[test]
 fn run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux() {
     let test = "run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux";
@@ -62603,4 +62668,31 @@ fn run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux() {
         return;
     }
     read_the_dotdot_spellings_of_proc_locks_and_fdinfo("kvm");
+    read_the_link_limit_spellings("kvm");
+    let guest = procfs_dotdot_spellings_guest();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let args = [
+        "--backend",
+        "kvm",
+        "run",
+        "--strict",
+        "--proc=standard",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        directory.path().to_str().expect("directory path is UTF-8"),
+        "init",
+    ];
+    let output = hermit(&args);
+    let log = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "kvm init did not stop with the policy's exit: {log}"
+    );
+    assert!(
+        log.contains("a descriptor's fdinfo of Hermit's own init, cannot be served"),
+        "kvm init: the refusal does not name its reason: {log}"
+    );
 }

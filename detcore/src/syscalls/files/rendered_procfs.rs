@@ -853,6 +853,15 @@ pub(super) enum LockOrFdinfoAlias {
         file: std::path::PathBuf,
         tasks: Vec<super::descriptor_directory::NamedTask>,
     },
+    /// A walk to `file` that follows the `self` or `thread-self` link more
+    /// than `MAXSYMLINKS` times before it reaches the file: Linux's walk
+    /// fails with ELOOP at the first link past the limit
+    /// (`pick_link`'s `total_link_count`), provided every task in `tasks`,
+    /// the ones named before that link, exists, in order.
+    LinkLimit {
+        file: std::path::PathBuf,
+        tasks: Vec<super::descriptor_directory::NamedTask>,
+    },
 }
 
 /// Walk `path`, an absolute spelling with a `..`, to `/proc/locks` or a
@@ -864,7 +873,9 @@ pub(super) enum LockOrFdinfoAlias {
 /// file, where it is the whole path, or the file with something after it.
 /// Empty and `.` components are dropped as the walk drops them, but a slash
 /// or `/.` after the last component asks for a directory, which the file is
-/// not ([`LockOrFdinfoAlias::PastFile`]).
+/// not ([`LockOrFdinfoAlias::PastFile`]). Each `self` or `thread-self` the
+/// walk looks up in `/proc` before the file is a link it follows, and the
+/// first one past the limit ends the walk ([`LockOrFdinfoAlias::LinkLimit`]).
 pub(super) fn walk_lock_or_fdinfo_alias(path: &Path) -> LockOrFdinfoAlias {
     let bytes = path.as_os_str().as_bytes();
     if !bytes.starts_with(b"/") {
@@ -901,6 +912,9 @@ pub(super) fn walk_lock_or_fdinfo_alias(path: &Path) -> LockOrFdinfoAlias {
         {
             continue;
         }
+        if let Some(tasks) = past_the_link_limit(&components[..index]) {
+            return LockOrFdinfoAlias::LinkLimit { file, tasks };
+        }
         return if index + 1 == components.len() && !trailing {
             LockOrFdinfoAlias::File { file, tasks }
         } else {
@@ -908,6 +922,46 @@ pub(super) fn walk_lock_or_fdinfo_alias(path: &Path) -> LockOrFdinfoAlias {
         };
     }
     LockOrFdinfoAlias::NotApplicable
+}
+
+/// Whether Linux's walk of `components` (an absolute path's, without empty
+/// and `.` ones, whose `..` all resolve over procfs's own directories) follows
+/// the `self` or `thread-self` link more than `MAXSYMLINKS` times: each one it
+/// looks up in `/proc` is one link (`proc_self_get_link`,
+/// `proc_thread_self_get_link`), counted in lookup order. `Some` of the tasks
+/// named before the first link past the limit, which the walk looks up first
+/// (and fails with ENOENT at the first that does not exist); `None` within
+/// the limit.
+fn past_the_link_limit(
+    components: &[&[u8]],
+) -> Option<Vec<super::descriptor_directory::NamedTask>> {
+    let mut links = 0;
+    let mut prefix = Vec::new();
+    let mut passed_dotdot = false;
+    for component in components {
+        if *component == b"self" || *component == b"thread-self" {
+            let spelled = Path::new(OsStr::from_bytes(&prefix));
+            // Where the walk is when it looks the name up. Every `..` before
+            // the file resolves (the caller's walk found the file through
+            // them), so a prefix the resolver leaves to the kernel is none.
+            let (directory, tasks) = if passed_dotdot {
+                super::descriptor_directory::resolved_procfs_dotdot(spelled)
+                    .unwrap_or_else(|| (spelled.to_path_buf(), Vec::new()))
+            } else {
+                (spelled.to_path_buf(), Vec::new())
+            };
+            if directory == Path::new("/proc") {
+                links += 1;
+                if links > super::descriptor_directory::LINK_LIMIT {
+                    return Some(tasks);
+                }
+            }
+        }
+        prefix.push(b'/');
+        prefix.extend_from_slice(component);
+        passed_dotdot |= *component == b"..";
+    }
+    None
 }
 
 /// Whether an open with `flags` asks to write the file it opens: a write or
@@ -3906,7 +3960,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// kernel's): [`walk_lock_or_fdinfo_alias`], then each task the walk
     /// passed must exist in Detcore's process table, in order, as Linux's
     /// lookup requires of the components a `..` later undoes (ENOENT
-    /// otherwise). The file's spelling without the `..`, and whether
+    /// otherwise). A walk that follows more links than Linux's lookup does
+    /// fails with ELOOP, once the tasks named before the first link past the
+    /// limit exist ([`LockOrFdinfoAlias::LinkLimit`]). The file's spelling
+    /// without the `..`, and whether
     /// something follows it in `path` (which the caller refuses with ENOTDIR
     /// once the file is found, as Linux's walk does), for the caller to
     /// classify as it classifies a plain spelling. `None` for any other
@@ -3918,10 +3975,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         path: &Path,
     ) -> Result<Option<(std::path::PathBuf, bool)>, Error> {
-        let (file, tasks, past) = match walk_lock_or_fdinfo_alias(path) {
+        let (file, tasks, past, loops) = match walk_lock_or_fdinfo_alias(path) {
             LockOrFdinfoAlias::NotApplicable => return Ok(None),
-            LockOrFdinfoAlias::File { file, tasks } => (file, tasks, false),
-            LockOrFdinfoAlias::PastFile { file, tasks } => (file, tasks, true),
+            LockOrFdinfoAlias::File { file, tasks } => (file, tasks, false, false),
+            LockOrFdinfoAlias::PastFile { file, tasks } => (file, tasks, true, false),
+            LockOrFdinfoAlias::LinkLimit { file, tasks } => (file, tasks, false, true),
         };
         let rendered = if file == Path::new("/proc/locks") {
             self.rendered_files(guest).locks
@@ -3933,6 +3991,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         if !Self::named_tasks_exist(guest, &tasks).await {
             return Err(Errno::ENOENT.into());
+        }
+        if loops {
+            return Err(Errno::ELOOP.into());
         }
         Ok(Some((file, past)))
     }
@@ -9223,7 +9284,8 @@ mod tests {
     /// names one of the two files decides: the file, or the file with a
     /// component or a slash after it. A `..` after anything procfs's walk
     /// cannot undo by name (a link such as `cwd`, a step out of `/proc`) and
-    /// a spelling without `..` are not the walk's.
+    /// a spelling without `..` are not the walk's. More than `MAXSYMLINKS`
+    /// links before the file end the walk.
     #[test]
     fn a_lock_or_fdinfo_alias_walk_follows_linuxs_lookup() {
         use super::super::descriptor_directory::NamedTask;
@@ -9301,6 +9363,68 @@ mod tests {
         ] {
             assert_eq!(
                 walk_lock_or_fdinfo_alias(Path::new(path)),
+                expected,
+                "{path}"
+            );
+        }
+        // Linux's limit on the links one lookup follows: each `self` or
+        // `thread-self` looked up in `/proc` before the file is one, counted
+        // in lookup order. 40 resolve, the 41st is ELOOP; a task named or a
+        // file found before the 41st link decides first, and a task named
+        // after it is never looked up.
+        let limit = |file: &str, tasks: Vec<NamedTask>| LockOrFdinfoAlias::LinkLimit {
+            file: std::path::PathBuf::from(file),
+            tasks,
+        };
+        let repeated = |count: usize| "self/../".repeat(count);
+        for (path, expected) in [
+            (
+                format!("/proc/{}locks", repeated(40)),
+                file("/proc/locks", vec![]),
+            ),
+            (
+                format!("/proc/{}locks", repeated(41)),
+                limit("/proc/locks", vec![]),
+            ),
+            (
+                format!("/proc/{}locks/..", repeated(41)),
+                limit("/proc/locks", vec![]),
+            ),
+            (
+                format!("/proc/{}self/fdinfo/3", repeated(39)),
+                file("/proc/self/fdinfo/3", vec![]),
+            ),
+            (
+                format!("/proc/{}self/fdinfo/3", repeated(40)),
+                limit("/proc/self/fdinfo/3", vec![]),
+            ),
+            (
+                format!("/proc/thread-self/../../../{}locks", repeated(39)),
+                file("/proc/locks", vec![]),
+            ),
+            (
+                format!("/proc/thread-self/../../../{}locks", repeated(40)),
+                limit("/proc/locks", vec![]),
+            ),
+            (
+                format!("/proc/7/../{}locks", repeated(41)),
+                limit("/proc/locks", vec![named(Some(7), None)]),
+            ),
+            (
+                format!("/proc/{}7/../locks", repeated(41)),
+                limit("/proc/locks", vec![]),
+            ),
+            (
+                format!("/proc/{}7/../locks", repeated(40)),
+                file("/proc/locks", vec![named(Some(7), None)]),
+            ),
+            (
+                format!("/proc/locks/../{}locks", repeated(41)),
+                past("/proc/locks", vec![]),
+            ),
+        ] {
+            assert_eq!(
+                walk_lock_or_fdinfo_alias(Path::new(&path)),
                 expected,
                 "{path}"
             );
