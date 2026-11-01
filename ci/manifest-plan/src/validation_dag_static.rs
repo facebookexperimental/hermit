@@ -3589,7 +3589,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the shard pins 61 + 290 + 349 again sum to the on-host 700).
     // The integrated chain adds twelve cases in this shard's range:
     // 349 + 12 = 361, re-measured at fd59b85c73 (361 passed).
-    ("test.hermit_integration_3", 361),
+    // The DBT robust-futex named-loss #[ignore] (issue 5023) drops one
+    // executed case: 361 - 1 = 360, measured at bf80a560a9.
+    ("test.hermit_integration_3", 360),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4786,8 +4788,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // population that does not leave exactly this many required. Deleting a
     // row (a gap that now passes) or adding a test raises it.
     // T2's promotion (578b92a6af) made it 37; the 2026-10-31 deselection of
-    // the four batch-28 itimer gaps (approval on issue 4929) makes it 34.
-    ("privileged-test.deadline_slice_cap_kvm", 34),
+    // the four batch-28 itimer gaps (approval on issue 4929) made it 34; the
+    // bf80a560a9 validate showed itimer_a_recorded_schedule_replays passing,
+    // so its row was promoted out of the ledger: 34 + 1 = 35.
+    ("privileged-test.deadline_slice_cap_kvm", 35),
     // The same three https://github.com/rrnewton/hermit/issues/3260 tests as
     // test.cli; all 99 prior identities retained. The same
     // https://github.com/rrnewton/hermit/pull/3547 version test as test.cli
@@ -5775,7 +5779,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The integrated chain grows shard 3 to 361 (see its pin): 61 + 292 +
     // 361 = 714.
     // Shard 2 then grows to 293 (see its pin): 61 + 293 + 361 = 715.
-    ("test.hermit_integration_on_host", 715),
+    // The DBT robust-futex #[ignore] (issue 5023) drops shard 3 to 360:
+    // 61 + 293 + 360 = 714.
+    ("test.hermit_integration_on_host", 714),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

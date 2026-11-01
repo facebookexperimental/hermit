@@ -10,15 +10,7 @@
           "id": "hermit-run::deadline_slice_cap$itimer_a_private_descriptor_table_consumer_re_arms",
           "issue": "https://github.com/rrnewton/hermit/issues/4929",
           "outcome": "failed",
-          "signature": "\"privfd\" \"5000\"\\nstatus: exit status: 122",
-          "status": "known-gap"
-        },
-        {
-          "gap": "I",
-          "id": "hermit-run::deadline_slice_cap$itimer_a_recorded_schedule_replays",
-          "issue": "https://github.com/rrnewton/hermit/issues/4929",
-          "outcome": "failed",
-          "signature": "\"storm\" \"400\" \"20\" \"2\"\\nstatus: exit status: 122",
+          "signature": "\"privfd\" \"5000\"\\nstatus: exit status: 122\\nstdout:\\n\\nstderr:",
           "status": "known-gap"
         },
         {
@@ -66,13 +58,13 @@
           "id": "hermit-run::deadline_slice_cap$skipped_slice_ends_survive_the_backstop",
           "issue": "https://github.com/rrnewton/hermit/issues/4929",
           "outcome": "failed",
-          "signature": "INFO line <N> differs:",
+          "signature": "long: backstop events\\n      left: 0\\n     right: 1",
           "status": "known-gap"
         }
       ],
       "ledger": "hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv",
       "node": "privileged-test.deadline_slice_cap_kvm",
-      "required_tests": 34
+      "required_tests": 35
     }
   ],
   "schema": 1

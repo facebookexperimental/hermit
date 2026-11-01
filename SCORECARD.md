@@ -80,22 +80,21 @@ These rows are part of the selected regression denominator even though they are 
 
 ## Known gaps of validation nodes, outside every count above
 
-Each row below is a test that a validation node runs and expects to FAIL on its backend: a known gap, listed with its tracking issue in the node's known-gap ledger. These **8** rows are not manifest cells, so they are in none of the counts or percentages above. Each one counts as a failing test, never as a pass and never as not applicable. The node records it as `diagnostic_fail` when it fails the way its row says, and fails outright when it passes (promote it to required) or fails some other way. In a signature, `\n` is a newline and `<N>` any run of digits. The same rows, with their tracking URLs, are in `ci/compat-envelope/known-gaps.json`.
+Each row below is a test that a validation node runs and expects to FAIL on its backend: a known gap, listed with its tracking issue in the node's known-gap ledger. These **7** rows are not manifest cells, so they are in none of the counts or percentages above. Each one counts as a failing test, never as a pass and never as not applicable. The node records it as `diagnostic_fail` when it fails the way its row says, and fails outright when it passes (promote it to required) or fails some other way. In a signature, `\n` is a newline and `<N>` any run of digits. The same rows, with their tracking URLs, are in `ci/compat-envelope/known-gaps.json`.
 
 ### `privileged-test.deadline_slice_cap_kvm` (`--backend=kvm`)
 
-**34** required tests must pass; **8** known gaps, from `hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv`:
+**35** required tests must pass; **7** known gaps, from `hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv`:
 
 | Test | Gap | Tracking issue | Must fail with | Status |
 | --- | --- | --- | --- | --- |
-| `itimer_a_private_descriptor_table_consumer_re_arms` | D | https://github.com/rrnewton/hermit/issues/4929 | output showing `"privfd" "5000"\nstatus: exit status: 122` | failing (known gap) |
-| `itimer_a_recorded_schedule_replays` | I | https://github.com/rrnewton/hermit/issues/4929 | output showing `"storm" "400" "20" "2"\nstatus: exit status: 122` | failing (known gap) |
+| `itimer_a_private_descriptor_table_consumer_re_arms` | D | https://github.com/rrnewton/hermit/issues/4929 | output showing `"privfd" "5000"\nstatus: exit status: 122\nstdout:\n\nstderr:` | failing (known gap) |
 | `itimer_a_sigsuspend_loop_takes_every_expiry` | C | https://github.com/rrnewton/hermit/issues/4929 | output showing `failed: deliveries=` | failing (known gap) |
 | `itimer_a_wait_mask_is_withdrawn_when_the_wait_returns` | H | https://github.com/rrnewton/hermit/issues/4929 | output showing `"stale" "ppoll_mask"\nstatus: exit status: 122` | failing (known gap) |
 | `itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue` | E | https://github.com/rrnewton/hermit/issues/4929 | output showing `failed: ignored_remaining_us=` | failing (known gap) |
 | `itimer_generation_discard_follows_the_wait_mask` | E+F' | https://github.com/rrnewton/hermit/issues/4929 | output showing `failed: poll: result=0 first_us=` | failing (known gap) |
 | `itimer_mixed_masks_keep_the_timer_running` | G | https://github.com/rrnewton/hermit/issues/4929 | output showing `\npositive=<N> samples=20 progress=<N>\n\nnote: run with` | failing (known gap) |
-| `skipped_slice_ends_survive_the_backstop` | J | https://github.com/rrnewton/hermit/issues/4929 | output showing `INFO line <N> differs:` | failing (known gap) |
+| `skipped_slice_ends_survive_the_backstop` | J | https://github.com/rrnewton/hermit/issues/4929 | output showing `long: backstop events\n      left: 0\n     right: 1` | failing (known gap) |
 
 ## Run history
 
