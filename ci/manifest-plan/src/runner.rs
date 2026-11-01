@@ -23222,6 +23222,13 @@ exit "$(cat "$PWD/exit-status")"
                  whose /proc/locks rows Detcore refuses by name",
             ),
             (
+                "c-programs/robust-list-owner-death-routes",
+                "kvm",
+                "`skip-exec-sibling` leaves out the exec that ends an owning sibling: KVM hangs at \
+                 an exec by a process with another live thread \
+                 (https://github.com/rrnewton/hermit/issues/4904)",
+            ),
+            (
                 "c-programs/scm-rights-received-descriptors",
                 "in-guest-trap",
                 "`--no-exec` skips the exec check: in-guest LiteInst refuses execve",

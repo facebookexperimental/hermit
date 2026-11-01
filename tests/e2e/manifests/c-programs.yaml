@@ -8723,6 +8723,78 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/robust-list-owner-death-routes
+    description: "Robust-futex owner death by each Linux exit route, observed from another process: a thread's own exit over a hand-written robust list (an entry it owns, one another thread owns and Linux leaves alone, one with a waiter, a pending entry holding 0, a list whose entry has an unreadable word, where the walk stops, and a list whose entry and pending entry are both NULL, which Linux compares as pointers and skips), a robust priority-inheritance mutex with and without a waiter, exit_group, a signal whose default action ends the process, a SIGKILL to the own process, an exec by the owner, an exec that ends an owning sibling, a failed exec, a failed exec holding a robust mutex on a MAP_SHARED memfd page (nothing is walked), and an exec whose argument string is a byte of an owned lock word (Linux copies the strings before it walks); each waiter that gets EOWNERDEAD makes the mutex consistent and locks it again, for tests/c/robust_list_owner_death_routes.c. KVM leaves out the exec that ends an owning sibling, because it hangs at an exec by a process with another live thread (https://github.com/rrnewton/hermit/issues/4904)"
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/robust_list_owner_death_routes.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: Not measured; the robust-futex owner-word slice qualified ptrace and KVM (https://github.com/rrnewton/hermit/issues/4529)
+          sabre: Not measured; the robust-futex owner-word slice qualified ptrace and KVM (https://github.com/rrnewton/hermit/issues/4529)
+          liteinst: "The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest's exec cases exec it again"
+          in-guest-trap: "The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest's exec cases exec it again"
+        guest_args:
+          kvm:
+            - skip-exec-sibling
+        expected_stdout:
+          ptrace: "thread-exit: own=OWNER_DIED other=untouched contended=OWNER_DIED|WAITERS waiter=woken pending=untouched waiter=woken child=exit 0\nbad-pointer: before=OWNER_DIED after=untouched pending=untouched child=exit 0\nnull-entry: word=untouched child=exit 0\npi-thread-exit: waiter=EOWNERDEAD uncontended=EOWNERDEAD child=exit 0\nexit-group: m1=EOWNERDEAD consistent=0 relock=0 m2=EOWNERDEAD m3=EOWNERDEAD child=exit 0\nfatal-signal: m1=EOWNERDEAD consistent=0 relock=0 m2=EOWNERDEAD m3=EOWNERDEAD child=signal 15\nsigkill-self: m1=EOWNERDEAD consistent=0 relock=0 m2=EOWNERDEAD m3=EOWNERDEAD child=signal 9\nexec-owner: m1=EOWNERDEAD child=exit 0\nexec-sibling: m1=EOWNERDEAD child=exit 0\nexec-failed: m1=0 child=exit 0\nexec-failed-file: errno=ENOENT unlock=0 child=exit 0\nexec-alias: argument-length=0 child=exit 0\nrobust-list-owner-death-routes: done\n"
+          kvm: "thread-exit: own=OWNER_DIED other=untouched contended=OWNER_DIED|WAITERS waiter=woken pending=untouched waiter=woken child=exit 0\nbad-pointer: before=OWNER_DIED after=untouched pending=untouched child=exit 0\nnull-entry: word=untouched child=exit 0\npi-thread-exit: waiter=EOWNERDEAD uncontended=EOWNERDEAD child=exit 0\nexit-group: m1=EOWNERDEAD consistent=0 relock=0 m2=EOWNERDEAD m3=EOWNERDEAD child=exit 0\nfatal-signal: m1=EOWNERDEAD consistent=0 relock=0 m2=EOWNERDEAD m3=EOWNERDEAD child=signal 15\nsigkill-self: m1=EOWNERDEAD consistent=0 relock=0 m2=EOWNERDEAD m3=EOWNERDEAD child=signal 9\nexec-owner: m1=EOWNERDEAD child=exit 0\nexec-sibling: skipped\nexec-failed: m1=0 child=exit 0\nexec-failed-file: errno=ENOENT unlock=0 child=exit 0\nexec-alias: argument-length=0 child=exit 0\nrobust-list-owner-death-routes: done\n"
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: this guest asserts strict verification and native-equal output; it asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts strict verification and native-equal output; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification cell and has not been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this strict-verification cell
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/sched-setattr-batch
     description: Strict verification for tests/c/sched_setattr_batch.c
     lane: portable

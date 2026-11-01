@@ -2539,10 +2539,22 @@
       "why": "tests/c/robust_futex_owner_lifecycle.c is owned by hermit-cli/tests/robust_futex_owner_death.rs: the integration test compiles this multi-mode process-shared robust-mutex guest, requires the waiter to set FUTEX_WAITERS before triggering owner death, exercises native Linux signal, exit_group, de_thread, owner-exec and leader-exec behavior, checks the ptrace signal and exit_group paths for EOWNERDEAD plus one post-exit modeled wake, checks the three exec paths for EOWNERDEAD plus one modeled wake at the exec, and checks that a non-leader owner's own exec and a failed exec wake nobody, as on Linux (https://github.com/rrnewton/hermit/issues/2082); checks on ptrace that a SIGKILL of the owner's process by another process (kill, tgkill naming another thread, pidfd_send_signal, kill of its process group, an owner holding the mutex only through its pending slot, a waiter in the killing process, two owning threads) or by the process itself (from another thread, from the owner, from a thread owning a second mutex) wakes each waiter with EOWNERDEAD at L2; on DBT it checks exit_group cases with a blocked sibling, a registration made after the exit_group is filed, a word reached through two mappings, two pending slots on one ownerless word and an owner's pending word (https://github.com/rrnewton/hermit/issues/4238)"
     },
     {
+      "disposition": "cargo-integration-test-fixture",
+      "path": "tests/c/robust_futex_unexchangeable_word.c",
+      "runner": "cargo test -p hermit-run --test cli",
+      "why": "tests/c/robust_futex_unexchangeable_word.c is compiled and exercised by hermit-cli/tests/cli.rs's run_kvm_a_robust_word_kvm_cannot_exchange_is_a_named_refusal_where_ptrace_marks_it: a child holding a robust mutex on a MAP_SHARED memfd page exits or execs; ptrace must give Linux's EOWNERDEAD, and KVM, which has no atomic store for a word on file backing, must refuse the run by name at the death and at the exec's point of no return (https://github.com/rrnewton/hermit/issues/4529)"
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/robust_list.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/robust_list.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/robust_list_owner_death_routes.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and KVM; ci=true)",
+      "why": "tests/c/robust_list_owner_death_routes.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: robust-futex owner death by each Linux exit route (a thread's own exit over hand-written lists, including an entry another thread owns, a waiter, a pending entry holding 0, an unreadable word, and a NULL entry with a NULL pending entry; a robust priority-inheritance mutex; exit_group; a default-fatal signal; a SIGKILL to the own process; an exec by the owner, an exec that ends an owning sibling, a failed exec, a failed exec holding a robust mutex on a shared memfd page, and an exec whose argument string is a byte of an owned lock word) must mark and wake as native Linux does, observed from another process (https://github.com/rrnewton/hermit/issues/4529)"
     },
     {
       "disposition": "guest-fixture",

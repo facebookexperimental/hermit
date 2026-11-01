@@ -39,10 +39,20 @@
 //! has made the transition. For an exit_group the threads it kills hold their
 //! native exits until its walk is done
 //! (`ThreadState::wait_for_exit_group_robust_walk`), so Linux marks no word
-//! before the walk reads it. SaBRe and KVM, which have neither a
-//! post-cleanup callback nor that barrier, do not run this path.
+//! before the walk reads it. SaBRe, which has neither a post-cleanup callback
+//! nor that barrier, does not run this path.
 //! The fake below models the unsafe separate read/write window so an
 //! implementation cannot hide it behind an atomic test double.
+//!
+//! On KVM no Linux task exits for a guest thread, so no kernel walk would
+//! ever mark a word (`BackendCapabilities::kernel_never_walks_robust_lists`).
+//! There Detcore makes the transition itself, in the dying thread's own turn,
+//! with the guest compare-and-exchange (`MemoryAccess::compare_exchange_u32`),
+//! which is atomic with respect to every vCPU that can reach the word, as the
+//! kernel's `futex_cmpxchg_value_locked` is; it never stores with a separate
+//! read and write. A word the backend cannot exchange atomically (one on file
+//! backing it has no atomic store for) stops the walk, and the run is refused
+//! by name ([`FutexCasOutcome::Unsupported`]), never left unmarked.
 //!
 //! # Lifecycle scope
 //!
@@ -66,8 +76,20 @@
 //! delivery at the caller's deregistration covers an old image that
 //! deregisters before any reconnect. Ptrace loses those wakes
 //! (<https://github.com/rrnewton/hermit/issues/4363>). DBT does not yet model
-//! a fatal signal (<https://github.com/rrnewton/hermit/issues/4278>); KVM and
-//! SaBRe model none of them.
+//! a fatal signal (<https://github.com/rrnewton/hermit/issues/4278>); SaBRe
+//! models none of them. KVM walks, stores and wakes at an owner's own exit; at
+//! the grant of the `Exit` request that ends a whole group by exit_group or
+//! by a SIGKILL a thread sends its own process; and at a delivery whose
+//! default action ends the process, in the delivering thread's turn, which
+//! the delivery then leaves without the post-handler hook, so no thread of
+//! the dying group runs guest code after the walk. An exec walks and stores
+//! at its point of no return, which the backend reports through
+//! `Tool::handle_exec_commit` after it has read the strings the exec copies,
+//! and holds the wakes until the new image's first callback; an exec that
+//! fails walks nothing
+//! (<https://github.com/rrnewton/hermit/issues/4529>). KVM refuses an exec by
+//! a thread that is not its group's leader, and a signal to another process,
+//! so neither of those deaths reaches Detcore there.
 //!
 //! # Structure
 //!
@@ -128,8 +150,9 @@ impl RobustEntry {
         }
     }
 
-    /// Whether this slot is the NULL terminator (`fetch_robust_entry` yields a
-    /// null entry only for an unset `list_op_pending`).
+    /// Whether this slot is NULL: an unset `list_op_pending`, or a `next`
+    /// pointer of 0 (which Linux then compares with `list_op_pending` as any
+    /// other pointer, and faults on when it fetches through it).
     pub(crate) fn is_null(&self) -> bool {
         self.address == 0
     }
@@ -185,6 +208,10 @@ enum DeathStep {
     /// `return`, so nothing further is touched — not the remaining entries and
     /// not the trailing `list_op_pending` slot.
     Abort,
+    /// The exchange Linux would have made cannot be made at all
+    /// ([`FutexCasOutcome::Unsupported`]). The walk stops here, untouched
+    /// beyond this word, and its caller refuses the run by name.
+    Unsupported,
 }
 
 /// What one attempted futex-word replacement reported, mirroring the kernel's
@@ -198,9 +225,10 @@ pub(crate) enum FutexCasOutcome {
     /// native exit repeats the owner check and replaces the word atomically
     /// before the modeled wake can let another thread run; on DBT the
     /// scheduler's exited-thread barrier gives the same order. Later reads in
-    /// the same exit see the value Linux will store. The unit-test model
-    /// stores it immediately, so the walk can be checked against the kernel's
-    /// write sequence.
+    /// the same exit see the value Linux will store. Where no native exit
+    /// makes it (KVM), the production effects store it with the guest's
+    /// atomic compare-and-exchange. The unit-test model stores it immediately,
+    /// so the walk can be checked against the kernel's write sequence.
     Matched,
     /// The word held this other value instead, so nothing was written. The
     /// kernel's `goto retry`.
@@ -208,6 +236,12 @@ pub(crate) enum FutexCasOutcome {
     /// The access faulted and could not be completed. The kernel's `return -1`
     /// after `fault_in_user_writeable()` also fails.
     Faulted,
+    /// The backend cannot exchange this word atomically at all (its guest
+    /// compare-and-exchange answered a missing capability or a failure of its
+    /// own, not a fault), where Linux would have made the exchange. Nothing
+    /// was written; the walk stops, and its caller refuses the run by name
+    /// rather than leave a word Linux marks unmarked.
+    Unsupported,
 }
 
 /// Guest-memory and wake effects the walk needs.
@@ -258,6 +292,9 @@ pub(crate) struct WalkOutcome {
     /// How many times a futex word changed between being read and being
     /// written, forcing the kernel's `goto retry`.
     pub cas_retries: usize,
+    /// The backend could not make an exchange Linux would have made
+    /// ([`FutexCasOutcome::Unsupported`]); the walk stopped there.
+    pub unsupported: bool,
 }
 
 /// Replay Linux's `exit_robust_list()` (`kernel/futex/core.c`) over `effects`.
@@ -286,10 +323,7 @@ pub(crate) async fn exit_robust_list<E: RobustDeathEffects>(
     };
     let futex_offset = futex_offset as i64;
     let mut entry = RobustEntry::decode(first_raw);
-    let pending = {
-        let decoded = RobustEntry::decode(pending_raw);
-        (!decoded.is_null()).then_some(decoded)
-    };
+    let pending = RobustEntry::decode(pending_raw);
 
     let mut limit = ROBUST_LIST_LIMIT;
     while entry.address != head {
@@ -298,10 +332,15 @@ pub(crate) async fn exit_robust_list<E: RobustDeathEffects>(
         // `struct robust_list` is a single `next` pointer at offset 0.
         let next = effects.read_u64(entry.address).map(RobustEntry::decode);
 
-        // The kernel skips `pending` here and handles it once at the end.
-        if pending.map(|slot| slot.address) != Some(entry.address) {
+        // The kernel skips `pending` here and handles it once at the end. It
+        // compares the two as pointers (`if (entry != pending)`, with the PI
+        // bit already stripped from both), so a NULL entry equals a NULL
+        // `list_op_pending` and is skipped too: Linux leaves the word at
+        // `NULL + futex_offset` alone, and the fetch of `NULL->next` above
+        // then ends the walk.
+        if entry.address != pending.address {
             outcome.entries_visited += 1;
-            if handle_futex_death(
+            match handle_futex_death(
                 effects,
                 entry,
                 futex_offset,
@@ -310,10 +349,16 @@ pub(crate) async fn exit_robust_list<E: RobustDeathEffects>(
                 &mut outcome.cas_retries,
             )
             .await
-                == DeathStep::Abort
             {
-                outcome.aborted = true;
-                return outcome;
+                DeathStep::Continue => {}
+                DeathStep::Abort => {
+                    outcome.aborted = true;
+                    return outcome;
+                }
+                DeathStep::Unsupported => {
+                    outcome.unsupported = true;
+                    return outcome;
+                }
             }
         }
 
@@ -333,10 +378,10 @@ pub(crate) async fn exit_robust_list<E: RobustDeathEffects>(
 
     // `list_op_pending` covers the window in which the guest has claimed or
     // released a mutex but not yet linked or unlinked it, so the kernel handles
-    // it last and with `pending_op` set.
-    if let Some(pending) = pending {
+    // it last and with `pending_op` set (`if (pending)`).
+    if !pending.is_null() {
         outcome.entries_visited += 1;
-        if handle_futex_death(
+        match handle_futex_death(
             effects,
             pending,
             futex_offset,
@@ -345,9 +390,10 @@ pub(crate) async fn exit_robust_list<E: RobustDeathEffects>(
             &mut outcome.cas_retries,
         )
         .await
-            == DeathStep::Abort
         {
-            outcome.aborted = true;
+            DeathStep::Continue => {}
+            DeathStep::Abort => outcome.aborted = true,
+            DeathStep::Unsupported => outcome.unsupported = true,
         }
     }
 
@@ -430,6 +476,7 @@ async fn handle_futex_death<E: RobustDeathEffects>(
                 );
             }
             FutexCasOutcome::Faulted => return DeathStep::Abort,
+            FutexCasOutcome::Unsupported => return DeathStep::Unsupported,
         }
     }
 }
@@ -635,6 +682,8 @@ mod tests {
         unreadable: BTreeSet<usize>,
         /// Addresses whose write faults.
         unwritable: BTreeSet<usize>,
+        /// Addresses the backend cannot exchange atomically at all.
+        unexchangeable: BTreeSet<usize>,
         /// Values a concurrent writer stores into a word immediately after the
         /// walk reads it, one per read, consumed in order. This is the only way
         /// to reach the compare-and-swap retry path from a test, because the
@@ -742,6 +791,9 @@ mod tests {
         ) -> FutexCasOutcome {
             if self.unwritable.contains(&address) {
                 return FutexCasOutcome::Faulted;
+            }
+            if self.unexchangeable.contains(&address) {
+                return FutexCasOutcome::Unsupported;
             }
             let Some(observed) = self.get_u32(address) else {
                 return FutexCasOutcome::Faulted;
@@ -1372,6 +1424,32 @@ mod tests {
         assert_eq!(guest.get_u32(0x3000), Some(FUTEX_WAITERS | OWNER));
     }
 
+    /// A word the backend cannot exchange atomically stops the walk with
+    /// `unsupported` set, after the words before it, with nothing written to
+    /// it or past it and the pending slot untouched: the caller refuses the
+    /// run rather than leave a word Linux marks unmarked.
+    #[test]
+    fn an_unexchangeable_word_stops_the_walk_for_a_refusal() {
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2020, 0x5020);
+        guest.node(0x2020, 0x3020, OWNER);
+        guest.node(0x3020, 0x4020, FUTEX_WAITERS | OWNER);
+        guest.node(0x4020, 0x1000, OWNER);
+        guest.node(0x5020, 0x1000, OWNER);
+        guest.unexchangeable.insert(0x3000);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert!(outcome.unsupported);
+        assert!(!outcome.aborted);
+        assert_eq!(outcome.entries_visited, 2);
+        assert_eq!(guest.marked_words(), vec![0x2000]);
+        assert!(guest.wakes.is_empty());
+        assert_eq!(guest.get_u32(0x3000), Some(FUTEX_WAITERS | OWNER));
+        assert_eq!(guest.get_u32(0x4000), Some(OWNER));
+        assert_eq!(guest.get_u32(0x5000), Some(OWNER));
+    }
+
     #[test]
     fn an_abort_also_skips_the_pending_slot() {
         let mut guest = FakeGuest::default();
@@ -1387,6 +1465,32 @@ mod tests {
             guest.wakes.is_empty() && guest.marks.is_empty(),
             "Linux's bare `return` skips the trailing pending handling too"
         );
+    }
+
+    #[test]
+    fn a_null_entry_matches_a_null_pending_slot_and_is_skipped() {
+        // `list.next` and `list_op_pending` both NULL, and `futex_offset` the
+        // absolute address of a word the dying thread owns. Linux compares the
+        // entry with `pending` as pointers (`if (entry != pending)`), so the
+        // NULL entry is the NULL pending slot and is skipped; the fetch of
+        // `NULL->next` faults and ends the walk before `if (pending)`, which
+        // would have handled nothing anyway (kernel/futex/core.c v6.17,
+        // `exit_robust_list`, L1187-L1197).
+        let mut guest = FakeGuest::default();
+        guest.put_u64(0x1000 + HEAD_LIST_OFFSET, 0);
+        guest.put_u64(0x1000 + HEAD_FUTEX_OFFSET_OFFSET, 0x5000);
+        guest.put_u64(0x1000 + HEAD_LIST_OP_PENDING_OFFSET, 0);
+        guest.put_u32(0x5000, OWNER);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert!(outcome.next_faulted, "{outcome:?}");
+        assert_eq!(outcome.entries_visited, 0, "{outcome:?}");
+        assert!(
+            guest.marks.is_empty() && guest.wakes.is_empty(),
+            "Linux leaves the word at NULL + futex_offset alone"
+        );
+        assert_eq!(guest.get_u32(0x5000), Some(OWNER));
     }
 
     #[test]

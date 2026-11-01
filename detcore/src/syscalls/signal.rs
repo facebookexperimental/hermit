@@ -2212,6 +2212,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         crate::reserved_input::before_exit_group(guest)
             .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
+        // Where no Linux exit walks the robust lists (KVM), the SIGKILL ends
+        // the process as an exit_group does, so its lists are walked as an
+        // exit_group's are: filed before the request, then walked, stored and
+        // woken at the grant, before the call that ends the process.
+        let walks_at_grant = self.sigkill_of_own_process_walks_robust_lists();
+        if walks_at_grant {
+            guest.thread_state().file_exit_group_for_robust_lists();
+        }
         let request = guest.thread_state().mk_request(
             ResourceID::Exit {
                 group: true,
@@ -2221,6 +2229,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
+        if walks_at_grant {
+            self.walk_robust_lists_of_granted_sigkill(guest).await;
+        }
         // The SIGKILL ends the process as an exit_group does: once the grant
         // has logically ended the process's other threads, a table only it
         // holds goes, with what the queues of its sockets held, just before
@@ -3524,6 +3535,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await;
         }
+        // No backend on which Detcore walks the robust lists itself (KVM,
+        // `Self::sigkill_of_own_process_walks_robust_lists`) gets here: such
+        // a backend cancels killed threads' RPCs, so the scheduler does not
+        // retire a SIGKILL at the kill turn
+        // (`sigkill_retirement::retires_sigkill_at_the_kill_turn`), no
+        // reservation is made, and a SIGKILL of the caller's own process
+        // takes `Self::reserve_controlled_self_sigkill_exit`, which walks them
+        // at its grant.
+        debug_assert!(
+            !self.sigkill_of_own_process_walks_robust_lists(),
+            "a backend on which Detcore walks the robust lists reserved a SIGKILL of its own process"
+        );
         let request = guest.thread_state().mk_request(
             ResourceID::Exit {
                 group: true,

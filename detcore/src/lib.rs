@@ -2366,6 +2366,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             return Ok(Some(signal));
         }
+        // Where no Linux exit walks the robust lists (KVM), a delivery whose
+        // default action ends the thread group walks them now, storing and
+        // waking, in this turn.
+        let walked = self
+            .walk_robust_lists_before_fatal_delivery(guest, signal)
+            .await;
         // A delivered signal may be caught, ignored, or terminate the
         // thread group. Reading the lists is harmless; the collected
         // wakes remain inert unless the ptrace exit callback later reports
@@ -2384,6 +2390,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             // selection waits for the retired threads' deaths
             // (`Scheduler::sigkill_fence_holds`), which only this delivery
             // causes, so a request filed here would never be granted.
+            return Ok(Some(signal));
+        }
+        if walked {
+            // The delivery ends the thread group: nothing here may end this
+            // turn, or a thread of the dying group could run guest code after
+            // its list was walked and lock or unlock a robust mutex no walk
+            // then sees. So the post-handler hook, which can end the turn at
+            // its slice end, is not run: the backend carries the default
+            // action out as soon as this hook returns (Claude review of the
+            // robust-futex owner-word change, P3-2).
             return Ok(Some(signal));
         }
         self.record_handler_restore_mask(guest, signal).await;
@@ -5300,6 +5316,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     } else {
                         Arc::new(Mutex::new(tool_local::RobustListProcessState::default()))
                     },
+                    // A new task has no exec in flight.
+                    exec_robust_commit: None,
                 }
             }
         }
@@ -5422,6 +5440,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         Ok(())
     }
 
+    /// An exec this thread's handler injected can no longer fail, and the old
+    /// image is still mapped: make the robust-list walk Linux makes there
+    /// (`Detcore::commit_exec_robust_lists`). Only a backend that carries
+    /// exec out itself calls this (KVM), and only Detcore's owner-death path
+    /// for such a backend leaves a walk for it to make.
+    async fn handle_exec_commit<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        self.commit_exec_robust_lists(guest).await;
+        Ok(())
+    }
+
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         // The exec's own entry processed the ends the old image ran past; the
         // new image's first slice is installed fresh, by the exec continuation.
@@ -5539,9 +5567,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if guest.config().sequentialize_threads {
             tool_global::set_child_tid_address(guest, 0).await;
         }
+        // Where Detcore walks the robust lists itself (KVM), the exec's walk
+        // runs at its point of no return, which the backend reports through
+        // `Tool::handle_exec_commit`; one still owed here never ran.
+        if guest.thread_state().exec_robust_commit.is_some() {
+            self.refuse_unwalked_exec(guest).await;
+        }
         // The exec walked the old thread group's robust lists; wake one waiter
         // per owner word it marked FUTEX_OWNER_DIED.
         let robust_wakes = guest.thread_state().take_robust_list_wakes_for_exec();
+        if self.exec_starts_a_new_robust_list_process() {
+            guest
+                .thread_state_mut()
+                .start_robust_list_process_for_exec();
+        }
         let identities: Vec<_> = robust_wakes
             .iter()
             .map(|(owner, wake)| (*owner, wake.futex))

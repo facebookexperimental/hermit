@@ -6307,7 +6307,10 @@ mod tests {
         // language-runtimes/rustc-hello (SOCK_SEQPACKET socketpairs, which
         // rustc's linker start uses) add one row each per candidate backend:
         // 3105.
-        assert_eq!(parsed.cells.len(), 3105);
+        // c-programs/robust-list-owner-death-routes (robust-futex owner death
+        // by each Linux exit route, https://github.com/rrnewton/hermit/issues/4529)
+        // adds one row per candidate backend: 3110.
+        assert_eq!(parsed.cells.len(), 3110);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448

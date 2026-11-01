@@ -5707,18 +5707,35 @@ pub(crate) struct RobustListOwner {
     pub(crate) head: usize,
 }
 
+/// The robust-list walk an exec still owes, where Detcore makes the walk
+/// itself (`OwnerDeathPath::Detcore`): set at the exec's entry
+/// (`Detcore::handle_execveat`) and taken where the exec can no longer fail
+/// (`Tool::handle_exec_commit`, `Detcore::commit_exec_robust_lists`).
+/// The exec's entry has already given the thread the new image's state by
+/// then, so this keeps what the walk needs from the old image: every
+/// registration to walk, the caller's included, and the shared-mapping model
+/// and address-space identity that name the futex keys of the walk's wakes.
+#[derive(Clone)]
+pub(crate) struct ExecRobustCommit {
+    pub(crate) owners: Vec<RobustListOwner>,
+    pub(crate) memory_metadata: Arc<Mutex<MemoryMetadata>>,
+    pub(crate) mm_id: MmId,
+}
+
 /// Robust-list registrations and staged wakes shared by one Linux thread
 /// group. A forked process starts with an empty instance; `CLONE_THREAD`
 /// members share it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct RobustListProcessState {
     heads: BTreeMap<DetTid, usize>,
-    /// Threads whose own exit Detcore has already walked on DBT
-    /// ([`crate::syscalls::threads`]'s `OwnerDeathPath::Barrier`).
+    /// Threads whose own exit Detcore has already walked on DBT or KVM
+    /// ([`crate::syscalls::threads`]'s `OwnerDeathPath::Barrier` and
+    /// `OwnerDeathPath::Detcore`).
     #[serde(default)]
     tool_walked: BTreeSet<DetTid>,
-    /// An exit_group on DBT (`OwnerDeathPath::Barrier`) has been filed: an
-    /// exiting thread keeps its head here for that exit_group's walk
+    /// An exit_group on DBT or KVM (`OwnerDeathPath::Barrier`,
+    /// `OwnerDeathPath::Detcore`) has been filed: an exiting thread keeps its
+    /// head here for that exit_group's walk
     /// ([`ThreadState::drop_robust_list_head_at_exit`]).
     #[serde(default)]
     exit_group_filed: bool,
@@ -6490,6 +6507,12 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) robust_list_process: Arc<Mutex<RobustListProcessState>>,
 
+    /// The robust-list walk this thread's exec in flight still owes
+    /// ([`ExecRobustCommit`]), from the exec's entry to its point of no
+    /// return; `None` otherwise.
+    #[serde(skip)]
+    pub(crate) exec_robust_commit: Option<ExecRobustCommit>,
+
     /// Staged boundary protocol state. Runtime creation/exec does not enable
     /// it yet; legacy state keeps `None`. Native transfer cannot discard it.
     #[serde(default)]
@@ -7229,6 +7252,7 @@ impl<T> ThreadState<T> {
             interrupt_at: cfg.interrupts_for_thread(pid),
             robust_list_head: None,
             robust_list_process: Arc::new(Mutex::new(RobustListProcessState::default())),
+            exec_robust_commit: None,
             slice_boundary: None,
             callback_history: Default::default(),
             schedule_replay_over: false,
@@ -7319,8 +7343,20 @@ impl<T> ThreadState<T> {
             .insert(self.dettid);
     }
 
-    /// Note that an exit_group on DBT (`OwnerDeathPath::Barrier`) has been
-    /// filed. From now on a thread the exit_group's grant kills waits for its
+    /// The same for every owner a group death walked
+    /// (`OwnerDeathPath::Detcore`): each thread's death walks its list once,
+    /// however many paths of the one death reach a walk.
+    pub(crate) fn mark_robust_lists_walked_by_tool(&self, owners: &[RobustListOwner]) {
+        self.robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned")
+            .tool_walked
+            .extend(owners.iter().map(|owner| owner.dettid));
+    }
+
+    /// Note that an exit_group on DBT or KVM (`OwnerDeathPath::Barrier`,
+    /// `OwnerDeathPath::Detcore`; on KVM also a SIGKILL a thread sends its own
+    /// process) has been filed. From now on a thread the exit_group's grant kills waits for its
     /// walk before its native exit ([`Self::wait_for_exit_group_robust_walk`]),
     /// and a thread of the group that exits keeps its head registered for the
     /// walk, so the walk sees the registrations current at the grant even if
@@ -7330,10 +7366,12 @@ impl<T> ThreadState<T> {
     /// Nothing clears the filing: the thread group ends with the exit_group.
     /// The one exception is an exec granted first, which kills the filer.
     /// Where exec keeps this shared state for the new image, killed threads'
-    /// old heads would then stay listed for a later exit_group. Only DBT files,
-    /// and there the exec replaces the in-guest runtime's memory, this state
-    /// included; modeling exec on DBT
-    /// (<https://github.com/rrnewton/hermit/issues/4268>) must keep it so.
+    /// old heads would then stay listed for a later exit_group. DBT and KVM
+    /// file. On DBT the exec replaces the in-guest runtime's memory, this
+    /// state included; modeling exec on DBT
+    /// (<https://github.com/rrnewton/hermit/issues/4268>) must keep it so. On
+    /// KVM a successful exec gives the new image a state of its own
+    /// ([`Self::start_robust_list_process_for_exec`]).
     pub(crate) fn file_exit_group_for_robust_lists(&self) {
         let mut process = self
             .robust_list_process
@@ -7392,9 +7430,12 @@ impl<T> ThreadState<T> {
     /// host time, but nothing guest-visible depends on how long it takes: the
     /// thread is already logically dead. A walk that never comes, because an
     /// exec killed every filer first, is recognised when the last filing is
-    /// cancelled ([`Self::cancel_exit_group_filing`]). Only DBT files an
-    /// exit_group, and there each guest thread polls its own callbacks, so the
-    /// blocking wait holds up only this thread.
+    /// cancelled ([`Self::cancel_exit_group_filing`]). Only DBT and KVM file an
+    /// exit_group. On DBT each guest thread polls its own callbacks, and on KVM
+    /// each guest thread's callbacks run on a host worker of its own, so the
+    /// blocking wait holds up only this thread. On KVM no native exit marks a
+    /// word, so the wait is not needed there for the walk's reads, only
+    /// harmless: the walk's registrations are kept by the filing itself.
     pub(crate) fn wait_for_exit_group_robust_walk(&self, bound: std::time::Duration) -> bool {
         let started = std::time::Instant::now();
         loop {
@@ -7433,8 +7474,9 @@ impl<T> ThreadState<T> {
         }
     }
 
-    /// The registrations an exit_group walks on DBT
-    /// (`OwnerDeathPath::Barrier`), read at its grant: every registration current then, including
+    /// The registrations an exit_group walks on DBT or KVM
+    /// (`OwnerDeathPath::Barrier`, `OwnerDeathPath::Detcore`), read at its
+    /// grant: every registration current then, including
     /// those of threads the grant killed, less any thread whose own exit
     /// Detcore already replayed, so no list is walked twice.
     pub(crate) fn robust_list_owners_for_exit_group(&self) -> Vec<RobustListOwner> {
@@ -7555,9 +7597,12 @@ impl<T> ThreadState<T> {
     /// `exit_robust_list` before the old address space goes away. A caller that
     /// is not the group leader already holds the leader's TID by then
     /// (`exchange_tids` in `de_thread`), so its own list is walked with the
-    /// thread group ID. The lists can only be read before the exec, and a
-    /// failed exec never reaches that point, so the wakes wait here for
-    /// `take_robust_list_wakes_for_exec`.
+    /// thread group ID. The lists can only be read before the old address
+    /// space goes, so the wakes are staged here for
+    /// `take_robust_list_wakes_for_exec`: at the exec's entry where Linux's
+    /// exec walks the lists (ptrace), and at the exec's point of no return
+    /// where Detcore walks them itself (KVM,
+    /// `Detcore::commit_exec_robust_lists`). A failed exec delivers none.
     pub(crate) fn stage_robust_list_wakes_for_exec(
         &self,
         wakes: Vec<(DetTid, Vec<RobustListWake>)>,
@@ -7569,8 +7614,9 @@ impl<T> ThreadState<T> {
         process.exec_pending = flatten_exec_robust_list_wakes(wakes);
     }
 
-    /// Take the wakes staged at the exec's entry: to deliver them once it has
-    /// succeeded, or to drop them when it failed and left the old image running.
+    /// Take the wakes staged for an exec (`stage_robust_list_wakes_for_exec`):
+    /// to deliver them once it has succeeded, or to drop them when it failed
+    /// and left the old image running.
     pub(crate) fn take_robust_list_wakes_for_exec(&self) -> Vec<(DetTid, RobustListWake)> {
         std::mem::take(
             &mut self
@@ -7603,6 +7649,17 @@ impl<T> ThreadState<T> {
     /// space intact.
     pub(crate) fn restore_robust_list_after_failed_exec(&mut self, previous: Option<usize>) {
         self.record_robust_list_head(previous);
+    }
+
+    /// Give the new image of a successful exec a robust-list state of its own
+    /// (`Detcore::exec_starts_a_new_robust_list_process`). The exec'ing thread
+    /// is its process's only thread now and has registered no list yet; the
+    /// threads the exec killed keep the old state for their exit hooks. Called
+    /// after the exec's staged wakes were taken
+    /// ([`Self::take_robust_list_wakes_for_exec`]).
+    pub(crate) fn start_robust_list_process_for_exec(&mut self) {
+        self.robust_list_head = None;
+        self.robust_list_process = Arc::new(Mutex::new(RobustListProcessState::default()));
     }
 
     /// Resolve a futex key from its opcode mode and virtual address.

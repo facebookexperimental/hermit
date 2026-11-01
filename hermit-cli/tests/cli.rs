@@ -1260,6 +1260,34 @@ fn kill_child_and_wait_guest() -> &'static Path {
     })
 }
 
+static ROBUST_FUTEX_UNEXCHANGEABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+fn robust_futex_unexchangeable_word_guest() -> &'static Path {
+    ROBUST_FUTEX_UNEXCHANGEABLE_WORD_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("robust-futex-unexchangeable-word");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create robust-futex-unexchangeable-word guest directory");
+        let guest = build_root.join("robust_futex_unexchangeable_word");
+        let output = Command::new("cc")
+            .args(["-O1", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/robust_futex_unexchangeable_word.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile robust-futex-unexchangeable-word guest");
+        assert!(
+            output.status.success(),
+            "robust-futex-unexchangeable-word guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
 fn sigkill_cross_process_guest() -> &'static Path {
     SIGKILL_CROSS_PROCESS_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -23281,6 +23309,83 @@ fn run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills() {
         assert!(
             !stdout.contains("kill=") && !stderr.contains("Deadlock detected"),
             "{log:?}: the KVM guest went on past the refused kill\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// tests/c/robust_futex_unexchangeable_word.c: a child process holding a
+/// robust mutex whose word is on a MAP_SHARED memfd page dies (`exit`) or
+/// execs (`exec`). Linux marks the word FUTEX_OWNER_DIED, at the exit or once
+/// the exec can no longer fail, so on ptrace the parent's lock returns
+/// EOWNERDEAD. No Linux exit or exec walks the list for a KVM guest thread,
+/// and the KVM backend has no atomic store for a word on file backing, so
+/// Detcore cannot make the transition, and it refuses the run by name rather
+/// than leave the word unmarked and its waiter parked: at the child's death,
+/// and at the exec's point of no return, which the backend reports through
+/// Tool::handle_exec_commit only for an exec that succeeds
+/// (https://github.com/rrnewton/hermit/issues/4529). That an exec that fails
+/// is not refused is the exec-failed-file case of
+/// c-programs/robust-list-owner-death-routes.
+#[test]
+fn run_kvm_a_robust_word_kvm_cannot_exchange_is_a_named_refusal_where_ptrace_marks_it() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM unexchangeable robust word case: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = robust_futex_unexchangeable_word_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    for (mode, refusal) in [
+        (
+            "exit",
+            "died owning a robust futex whose word this backend cannot exchange atomically",
+        ),
+        ("exec", "an exec that can no longer fail walks thread"),
+    ] {
+        let args = [
+            "--backend=ptrace",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            format!("{mode}: lock=EOWNERDEAD child=exit 0\n"),
+            "ptrace, {mode}"
+        );
+
+        let args = [
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        let stdout = stdout(&output);
+        let stderr = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "KVM, {mode}: the run must end as a policy refusal, not a deadlock or a pass\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+                && stderr.contains(refusal)
+                && stderr.contains("https://github.com/rrnewton/hermit/issues/4529"),
+            "KVM, {mode}: the run did not name the unexchangeable word on stderr\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("lock=") && !stderr.contains("Deadlock"),
+            "KVM, {mode}: the guest went on past the refusal\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
 }

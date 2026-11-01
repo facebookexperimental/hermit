@@ -2514,10 +2514,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// Linux runs this from `mm_release()` while a task dies. Detcore performs
     /// the same walk and issues the wake against its own modeled waiter pool,
-    /// which is where precise-mode futex waiters actually live. Ptrace leaves
-    /// the atomic word transition to Linux on every backend that enters this
-    /// path ([`OwnerDeathPath`]), and the wake reaches a waiter only after
-    /// Linux has made it. The algorithm is in
+    /// which is where precise-mode futex waiters actually live. Where the
+    /// native exit walks the list too ([`OwnerDeathPath::Kernel`],
+    /// [`OwnerDeathPath::Barrier`]), Detcore leaves the atomic word transition
+    /// to Linux, and the wake reaches a waiter only after Linux has made it.
+    /// Where none does ([`OwnerDeathPath::Detcore`], KVM), Detcore makes each
+    /// transition itself with the guest's atomic compare-and-exchange, in this
+    /// thread's own turn, before its wake. The algorithm is in
     /// [`crate::syscalls::robust_list`]; this function only supplies guest
     /// memory and the scheduler wake.
     ///
@@ -2551,16 +2554,32 @@ impl<T: RecordOrReplay> Detcore<T> {
         let owner_tid = dettid.as_raw() as u32;
 
         let mut marked = HashMap::new();
+        let mut unsupported = None;
+        let transition = if path == OwnerDeathPath::Detcore {
+            OwnerWordTransition::Detcore {
+                unsupported: &mut unsupported,
+            }
+        } else {
+            OwnerWordTransition::Linux
+        };
         let mut effects = GuestRobustEffects::<'_, G, T> {
             guest,
             dettid,
             staged_wakes: None,
             marked: &mut marked,
+            transition,
             tool: PhantomData,
         };
         let outcome = robust_list::exit_robust_list(&mut effects, head, owner_tid).await;
-        if path == OwnerDeathPath::Barrier {
+        // A later exit_group of this group must not walk this list again: on
+        // DBT and KVM it walks at its grant, which may come before this
+        // thread's exit hook drops the registration.
+        if matches!(path, OwnerDeathPath::Barrier | OwnerDeathPath::Detcore) {
             guest.thread_state().mark_robust_list_walked_by_tool();
+        }
+        if let Some(errno) = unsupported {
+            self.refuse_unexchangeable_owner_word(guest, dettid, errno, OwnerDeath::Exit)
+                .await;
         }
         if outcome.head_unreadable {
             trace!(
@@ -2586,14 +2605,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// ended the group. A delivered signal
     /// may still be caught or ignored: Detcore must not mark a live owner's
     /// word, and that backend's native exit callback cannot tell which signal
-    /// ended the thread group.
+    /// ended the thread group. Nor on [`OwnerDeathPath::Detcore`], where
+    /// Detcore walks, stores and wakes at the exit itself, and for a signal
+    /// only once its default action is known to end the group
+    /// (`Self::walk_robust_lists_before_fatal_delivery`).
     pub(crate) async fn stage_thread_group_robust_list_wakes<G: Guest<Self>>(
         &self,
         guest: &mut G,
         reason: RobustListExit,
     ) {
         match self.robust_owner_death_path() {
-            None | Some(OwnerDeathPath::Barrier) => {}
+            None | Some(OwnerDeathPath::Barrier) | Some(OwnerDeathPath::Detcore) => {}
             Some(OwnerDeathPath::Kernel) => {
                 let staged = self
                     .read_thread_group_robust_list_wakes(guest, OwnerDeath::Exit)
@@ -2605,27 +2627,39 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Replay Linux's `exit_robust_list()` for each `(owner, head)` of the
     /// current thread group, in owner order, as that owner's list, waking at
-    /// once ([`OwnerDeathPath::Barrier`]). The threads the grant killed have not made
-    /// their native exits (`ThreadState::wait_for_exit_group_robust_walk`), so
-    /// every word reads as the guest left it.
+    /// once ([`OwnerDeathPath::Barrier`], [`OwnerDeathPath::Detcore`]). On
+    /// Barrier the threads the grant killed have not made their native exits
+    /// (`ThreadState::wait_for_exit_group_robust_walk`), so every word reads as
+    /// the guest left it, and Linux makes the transitions; on Detcore no
+    /// native exit ever walks, and Detcore makes them itself.
     async fn run_thread_group_robust_list_owner_death<G: Guest<Self>>(
         &self,
         guest: &mut G,
         heads: Vec<RobustListOwner>,
+        path: OwnerDeathPath,
     ) {
         // One group exit: a word Linux marks under one owner reads as marked
         // under every later one.
         let mut marked = HashMap::new();
+        let mut unsupported = None;
         for RobustListOwner {
             dettid: owner,
             head,
         } in heads
         {
+            let transition = if path == OwnerDeathPath::Detcore {
+                OwnerWordTransition::Detcore {
+                    unsupported: &mut unsupported,
+                }
+            } else {
+                OwnerWordTransition::Linux
+            };
             let mut effects = GuestRobustEffects::<'_, G, T> {
                 guest,
                 dettid: owner,
                 staged_wakes: None,
                 marked: &mut marked,
+                transition,
                 tool: PhantomData,
             };
             let outcome =
@@ -2636,7 +2670,72 @@ impl<T: RecordOrReplay> Detcore<T> {
                     owner, outcome,
                 );
             }
+            if let Some(errno) = unsupported {
+                self.refuse_unexchangeable_owner_word(guest, owner, errno, OwnerDeath::Exit)
+                    .await;
+            }
         }
+    }
+
+    /// The owner-word transitions of a thread group that dies as a whole,
+    /// where Detcore makes them itself ([`OwnerDeathPath::Detcore`]): at the
+    /// grant of the `Exit` request that ends the group (an exit_group, or a
+    /// SIGKILL a thread sends its own process), whose filing
+    /// (`ThreadState::file_exit_group_for_robust_lists`) kept the threads the
+    /// grant killed registered. Every registration current at the grant is
+    /// walked, in owner order, as `do_group_exit` makes each thread's own exit
+    /// walk its list (`do_exit`, `exit_mm_release`, `futex_exit_release`),
+    /// less a thread whose own exit Detcore already walked.
+    async fn run_granted_group_robust_list_owner_death<G: Guest<Self>>(&self, guest: &mut G) {
+        guest.thread_state().begin_exit_group_robust_walk();
+        let owners = guest.thread_state().robust_list_owners_for_exit_group();
+        guest
+            .thread_state()
+            .mark_robust_lists_walked_by_tool(&owners);
+        self.run_thread_group_robust_list_owner_death(guest, owners, OwnerDeathPath::Detcore)
+            .await;
+        guest.thread_state().finish_exit_group_robust_walk();
+    }
+
+    /// Refuse the run, by name, at a robust-list owner word the backend
+    /// cannot exchange atomically ([`robust_list::FutexCasOutcome::Unsupported`]),
+    /// where no Linux exit or exec will mark it ([`OwnerDeathPath::Detcore`]):
+    /// Linux marks such a word `FUTEX_OWNER_DIED` and wakes a waiter at its
+    /// owner's death, or at an exec once it can no longer fail, and skipping
+    /// it would leave that waiter parked for good. `death` words the message:
+    /// an exec walks only once it can no longer fail
+    /// (`Self::commit_exec_robust_lists`), so a failed exec never gets here.
+    async fn refuse_unexchangeable_owner_word<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        owner: DetTid,
+        errno: Errno,
+        death: OwnerDeath,
+    ) -> ! {
+        let message = match death {
+            OwnerDeath::Exit => format!(
+                "hermit: thread {owner} died owning a robust futex whose word this backend \
+                 cannot exchange atomically ({errno}); Linux marks that word \
+                 FUTEX_OWNER_DIED and wakes a waiter at the owner's death, and no Linux exit \
+                 does that for this backend's threads, so the run is refused \
+                 (https://github.com/rrnewton/hermit/issues/4529)"
+            ),
+            OwnerDeath::Exec => format!(
+                "hermit: an exec that can no longer fail walks thread {owner}'s robust list, \
+                 which holds a robust futex whose word this backend cannot exchange \
+                 atomically ({errno}); Linux marks that word FUTEX_OWNER_DIED and wakes a \
+                 waiter there (futex_exec_release), and no Linux exec does that for this \
+                 backend's threads, so the run is refused \
+                 (https://github.com/rrnewton/hermit/issues/4529)"
+            ),
+        };
+        tracing::error!("{message}");
+        let _ = std::io::Write::write_fmt(
+            &mut crate::util::RetryingStderr,
+            format_args!("{message}\n"),
+        );
+        crate::tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+            .await
     }
 
     /// How this backend orders owner-death wakes after Linux's walk, or `None`
@@ -2648,6 +2747,33 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// not model futexes at all.
     fn robust_owner_death_path(&self) -> Option<OwnerDeathPath> {
         owner_death_path(&self.cfg)
+    }
+
+    /// Whether a SIGKILL that a thread sends its own process walks the
+    /// process's robust lists at the grant of the `Exit` request it files
+    /// (`Self::reserve_controlled_self_sigkill_exit`, the only route such a
+    /// SIGKILL takes on a backend that cancels killed threads' RPCs), as an
+    /// exit_group does: on [`OwnerDeathPath::Detcore`], where no Linux exit
+    /// walks them. Elsewhere the sender records the lists for Linux's walk
+    /// (`Self::record_sigkill_robust_lists`) or the backend walks them.
+    pub(crate) fn sigkill_of_own_process_walks_robust_lists(&self) -> bool {
+        self.robust_owner_death_path() == Some(OwnerDeathPath::Detcore)
+    }
+
+    /// The walk of [`Self::sigkill_of_own_process_walks_robust_lists`], at the
+    /// grant: every registration of the sender's process, stored and woken in
+    /// the sender's turn, before the send that ends the process.
+    pub(crate) async fn walk_robust_lists_of_granted_sigkill<G: Guest<Self>>(&self, guest: &mut G) {
+        self.run_granted_group_robust_list_owner_death(guest).await;
+    }
+
+    /// Whether a successful exec gives the new image a robust-list state of
+    /// its own (`ThreadState::start_robust_list_process_for_exec`): on
+    /// [`OwnerDeathPath::Detcore`], where an exit_group filed by a thread the
+    /// exec killed would otherwise keep that thread's old registration listed
+    /// for a walk that stores into the new image.
+    pub(crate) fn exec_starts_a_new_robust_list_process(&self) -> bool {
+        self.robust_owner_death_path() == Some(OwnerDeathPath::Detcore)
     }
 
     /// Before the send of SIGKILL reservation `token`, record the robust list
@@ -2767,8 +2893,153 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The owner-death wakes Linux's `exit_robust_list` would make for every
     /// registered robust list in the current thread group, read without
-    /// changing guest memory: Linux makes the owner-word transitions. Callers
-    /// decide whether Detcore models owner death at all
+    /// changing guest memory, held for the caller to deliver: Linux makes the
+    /// owner-word transitions ([`Self::robust_list_wakes_of`]). A thread whose
+    /// own exit Detcore already walked (its head stays registered while an
+    /// exit_group is filed) is left out, as an exit_group's walk leaves it
+    /// out, so no list is walked twice (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4352, F4).
+    async fn read_thread_group_robust_list_wakes<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        death: OwnerDeath,
+    ) -> Vec<(DetTid, Vec<RobustListWake>)> {
+        let owners = guest.thread_state().robust_list_owners_for_exit_group();
+        self.robust_list_wakes_of(guest, death, owners, false).await
+    }
+
+    /// At the entry of an exec, where Detcore walks the robust lists itself
+    /// ([`OwnerDeathPath::Detcore`]): keep what the walk needs for the exec's
+    /// point of no return ([`Self::commit_exec_robust_lists`]), the old
+    /// image's `memory_metadata` and `mm_id` and the registrations to walk,
+    /// read now, before the entry gives the thread the new image's state. A
+    /// walk of lists that hold no entry and no pending entry would change
+    /// nothing, so nothing is kept for one. Every other guest thread is held
+    /// off from here to the point of no return, so the registrations cannot
+    /// change in between.
+    fn plan_exec_robust_lists<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        memory_metadata: &Arc<Mutex<MemoryMetadata>>,
+        mm_id: crate::types::MmId,
+    ) {
+        let owners = guest.thread_state().robust_list_owners_for_exit_group();
+        if !owners
+            .iter()
+            .any(|owner| robust_list_holds_an_entry(guest, owner.head))
+        {
+            return;
+        }
+        guest.thread_state_mut().exec_robust_commit = Some(crate::tool_local::ExecRobustCommit {
+            owners,
+            memory_metadata: Arc::clone(memory_metadata),
+            mm_id,
+        });
+    }
+
+    /// The robust-list walk an exec owes where Detcore walks the lists itself
+    /// ([`OwnerDeathPath::Detcore`], KVM), made where Linux makes it: once the
+    /// exec can no longer fail, with the old image still mapped. The backend
+    /// calls `Tool::handle_exec_commit` there, after it has read the path,
+    /// argv and envp and validated the new image, before it replaces the
+    /// image; Linux's `begin_new_exec` passes `point_of_no_return`, ends the
+    /// other threads in `de_thread`, and walks the lists from `exec_mmap`'s
+    /// `exec_mm_release` (`futex_exec_release`), after `do_execveat_common`
+    /// copied the strings (fs/exec.c). So a failed exec walks nothing, and no
+    /// store can change a string the exec copies. Every list kept at the
+    /// exec's entry ([`Self::plan_exec_robust_lists`]) is walked, the caller's
+    /// last and as the thread group ID's ([`Self::robust_list_wakes_of`]),
+    /// each word stored with the guest's compare-and-exchange; a word the
+    /// backend cannot exchange refuses the run by name, at this point and so
+    /// only for an exec that succeeds. The walk's wakes name the old image's
+    /// futexes, and wait for the new image's first callback
+    /// (`ThreadState::stage_robust_list_wakes_for_exec`).
+    pub(crate) async fn commit_exec_robust_lists<G: Guest<Self>>(&self, guest: &mut G) {
+        let Some(crate::tool_local::ExecRobustCommit {
+            owners,
+            memory_metadata,
+            mm_id,
+        }) = guest.thread_state_mut().exec_robust_commit.take()
+        else {
+            return;
+        };
+        // The exec's entry gave the thread the new image's mapping model and
+        // address-space identity; the walk's futex keys are the old image's.
+        let (new_memory_metadata, new_mm_id) = {
+            let thread_state = guest.thread_state_mut();
+            (
+                std::mem::replace(&mut thread_state.memory_metadata, memory_metadata),
+                std::mem::replace(&mut thread_state.mm_id, mm_id),
+            )
+        };
+        // A thread the exec ends must not walk its list again at its own exit.
+        guest
+            .thread_state()
+            .mark_robust_lists_walked_by_tool(&owners);
+        let wakes = self
+            .robust_list_wakes_of(guest, OwnerDeath::Exec, owners, true)
+            .await;
+        let thread_state = guest.thread_state_mut();
+        thread_state.memory_metadata = new_memory_metadata;
+        thread_state.mm_id = new_mm_id;
+        thread_state.stage_robust_list_wakes_for_exec(wakes);
+    }
+
+    /// Refuse the run, by name, when a successful exec's new image starts
+    /// with its robust-list walk unmade: the backend replaced the image
+    /// without calling `Tool::handle_exec_commit`, so the walk Linux makes at
+    /// the exec ([`Self::commit_exec_robust_lists`]) never ran, and a waiter
+    /// on a word the old image owned would stay parked for good.
+    pub(crate) async fn refuse_unwalked_exec<G: Guest<Self>>(&self, guest: &mut G) -> ! {
+        let dettid = guest.thread_state().dettid;
+        let message = format!(
+            "hermit: thread {dettid}'s exec replaced its image without the backend reporting \
+             the exec's point of no return (Tool::handle_exec_commit), so the robust-list walk \
+             Linux makes there did not run, and the run is refused \
+             (https://github.com/rrnewton/hermit/issues/4529)"
+        );
+        tracing::error!("{message}");
+        let _ = std::io::Write::write_fmt(
+            &mut crate::util::RetryingStderr,
+            format_args!("{message}\n"),
+        );
+        crate::tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+            .await
+    }
+
+    /// Refuse the run, by name, when the backend reported that an exec could
+    /// no longer fail (`Tool::handle_exec_commit`, which made the robust-list
+    /// walk) and the exec then failed: the walk's stores are made, and Linux
+    /// makes none for an exec that fails.
+    async fn refuse_failed_committed_exec<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        errno: impl std::fmt::Display,
+    ) -> ! {
+        let dettid = guest.thread_state().dettid;
+        let message = format!(
+            "hermit: thread {dettid}'s exec failed ({errno}) after the backend reported that it \
+             could no longer fail (Tool::handle_exec_commit) and its robust lists were walked; \
+             Linux walks nothing at a failed exec, so the run is refused \
+             (https://github.com/rrnewton/hermit/issues/4529)"
+        );
+        tracing::error!("{message}");
+        let _ = std::io::Write::write_fmt(
+            &mut crate::util::RetryingStderr,
+            format_args!("{message}\n"),
+        );
+        crate::tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+            .await
+    }
+
+    /// Walk each of `owners`' robust lists as Linux's `exit_robust_list`
+    /// does, returning each owner's owner-death wakes, held for the caller to
+    /// deliver. With `detcore_stores` false the walk only reads guest memory:
+    /// Linux makes the owner-word transitions. With it true
+    /// ([`OwnerDeathPath::Detcore`]), Detcore makes them, with the guest's
+    /// atomic compare-and-exchange, and a word the backend cannot exchange
+    /// refuses the run by name (`Self::refuse_unexchangeable_owner_word`).
+    /// Callers decide whether Detcore models owner death at all
     /// ([`Self::robust_owner_death_path`]).
     ///
     /// Each list is walked as its owner's, with that owner's TID, except the
@@ -2777,20 +3048,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `exec_mm_release` walks its list, so `handle_futex_death` compares the
     /// owner words with the thread group ID and leaves a word the caller owns
     /// under its old TID alone (fs/exec.c, kernel/futex/core.c).
-    async fn read_thread_group_robust_list_wakes<G: Guest<Self>>(
+    async fn robust_list_wakes_of<G: Guest<Self>>(
         &self,
         guest: &mut G,
         death: OwnerDeath,
+        owners: Vec<RobustListOwner>,
+        detcore_stores: bool,
     ) -> Vec<(DetTid, Vec<RobustListWake>)> {
         let caller = guest.thread_state().dettid;
         let tgid = guest.thread_state().detpid.expect("detpid unset");
-        // A thread whose own exit Detcore already walked (its head stays
-        // registered while an exit_group is filed) is left out, as an
-        // exit_group's walk leaves it out, so no list is walked twice (Claude
-        // review of https://github.com/rrnewton/hermit/pull/4352, F4).
-        let mut heads: Vec<(DetTid, usize)> = guest
-            .thread_state()
-            .robust_list_owners_for_exit_group()
+        let mut heads: Vec<(DetTid, usize)> = owners
             .into_iter()
             .map(|owner| (owner.dettid, owner.head))
             .collect();
@@ -2804,6 +3071,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let mut staged = Vec::with_capacity(heads.len());
         let mut marked = HashMap::new();
+        let mut unsupported = None;
         for (owner, head) in heads {
             let walked_as = if death == OwnerDeath::Exec && owner == caller {
                 tgid.as_raw()
@@ -2811,11 +3079,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 owner.as_raw()
             };
             let mut wakes = Vec::new();
+            let transition = if detcore_stores {
+                OwnerWordTransition::Detcore {
+                    unsupported: &mut unsupported,
+                }
+            } else {
+                OwnerWordTransition::Linux
+            };
             let mut effects = GuestRobustEffects::<'_, G, T> {
                 guest,
                 dettid: owner,
                 staged_wakes: Some(&mut wakes),
                 marked: &mut marked,
+                transition,
                 tool: PhantomData,
             };
             let outcome = robust_list::exit_robust_list(&mut effects, head, walked_as as u32).await;
@@ -2824,6 +3100,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     "[detcore, dtid {}] could not stage complete robust-list owner-death effects: {:?}",
                     owner, outcome,
                 );
+            }
+            if let Some(errno) = unsupported {
+                self.refuse_unexchangeable_owner_word(guest, owner, errno, death)
+                    .await;
             }
             staged.push((owner, wakes));
         }
@@ -2948,8 +3228,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         // native exit would otherwise let Linux mark and clear its words before
         // the walk reads them. The lists stay mapped until the native
         // exit_group.
-        let barrier = self.robust_owner_death_path() == Some(OwnerDeathPath::Barrier);
-        if barrier {
+        //
+        // On [`OwnerDeathPath::Detcore`] the walk follows the grant too, and
+        // stores each owner word itself: no Linux exit will. Filing keeps the
+        // killed threads' registrations for the walk however early their exit
+        // hooks run.
+        let path = self.robust_owner_death_path();
+        if matches!(
+            path,
+            Some(OwnerDeathPath::Barrier) | Some(OwnerDeathPath::Detcore)
+        ) {
             guest.thread_state().file_exit_group_for_robust_lists();
         }
         let request = guest.thread_state().mk_request(
@@ -2961,15 +3249,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
-        if barrier {
-            guest.thread_state().begin_exit_group_robust_walk();
-            let owners = guest.thread_state().robust_list_owners_for_exit_group();
-            self.run_thread_group_robust_list_owner_death(guest, owners)
+        match path {
+            Some(OwnerDeathPath::Barrier) => {
+                guest.thread_state().begin_exit_group_robust_walk();
+                let owners = guest.thread_state().robust_list_owners_for_exit_group();
+                self.run_thread_group_robust_list_owner_death(
+                    guest,
+                    owners,
+                    OwnerDeathPath::Barrier,
+                )
                 .await;
-            guest.thread_state().finish_exit_group_robust_walk();
-        } else {
-            self.stage_thread_group_robust_list_wakes(guest, RobustListExit::ExitGroup)
-                .await
+                guest.thread_state().finish_exit_group_robust_walk();
+            }
+            Some(OwnerDeathPath::Detcore) => {
+                self.run_granted_group_robust_list_owner_death(guest).await
+            }
+            Some(OwnerDeathPath::Kernel) | None => {
+                self.stage_thread_group_robust_list_wakes(guest, RobustListExit::ExitGroup)
+                    .await
+            }
         }
         // Every thread of the process exits with it: a table only they held
         // goes with this exit, once the grant has logically ended the other
@@ -3089,11 +3387,98 @@ impl<T: RecordOrReplay> Detcore<T> {
         if barrier {
             guest.thread_state().begin_exit_group_robust_walk();
             let owners = guest.thread_state().robust_list_owners_for_exit_group();
-            self.run_thread_group_robust_list_owner_death(guest, owners)
+            self.run_thread_group_robust_list_owner_death(guest, owners, OwnerDeathPath::Barrier)
                 .await;
             guest.thread_state().finish_exit_group_robust_walk();
         }
         true
+    }
+
+    /// Before a signal whose delivery ends the thread group by its default
+    /// action, on a backend where Detcore makes the owner-word transitions
+    /// ([`OwnerDeathPath::Detcore`], KVM): walk every registered robust list
+    /// of the group, as each thread's death in `do_group_exit` walks its own,
+    /// storing and waking in this, the delivering thread's, `InboundSignal`
+    /// turn. Returns whether it walked; the caller then returns from the
+    /// delivery hook at once, without the post-handler hook, which could end
+    /// this turn and let a thread of the dying group run guest code after its
+    /// list was walked (`Detcore::inbound_delivered`). The backend carries the
+    /// default action out as soon as the hook returns, so no guest code runs
+    /// between this walk and the group's end, as none does in Linux between
+    /// `complete_signal` queueing SIGKILL to every thread of the group and
+    /// their exits' walks.
+    ///
+    /// A signal that is caught, ignored, or whose default is not to end the
+    /// process (`signal_default_action_ends_the_process`) leaves every word
+    /// alone, as Linux does. A walk of lists that hold no entry and no pending
+    /// entry changes nothing, so the action, which costs an injected call to
+    /// read, is read only when some list holds one (glibc registers a list for
+    /// every thread, but holds entries in it only while a robust mutex is
+    /// locked), and nothing changes for a group none of whose lists holds
+    /// one. No Linux exit walks the lists for this backend's threads, so the
+    /// decision cannot be guessed: an action that cannot be read refuses the
+    /// run by name (`Self::refuse_unreadable_fatal_action`).
+    pub(crate) async fn walk_robust_lists_before_fatal_delivery<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: SigWrapper,
+    ) -> bool {
+        if self.robust_owner_death_path() != Some(OwnerDeathPath::Detcore)
+            || !signal_default_action_ends_the_process(signal)
+        {
+            return false;
+        }
+        let owners = guest.thread_state().robust_list_owners_for_exit_group();
+        if !owners
+            .iter()
+            .any(|owner| robust_list_holds_an_entry(guest, owner.head))
+        {
+            return false;
+        }
+        match self.signal_is_left_at_default(guest, signal).await {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                self.refuse_unreadable_fatal_action(guest, signal, error)
+                    .await
+            }
+        }
+        guest
+            .thread_state()
+            .mark_robust_lists_walked_by_tool(&owners);
+        self.run_thread_group_robust_list_owner_death(guest, owners, OwnerDeathPath::Detcore)
+            .await;
+        true
+    }
+
+    /// Refuse the run, by name, when the action for `signal`, whose default
+    /// ends the thread group, cannot be read while a robust list of the group
+    /// holds an entry, on a backend where Detcore makes the owner-word
+    /// transitions ([`OwnerDeathPath::Detcore`]). Linux walks every list of
+    /// the group when the action is the default and none when it is not, and
+    /// no Linux exit walks them for this backend's threads, so guessing either
+    /// way could leave a waiter parked for good or mark a live owner's word.
+    async fn refuse_unreadable_fatal_action<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: SigWrapper,
+        error: Error,
+    ) -> ! {
+        let dettid = guest.thread_state().dettid;
+        let message = format!(
+            "hermit: thread {dettid} took {signal}, whose default action ends its thread group, \
+             while a robust list of the group holds an entry, and the signal's action cannot \
+             be read ({error}); Linux walks every robust list of the group when the action is \
+             the default, and no Linux exit walks them for this backend's threads, so the run \
+             is refused (https://github.com/rrnewton/hermit/issues/4529)"
+        );
+        tracing::error!("{message}");
+        let _ = std::io::Write::write_fmt(
+            &mut crate::util::RetryingStderr,
+            format_args!("{message}\n"),
+        );
+        crate::tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+            .await
     }
 
     /// Set the guest's action for `signal` to `SIG_DFL`.
@@ -4409,13 +4794,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         // on DBT Detcore never sees the execve, and a word the native client
         // does not rewrite to a TID Linux knows is never marked
         // (https://github.com/rrnewton/hermit/issues/4268).
+        //
+        // Where no Linux exec walks the lists at all ([`OwnerDeathPath::Detcore`],
+        // KVM), Detcore walks them itself, and only where Linux does: at the
+        // exec's point of no return, which the backend reports through
+        // `Tool::handle_exec_commit` after it has read the strings the exec
+        // copies, with the old image still mapped
+        // (`Self::commit_exec_robust_lists`). Here, at the entry, it only
+        // keeps what that walk needs from the old image
+        // (`Self::plan_exec_robust_lists`). This thread holds its turn from
+        // here through the exec, so no other guest thread runs in between.
         let exec_robust_wakes = match self.robust_owner_death_path() {
             Some(OwnerDeathPath::Kernel) => Some(
                 self.read_thread_group_robust_list_wakes(guest, OwnerDeath::Exec)
                     .await,
             ),
+            Some(OwnerDeathPath::Detcore) => {
+                self.plan_exec_robust_lists(guest, &old_memory_metadata, old_mm_id);
+                None
+            }
             Some(OwnerDeathPath::Barrier) | None => None,
         };
+        let exec_walk_planned = guest.thread_state().exec_robust_commit.is_some();
         let old_robust_list_head;
         // The exec'ing thread leads its process after a successful exec, so
         // the table exec gives it is the process's (`process_files`), also
@@ -4449,6 +4849,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             thread_state.restore_robust_list_after_failed_exec(old_robust_list_head);
             // The old image runs on, and so do its robust-mutex owners.
             thread_state.take_robust_list_wakes_for_exec();
+        }
+        // A failed exec never reached its point of no return, so the walk it
+        // would have owed is dropped unmade, as Linux makes none. One that is
+        // gone was made: the backend reported the point of no return, and
+        // then the exec failed.
+        if exec_walk_planned && guest.thread_state_mut().exec_robust_commit.take().is_none() {
+            self.refuse_failed_committed_exec(guest, errno).await;
         }
 
         cancel_exec(guest).await;
@@ -6024,6 +6431,49 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
+/// Whether the robust list registered at `head` holds an entry or a pending
+/// entry, as the first reads of Linux's `exit_robust_list` find it: false for
+/// an empty list with no pending entry, whose walk changes nothing, and for a
+/// head that cannot be read, whose walk stops before any change.
+fn robust_list_holds_an_entry<G, T>(guest: &G, head: usize) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let read = |offset: usize| {
+        head.checked_add(offset)
+            .and_then(Addr::<u64>::from_raw)
+            .and_then(|at| guest.memory().read_value::<_, u64>(at).ok())
+    };
+    match (
+        read(robust_list::HEAD_LIST_OFFSET),
+        read(robust_list::HEAD_FUTEX_OFFSET_OFFSET),
+        read(robust_list::HEAD_LIST_OP_PENDING_OFFSET),
+    ) {
+        (Some(first), Some(_), Some(pending)) => {
+            robust_list::RobustEntry::decode(first).address != head
+                || !robust_list::RobustEntry::decode(pending).is_null()
+        }
+        _ => false,
+    }
+}
+
+/// Who makes the owner-word transition `handle_futex_death` performs.
+enum OwnerWordTransition<'a> {
+    /// The backend's native task exit ([`OwnerDeathPath::Kernel`],
+    /// [`OwnerDeathPath::Barrier`]): Detcore only reads the words.
+    Linux,
+    /// Detcore itself, with the guest's atomic compare-and-exchange
+    /// ([`OwnerDeathPath::Detcore`]), only ever where Linux would have made
+    /// it: at a death, or at an exec that can no longer fail.
+    Detcore {
+        /// What the guest compare-and-exchange answered when it could not
+        /// make an exchange Linux would have made
+        /// ([`robust_list::FutexCasOutcome::Unsupported`]).
+        unsupported: &'a mut Option<Errno>,
+    },
+}
+
 /// The one real implementation of [`robust_list::RobustDeathEffects`]: guest
 /// memory plus a wake against Detcore's modeled futex waiter pool.
 ///
@@ -6035,11 +6485,14 @@ struct GuestRobustEffects<'a, G, T> {
     staged_wakes: Option<&'a mut Vec<RobustListWake>>,
     /// The words this exit's walks found owned by their dying owner, keyed as
     /// futexes (so two mappings of one shared page are one word), with the
-    /// value Linux's walk stores there. Detcore does not store it, so a later
-    /// read of the same word, through another entry or another owner's list
-    /// in the same group exit, sees this value, as it would after Linux's
-    /// store.
+    /// value Linux's walk stores there. Where Linux makes the transition
+    /// Detcore does not store it, so a later read of the same word, through
+    /// another entry or another owner's list in the same group exit, sees this
+    /// value, as it would after Linux's store. Where Detcore stores it
+    /// ([`OwnerWordTransition::Detcore`]), memory holds it, and this is not
+    /// consulted.
     marked: &'a mut HashMap<FutexID, u32>,
+    transition: OwnerWordTransition<'a>,
     tool: PhantomData<T>,
 }
 
@@ -6056,6 +6509,10 @@ where
     fn read_u32(&mut self, address: usize) -> Option<u32> {
         let at = Addr::<u32>::from_raw(address)?;
         let value = self.guest.memory().read_value::<_, u32>(at).ok()?;
+        if matches!(self.transition, OwnerWordTransition::Detcore { .. }) {
+            // Detcore's own stores are in memory already.
+            return Some(value);
+        }
         let futexid = self.guest.thread_state().futex_id(address, false);
         Some(self.marked.get(&futexid).copied().unwrap_or(value))
     }
@@ -6067,6 +6524,41 @@ where
         desired: u32,
     ) -> robust_list::FutexCasOutcome {
         use robust_list::FutexCasOutcome;
+
+        if let OwnerWordTransition::Detcore { unsupported } = &mut self.transition {
+            // No Linux exit or exec will make this transition, so Detcore makes
+            // it, in the dying or exec'ing thread's turn, with the guest's
+            // atomic exchange: Linux's `futex_cmpxchg_value_locked`. Never a
+            // separate read and write, which a process sharing the mapping
+            // outside Hermit's scheduler could interleave.
+            let Some(at) = AddrMut::<u32>::from_raw(address) else {
+                return FutexCasOutcome::Faulted;
+            };
+            return match self
+                .guest
+                .memory()
+                .compare_exchange_u32(at, expected, desired)
+            {
+                Ok(observed) if observed == expected => {
+                    // Deliberately DEBUG, not INFO: this line carries a raw
+                    // guest address, and INFO is the surface `--verify-strict`
+                    // compares.
+                    debug!(
+                        "[detcore, dtid {}] robust-list owner death: marked futex word {:#x} {:#x} -> {:#x}",
+                        self.dettid, address, expected, desired,
+                    );
+                    FutexCasOutcome::Matched
+                }
+                Ok(observed) => FutexCasOutcome::Changed(observed),
+                // `fault_in_user_writeable()` fails: `return -1`. (A misaligned
+                // word, EINVAL, was refused before any access.)
+                Err(Errno::EFAULT | Errno::EINVAL) => FutexCasOutcome::Faulted,
+                Err(errno) => {
+                    **unsupported = Some(errno);
+                    FutexCasOutcome::Unsupported
+                }
+            };
+        }
 
         let Some(read_at) = Addr::<u32>::from_raw(address) else {
             return FutexCasOutcome::Faulted;
@@ -6171,6 +6663,11 @@ enum OwnerDeath {
 /// `owner_death_path_is_tied_to_the_backends_that_have_its_properties` fails
 /// if another backend starts to set it (Claude review of
 /// https://github.com/rrnewton/hermit/pull/4277 at 65138a17, N4).
+///
+/// The Detcore path is checked last: a backend whose native exit runs Linux's
+/// walk, through either of the first two, never gets it, even if it also set
+/// `kernel_never_walks_robust_lists`, so a word is never marked twice (the
+/// same test pins that too).
 fn owner_death_path(cfg: &Config) -> Option<OwnerDeathPath> {
     if !cfg.sequentialize_threads || cfg.debug_futex_mode != BlockingMode::Precise {
         return None;
@@ -6179,14 +6676,17 @@ fn owner_death_path(cfg: &Config) -> Option<OwnerDeathPath> {
         Some(OwnerDeathPath::Kernel)
     } else if cfg.backend.requires_thread_directed_process_signals {
         Some(OwnerDeathPath::Barrier)
+    } else if cfg.backend.kernel_never_walks_robust_lists {
+        Some(OwnerDeathPath::Detcore)
     } else {
         None
     }
 }
 
-/// How Detcore orders its modeled owner-death wakes after Linux's own walk.
-/// In both, Linux changes each owner word to `FUTEX_OWNER_DIED` in the native
-/// exit, and Detcore only reads the words.
+/// How Detcore orders its modeled owner-death wakes against the owner-word
+/// transitions. In the first two, Linux changes each owner word to
+/// `FUTEX_OWNER_DIED` in the native exit, and Detcore only reads the words; in
+/// the third no native exit walks the list, and Detcore changes them itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OwnerDeathPath {
     /// The backend's exit callback comes after the native exit
@@ -6203,6 +6703,20 @@ enum OwnerDeathPath {
     /// done (`ThreadState::wait_for_exit_group_robust_walk`), so that walk reads
     /// every word as the guest left it.
     Barrier,
+    /// No Linux task exits for a guest thread
+    /// (`BackendCapabilities::kernel_never_walks_robust_lists`, KVM), so no
+    /// kernel walk ever marks a word. Detcore makes Linux's whole walk itself,
+    /// in the dying thread's own turn: each transition with the guest's
+    /// atomic compare-and-exchange, and each wake at once, against its
+    /// modeled waiter pool, before any other thread can run. An exec walks
+    /// once it can no longer fail, at the point the backend reports through
+    /// `Tool::handle_exec_commit`, and holds its wakes until the new image's
+    /// first callback; an exec that fails walks nothing. An exit_group and a
+    /// SIGKILL of the caller's own process are filed first, as on
+    /// [`Self::Barrier`], so the threads the grant kills keep their
+    /// registrations for its walk; a delivery whose default action ends the
+    /// group walks in its own turn and returns without the post-handler hook.
+    Detcore,
 }
 
 /// How precise and polling futex modes answer a futex command, decided as
@@ -6870,9 +7384,13 @@ mod tests {
 
     use super::*;
 
-    /// The Kernel path is ptrace's, and the Barrier path is DBT's alone: a
-    /// backend gets the Barrier path only by setting a flag whose other
-    /// properties it must then have (`owner_death_path`).
+    /// The Kernel path is ptrace's, the Barrier path is DBT's alone, and the
+    /// Detcore path is KVM's alone: a backend gets the Barrier path only by
+    /// setting a flag whose other properties it must then have, and the
+    /// Detcore path only by stating that no kernel walk runs
+    /// (`owner_death_path`). A backend whose native exit does run Linux's walk
+    /// keeps its path even if it also claimed that none runs, so a word is
+    /// never marked by Detcore and by Linux both.
     #[test]
     fn owner_death_path_is_tied_to_the_backends_that_have_its_properties() {
         let path = |backend: reverie::BackendCapabilities| {
@@ -6889,12 +7407,27 @@ mod tests {
             path(reverie::BackendCapabilities::DBT),
             Some(OwnerDeathPath::Barrier)
         );
+        assert_eq!(
+            path(reverie::BackendCapabilities::KVM),
+            Some(OwnerDeathPath::Detcore)
+        );
         for backend in [
-            reverie::BackendCapabilities::KVM,
             reverie::BackendCapabilities::SABRE,
             reverie::BackendCapabilities::LITEINST_IN_GUEST,
         ] {
             assert_eq!(path(backend), None, "{backend:?}");
+        }
+        for (backend, kept) in [
+            (reverie::BackendCapabilities::PTRACE, OwnerDeathPath::Kernel),
+            (
+                reverie::BackendCapabilities::E9PATCH,
+                OwnerDeathPath::Kernel,
+            ),
+            (reverie::BackendCapabilities::DBT, OwnerDeathPath::Barrier),
+        ] {
+            let mut claimed = backend;
+            claimed.kernel_never_walks_robust_lists = true;
+            assert_eq!(path(claimed), Some(kept), "{backend:?}");
         }
     }
 
