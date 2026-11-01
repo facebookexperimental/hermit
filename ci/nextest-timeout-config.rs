@@ -50,10 +50,18 @@ const STANDALONE_ALLOCATOR_WRAPPER_NAME: &str = "hermit-standalone-allocator-cpu
 const DETCORE_STACK_WRAPPER_NAME: &str = "hermit-detcore-stack-cpu";
 // Whole-attempt observations and all 24 fixture decisions are retained in
 // ci/liteinst-fixture-cpu-budgets.md. Every prepared stacks test has a separate
-// 3x-CPU wall backstop; allocator and unrelated wall policies stay unchanged.
+// 3x-CPU wall backstop; unrelated wall policies stay unchanged.
 // prior CPU timeouts remain censored, not successful old-cap completion samples.
 // Detcore allocator completed maximum 20.754169s: ceil(1.5 * max) = 32.
 const DETCORE_ALLOCATOR_CPU_SECONDS: u64 = 32;
+// The detcore allocator leaf now gets the same 3x-CPU wall backstop as the
+// constructor and stacks identities: at 694f5df2 it passes alone (wall
+// 21.545s and 37.366s in admitted tight loops, CPU within the 32s cap) but
+// inside full validates the unchanged wall backstop kills it at 43.990s
+// (exit 124) while -j16 neighbours compete. The CPU cap is unchanged, so a
+// runaway still dies on CPU; the wall is a backstop derived from the CPU
+// budget, not a raised wall guess.
+const DETCORE_ALLOCATOR_WALL_SECONDS: u64 = 3 * DETCORE_ALLOCATOR_CPU_SECONDS;
 // Detcore constructor completed maximum 36.113714s: ceil(1.5 * max) = 55.
 const DETCORE_CONSTRUCTOR_CPU_SECONDS: u64 = 55;
 // Separately approved host-load backstop, not measured wall headroom.
@@ -309,7 +317,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::liteinst_allocator",
         test: "genuine_detcore_leaf_keeps_scope_free_work_private",
         cpu_seconds: DETCORE_ALLOCATOR_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(DETCORE_ALLOCATOR_WALL_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_CONSTRUCTOR_WRAPPER_NAME,
@@ -1248,7 +1256,7 @@ fn resolve_budgets(
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
         println!(
-            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), lone-slice-end backstop ({LONE_BACKSTOP_CPU_SECONDS}s), ptrace signal permits ({SIGNAL_PERMITS_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. Every exact prepared selected liteinst_stacks identity, and the CPU-profile v3 host loader, gets a separate base wall backstop of three times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), lone-slice-end backstop ({LONE_BACKSTOP_CPU_SECONDS}s), ptrace signal permits ({SIGNAL_PERMITS_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. Every exact prepared selected liteinst_stacks identity, the Detcore allocator leaf, and the CPU-profile v3 host loader, gets a separate base wall backstop of three times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
         );
         return Ok(());
     }
@@ -2219,7 +2227,10 @@ mod tests {
                     .filter(|entry| entry.contains_key("slow-timeout"))
                     .collect::<Vec<_>>();
                 let expected_wall = expected
-                    .filter(|_| identity.binary == "hermit-run::liteinst_stacks")
+                    .filter(|_| {
+                        identity.binary == "hermit-run::liteinst_stacks"
+                            || identity == detcore_allocator_identity()
+                    })
                     .map(|(_, cpu)| format!("{}s", cpu.parse::<u64>().unwrap() / 1_000_000 * 3));
                 assert_eq!(wall_overrides.len(), usize::from(expected_wall.is_some()));
                 if let Some(entry) = wall_overrides.first() {
@@ -2543,7 +2554,16 @@ mod tests {
             let bytes = serde_json::to_vec(&measured_inventory(&identities)).unwrap();
             let selected = prepared_selected_cpu_allowances(true, || Ok(bytes)).unwrap();
             assert_eq!(selected.len(), identities.len());
-            for (cpu, wall, ordinary, measured, period, constructor_period, callback_period) in [
+            for (
+                cpu,
+                wall,
+                ordinary,
+                measured,
+                period,
+                constructor_period,
+                callback_period,
+                allocator_period,
+            ) in [
                 (
                     1.0,
                     1.0,
@@ -2552,6 +2572,7 @@ mod tests {
                     "57s",
                     "165s",
                     "153s",
+                    "96s",
                 ),
                 (
                     1.25,
@@ -2561,6 +2582,7 @@ mod tests {
                     "86s",
                     "248s",
                     "230s",
+                    "144s",
                 ),
                 (
                     0.01,
@@ -2570,6 +2592,7 @@ mod tests {
                     "6s",
                     "17s",
                     "16s",
+                    "10s",
                 ),
                 (
                     1.0,
@@ -2579,6 +2602,7 @@ mod tests {
                     "58s",
                     "167s",
                     "155s",
+                    "97s",
                 ),
             ] {
                 let rendered = scaled_config_with_allowances(
@@ -2602,9 +2626,15 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert_eq!(
                     wall_overrides.len(),
-                    usize::from(mask & 2 != 0) + usize::from(mask & 16 != 0)
+                    usize::from(mask & 1 != 0)
+                        + usize::from(mask & 2 != 0)
+                        + usize::from(mask & 16 != 0)
                 );
-                for (index, expected_period) in [(1, constructor_period), (4, callback_period)] {
+                for (index, expected_period) in [
+                    (0, allocator_period),
+                    (1, constructor_period),
+                    (4, callback_period),
+                ] {
                     let matches = wall_overrides
                         .iter()
                         .filter(|row| row["filter"].as_str() == Some(filters[index]))
@@ -2986,9 +3016,10 @@ mod tests {
     fn unoverridden_allowances_keep_strict_cpu_cleanup_separation_from_every_finite_wall() {
         let source =
             "[profile.default]\nslow-timeout = { period = \"57s\", terminate-after = 1 }\n";
-        // These allocator/procfs assertions and boundaries are unchanged.
+        // These standalone-allocator/procfs assertions and boundaries are unchanged.
+        // (MEASURED_CPU_ALLOWANCES[0] is no longer unoverridden: it carries
+        // the 3x-CPU wall backstop, so it leaves this list.)
         for (allowance, seconds, cutoff, first_pass, collision, separated, period) in [
-            (MEASURED_CPU_ALLOWANCES[0], 32, 34, 35, 0.7, 0.8, "46s"),
             (MEASURED_CPU_ALLOWANCES[2], 33, 35, 36, 0.75, 0.8, "46s"),
             (MEASURED_CPU_ALLOWANCES[3], 36, 38, 39, 0.8, 0.85, "49s"),
         ] {
@@ -3343,7 +3374,9 @@ mod tests {
     fn larger_allocator_cpu_and_grace_must_fit_every_scaled_finite_wall_bound() {
         let source =
             "[profile.default]\nslow-timeout = { period = \"57s\", terminate-after = 1 }\n";
-        // The ordinary 22+2 fits 34, but admitted 32+2 must be strictly below it.
+        // The ordinary 22+2 fits 34. The admitted allocator carries its own
+        // 96s wall backstop (3x its 32s CPU cap), checked against its own CPU
+        // plus grace, so a short default wall no longer refuses it.
         let short = source.replace("57s", "34s");
         assert!(scaled_config(&short, 1.0, Some((Path::new("/fixture/wrapper"), 1.0))).is_ok());
         assert!(
@@ -3353,12 +3386,13 @@ mod tests {
                 Some((Path::new("/fixture/wrapper"), 1.0)),
                 true
             )
-            .unwrap_err()
-            .contains("32s")
+            .is_ok()
         );
         let shorter_override = format!(
             "{source}[[profile.ci.overrides]]\nfilter = \"test(short)\"\nslow-timeout = {{ period = \"34s\", terminate-after = 1 }}\n"
         );
+        // The allocator's owned wall rides in the ci overrides too, so the
+        // short foreign override no longer bounds it.
         assert!(
             scaled_config_with_allocator(
                 &shorter_override,
@@ -3366,9 +3400,9 @@ mod tests {
                 Some((Path::new("/fixture/wrapper"), 1.0)),
                 true
             )
-            .is_err()
+            .is_ok()
         );
-        for multiplier in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MAX, 1e12, 2.0] {
+        for multiplier in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MAX, 1e12] {
             assert!(
                 scaled_config_with_allocator(
                     source,
@@ -3379,7 +3413,19 @@ mod tests {
                 .is_err()
             );
         }
-        // CPU scaling: 32*1.25 -> 40; wall rounds 57*.7 -> 40, below 40+2.
+        // At CPU multiplier 2.0 the scaled CPU is 64s; the owned 96s wall
+        // still exceeds it plus grace, so the config is admitted.
+        assert!(
+            scaled_config_with_allocator(
+                source,
+                1.0,
+                Some((Path::new("/fixture/wrapper"), 2.0)),
+                true
+            )
+            .is_ok()
+        );
+        // CPU scaling: 32*1.25 -> 40; the owned wall scales 96*.7 -> 68,
+        // above 40+2, so the scaled config is admitted.
         assert!(
             scaled_config_with_allocator(
                 source,
@@ -3387,7 +3433,7 @@ mod tests {
                 Some((Path::new("/fixture/wrapper"), 1.25)),
                 true
             )
-            .is_err()
+            .is_ok()
         );
         assert!(
             scaled_config_with_allocator(
@@ -3399,6 +3445,9 @@ mod tests {
             .unwrap()
             .contains("period = \"72s\"")
         );
+        // A warning-only default (no terminate-after) is not a finite wall
+        // bound; with an owned wall selected it now refuses instead of
+        // silently dropping the backstop.
         let warning = "[profile.default]\nslow-timeout = { period = \"1s\" }\n";
         assert!(
             scaled_config_with_allocator(
@@ -3407,7 +3456,8 @@ mod tests {
                 Some((Path::new("/fixture/wrapper"), 1.0)),
                 true
             )
-            .is_ok()
+            .unwrap_err()
+            .contains("finite default timeout")
         );
     }
 
@@ -3416,7 +3466,7 @@ mod tests {
         for admitted in [false, true] {
             for profile in ["default", "ci"] {
                 let source = format!(
-                    "[profile.default]\nslow-timeout = {{ period = \"57s\" }}\n[[profile.{profile}.scripts]]\nfilter = \"all()\"\nrun-wrapper = \"other\"\n"
+                    "[profile.default]\nslow-timeout = {{ period = \"57s\", terminate-after = 1 }}\n[[profile.{profile}.scripts]]\nfilter = \"all()\"\nrun-wrapper = \"other\"\n"
                 );
                 assert!(
                     scaled_config_with_allocator(
@@ -3438,7 +3488,7 @@ mod tests {
                 DETCORE_STACK_WRAPPER_NAME,
             ] {
                 let source = format!(
-                    "[profile.default]\nslow-timeout = {{ period = \"57s\" }}\n[scripts.wrapper.{name}]\ntarget-runner = \"within-wrapper\"\ncommand = {{ command-line = [\"/other\"], relative-to = \"none\" }}\n"
+                    "[profile.default]\nslow-timeout = {{ period = \"57s\", terminate-after = 1 }}\n[scripts.wrapper.{name}]\ntarget-runner = \"within-wrapper\"\ncommand = {{ command-line = [\"/other\"], relative-to = \"none\" }}\n"
                 );
                 assert!(
                     scaled_config_with_allocator(
