@@ -86,6 +86,7 @@ use crate::types::*;
 pub(crate) mod descriptor_directory;
 #[cfg(test)]
 mod determinize_stat_tests;
+pub(crate) mod flock_model;
 pub(crate) mod other_process_procfs;
 #[cfg(test)]
 mod prefilter_tests;
@@ -6742,6 +6743,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return refusal;
         }
+        // A close KVM cannot let release a flock while a mapping may keep it
+        // (`flock_model`).
+        if let Some(refusal) = self.refuse_flock_close(guest, Sysno::close, fd..=fd).await {
+            return refusal;
+        }
         let channel_end = self.pipe_channel_end(guest, fd);
         let lock_tracked = self.lock_tracked_descriptions(guest, fd..=fd);
         let res = self.record_or_replay(guest, call).await;
@@ -6791,11 +6797,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             return refusal;
         }
 
+        let range = match (i32::try_from(first), i32::try_from(last)) {
+            (Ok(first), Ok(last)) => Some(first..=last),
+            (Ok(first), Err(_)) => Some(first..=RawFd::MAX),
+            _ => None,
+        };
+        if let Some(range) = range.clone()
+            && let Some(refusal) = self
+                .refuse_flock_close(guest, Sysno::close_range, range)
+                .await
+        {
+            return refusal;
+        }
         let channel_ends = self.pipe_channel_ends_in(guest, first, last);
-        let lock_tracked = match (i32::try_from(first), i32::try_from(last)) {
-            (Ok(first), Ok(last)) => self.lock_tracked_descriptions(guest, first..=last),
-            (Ok(first), Err(_)) => self.lock_tracked_descriptions(guest, first..=RawFd::MAX),
-            _ => Vec::new(),
+        let lock_tracked = match range {
+            Some(range) => self.lock_tracked_descriptions(guest, range),
+            None => Vec::new(),
         };
         let result = self.record_or_replay(guest, call).await;
         if result.is_ok() {
@@ -6910,7 +6927,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             && operation & (libc::LOCK_SH | libc::LOCK_EX) != 0)
             .then_some("FLOCK");
         let baseline = self.lock_baseline(guest, fd, class);
-        let result = self.flock_through_the_kernel(guest, call).await;
+        // Detcore's flock model decides the call where it can follow the
+        // description; otherwise the kernel does, as before it
+        // (`flock_model`).
+        let result = match self.flock_through_the_model(guest, call).await? {
+            flock_model::FlockRoute::Decided(result) => result,
+            flock_model::FlockRoute::Kernel => self.flock_through_the_kernel(guest, call).await,
+        };
         self.refresh_description_locks(guest, fd, LockCall::Flock, baseline)
             .await?;
         result
@@ -8651,14 +8674,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         // sequentialized threads no other guest thread's lock call (and its
         // fdinfo record) runs between them. Parallel execution would need
         // them taken as one.
-        let lock_rows_kept = if !ledger_locks
+        // On an inode Detcore's flock model decides, the model's locks and
+        // waiters are the rows, after the kept ones, in place of the kernel's
+        // (`procfs::locks::LockLedger::flock_kernel_rows`).
+        let (contents, lock_rows_kept) = if !ledger_locks
             && guest
                 .thread_state()
                 .with_detfd(call.fd(), |detfd| detfd.procfs_lists_locks())?
         {
             match crate::procfs::locks::lock_rows(&contents) {
                 Some(rows) => match crate::tool_global::guest_lock_rows(guest, rows).await {
-                    Ok(kept) => Some(kept),
+                    Ok((kept, model_rows)) => {
+                        let (contents, kept) =
+                            crate::procfs::locks::with_appended_rows(contents, kept, model_rows);
+                        (contents, Some(kept))
+                    }
                     Err(reason) => {
                         let reason = format!(
                             "/proc/locks: {reason}; that description's rows cannot be told \
@@ -8668,10 +8698,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 },
                 // Rows that do not parse: the sanitizer refuses the snapshot.
-                None => None,
+                None => (contents, None),
             }
         } else {
-            None
+            (contents, None)
         };
         let machine = crate::machine::MachineDescription::of(guest.config());
         // A status reports the guest's own mask of a thread Detcore holds
@@ -11476,6 +11506,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             None => {}
         }
+        // A file mapping keeps its open file description, and a flock lock it
+        // holds, after its last descriptor goes (`flock_model`). The mmap's
+        // result is unchanged.
+        if !call.flags().contains(MapFlags::MAP_ANONYMOUS) && call.fd() >= 0 {
+            self.note_flock_mapping(guest, call.fd()).await;
+        }
         Ok(result)
     }
 
@@ -13152,23 +13188,26 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// kernel snapshot.
     async fn ledger_locks_text<G: Guest<Self>>(&self, guest: &mut G) -> Vec<u8> {
         match crate::tool_global::ledger_lock_rows(guest).await {
-            Ok(rows) => rows
-                .iter()
-                .enumerate()
-                .map(|(index, (lock, owner))| {
-                    format!(
-                        "{}: {} {} {} {owner} {} {} {}\n",
-                        index + 1,
-                        lock.class,
-                        lock.mode,
-                        lock.access,
-                        lock.object,
-                        lock.start,
-                        lock.end
-                    )
-                })
-                .collect::<String>()
-                .into_bytes(),
+            Ok(rows) => {
+                // A waiter (`depth` above 0) shares its lock's number, after
+                // `->` indented by its depth, as `lock_get_status` prints it.
+                let mut number = 0;
+                rows.iter()
+                    .map(|(lock, owner, depth)| {
+                        let prefix = if *depth == 0 {
+                            number += 1;
+                            String::new()
+                        } else {
+                            format!("{:>width$}", "-> ", width = *depth as usize + 2)
+                        };
+                        format!(
+                            "{number}: {prefix}{} {} {} {owner} {} {} {}\n",
+                            lock.class, lock.mode, lock.access, lock.object, lock.start, lock.end
+                        )
+                    })
+                    .collect::<String>()
+                    .into_bytes()
+            }
             Err(reason) => {
                 let reason =
                     format!("/proc/locks: {reason}; Detcore cannot render that description's rows");
@@ -14391,6 +14430,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return refusal;
         }
+        // A replacement KVM cannot let release a flock while a mapping may
+        // keep it (`flock_model`).
+        if old_fd != new_fd
+            && let Some(refusal) = self
+                .refuse_flock_close(guest, Sysno::dup2, new_fd..=new_fd)
+                .await
+        {
+            return refusal;
+        }
         // `dup2` over another open descriptor closes it.
         let closed_end = (old_fd != new_fd)
             .then(|| self.pipe_channel_end(guest, new_fd))
@@ -14499,6 +14547,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(refusal) = self
             .refuse_dup_over_waited_listener(guest, Sysno::dup3, old_fd, new_fd)
             .await
+        {
+            return refusal;
+        }
+        // A replacement KVM cannot let release a flock while a mapping may
+        // keep it (`flock_model`).
+        if old_fd != new_fd
+            && let Some(refusal) = self
+                .refuse_flock_close(guest, Sysno::dup3, new_fd..=new_fd)
+                .await
         {
             return refusal;
         }

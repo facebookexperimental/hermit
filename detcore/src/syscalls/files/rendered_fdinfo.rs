@@ -442,6 +442,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         // line would show a guest's record lock the backend holds as an OFD
         // lock.
         let mut locks = Vec::new();
+        // The flock Detcore's model holds through the description, which no
+        // host lock mirrors here: first, as Linux lists a description's flock
+        // locks before its record locks and leases (`show_fd_locks`).
+        if let Some(identity) = guest
+            .thread_state()
+            .with_detfd(target, |detfd| detfd.flock_identity())
+            .ok()
+            .flatten()
+            .filter(|identity| identity.modelled)
+            && let Some((write, owner)) =
+                crate::tool_global::flock_held_by(guest, model.open_file).await
+        {
+            locks.push(FdinfoLock {
+                class: reverie::LockClass::Flock,
+                mandatory: false,
+                write,
+                owner,
+                device: Self::lock_line_device(guest, identity.dev).await,
+                inode: ino,
+                start: 0,
+                end: None,
+            });
+        }
         if let Some(status) = &status
             && !status.locks.is_empty()
         {

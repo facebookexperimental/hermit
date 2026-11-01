@@ -440,6 +440,13 @@ pub(crate) struct SentDescriptor {
     /// (`PlaceholderCopies::Received`) or the release of this descriptor
     /// (`Detcore::settle_released_rights`) uncounts it.
     pub(crate) lock_copy: Option<OpenFileId>,
+    /// Whether a receive Detcore could not match to its queue may have taken
+    /// this descriptor's message unseen (`SocketRights::suspects`), when the
+    /// receiving socket's last close released it with the queue
+    /// ([`DetFd::take_all_queued_rights`]): the receive may hold the
+    /// description under an identity Detcore does not know, so its copy's
+    /// release cannot be placed (`flock_model`).
+    pub(crate) suspect: bool,
 }
 
 /// The most messages kept queued to one socket ([`SocketRights::queued`]):
@@ -1233,6 +1240,21 @@ struct OpenFileDescription {
     /// and carried across exec (`ExecProcfsRecord`). Not printed.
     #[serde(default)]
     record_sequence_unknown: bool,
+    /// True once Detcore may not see every reference to this open file
+    /// description: another process or table got it before the lock ledger
+    /// followed its references (a fork copied it, a send over `SCM_RIGHTS`
+    /// passed it), or Detcore did not see it made (the launcher's standard
+    /// streams, a descriptor discovered in the table, one received as a
+    /// description of its own). Its last reference cannot be placed, so a
+    /// `flock` through it is not Detcore's to decide (`Detcore::handle_flock`).
+    /// Shared by every alias, as the description is. Permanent. Not printed.
+    #[serde(default)]
+    references_escaped: bool,
+    /// The inode a `flock` through this description is kept on, and how
+    /// Detcore decides it, once a `flock` took it (`Detcore::flock_identity`).
+    /// Not printed.
+    #[serde(default)]
+    flock_identity: Option<FlockIdentity>,
     /// For an `AF_UNIX` socket: its type, name and peer, and the
     /// descriptors queued to it in `SCM_RIGHTS` messages
     /// (`crate::syscalls::scm_rights`). It names descriptions by handles
@@ -1270,6 +1292,15 @@ struct OpenFileDescription {
     /// the one description it is. Shared by every alias. Not printed.
     #[serde(default)]
     stdio_alias_group: Option<OpenFileId>,
+}
+
+impl OpenFileDescription {
+    /// Escaped, with no reference the lock ledger follows and no flock
+    /// identity: Detcore's flock model never decided a call through this
+    /// description, and never will (`DetFd::rebind_open_file_id`).
+    fn never_the_flock_models(&self) -> bool {
+        self.references_escaped && !self.lock_tracked && self.flock_identity.is_none()
+    }
 }
 
 /// State of an anonymous-inode file that its `/proc/<pid>/fdinfo/<fd>`
@@ -1553,6 +1584,23 @@ impl Hash for DetFd {
     }
 }
 
+/// The inode a `flock` through an open file description is kept on, and how
+/// Detcore decides it (`Detcore::handle_flock`), as the first `flock` through
+/// it found them: they do not change while the description lives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FlockIdentity {
+    /// The file's `st_dev`, from `fstat`.
+    pub(crate) dev: u64,
+    /// The file's `st_ino`, from `fstat`.
+    pub(crate) ino: u64,
+    /// The file's filesystem, by name, where the filesystem's own
+    /// `f_op->flock` decides the call (`flock_lock_inode` never runs), which
+    /// Detcore leaves to it; `None` for any other.
+    pub(crate) own_flock: Option<String>,
+    /// Whether Detcore's flock model decided a call through the description.
+    pub(crate) modelled: bool,
+}
+
 /// If the flags specify O_NONBLOCK.
 fn oflags_nonblocking(flags: i32) -> bool {
     let o_nonblock = OFlag::O_NONBLOCK.bits();
@@ -1628,6 +1676,23 @@ impl DetFd {
                 id,
                 directory_lock: Arc::default(),
             }))),
+        }
+    }
+
+    /// A table copy (a fork, or a thread made without `CLONE_FILES`) gave
+    /// this description references the lock ledger never saw taken, unless
+    /// the ledger follows it (`is_lock_tracked`): mark them escaped
+    /// (`mark_references_escaped`). Only a local description is marked here;
+    /// a promoted one is never contacted, as a fork precedes the callback in
+    /// which its shared model may be leased (DBT), and the flock model takes
+    /// every promoted description as escaped anyway (`is_shared`): its model
+    /// spans processes by construction.
+    pub(crate) fn mark_local_untracked_references_escaped(&self) {
+        let mut state = self.open_file.lock().expect("open file mutex poisoned");
+        if let OpenFileState::Local(description) = &mut *state
+            && !description.lock_tracked
+        {
+            description.references_escaped = true;
         }
     }
 
@@ -1716,6 +1781,8 @@ impl DetFd {
                 received_for_locks: false,
                 may_hold_ofd_lock: false,
                 record_sequence_unknown: false,
+                references_escaped: false,
+                flock_identity: None,
                 rights: SocketRights::default(),
                 in_flight: 0,
                 fdinfo_facts: None,
@@ -3111,11 +3178,24 @@ impl DetFd {
     /// (`unix_release_sock`).
     pub(crate) fn take_all_queued_rights(&self) -> Vec<SentDescriptor> {
         self.with_description(|d| {
+            // The oldest messages, or every one once the queue lost lockstep,
+            // may have been taken unseen by a receive Detcore could not match.
+            let suspects = if d.rights.lockstep_lost {
+                d.rights.queued.len()
+            } else {
+                d.rights.suspects
+            };
             d.rights.suspects = 0;
             d.rights
                 .queued
                 .drain(..)
-                .flat_map(|message| message.descriptors)
+                .enumerate()
+                .flat_map(|(position, message)| {
+                    message.descriptors.into_iter().map(move |mut sent| {
+                        sent.suspect = position < suspects;
+                        sent
+                    })
+                })
                 .collect()
         })
     }
@@ -3747,11 +3827,80 @@ impl DetFd {
     /// registry names it (`FileMetadata::adopt_placeholder`,
     /// `Detcore::adopt_received_placeholder`), so it takes the record
     /// sequence that open file keeps in Detcore's global state.
+    ///
+    /// Detcore's flock model keys its locks, waiters and the references it
+    /// follows by this identity (`procfs::locks::LockLedger`), so a rebind
+    /// must leave it nothing to move, and every caller makes it so
+    /// (`OpenFileDescription::never_the_flock_models`): the description is
+    /// one Detcore made in the same handler, before any guest call went
+    /// through it, for a descriptor it had no record of, discovered in the table
+    /// (`FileMetadata::add_discovered_fd`) or received
+    /// (`Detcore::rebuild_received_placeholder`). Such a description holds no
+    /// lock and waits for none, the ledger follows none of its references,
+    /// and it is escaped (`mark_flock_mode_unobserved`), so the model never
+    /// decides a flock through it, under either identity: the kernel does,
+    /// on every backend that rebinds (those where the tool runs in each guest
+    /// process, all of which mirror flock onto the host).
     pub(crate) fn rebind_open_file_id(&self, id: OpenFileId) {
         let mut state = self.open_file.lock().expect("open file mutex poisoned");
         if let OpenFileState::Local(description) = &mut *state {
+            debug_assert!(
+                description.never_the_flock_models(),
+                "a rebound description is escaped and was never the flock model's"
+            );
             description.id = id;
         }
+    }
+
+    /// Whether this description may take another open file's identity
+    /// ([`Self::rebind_open_file_id`]): only one Detcore's flock model never
+    /// decided a call through and never will, because it is escaped, the
+    /// ledger follows none of its references, and no flock took its inode.
+    /// The rebind itself asserts the same predicate in debug builds.
+    #[cfg(test)]
+    pub(crate) fn may_rebind_open_file_id(&self) -> bool {
+        let state = self.open_file.lock().expect("open file mutex poisoned");
+        match &*state {
+            OpenFileState::Local(description) => description.never_the_flock_models(),
+            OpenFileState::Shared(_) => false,
+        }
+    }
+
+    /// Mark this description as one whose references Detcore may not all see
+    /// (`OpenFileDescription::references_escaped`). Permanent.
+    pub(crate) fn mark_references_escaped(&self) {
+        self.with_description(|d| d.references_escaped = true);
+    }
+
+    /// Whether Detcore may not see every reference to this description.
+    pub(crate) fn references_escaped(&self) -> bool {
+        self.with_description(|d| d.references_escaped)
+    }
+
+    /// The inode a `flock` through this description is kept on, once taken.
+    pub(crate) fn flock_identity(&self) -> Option<FlockIdentity> {
+        self.with_description(|d| d.flock_identity.clone())
+    }
+
+    /// Record the inode a `flock` through this description is kept on.
+    pub(crate) fn set_flock_identity(&self, identity: FlockIdentity) {
+        self.with_description(|d| d.flock_identity = Some(identity));
+    }
+
+    /// Whether Detcore's flock model decided a call through this description,
+    /// so that its mappings matter to the model (`Detcore::note_flock_mapping`).
+    pub(crate) fn is_flock_modelled(&self) -> bool {
+        self.with_description(|d| d.flock_identity.as_ref().is_some_and(|id| id.modelled))
+    }
+
+    /// Record that Detcore's flock model decided a call through this
+    /// description.
+    pub(crate) fn set_flock_modelled(&self) {
+        self.with_description(|d| {
+            if let Some(identity) = &mut d.flock_identity {
+                identity.modelled = true;
+            }
+        });
     }
 
     /// Mark this open file as passed over `SCM_RIGHTS`. Permanent.
@@ -3833,6 +3982,9 @@ impl DetFd {
             description.flock_mode_ever_known = false;
             // A lock may have been taken before Detcore saw the description.
             description.flock_ever_granted = true;
+            // Another process may hold it too, under a reference Detcore never
+            // saw taken.
+            description.references_escaped = true;
         })
     }
 
@@ -4742,6 +4894,101 @@ mod tests {
         assert_eq!(original.open_file_alias_count(), 3);
     }
 
+    /// The fork-time escape marking never leases a promoted description's
+    /// shared model: a fork precedes the callback in which DBT may lease it
+    /// (a lease outside it panics there), and the flock model takes a promoted
+    /// description as escaped anyway (`DetFd::is_shared`). A local description
+    /// is marked unless the lock ledger follows it.
+    #[test]
+    fn the_fork_time_escape_marking_leaves_a_promoted_description_alone() {
+        let channel = MemoryChannel::installed();
+        let id = OpenFileId::new(DetTid::from_raw(9051), 0);
+        let promoted = DetFd::new(3, OFlag::O_RDONLY, FdType::Rng, id);
+        promoted.promote().unwrap();
+        let takes = channel.takes(id);
+        promoted.mark_local_untracked_references_escaped();
+        assert_eq!(channel.takes(id), takes);
+        assert!(promoted.is_shared());
+
+        let local = DetFd::new(
+            4,
+            OFlag::O_RDWR,
+            FdType::Regular,
+            OpenFileId::new(DetTid::from_raw(9051), 1),
+        );
+        local.mark_local_untracked_references_escaped();
+        assert!(local.references_escaped());
+
+        let followed = DetFd::new(
+            5,
+            OFlag::O_RDWR,
+            FdType::Regular,
+            OpenFileId::new(DetTid::from_raw(9051), 2),
+        );
+        followed.set_lock_tracked();
+        followed.mark_local_untracked_references_escaped();
+        assert!(!followed.references_escaped());
+    }
+
+    /// Detcore's flock model keys its state by a description's identity, so
+    /// a rebind (`DetFd::rebind_open_file_id`), which gives a description
+    /// Detcore just made the identity of an open file its registry names, is
+    /// only for a description the model never decided a call through: one
+    /// made as discovery or a receipt makes it, escaped and never followed,
+    /// before and after the rebind; never one Detcore saw opened, one the
+    /// ledger follows, or one whose inode a flock took.
+    #[test]
+    fn only_a_description_the_flock_model_never_decided_is_rebound() {
+        let made = DetFd::new(
+            3,
+            OFlag::O_RDONLY,
+            FdType::Regular,
+            OpenFileId::new(DetTid::from_raw(9061), 0),
+        );
+        made.mark_flock_mode_unobserved();
+        assert!(made.may_rebind_open_file_id());
+        let joined = OpenFileId::new(DetTid::from_raw(9060), 4);
+        made.rebind_open_file_id(joined);
+        assert_eq!(made.open_file_id(), joined);
+        assert!(made.may_rebind_open_file_id());
+        assert!(made.references_escaped());
+        assert!(!made.is_lock_tracked());
+        assert!(made.flock_identity().is_none());
+
+        let opened = DetFd::new(
+            4,
+            OFlag::O_RDWR,
+            FdType::Regular,
+            OpenFileId::new(DetTid::from_raw(9061), 1),
+        );
+        assert!(!opened.may_rebind_open_file_id());
+
+        let followed = DetFd::new(
+            5,
+            OFlag::O_RDWR,
+            FdType::Regular,
+            OpenFileId::new(DetTid::from_raw(9061), 2),
+        );
+        followed.mark_flock_mode_unobserved();
+        followed.set_lock_tracked();
+        assert!(!followed.may_rebind_open_file_id());
+
+        let identified = DetFd::new(
+            6,
+            OFlag::O_RDWR,
+            FdType::Regular,
+            OpenFileId::new(DetTid::from_raw(9061), 3),
+        );
+        identified.mark_flock_mode_unobserved();
+        identified.set_flock_identity(FlockIdentity {
+            dev: 42,
+            ino: 1001,
+            own_flock: None,
+            modelled: false,
+        });
+        assert!(!identified.may_rebind_open_file_id());
+    }
+
     /// A promoted description has one canonical model, so a grant through a
     /// handle another process forked from it is a grant every handle sees.
     /// `has_unsafe_vfork_flock_state` therefore keeps refusing on a lock a
@@ -5029,6 +5276,7 @@ mod tests {
                     file: (1, 50),
                     open_file: Some(pipe_end.in_flight_open_file(true)),
                     lock_copy: None,
+                    suspect: false,
                 }],
                 0,
             )
@@ -5116,6 +5364,7 @@ mod tests {
                     file: file(inode),
                     open_file: None,
                     lock_copy: None,
+                    suspect: false,
                 })
                 .collect()
         };
@@ -5263,6 +5512,7 @@ mod tests {
                 file: (1, inode),
                 open_file: None,
                 lock_copy: None,
+                suspect: false,
             }]
         };
         let take = |socket: &DetFd, inode: u64, peek: bool| {
@@ -5355,6 +5605,7 @@ mod tests {
                     file: (1, 50),
                     open_file: Some(sent.in_flight_open_file(held)),
                     lock_copy: None,
+                    suspect: false,
                 }],
                 1
             ),
@@ -5483,6 +5734,7 @@ mod tests {
             file: (1, inode),
             open_file: None,
             lock_copy: None,
+            suspect: false,
         };
         assert!(matches!(
             left.queue_rights_to_peer(vec![later(60)], 1),
@@ -5511,11 +5763,35 @@ mod tests {
         let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
         let handle = queue_and_close(&left, sent, true);
         let taken = right.take_all_queued_rights();
+        assert!(
+            taken.iter().all(|sent| !sent.suspect),
+            "no receive took a message unseen"
+        );
         assert_eq!(release(taken), 1);
         assert!(
             handle.descriptor(5, false).is_none(),
             "gone with the socket"
         );
+
+        // A message a receive Detcore could not match may have taken is
+        // suspect when the socket's last reference takes the queue: the
+        // receive may hold its descriptions (`flock_model`). A later one is
+        // not, unless the queue lost lockstep, which makes every one suspect.
+        for legacy in [false, true] {
+            let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
+            queue_and_close(&left, sent, true);
+            assert!(matches!(
+                left.queue_rights_to_peer(vec![later(60)], 1),
+                Ok(())
+            ));
+            right.lose_lockstep_if_queued(1, legacy);
+            let suspects = right
+                .take_all_queued_rights()
+                .iter()
+                .map(|sent| sent.suspect)
+                .collect::<Vec<_>>();
+            assert_eq!(suspects, [true, legacy], "legacy={legacy}");
+        }
 
         // A release keeps a description another descriptor still names.
         let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
@@ -5561,6 +5837,7 @@ mod tests {
             file: (1, 60),
             open_file: None,
             lock_copy: None,
+            suspect: false,
         };
         for _ in 0..MAX_QUEUED_RIGHTS_MESSAGES {
             assert!(matches!(
@@ -5676,6 +5953,7 @@ mod tests {
                 file: (1, inode),
                 open_file: None,
                 lock_copy: None,
+                suspect: false,
             }]
         };
         assert!(matches!(left.queue_rights_to_peer(Vec::new(), 1), Ok(())));
@@ -5816,6 +6094,7 @@ mod tests {
                 file: (1, inode),
                 open_file: None,
                 lock_copy: None,
+                suspect: false,
             }]
         };
         let inodes = |taken: Option<Vec<SentDescriptor>>| {
@@ -5926,6 +6205,7 @@ mod tests {
                 file: (1, inode),
                 open_file: None,
                 lock_copy: None,
+                suspect: false,
             }]
         };
 
@@ -5992,6 +6272,7 @@ mod tests {
                 file: (1, inode),
                 open_file: None,
                 lock_copy: None,
+                suspect: false,
             }]
         };
         let peek = |socket: &DetFd, inode| {
@@ -6050,6 +6331,7 @@ mod tests {
                     file: (1, 0),
                     open_file: Some(first.in_flight_open_file(true)),
                     lock_copy: None,
+                    suspect: false,
                 }],
                 1
             ),
@@ -6065,6 +6347,7 @@ mod tests {
                         file: (1, 1),
                         open_file: Some(right.in_flight_open_file(true)),
                         lock_copy: None,
+                        suspect: false,
                     }],
                     1
                 ),

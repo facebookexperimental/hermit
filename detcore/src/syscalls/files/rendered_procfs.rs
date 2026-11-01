@@ -5733,6 +5733,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             procfs.share_sequence();
         }
         let (handle, id) = guest.thread_state().with_detfd(fd, |detfd| {
+            // Received unjoined, it is a description of its own whose lock
+            // history and references Detcore did not see (the sender's table
+            // may hold it too), as is every other such receipt
+            // (`FileMetadata::add_discovered_fd`): escaped, so Detcore's flock
+            // model never decides a flock through it, under either identity
+            // (`DetFd::rebind_open_file_id`).
+            detfd.mark_flock_mode_unobserved();
             if let Some(id) = joined {
                 detfd.rebind_open_file_id(id);
             }

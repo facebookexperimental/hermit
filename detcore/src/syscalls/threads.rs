@@ -2352,6 +2352,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             // the previously observed flock state authoritative.
             guest.thread_state().forget_flock_modes();
         }
+        if !flags.contains(CloneFlags::CLONE_FILES) {
+            // The child's table is a copy of this one: the descriptions the
+            // lock ledger does not follow now have references it never saw
+            // taken. Marked here too, for the backends whose child is a copy of
+            // this tool state (`FileMetadata::fork_for` marks the child's).
+            guest.thread_state().mark_untracked_references_escaped();
+        }
 
         // Match ordinary clone: the parent consumes the priority entropy after
         // the child has inherited the parent state.

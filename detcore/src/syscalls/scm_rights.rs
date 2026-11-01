@@ -471,6 +471,10 @@ pub(crate) struct Settled {
     /// The copies in flight `procfs::locks::LockLedger` counted, which it
     /// uncounts (`PlaceholderCopies::Unsent`).
     pub(crate) lock_copies: Vec<crate::types::OpenFileId>,
+    /// Those of them a receive Detcore could not match may have taken unseen
+    /// (`SentDescriptor::suspect`), whose descriptions leave the flock model
+    /// before the copies are uncounted (`flock_model`).
+    pub(crate) unfollowable_copies: Vec<crate::types::OpenFileId>,
     /// The sockets among the descriptions that went with their last copy,
     /// whose ports go with them (`GlobalRequest::ReleasePort`).
     pub(crate) ports: Vec<crate::types::OpenFileId>,
@@ -489,6 +493,9 @@ pub(crate) fn settle(released: Vec<SentDescriptor>) -> Settled {
     let mut settled = Settled::default();
     while let Some(sent) = pending.pop() {
         settled.lock_copies.extend(sent.lock_copy);
+        if sent.suspect {
+            settled.unfollowable_copies.extend(sent.lock_copy);
+        }
         if let Some((open_file, ty, queued)) = sent.open_file.and_then(InFlightOpenFile::release) {
             if ty == crate::fd::FdType::Socket {
                 settled.ports.push(open_file);
@@ -1974,7 +1981,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .map(|taken| (taken.sent, taken.forgotten))
                 .unwrap_or_default();
             // The messages before it, which calls Detcore could not match took,
-            // are released with this receipt.
+            // are released with this receipt. Their copies the lock ledger
+            // counted reached a table Detcore does not know (`flock_model`).
+            let unmatched: Vec<_> = forgotten.iter().filter_map(|sent| sent.lock_copy).collect();
+            self.note_flock_receipts_unjoined(guest, unmatched).await;
             guest.thread_state().defer_released_rights(forgotten);
             let mut joined = vec![false; sent.len()];
             for (index, (&fd, facts)) in fds.iter().zip(facts).enumerate() {
@@ -2026,12 +2036,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             // took a copy of a message that stays queued: releasing the copy's
             // references releases nothing else.
             if !from.peek {
-                guest.thread_state().defer_released_rights(
-                    sent.drain(..)
-                        .zip(joined)
-                        .filter(|(_, joined)| !joined)
-                        .map(|(sent, _)| sent),
-                );
+                let unjoined: Vec<SentDescriptor> = sent
+                    .drain(..)
+                    .zip(joined)
+                    .filter(|(_, joined)| !joined)
+                    .map(|(sent, _)| sent)
+                    .collect();
+                // A copy the lock ledger counted that this table holds under
+                // an identity of its own, or not at all (`flock_model`).
+                let lock_copies = unjoined.iter().filter_map(|sent| sent.lock_copy).collect();
+                self.note_flock_receipts_unjoined(guest, lock_copies).await;
+                guest.thread_state().defer_released_rights(unjoined);
             }
         }
         Ok(recorded)
@@ -2850,7 +2865,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// a description is released only when it counts none
     /// ([`InFlightOpenFile::release`]).
     pub(crate) async fn settle_released_rights<G: Guest<Self>>(&self, guest: &mut G) {
-        let Settled { lock_copies, ports } = settle(guest.thread_state().take_released_rights());
+        let Settled {
+            lock_copies,
+            unfollowable_copies,
+            ports,
+        } = settle(guest.thread_state().take_released_rights());
+        if self.follows_lock_copies() {
+            self.note_flock_receipts_unjoined(guest, unfollowable_copies)
+                .await;
+        }
         if !lock_copies.is_empty() && self.follows_lock_copies() {
             let _ = crate::tool_global::placeholder_copies(
                 guest,
@@ -3262,7 +3285,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// cannot all be taken queues nothing, so its receipt names no open file,
     /// as before. A send that failed queued nothing in Linux and queues
     /// nothing here. A tool error (an `fstat` under record and replay that
-    /// could not be recorded) ends the run.
+    /// could not be recorded) ends the run. Returns the descriptions whose
+    /// queued copies the lock ledger counted in flight
+    /// (`procfs::locks::LockLedger::placeholder_copies`): the ledger follows
+    /// their references to the receipt (`flock_model`).
     pub(crate) async fn queue_sent_rights<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3270,7 +3296,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         stream: bool,
         sent: SentRights,
         out_of_band: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<crate::types::OpenFileId>, Error> {
+        let mut followed = Vec::new();
         if sent.unread {
             self.lose_peer_lockstep(guest, socket);
         }
@@ -3279,7 +3306,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // place for such a send. Recordings made before queued as usual.
         if out_of_band && stream && !self.keeps_recorded_decisions() {
             self.lose_peer_lockstep(guest, socket);
-            return Ok(());
+            return Ok(followed);
         }
         // A datagram send that names its destination reaches the socket it
         // names, not the peer (`unix_dgram_sendmsg`); a seqpacket send
@@ -3341,6 +3368,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     file: (stat.st_dev, stat.st_ino),
                     open_file,
                     lock_copy: lock_copy.flatten(),
+                    suspect: false,
                 });
             }
             if descriptors.len() != fds.len() {
@@ -3363,14 +3391,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             if matches!(queued, Some(Ok(()))) && !copies.is_empty() {
                 // The sender's descriptors still hold the descriptions, so
                 // their locks were never in danger before this count.
-                let _ = Box::pin(crate::tool_global::placeholder_copies(
+                let counted = Box::pin(crate::tool_global::placeholder_copies(
                     guest,
-                    crate::procfs::locks::PlaceholderCopies::Sending(copies),
+                    crate::procfs::locks::PlaceholderCopies::Sending(copies.clone()),
                 ))
                 .await;
+                if counted.is_ok() {
+                    followed.extend(copies);
+                }
             }
         }
-        Ok(())
+        Ok(followed)
     }
 
     /// A send through `socket` may have passed descriptors its peer's queue

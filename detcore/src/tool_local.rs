@@ -219,6 +219,15 @@ pub struct FileMetadata {
     /// copied.
     #[serde(skip)]
     exec_replaced: ReplacedTable,
+    /// The open file descriptions a successful file-backed `mmap` through a
+    /// descriptor of this table mapped (`Detcore::note_flock_mapping`): a
+    /// mapping keeps its description, and so a `flock` lock it holds, after
+    /// its last descriptor goes (`vm_file`). Copied by a fork, whose child
+    /// inherits the mappings, and dropped by an exec, which replaces them.
+    /// Never cleared by `munmap`, so it names every description the process
+    /// may still map. Serialized under no older name.
+    #[serde(default)]
+    mapped_open_files: BTreeSet<OpenFileId>,
 }
 
 /// The table an exec replaced, and the exec'ing process
@@ -1036,6 +1045,7 @@ impl FileMetadata {
             released_rights: ReleasedRights::default(),
             holders: BTreeMap::from([(owner, 1)]),
             exec_replaced: ReplacedTable::default(),
+            mapped_open_files: BTreeSet::new(),
         }
     }
 
@@ -1274,6 +1284,19 @@ impl FileMetadata {
         }
     }
 
+    /// Another table takes a copy of this one (a fork, or a thread made
+    /// without `CLONE_FILES`): every description the lock ledger does not
+    /// follow yet (`DetFd::is_lock_tracked`) now has references it never saw
+    /// taken (`DetFd::mark_local_untracked_references_escaped`), without
+    /// contacting a promoted description's shared model, which the flock
+    /// model takes as escaped (`DetFd::is_shared`). The ledger copies the
+    /// references of the descriptions it follows (`LockLedger::fork`).
+    fn mark_untracked_references_escaped(&self) {
+        for detfd in self.file_handles.values() {
+            detfd.mark_local_untracked_references_escaped();
+        }
+    }
+
     // TODO-HUMAN-REVIEW(#2373)
     /// Fork the file table for `child`.
     ///
@@ -1284,6 +1307,7 @@ impl FileMetadata {
     /// resets copied locks at its physical child boundary.
     pub(crate) fn fork_for(&self, child: DetTid) -> Self {
         self.forget_flock_modes();
+        self.mark_untracked_references_escaped();
         Self {
             files_id: FilesId::forked(child),
             next_open_file_sequence: self.next_open_file_sequence,
@@ -1304,6 +1328,7 @@ impl FileMetadata {
             released_rights: ReleasedRights::default(),
             holders: BTreeMap::from([(child, 1)]),
             exec_replaced: ReplacedTable::default(),
+            mapped_open_files: self.mapped_open_files.clone(),
         }
     }
 
@@ -1340,6 +1365,7 @@ impl FileMetadata {
             released_rights: ReleasedRights::default(),
             holders: BTreeMap::from([(task, 1)]),
             exec_replaced: ReplacedTable::default(),
+            mapped_open_files: BTreeSet::new(),
         }
     }
 
@@ -3293,6 +3319,7 @@ mod file_metadata_tests {
                     file: (1, 5),
                     open_file: Some(carried),
                     lock_copy: None,
+                    suspect: false,
                 }],
                 1
             ),
@@ -3347,6 +3374,7 @@ mod file_metadata_tests {
                     file: (1, 5),
                     open_file: Some(carried),
                     lock_copy: None,
+                    suspect: false,
                 }],
                 1
             ),
@@ -3512,6 +3540,7 @@ mod file_metadata_tests {
                     file: (1, 5),
                     open_file: Some(carried),
                     lock_copy: Some(sent_id),
+                    suspect: false,
                 }],
                 1
             ),
@@ -3602,6 +3631,7 @@ mod file_metadata_tests {
                     file: (1, 5),
                     open_file: Some(carried),
                     lock_copy: Some(sent_id),
+                    suspect: false,
                 }],
                 1
             ),
@@ -3618,6 +3648,7 @@ mod file_metadata_tests {
             crate::syscalls::scm_rights::settle(rights),
             crate::syscalls::scm_rights::Settled {
                 lock_copies: vec![sent_id],
+                unfollowable_copies: Vec::new(),
                 ports: Vec::new(),
             },
             "the death released the copy in flight, its description's last reference"
@@ -8347,6 +8378,26 @@ impl<T> ThreadState<T> {
     /// cached flock mode as authoritative after fork.
     pub fn forget_flock_modes(&self) {
         self.metadata().forget_flock_modes();
+    }
+
+    /// After a successful clone that gave another table a copy of this one:
+    /// the descriptions the lock ledger does not follow have references it
+    /// never saw taken, in this process's view too where the copy is a
+    /// separate tool state (`FileMetadata::mark_untracked_references_escaped`).
+    pub fn mark_untracked_references_escaped(&self) {
+        self.metadata().mark_untracked_references_escaped();
+    }
+
+    /// A successful file-backed `mmap` through a descriptor of this table
+    /// mapped `open_file` (`FileMetadata::mapped_open_files`).
+    pub(crate) fn note_mapped_open_file(&self, open_file: OpenFileId) {
+        self.metadata().mapped_open_files.insert(open_file);
+    }
+
+    /// Whether this process may map `open_file`
+    /// (`FileMetadata::mapped_open_files`).
+    pub(crate) fn maps_open_file(&self, open_file: OpenFileId) -> bool {
+        self.metadata().mapped_open_files.contains(&open_file)
     }
 
     /// remove a rawfd

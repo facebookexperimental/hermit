@@ -4752,17 +4752,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let result = result?;
         guest.thread_state().forget_flock_modes();
+        let mut followed = Vec::new();
         if let Some(stream) = self.rights_peer_is_stream(guest, call.fd()) {
             if in_turn {
                 // One message, of `result` bytes.
                 let sent = sent_rights(guest, &headers, |_| usize::try_from(result).unwrap_or(0));
                 let out_of_band = call.flags() & libc::MSG_OOB != 0;
-                self.queue_sent_rights(guest, call.fd(), stream, sent, out_of_band)
+                followed = self
+                    .queue_sent_rights(guest, call.fd(), stream, sent, out_of_band)
                     .await?;
             } else {
                 self.lose_peer_lockstep(guest, call.fd());
             }
         }
+        // The descriptors the send passed, as its control data named them at
+        // entry, or, for a send outside the caller's turn, whose control data
+        // another thread could rewrite before Linux read it, any descriptor of
+        // the table: Detcore cannot follow their references to the end, but
+        // for the copies the lock ledger counted in flight (`flock_model`).
+        let passed = if outside_turn {
+            guest.thread_state().open_fds()
+        } else {
+            sent_descriptors(guest, &headers).0
+        };
+        self.note_flock_descriptors_sent(guest, &passed, &followed)
+            .await;
         Ok(result)
     }
 
@@ -5257,6 +5271,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(Error::Errno(Errno::EFAULT)) => (0, (!headers.is_empty()).then_some(0)),
             Err(_) => (0, None),
         };
+        let mut followed = Vec::new();
         if (counted != 0 || uncounted.is_some())
             && let Some(stream) = self.rights_peer_is_stream(guest, call.sockfd())
         {
@@ -5272,7 +5287,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .map_or(0, |length: u32| length as usize)
                     });
                     let out_of_band = call.flags() & libc::MSG_OOB != 0;
-                    self.queue_sent_rights(guest, call.sockfd(), stream, sent, out_of_band)
+                    followed = self
+                        .queue_sent_rights(guest, call.sockfd(), stream, sent, out_of_band)
                         .await?;
                 }
                 // The first entry not counted may have been sent unseen,
@@ -5292,6 +5308,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         let result = result?;
         if result > 0 {
             guest.thread_state().forget_flock_modes();
+        }
+        if result > 0 {
+            // Every message the batch named at entry, sent or not (which of
+            // them Linux sent changes only how many escaped), or, outside the
+            // caller's turn, any descriptor of the table, but for the copies
+            // the lock ledger counted in flight (`flock_model`).
+            let passed = if outside_turn {
+                guest.thread_state().open_fds()
+            } else {
+                sent_descriptors(guest, &headers).0
+            };
+            self.note_flock_descriptors_sent(guest, &passed, &followed)
+                .await;
         }
         Ok(result)
     }

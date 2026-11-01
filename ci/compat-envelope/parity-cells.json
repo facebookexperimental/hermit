@@ -8,59 +8,59 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 3110,
-      "applicable": 2261,
-      "selectable": 1770,
-      "population": 3045,
-      "population_candidate_selected": 1770,
+      "cells": 3115,
+      "applicable": 2263,
+      "selectable": 1772,
+      "population": 3050,
+      "population_candidate_selected": 1772,
       "population_candidate_not_selected": 475,
-      "population_candidate_disabled": 800
+      "population_candidate_disabled": 803
     },
     "by_backend": {
       "dbt": {
-        "cells": 622,
+        "cells": 623,
         "applicable": 560,
         "selectable": 555,
-        "population": 609,
+        "population": 610,
         "population_candidate_selected": 555,
         "population_candidate_not_selected": 2,
-        "population_candidate_disabled": 52
+        "population_candidate_disabled": 53
       },
       "in-guest-trap": {
-        "cells": 622,
+        "cells": 623,
         "applicable": 314,
         "selectable": 314,
-        "population": 609,
+        "population": 610,
         "population_candidate_selected": 314,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 296
+      },
+      "kvm": {
+        "cells": 623,
+        "applicable": 597,
+        "selectable": 588,
+        "population": 610,
+        "population_candidate_selected": 588,
+        "population_candidate_not_selected": 3,
+        "population_candidate_disabled": 19
+      },
+      "liteinst": {
+        "cells": 623,
+        "applicable": 315,
+        "selectable": 315,
+        "population": 610,
+        "population_candidate_selected": 315,
         "population_candidate_not_selected": 0,
         "population_candidate_disabled": 295
       },
-      "kvm": {
-        "cells": 622,
-        "applicable": 595,
-        "selectable": 586,
-        "population": 609,
-        "population_candidate_selected": 586,
-        "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 20
-      },
-      "liteinst": {
-        "cells": 622,
-        "applicable": 315,
-        "selectable": 315,
-        "population": 609,
-        "population_candidate_selected": 315,
-        "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 294
-      },
       "sabre": {
-        "cells": 622,
+        "cells": 623,
         "applicable": 477,
         "selectable": 0,
-        "population": 609,
+        "population": 610,
         "population_candidate_selected": 0,
         "population_candidate_not_selected": 470,
-        "population_candidate_disabled": 139
+        "population_candidate_disabled": 140
       }
     }
   },
@@ -1942,7 +1942,7 @@
     {"test_id":"compat/flex","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
     {"test_id":"compat/flock","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/flock","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its first verify run on in-guest-trap failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
-    {"test_id":"compat/flock","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM refuses every flock lock operation by name (ENOSYS with the typed refusal UnsupportedOperation::Flock): it cannot keep a host lock's lifetime equal to the guest description's. This cell passed only because KVM flock used to be a silent no-op (https://github.com/rrnewton/reverie/issues/1069)"},
+    {"test_id":"compat/flock","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/flock","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/flock","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
     {"test_id":"compat/fmt","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -3025,6 +3025,11 @@
     {"test_id":"system-utils/find-tree-metadata","backend":"kvm","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/find-tree-metadata","backend":"liteinst","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/find-tree-metadata","backend":"sabre","category":"system-utils","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"system-utils/flock-shared-exclusive","backend":"dbt","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Config::backend_supports_blocked_wait_signal_interruption is false on DBT, so a signal to a thread waiting for a flock does not end the wait, as it does not end a blocked pipe read there (https://github.com/rrnewton/hermit/issues/3982): the signal-interrupts scenario never returns. The other 14 scenarios pass on DBT when run alone."},
+    {"test_id":"system-utils/flock-shared-exclusive","backend":"in-guest-trap","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: As on LiteInst, which in-guest-trap runs with syscall site patching off: no thread (clone3 is not forwarded), no exec (execve is not forwarded, https://github.com/rrnewton/hermit/issues/3745), and no SIGUSR1 handler (sigaction EPERM), so 4 of the 15 scenarios cannot run there. The other 11 pass on in-guest-trap when run alone."},
+    {"test_id":"system-utils/flock-shared-exclusive","backend":"kvm","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"system-utils/flock-shared-exclusive","backend":"liteinst","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The in-guest backend cannot create a thread (clone3 is not forwarded) or replace the process image (execve is not forwarded, https://github.com/rrnewton/hermit/issues/3745), and it refuses this guest's SIGUSR1 handler (sigaction EPERM), so 4 of the 15 scenarios cannot run there. The other 11 pass on LiteInst when run alone."},
+    {"test_id":"system-utils/flock-shared-exclusive","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe is archived; there a thread blocked in a Detcore wait is killed by SIGSEGV at address 0, as one blocked in a pipe read is, and a signal does not end a flock wait. The 12 scenarios without a waiting thread pass on SaBRe when run alone."},
     {"test_id":"system-utils/harness-width-contract","backend":"dbt","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/harness-width-contract","backend":"in-guest-trap","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
     {"test_id":"system-utils/harness-width-contract","backend":"kvm","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

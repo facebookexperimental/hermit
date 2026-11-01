@@ -11377,7 +11377,7 @@ fn a_recording_from_before_rendered_io_and_arch_status_is_refused_by_version() {
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
     assert_eq!(
-        metadata["version"], 0x198,
+        metadata["version"], 0x199,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x197);
@@ -22030,21 +22030,21 @@ fn kvm_child_exit_is_notified_once_at_bitwise_parity(mode: &str, test: &str) {
     }
 }
 
-/// tests/c/flock_exclusion.c's `exclusion` scenario: on ptrace a held LOCK_EX
-/// excludes a second open file description and a second, forked process, at
-/// bitwise parity; on KVM the first lock is refused by name. KVM's flock used to
-/// check its arguments and return 0 without taking a lock, so both contenders
-/// "acquired" it and the guest printed `FAIL: a second open file description
-/// acquired a held LOCK_EX`. KVM cannot keep a host lock's lifetime equal to the
-/// guest description's (per-thread descriptor copies, copied mappings, in-flight
-/// SCM_RIGHTS), so it now refuses every lock operation with the typed refusal
-/// `UnsupportedOperation::Flock` (https://github.com/rrnewton/reverie/issues/1069).
-/// Detcore reports that refusal; under --strict the run ends as a policy
-/// refusal naming it, not with an errno the guest could mistake for contention.
+/// tests/c/flock_exclusion.c's `exclusion` scenario: a held LOCK_EX excludes a
+/// second open file description and a second, forked process, at bitwise
+/// parity, on ptrace and on KVM alike. Detcore's flock model decides every
+/// flock through a description it can follow on every backend (the kvm lane's
+/// slice SP2); before it KVM refused every lock operation with the typed
+/// refusal `UnsupportedOperation::Flock`
+/// (https://github.com/rrnewton/reverie/issues/1069), and before that its flock
+/// returned 0 without taking a lock, so both contenders "acquired" it. On KVM
+/// Detcore asks the backend for no lock at all, so no backend refusal is ever
+/// reported; a lock taken in a forked child (a shell runs the guest) is
+/// decided the same way.
 #[test]
-fn run_kvm_flock_is_a_named_refusal_where_ptrace_excludes() {
-    if kvm_unavailable("run_kvm_flock_is_a_named_refusal_where_ptrace_excludes") {
-        eprintln!("skipping the KVM flock refusal case: /dev/kvm is unavailable");
+fn run_kvm_flock_excludes_as_ptrace_does() {
+    if kvm_unavailable("run_kvm_flock_excludes_as_ptrace_does") {
+        eprintln!("skipping the KVM flock case: /dev/kvm is unavailable");
         return;
     }
     let _guard = hermit_run_guard();
@@ -22052,119 +22052,67 @@ fn run_kvm_flock_is_a_named_refusal_where_ptrace_excludes() {
         .to_str()
         .expect("guest path should be UTF-8");
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let report = directory.path().join("verify.json");
-    let report_arg = report.to_str().expect("report path should be UTF-8");
-    let args = [
-        "--backend=ptrace",
-        "run",
-        "--strict",
-        "--base-env=minimal",
-        "--verify",
-        "--verify-strict",
-        "--verify-json",
-        report_arg,
-        "--",
-        guest,
-        "exclusion",
-    ];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    let verdict: serde_json::Value =
-        serde_json::from_slice(&fs::read(&report).expect("strict verification wrote no verdict"))
-            .expect("strict verification verdict is valid JSON");
-    assert_eq!(verdict["bitwise_parity"], true, "ptrace: {verdict}");
-    for side in ["left", "right"] {
-        assert!(
-            verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
-            "ptrace: no INFO messages compared: {verdict}"
-        );
-    }
-    assert_eq!(
-        stdout(&output),
-        "flock-first-holder-acquired\nflock-second-open-excluded\n\
-         flock-second-process-excluded\nflock-released-and-reacquired\nflock-exclusion-ok\n",
-        "ptrace"
-    );
-    assert!(
-        !stderr(&output).contains("refused by the backend"),
-        "ptrace must not report a backend flock refusal\nstderr:\n{}",
-        stderr(&output)
-    );
-
-    // The refusal is named on stderr whatever the log level or destination:
-    // default logging, --log=off, and --log-file (which takes the tracing
-    // copy, leaving only the required diagnostic on stderr). The last case
-    // takes the first lock in a forked child (a shell runs the guest), which
-    // must end the run at the same point.
-    let log_file = directory.path().join("hermit.log");
-    let log_file_arg = format!("--log-file={}", log_file.display());
-    let child_command = format!("{guest} holder; echo shell-continued");
-    let cases: [(&str, Vec<&str>); 4] = [
-        ("default logging", vec![guest, "exclusion"]),
-        ("--log=off", vec![guest, "exclusion"]),
-        ("--log-file", vec![guest, "exclusion"]),
-        (
-            "forked child",
-            vec!["/bin/sh", "-c", child_command.as_str()],
-        ),
-    ];
-    for (case, command) in cases {
-        let mut args = Vec::new();
-        match case {
-            "--log=off" => args.push("--log=off"),
-            "--log-file" => args.extend(["--log=error", log_file_arg.as_str()]),
-            _ => {}
-        }
-        args.extend([
-            "--backend=kvm",
+    for backend in ["ptrace", "kvm"] {
+        let report = directory.path().join(format!("{backend}-verify.json"));
+        let report_arg = report.to_str().expect("report path should be UTF-8");
+        let backend_arg = format!("--backend={backend}");
+        let args = [
+            backend_arg.as_str(),
             "run",
             "--strict",
             "--base-env=minimal",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_arg,
             "--",
-        ]);
-        args.extend(command);
+            guest,
+            "exclusion",
+        ];
         let output = hermit(&args);
-        let stdout = stdout(&output);
-        let stderr = stderr(&output);
+        assert_success(&output, &args);
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+        for side in ["left", "right"] {
+            assert!(
+                verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+                "{backend}: no INFO messages compared: {verdict}"
+            );
+        }
         assert_eq!(
-            output.status.code(),
-            Some(HERMIT_POLICY_REFUSAL_EXIT),
-            "{case}: KVM flock must end the strict run as a policy refusal\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            stdout(&output),
+            "flock-first-holder-acquired\nflock-second-open-excluded\n\
+             flock-second-process-excluded\nflock-released-and-reacquired\nflock-exclusion-ok\n",
+            "{backend}"
         );
         assert!(
-            stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
-                && stderr.contains("refused by the backend: KVM flock is unsupported"),
-            "{case}: the KVM run did not name the flock refusal on stderr\nstderr:\n{stderr}"
-        );
-        assert!(
-            !stdout.contains("acquired") && !stdout.contains("shell-continued"),
-            "{case}: the KVM guest went on past a lock the backend refused\nstdout:\n{stdout}"
+            !stderr(&output).contains("refused by the backend"),
+            "{backend} must not report a backend flock refusal\nstderr:\n{}",
+            stderr(&output)
         );
     }
 
-    // Opted in with --allow-unsupported-syscalls, the guest receives ENOLCK
-    // (37) and runs on, and the refusal is still named on stderr with
-    // logging off.
+    let child_command = format!("{guest} holder; echo shell-continued");
     let args = [
         "--log=off",
         "--backend=kvm",
         "run",
-        "--allow-unsupported-syscalls",
+        "--strict",
         "--base-env=minimal",
         "--",
-        guest,
-        "exclusion",
+        "/bin/sh",
+        "-c",
+        child_command.as_str(),
     ];
     let output = hermit(&args);
-    let stdout = stdout(&output);
-    let stderr = stderr(&output);
-    assert!(
-        stdout.contains("FAIL: LOCK_EX on an unlocked file was refused (errno=37)"),
-        "opt-in: the KVM guest did not receive ENOLCK\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("refused by the backend: KVM flock is unsupported"),
-        "opt-in: the KVM run did not name the flock refusal on stderr\nstderr:\n{stderr}"
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "flock-holder-acquired\nflock-holder-ok\nshell-continued\n",
+        "KVM: a lock taken in a forked child"
     );
 }
 
@@ -45034,7 +44982,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x198, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x199, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];
@@ -62715,9 +62663,10 @@ fn proc_fdinfo_lines_verify_at_bitwise_parity_on_ptrace() {
 /// - a description in flight when its sender exits or closes its descriptor
 ///   keeps an OFD lock or a flock until the receipt, and loses a POSIX lock
 ///   with the sender's exit or close, as native Linux shows; ptrace shows the
-///   same rows, and so does KVM for the OFD lock, while it refuses flock by
-///   name, and the snapshot that would show the record lock it holds as an
-///   OFD lock through the flight (Codex's narrow check of K8-h reb9: KVM
+///   same rows, and so does KVM for the OFD lock and the flock (Detcore's
+///   flock model follows the copy in flight), while it refuses the snapshot
+///   that would show the record lock it holds as an OFD lock through the
+///   flight (Codex's narrow check of K8-h reb9: KVM
 ///   listed it in flight and after the receipt, where Linux lists none);
 /// - a description in flight to a receiving socket that goes without a close
 ///   (the receiver's exec drops it by close-on-exec, or the receiver dies by
@@ -63237,9 +63186,10 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
     // every row is the guest's own. Linux's in-flight reference holds an OFD
     // lock and a flock until the receipt; a POSIX lock is the sender's, and
     // goes with its close or its exit. ptrace shows Linux's rows, and so does
-    // KVM for the OFD lock; it refuses flock by name, and the first snapshot,
-    // which would show the record lock its provider holds as an OFD lock
-    // through the flight.
+    // KVM for the OFD lock and for the flock, which Detcore's flock model
+    // decides and follows through the flight (the kvm lane's slice SP2); it
+    // refuses the first snapshot that would show the record lock its provider
+    // holds as an OFD lock through the flight.
     let lock_classes = |text: &str, inode: Option<u64>| {
         let mut sections: Vec<(String, Vec<String>)> = Vec::new();
         for line in text.lines() {
@@ -63334,34 +63284,6 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
                 .path()
                 .to_str()
                 .expect("directory path is UTF-8");
-            if kind == "flock" {
-                let guest = proc_fdinfo_lines_guest();
-                let args = [
-                    "--backend=kvm",
-                    "run",
-                    "--strict",
-                    "--proc=standard",
-                    "--epoch=2026-01-01T00:00:00Z",
-                    "--base-env=minimal",
-                    "--",
-                    guest.to_str().expect("guest path is UTF-8"),
-                    kvm_directory_arg,
-                    &mode,
-                ];
-                let output = hermit(&args);
-                assert_eq!(
-                    output.status.code(),
-                    Some(HERMIT_POLICY_REFUSAL_EXIT),
-                    "{test}: KVM refuses the sender's flock by name, {case}\nstderr:\n{}",
-                    stderr(&output)
-                );
-                assert!(
-                    stderr(&output).contains("refused by the backend: KVM flock is unsupported"),
-                    "{test}: KVM refuses the sender's flock by name, {case}\nstderr:\n{}",
-                    stderr(&output)
-                );
-                continue;
-            }
             if kind == "posix" {
                 let refused = proc_fdinfo_lines_refused_on_kvm(
                     &[kvm_directory_arg, &mode],

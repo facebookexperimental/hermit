@@ -2898,3 +2898,73 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this guest
           liteinst: No custom edge-case arguments have been calibrated for this guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: system-utils/flock-shared-exclusive
+    description: "tests/c/flock_shared_exclusive.c takes flock(2) locks between processes, each through an open file description Detcore can follow, which Detcore's flock model decides on every backend (the kvm lane's slice SP2): shared and exclusive locks, LOCK_NB conflicts (EWOULDBLOCK), a conversion that deletes the held lock before it finds a conflict, blocking waiters woken at a release, at a last close (a dup still holding it first) and at the holder's exit, a fork's copy of a locked description, a downgrade that wakes a shared waiter, the wake order of two exclusive waiters (granted in the order they blocked) and of shared and exclusive ones (both shared granted together, the exclusive one after both release), the rows /proc/locks shows for the file (two shared, one, a converted exclusive, none, and a blocked request's waiter row under the shared lock it waits for), a lock taken before children are forked and exec'd, the way rustup holds its lock while cargo runs, a signal directed at a waiting thread that ends its call with EINTR or, under SA_RESTART, restarts it until the release, and a waiting thread woken by a release in another thread of its process. Every line is printed by the parent at points its pipes order, so the output is the same natively and under Hermit on every backend; hermit-cli/tests/flock_exclusion.rs compares it with native Linux's. The guest exits 0 when every answer is Linux's."
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    proc: standard
+    program: tests/c/flock_shared_exclusive.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -O0
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          kvm: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: "Config::backend_supports_blocked_wait_signal_interruption is false on DBT, so a signal to a thread waiting for a flock does not end the wait, as it does not end a blocked pipe read there (https://github.com/rrnewton/hermit/issues/3982): the signal-interrupts scenario never returns. The other 14 scenarios pass on DBT when run alone."
+          sabre: "SaBRe is archived; there a thread blocked in a Detcore wait is killed by SIGSEGV at address 0, as one blocked in a pipe read is, and a signal does not end a flock wait. The 12 scenarios without a waiting thread pass on SaBRe when run alone."
+          liteinst: "The in-guest backend cannot create a thread (clone3 is not forwarded) or replace the process image (execve is not forwarded, https://github.com/rrnewton/hermit/issues/3745), and it refuses this guest's SIGUSR1 handler (sigaction EPERM), so 4 of the 15 scenarios cannot run there. The other 11 pass on LiteInst when run alone."
+          in-guest-trap: "As on LiteInst, which in-guest-trap runs with syscall site patching off: no thread (clone3 is not forwarded), no exec (execve is not forwarded, https://github.com/rrnewton/hermit/issues/3745), and no SIGUSR1 handler (sigaction EPERM), so 4 of the 15 scenarios cannot run there. The other 11 pass on in-guest-trap when run alone."
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the contract is native Linux output on every backend, which hermit-cli/tests/flock_exclusion.rs checks against a native run of this guest.'
+        backends_enabled: []
+        backends_disabled:
+          native: hermit-cli/tests/flock_exclusion.rs runs this guest natively and compares each backend's output with it
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: every outcome the guest prints is ordered by its pipes and its locks, so chaos scheduling has no outcome to diversify.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Every outcome the guest prints is ordered by its pipes and its locks
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this guest
+          dbt: No custom edge-case arguments have been calibrated for this guest
+          kvm: No custom edge-case arguments have been calibrated for this guest
+          sabre: No custom edge-case arguments have been calibrated for this guest
+          liteinst: No custom edge-case arguments have been calibrated for this guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap

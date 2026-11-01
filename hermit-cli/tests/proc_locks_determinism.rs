@@ -1689,7 +1689,10 @@ static int lock_after_fork_vfork_unlock_scenario(const char* path, int use_flock
   }
   if (unlocker == 0) {
     if (use_flock) {
-      _exit(flock(fd, LOCK_UN) == 0 ? 0 : 3);
+      if (flock(fd, LOCK_UN) == 0) {
+        _exit(0);
+      }
+      _exit(errno == ENOLCK ? 10 : 3);
     }
     struct flock lock = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1};
     if (fcntl(fd, F_OFD_SETLK, &lock) == 0) {
@@ -1702,9 +1705,10 @@ static int lock_after_fork_vfork_unlock_scenario(const char* path, int use_flock
       (WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != 10)) {
     die("unlocker");
   }
-  // 10: the unlock was refused with ENOLCK and the lock is still held (DBT
-  // under --allow-unsupported-syscalls). Reported on stderr, outside the
-  // snapshots.
+  // 10: the unlock was refused with ENOLCK and the lock is still held (DBT's
+  // copied child: an OFD unlock under --allow-unsupported-syscalls, and every
+  // flock operation, which Detcore's flock model decides). Reported on stderr,
+  // outside the snapshots.
   fprintf(stderr, "unlocker-status=%d\n", WEXITSTATUS(status));
   snapshot("after-vfork-unlock");
   byte_out(go[1]);
@@ -2282,7 +2286,7 @@ fn recordings_from_before_the_lock_ledger_are_refused_by_the_version_gate() {
     let mut metadata: serde_json::Value =
         serde_json::from_str(&text).expect("recording metadata is not JSON");
     assert_eq!(
-        metadata["version"], 0x198,
+        metadata["version"], 0x199,
         "RECORD_VERSION moved; point this test at the current version and the ledger's predecessor"
     );
     // 0x180, 0x17f, 0x17e, 0x17d and 0x17c keep, or drop by length alone, the
@@ -2744,12 +2748,14 @@ fn a_copied_childs_ofd_unlock_is_refused_on_dbt_and_seen_on_ptrace() {
 /// `/proc/locks` ledger records the description's flock; the parent vforks
 /// and the vfork child runs `LOCK_UN` on its inherited descriptor; a host
 /// process holds the identical shared flock throughout. Under
-/// `--no-namespace` the guest's procfs shows the host's flock row. On DBT the
-/// copied child's unlock is native, so the ledger's record of the sibling's
-/// flock goes stale; a flock row is kept only by its taker's pid, so the
-/// host's row stays out anyway. On ptrace the unlock is mediated; the same
-/// shape checks the owner rule there. Both backends show the sibling's flock
-/// (its taker is a guest process) and then nothing.
+/// `--no-namespace` the guest's procfs shows the host's flock row; a flock
+/// row is kept only by its taker's pid, so the host's row stays out. On
+/// ptrace the unlock is mediated, and both snapshots show the sibling's flock
+/// (its taker is a guest process) and then nothing. On DBT the copied vfork
+/// child cannot reach Detcore's flock model, so its copied policy refuses the
+/// unlock with ENOLCK (before the model, it ran natively and left the
+/// ledger's record of the sibling's flock stale): the sibling's flock row
+/// stays in the second snapshot, and the host's still does not appear.
 ///
 /// Relaxation: `--strict` refuses `--no-namespace`, so these runs are not
 /// strict, and their task ids are the host's; the sections are compared,
@@ -2800,11 +2806,16 @@ fn a_stale_flock_record_admits_no_host_row_without_a_namespace() {
             "{backend}: run failed\nstdout:\n{stdout}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let after_unlock = if backend == "dbt" {
+            vec!["FLOCK"]
+        } else {
+            vec![]
+        };
         assert_eq!(
             sections(&stdout),
             expected(vec![
                 ("child-holds", vec!["FLOCK"]),
-                ("after-vfork-unlock", vec![]),
+                ("after-vfork-unlock", after_unlock),
             ]),
             "{backend}: the host's identical flock reached the guest\n{stdout}"
         );

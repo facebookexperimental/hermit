@@ -935,7 +935,14 @@ impl RecordVersion {
 //   read, recorded, to tell whether it is such a file.
 // An older recording that reads any of these is refused here instead of
 // failing mid-replay.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x198);
+// 0x198 -> 0x199 (reserved for the kvm lane's slice SP2): Detcore
+// decides flock(2) in its lock ledger. A flock is no longer one recorded probe:
+// the recording holds a recorded fstat and fstatfs at a description's first
+// flock and the mirrors of the model's decisions (LOCK_NB after a grant,
+// LOCK_UN after a release), a contended blocking flock waits instead of being
+// refused, and a malformed operation is answered without a kernel call. An
+// older recording replayed with this binary desyncs at its first flock.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x199);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -960,7 +967,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x198);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x198;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x199;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

@@ -20,29 +20,34 @@
  *              available again after LOCK_UN. Matches native Linux, so it is
  *              also meaningful under --verify and under record/replay.
  *
- *   upgrade    A CONTENDED BLOCKING LOCK_SH -> LOCK_EX conversion. Detcore
- *              cannot park a thread on a file lock deterministically, so it
- *              refuses; the point of this scenario is that the refusal must
- *              leave the caller's shared lock intact. Linux converts a lock
- *              non-atomically (the old lock is deleted before the conflict
- *              scan), so a naive LOCK_NB probe silently destroys it. A fresh
- *              open file description reports whether the original shared lock
- *              survived. HERMIT ONLY: natively the
- *              blocking conversion sleeps and this scenario deadlocks by
- *              construction, which is exactly why Detcore refuses instead.
+ *   upgrade-waits  A CONTENDED BLOCKING LOCK_SH -> LOCK_EX conversion,
+ *              whose contender is another process that releases its shared
+ *              lock later. Linux deletes the caller's shared lock before it
+ *              finds the conflict, waits, and grants the exclusive lock at the
+ *              contender's release; Detcore's flock model does the same in its
+ *              schedule. Matches native Linux, so it is also meaningful under
+ *              --verify and under record and replay.
  *
  *   received   Receive an already-locked open file description through
- *              SCM_RIGHTS, then attempt a contended blocking upgrade. Hermit
- *              did not observe the original lock acquisition, so it must
- *              refuse before a destructive LOCK_NB probe rather than drop a
- *              lock it cannot restore.
+ *              SCM_RIGHTS: it holds the sender's shared lock, and a
+ *              contended nonblocking upgrade through it deletes that lock
+ *              before it fails, as Linux's conversion does. Matches native
+ *              Linux.
  *
- *   fork-blocking-refusal  A DBT copied child cannot enter the Rust Detcore
- *              handler, so a blocking flock must return ENOLCK instead of
- *              running natively and deadlocking its waiting parent.
+ *   vfork-refusal  A vfork child of a parent that holds no lock: DBT's
+ *              copied vfork child cannot reach Detcore's flock model, which
+ *              decides every lock operation, so it refuses each valid one
+ *              (LOCK_EX|LOCK_NB, a blocking LOCK_SH, LOCK_UN) with ENOLCK and
+ *              keeps the kernel's EINVAL for a malformed one, and no lock
+ *              changes: the parent's second description then takes
+ *              LOCK_EX|LOCK_NB. DBT only: on Linux, and wherever a vfork child
+ *              reaches Detcore, the valid calls succeed.
  *
- *   fork-safe-operations  The same copied child still delegates malformed,
- *              nonblocking, and unlock operations to the kernel.
+ *   fork-safe-operations  A DBT fork child, whose flock calls reach
+ *              Detcore's flock model, gets Linux's answers: EINVAL for a
+ *              malformed operation, EWOULDBLOCK for a contended LOCK_NB, 0 for
+ *              the same mode again, and 0 for an unlock, which releases the
+ *              lock of the open file description it shares with its parent.
  *
  *   fork-vfork-blocking  A copied fork child's vfork child must route a
  *              blocking flock through the copied-syscall guard. Native Linux
@@ -61,7 +66,8 @@
  *              preserves both its shared OFD and reserved-flags errors.
  *
  *   sent-after-fork  Transfer a lock acquired after fork, let the receiver
- *              unlock it, and prove the sender does not restore stale state.
+ *              unlock it, and prove the sender holds no stale lock: its
+ *              nonblocking upgrade finds only a contender's.
  *
  *   vfork-upgrade  A copied vfork child must not enter a blocking flock that
  *              bypasses Detcore while its parent is suspended.
@@ -288,11 +294,10 @@ static int scenario_exclusion(void) {
   return 0;
 }
 
-static int scenario_upgrade(void) {
-  const char* path = lock_path("upgrade");
+static int scenario_upgrade_waits(void) {
+  const char* path = lock_path("upgrade-waits");
   int held = open_lock(path);
-  int contender = open_lock(path);
-  if (held < 0 || contender < 0) {
+  if (held < 0) {
     printf("FAIL: could not open %s (errno=%d)\n", path, errno);
     return HARNESS_FAILURE;
   }
@@ -301,41 +306,56 @@ static int scenario_upgrade(void) {
     return 1;
   }
   printf("flock-upgrade-parent-holds-shared\n");
-  if (flock(contender, LOCK_SH | LOCK_NB) != 0) {
-    printf("FAIL: second LOCK_SH was refused (errno=%d)\n", errno);
-    return 1;
+  int ready[2];
+  int release[2];
+  if (pipe(ready) != 0 || pipe(release) != 0) {
+    return HARNESS_FAILURE;
+  }
+  fflush(stdout);
+  pid_t child = fork();
+  if (child < 0) {
+    return HARNESS_FAILURE;
+  }
+  if (child == 0) {
+    int contender = open_lock(path);
+    char token = 0;
+    if (contender < 0 || flock(contender, LOCK_SH | LOCK_NB) != 0 ||
+        write(ready[1], "r", 1) != 1 || read(release[0], &token, 1) != 1) {
+      _exit(HARNESS_FAILURE);
+    }
+    /* Released only after the parent's conversion has had time to block. */
+    usleep(100 * 1000);
+    flock(contender, LOCK_UN);
+    _exit(0);
+  }
+  char token = 0;
+  if (read(ready[0], &token, 1) != 1 || write(release[1], "g", 1) != 1) {
+    return HARNESS_FAILURE;
   }
   printf("flock-upgrade-contender-holds-shared\n");
 
-  /* The contended blocking conversion. Natively this sleeps forever here,
-   * which is the deadlock Detcore refuses rather than reproduces. Both locks
-   * are in one process so Detcore still knows the first descriptor's mode and
-   * must exercise the restore path after its substituted LOCK_NB probe. */
+  /* The contended blocking conversion: it waits for the contender's release. */
   errno = 0;
-  int upgraded = flock(held, LOCK_EX);
-  int upgrade_errno = errno;
-  if (upgraded == 0) {
-    printf("FAIL: a contended blocking LOCK_EX upgrade reported success\n");
+  if (flock(held, LOCK_EX) != 0) {
+    printf("FAIL: the contended blocking LOCK_EX upgrade failed (errno=%d)\n", errno);
     return 1;
   }
-  printf("flock-upgrade-refused errno=%d\n", upgrade_errno);
-
-  flock(contender, LOCK_UN);
-  close(contender);
+  printf("flock-upgrade-acquired-after-the-release\n");
+  int status = 0;
+  if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    printf("FAIL: the contender failed (status=%d)\n", status);
+    return HARNESS_FAILURE;
+  }
   int probe = open_lock(path);
   if (probe < 0) {
     return HARNESS_FAILURE;
   }
   errno = 0;
-  if (flock(probe, LOCK_EX | LOCK_NB) == 0) {
-    printf("FAIL: the refused upgrade destroyed this process's shared lock\n");
+  if (flock(probe, LOCK_SH | LOCK_NB) == 0 || errno != EWOULDBLOCK) {
+    printf("FAIL: the upgraded lock did not exclude a fresh open (errno=%d)\n", errno);
     return 1;
   }
-  if (errno != EWOULDBLOCK) {
-    printf("FAIL: shared-lock survival probe got errno=%d\n", errno);
-    return 1;
-  }
-  printf("flock-upgrade-preserved-shared-lock\n");
+  printf("flock-upgrade-holds-exclusive\n");
   printf("flock-upgrade-ok\n");
   close(probe);
   close(held);
@@ -384,35 +404,38 @@ static int scenario_received(void) {
       _exit(HARNESS_FAILURE);
     }
 
+    /* The received description holds the sender's shared lock: a probe
+     * through a fresh open cannot take the exclusive lock. */
+    int probe = open_lock(path);
     errno = 0;
-    int upgraded = flock(received, LOCK_EX);
+    if (probe < 0 || flock(probe, LOCK_EX | LOCK_NB) == 0 || errno != EWOULDBLOCK) {
+      printf("FAIL: the received description's shared lock was lost (errno=%d)\n", errno);
+      _exit(1);
+    }
+    printf("flock-received-holds-the-shared-lock\n");
+
+    /* A nonblocking conversion through it deletes that lock before it finds
+     * the contender's (flock_lock_inode), as Linux does. */
+    errno = 0;
+    int upgraded = flock(received, LOCK_EX | LOCK_NB);
     int upgrade_errno = errno;
-    if (upgraded == 0 || upgrade_errno != ENOLCK) {
+    if (upgraded == 0 || upgrade_errno != EWOULDBLOCK) {
       printf(
-          "FAIL: blocking upgrade on received fd returned %d errno=%d\n",
+          "FAIL: nonblocking upgrade on received fd returned %d errno=%d\n",
           upgraded,
           upgrade_errno);
       _exit(1);
     }
-    printf("flock-received-upgrade-refused errno=%d\n", upgrade_errno);
+    printf("flock-received-upgrade-would-block errno=%d\n", upgrade_errno);
 
     flock(contender, LOCK_UN);
     close(contender);
-    int probe = open_lock(path);
-    if (probe < 0) {
-      _exit(HARNESS_FAILURE);
-    }
     errno = 0;
-    if (flock(probe, LOCK_EX | LOCK_NB) == 0) {
-      printf(
-          "FAIL: probing an unknown received fd destroyed its shared lock\n");
+    if (flock(probe, LOCK_EX | LOCK_NB) != 0) {
+      printf("FAIL: the failed conversion left a lock behind (errno=%d)\n", errno);
       _exit(1);
     }
-    if (errno != EWOULDBLOCK) {
-      printf("FAIL: received-fd survival probe got errno=%d\n", errno);
-      _exit(1);
-    }
-    printf("flock-received-upgrade-preserved-shared-lock\n");
+    printf("flock-received-upgrade-dropped-the-shared-lock\n");
     printf("flock-received-upgrade-ok\n");
     _exit(0);
   }
@@ -437,49 +460,63 @@ static int scenario_received(void) {
   return WEXITSTATUS(status);
 }
 
-static int scenario_fork_blocking_refusal(void) {
-  const char* path = lock_path("fork-blocking-refusal");
-  int holder = open_lock(path);
-  if (holder < 0 || flock(holder, LOCK_SH | LOCK_NB) != 0) {
-    printf("FAIL: could not establish parent shared lock (errno=%d)\n", errno);
+static int scenario_vfork_refusal(void) {
+  const char* path = lock_path("vfork-refusal");
+  int described = open_lock(path);
+  if (described < 0) {
+    printf("FAIL: could not open the lock file (errno=%d)\n", errno);
     return HARNESS_FAILURE;
   }
 
   fflush(stdout);
-  pid_t child = fork();
+  pid_t child = vfork();
   if (child < 0) {
-    printf("FAIL: fork failed (errno=%d)\n", errno);
+    printf("FAIL: vfork failed (errno=%d)\n", errno);
     return HARNESS_FAILURE;
   }
   if (child == 0) {
-    int contender = open_lock(path);
-    errno = 0;
-    int result = contender < 0 ? -2 : flock(contender, LOCK_EX);
-    if (result != -1 || errno != ENOLCK) {
-      dprintf(
-          STDOUT_FILENO,
-          "FAIL: copied fork child blocking flock returned %d errno=%d\n",
-          result,
-          errno);
-      _exit(1);
-    }
-    dprintf(
-        STDOUT_FILENO, "flock-fork-child-blocking-refused errno=%d\n", errno);
-    _exit(0);
+    // A vfork child shares its parent's memory until it exits, so it calls
+    // nothing but flock and _exit, and its exit status carries the verdict:
+    // one bit per call that failed as the copied child's policy says.
+    int refused = 0;
+    if (flock(described, LOCK_EX | LOCK_NB) == -1 && errno == ENOLCK)
+      refused |= 1;
+    if (flock(described, LOCK_SH) == -1 && errno == ENOLCK)
+      refused |= 2;
+    if (flock(described, LOCK_UN) == -1 && errno == ENOLCK)
+      refused |= 4;
+    if (flock(described, LOCK_SH | LOCK_EX) == -1 && errno == EINVAL)
+      refused |= 8;
+    _exit(refused);
   }
 
   int status = 0;
-  if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) ||
-      WEXITSTATUS(status) != 0) {
-    printf(
-        "FAIL: copied fork child did not fail closed (status=%d errno=%d)\n",
-        status,
-        errno);
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) {
+    printf("FAIL: vfork child did not exit (status=%d errno=%d)\n", status, errno);
     return HARNESS_FAILURE;
   }
-  printf("flock-fork-child-refusal-ok\n");
-  flock(holder, LOCK_UN);
-  close(holder);
+  int refused = WEXITSTATUS(status);
+  printf(
+      "flock-vfork-child lock-ex-nb=%s lock-sh=%s lock-un=%s malformed=%s\n",
+      refused & 1 ? "ENOLCK" : "other",
+      refused & 2 ? "ENOLCK" : "other",
+      refused & 4 ? "ENOLCK" : "other",
+      refused & 8 ? "EINVAL" : "other");
+  int second = open_lock(path);
+  errno = 0;
+  int taken = second < 0 ? -2 : flock(second, LOCK_EX | LOCK_NB);
+  printf(
+      "flock-vfork-parent-second-description lock-ex-nb=%d errno=%d\n",
+      taken,
+      taken == 0 ? 0 : errno);
+  if (refused != 15 || taken != 0) {
+    printf("FAIL: the vfork child's flock calls were not refused, or took a lock\n");
+    return 1;
+  }
+  printf("flock-vfork-refusal-ok\n");
+  flock(second, LOCK_UN);
+  close(second);
+  close(described);
   return 0;
 }
 
@@ -708,13 +745,15 @@ static int scenario_pidfd_getfd(void) {
         errno);
     return HARNESS_FAILURE;
   }
+  /* The duplicate's unlock released the source's shared lock: a
+   * nonblocking upgrade through the source finds only the contender's. */
   errno = 0;
-  if (flock(source, LOCK_EX) != -1 || errno != ENOLCK) {
+  if (flock(source, LOCK_EX | LOCK_NB) != -1 || errno != EWOULDBLOCK) {
     printf(
-        "FAIL: pidfd_getfd source blocking upgrade returned errno=%d\n", errno);
+        "FAIL: pidfd_getfd source nonblocking upgrade returned errno=%d\n", errno);
     return 1;
   }
-  printf("flock-pidfd-source-upgrade-refused errno=%d\n", errno);
+  printf("flock-pidfd-source-upgrade-would-block errno=%d\n", errno);
 
   if (flock(contender, LOCK_UN) != 0) {
     printf("FAIL: pidfd_getfd contender unlock failed (errno=%d)\n", errno);
@@ -1041,12 +1080,14 @@ static int scenario_sent_after_fork(const char* scenario, int batched) {
         errno);
     return HARNESS_FAILURE;
   }
+  /* The receiver's unlock released the description's shared lock: a
+   * nonblocking upgrade through the sender finds only the contender's. */
   errno = 0;
-  if (flock(sent, LOCK_EX) != -1 || errno != ENOLCK) {
-    printf("FAIL: post-transfer blocking upgrade returned errno=%d\n", errno);
+  if (flock(sent, LOCK_EX | LOCK_NB) != -1 || errno != EWOULDBLOCK) {
+    printf("FAIL: post-transfer nonblocking upgrade returned errno=%d\n", errno);
     return 1;
   }
-  printf("flock-sender-upgrade-refused errno=%d\n", errno);
+  printf("flock-sender-upgrade-would-block errno=%d\n", errno);
 
   flock(contender, LOCK_UN);
   close(contender);
@@ -1175,19 +1216,24 @@ static int scenario_partial_sendmmsg(void) {
     return HARNESS_FAILURE;
   }
 
+  /* The receiver joined the delivered description and unlocked it: it
+   * holds nothing, and nothing else holds its file. */
   errno = 0;
-  if (flock(first, LOCK_EX) != -1 || errno != ENOLCK) {
-    printf("FAIL: delivered fd retained stale state (errno=%d)\n", errno);
+  if (flock(first, LOCK_EX) != 0) {
+    printf("FAIL: the delivered description's uncontended upgrade failed (errno=%d)\n", errno);
     return 1;
   }
+  /* The second message carried nothing Linux read (its control data is
+   * unreadable), so the second description never left this process; its
+   * uncontended blocking upgrade is granted, as Linux does. */
   errno = 0;
-  if (flock(second, LOCK_EX) != -1 || errno != ENOLCK) {
+  if (flock(second, LOCK_EX) != 0) {
     printf(
-        "FAIL: partial sendmmsg did not conservatively invalidate unsent state (errno=%d)\n",
+        "FAIL: the unsent description's uncontended blocking upgrade failed (errno=%d)\n",
         errno);
     return 1;
   }
-  printf("flock-partial-sendmmsg-invalidated-all\n");
+  printf("flock-partial-sendmmsg-both-granted\n");
   close(first);
   close(second);
   return 0;
@@ -1605,14 +1651,14 @@ int main(int argc, char** argv) {
   if (strcmp(scenario, "exclusion") == 0) {
     return scenario_exclusion();
   }
-  if (strcmp(scenario, "upgrade") == 0) {
-    return scenario_upgrade();
+  if (strcmp(scenario, "upgrade-waits") == 0) {
+    return scenario_upgrade_waits();
   }
   if (strcmp(scenario, "received") == 0) {
     return scenario_received();
   }
-  if (strcmp(scenario, "fork-blocking-refusal") == 0) {
-    return scenario_fork_blocking_refusal();
+  if (strcmp(scenario, "vfork-refusal") == 0) {
+    return scenario_vfork_refusal();
   }
   if (strcmp(scenario, "fork-safe-operations") == 0) {
     return scenario_fork_safe_operations();

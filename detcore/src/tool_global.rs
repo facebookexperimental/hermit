@@ -2994,6 +2994,13 @@ impl GlobalTool for GlobalState {
     /// A backend whose process exits complete asynchronously reports each
     /// physical exit here; see [`GlobalState::complete_physical_process_exit`].
     fn on_backend_process_exited(&self, pid: i32) {
+        // Either report follows the kernel's `exit_files` for the process:
+        // its flock locks are released on the host
+        // (`LockLedger::flock_torn_down`).
+        self.lock_ledger
+            .lock()
+            .unwrap()
+            .flock_torn_down(DetPid::from_raw(pid));
         if self.cfg.backend.reports_child_exit_publication {
             // The kernel has published this process's exit to its parent. It
             // is not a physical-exit barrier report on this backend.
@@ -3327,9 +3334,18 @@ impl GlobalState {
                 }
             }
         }
-        let scm_rights::Settled { lock_copies, ports } = scm_rights::settle(released);
+        let scm_rights::Settled {
+            lock_copies,
+            unfollowable_copies,
+            ports,
+        } = scm_rights::settle(released);
         if scm_rights::follows_lock_copies(&self.cfg) {
             let mut ledger = self.lock_ledger.lock().unwrap();
+            // A copy a receive Detcore could not match may have taken leaves
+            // the flock model before it is uncounted (`flock_model`).
+            for open_file in unfollowable_copies {
+                ledger.flock_unfollowable(open_file);
+            }
             if !lock_copies.is_empty() {
                 // Uncounting never refuses: only a send names a locked copy.
                 let _ = ledger.placeholder_copies(crate::procfs::locks::PlaceholderCopies::Unsent(
@@ -3780,6 +3796,20 @@ impl GlobalState {
                 None,
                 R::SharedOpenFile(self.shared_open_file_control(dtid, control)),
             );
+        }
+        // Whether the host teardown of processes is still to be reported,
+        // asked by a flock mirror waiting for it
+        // (`Detcore::flock_mirror_after_teardown`): like the observations
+        // above, it carries no logical time, changes no scheduler state, and
+        // its answer carries no time back, so how many times host timing makes
+        // the waiter ask changes no guest time.
+        if let GlobalRequest::FlockTeardownPending(processes) = request {
+            let pending = self
+                .lock_ledger
+                .lock()
+                .unwrap()
+                .flock_teardown_pending(&processes);
+            return (None, R::FlockTeardownPending(pending));
         }
         // A SIGALRM ledger control message: like the messages above, it
         // carries no logical time and its answer carries none back. It reads
@@ -4368,8 +4398,17 @@ impl GlobalState {
             ) => {
                 let mut sched = self.lock_rpc_scheduler(false).await;
                 // The exec leaves its process's descriptor table
-                // (`LockLedger::exec`); `TableExec` names what survived.
-                self.lock_ledger.lock().unwrap().exec(detpid);
+                // (`LockLedger::exec`); `TableExec` names what survived. A
+                // backend that rebuilds the table under new identities takes
+                // the descriptions' flock locks out of the model first
+                // (`LockLedger::flock_exec_rebuilds_table`).
+                {
+                    let mut ledger = self.lock_ledger.lock().unwrap();
+                    if self.cfg.backend.rediscovers_descriptors_after_exec {
+                        ledger.flock_exec_rebuilds_table(detpid);
+                    }
+                    ledger.exec(detpid);
+                }
                 // A backend preserving the leader's ThreadState does not use
                 // the identity-transfer RPC. This successful-exec edge still
                 // commits the frozen sibling cohort in scheduler order.
@@ -5460,15 +5499,26 @@ impl GlobalState {
                 // holds as an OFD lock refuses it too.
                 let mut ledger = self.lock_ledger.lock().unwrap();
                 ledger.prune(|process| sched.process_is_alive(process));
-                R::LedgerLockRows(match ledger.unknown() {
-                    Some(reason) => Err(reason.to_string()),
+                let refusal = ledger
+                    .unknown()
+                    .map(str::to_owned)
+                    .or_else(|| ledger.flock_rows_refusal());
+                R::LedgerLockRows(match refusal {
+                    Some(reason) => Err(reason),
                     None => {
-                        let rows = ledger.rendered_rows(&|process| {
-                            listed.binary_search(&process.as_raw()).is_ok()
-                        });
+                        let listed =
+                            |process: DetPid| listed.binary_search(&process.as_raw()).is_ok();
+                        let rows = ledger.rendered_rows(&listed);
                         match ledger.record_lock_held_as_ofd(rows.iter().map(|(lock, _)| lock)) {
                             Some(reason) => Err(reason),
-                            None => Ok(rows),
+                            // The flock model's locks and waiters follow, as
+                            // the kernel would list them
+                            // (`LockLedger::flock_rows`).
+                            None => Ok(rows
+                                .into_iter()
+                                .map(|(lock, owner)| (lock, owner, 0))
+                                .chain(ledger.flock_rows(&listed))
+                                .collect()),
                         }
                     }
                 })
@@ -5544,11 +5594,29 @@ impl GlobalState {
                     R::GuestLockRows(Err(reason.to_string()))
                 } else {
                     let held = ledger.held();
-                    R::GuestLockRows(Ok(crate::procfs::locks::guest_lock_rows(
+                    let mut kept = crate::procfs::locks::guest_lock_rows(
                         &rows,
                         |owner| guest_owners.contains(&owner),
                         &held,
-                    )))
+                    );
+                    // On an inode the flock model decides, the model's locks
+                    // and waiters are the rows, in place of the kernel's
+                    // (`LockLedger::flock_kernel_rows`), each owner in the
+                    // kernel's numbering, as the capture's rows have theirs.
+                    let model_rows = ledger.flock_kernel_rows(
+                        &rows,
+                        &mut kept,
+                        &|process| listed.binary_search(&process.as_raw()).is_ok(),
+                        &|process| {
+                            sched
+                                .procfs_ids(true, &[process.as_raw()])
+                                .first()
+                                .copied()
+                                .flatten()
+                                .map(i64::from)
+                        },
+                    );
+                    R::GuestLockRows(Ok((kept, model_rows)))
                 }
             }
             GlobalRequest::AuxvFromKernel(why, cmdline) => {
@@ -5638,6 +5706,80 @@ impl GlobalState {
                 // releases them (`procfs::locks::LockLedger::prune`).
                 ledger.prune(|process| sched.process_is_alive(process));
                 R::PlaceholderFlock(ledger.placeholder_flock(process, request))
+            }
+            // Each flock request first lets go of what processes that have
+            // exited held (`LockLedger::prune`), as the scheduler's
+            // deterministic liveness says, so a lock an exit released is
+            // handed on as at the exit itself, whenever the request comes.
+            GlobalRequest::Flock(request) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let process = sched.registered_process(dtid).unwrap_or(dtid);
+                let mut ledger = self.lock_ledger.lock().unwrap();
+                ledger.prune(|process| sched.process_is_alive(process));
+                R::Flock(ledger.flock(process, dtid, request))
+            }
+            GlobalRequest::FlockPoll => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let mut ledger = self.lock_ledger.lock().unwrap();
+                ledger.prune(|process| sched.process_is_alive(process));
+                R::FlockPoll(ledger.flock_poll(dtid))
+            }
+            GlobalRequest::FlockCancel => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let mut ledger = self.lock_ledger.lock().unwrap();
+                ledger.prune(|process| sched.process_is_alive(process));
+                R::FlockCancel(ledger.flock_cancel(dtid))
+            }
+            GlobalRequest::FlockCloseCheck(open_file, remaining, mapped, maps_inode) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let process = sched.registered_process(dtid).unwrap_or(dtid);
+                let mut ledger = self.lock_ledger.lock().unwrap();
+                ledger.prune(|process| sched.process_is_alive(process));
+                R::FlockCloseCheck(
+                    ledger.flock_close_refusal(process, open_file, remaining, mapped, maps_inode),
+                )
+            }
+            GlobalRequest::FlockHostDecided(key, object) => {
+                let _sched = self.lock_rpc_scheduler(false).await;
+                self.lock_ledger
+                    .lock()
+                    .unwrap()
+                    .flock_host_decided(key, object);
+                R::FlockHostDecided(())
+            }
+            GlobalRequest::FlockMapped(open_file) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let process = sched.registered_process(dtid).unwrap_or(dtid);
+                self.lock_ledger
+                    .lock()
+                    .unwrap()
+                    .flock_mapped(process, open_file);
+                R::FlockMapped(())
+            }
+            GlobalRequest::FlockUnfollowable(open_files) => {
+                let _sched = self.lock_rpc_scheduler(false).await;
+                let mut ledger = self.lock_ledger.lock().unwrap();
+                for open_file in open_files {
+                    ledger.flock_unfollowable(open_file);
+                }
+                R::FlockUnfollowable(())
+            }
+            GlobalRequest::FlockTeardownPending(_) => {
+                unreachable!("a flock teardown query is answered before clock accounting")
+            }
+            GlobalRequest::FlockHeldBy(open_file) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let listed = sched.procfs_listing(None).processes;
+                let mut ledger = self.lock_ledger.lock().unwrap();
+                ledger.prune(|process| sched.process_is_alive(process));
+                R::FlockHeldBy(ledger.flock_held_by(open_file).map(|(mode, taker)| {
+                    let owner = if listed.binary_search(&taker.as_raw()).is_ok() {
+                        i64::from(taker.as_raw())
+                    } else {
+                        0
+                    };
+                    (mode == crate::procfs::locks::FlockMode::Exclusive, owner)
+                }))
             }
             GlobalRequest::PlaceholderWriteHint(key, hint) => {
                 let _sched = self.lock_rpc_scheduler(false).await;
@@ -7598,7 +7740,7 @@ pub enum SignalScope {
 /// `Resources`: a change to another payload type defined elsewhere
 /// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 24;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 25;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -8528,6 +8670,40 @@ pub enum GlobalRequest {
     /// due, if one did (`Scheduler::take_sleep_interruption`), for the sleep's
     /// remaining time. Appended last.
     TakeSleepInterruption,
+    /// A `flock` through a descriptor of the sender's table, which Detcore's
+    /// flock model decides (`procfs::locks::LockLedger::flock`). Appended
+    /// last.
+    Flock(crate::procfs::locks::FlockRequest),
+    /// Where the sender's queued `flock` stands, in its turn
+    /// (`procfs::locks::LockLedger::flock_poll`). Appended last.
+    FlockPoll,
+    /// The sender's queued `flock` ends without a lock, at a signal
+    /// (`procfs::locks::LockLedger::flock_cancel`). Appended last.
+    FlockCancel,
+    /// Why a close by the sender, after which this many slots of its table
+    /// name this description, would release a lock whose release the model
+    /// cannot place, given whether the sender maps the description and
+    /// whether its memory map may show the file
+    /// (`procfs::locks::LockLedger::flock_close_refusal`). Appended last.
+    FlockCloseCheck(OpenFileId, u32, bool, bool),
+    /// A description outside the flock model took or asked for a lock on
+    /// this inode, spelled so for `/proc/locks`, through the kernel, which
+    /// decides it from now on (`procfs::locks::LockLedger::flock_host_decided`).
+    /// Appended last.
+    FlockHostDecided(crate::procfs::locks::FlockInodeKey, String),
+    /// The sender mapped this description, which the flock model follows
+    /// (`procfs::locks::LockLedger::flock_mapped`). Appended last.
+    FlockMapped(OpenFileId),
+    /// The sender passed these descriptions over `SCM_RIGHTS`
+    /// (`procfs::locks::LockLedger::flock_unfollowable`). Appended last.
+    FlockUnfollowable(Vec<OpenFileId>),
+    /// Whether the host teardown of any of these processes is still to be
+    /// reported (`procfs::locks::LockLedger::flock_teardown_pending`).
+    /// Appended last.
+    FlockTeardownPending(Vec<DetPid>),
+    /// The flock the model holds through this description, for a rendered
+    /// fdinfo (`procfs::locks::LockLedger::flock_held_by`). Appended last.
+    FlockHeldBy(OpenFileId),
 }
 
 /// Responses from the global object
@@ -8752,9 +8928,11 @@ pub enum GlobalResponse {
     DescriptionLocks(()),
     /// Appended last.
     TableReleased(()),
-    /// One answer per row, in row order, or, while a referenced description's
-    /// locks are unknown, why. Appended last.
-    GuestLockRows(Result<Vec<bool>, String>),
+    /// One answer per row, in row order, and the rows the flock model shows
+    /// in place of the kernel's FLOCK rows on the inodes it decides; or,
+    /// while a referenced description's locks are unknown, why. Appended
+    /// last.
+    GuestLockRows(Result<(Vec<bool>, Vec<String>), String>),
     /// Appended last.
     TableExec(()),
     /// Appended last.
@@ -8869,7 +9047,7 @@ pub enum GlobalResponse {
     LockOwners(Result<Vec<i64>, String>),
     /// The rows and their owners, or, while a referenced description's locks
     /// are unknown, why no snapshot can be decided. Appended last.
-    LedgerLockRows(Result<Vec<(crate::procfs::locks::HeldLock, i64)>, String>),
+    LedgerLockRows(Result<Vec<crate::procfs::locks::RenderedLockRow>, String>),
     /// Appended last.
     SecondIdentityLocks(()),
     /// The table is held, or why it cannot be: it reached the global state
@@ -8895,6 +9073,26 @@ pub enum GlobalResponse {
     StoreProcfsSequence(()),
     /// The answer to `GlobalRequest::TakeSleepInterruption`. Appended last.
     TakeSleepInterruption(Option<LogicalTime>),
+    /// The answer to `GlobalRequest::Flock`. Appended last.
+    Flock(crate::procfs::locks::FlockOutcome),
+    /// The answer to `GlobalRequest::FlockPoll`. Appended last.
+    FlockPoll(crate::procfs::locks::FlockPoll),
+    /// Where a release had handed the cancelled waiter its lock, the
+    /// processes whose teardown its mirror may wait for. Appended last.
+    FlockCancel(Option<Vec<DetPid>>),
+    /// Why the close must be refused, or `None`. Appended last.
+    FlockCloseCheck(Option<String>),
+    /// Appended last.
+    FlockHostDecided(()),
+    /// Appended last.
+    FlockMapped(()),
+    /// Appended last.
+    FlockUnfollowable(()),
+    /// The answer to `GlobalRequest::FlockTeardownPending`. Appended last.
+    FlockTeardownPending(bool),
+    /// Whether the lock is exclusive, and the owner its line shows (the
+    /// taker while the container's `/proc` lists it, else 0). Appended last.
+    FlockHeldBy(Option<(bool, i64)>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -12282,6 +12480,157 @@ where
     }
 }
 
+/// A `flock` through a descriptor of the caller's table, which Detcore's
+/// flock model decides (`procfs::locks::LockLedger::flock`).
+pub(crate) async fn flock<G, T>(
+    guest: &mut G,
+    request: crate::procfs::locks::FlockRequest,
+) -> crate::procfs::locks::FlockOutcome
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::Flock(request))
+        .await
+        .1
+    {
+        GlobalResponse::Flock(outcome) => outcome,
+        _ => unreachable!(),
+    }
+}
+
+/// Where the caller's queued `flock` stands
+/// (`procfs::locks::LockLedger::flock_poll`).
+pub(crate) async fn flock_poll<G, T>(guest: &mut G) -> crate::procfs::locks::FlockPoll
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::FlockPoll)
+        .await
+        .1
+    {
+        GlobalResponse::FlockPoll(poll) => poll,
+        _ => unreachable!(),
+    }
+}
+
+/// The caller's queued `flock` ends without a lock, at a signal; where a
+/// release had handed it its lock already, the processes whose teardown its
+/// mirror may wait for (`procfs::locks::LockLedger::flock_cancel`).
+pub(crate) async fn flock_cancel<G, T>(guest: &mut G) -> Option<Vec<DetPid>>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::FlockCancel)
+        .await
+        .1
+    {
+        GlobalResponse::FlockCancel(granted) => granted,
+        _ => unreachable!(),
+    }
+}
+
+/// Why a close by the caller, after which `remaining` slots of its table name
+/// `open_file`, must be refused (`procfs::locks::LockLedger::flock_close_refusal`).
+pub(crate) async fn flock_close_check<G, T>(
+    guest: &mut G,
+    open_file: OpenFileId,
+    remaining: u32,
+    mapped: bool,
+    maps_inode: bool,
+) -> Option<String>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(
+        guest,
+        GlobalRequest::FlockCloseCheck(open_file, remaining, mapped, maps_inode),
+    )
+    .await
+    .1
+    {
+        GlobalResponse::FlockCloseCheck(refusal) => refusal,
+        _ => unreachable!(),
+    }
+}
+
+/// The kernel decides `key`'s inode from now on
+/// (`procfs::locks::LockLedger::flock_host_decided`).
+pub(crate) async fn flock_host_decided<G, T>(
+    guest: &mut G,
+    key: crate::procfs::locks::FlockInodeKey,
+    object: String,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::FlockHostDecided(key, object))
+        .await
+        .1;
+    assert_eq!(response, GlobalResponse::FlockHostDecided(()));
+}
+
+/// The caller mapped `open_file`, which the flock model follows
+/// (`procfs::locks::LockLedger::flock_mapped`).
+pub(crate) async fn flock_mapped<G, T>(guest: &mut G, open_file: OpenFileId)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::FlockMapped(open_file))
+        .await
+        .1;
+    assert_eq!(response, GlobalResponse::FlockMapped(()));
+}
+
+/// The caller passed `open_files` over `SCM_RIGHTS`
+/// (`procfs::locks::LockLedger::flock_unfollowable`).
+pub(crate) async fn flock_unfollowable<G, T>(guest: &mut G, open_files: Vec<OpenFileId>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::FlockUnfollowable(open_files))
+        .await
+        .1;
+    assert_eq!(response, GlobalResponse::FlockUnfollowable(()));
+}
+
+/// The flock the model holds through `open_file`: whether it is exclusive,
+/// and the owner its fdinfo line shows (`procfs::locks::LockLedger::flock_held_by`).
+pub(crate) async fn flock_held_by<G, T>(guest: &mut G, open_file: OpenFileId) -> Option<(bool, i64)>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::FlockHeldBy(open_file))
+        .await
+        .1
+    {
+        GlobalResponse::FlockHeldBy(held) => held,
+        _ => unreachable!(),
+    }
+}
+
+/// Whether the host teardown of any of `processes` is still to be reported
+/// (`procfs::locks::LockLedger::flock_teardown_pending`).
+pub(crate) async fn flock_teardown_pending<G, T>(guest: &mut G, processes: Vec<DetPid>) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::FlockTeardownPending(processes))
+        .await
+        .1
+    {
+        GlobalResponse::FlockTeardownPending(pending) => pending,
+        _ => unreachable!(),
+    }
+}
+
 /// A change to the copies of placeholder descriptions in flight over
 /// `SCM_RIGHTS` (`procfs::locks::LockLedger::placeholder_copies`): for a
 /// send, the description it would send that holds a placeholder `flock`, if
@@ -12609,7 +12958,7 @@ where
 /// decided (`procfs::locks::LockLedger::unknown`).
 pub(crate) async fn ledger_lock_rows<G, T>(
     guest: &mut G,
-) -> Result<Vec<(crate::procfs::locks::HeldLock, i64)>, String>
+) -> Result<Vec<crate::procfs::locks::RenderedLockRow>, String>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -12692,12 +13041,14 @@ where
 }
 
 /// Which of the rows of a `/proc/locks` snapshot the guest owns, in row order
-/// (`procfs::locks::guest_lock_rows`), or why no snapshot can be decided
-/// (`procfs::locks::LockLedger::unknown`).
+/// (`procfs::locks::guest_lock_rows`), with the rows the flock model shows in
+/// place of the kernel's FLOCK rows on the inodes it decides
+/// (`procfs::locks::LockLedger::flock_kernel_rows`), or why no snapshot can
+/// be decided (`procfs::locks::LockLedger::unknown`).
 pub(crate) async fn guest_lock_rows<G, T>(
     guest: &mut G,
     rows: Vec<crate::procfs::locks::LockRowFacts>,
-) -> Result<Vec<bool>, String>
+) -> Result<(Vec<bool>, Vec<String>), String>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -13362,6 +13713,7 @@ mod tests {
                     file: (1, 5),
                     open_file: Some(carried),
                     lock_copy: Some(sent_id),
+                    suspect: false,
                 }],
                 1,
             )

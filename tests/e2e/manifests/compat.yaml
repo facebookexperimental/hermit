@@ -1494,7 +1494,11 @@ corpus:
     # verify runs (bitwise parity, 65233 INFO records each side), its stdout
     # byte-identical to ptrace's, at 5.6 CPU seconds median and 6.4 at most
     # against the default 22-second budget that stopped it in 10 of 10 runs
-    # on 2026-10-13.
+    # on 2026-10-13. flock joined with Detcore's flock model (the kvm lane's
+    # slice SP2; before it, KVM refused every flock,
+    # https://github.com/rrnewton/reverie/issues/1069): 21 of 21 canonical
+    # strict verify pairs on the tree that enabled it. flock(1) takes its lock
+    # before it forks the command, as rustup does.
     - backend: kvm
       rows:
         [
@@ -1504,7 +1508,7 @@ corpus:
           column, comm, cp, cpio-roundtrip, cpp, crc32, cscope, csplit, curl,
           curl-localhost, cut, date, dc, dd, df, df-direct, diff, diff3,
           dirname, dos2unix, du, echo, egrep, elfedit, env, envsubst, expand,
-          expr, factor, fallocate, fgrep, file, find, findmnt, flex,
+          expr, factor, fallocate, fgrep, file, find, findmnt, flex, flock,
           fmt, fold, free, "g++", gcc, gcov, getconf, getopt, git, gprof, grep,
           groups, gzip, gzip-roundtrip, head, hexdump, hostname, iconv, id,
           install, ionice, iostat, ip, join, jq, kill, ld, ln, logger, logname, ls,
@@ -1528,12 +1532,6 @@ corpus:
         Not in the 2026-10-13 KVM survey: its KVM verify cell was not green
         on the compatibility ledger
       disabled:
-        flock: >-
-          KVM refuses every flock lock operation by name (ENOSYS with the
-          typed refusal UnsupportedOperation::Flock): it cannot keep a host
-          lock's lifetime equal to the guest description's. This cell passed
-          only because KVM flock used to be a silent no-op
-          (https://github.com/rrnewton/reverie/issues/1069)
         java: >-
           The JVM publishes a shared file mapping while its other threads run,
           which KVM's one-vCPU shared-file views cannot do

@@ -1655,6 +1655,12 @@ pub(crate) fn refresh_guest_poll_state<G: Guest<Detcore<T>>, T: RecordOrReplay>(
         resources.relies_on_guest_held_marks = false;
         return;
     }
+    // A flock waiting in Detcore's flock model waits on guest state alone,
+    // which no descriptor's mark decides (`flock_model`): the caller's
+    // classification stands.
+    if matches!(call, Syscall::Flock(_)) {
+        return;
+    }
     let held = match call {
         #[cfg(target_arch = "x86_64")]
         Syscall::Poll(call) => poll_targets_guest_held(
@@ -3643,13 +3649,18 @@ where
         // Route through the record/replay subtool for internal pipes so each poll (an
         // EAGAIN, or the final data-bearing read) becomes one recorded event that replay
         // reproduces deterministically; otherwise execute the syscall directly.
-        let res = match subtool {
-            Some(detcore) => {
+        let res = match (subtool, call.into()) {
+            // A flock waiting in Detcore's flock model asks the model, not
+            // the kernel (`Detcore::flock_wait_attempt`).
+            (Some(detcore), Syscall::Flock(flock)) => {
+                detcore.flock_wait_attempt(guest, flock).await
+            }
+            (Some(detcore), _) => {
                 detcore
                     .record_or_replay_preserving_tool_errors(guest, call)
                     .await
             }
-            None => {
+            (None, _) => {
                 // The preceding placeholder inspection can await. Publish
                 // persistent/reference effects at the actual issue cut,
                 // not from the descriptor or ancillary view before it.

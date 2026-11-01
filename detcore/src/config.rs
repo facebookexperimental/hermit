@@ -188,6 +188,16 @@ mod tests {
         // request's payload types. Renumbered to 24 at landing on top of
         // Train 6's revision 23; digest measured at this combined head.
         (24, "b31c27eec3d0d5b4", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::Flock`, `FlockPoll`, `FlockCancel`,
+        // `FlockCloseCheck`, `FlockHostDecided`, `FlockMapped`,
+        // `FlockUnfollowable`, `FlockTeardownPending` and `FlockHeldBy` and
+        // their responses, after slice N3's, and retypes
+        // `GlobalResponse::LedgerLockRows` and `GlobalResponse::GuestLockRows`
+        // (the kvm lane's slice SP2, Detcore's flock model; revision 21 on its
+        // own base, renumbered to 22 at its rebase onto main's 21, and to 25,
+        // appended after main's 22 to 24, at its rebase onto batch5a; digests
+        // measured at this head).
+        (25, "c56f4e5326c39066", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
