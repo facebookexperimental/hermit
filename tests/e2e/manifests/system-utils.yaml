@@ -2178,7 +2178,7 @@ test:
           - ptrace
           - dbt
         backends_disabled:
-          kvm: ps exits 1 with no output on KVM, whose own /proc cannot open a process's directory (https://github.com/rrnewton/hermit/issues/4479, https://github.com/rrnewton/hermit/issues/4282)
+          kvm: 'ps opens /proc/self as an O_PATH directory, which KVM''s /proc answers with EACCES (https://github.com/rrnewton/hermit/issues/5039), so ps exits 47 (`Error, do this: mount -t proc proc /proc`) in 3 of 3 KVM verify runs at Hermit 73d15dd6; its process table also needs another process''s /proc/<pid> (https://github.com/rrnewton/hermit/issues/4564)'
           sabre: Under SaBRe this guest's verify matches, but the harness refuses the run because SaBRe used fallback or native sites for bash and the utilities it runs (https://github.com/rrnewton/hermit/issues/4477)
           liteinst: Under in-guest LiteInst, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)
           in-guest-trap: Under in-guest-trap, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)

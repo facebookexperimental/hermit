@@ -10025,6 +10025,13 @@
           "category": "c-programs",
           "test": "c-programs/sigreturn-preemption",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigreturn-preemption",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17114,6 +17121,13 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/rustc",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/sar-resource-tables",
           "mode": "replay",
           "backend": "ptrace"
@@ -23266,6 +23280,13 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/rustc",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/sar-resource-tables",
           "mode": "replay",
           "backend": "ptrace"
@@ -28076,6 +28097,13 @@
           "test": "determinism-stress/thread-interleaving",
           "mode": "verify",
           "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress",
+          "test": "determinism-stress/thread-interleaving",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -68848,6 +68876,13 @@
           "category": "c-programs",
           "test": "c-programs/sigreturn-preemption",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigreturn-preemption",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -75919,6 +75954,13 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/rustc",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/sar-resource-tables",
           "mode": "replay",
           "backend": "ptrace"
@@ -78798,6 +78840,13 @@
           "test": "determinism-stress/thread-interleaving",
           "mode": "verify",
           "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress",
+          "test": "determinism-stress/thread-interleaving",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

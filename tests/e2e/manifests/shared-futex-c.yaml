@@ -41,7 +41,7 @@ test:
           - ptrace
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          kvm: 'Not qualifiable on any backend: a PID-1 guest that the ordinary manifest driver cannot run (https://github.com/rrnewton/hermit/issues/2102), whose ptrace cell is ci false; at Hermit 26eb116d the freestanding program does not even link in the pinned root (undefined reference to strlen), so there is no KVM cell to measure'
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -198,7 +198,7 @@ test:
           - ptrace
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          kvm: 'Not qualifiable on any backend: a PID-1 guest that the ordinary manifest driver cannot run (https://github.com/rrnewton/hermit/issues/2102), whose ptrace cell is ci false; at Hermit 26eb116d the freestanding program does not even link in the pinned root (undefined reference to strlen), so there is no KVM cell to measure'
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -279,7 +279,7 @@ test:
           - ptrace
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          kvm: 'Not qualifiable on any backend: a PID-1 guest that the ordinary manifest driver cannot run (https://github.com/rrnewton/hermit/issues/2102), whose ptrace cell is ci false; at Hermit 26eb116d the freestanding program does not even link in the pinned root (undefined reference to strlen), so there is no KVM cell to measure'
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)

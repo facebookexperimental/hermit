@@ -88,7 +88,7 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled:
-          kvm: "Initial C-corpus migration preserves the established ptrace and SaBRe baseline; qualify KVM separately"
+          kvm: 'KVM gap (https://github.com/rrnewton/hermit/issues/5038): KVM''s /proc/self/maps holds only the [stack] line, so no line covers the guest''s memfd mapping and the guest exits 1 (`FAIL: no maps line covers the mapping`) in 3 of 3 KVM verify runs at Hermit 26eb116d; ptrace lists every mapping and passes'
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -680,7 +680,7 @@ test:
           - ptrace
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          kvm: 'NAMED REFUSAL (https://github.com/rrnewton/hermit/issues/5035): KVM refuses a clone with CLONE_VM but not CLONE_VFORK by name (`KVM cannot create a process that shares its parent''s memory`), a fail-closed policy refusal (HERMIT_POLICY_REFUSAL) that ends verify run 1, in 3 of 3 KVM verify runs at Hermit 26eb116d; ptrace passes'
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -1306,7 +1306,7 @@ test:
           - ptrace
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          kvm: 'NAMED REFUSAL (https://github.com/rrnewton/hermit/issues/404): Detcore refuses restart_syscall on every backend (`unsupported syscall: restart_syscall() = ?`, HERMIT_POLICY_REFUSAL), on KVM in 3 of 3 verify runs at Hermit 26eb116d exactly as on ptrace, whose cell is ci false for the same refusal'
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -4020,7 +4020,7 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled:
-          kvm: userfaultfd has not been qualified on KVM
+          kvm: 'NAMED REFUSAL (https://github.com/rrnewton/hermit/issues/5041): KVM refuses userfaultfd by name (`KVM does not implement userfaultfd`), a fail-closed policy refusal (HERMIT_POLICY_REFUSAL) that ends verify run 1, in 3 of 3 KVM verify runs at Hermit 26eb116d; ptrace passes'
           sabre: userfaultfd has not been qualified on SaBRe
         hermit_args:
           liteinst:
@@ -5188,7 +5188,7 @@ test:
           bitwise_parity: true
         backends_disabled:
           dbt: Config::backend_supports_blocked_wait_signal_interruption is false on DBT, so the scheduler does not model signal targets and a cross-task signal to a thread parked in an emulated pause or nanosleep is not recorded for the step2 drain (https://github.com/rrnewton/hermit/issues/3982); qualify DBT separately
-          kvm: Config::backend_supports_blocked_wait_signal_interruption is false on KVM, so the scheduler does not model signal targets and a cross-task signal to a thread parked in an emulated pause or nanosleep is not recorded for the step2 drain (https://github.com/rrnewton/hermit/issues/3982); qualify KVM separately
+          kvm: 'NAMED REFUSAL (https://github.com/rrnewton/hermit/issues/5036): KVM refuses a signal to another process by name (`KVM signal delivery refused: KVM cannot deliver a signal to another process`, UnsupportedOperation::Signal), a fail-closed policy refusal (HERMIT_POLICY_REFUSAL) at the guest''s first kill of its child, in 3 of 3 KVM verify runs at Hermit 26eb116d; ptrace passes'
           sabre: Config::backend_supports_blocked_wait_signal_interruption is false on SaBRe, so the scheduler does not model signal targets and a cross-task signal to a thread parked in an emulated pause or nanosleep is not recorded for the step2 drain (https://github.com/rrnewton/hermit/issues/3982); qualify SaBRe separately
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -5532,7 +5532,7 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled:
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          kvm: 'KVM gap (https://github.com/rrnewton/hermit/issues/5037): KVM''s pidfd_open serves only the calling process and answers ESRCH for a live child, so the guest exits 1 (`pidfd_open child failed: No such process`) in 3 of 3 KVM verify runs at Hermit 26eb116d; ptrace and native Linux return a pidfd'
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -6731,7 +6731,7 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled:
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          kvm: 'KVM gap (https://github.com/rrnewton/hermit/issues/5039): KVM''s own /proc answers EACCES for readlink of /proc/self/fd/../fd/3, which Linux resolves lexically, so the guest exits 1 (`lexical: Permission denied`) in 3 of 3 KVM verify runs at Hermit 26eb116d; the four preceding readlink calls succeed'
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -9716,7 +9716,7 @@ test:
           bitwise_parity: true
         backends_disabled:
           dbt: Config::backend_supports_blocked_wait_signal_interruption is false on DBT, so the scheduler does not model signal targets and a sibling's signal neither arms a pooled rt_sigsuspend waiter for the release barrier nor is noted at a posted rt_sigsuspend request; qualify DBT separately
-          kvm: Config::backend_supports_blocked_wait_signal_interruption is false on KVM, so the scheduler does not model signal targets and a sibling's signal neither arms a pooled rt_sigsuspend waiter for the release barrier nor is noted at a posted rt_sigsuspend request; qualify KVM separately
+          kvm: 'KVM gap (https://github.com/rrnewton/hermit/issues/5040): KVM''s rt_sigsuspend never sleeps (Detcore''s rt_sigsuspend_never_sleeps); a wait for a signal not yet pending returns ENOSYS at once, so a sibling''s signal cannot end it and the guest exits 1 (`SIGSUSPEND_SIBLING_SIGNAL_WAKE_FAILED`) in 3 of 3 KVM verify runs at Hermit 26eb116d; ptrace and native Linux end the wait with EINTR'
           sabre: Config::backend_supports_blocked_wait_signal_interruption is false on SaBRe, so the scheduler does not model signal targets and a sibling's signal neither arms a pooled rt_sigsuspend waiter for the release barrier nor is noted at a posted rt_sigsuspend request; qualify SaBRe separately
           liteinst: Config::backend_supports_blocked_wait_signal_interruption is false on LiteInst, so the scheduler does not model signal targets and a sibling's signal neither arms a pooled rt_sigsuspend waiter for the release barrier nor is noted at a posted rt_sigsuspend request; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -11619,7 +11619,7 @@ test:
           - dbt
           - sabre
         backends_disabled:
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          kvm: 'KVM gap (https://github.com/rrnewton/hermit/issues/5039): KVM''s own /proc answers EACCES for /proc/thread-self/status, which Linux and ptrace open, so the guest exits 1 in 3 of 3 KVM verify runs at Hermit 26eb116d'
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -21936,9 +21936,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: The defect this cell guards is in the ptrace backend's reported rt_sigreturn stop; DBT reports no sigreturns
-          kvm: The defect this cell guards is in the ptrace backend's reported rt_sigreturn stop; KVM reports no sigreturns
           sabre: The defect this cell guards is in the ptrace backend's reported rt_sigreturn stop; SaBRe reports no sigreturns
           liteinst: The defect this cell guards is in the ptrace backend's reported rt_sigreturn stop, and in-guest LiteInst refuses a preemption timer
           in-guest-trap: The defect this cell guards is in the ptrace backend's reported rt_sigreturn stop, and in-guest LiteInst refuses a preemption timer
