@@ -239,7 +239,7 @@ mod tests {
             event_id: "e1".into(),
             emitted_at: "2026-11-01T00:00:00Z".into(),
             team: "hermit".into(),
-            host: "devbig014".into(),
+            host: "validation-host".into(),
             run_id: "validate-1".into(),
             producer: "hermit-validate-rs".into(),
             legacy: serde_json::json!({"b": 1, "a": 2}),
@@ -288,7 +288,7 @@ mod tests {
             &rollup,
             "2026-11-01T00:00:00Z",
             "hermit",
-            "devbig014",
+            "validation-host",
             "validate-1",
             "hermit-validate-rs",
         );
