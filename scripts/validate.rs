@@ -27317,6 +27317,7 @@ fn write_validation_service_result(path: &Path, summary: &RunSummary) -> Result<
         passed_tests: summary.passed_tests,
         diagnostic_failed_tests: summary.diagnostic_failed_tests,
         scorecard_writeback: summary.scorecard_writeback.clone(),
+        composition: None,
     }
     .validated()?;
     let bytes = serde_json::to_vec(&result)
