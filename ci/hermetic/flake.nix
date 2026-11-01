@@ -177,6 +177,9 @@
         bc cpio dos2unix file zip unzip wget gettext lsof cscope flex
         gnupatch attr acl time perlPackages.ArchiveZip libxml2.bin
         clang jdk_headless
+        # The KVM SP1 Go os/exec cell runs the go toolchain as its guest; it
+        # was the image's only missing toolchain (coordinator, 2026-11-01).
+        go
         # These outputs are not implied by their runtime libraries.
         bzip2.bin curl.bin glibc.bin hostname
       ];
