@@ -905,20 +905,77 @@ static void probe_path(const char* s, const char* what, const char* path, int op
   memcpy(lock_path, saved, sizeof(lock_path));
 }
 
+/* An OFD lock on a file of its own, unrelated to the lock file, which
+   waiter-closed, waiter-replaced and ebadf hold while they check that its
+   /proc/locks row stays. Its range starts at 4096 plus the process's pid,
+   so that no other process's lock has it, natively too, where /proc/locks
+   lists every process's locks and other runs of this program may hold
+   theirs; /proc/locks prints the range as the row's last two fields. */
+static long unrelated_start(void) {
+  return 4096 + (long)getpid();
+}
+
+static int take_unrelated_ofd_lock(char* path, size_t size) {
+  snprintf(path, size, "%s/lock-unrelated", lock_dir);
+  int unrelated = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  struct flock range = {
+      .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = unrelated_start(), .l_len = 23};
+  if (unrelated < 0 || fcntl(unrelated, F_OFD_SETLK, &range) != 0) {
+    harness("take the unrelated OFD lock");
+  }
+  return unrelated;
+}
+
+/* The /proc/locks rows of that lock, as a word. */
+static void unrelated_ofd_rows(char* out, size_t size) {
+  char range[48];
+  snprintf(range, sizeof(range), " %ld %ld\n", unrelated_start(), unrelated_start() + 22);
+  FILE* locks = fopen("/proc/locks", "re");
+  if (locks == NULL) {
+    harness("open /proc/locks");
+  }
+  int count = 0;
+  char row[256];
+  while (fgets(row, sizeof(row), locks) != NULL) {
+    if (strstr(row, "OFDLCK") != NULL && strstr(row, range) != NULL) {
+      count++;
+    }
+  }
+  fclose(locks);
+  snprintf(out, size, "%d", count);
+}
+
 /* A sibling closes, or replaces with another file's, the descriptor a waiting
    call took. Linux's call holds the open file description it took
    (`fdget`): it is granted at the release and returns 0, and its lock goes
    with its own reference, the description's last; the other file is never
-   locked. */
+   locked. An OFD lock the process holds on an unrelated file keeps its
+   /proc/locks row throughout (the Codex review of slice SP2's second round:
+   the call's completion read the stale descriptor number, which hid every
+   lock's row). */
 static void scenario_waiter_descriptor_gone(int replaced) {
   const char* s = replaced ? "waiter-replaced" : "waiter-closed";
   char rows[128];
+  char count[16];
   char other[sizeof(lock_path)];
+  char unrelated_path[sizeof(lock_path)];
   snprintf(other, sizeof(other), "%s/lock-other", lock_dir);
+  int unrelated = take_unrelated_ofd_lock(unrelated_path, sizeof(unrelated_path));
+  unrelated_ofd_rows(count, sizeof(count));
+  expect(s, "the unrelated OFD lock's rows before the wait", count, "1");
   learn_whose_rows_show();
   int held = open_lock();
   expect(s, "main thread LOCK_EX", attempt(held, LOCK_EX), "ok");
   struct fd_wait wait = {channel(), open_lock()};
+  /* The waiting descriptor is a number no open takes meanwhile, as in the
+     review's probe (200). The lowest free number goes to the next open,
+     Hermit's own included; on ptrace that open masked the defect this
+     checks. */
+  int high = fcntl(wait.fd, F_DUPFD_CLOEXEC, 200);
+  if (high < 0 || close(wait.fd) != 0) {
+    harness("move the waiting descriptor to 200");
+  }
+  wait.fd = high;
   pthread_t thread = start_descriptor_waiter(&wait);
   proc_locks_rows_once(rows, sizeof(rows), "WRITE ->WRITE");
   expect(s, "rows while the other thread waits", rows, "WRITE ->WRITE");
@@ -943,6 +1000,8 @@ static void scenario_waiter_descriptor_gone(int replaced) {
     harness("pthread_join");
   }
   close_channel(wait.report);
+  unrelated_ofd_rows(count, sizeof(count));
+  expect(s, "the unrelated OFD lock's rows after the waiting call returned", count, "1");
   /* The call's own reference was the description's last. */
   probe(s, "child LOCK_EX|LOCK_NB after the call returned", LOCK_EX | LOCK_NB, "ok");
   if (replaced) {
@@ -951,6 +1010,8 @@ static void scenario_waiter_descriptor_gone(int replaced) {
     unlink(other);
   }
   close(held);
+  close(unrelated);
+  unlink(unrelated_path);
 }
 
 static void scenario_waiter_closed(void) {
@@ -959,6 +1020,76 @@ static void scenario_waiter_closed(void) {
 
 static void scenario_waiter_replaced(void) {
   scenario_waiter_descriptor_gone(1);
+}
+
+/* A flock through a descriptor number that names nothing fails with EBADF
+   before it looks at any lock (`SYSCALL_DEFINE2(flock)`): an OFD lock the
+   process holds on an unrelated file keeps its /proc/locks row (found in
+   slice SP2's third round, on main too: the call's completion read the
+   number's fdinfo, found none, and hid every lock's row). Not in `all`:
+   replay refuses a flock through a descriptor outside its root, an EBADF
+   one included; hermit-cli/tests/flock_exclusion.rs runs it. */
+static void scenario_ebadf(void) {
+  const char* s = "ebadf";
+  char count[16];
+  char unrelated_path[sizeof(lock_path)];
+  int unrelated = take_unrelated_ofd_lock(unrelated_path, sizeof(unrelated_path));
+  unrelated_ofd_rows(count, sizeof(count));
+  expect(s, "the unrelated OFD lock's rows", count, "1");
+  expect(s, "LOCK_EX|LOCK_NB through descriptor 250, which names nothing",
+         attempt(250, LOCK_EX | LOCK_NB), "errno=9");
+  unrelated_ofd_rows(count, sizeof(count));
+  expect(s, "the unrelated OFD lock's rows after that EBADF", count, "1");
+  close(unrelated);
+  unlink(unrelated_path);
+}
+
+/* A sibling closes the descriptor a waiting call took while a mapping of its
+   open file description remains (the Claude review of slice SP2's second
+   round). Linux's call takes the lock at the release, and the mapping keeps
+   the description, and with it the lock, after the call's own reference
+   goes (`locks_remove_file` runs at the last `fput`): another description's
+   LOCK_EX|LOCK_NB fails until the munmap. Detcore cannot place that lock on
+   the host without a descriptor that names the description, so the
+   backends with host descriptions refuse the call by name, and KVM refuses
+   the thread of a process with a shared file mapping. Not in `all`:
+   hermit-cli/tests/flock_exclusion.rs runs it. */
+static void scenario_waiter_mapped(void) {
+  const char* s = "waiter-mapped";
+  char rows[128];
+  learn_whose_rows_show();
+  int held = open_lock();
+  if (ftruncate(held, 4096) != 0) {
+    harness("ftruncate");
+  }
+  expect(s, "main thread LOCK_EX", attempt(held, LOCK_EX), "ok");
+  struct fd_wait wait = {channel(), open_lock()};
+  void* mapping = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, wait.fd, 0);
+  if (mapping == MAP_FAILED) {
+    harness("mmap");
+  }
+  pthread_t thread = start_descriptor_waiter(&wait);
+  proc_locks_rows_once(rows, sizeof(rows), "WRITE ->WRITE");
+  expect(s, "rows while the other thread waits", rows, "WRITE ->WRITE");
+  if (close(wait.fd) != 0) {
+    harness("close the waiting descriptor");
+  }
+  printf("%s: main thread closed the waiting descriptor; its mapping remains\n", s);
+  expect(s, "main thread LOCK_UN", attempt(held, LOCK_UN), "ok");
+  char line[64];
+  hear(wait.report, line, sizeof(line));
+  expect(s, "the waiting call after the release", line, "ok");
+  if (pthread_join(thread, NULL) != 0) {
+    harness("pthread_join");
+  }
+  close_channel(wait.report);
+  /* The mapping keeps the description, and the lock the call took. */
+  probe(s, "child LOCK_EX|LOCK_NB while the mapping remains", LOCK_EX | LOCK_NB, "EWOULDBLOCK");
+  if (munmap(mapping, 4096) != 0) {
+    harness("munmap");
+  }
+  probe(s, "child LOCK_EX|LOCK_NB after the munmap", LOCK_EX | LOCK_NB, "ok");
+  close(held);
 }
 
 /* The thread of private-table-close: CLONE_THREAD without CLONE_FILES gives it
@@ -1068,9 +1199,10 @@ static void scenario_stopped_waiter(void) {
    its requests blocked (`locks_show`), with a waiter's depth in its
    indentation; Detcore's /proc/locks sanitizer orders a lock's waiter rows
    by their fields and indents each by one level (`sanitize_locks`, older
-   than the flock model). So the scenarios below with more than one waiter
-   compare this form, whose rows show which locks are granted and which
-   requests wait under them, and whose events show the order of the grants. */
+   than the flock model: https://github.com/rrnewton/hermit/issues/5052). So
+   the scenarios below with more than one waiter compare this form, whose
+   rows show which locks are granted and which requests wait under them, and
+   whose events show the order of the grants. */
 static void proc_locks_sorted(char* out, size_t size) {
   char rows[256];
   proc_locks_rows(rows, sizeof(rows));
@@ -1605,6 +1737,10 @@ int main(int argc, char** argv) {
     scenario_stopped_waiter();
   } else if (!ran && strcmp(scenario, "exec-waiter") == 0) {
     scenario_exec_waiter();
+  } else if (!ran && strcmp(scenario, "waiter-mapped") == 0) {
+    scenario_waiter_mapped();
+  } else if (!ran && strcmp(scenario, "ebadf") == 0) {
+    scenario_ebadf();
   } else if (!ran) {
     printf("HARNESS: unknown scenario %s\n", scenario);
     failures = -1;

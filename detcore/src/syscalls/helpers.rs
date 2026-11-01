@@ -3653,7 +3653,13 @@ where
             // A flock waiting in Detcore's flock model asks the model, not
             // the kernel (`Detcore::flock_wait_attempt`).
             (Some(detcore), Syscall::Flock(flock)) => {
-                detcore.flock_wait_attempt(guest, flock).await
+                let (answer, woke) = detcore.flock_wait_attempt(guest, flock).await;
+                // A retry that blocked again but woke other requests changed
+                // what their own retries find: progress, for the scheduler's
+                // check that only idle pollers remain, as a partial pipe
+                // write is (`Resources::previous_attempt_made_progress`).
+                rsrc.previous_attempt_made_progress = woke;
+                answer
             }
             (Some(detcore), _) => {
                 detcore

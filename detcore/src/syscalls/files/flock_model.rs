@@ -78,6 +78,7 @@ use crate::procfs::locks::FlockMode;
 use crate::procfs::locks::FlockOutcome;
 use crate::procfs::locks::FlockPoll;
 use crate::procfs::locks::FlockRequest;
+use crate::procfs::locks::WAITER_DESCRIPTOR_GONE_REFUSAL;
 use crate::procfs_inode;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
@@ -129,16 +130,6 @@ const ESCAPED_REFUSAL: &str = "this open file description was shared with anothe
      made: the launcher's standard streams, or a descriptor found in the table), so Detcore \
      cannot follow its references to place the lock's release, and on this backend no host lock \
      can decide the file";
-
-/// Why a call that waited is refused when its retry changed the lock of the
-/// description it took (a grant, or the release of the other mode), which
-/// another reference keeps, and no descriptor of the caller's table names
-/// that description any longer (`Detcore::flock_mirror_waited`).
-const WAITER_DESCRIPTOR_GONE_REFUSAL: &str = "the waiting call's descriptor was closed or \
-     replaced while it waited, and another reference (another process's table, a mapping, a \
-     copy in flight) keeps the open file description the call took, whose lock the call's retry \
-     changed: the caller's process has no descriptor of it to change the lock on the host \
-     through";
 
 /// Why a call that waited is refused when its file left the model meanwhile
 /// and no descriptor of the caller's table names the description the call
@@ -659,11 +650,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// released with the call ([`crate::procfs::locks::LockLedger::flock_poll`]),
     /// so the host has no lock to take (the call returns 0, as Linux's does
     /// before its last `fput` releases the lock). Otherwise another reference
-    /// (another process's table, a mapping, a copy in flight) keeps the
-    /// description, whose lock changed, and the caller has no descriptor to
-    /// change it on the host through: the call is refused by name. (The model
-    /// reports a release only while such a reference remains, as with none the
-    /// host's description, and its lock, went with its last descriptor.)
+    /// (another process's table, a copy in flight) keeps the description,
+    /// whose lock changed, and the caller has no descriptor to change it on
+    /// the host through: the call is refused by name. A grant that a mapping
+    /// alone keeps is refused by name in the poll already, which the model
+    /// would otherwise release with the call, leaving the kernel to decide
+    /// the inode without the lock. (The model reports a release only while
+    /// such a reference remains, as with none the host's description, and its
+    /// lock, went with its last descriptor.)
     async fn flock_mirror_waited<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -732,7 +726,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// which holds every turn until it: there the mirror is made, and made
     /// again while it answers `EWOULDBLOCK`, at most for
     /// [`TEARDOWN_BACKSTOP`], after which the answer is `EWOULDBLOCK`. A
-    /// mirror that fails is refused by name.
+    /// mirror that fails is refused by name. The model hands each exited
+    /// process to one grant's mirror only, the first whose lock conflicts
+    /// with the one it released
+    /// (`procfs::locks::LockLedger::flock_take_lagging`), so on DBT at most
+    /// that grant waits, and a later one that meets a lock from outside the
+    /// run is refused at once.
     async fn flock_mirror_after_teardown<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -863,15 +862,31 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// ([`crate::procfs::locks::LockLedger::flock_poll`]), with its mirror, so
     /// that a lock is placed on the host in the turn that takes it;
     /// `EWOULDBLOCK` while the call waits; the kernel's path where the file
-    /// left the model; a refusal by name where the model refuses it.
+    /// left the model; a refusal by name where the model refuses it. With it,
+    /// whether a retry that blocked again woke other requests, whose own
+    /// retries may now succeed: progress, although the call goes on waiting
+    /// (`Resources::previous_attempt_made_progress`).
     pub(crate) async fn flock_wait_attempt<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Flock,
-    ) -> Result<i64, Error> {
+    ) -> (Result<i64, Error>, bool) {
         // The description the call took at its entry (`Self::flock_wait`).
         let taken = guest.thread_state().flock_waiting_description.clone();
-        match crate::tool_global::flock_poll(guest).await {
+        let poll = crate::tool_global::flock_poll(guest).await;
+        let woke = matches!(poll, FlockPoll::Waiting { woke: true, .. });
+        (self.flock_wait_answer(guest, call, taken, poll).await, woke)
+    }
+
+    /// [`Self::flock_wait_attempt`]'s answer to the model's `poll`.
+    async fn flock_wait_answer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Flock,
+        taken: Option<DetFd>,
+        poll: FlockPoll,
+    ) -> Result<i64, Error> {
+        match poll {
             FlockPoll::Granted { lagging } => {
                 let mode = match call.operation() & !libc::LOCK_NB {
                     libc::LOCK_SH => FlockMode::Shared,
@@ -885,7 +900,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     None => self.flock_mirror(guest, call, Some(mode), lagging).await,
                 }
             }
-            FlockPoll::Waiting { dropped } => {
+            FlockPoll::Waiting { dropped, .. } => {
                 // The retry deleted the description's lock of the other mode
                 // before it found its conflict, as a conversion does: the
                 // host's goes in this turn too.

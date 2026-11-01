@@ -6927,6 +6927,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             && operation & (libc::LOCK_SH | libc::LOCK_EX) != 0)
             .then_some("FLOCK");
         let baseline = self.lock_baseline(guest, fd, class);
+        // The open file description the call takes now (`fdget`), which a
+        // call that waits keeps, whatever a sibling does to `fd` meanwhile.
+        let taken = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.open_file_id())
+            .ok();
         // Detcore's flock model decides the call where it can follow the
         // description; otherwise the kernel does, as before it
         // (`flock_model`).
@@ -6934,8 +6940,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             flock_model::FlockRoute::Decided(result) => result,
             flock_model::FlockRoute::Kernel => self.flock_through_the_kernel(guest, call).await,
         };
-        self.refresh_description_locks(guest, fd, LockCall::Flock, baseline)
-            .await?;
+        // The description's locks are read through a descriptor that still
+        // names the description the call took: a sibling may have closed
+        // `fd`, or made it name another file, while the call waited. Where no
+        // slot names it any longer, the ledger has already let its references
+        // go, and a read through the stale number would read another file's
+        // locks, or find none and hide every lock
+        // (`procfs::locks::LockLedger::alias_inode`): there is nothing to
+        // refresh. Nor after a call that failed with EBADF, which changed no
+        // lock: `fd` named no open file description, or one opened without
+        // read or write access asked for a lock (`SYSCALL_DEFINE2(flock)`,
+        // lines 2158-2162 of fs/locks.c in Linux v6.17).
+        let current = match taken {
+            _ if matches!(result, Err(Error::Errno(Errno::EBADF))) => None,
+            Some(open_file) => guest.thread_state().slot_naming(open_file, fd),
+            None => Some(fd),
+        };
+        if let Some(fd) = current {
+            self.refresh_description_locks(guest, fd, LockCall::Flock, baseline)
+                .await?;
+        }
         result
     }
 

@@ -653,10 +653,12 @@ pub struct Resources {
     #[serde(default)]
     pub(crate) waits_until_nothing_else_can_run: bool,
     /// Set on a retry (`poll_attempt > 0`) whose previous attempt moved data
-    /// (a partial pipe write). Every other retry follows an attempt that would
-    /// have blocked and moved nothing, which `Scheduler::nothing_else_can_run`
-    /// needs to know: a guest-state poll grant is progress unless the thread's
-    /// next request is a retry without this flag.
+    /// (a partial pipe write), or blocked again but woke other requests (a
+    /// waiting flock's retry, `Detcore::flock_wait_attempt`). Every other
+    /// retry follows an attempt that would have blocked and changed nothing,
+    /// which `Scheduler::nothing_else_can_run` needs to know: a guest-state
+    /// poll grant is progress unless the thread's next request is a retry
+    /// without this flag.
     #[serde(default)]
     pub(crate) previous_attempt_made_progress: bool,
     /// The `poll_attempt` a skipped retry had when the scheduler replaced it

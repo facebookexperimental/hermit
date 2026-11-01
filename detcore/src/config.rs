@@ -200,7 +200,8 @@ mod tests {
         // `procfs::locks::FlockRequest`, `FlockOutcome` and `FlockPoll`, whose
         // `Waiting` carries whether a retry deleted the description's lock
         // (SP2's review round, before any release of revision 25, which also
-        // made `GlobalResponse::FlockCancel` a unit answer).
+        // made `GlobalResponse::FlockCancel` a unit answer) and whether it woke
+        // other requests (SP2's third review round, still before any release).
         (25, "5c9d613c4fb323bd", "f013e36743d8d9e6"),
     ];
 

@@ -26,6 +26,7 @@
 //! | [`a_private_table_closing_every_descriptor_frees_the_lock_on_ptrace`] | a description a private-table thread had referenced kept its lock in the model after every descriptor closed |
 //! | [`a_job_control_stop_of_a_waiter_is_refused_by_name_on_ptrace`] | a stopped waiter stayed queued, and was granted while Linux kept it stopped |
 //! | [`an_exec_ends_the_flock_wait_of_a_thread_it_kills_on_ptrace`] | a waiter an exec killed stayed queued, took the lock, and kept it for the rest of the run, or left a request blocked under its own forever |
+//! | [`a_waiter_kept_by_a_mapping_alone_is_refused_by_name_on_ptrace`] | a waiting call whose descriptor a sibling closed while a mapping kept its description returned 0 with no lock on the host, where the kernel then granted a conflicting lock |
 //! | [`dbt_copied_vfork_child_refuses_every_flock_by_name`] | a copied DBT vfork child ran `LOCK_NB` and `LOCK_UN` natively, changing locks behind the flock model |
 //! | [`dbt_forked_child_preserves_safe_flock_operations`] | copied-child refusal overmatched malformed, nonblocking, and unlock operations; a DBT fork child's calls now reach the flock model |
 //! | [`dbt_nested_vfork_child_blocking_flock_reaches_the_copied_policy`] | a copied fork child's vfork path was assumed to bypass the copied-syscall flock guard |
@@ -1260,34 +1261,41 @@ fn find_metadata(data_dir: &Path) -> PathBuf {
 /// blocks ahead of the waiter its conversion woke, a cancelled waiter that
 /// wakes the requests blocked under it, a retry that converts its
 /// description's lock, and a release through the waiting call's own
-/// description before its retry). Before Detcore's flock model a blocking
-/// waiter was refused on every backend, and KVM refused every flock; before
-/// the review, a release handed the lock to waiters in its own turn, in the
-/// order they first blocked, which no Linux schedule does.
+/// description before its retry), with an unrelated file's OFD lock whose
+/// `/proc/locks` row stays while those waiting calls end. Then the guest's
+/// `ebadf`, which `all` leaves out because replay refuses its call: a flock
+/// through a number that names nothing fails with EBADF, and the unrelated
+/// row stays (slice SP2's third round; the row went, on main too). Before
+/// Detcore's flock model a blocking waiter was refused on every backend, and
+/// KVM refused every flock; before the review, a release handed the lock to
+/// waiters in its own turn, in the order they first blocked, which no Linux
+/// schedule does.
 fn assert_flock_model_matches_linux_at_l2(backend: &str) {
-    let native = native_model_run("all");
-    let run = hermit_run_model(
-        backend,
-        "info",
-        &["--strict", "--verify", "--verify-strict"],
-        "all",
-    );
-    assert!(
-        run.status.success(),
-        "{backend} strict --verify flock model run failed\n{}",
-        run.combined()
-    );
-    assert!(
-        run.combined().contains("bitwise parity established"),
-        "{backend} flock model run did not verify at L2\n{}",
-        run.combined()
-    );
-    assert_eq!(
-        run.stdout,
-        native.stdout,
-        "{backend} printed other answers than native Linux\n{}",
-        run.combined()
-    );
+    for scenario in ["all", "ebadf"] {
+        let native = native_model_run(scenario);
+        let run = hermit_run_model(
+            backend,
+            "info",
+            &["--strict", "--verify", "--verify-strict"],
+            scenario,
+        );
+        assert!(
+            run.status.success(),
+            "{backend} strict --verify flock model run of {scenario} failed\n{}",
+            run.combined()
+        );
+        assert!(
+            run.combined().contains("bitwise parity established"),
+            "{backend} flock model run of {scenario} did not verify at L2\n{}",
+            run.combined()
+        );
+        assert_eq!(
+            run.stdout,
+            native.stdout,
+            "{backend} printed other answers than native Linux for {scenario}\n{}",
+            run.combined()
+        );
+    }
 }
 
 #[test]
@@ -1366,6 +1374,84 @@ fn a_job_control_stop_of_a_waiter_is_refused_by_name_on_ptrace() {
     );
 }
 
+/// The refusal of a waiting call whose descriptor was closed or replaced
+/// while another reference kept the description it took.
+const WAITER_KEPT_BY_ANOTHER_REFERENCE: &str = "the waiting call's descriptor was closed or \
+     replaced while it waited, and another reference (another process's table, a mapping, a \
+     copy in flight) keeps the open file description the call took";
+
+/// A sibling closes the descriptor a waiting call took while a mapping of its
+/// open file description remains (the guest's `waiter-mapped`, natively):
+/// Linux's call takes the lock at the release, and the mapping keeps it after
+/// the call returns, so another description's `LOCK_EX|LOCK_NB` fails until
+/// the munmap. No descriptor names the description any longer, through which
+/// Detcore could place the lock on the host, so the call is refused by name;
+/// under `--allow-unsupported-syscalls` it fails with ENOLCK, and the model,
+/// like the host, then holds no lock for the description, so the child's
+/// `LOCK_EX|LOCK_NB` succeeds. Before the Claude review of the kvm lane's
+/// slice SP2's second round, the call returned 0 with no lock on the host,
+/// and the kernel, which decided the file from then on, granted the child's
+/// conflicting lock. KVM refuses the thread of a process with a shared file
+/// mapping, so it cannot run this.
+fn assert_a_waiter_kept_by_a_mapping_alone_is_refused_by_name(backend: &str) {
+    let native = native_model_run("waiter-mapped");
+    assert!(
+        native.stdout.contains(
+            "waiter-mapped: child LOCK_EX|LOCK_NB while the mapping remains = EWOULDBLOCK"
+        ),
+        "natively the mapping kept the waiting call's lock\n{}",
+        native.combined()
+    );
+    let run = hermit_run_model(backend, "error", &["--strict"], "waiter-mapped");
+    // The unsupported-operation policy's exit: DBT's runtime ends the run
+    // with 101, as its copied-child refusals do.
+    let refused = if backend == "dbt" { 101 } else { 122 };
+    assert_eq!(
+        run.status.code(),
+        Some(refused),
+        "{backend} must refuse the waiting call by name\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stderr.contains(WAITER_KEPT_BY_ANOTHER_REFERENCE),
+        "{backend} refused the waiting call without its reason\n{}",
+        run.combined()
+    );
+    assert!(
+        !run.stdout.contains("while the mapping remains"),
+        "{backend} went on after refusing the waiting call\n{}",
+        run.combined()
+    );
+    let run = hermit_run_model(
+        backend,
+        "error",
+        &["--allow-unsupported-syscalls"],
+        "waiter-mapped",
+    );
+    for marker in [
+        "FAIL waiter-mapped: the waiting call after the release = errno=37, expected ok",
+        "FAIL waiter-mapped: child LOCK_EX|LOCK_NB while the mapping remains = ok, expected \
+         EWOULDBLOCK",
+        "waiter-mapped: child LOCK_EX|LOCK_NB after the munmap = ok",
+    ] {
+        assert!(
+            run.stdout.contains(marker),
+            "{backend} --allow-unsupported-syscalls: missing {marker}\n{}",
+            run.combined()
+        );
+    }
+    assert!(
+        run.stderr.contains(WAITER_KEPT_BY_ANOTHER_REFERENCE),
+        "{backend} --allow-unsupported-syscalls: the ENOLCK came without its reason\n{}",
+        run.combined()
+    );
+}
+
+#[test]
+fn a_waiter_kept_by_a_mapping_alone_is_refused_by_name_on_ptrace() {
+    assert_a_waiter_kept_by_a_mapping_alone_is_refused_by_name("ptrace");
+}
+
 /// An exec kills the caller's other threads before it closes the
 /// close-on-exec descriptors (`de_thread`): a thread waiting for `LOCK_EX`
 /// behind its process's lock leaves the queue with it, which wakes another
@@ -1377,7 +1463,7 @@ fn a_job_control_stop_of_a_waiter_is_refused_by_name_on_ptrace() {
 /// own turns and without the exec taking the request out, the other process
 /// would wait forever under it. KVM hangs at an exec while another thread of
 /// the process is blocked, in a flock or a pipe read alike
-/// (KVM-EXEC-BLOCKED-SIBLING-ISSUE), so this runs on ptrace.
+/// (https://github.com/rrnewton/hermit/issues/4904), so this runs on ptrace.
 #[test]
 fn an_exec_ends_the_flock_wait_of_a_thread_it_kills_on_ptrace() {
     let native = native_model_run("exec-waiter");
