@@ -365,54 +365,89 @@ pub fn ptrace_cell_capability(cell: &SelectedCell) -> Option<HostCapability> {
     needs_cpuid.then_some(HostCapability::CpuidFaulting)
 }
 
-/// Whether `hermit run --strict` on `backend` reads its virtual clock from the
-/// host's retired-conditional-branch counter, and so refuses where the hermit
-/// binary reports no `exact_branch_counter`.
+/// Whether a verify cell on `backend` has a relaxed form: the ptrace backend
+/// and e9patch preprocessing on it, whose verify cells this harness runs at the
+/// relaxed level ([`RELAXED_LEVEL_ARGS`]) on a host without CPUID faulting or
+/// an exact retired-conditional-branch counter, and which `max_level` may cap.
+///
+/// It does not decide which cells the hermit binary refuses on an inexact
+/// counter: [`strict_run_arms_the_preemption_timer`] does, and it also names
+/// KVM, which reads the same counter for its preemption timer but has no
+/// relaxed form. Relaxing a KVM cell would turn off the preemption timer its
+/// cell was qualified with, and KVM does not need CPUID faulting, so a KVM cell
+/// is withheld on such a host instead ([`refused_on_an_inexact_branch_counter`]).
+pub fn pmu_clock_backend(backend: &str) -> bool {
+    matches!(backend, "ptrace" | "e9patch")
+}
+
+/// Whether `hermit run --strict` on `backend` arms the PMU preemption timer,
+/// whose retired-conditional-branch counter is then the run's virtual clock, so
+/// the hermit binary refuses the run where it reports no `exact_branch_counter`
+/// unless the run has no timeslice. It mirrors the CLI's capability table:
+/// hermit-cli's `backend_delivers_preemption_timer`, the backend's
+/// `delivers_preemption_timer_events` capability (ptrace, e9patch preprocessing
+/// on it, and KVM since Reverie 9443a6b2), on which
+/// `RunOpts::reads_the_branch_counter` keys the `--strict` refusal.
 ///
 /// Unlike [`backend_capability`], this is decided on the machine that runs the
 /// cell and never enters a plan row: a plan row that names a host capability
 /// routes the cell off remote execution, and remote workers differ in CPU
 /// model, so the plan cannot say which of them count exactly.
-pub fn pmu_clock_backend(backend: &str) -> bool {
-    matches!(backend, "ptrace" | "e9patch")
+pub fn strict_run_arms_the_preemption_timer(backend: &str) -> bool {
+    matches!(backend, "ptrace" | "e9patch" | "kvm")
 }
 
 /// Whether the hermit binary refuses `cell` where it reports no
-/// `exact_branch_counter`: the cell runs `hermit run --strict` or `hermit
-/// record start --strict` on a [`pmu_clock_backend`]. Verify and chaos cells
-/// always pass `--strict` to `run`, and replay cells to `record start`, which
-/// refuses in the same way
+/// `exact_branch_counter`, as `RunOpts::refuse_strict_with_inexact_branch_counter`
+/// does (hermit-cli/src/bin/hermit/run.rs): the run is `--strict`, its backend
+/// arms the PMU preemption timer ([`strict_run_arms_the_preemption_timer`]:
+/// ptrace, e9patch and kvm), and it has a maximum timeslice, the condition of
+/// `RunOpts::reads_the_branch_counter`.
+///
+/// Verify and chaos cells always pass `--strict` to `run`, and replay cells to
+/// `record start`, which refuses in the same way
 /// (<https://github.com/rrnewton/hermit/issues/3810>). A custom cell passes it
-/// when its arguments say so, unless they also select `--namespace-only`
-/// (alias `--lite`), which arms no branch counter. A naked cell runs no
-/// hermit. A run with `--max-timeslice=disabled` uses no branch count in
-/// Detcore (Reverie still sets the counters up), so Hermit does not refuse it
-/// (<https://github.com/rrnewton/hermit/issues/4291>):
-/// not a custom cell that passes it, and not a verify cell at the relaxed
-/// strictness level, which adds it ([`RELAXED_LEVEL_ARGS`]) — unless the
-/// cell's recipe declares its own numeric `--max-timeslice`, which the
-/// relaxed level then leaves in place, so the run still arms the counter.
+/// when its arguments before any `--` say so, unless they also select
+/// `--namespace-only` (alias `--lite`), which arms no branch counter. A naked
+/// cell runs no hermit.
+///
+/// The timeslice is the one hermit resolves from the flags the cell passes
+/// ([`SelectedCell::strictness`], [`MaxTimeslice::from_options`]), so every
+/// spelling hermit reads as no timer leaves the cell unrefused: `disabled` or
+/// 0, after `=` or as the next argument, under `--max-timeslice` or its alias
+/// `--preemption-timeout`. Without a timeslice Detcore uses no branch count
+/// (Reverie still sets the counters up), so Hermit does not refuse the run
+/// (<https://github.com/rrnewton/hermit/issues/4291>). A verify cell at the
+/// relaxed strictness level passes `--max-timeslice=disabled`
+/// ([`RELAXED_LEVEL_ARGS`]) unless its recipe names its own timeslice, which
+/// the relaxed level then leaves in place. KVM has no relaxed form
+/// ([`pmu_clock_backend`]), so a KVM cell is refused exactly when the flags it
+/// declares leave it a timeslice.
 pub fn refused_on_an_inexact_branch_counter(cell: &SelectedCell) -> bool {
     let strict_run = match cell.id.mode.as_str() {
         "verify" | "chaos" | "replay" => true,
         "custom" => {
-            let args = &cell.test.modes["custom"].args;
-            let has = |flag: &str| args.iter().any(|arg| arg == flag);
-            has("--strict")
-                && !has("--namespace-only")
-                && !has("--lite")
-                && !has("--max-timeslice=disabled")
+            let options: Vec<&str> = cell.test.modes["custom"]
+                .args
+                .iter()
+                .map(String::as_str)
+                .take_while(|arg| *arg != "--")
+                .collect();
+            options.contains(&"--strict")
+                && !options.contains(&"--namespace-only")
+                && !options.contains(&"--lite")
         }
         _ => false,
     };
     strict_run
-        && cell.id.backend.as_deref().is_some_and(pmu_clock_backend)
-        && match cell.strictness_level() {
-            Some(StrictnessLevel::Relaxed) => cell
-                .strictness()
-                .is_some_and(|strictness| strictness.max_timeslice != MaxTimeslice::Disabled),
-            _ => true,
-        }
+        && cell
+            .id
+            .backend
+            .as_deref()
+            .is_some_and(strict_run_arms_the_preemption_timer)
+        && cell
+            .strictness()
+            .is_some_and(|strictness| strictness.max_timeslice != MaxTimeslice::Disabled)
 }
 
 pub fn requires_capability(token: &str) -> Result<Option<HostCapability>, String> {
@@ -1888,18 +1923,71 @@ pub enum MaxTimeslice {
     Nanoseconds(u64),
 }
 
+/// The long names `hermit run` takes its maximum timeslice under: the flag
+/// and its alias, `#[clap(long, visible_alias = "preemption-timeout")]` on
+/// `Config::max_timeslice` in detcore-model/src/config.rs. clap accepts each
+/// as `--NAME=VALUE` or as `--NAME VALUE`, and no abbreviation of either.
+pub const MAX_TIMESLICE_FLAGS: [&str; 2] = ["--max-timeslice", "--preemption-timeout"];
+
 impl MaxTimeslice {
-    /// The value of a `--max-timeslice=<value>` flag, or `None` when Hermit
-    /// would not accept it.
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "disabled" => Some(Self::Disabled),
-            value => value
-                .parse::<u64>()
-                .ok()
-                .filter(|nanoseconds| *nanoseconds > 0)
-                .map(Self::Nanoseconds),
+    /// A maximum-timeslice value as hermit reads it, or why hermit refuses
+    /// it. This restates detcore-model's `parse_timeslice`
+    /// (detcore-model/src/config.rs), the flag's clap `value_parser`: a
+    /// number as `str::parse::<u64>` reads it, so `00` and `+0` are numbers
+    /// too, where 0 turns the timer off and 1 to 9 are below one RCB
+    /// (`NANOS_PER_RCB`, 10 virtual nanoseconds); or the word `disabled`.
+    /// Anything else is refused.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let one_rcb = detcore_model::time::NANOS_PER_RCB as u64;
+        match value.parse::<u64>() {
+            Ok(0) => Ok(Self::Disabled),
+            Ok(nanoseconds) if nanoseconds < one_rcb => Err(format!(
+                "`{value}` is below one RCB ({one_rcb} virtual nanoseconds), which hermit refuses"
+            )),
+            Ok(nanoseconds) => Ok(Self::Nanoseconds(nanoseconds)),
+            Err(_) if value == "disabled" => Ok(Self::Disabled),
+            Err(_) => Err(format!(
+                "`{value}` is neither `disabled` nor a non-negative integer, which hermit refuses"
+            )),
         }
+    }
+
+    /// The maximum timeslice `hermit run` resolves from `options`, its
+    /// command-line options in order, or `Ok(None)` where none names it and
+    /// hermit runs with `MaxTimeslice::hermit_default`. An option is either
+    /// name in [`MAX_TIMESLICE_FLAGS`] with its value after `=` or in the next
+    /// element, read by [`MaxTimeslice::parse`]; nothing after a `--` is an
+    /// option. As clap does, this refuses a second occurrence under either
+    /// name ("cannot be used multiple times"), a name whose next element is
+    /// missing or starts with `-`, and a value hermit refuses.
+    pub fn from_options(options: &[String]) -> Result<Option<Self>, String> {
+        let mut resolved = None;
+        let mut options = options.iter().take_while(|option| option.as_str() != "--");
+        while let Some(option) = options.next() {
+            let value = if MAX_TIMESLICE_FLAGS.contains(&option.as_str()) {
+                match options.next() {
+                    Some(value) if !value.starts_with('-') => value.as_str(),
+                    _ => return Err(format!("`{option}` has no value, which hermit refuses")),
+                }
+            } else if let Some(value) = MAX_TIMESLICE_FLAGS.iter().find_map(|flag| {
+                option
+                    .strip_prefix(flag)
+                    .and_then(|rest| rest.strip_prefix('='))
+            }) {
+                value
+            } else {
+                continue;
+            };
+            if resolved.is_some() {
+                return Err(format!(
+                    "`{option}` names the maximum timeslice a second time ({} are one \
+                     option), which hermit refuses",
+                    MAX_TIMESLICE_FLAGS.join(" and ")
+                ));
+            }
+            resolved = Some(Self::parse(value).map_err(|error| format!("`{option}`: {error}"))?);
+        }
+        Ok(resolved)
     }
 
     /// The timeslice Hermit runs with when it is given no `--max-timeslice`.
@@ -2010,11 +2098,11 @@ impl SelectedCell {
     /// The strictness level this cell runs at, or `None` for a naked cell,
     /// which runs no Hermit.
     ///
-    /// Only a verify cell on a backend that reads its virtual clock from the
-    /// host's branch counter ([`pmu_clock_backend`]) has a relaxed form, so
-    /// only it runs relaxed: on a relaxed host, or when its recipe caps it.
-    /// Every other cell runs as declared, at the strict level; a chaos or
-    /// replay cell that needs the counter is not run on a host without it.
+    /// Only a verify cell on a backend with a relaxed form ([`pmu_clock_backend`]:
+    /// ptrace and e9patch) runs relaxed: on a relaxed host, or when its recipe
+    /// caps it. Every other cell runs as declared, at the strict level; a KVM
+    /// cell with a timeslice, or a chaos or replay cell, that needs the counter
+    /// is not run on a host without it ([`refused_on_an_inexact_branch_counter`]).
     pub fn strictness_level(&self) -> Option<StrictnessLevel> {
         (self.id.mode != "naked").then(|| {
             if self.relaxed_level_reason().is_some() {
@@ -2028,7 +2116,8 @@ impl SelectedCell {
     /// How this cell runs ([`CellStrictness`]), or `None` for a naked cell.
     /// The settings are read from the Hermit flags the cell passes: a verify
     /// cell's recipe flags, level flags and probe flag, or a custom cell's
-    /// arguments. Chaos and replay cells pass none.
+    /// arguments. Chaos and replay cells pass none. The timeslice is the one
+    /// hermit resolves from them ([`MaxTimeslice::from_options`]).
     pub fn strictness(&self) -> Option<CellStrictness> {
         let level = self.strictness_level()?;
         let recipe = &self.test.modes[&self.id.mode];
@@ -2046,11 +2135,13 @@ impl SelectedCell {
             ("custom", _) => recipe.args.clone(),
             _ => Vec::new(),
         };
-        let max_timeslice = flags
-            .iter()
-            .rev()
-            .find_map(|flag| flag.strip_prefix("--max-timeslice="))
-            .and_then(MaxTimeslice::parse)
+        // The timeslice hermit resolves from these flags. Manifest validation
+        // refuses timeslice flags hermit would refuse, so the default stands
+        // in only where no flag names one, or for a cell built without that
+        // validation.
+        let max_timeslice = MaxTimeslice::from_options(&flags)
+            .ok()
+            .flatten()
             .unwrap_or_else(MaxTimeslice::hermit_default);
         Some(CellStrictness {
             level,
@@ -10151,6 +10242,12 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
                 "{id}: hermit_args entry `{arg}` is not one of {ALLOWED_HERMIT_ARGS:?}"
             ));
         }
+        // A value hermit refuses would fail every run of the cell, and the
+        // harness reads the cell's timeslice from this value.
+        if let Some(value) = arg.strip_prefix("--max-timeslice=") {
+            MaxTimeslice::parse(value)
+                .map_err(|error| format!("{id}: hermit_args entry `{arg}`: {error}"))?;
+        }
     }
     match (recipe.hermit_args.is_empty(), &recipe.hermit_args_reason) {
         (true, None) => {}
@@ -10274,6 +10371,14 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
                 "{id}: diagnostic on `{backend}` requires a substantive, trimmed reason"
             ));
         }
+    }
+    // A custom cell's arguments reach `hermit run` as written. Timeslice
+    // arguments hermit would refuse fail every run of the cell, and the
+    // harness decides admission on the timeslice it resolves from them
+    // ([`refused_on_an_inexact_branch_counter`]), so they are refused here.
+    if mode == "custom" {
+        MaxTimeslice::from_options(&recipe.args)
+            .map_err(|error| format!("{id}: custom args: {error}"))?;
     }
     Ok(())
 }
@@ -12654,6 +12759,311 @@ corpus:
             cell.strictness().unwrap().max_timeslice,
             MaxTimeslice::Disabled
         );
+    }
+
+    /// The backends whose strict run arms the PMU preemption timer, so that
+    /// the hermit binary refuses their cells on an inexact branch counter, are
+    /// those hermit-cli's capability table says deliver preemption timer
+    /// events (`delivers_preemption_timer_events` in hermit-cli/src/lib.rs):
+    /// ptrace, e9patch preprocessing on it, and KVM. Only ptrace and e9patch
+    /// have a relaxed form. Change both tables together.
+    #[test]
+    fn the_timer_arming_backends_mirror_the_cli_capability_table() {
+        for backend in [
+            "ptrace",
+            "e9patch",
+            "kvm",
+            "dbt",
+            "sabre",
+            "liteinst",
+            "in-guest-trap",
+        ] {
+            assert_eq!(
+                strict_run_arms_the_preemption_timer(backend),
+                matches!(backend, "ptrace" | "e9patch" | "kvm"),
+                "{backend}"
+            );
+            assert_eq!(
+                pmu_clock_backend(backend),
+                matches!(backend, "ptrace" | "e9patch"),
+                "{backend}"
+            );
+        }
+    }
+
+    /// A strict KVM verify cell arms KVM's preemption timer, so the hermit
+    /// binary refuses it on an inexact counter and the harness withholds it
+    /// there. It has no relaxed form: a relaxed host leaves it strict and
+    /// adds nothing. A recipe that passes `--max-timeslice=disabled` gives it
+    /// no timeslice and so no timer, which `hermit run --strict` does not
+    /// refuse; a numeric one is still refused.
+    #[test]
+    fn a_strict_kvm_cell_with_a_timeslice_is_refused_on_an_inexact_counter() {
+        let mut cell = verify_cell("kvm", true, BTreeMap::new(), None);
+        assert_eq!(cell.strictness_level(), Some(StrictnessLevel::Strict));
+        assert_eq!(
+            cell.strictness().unwrap().max_timeslice,
+            MaxTimeslice::Nanoseconds(200_000_000)
+        );
+        assert!(refused_on_an_inexact_branch_counter(&cell));
+        cell.host_level = relaxed_host();
+        assert_eq!(cell.strictness_level(), Some(StrictnessLevel::Strict));
+        assert!(cell.level_relaxations().is_empty());
+        assert!(refused_on_an_inexact_branch_counter(&cell));
+        // A disabled KVM cell under --probe-disabled runs the same command.
+        assert!(refused_on_an_inexact_branch_counter(&verify_cell(
+            "kvm",
+            false,
+            BTreeMap::new(),
+            None
+        )));
+
+        let timeslice = |value: &str| {
+            verify_cell(
+                "kvm",
+                true,
+                BTreeMap::from([("kvm".into(), vec![format!("--max-timeslice={value}")])]),
+                None,
+            )
+        };
+        let disabled = timeslice("disabled");
+        assert_eq!(
+            disabled.strictness().unwrap().max_timeslice,
+            MaxTimeslice::Disabled
+        );
+        assert!(!refused_on_an_inexact_branch_counter(&disabled));
+        assert!(refused_on_an_inexact_branch_counter(&timeslice("100000")));
+    }
+
+    /// KVM's chaos, replay and custom cells follow ptrace's mode rules: chaos
+    /// and replay always run strict, with a timeslice, and a custom cell is
+    /// refused only when its arguments pass `--strict`, neither
+    /// `--namespace-only` nor `--lite`, and leave it a timeslice. The other
+    /// backends' cells never are.
+    #[test]
+    fn kvm_chaos_replay_and_custom_cells_follow_the_mode_rules() {
+        let kvm = |mode: &str| {
+            let mut cell = ptrace_cell(mode);
+            cell.id.backend = Some("kvm".into());
+            cell
+        };
+        assert!(refused_on_an_inexact_branch_counter(&kvm("chaos")));
+        assert!(refused_on_an_inexact_branch_counter(&kvm("replay")));
+        let mut custom = kvm("custom");
+        for (args, refused) in [
+            (&[][..], false),
+            (&["--strict"][..], true),
+            (&["--strict", "--max-timeslice=100000"][..], true),
+            (&["--strict", "--max-timeslice=disabled"][..], false),
+            (&["--strict", "--namespace-only"][..], false),
+            (&["--strict", "--lite"][..], false),
+        ] {
+            custom.test.modes.get_mut("custom").unwrap().args =
+                args.iter().map(|arg| arg.to_string()).collect();
+            assert_eq!(
+                refused_on_an_inexact_branch_counter(&custom),
+                refused,
+                "{args:?}"
+            );
+        }
+        let mut naked = kvm("naked");
+        naked.id.backend = None;
+        assert!(!refused_on_an_inexact_branch_counter(&naked));
+        for backend in ["dbt", "sabre", "liteinst", "in-guest-trap"] {
+            assert!(
+                !refused_on_an_inexact_branch_counter(&verify_cell(
+                    backend,
+                    true,
+                    BTreeMap::new(),
+                    None
+                )),
+                "{backend}"
+            );
+        }
+    }
+
+    /// Every spelling hermit reads as no timer leaves a strict cell unrefused on
+    /// an inexact counter, on KVM and on ptrace, and the same spelling with a
+    /// timeslice is refused. hermit takes the maximum timeslice as
+    /// `--max-timeslice` or its alias `--preemption-timeout`, its value after
+    /// `=` or as the next argument, and reads `disabled` and 0 (also `00` and
+    /// `+0`, which `str::parse::<u64>` accepts) as no timer: run against hermit
+    /// itself, each disabling spelling here gave a summary with no maximum
+    /// timeslice, and each timed one 100000. A verify recipe may spell it only
+    /// `--max-timeslice=VALUE`; its cell is decided the same way at either
+    /// strictness level.
+    #[test]
+    fn every_spelling_that_disables_the_timer_is_admitted_and_its_timed_twin_refused() {
+        let pairs: [(&[&str], &[&str]); 10] = [
+            (&["--max-timeslice=disabled"], &["--max-timeslice=100000"]),
+            (&["--max-timeslice=0"], &["--max-timeslice=100000"]),
+            (
+                &["--max-timeslice", "disabled"],
+                &["--max-timeslice", "100000"],
+            ),
+            (&["--max-timeslice", "0"], &["--max-timeslice", "100000"]),
+            (
+                &["--preemption-timeout=disabled"],
+                &["--preemption-timeout=100000"],
+            ),
+            (
+                &["--preemption-timeout=0"],
+                &["--preemption-timeout=100000"],
+            ),
+            (
+                &["--preemption-timeout", "disabled"],
+                &["--preemption-timeout", "100000"],
+            ),
+            (
+                &["--preemption-timeout", "0"],
+                &["--preemption-timeout", "100000"],
+            ),
+            (&["--max-timeslice=00"], &["--max-timeslice=+100000"]),
+            (&["--max-timeslice=+0"], &["--max-timeslice=+100000"]),
+        ];
+        for backend in ["kvm", "ptrace"] {
+            let mut custom = ptrace_cell("custom");
+            custom.id.backend = Some(backend.into());
+            for (disabled, timed) in pairs {
+                for (spelling, refused, recorded) in [
+                    (disabled, false, MaxTimeslice::Disabled),
+                    (timed, true, MaxTimeslice::Nanoseconds(100_000)),
+                ] {
+                    let args = std::iter::once("--strict")
+                        .chain(spelling.iter().copied())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    validate_mode_extensions(
+                        "fixture/test",
+                        "custom",
+                        &ModeRecipe {
+                            args: args.clone(),
+                            ..ModeRecipe::default()
+                        },
+                    )
+                    .unwrap();
+                    custom.test.modes.get_mut("custom").unwrap().args = args;
+                    assert_eq!(
+                        refused_on_an_inexact_branch_counter(&custom),
+                        refused,
+                        "{backend} custom {spelling:?}"
+                    );
+                    assert_eq!(
+                        custom.strictness().unwrap().max_timeslice,
+                        recorded,
+                        "{backend} custom {spelling:?}"
+                    );
+                }
+            }
+            for (value, refused) in [
+                ("disabled", false),
+                ("0", false),
+                ("00", false),
+                ("+0", false),
+                ("100000", true),
+                ("+100000", true),
+            ] {
+                let hermit_args = BTreeMap::from([(
+                    backend.to_string(),
+                    vec![format!("--max-timeslice={value}")],
+                )]);
+                let mut cell = verify_cell(backend, true, hermit_args, None);
+                for host_level in [HostLevel::default(), relaxed_host()] {
+                    cell.host_level = host_level;
+                    assert_eq!(
+                        refused_on_an_inexact_branch_counter(&cell),
+                        refused,
+                        "{backend} verify --max-timeslice={value} at {:?}",
+                        cell.strictness_level()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The timeslice flags hermit refuses with a usage error before any guest
+    /// runs are refused when the manifest loads, in a custom cell's arguments
+    /// and in a verify recipe: a value below one RCB or neither `disabled`
+    /// nor a number, a name with no value, and a second occurrence under
+    /// either name (each measured against hermit itself). A flag after `--`
+    /// is a guest argument, and a longer name is another option.
+    #[test]
+    fn timeslice_flags_resolve_and_are_refused_as_hermit_resolves_and_refuses_them() {
+        let resolve = |args: &[&str]| {
+            MaxTimeslice::from_options(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(resolve(&[]), Ok(None));
+        assert_eq!(resolve(&["--strict", "--lite"]), Ok(None));
+        assert_eq!(
+            resolve(&["--strict", "--max-timeslice", "disabled", "--lite"]),
+            Ok(Some(MaxTimeslice::Disabled))
+        );
+        assert_eq!(
+            resolve(&["--preemption-timeout=4000"]),
+            Ok(Some(MaxTimeslice::Nanoseconds(4_000)))
+        );
+        assert_eq!(
+            resolve(&["--max-timeslice=10"]),
+            Ok(Some(MaxTimeslice::Nanoseconds(10)))
+        );
+        assert_eq!(resolve(&["--strict", "--", "--max-timeslice=0"]), Ok(None));
+        assert_eq!(resolve(&["--max-timeslices=0"]), Ok(None));
+        for (refused, needle) in [
+            (&["--max-timeslice=5"][..], "below one RCB"),
+            (&["--max-timeslice=abc"], "neither `disabled`"),
+            (&["--max-timeslice="], "neither `disabled`"),
+            (&["--max-timeslice=Disabled"], "neither `disabled`"),
+            (&["--preemption-timeout", "9"], "below one RCB"),
+            (&["--max-timeslice"], "has no value"),
+            (&["--max-timeslice", "-5"], "has no value"),
+            (&["--preemption-timeout", "--", "0"], "has no value"),
+            (&["--max-timeslice=0", "--max-timeslice=0"], "a second time"),
+            (
+                &["--max-timeslice=0", "--preemption-timeout=0"],
+                "a second time",
+            ),
+            (
+                &["--preemption-timeout", "0", "--max-timeslice=100000"],
+                "a second time",
+            ),
+        ] {
+            let error = resolve(refused).unwrap_err();
+            assert!(error.contains(needle), "{refused:?}: {error}");
+            let custom = ModeRecipe {
+                args: refused.iter().map(|arg| arg.to_string()).collect(),
+                ..ModeRecipe::default()
+            };
+            let error = validate_mode_extensions("fixture/test", "custom", &custom).unwrap_err();
+            assert!(error.contains("custom args"), "{refused:?}: {error}");
+            assert!(error.contains(needle), "{refused:?}: {error}");
+        }
+        let verify = |value: &str| {
+            validate_mode_extensions(
+                "fixture/test",
+                "verify",
+                &ModeRecipe {
+                    backends_enabled: vec!["kvm".into()],
+                    hermit_args: BTreeMap::from([(
+                        "kvm".into(),
+                        vec![format!("--max-timeslice={value}")],
+                    )]),
+                    hermit_args_reason: Some("fixture timeslice".into()),
+                    ..ModeRecipe::default()
+                },
+            )
+        };
+        for accepted in ["disabled", "0", "+0", "10", "100000"] {
+            verify(accepted).unwrap();
+        }
+        for (refused, needle) in [
+            ("5", "below one RCB"),
+            ("abc", "neither `disabled`"),
+            ("Disabled", "neither `disabled`"),
+        ] {
+            let error = verify(refused).unwrap_err();
+            assert!(error.contains("hermit_args entry"), "{refused}: {error}");
+            assert!(error.contains(needle), "{refused}: {error}");
+        }
     }
 
     #[test]

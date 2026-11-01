@@ -366,12 +366,15 @@ specific configuration:
 
 - `hermit_args` are Hermit `run` flags added after the runner's own, per
   enabled backend: a backend not named gets none. Only
-  `--no-virtualize-cpuid` and `--max-timeslice=VALUE` are accepted. Each
-  relaxes determinism, so a non-empty `hermit_args_reason` is required and
-  every flag is recorded, with that reason, in the result row's
-  `relaxations`. `hermit_args_reason` is one string for every backend's
-  flags, or a mapping that names exactly the backends of `hermit_args`, each
-  with its own reason, so each cell records only its own.
+  `--no-virtualize-cpuid` and `--max-timeslice=VALUE` are accepted, VALUE as
+  hermit reads it: `disabled` or 0 turns the preemption timer off, and a value
+  hermit refuses (1 to 9, below one RCB, or anything else that is not a
+  number) is refused here. Each relaxes determinism, so a non-empty
+  `hermit_args_reason` is required and every flag is recorded, with that
+  reason, in the result row's `relaxations`. `hermit_args_reason` is one
+  string for every backend's flags, or a mapping that names exactly the
+  backends of `hermit_args`, each with its own reason, so each cell records
+  only its own.
 - `env` adds guest variables as `--env NAME=VALUE` after the runner's fixed
   guest environment; a name the runner sets (`HOME`, `TZ`, `LC_ALL`, ...) is
   refused. Only a verify or a replay mode accepts it. A replay cell that does
@@ -431,11 +434,18 @@ and the cell allow:
   (without the preemption timer it does not refuse an inexact counter). Nothing
   can make a host without the capabilities run the strict level.
 
-Only a verify cell on ptrace or e9patch, the backends whose virtual clock reads
-the host's branch counter, has a relaxed form. Every other cell runs as
-declared, and a chaos or replay cell that needs the counter is still
-`HOST-INAPPLICABLE` on a host without it. `test-harness run` prints the level it
-chose and why.
+Only a verify cell on ptrace or e9patch has a relaxed form. KVM's preemption
+timer reads the same branch counter, but a KVM cell has no relaxed form: it runs
+as declared, and on a host without an exact counter a strict KVM cell with a
+timeslice is `HOST-INAPPLICABLE`, as is a chaos or replay cell that needs the
+counter. A cell whose run has no timeslice arms no timer and still runs: a KVM
+cell whose recipe passes `--max-timeslice=disabled` or `--max-timeslice=0`, and
+a strict custom cell whose arguments turn the timer off in any spelling hermit
+accepts (`--max-timeslice` or its alias `--preemption-timeout`, with `disabled`
+or 0 after `=` or as the next argument). Custom arguments that hermit would
+refuse for their timeslice (a second one under either name, a name with no
+value, a value hermit refuses) are refused when the manifest loads. Every other
+cell runs as declared. `test-harness run` prints the level it chose and why.
 
 A verify mode that does not depend on preemption or CPUID virtualization may cap
 itself at the relaxed level, so it never has a strict form on any host:

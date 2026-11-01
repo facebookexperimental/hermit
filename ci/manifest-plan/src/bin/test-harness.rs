@@ -6151,6 +6151,33 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
         hermit
     }
 
+    /// [`host_capabilities_hermit`] that also answers the help probes a run
+    /// makes before its first cell (`run --help` and `record start --help`,
+    /// each naming `--verify-strict`), exits 2 for anything else, so a cell
+    /// that reaches an attempt fails there, and appends every invocation's
+    /// arguments to `dir/invocations`, so a test can tell whether a cell ran.
+    fn probed_host_capabilities_hermit(dir: &std::path::Path, present: bool) -> std::path::PathBuf {
+        let hermit = host_capabilities_hermit(dir, present);
+        let script = fs::read_to_string(&hermit).unwrap();
+        let guard = "test \"$*\" = 'host-capabilities --json' || exit 2\n";
+        assert!(script.contains(guard), "{script}");
+        let script = script.replacen(
+            guard,
+            &format!(
+                "printf '%s\\n' \"$*\" >> '{}'\n\
+                 case \"$*\" in\n\
+                 'run --help' | 'record start --help') echo '--verify-strict'; exit 0 ;;\n\
+                 'host-capabilities --json') ;;\n\
+                 *) exit 2 ;;\n\
+                 esac\n",
+                dir.join("invocations").display()
+            ),
+            1,
+        );
+        fs::write(&hermit, script).unwrap();
+        hermit
+    }
+
     /// The `evidence_complete_executions` entry of the execution that wrote
     /// `row`.
     fn import_execution(row: &CellResult) -> serde_json::Value {
@@ -9018,14 +9045,16 @@ sys.exit(1 if failed else 0)
     }
 
     /// Where the hermit binary reports an inexact branch counter it refuses
-    /// `hermit run --strict` and `hermit record start --strict` on ptrace and
-    /// e9patch, so exactly the cells that run those are withheld, with the
-    /// binary's evidence. A replay cell runs `record start --strict`
+    /// `hermit run --strict` and `hermit record start --strict` on the
+    /// backends whose strict run arms the PMU preemption timer (ptrace,
+    /// e9patch and kvm), so exactly the cells that run those are withheld,
+    /// with the binary's evidence. A replay cell runs `record start --strict`
     /// (https://github.com/rrnewton/hermit/issues/3810). A custom cell without
-    /// `--strict` runs plain `run`, which the binary runs, so it still runs
-    /// here. An unprobed binary withholds nothing.
+    /// `--strict`, or whose arguments turn the timer off, runs a `run` the
+    /// binary runs, so it still runs here. An unprobed binary withholds
+    /// nothing.
     #[test]
-    fn strict_run_pmu_clock_cells_are_withheld_where_the_binary_reports_an_inexact_counter() {
+    fn strict_timer_runs_are_withheld_where_the_binary_reports_an_inexact_counter() {
         let manifests = ManifestSet::load(&super::root(None)).unwrap();
         let cell = |test: &str, mode: &str| {
             manifests
@@ -9061,7 +9090,7 @@ sys.exit(1 if failed else 0)
             cell("c-programs/random-readv-stream", "replay"),
         ];
         for mut strict_run in strict_runs {
-            for backend in ["ptrace", "e9patch"] {
+            for backend in ["ptrace", "e9patch", "kvm"] {
                 strict_run.id.backend = Some(backend.into());
                 let (capabilities, reason) = withheld(&strict_run).unwrap();
                 assert_eq!(capabilities, ["exact-branch-counter"]);
@@ -9076,13 +9105,7 @@ sys.exit(1 if failed else 0)
                 );
                 assert!(cell_host_inapplicable_reason(&strict_run, &present, None).is_none());
             }
-            for backend in [
-                Some("kvm"),
-                Some("dbt"),
-                Some("sabre"),
-                Some("liteinst"),
-                None,
-            ] {
+            for backend in [Some("dbt"), Some("sabre"), Some("liteinst"), None] {
                 strict_run.id.backend = backend.map(Into::into);
                 assert!(withheld(&strict_run).is_none(), "{:?}", strict_run.id);
             }
@@ -9095,6 +9118,40 @@ sys.exit(1 if failed else 0)
                 .iter()
                 .any(|arg| arg == "--strict")
         );
+        // A strict custom cell whose arguments turn the timer off, in any
+        // spelling hermit accepts, reads no branch counter and still runs; the
+        // same spelling with a timeslice is withheld.
+        let mut untimed = cell("c-programs/environment-and-workdir", "custom");
+        let strict_args = untimed.test.modes["custom"].args.clone();
+        for (spelling, timed) in [
+            (&["--max-timeslice=0"][..], &["--max-timeslice=100000"][..]),
+            (
+                &["--max-timeslice", "disabled"],
+                &["--max-timeslice", "100000"],
+            ),
+            (
+                &["--preemption-timeout=disabled"],
+                &["--preemption-timeout=100000"],
+            ),
+            (
+                &["--preemption-timeout", "0"],
+                &["--preemption-timeout", "100000"],
+            ),
+        ] {
+            for backend in ["ptrace", "e9patch", "kvm"] {
+                untimed.id.backend = Some(backend.into());
+                for (args, withholds) in [(spelling, false), (timed, true)] {
+                    let custom_args = &mut untimed.test.modes.get_mut("custom").unwrap().args;
+                    *custom_args = strict_args.clone();
+                    custom_args.extend(args.iter().map(|arg| arg.to_string()));
+                    assert_eq!(
+                        withheld(&untimed).is_some(),
+                        withholds,
+                        "{backend} {args:?}"
+                    );
+                }
+            }
+        }
         // `--namespace-only` arms no branch counter, so the binary does not
         // refuse it for the counter even with `--strict` (with the harness's
         // explicit `--backend` it is a usage error, which must fail visibly).
@@ -9106,6 +9163,201 @@ sys.exit(1 if failed else 0)
             assert!(withheld(&namespace_only).is_none(), "{flag}");
         }
         assert!(withheld(&custom).is_none(), "{:?}", custom.id);
+    }
+
+    /// The real run(), with HERMIT_BIN a planted hermit that answers only
+    /// `host-capabilities --json` and the run's help probes, and logs every
+    /// command line ([`probed_host_capabilities_hermit`]): where it reports no
+    /// exact branch counter, a strict KVM verify cell is withheld before any
+    /// attempt. The binary is never asked to run it, no cell row is published,
+    /// and the summary's `host_inapplicable_cells` and the JUnit skip name the
+    /// binary's evidence (the run, whose only cell ran nothing, is then refused
+    /// as vacuous). Where it reports the counter exact, the same cell makes one
+    /// attempt (the planted binary cannot run it, so that attempt fails, which
+    /// is not what this test checks).
+    #[test]
+    fn a_strict_kvm_cell_makes_no_attempt_where_the_binary_reports_an_inexact_counter() {
+        use std::path::PathBuf;
+        use std::process::Command;
+
+        use serde_json::json;
+
+        const CHILD_FIXTURE: &str = "HERMIT_HARNESS_KVM_INEXACT_COUNTER_FIXTURE";
+        const TEST_NAME: &str =
+            "tests::a_strict_kvm_cell_makes_no_attempt_where_the_binary_reports_an_inexact_counter";
+        if let Some(fixture) = std::env::var_os(CHILD_FIXTURE) {
+            let fixture = PathBuf::from(fixture);
+            let manifests = ManifestSet::load(&fixture).unwrap();
+            let argv: Vec<String> = vec![
+                "--repo-root".into(),
+                fixture.to_string_lossy().into_owned(),
+                "--source-sha".into(),
+                "0123456789abcdef0123456789abcdef01234567".into(),
+                "--test".into(),
+                "inexact/kvm".into(),
+                "--mode".into(),
+                "verify".into(),
+                "--backend".into(),
+                "kvm".into(),
+                "--no-retry".into(),
+                "--results".into(),
+                fixture.join("results.jsonl").to_string_lossy().into_owned(),
+                "--junit".into(),
+                fixture.join("junit.xml").to_string_lossy().into_owned(),
+            ];
+            let args = parse(argv.into_iter());
+            super::validate_args("run", &args);
+            let _ = super::run(&fixture, &manifests, &args);
+            return;
+        }
+
+        let disabled = |backends: &[&str]| {
+            json!({
+                "ci": false,
+                "backends_enabled": [],
+                "backends_disabled": backends
+                    .iter()
+                    .map(|backend| (backend.to_string(), json!("This fixture runs only its verify cells")))
+                    .collect::<serde_json::Map<_, _>>(),
+            })
+        };
+        let hermit_backends = ["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"];
+        let manifest = json!({
+            "schema": 3,
+            "bucket": "inexact",
+            "test": [{
+                "id": "inexact/kvm",
+                "description": "A strict KVM verify cell on a host whose hermit reports no exact branch counter",
+                "lane": "portable",
+                "occasional": false,
+                "direct": ["/bin/true"],
+                "observation": {"status": true, "stdout": true, "stderr": true},
+                "modes": {
+                    "verify": {
+                        "ci": true,
+                        "backends_enabled": ["ptrace", "kvm"],
+                        "backends_disabled": {
+                            "dbt": "This fixture runs only ptrace and kvm",
+                            "sabre": "This fixture runs only ptrace and kvm",
+                            "liteinst": "This fixture runs only ptrace and kvm",
+                            "in-guest-trap": "This fixture runs only ptrace and kvm"
+                        }
+                    },
+                    "chaos": disabled(&hermit_backends),
+                    "replay": disabled(&hermit_backends),
+                    "custom": disabled(&hermit_backends),
+                    "naked": disabled(&["native"])
+                }
+            }]
+        });
+        for exact in [false, true] {
+            let fixture = std::env::temp_dir().join(format!(
+                "hermit-harness-kvm-inexact-{}-{exact}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&fixture);
+            fs::create_dir(&fixture).unwrap();
+            let manifests = fixture.join("tests/e2e/manifests");
+            fs::create_dir_all(&manifests).unwrap();
+            fs::write(
+                manifests.join("defaults.yaml"),
+                "schema: 3\ntimeout_seconds: 5\ncpu_timeout_seconds: 4\n",
+            )
+            .unwrap();
+            fs::write(
+                manifests.join("inexact.yaml"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let hermit = probed_host_capabilities_hermit(&fixture, exact);
+            let output = Command::new("timeout")
+                .args(["--kill-after=2s", "25s"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env(CHILD_FIXTURE, &fixture)
+                .env("HERMIT_BIN", &hermit)
+                // The planted binary reports every host capability present;
+                // the probes must agree, so the counter alone decides.
+                .env(
+                    "HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT",
+                    "kvm,cpuid-faulting",
+                )
+                .env("E2E_RESULT_ROOT", fixture.join("artifacts"))
+                .env("E2E_BUILD_ROOT", fixture.join("build"))
+                .env("E2E_RUN_ID", "kvm-inexact-counter")
+                .env("E2E_MACHINE_SHORTNAME", "kvm-inexact-counter")
+                .env("E2E_KERNEL_VERSION", "kvm-inexact-counter")
+                .env("E2E_PARITY_POST_PASS", "0")
+                .env("DAGRUN_TEST_COUNTS_PATH", fixture.join("counts.json"))
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "the child test must pass: {}\n{stdout}\n{stderr}",
+                fixture.display()
+            );
+            let rows = fs::read_to_string(fixture.join("results.jsonl"))
+                .unwrap_or_else(|error| panic!("{error}\n{stdout}\n{stderr}"))
+                .lines()
+                .map(|line| serde_json::from_str::<CellResult>(line).unwrap())
+                .collect::<Vec<_>>();
+            let summary: serde_json::Value =
+                serde_json::from_slice(&fs::read(fixture.join("summary.json")).unwrap()).unwrap();
+            // Every hermit command line but the run's probes is a cell's attempt.
+            let attempts = fs::read_to_string(fixture.join("invocations"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| {
+                    !matches!(
+                        *line,
+                        "host-capabilities --json"
+                            | "run --help"
+                            | "record start --help"
+                            | "version --json"
+                    )
+                })
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if exact {
+                assert_eq!(rows.len(), 1, "{rows:?}\n{stderr}");
+                let row = &rows[0];
+                assert_eq!(
+                    (row.test.as_str(), row.mode.as_str(), row.backend.as_deref()),
+                    ("inexact/kvm", "verify", Some("kvm"))
+                );
+                assert_ne!(row.outcome, "HOST-INAPPLICABLE", "{row:?}");
+                assert_eq!(row.attempts.len(), 1, "{row:?}");
+                assert!(!attempts.is_empty(), "{stderr}");
+                assert_eq!(summary["host_inapplicable"], 0, "{summary}");
+            } else {
+                // No attempt: the binary never ran the guest, and no cell row
+                // was published (a withheld cell executed nothing).
+                assert!(attempts.is_empty(), "{attempts:?}");
+                assert!(rows.is_empty(), "{rows:?}");
+                assert_eq!(summary["cells"], 1, "{summary}");
+                assert_eq!(summary["host_inapplicable"], 1, "{summary}");
+                let withheld = &summary["host_inapplicable_cells"][0];
+                assert_eq!(
+                    (
+                        withheld["test"].as_str(),
+                        withheld["mode"].as_str(),
+                        withheld["backend"].as_str()
+                    ),
+                    (Some("inexact/kvm"), Some("verify"), Some("kvm"))
+                );
+                let reason = withheld["reason"].as_str().unwrap_or_default();
+                assert!(reason.contains("exact-branch-counter"), "{reason}");
+                assert!(reason.contains(PLANTED_COUNTER_EVIDENCE), "{reason}");
+                let junit = fs::read_to_string(fixture.join("junit.xml")).unwrap();
+                assert!(junit.contains("skipped=\"1\""), "{junit}");
+                assert!(stderr.contains("host-inapplicable"), "{stderr}");
+            }
+            fs::remove_dir_all(&fixture).unwrap();
+        }
     }
 
     const GUARDED_WORKFLOW: &str = r#"    # --allow-cgroup-failure is documented here but not executed.
