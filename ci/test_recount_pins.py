@@ -15,3 +15,14 @@ def test_drop_refused_and_growth_applies(tmp_path):
     assert _run(tmp_path, {"unit": 5}, 10).returncode == 1
     r = _run(tmp_path, {"unit": 12}, 10)
     assert r.returncode == 0 and "10 -> 12" in r.stdout
+
+
+def test_inventory_loss_refused(tmp_path):
+    import shutil
+    (tmp_path / "ci").mkdir(exist_ok=True)
+    shutil.copy(TOOL, tmp_path / "ci/recount-pins")
+    (tmp_path / "ci/recount-pins.json").write_text(json.dumps({"sites": [{"kind": "inventory", "name": "s", "file": "ci/inv.txt"}]}))
+    (tmp_path / "ci/inv.txt").write_text("a\nb\n")
+    receipt = tmp_path / "r.json"; receipt.write_text(json.dumps({"inventories": {"s": ["a"]}}))
+    r = subprocess.run([sys.executable, str(tmp_path / "ci/recount-pins"), str(receipt)], capture_output=True, text=True)
+    assert r.returncode == 1 and "-b" in r.stdout + r.stderr

@@ -37,10 +37,34 @@ def main(argv: list[str]) -> int:
         print(__doc__)
         return 2
     sites = json.loads(REGISTRY.read_text())["sites"] if REGISTRY.exists() else []
+    receipt_data = json.loads(Path(args[0]).read_text())
     counts = measured(Path(args[0]))
+    inventories: dict[str, list[str]] = {
+        str(k): [str(x) for x in v] for k, v in (receipt_data.get("inventories") or {}).items()
+    }
     drops: list[str] = []
     changes: list[str] = []
     for site in sites:
+        if site.get("kind") != "inventory":
+            continue
+        name, file = site["name"], ROOT / site["file"]
+        if name not in inventories:
+            continue
+        new_ids = sorted(set(inventories[name]))
+        old_ids = sorted({line.strip() for line in file.read_text().splitlines() if line.strip()}) if file.exists() else []
+        removed = [i for i in old_ids if i not in new_ids]
+        added = [i for i in new_ids if i not in old_ids]
+        if removed and not allow_drop:
+            drops.extend(f"{name}: -{i} (LOSS refused)" for i in removed)
+            continue
+        if added or removed:
+            changes.append(f"{site['file']}: {name}: +{len(added)} -{len(removed)}")
+            if apply:
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text("".join(f"{i}\n" for i in new_ids))
+    for site in sites:
+        if site.get("kind") == "inventory":
+            continue
         name, file, pattern = site["name"], ROOT / site["file"], site["pattern"]
         if name not in counts or not file.exists():
             continue
