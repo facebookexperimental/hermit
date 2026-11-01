@@ -18395,7 +18395,10 @@ impl Scheduler {
     /// schedule lasts that is not the start due next was not begun there in
     /// the recording: a hard desync of its thread, fatal under
     /// `--die-on-desync`. A due start not taken stays due until the next event
-    /// shows it was not taken (`Replayer::observe_event`).
+    /// shows it was not taken (`Replayer::observe_event`). Once the replay has
+    /// released its schedule the schedule no longer lasts
+    /// (`Replayer::has_events_left`): no start is due, and a call begun then
+    /// is the unguided run's, not a desync.
     fn record_or_replay_background_start(&mut self, dettid: DetTid, call: u64) {
         if !self.has_schedule_replay()
             && let Some(writer) = &mut self.preemption_writer
@@ -29765,6 +29768,229 @@ mod test {
         // The same record without noted starts hands the call over.
         let mut heuristic = replay(&[], false, &[poller, caller]);
         assert_eq!(selected(&mut heuristic), caller);
+    }
+
+    /// A schedule replay that releases its schedule
+    /// (`replayer::UNMATCHED_EVENTS_BEFORE_RELEASE` unmatched events) while a
+    /// background start recorded past the release point is still queued is
+    /// over at the release, as one without starts is: it has no records left,
+    /// every thread takes the default priority, once
+    /// (`release_replay_priorities_if_exhausted`), and a call begun after it,
+    /// the recorded one or another, is the unguided run's, not a desync. The
+    /// summary still names the start as untaken, never reached. The same
+    /// record replayed without a release takes its start in place.
+    #[test]
+    fn a_released_schedule_replay_is_over_though_a_later_start_is_queued() {
+        let root = DetTid::from_raw(3);
+        let caller = DetTid::from_raw(5);
+        let next = DetTid::from_raw(7);
+        let spinner = DetTid::from_raw(9);
+        let threads = [root, caller, next, spinner];
+        let at = LogicalTime::from_nanos;
+        let schedule = vec![
+            SchedEvent::syscall(root, Sysno::getpid, SyscallPhase::Prehook).with_time(at(10_000)),
+            SchedEvent::syscall(root, Sysno::getppid, SyscallPhase::Prehook).with_time(at(20_000)),
+            SchedEvent::syscall(next, Sysno::getpid, SyscallPhase::Prehook).with_time(at(30_000)),
+        ];
+        // The recording began the caller's call after its second event.
+        let start = crate::preemptions::BackgroundStart {
+            after: 2,
+            thread: caller,
+            call: 1,
+        };
+        let replay = || {
+            let mut sched = Scheduler::new(&Config::default());
+            for tid in threads {
+                register_known_thread(&mut sched, tid);
+                sched.priorities.insert(tid, REPLAY_DEFERRED_PRIORITY);
+                sched.runqueue_push_back(tid);
+            }
+            sched.requeue_with_new_priority(root, REPLAY_FOREGROUND_PRIORITY);
+            sched.replayer =
+                Some(Replayer::new(schedule.clone()).with_background_starts(&[start], true));
+            sched
+        };
+        let hard = |sched: &Scheduler, tid: DetTid| {
+            sched
+                .replayer
+                .as_ref()
+                .unwrap()
+                .desync_counts
+                .get(&tid)
+                .map_or(0, |stats| stats.hard)
+        };
+
+        // The replay runs the record's first event, then a spinner whose
+        // events match none of the second until the replay lets go.
+        let mut released = replay();
+        let _ = released.consume_schedevent(&schedule[0]);
+        let spin = SchedEvent::syscall(spinner, Sysno::sched_yield, SyscallPhase::Prehook)
+            .with_time(at(15_000));
+        for _ in 1..replayer::UNMATCHED_EVENTS_BEFORE_RELEASE {
+            let _ = released.consume_schedevent(&spin);
+        }
+        assert!(!released.schedule_released());
+        assert!(released.replay_has_records_left());
+        assert!(!released.replay_priorities_released);
+        assert_eq!(released.priorities[&root], REPLAY_FOREGROUND_PRIORITY);
+        assert_eq!(released.priorities[&spinner], REPLAY_DEFERRED_PRIORITY);
+        let _ = released.consume_schedevent(&spin);
+        assert!(released.schedule_released());
+        // The start lies past the release point, after record event #1, and
+        // stays in the record; the replay is over all the same.
+        assert!(!released.replay_has_records_left());
+        assert_eq!(released.replay_next_resume(), None);
+        assert!(released.replay_priorities_released);
+        assert!(released.schedule_replay_over());
+        for tid in threads {
+            assert_eq!(released.priorities[&tid], DEFAULT_PRIORITY, "{tid}");
+            assert_eq!(
+                released.run_queue.queued_priority(tid),
+                Some(DEFAULT_PRIORITY),
+                "{tid}"
+            );
+        }
+        // Once: what the run sets later stays set.
+        released.requeue_with_new_priority(next, REPLAY_DEFERRED_PRIORITY);
+        // The recorded call and an unrecorded one, begun after the release.
+        released.record_or_replay_background_start(caller, 1);
+        released.record_or_replay_background_start(caller, 2);
+        let _ = released.consume_schedevent(&spin);
+        released.release_replay_priorities_if_exhausted();
+        assert_eq!(hard(&released, caller), 0);
+        assert_eq!(released.priorities[&next], REPLAY_DEFERRED_PRIORITY);
+        assert_eq!(
+            released.run_queue.queued_priority(next),
+            Some(REPLAY_DEFERRED_PRIORITY)
+        );
+        assert_eq!(
+            released
+                .replayer
+                .as_ref()
+                .unwrap()
+                .untaken_background_starts(),
+            [replayer::UntakenStart {
+                thread: caller,
+                call: 1,
+                after: 2,
+                passed_at: None,
+            }]
+        );
+        let summary = released.generate_partial_run_summary(None).unwrap();
+        let text = summary.desync_descrip.unwrap();
+        assert!(
+            text.contains("thread 5's call 1 before record event #2 (not reached)"),
+            "{text}"
+        );
+
+        // Control: the same record, followed, takes its start in place.
+        let mut followed = replay();
+        let _ = followed.consume_schedevent(&schedule[0]);
+        let _ = followed.consume_schedevent(&schedule[1]);
+        assert_eq!(
+            followed
+                .replayer
+                .as_ref()
+                .unwrap()
+                .pending_background_start(),
+            Some((caller, 1))
+        );
+        assert_eq!(followed.replay_next_resume(), Some((caller, None)));
+        followed.record_or_replay_background_start(caller, 1);
+        assert_eq!(hard(&followed, caller), 0);
+        assert_eq!(
+            followed
+                .replayer
+                .as_ref()
+                .unwrap()
+                .pending_background_start(),
+            None
+        );
+        assert_eq!(followed.priorities[&next], REPLAY_FOREGROUND_PRIORITY);
+        assert!(followed.replay_has_records_left());
+        assert!(!followed.replay_priorities_released);
+        let _ = followed.consume_schedevent(&schedule[2]);
+        assert!(!followed.schedule_released());
+        assert!(followed.replay_priorities_released);
+        for tid in threads {
+            assert_eq!(followed.priorities[&tid], DEFAULT_PRIORITY, "{tid}");
+        }
+    }
+
+    /// A schedule replay whose record ends with background starts after its
+    /// last event ends after the last of them, not at that event. Before each
+    /// start the replay is not over, has records left and runs the start's
+    /// thread at the foreground priority; taking the last start ends it, every
+    /// thread takes the default priority, and a further event changes
+    /// nothing. Tails of one start and of two.
+    #[test]
+    fn a_schedule_replay_ends_after_its_last_start_past_its_last_event() {
+        let root = DetTid::from_raw(3);
+        let next = DetTid::from_raw(5);
+        let first = DetTid::from_raw(7);
+        let second = DetTid::from_raw(9);
+        let threads = [root, next, first, second];
+        let at = LogicalTime::from_nanos;
+        let schedule = vec![
+            SchedEvent::syscall(root, Sysno::getpid, SyscallPhase::Prehook).with_time(at(10_000)),
+            SchedEvent::syscall(next, Sysno::getpid, SyscallPhase::Prehook).with_time(at(20_000)),
+        ];
+        let start = |thread| crate::preemptions::BackgroundStart {
+            after: 2,
+            thread,
+            call: 1,
+        };
+        for tail in [vec![first], vec![first, second]] {
+            let mut sched = Scheduler::new(&Config::default());
+            for tid in threads {
+                register_known_thread(&mut sched, tid);
+                sched.priorities.insert(tid, REPLAY_DEFERRED_PRIORITY);
+                sched.runqueue_push_back(tid);
+            }
+            sched.requeue_with_new_priority(root, REPLAY_FOREGROUND_PRIORITY);
+            let starts: Vec<_> = tail.iter().copied().map(start).collect();
+            sched.replayer =
+                Some(Replayer::new(schedule.clone()).with_background_starts(&starts, true));
+            for event in &schedule {
+                let _ = sched.consume_schedevent(event);
+            }
+            for &thread in &tail {
+                assert!(!sched.schedule_replay_over(), "{tail:?}");
+                assert!(sched.replay_has_records_left(), "{tail:?}");
+                assert_eq!(
+                    sched.priorities[&thread], REPLAY_FOREGROUND_PRIORITY,
+                    "{tail:?}"
+                );
+                sched.record_or_replay_background_start(thread, 1);
+            }
+            assert!(sched.schedule_replay_over(), "{tail:?}");
+            assert!(!sched.schedule_released(), "{tail:?}");
+            assert!(!sched.replay_has_records_left(), "{tail:?}");
+            for tid in threads {
+                assert_eq!(sched.priorities[&tid], DEFAULT_PRIORITY, "{tail:?} {tid}");
+            }
+            let further = SchedEvent::syscall(root, Sysno::getppid, SyscallPhase::Prehook)
+                .with_time(at(30_000));
+            let _ = sched.consume_schedevent(&further);
+            assert!(sched.schedule_replay_over(), "{tail:?}");
+            for tid in threads {
+                assert_eq!(sched.priorities[&tid], DEFAULT_PRIORITY, "{tail:?} {tid}");
+                assert_eq!(
+                    sched.run_queue.queued_priority(tid),
+                    Some(DEFAULT_PRIORITY),
+                    "{tail:?} {tid}"
+                );
+            }
+            let replayer = sched.replayer.as_ref().unwrap();
+            assert!(
+                replayer
+                    .desync_counts
+                    .values()
+                    .all(|counts| counts.hard == 0),
+                "{tail:?}"
+            );
+            assert!(replayer.untaken_background_starts().is_empty(), "{tail:?}");
+        }
     }
 
     /// A schedule replay that switches away from a thread at a syscall prehook

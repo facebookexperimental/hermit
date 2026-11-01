@@ -399,7 +399,13 @@ impl Replayer {
 
     /// The thread and call of the background start the recording took next,
     /// if one is due: the schedule's next decision, before its next event.
+    /// None once the replay has released its schedule (`release_schedule`):
+    /// it no longer follows the record, so no recorded start is due, and the
+    /// starts it left stay in the record for `untaken_background_starts`.
     pub(super) fn pending_background_start(&self) -> Option<(DetTid, u64)> {
+        if self.released() {
+            return None;
+        }
         self.pending_starts
             .front()
             .map(|&(thread, call, _)| (thread, call))
@@ -491,7 +497,9 @@ impl Replayer {
     ///
     /// A recorded background start due now comes first: the recording took
     /// it before its next event, and its turn runs no guest code, so it has no
-    /// slice length.
+    /// slice length. Once the replay has released its schedule there is
+    /// neither: the release drained the cursor, and no start is due
+    /// (`pending_background_start`).
     pub(super) fn next_resume(&self) -> Option<(DetTid, Option<LogicalTime>)> {
         if let Some((thread, _)) = self.pending_background_start() {
             return Some((thread, None));
@@ -569,10 +577,19 @@ impl Replayer {
     /// background start to take (after its last event, a start is still the
     /// schedule's). Past its end the run goes on unguided
     /// (`ReplayAction::Continue`).
+    ///
+    /// A released schedule has neither (`release_schedule`). The release
+    /// drains the events but leaves the starts recorded past its point, which
+    /// nothing will take: the replay no longer follows the record, so they
+    /// would hold the replay short of its end for good (no default
+    /// priorities, `Scheduler::release_replay_priorities_if_exhausted`, and
+    /// every unrecorded call a desync). `untaken_background_starts` still
+    /// reports them.
     pub(super) fn has_events_left(&self) -> bool {
-        self.cursor.peek().is_some()
-            || !self.pending_starts.is_empty()
-            || !self.background_starts.is_empty()
+        !self.released()
+            && (self.cursor.peek().is_some()
+                || !self.pending_starts.is_empty()
+                || !self.background_starts.is_empty())
     }
 
     /// Where the replay is: the number of the event it traces next, and the
@@ -590,7 +607,8 @@ impl Replayer {
     /// order (<https://github.com/rrnewton/hermit/issues/4876>): those it
     /// passed (the next event came, or a fast-forward skipped them), with
     /// where it was then, and those still due or not yet due, which it never
-    /// reached.
+    /// reached, those a release of the schedule left included
+    /// (`has_events_left`).
     pub(super) fn untaken_background_starts(&self) -> Vec<UntakenStart> {
         let mut untaken = self.passed_starts.clone();
         untaken.extend(
@@ -826,8 +844,10 @@ impl Replayer {
     /// The replay runs the thread the schedule names next and holds every
     /// other thread back. When that thread cannot produce the recorded event,
     /// a spinner waiting for a thread the replay holds back, say, the run
-    /// stops making progress for good. Dropping the rest of the schedule
-    /// ends the replay as running out of it does: the scheduler gives every
+    /// stops making progress for good. Dropping the rest of the schedule,
+    /// the background starts recorded past this point with it
+    /// (`has_events_left`), ends the replay as running out of it does: the
+    /// scheduler gives every
     /// thread the default priority (`Scheduler::consume_schedevent`), each
     /// thread's recorded callback checkpoints go with the events once it hears
     /// of the release (`Scheduler::schedule_replay_reply`), and the run goes
@@ -925,14 +945,8 @@ impl Replayer {
         // A recorded background start due now is the schedule's next
         // decision, before its next event or after its last one: its thread
         // runs next only to begin its call (`take_background_start`), with no
-        // slice length.
-        let next = match self.pending_background_start() {
-            Some((thread, _)) => Some((thread, None)),
-            None => self
-                .cursor
-                .peek()
-                .map(|next_ev| (next_ev.dettid, self.resolve_time_to_run(next_ev))),
-        };
+        // slice length (`next_resume`).
+        let next = self.next_resume();
         if let Some((next_tid, timeslice)) = next {
             let mytid = observed.dettid;
             let time = observed.end_time.expect("timestamps required for now");
@@ -1556,6 +1570,68 @@ mod tests {
         );
     }
 
+    /// A replay that releases its schedule has nothing left to replay, though
+    /// background starts recorded past the release point remain queued: none
+    /// is due, none names the thread to run next, and none can be taken. Each
+    /// is still reported as untaken, never reached. A due start is treated
+    /// alike; a release never finds one, since `observe_event` takes the due
+    /// starts before it can release, so the test places one by hand.
+    #[test]
+    fn a_released_schedule_has_no_events_left_though_starts_remain() {
+        let mut b = builder::SchedTestBuilder::new();
+        let recorded: Vec<SchedEvent> = (0..4).map(|_| b.other(SOME_RIP, tid(3))).collect();
+        let spinner = b.other(SOME_RIP + 8, tid(5));
+        let start = |after, raw, call| crate::preemptions::BackgroundStart {
+            after,
+            thread: tid(raw),
+            call,
+        };
+        let mut replayer = Replayer::new(recorded.clone())
+            .with_background_starts(&[start(2, 7, 1), start(4, 9, 1)], true);
+        assert_eq!(
+            replayer.observe_event(&recorded[0]),
+            ReplayAction::Continue(None)
+        );
+        for _ in 0..UNMATCHED_EVENTS_BEFORE_RELEASE {
+            replayer.observe_event(&spinner);
+        }
+        assert!(replayer.released());
+        assert_eq!(replayer.unconsumed_background_starts(), 2);
+        assert!(!replayer.has_events_left());
+        assert_eq!(replayer.pending_background_start(), None);
+        assert_eq!(replayer.next_resume(), None);
+        assert!(!replayer.take_background_start(tid(7), 1));
+
+        replayer.pending_starts.push_back((tid(11), 1, 1));
+        assert!(!replayer.has_events_left());
+        assert_eq!(replayer.pending_background_start(), None);
+        assert_eq!(replayer.next_resume(), None);
+        assert!(!replayer.take_background_start(tid(11), 1));
+        assert_eq!(replayer.unconsumed_background_starts(), 3);
+
+        let never_reached = |thread, after| UntakenStart {
+            thread: tid(thread),
+            call: 1,
+            after,
+            passed_at: None,
+        };
+        assert_eq!(
+            replayer.untaken_background_starts(),
+            [
+                never_reached(11, 1),
+                never_reached(7, 2),
+                never_reached(9, 4)
+            ]
+        );
+        assert_eq!(
+            replayer.position_now(),
+            ReplayPosition {
+                event: 1 + UNMATCHED_EVENTS_BEFORE_RELEASE,
+                record_event: 1
+            }
+        );
+    }
+
     /// A fast-forward past recorded events retires the starts recorded among
     /// them or before the matched event as hard desyncs of their threads, and
     /// leaves the start recorded after the matched event to come due in its
@@ -1612,9 +1688,12 @@ mod tests {
         assert_eq!(strict.desync_counts[&tid(5)].hard, 1);
 
         // The rest of the schedule survives the fast-forward: five events of
-        // one thread with a start recorded after the fourth, and the second
-        // observed first. The replay drops the first event, follows the rest,
-        // takes the start when it comes due, and then is exhausted.
+        // one thread with a start recorded after the fourth and one after the
+        // last, and the second observed first. The replay drops the first
+        // event, follows the rest, takes each start when it comes due, and
+        // then is exhausted. The dropped event counts toward the position
+        // (`skipped`), so the start after the last event comes due when that
+        // event is consumed rather than waiting for ever.
         let mut b = builder::SchedTestBuilder::new();
         let five = strip_times(vec![
             b.branch(10, tid(3)),
@@ -1623,8 +1702,8 @@ mod tests {
             b.branch(40, tid(3)),
             b.branch(50, tid(3)),
         ]);
-        let mut resynced =
-            Replayer::new(five.clone()).with_background_starts(&[start(4, 3, 1)], true);
+        let mut resynced = Replayer::new(five.clone())
+            .with_background_starts(&[start(4, 3, 1), start(5, 3, 2)], true);
         resynced.observe_event(&five[1]);
         assert_eq!(resynced.desync_counts[&tid(3)].fast_forwards, 1);
         assert_eq!(resynced.cursor.peek(), Some(&five[2]));
@@ -1633,6 +1712,10 @@ mod tests {
         assert_eq!(resynced.pending_background_start(), Some((tid(3), 1)));
         assert!(resynced.take_background_start(tid(3), 1));
         resynced.observe_event(&five[4]);
+        assert_eq!(resynced.pending_background_start(), Some((tid(3), 2)));
+        assert_eq!(resynced.next_resume(), Some((tid(3), None)));
+        assert!(resynced.has_events_left());
+        assert!(resynced.take_background_start(tid(3), 2));
         assert_eq!(resynced.desync_counts[&tid(3)].hard, 0);
         assert!(!resynced.has_events_left());
         assert_eq!(resynced.unconsumed_background_starts(), 0);
