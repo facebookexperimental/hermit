@@ -134,7 +134,7 @@ fi
 # "error: no matching package named `dagrun` found". The remedy was
 # `git submodule update --init agent-utils`, which the message never named.
 #
-# ⚠️ IT IS THE DOCUMENTED LANDING PROCEDURE THAT PRODUCES THIS. CLAUDE.md tells
+# ⚠️ IT IS THE DOCUMENTED LANDING PROCEDURE THAT PRODUCES THIS. AGENTS.md tells
 # every agent to land from a clean detached worktree, and a clean detached
 # worktree is exactly where submodules are unpopulated. So the safe procedure
 # reliably produced a misleading failure and each agent paid to rediagnose it.
@@ -213,7 +213,7 @@ if [[ ${#unpopulated[@]} -ne 0 ]]; then
         done
         echo
         echo "then push again. A fresh detached worktree -- the landing procedure"
-        echo "CLAUDE.md prescribes -- always starts in this state."
+        echo "AGENTS.md prescribes -- always starts in this state."
         echo
         echo "To push anyway: git push --no-verify"
         echo

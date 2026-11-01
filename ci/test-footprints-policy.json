@@ -214,7 +214,6 @@
         ".agents/**",
         ".claude/**",
         ".llms/**",
-        "CLAUDE.md",
         "scripts/check-skill-discovery.rs"
       ],
       "nodes": ["check.skill_discovery"]

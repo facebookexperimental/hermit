@@ -169,7 +169,7 @@ consequences:
    unknown baseline and returns **full**. It never skips on an unproven baseline.
 2. **The baseline SHA is supplied by the validate-run-ledger.** This tool is
    storage-agnostic: it does not decide what "green" means or remember past
-   runs. The [`validate-run-ledger`](../../CLAUDE.md) records, per slot, the last
+   runs. The [`validate-run-ledger`](../../AGENTS.md) records, per slot, the last
    commit whose validate run was green; a `scripts/validate.rs` wrapper reads that SHA
    and passes it in. See "Integration contract" below.
 

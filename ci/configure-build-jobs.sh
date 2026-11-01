@@ -2703,7 +2703,7 @@ fi
 # CARRY TO 6f8fc22eea171058f135b47bc8dc515554e613f2 (2026-10-24): from
 # 0e2bf15a2ca0ce02beb4c15532def254a629bc2e. Three commits: 223fa0e3 changes only
 # reverie-ptrace/src/tracer.rs (its held timer-step test fixture now retires
-# conditional branches), 6c55cdbe adds only the root AGENTS.md and CLAUDE.md,
+# conditional branches), 6c55cdbe adds only the root AGENTS.md,
 # and the kvm lane's per-call slice 7e (reverie-kvm
 # lends each syscall callback's registers and counted interval's CPU pin
 # instead of copying them, and allocates nothing for the fstat path's
