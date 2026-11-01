@@ -173,6 +173,7 @@ fn is_policy_refusal(err: &Error) -> bool {
             || is_chosen_root_id_taken(cause)
             || is_kvm_host_resources_refusal(cause)
             || is_kvm_named_refusal(cause)
+            || is_kvm_vfork_child_refusal(cause)
     }
     // The KVM backend's end of a run whose exec it could not finish past the
     // exec's point of no return, because a host resource of Hermit's own
@@ -202,6 +203,29 @@ fn is_policy_refusal(err: &Error) -> bool {
     }
     #[cfg(not(target_arch = "x86_64"))]
     fn is_kvm_named_refusal(_cause: &(dyn std::error::Error + 'static)) -> bool {
+        false
+    }
+    // The KVM backend's refusal by name of an operation of a vfork child that
+    // its copy of the parent's memory cannot carry back (reverie-kvm's
+    // `Error::VforkChildCapability`, found beneath the wrappers a run's
+    // failure is aggregated in): a mapping change the child leaves in place
+    // when its window ends, a byte the child and another thread of its parent
+    // both changed, a changed page whose mapping that thread replaced or
+    // removed, a brk that moves the break, and thread creation in the child
+    // (https://github.com/rrnewton/hermit/issues/5025).
+    #[cfg(target_arch = "x86_64")]
+    fn is_kvm_vfork_child_refusal(cause: &(dyn std::error::Error + 'static)) -> bool {
+        cause
+            .downcast_ref::<reverie_kvm::Error>()
+            .is_some_and(|error| {
+                matches!(
+                    error.primary(),
+                    reverie_kvm::Error::VforkChildCapability { .. }
+                )
+            })
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn is_kvm_vfork_child_refusal(_cause: &(dyn std::error::Error + 'static)) -> bool {
         false
     }
     // The guest's first process could not have its chosen ID

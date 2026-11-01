@@ -1945,7 +1945,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The KVM executor's refusals by name as policy refusals
     // (https://github.com/rrnewton/hermit/issues/4768) add one hermit-run
     // unit: 1329 + 1 = 1330.
-    ("test.hermit_unit", 1330),
+    // kvm_failure_tests::kvm_vfork_child_refusals_are_policy_refusals
+    // (https://github.com/rrnewton/hermit/issues/5025): 1330 + 1 = 1331,
+    // measured by nextest list.
+    ("test.hermit_unit", 1331),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6145,7 +6148,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1319 + 4 = 1323 (carried: the hosted lane did not run here; the
     // portable twin executed 1329 in the targeted rerun).
     // The same KVM named-refusal unit: 1323 + 1 = 1324.
-    ("test.hermit_unit_on_host", 1324),
+    // The same KVM vfork-child refusal unit: 1324 + 1 = 1325, measured by
+    // nextest list.
+    ("test.hermit_unit_on_host", 1325),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

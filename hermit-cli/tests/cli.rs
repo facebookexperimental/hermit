@@ -9022,21 +9022,21 @@ fn read_the_main_stack_from_maps_as_on_linux(backend: &str) {
             .unwrap_or_else(|| panic!("no vfork step:\n{with_vfork}"));
         with_vfork_steps.remove(vfork_step);
         assert_eq!(with_vfork_steps, step_sections(&native), "{with_vfork}");
-        // With the step, Hermit refuses the run by name when the vfork child
-        // exits with the page still read-only, before its parent prints the
-        // step.
+        // With the step, Hermit refuses the run by name, as a policy refusal,
+        // when the vfork child exits with the page still read-only, before its
+        // parent prints the step
+        // (https://github.com/rrnewton/hermit/issues/5025).
         let (code, stdout, stderr) = main_stack_output_once(backend, &guest, &[]);
-        // KNOWN DEFECT (https://github.com/rrnewton/hermit/issues/5025): this
-        // named refusal exits 125 as an internal failure, where it should exit
-        // 122 as a policy refusal, because `is_policy_refusal` does not yet
-        // recognize VF1's vfork refusals. This assertion is meant to fail when
-        // the class is fixed; the expectation then moves to 122,
-        // `HERMIT_POLICY_REFUSAL_EXIT`.
         // EXIT-CLASS: hermit
         assert_eq!(
             code,
-            Some(HERMIT_INTERNAL_FAILURE_EXIT),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
             "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+                && !stderr.contains("HERMIT_INTERNAL_FAILURE"),
+            "{stderr}"
         );
         assert!(stderr.contains(KVM_VFORK_MAPPING_REFUSAL), "{stderr}");
         assert!(

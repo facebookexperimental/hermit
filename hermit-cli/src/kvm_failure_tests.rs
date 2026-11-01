@@ -249,6 +249,108 @@ async fn kvm_exec_out_of_host_resources_past_its_point_of_no_return_is_a_policy_
     }
 }
 
+/// Each refusal by name of a KVM vfork child's operation that the backend's
+/// copy of its parent's memory cannot carry back (reverie-kvm's
+/// `Error::VforkChildCapability`), alone or beneath the wrappers a run's
+/// failure is aggregated in, ends the run as a policy refusal (exit 122), not
+/// as Hermit's internal failure (exit 125)
+/// (https://github.com/rrnewton/hermit/issues/5025). A genuine backend failure
+/// keeps the backend-failure class, and so does a run whose refusal is only a
+/// cleanup error beside such a failure.
+#[tokio::test]
+async fn kvm_vfork_child_refusals_are_policy_refusals() {
+    use crate::error::FailureKind;
+    // The refusals of reverie-kvm-core's vfork write-back and of
+    // reverie-linuxemu's dispatch, by operation and reason.
+    const REFUSALS: [(&str, &str); 5] = [
+        (
+            "vfork write-back",
+            "the vfork child left a mapping changed (by mmap, munmap, mprotect or mremap) when \
+             its window ended, which on Linux would be its parent's too, and a copy carries \
+             back contents, not mappings",
+        ),
+        (
+            "vfork write-back",
+            "the vfork child and another thread of its parent changed the same bytes during \
+             the window, which a copy cannot order",
+        ),
+        (
+            "vfork write-back",
+            "another thread of the parent removed or replaced the mapping of a page the vfork \
+             child changed during the window",
+        ),
+        (
+            "brk in a vfork child",
+            "a vfork child shares its parent's address space until it execs or exits, and runs \
+             on a copy here whose changes to private memory go back to the parent, but whose \
+             program break cannot: on Linux this call would move the parent's break too",
+        ),
+        (
+            "thread creation in a vfork child",
+            "a vfork child shares its parent's address space until it execs or exits, and runs \
+             on a copy here whose changes go back to the parent when its window ends; Linux \
+             ends that window when the creating task execs or exits, whatever threads of the \
+             child still run, and a copy cannot go back while another thread still changes it",
+        ),
+    ];
+    let failure = || reverie_kvm::Error::InvalidGuestPid(-17);
+    let mut cases = Vec::new();
+    for (operation, reason) in REFUSALS {
+        let refusal = || reverie_kvm::Error::VforkChildCapability { operation, reason };
+        cases.extend([
+            (refusal(), FailureKind::PolicyRefusal),
+            (
+                reverie_kvm::Error::SharedFailure(std::sync::Arc::new(refusal())),
+                FailureKind::PolicyRefusal,
+            ),
+            (
+                reverie_kvm::Error::WithCleanup {
+                    primary: std::sync::Arc::new(refusal()),
+                    cleanup: vec![std::sync::Arc::new(reverie_kvm::Error::RunAborted)],
+                },
+                FailureKind::PolicyRefusal,
+            ),
+            (
+                reverie_kvm::Error::WithCleanup {
+                    primary: std::sync::Arc::new(failure()),
+                    cleanup: vec![std::sync::Arc::new(refusal())],
+                },
+                FailureKind::BackendRunFailure,
+            ),
+        ]);
+    }
+    cases.push((failure(), FailureKind::BackendRunFailure));
+    for (backend, kind) in cases {
+        let description = backend.to_string();
+        let config = DetConfig {
+            sequentialize_threads: true,
+            ..DetConfig::default()
+        };
+        let global_state = detcore::GlobalState::init_global_state(&config).await;
+        global_state.report_backend_failure(reverie::BackendFailure {
+            pid: reverie::Pid::from_raw(17),
+            tid: reverie::Pid::from_raw(18),
+            phase: "vfork child refusal control",
+        });
+        let completion = reverie_kvm::ToolRunCompletion {
+            global_state,
+            result: Err(backend),
+        };
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            finish_kvm_tool_completion(completion, false, &None),
+        )
+        .await
+        .expect("failure cleanup must finish naturally")
+        .expect_err("a backend failure is not a guest status");
+        assert_eq!(
+            crate::error::SerializableError::from(error).kind(),
+            kind,
+            "{description}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn kvm_failed_completion_preserves_requested_partial_preemption_recording() {
     let directory = tempfile::tempdir().unwrap();
