@@ -23,6 +23,17 @@ pub struct RetryRecordV1 {
     /// Diagnosis class per attempt (e.g. `product_failure`, `pass`);
     /// never used to decide whether a retry happened.
     pub attempt_classes: Vec<Option<String>>,
+    /// Error kind per attempt (e.g. `infrastructure` for an
+    /// understood-infrastructure signature, `timeout` for no_result);
+    /// the signature half of the diagnosis, recorded beside the class so
+    /// a later flakiness investigation can judge the infra classifier.
+    #[serde(default)]
+    pub attempt_error_kinds: Vec<Option<String>>,
+    /// Named cause per attempt (`skid_overshoot`, `host_input_changed`,
+    /// or the error kind), so skid-overshoot keeps its own bucket,
+    /// separate from other understood-infrastructure causes.
+    #[serde(default)]
+    pub attempt_signatures: Vec<Option<String>>,
     pub final_outcome: String,
     pub flaky_pass: bool,
 }
@@ -39,6 +50,26 @@ pub struct RetryRollupV1 {
     pub total_retries: u64,
     pub retried_tests: u64,
     pub flaky_passes: u64,
+    /// Retries (failed attempts beyond none; one per failed attempt) by
+    /// that attempt's failure class, for classifier-trust reporting.
+    /// Diagnosis only: it does not change the landing signal.
+    #[serde(default)]
+    pub retries_by_class: std::collections::BTreeMap<String, u64>,
+    /// Retries grouped two levels: by failure class (the four classes,
+    /// unchanged), in `retries_by_class`, and within a class by
+    /// subcategory (`retries_by_subcategory`, class -> subcategory ->
+    /// count). Understood-infrastructure subcategories are the stable
+    /// typed signatures: `pmu_skid`, `host_input_changed`,
+    /// `sandbox_denied`.
+    #[serde(default)]
+    pub retries_by_subcategory:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
+    /// Flaky passes whose every failed attempt was
+    /// `understood_infrastructure_failure`. Reported separately so the
+    /// owner can later decide whether these count as clean; today they
+    /// still make the run green-flaky like any other retry.
+    #[serde(default)]
+    pub infra_recovered: u64,
     /// Zero retries run-wide is the clean score.
     pub clean: bool,
     pub tests: Vec<RetryRecordV1>,
@@ -49,12 +80,75 @@ impl RetryRollupV1 {
         let total_retries = tests.iter().map(|t| t.retries).sum();
         let retried_tests = tests.iter().filter(|t| t.retries > 0).count() as u64;
         let flaky_passes = tests.iter().filter(|t| t.flaky_pass).count() as u64;
+        let mut retries_by_class: std::collections::BTreeMap<String, u64> = Default::default();
+        let mut retries_by_subcategory: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, u64>,
+        > = Default::default();
+        let mut infra_recovered = 0u64;
+        for test in &tests {
+            for (i, (class, outcome)) in test
+                .attempt_classes
+                .iter()
+                .zip(&test.attempt_outcomes)
+                .enumerate()
+            {
+                if outcome != "PASS" {
+                    if let Some(class) = class {
+                        *retries_by_class.entry(class.clone()).or_default() += 1;
+                    }
+                    let signature = test.attempt_signatures.get(i).and_then(|s| s.as_deref());
+                    // The four classes stay as they are; skid is a
+                    // subcategory of understood infrastructure, not a
+                    // fifth class. Nextest skid records carry the legacy
+                    // class label `skid_overshoot`; normalize it here.
+                    let class = match class.as_deref() {
+                        Some("skid_overshoot") => {
+                            Some("understood_infrastructure_failure".to_string())
+                        }
+                        other => other.map(str::to_string),
+                    };
+                    let subcategory = match signature {
+                        Some("skid_overshoot") => "pmu_skid",
+                        Some("host_input_changed") => "host_input_changed",
+                        Some("sandbox-denied") | Some("sandbox_denied") => "sandbox_denied",
+                        Some(other) => other,
+                        None => "unspecified",
+                    }
+                    .to_string();
+                    let class_key = class.unwrap_or_else(|| "unclassified".to_string());
+                    *retries_by_subcategory
+                        .entry(class_key)
+                        .or_default()
+                        .entry(subcategory)
+                        .or_default() += 1;
+                }
+            }
+            let failed_classes: Vec<&String> = test
+                .attempt_classes
+                .iter()
+                .zip(&test.attempt_outcomes)
+                .filter(|(_, outcome)| *outcome != "PASS")
+                .filter_map(|(class, _)| class.as_ref())
+                .collect();
+            if test.flaky_pass
+                && !failed_classes.is_empty()
+                && failed_classes
+                    .iter()
+                    .all(|c| c.as_str() == "understood_infrastructure_failure")
+            {
+                infra_recovered += 1;
+            }
+        }
         Self {
             schema: 1,
             max_attempts_per_test: MAX_ATTEMPTS_PER_CELL,
             total_retries,
             retried_tests,
             flaky_passes,
+            retries_by_class,
+            retries_by_subcategory,
+            infra_recovered,
             clean: total_retries == 0,
             tests,
         }
@@ -91,6 +185,30 @@ impl RetryRollupV1 {
                     ]
                 } else {
                     vec![cell.first_failure_class.clone()]
+                },
+                attempt_signatures: if cell.attempts > 1 {
+                    vec![
+                        cell.first_signature.clone(),
+                        if cell.final_outcome == "PASS" {
+                            None
+                        } else {
+                            cell.first_signature.clone()
+                        },
+                    ]
+                } else {
+                    vec![cell.first_signature.clone()]
+                },
+                attempt_error_kinds: if cell.attempts > 1 {
+                    vec![
+                        cell.first_error_kind.clone(),
+                        if cell.final_outcome == "PASS" {
+                            None
+                        } else {
+                            cell.first_error_kind.clone()
+                        },
+                    ]
+                } else {
+                    vec![cell.first_error_kind.clone()]
                 },
                 final_outcome: cell.final_outcome.clone(),
                 flaky_pass: cell.final_outcome == "PASS",
@@ -166,6 +284,8 @@ mod tests {
             retries: 1,
             attempt_outcomes: vec!["FAIL".into(), "PASS".into()],
             attempt_classes: vec![Some("product_failure".into()), None],
+            attempt_error_kinds: vec![None, None],
+            attempt_signatures: vec![None, None],
             final_outcome: "PASS".into(),
             flaky_pass: true,
         };
@@ -187,6 +307,56 @@ mod tests {
     }
 
     #[test]
+    fn rollup_reports_retries_by_class_and_infra_recovered_without_changing_signal() {
+        let infra = RetryRecordV1 {
+            test: "fixture/infra".into(),
+            mode: "verify".into(),
+            backend: Some("ptrace".into()),
+            attempts: 2,
+            retries: 1,
+            attempt_outcomes: vec!["ERROR".into(), "PASS".into()],
+            attempt_classes: vec![Some("understood_infrastructure_failure".into()), None],
+            attempt_error_kinds: vec![Some("infrastructure".into()), None],
+            attempt_signatures: vec![Some("host_input_changed".into()), None],
+            final_outcome: "PASS".into(),
+            flaky_pass: true,
+        };
+        let product = RetryRecordV1 {
+            test: "fixture/product".into(),
+            mode: "verify".into(),
+            backend: None,
+            attempts: 2,
+            retries: 1,
+            attempt_outcomes: vec!["FAIL".into(), "PASS".into()],
+            attempt_classes: vec![Some("product_failure".into()), None],
+            attempt_error_kinds: vec![None, None],
+            attempt_signatures: vec![None, None],
+            final_outcome: "PASS".into(),
+            flaky_pass: true,
+        };
+        let rollup = RetryRollupV1::from_records(vec![infra, product]);
+        assert_eq!(rollup.infra_recovered, 1);
+        assert_eq!(
+            rollup
+                .retries_by_class
+                .get("understood_infrastructure_failure"),
+            Some(&1)
+        );
+        assert_eq!(rollup.retries_by_class.get("product_failure"), Some(&1));
+        // Diagnosis only: an infra-only recovered run is still green-flaky.
+        let (signal, _) = landing_signal(0, true, true, &rollup, 0, vec![]);
+        assert_eq!(signal, "green-flaky");
+        // Round-trip, and a pre-existing record without the new fields parses.
+        let value = serde_json::to_value(&rollup).unwrap();
+        assert_eq!(
+            serde_json::from_value::<RetryRollupV1>(value.clone()).unwrap(),
+            rollup
+        );
+        let legacy = r#"{"test":"fixture/old","mode":"verify","backend":null,"attempts":1,"retries":0,"attempt_outcomes":["PASS"],"attempt_classes":[null],"final_outcome":"PASS","flaky_pass":false}"#;
+        assert!(serde_json::from_str::<RetryRecordV1>(legacy).is_ok());
+    }
+
+    #[test]
     fn landing_signal_distinguishes_clean_flaky_and_red() {
         let clean = RetryRollupV1::from_records(vec![]);
         assert_eq!(
@@ -204,6 +374,8 @@ mod tests {
             retries: 1,
             attempt_outcomes: vec!["FAIL".into(), "PASS".into()],
             attempt_classes: vec![None, None],
+            attempt_error_kinds: vec![None, None],
+            attempt_signatures: vec![None, None],
             final_outcome: "PASS".into(),
             flaky_pass: true,
         }]);

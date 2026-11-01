@@ -35,11 +35,30 @@ pub struct RetriedCellV1 {
     pub first_outcome: String,
     pub first_failure_class: Option<String>,
     pub first_error_kind: Option<String>,
+    /// Named signature of the first attempt's cause, derived from its own
+    /// recorded reason: `skid_overshoot` or `host_input_changed` for the
+    /// typed infrastructure causes, otherwise the error kind. Keeps
+    /// skid-overshoot its own bucket, separate from other infrastructure.
+    pub first_signature: Option<String>,
     pub first_result: Option<String>,
     pub first_divergent_scheduler_turn: Option<u64>,
     pub first_divergent_record: Option<u64>,
     pub first_divergent_syscall: Option<u64>,
     pub final_outcome: String,
+}
+
+/// The named cause of one attempt, from its recorded reason. Only the
+/// typed infrastructure causes get their own names; everything else
+/// falls back to the attempt's error kind.
+pub fn signature_of(reason: Option<&str>, error_kind: Option<&str>) -> String {
+    let reason = reason.unwrap_or_default();
+    if reason.contains("HERMIT_SKID_OVERSHOOT") {
+        "skid_overshoot".to_string()
+    } else if reason.contains("host_input_changed") || reason.contains("outside the guest") {
+        "host_input_changed".to_string()
+    } else {
+        error_kind.unwrap_or("unclassified").to_string()
+    }
 }
 
 impl FrameworkRetriesV1 {
@@ -99,6 +118,10 @@ impl FrameworkRetriesV1 {
                     first_outcome: outcome(first),
                     first_failure_class: text("failure_class"),
                     first_error_kind: text("error_kind"),
+                    first_signature: Some(signature_of(
+                        text("reason").as_deref(),
+                        text("error_kind").as_deref(),
+                    )),
                     first_result: text("result"),
                     first_divergent_scheduler_turn: number("first_divergent_scheduler_turn"),
                     first_divergent_record: number("first_divergent_record"),
