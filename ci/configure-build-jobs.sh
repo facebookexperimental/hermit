@@ -3171,8 +3171,20 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, e2a6ab75, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 9443a6b2825711294852a75a955744c027684f16 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 9443a6b2825711294852a75a955744c027684f16 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO bca5399182dae3dc22ac959e3873e44be9271a69 (2026-11-01): from 9443a6b2825711294852a75a955744c027684f16.
+# Interval: a fork's copy of an arena with separately backed pages copies the
+# base backing's data extents and each such page's own backing's data extent,
+# reading no hole, and a discard makes one call per run of one backing
+# (4f93dd75); the fork fixture also copies a run that starts inside its
+# backing (83915d80); in reverie-kvm-core and reverie-kvm tests. The
+# reverie-dbt tree, the root Cargo.toml, Cargo.lock and rust-toolchain.toml
+# are unchanged.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bca5399182dae3dc22ac959e3873e44be9271a69 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie bca5399182dae3dc22ac959e3873e44be9271a69 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
