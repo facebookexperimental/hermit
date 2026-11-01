@@ -122,6 +122,21 @@ jobs:
         # The publication gate compares the registry with every earlier version
         # so an already-public content-addressed path cannot disappear or change.
         fetch-depth: 0
+    - name: Check out the reviewed Hermit source pin
+      # A dispatch on main must not race main moving past the reviewed pin:
+      # read hermit_commit from the dispatched main commit's pin file and
+      # check out exactly that commit, so every later step (adapter,
+      # source pin, rustdoc) runs at the pin by construction.  The pin
+      # must exist in this full-history checkout, or the rebuild refuses
+      # here instead of comparing a moved main checkout to the pin.
+      if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+      run: |
+        set -euo pipefail
+        pin=$(jq -er '.hermit_commit | select(type == "string" and test("^[0-9a-f]{40}$"))' \
+          .github/compatibility-site-builder.json)
+        git cat-file -e "$pin^{commit}"
+        git checkout --quiet --detach "$pin"
+        [[ $(git rev-parse 'HEAD^{commit}') == "$pin" ]]
     - name: Initialize dagrun submodule
       run: git submodule update --init --depth 1 -- agent-utils
     - name: Check nightly source access and pins
