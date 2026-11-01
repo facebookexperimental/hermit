@@ -827,6 +827,89 @@ pub(super) enum CommAlias {
     Undetermined,
 }
 
+/// Where a `..` spelling of `/proc/locks` or of a descriptor's fdinfo lands
+/// ([`walk_lock_or_fdinfo_alias`]): package K slice K8-d, so that no such
+/// spelling of a file Detcore renders where the guest's procfs is not the
+/// kernel's (package K slice K8-h) reaches the backend's own procfs
+/// (<https://github.com/rrnewton/hermit/issues/4263> is the general class).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LockOrFdinfoAlias {
+    /// Not a spelling the walk decides: not absolute, no `..`, a `..` that
+    /// follows a component procfs's walk cannot undo by name (a link such as
+    /// `cwd` or `fd/N`, a file, a directory procfs does not always have:
+    /// [`super::descriptor_directory::resolved_procfs_dotdot`] leaves it to
+    /// the kernel), or a walk that reaches neither file.
+    NotApplicable,
+    /// The file `file`, spelled without the `..`: `/proc/locks`, or a
+    /// `/proc/<pid>[/task/<tid>]/fdinfo/<name>` spelling (`self` and
+    /// `thread-self` kept), provided every task in `tasks` exists, in order.
+    File {
+        file: std::path::PathBuf,
+        tasks: Vec<super::descriptor_directory::NamedTask>,
+    },
+    /// The same, with a component or a slash after the file, which Linux's
+    /// walk refuses (ENOTDIR) once it has found the file.
+    PastFile {
+        file: std::path::PathBuf,
+        tasks: Vec<super::descriptor_directory::NamedTask>,
+    },
+}
+
+/// Walk `path`, an absolute spelling with a `..`, to `/proc/locks` or a
+/// descriptor's fdinfo, as Linux's path walk resolves it through the procfs
+/// directories ([`super::descriptor_directory::resolved_procfs_dotdot`]:
+/// `self` and `thread-self` are links it follows first, so `/proc/self/..`
+/// is `/proc`, and a `..` then goes back through procfs's own directories).
+/// The first prefix of the walk that names one of the two files decides: the
+/// file, where it is the whole path, or the file with something after it.
+/// Empty and `.` components are dropped as the walk drops them, but a slash
+/// or `/.` after the last component asks for a directory, which the file is
+/// not ([`LockOrFdinfoAlias::PastFile`]).
+pub(super) fn walk_lock_or_fdinfo_alias(path: &Path) -> LockOrFdinfoAlias {
+    let bytes = path.as_os_str().as_bytes();
+    if !bytes.starts_with(b"/") {
+        return LockOrFdinfoAlias::NotApplicable;
+    }
+    let components = bytes
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty() && *component != b".")
+        .collect::<Vec<_>>();
+    if !components.contains(&b"..".as_slice()) {
+        return LockOrFdinfoAlias::NotApplicable;
+    }
+    let trailing = bytes.ends_with(b"/") || bytes.ends_with(b"/.");
+    let mut prefix = Vec::new();
+    let mut passed_dotdot = false;
+    for (index, component) in components.iter().enumerate() {
+        prefix.push(b'/');
+        prefix.extend_from_slice(component);
+        if *component == b".." {
+            passed_dotdot = true;
+            continue;
+        }
+        let spelled = Path::new(OsStr::from_bytes(&prefix));
+        let (file, tasks) = if passed_dotdot {
+            match super::descriptor_directory::resolved_procfs_dotdot(spelled) {
+                Some(resolved) => resolved,
+                // Only the kernel's walk can go back past what came before.
+                None => return LockOrFdinfoAlias::NotApplicable,
+            }
+        } else {
+            (spelled.to_path_buf(), Vec::new())
+        };
+        if file != Path::new("/proc/locks") && crate::procfs::fdinfo_spelling_task(&file).is_none()
+        {
+            continue;
+        }
+        return if index + 1 == components.len() && !trailing {
+            LockOrFdinfoAlias::File { file, tasks }
+        } else {
+            LockOrFdinfoAlias::PastFile { file, tasks }
+        };
+    }
+    LockOrFdinfoAlias::NotApplicable
+}
+
 /// Whether an open with `flags` asks to write the file it opens: a write or
 /// read-write access mode, or `O_TRUNC`, which needs write permission
 /// (`may_open`), but not `O_PATH`, which opens for neither.
@@ -1877,11 +1960,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         // spelling of a task's `comm` where Detcore renders it (package K
         // slice A+): Detcore walks it itself, checking every task it passes
         // as Linux's lookup does, and answers it as the file it reaches, or
-        // fails it as Linux would ([`Self::resolve_comm_alias`]).
+        // fails it as Linux would ([`Self::resolve_comm_alias`]). And so for
+        // a spelling of `/proc/locks` or of a descriptor's fdinfo where
+        // Detcore renders them (package K slice K8-d,
+        // [`Self::resolve_lock_or_fdinfo_alias`]).
         if !self.renders_procfs(guest) {
             return Ok(None);
         }
         let resolved;
+        // A spelling that goes on past `/proc/locks` or an fdinfo, which
+        // Linux's walk refuses once it has found the file.
+        let mut past_the_file = false;
         let path = if path
             .components()
             .any(|component| component == std::path::Component::ParentDir)
@@ -1891,7 +1980,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                     resolved = comm;
                     resolved.as_path()
                 }
-                CommAlias::NotApplicable | CommAlias::Undetermined => return Ok(None),
+                CommAlias::Undetermined => return Ok(None),
+                CommAlias::NotApplicable => {
+                    match self.resolve_lock_or_fdinfo_alias(guest, path).await? {
+                        Some((file, past)) => {
+                            past_the_file = past;
+                            resolved = file;
+                            resolved.as_path()
+                        }
+                        None => return Ok(None),
+                    }
+                }
             }
         } else {
             path
@@ -1968,7 +2067,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if procfs.rendered_path(self.rendered_files(guest)).is_none() {
                 return Ok(None);
             }
-            if names_a_directory(path) {
+            if names_a_directory(path) || past_the_file {
                 return Err(Errno::ENOTDIR.into());
             }
             // `/proc/mounts` is a symbolic link to the caller's `self/mounts`:
@@ -3799,6 +3898,43 @@ impl<T: RecordOrReplay> Detcore<T> {
                 None => format!("/proc/{}/comm", task.process),
             },
         )))
+    }
+
+    /// Resolve `path`, an absolute spelling with a `..`, to `/proc/locks` or
+    /// a descriptor's fdinfo where Detcore renders that file (package K
+    /// slice K8-d; K8-h renders both where the guest's procfs is not the
+    /// kernel's): [`walk_lock_or_fdinfo_alias`], then each task the walk
+    /// passed must exist in Detcore's process table, in order, as Linux's
+    /// lookup requires of the components a `..` later undoes (ENOENT
+    /// otherwise). The file's spelling without the `..`, and whether
+    /// something follows it in `path` (which the caller refuses with ENOTDIR
+    /// once the file is found, as Linux's walk does), for the caller to
+    /// classify as it classifies a plain spelling. `None` for any other
+    /// spelling, and where Detcore does not render the file, both of which
+    /// stay the kernel's, as before. Only global-tool requests, no injected
+    /// call.
+    pub(super) async fn resolve_lock_or_fdinfo_alias<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &Path,
+    ) -> Result<Option<(std::path::PathBuf, bool)>, Error> {
+        let (file, tasks, past) = match walk_lock_or_fdinfo_alias(path) {
+            LockOrFdinfoAlias::NotApplicable => return Ok(None),
+            LockOrFdinfoAlias::File { file, tasks } => (file, tasks, false),
+            LockOrFdinfoAlias::PastFile { file, tasks } => (file, tasks, true),
+        };
+        let rendered = if file == Path::new("/proc/locks") {
+            self.rendered_files(guest).locks
+        } else {
+            self.renders_fdinfo()
+        };
+        if !rendered {
+            return Ok(None);
+        }
+        if !Self::named_tasks_exist(guest, &tasks).await {
+            return Err(Errno::ENOENT.into());
+        }
+        Ok(Some((file, past)))
     }
 
     /// ENOENT unless every task in `checks` exists in Detcore's process
@@ -9075,6 +9211,99 @@ mod tests {
             ("proc/self/../self/comm", CommAliasWalk::NotApplicable),
         ] {
             assert_eq!(walk_comm_alias(Path::new(path), own), expected, "{path}");
+        }
+    }
+
+    /// Detcore's walk of a `..` spelling to `/proc/locks` or a descriptor's
+    /// fdinfo (package K slice K8-d) resolves it as Linux's path walk does:
+    /// `self` and `thread-self` are links it follows first (so
+    /// `/proc/self/..` is `/proc`), a `..` then goes back through procfs's
+    /// own directories (`fd` and `fdinfo` among them), every task a number
+    /// names on the way is a check in path order, and the first prefix that
+    /// names one of the two files decides: the file, or the file with a
+    /// component or a slash after it. A `..` after anything procfs's walk
+    /// cannot undo by name (a link such as `cwd`, a step out of `/proc`) and
+    /// a spelling without `..` are not the walk's.
+    #[test]
+    fn a_lock_or_fdinfo_alias_walk_follows_linuxs_lookup() {
+        use super::super::descriptor_directory::NamedTask;
+        let named = |process, thread| NamedTask { process, thread };
+        let file = |file: &str, tasks: Vec<NamedTask>| LockOrFdinfoAlias::File {
+            file: std::path::PathBuf::from(file),
+            tasks,
+        };
+        let past = |file: &str, tasks: Vec<NamedTask>| LockOrFdinfoAlias::PastFile {
+            file: std::path::PathBuf::from(file),
+            tasks,
+        };
+        for (path, expected) in [
+            ("/proc/self/../locks", file("/proc/locks", vec![])),
+            ("/proc/../proc/locks", file("/proc/locks", vec![])),
+            ("/proc/./self/../locks", file("/proc/locks", vec![])),
+            (
+                "/proc/7/../locks",
+                file("/proc/locks", vec![named(Some(7), None)]),
+            ),
+            (
+                "/proc/self/task/5/../../../locks",
+                file("/proc/locks", vec![named(None, Some(5))]),
+            ),
+            (
+                "/proc/self/fdinfo/../fdinfo/3",
+                file("/proc/self/fdinfo/3", vec![]),
+            ),
+            (
+                "/proc/self/fd/../fdinfo/3",
+                file("/proc/self/fdinfo/3", vec![]),
+            ),
+            (
+                "/proc/self/../self/fdinfo/3",
+                file("/proc/self/fdinfo/3", vec![]),
+            ),
+            (
+                "/proc/thread-self/fdinfo/../fdinfo/3",
+                file("/proc/thread-self/fdinfo/3", vec![]),
+            ),
+            (
+                "/proc/self/task/5/fdinfo/../fdinfo/3",
+                file("/proc/self/task/5/fdinfo/3", vec![named(None, Some(5))]),
+            ),
+            (
+                "/proc/7/fdinfo/../fdinfo/3",
+                file("/proc/7/fdinfo/3", vec![named(Some(7), None)]),
+            ),
+            (
+                "/proc/self/fdinfo/3/..",
+                past("/proc/self/fdinfo/3", vec![]),
+            ),
+            (
+                "/proc/self/fdinfo/3/../3",
+                past("/proc/self/fdinfo/3", vec![]),
+            ),
+            (
+                "/proc/self/fdinfo/x/../3",
+                past("/proc/self/fdinfo/x", vec![]),
+            ),
+            ("/proc/locks/..", past("/proc/locks", vec![])),
+            ("/proc/locks/../locks", past("/proc/locks", vec![])),
+            ("/proc/self/../locks/", past("/proc/locks", vec![])),
+            ("/proc/self/../locks/.", past("/proc/locks", vec![])),
+            (
+                "/proc/thread-self/../locks",
+                LockOrFdinfoAlias::NotApplicable,
+            ),
+            ("/proc/self/cwd/../locks", LockOrFdinfoAlias::NotApplicable),
+            ("/tmp/../proc/locks", LockOrFdinfoAlias::NotApplicable),
+            ("/proc/self/../stat", LockOrFdinfoAlias::NotApplicable),
+            ("/proc/locks", LockOrFdinfoAlias::NotApplicable),
+            ("/proc/self/fdinfo/3", LockOrFdinfoAlias::NotApplicable),
+            ("proc/self/../locks", LockOrFdinfoAlias::NotApplicable),
+        ] {
+            assert_eq!(
+                walk_lock_or_fdinfo_alias(Path::new(path)),
+                expected,
+                "{path}"
+            );
         }
     }
 }

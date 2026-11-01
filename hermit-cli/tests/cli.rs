@@ -62491,3 +62491,116 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
         "{test}: a received copy across an exec"
     );
 }
+
+static PROCFS_DOTDOT_SPELLINGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// `tests/c/procfs_dotdot_spellings.c`'s guest.
+fn procfs_dotdot_spellings_guest() -> &'static Path {
+    compiled_c_guest(&PROCFS_DOTDOT_SPELLINGS_GUEST, "procfs_dotdot_spellings")
+}
+
+/// The spellings guest's transcript under Hermit on `backend` at
+/// `--proc=level`, at L2: two runs at bitwise parity under `--verify-strict`,
+/// with the same nonzero number of INFO records compared.
+fn procfs_dotdot_spellings_at_l2(backend: &str, level: &str) -> String {
+    let guest = procfs_dotdot_spellings_guest();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join(format!("{backend}.json"));
+    let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+    let level_arg = format!("--proc={level}");
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        &level_arg,
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        &report_arg,
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        directory.path().to_str().expect("directory path is UTF-8"),
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+            .expect("parse the verification report");
+    assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+    let compared = &verdict["compared_log_messages"];
+    assert!(
+        compared["left"].as_u64().is_some_and(|count| count > 0)
+            && compared["left"] == compared["right"],
+        "{backend} compared no INFO messages: {verdict}"
+    );
+    stdout(&output)
+}
+
+/// Spellings with `..` of `/proc/locks` and of a descriptor's fdinfo
+/// (`tests/c/procfs_dotdot_spellings.c`: through `self`, `thread-self`, the
+/// caller's numbers, `task/<tid>`, `fd` and `fdinfo`, and past either file)
+/// answer on `backend` as Linux's path walk resolves them, at L2: the plain
+/// spelling's bytes where natively they are, ENOTDIR past a file, ENOENT for a
+/// name that is no open descriptor, and a stat that reports a regular file of
+/// size 0, as natively. Where Detcore renders both files (KVM, package K slice
+/// K8-h), it resolves these spellings itself (package K slice K8-d); before,
+/// they reached the KVM provider's own procfs, whose `/proc/self/../locks`
+/// stat reported its rows' length (41) and which refused or failed the other
+/// spellings (EACCES, ENOENT). On ptrace the kernel resolves them, as before.
+/// At `--proc=minimal`, which has no `/proc/locks`, every spelling of it
+/// fails with ENOENT, as before.
+fn read_the_dotdot_spellings_of_proc_locks_and_fdinfo(backend: &str) {
+    let guest = procfs_dotdot_spellings_guest();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let native = Command::new(guest)
+        .arg(directory.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the dot-dot spellings guest natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let native = stdout(&native);
+    assert_eq!(native.lines().count(), 39, "{native}");
+    assert!(native.ends_with("done\n"), "{native}");
+    assert_eq!(
+        procfs_dotdot_spellings_at_l2(backend, "standard"),
+        native,
+        "{backend} at --proc=standard"
+    );
+    let minimal: String = native
+        .lines()
+        .map(|line| match line.split_once(": ") {
+            Some((label, answer)) if label.contains("locks") => {
+                if answer.starts_with("stat ") {
+                    format!("{label}: stat ENOENT\n")
+                } else {
+                    format!("{label}: open or read ENOENT\n")
+                }
+            }
+            _ => format!("{line}\n"),
+        })
+        .collect();
+    assert_eq!(
+        procfs_dotdot_spellings_at_l2(backend, "minimal"),
+        minimal,
+        "{backend} at --proc=minimal"
+    );
+}
+
+/// [`read_the_dotdot_spellings_of_proc_locks_and_fdinfo`] on ptrace.
+#[test]
+fn the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux() {
+    read_the_dotdot_spellings_of_proc_locks_and_fdinfo("ptrace");
+}
+
+/// [`read_the_dotdot_spellings_of_proc_locks_and_fdinfo`] on KVM.
+#[test]
+fn run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux() {
+    let test = "run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux";
+    if kvm_unavailable(test) {
+        return;
+    }
+    read_the_dotdot_spellings_of_proc_locks_and_fdinfo("kvm");
+}

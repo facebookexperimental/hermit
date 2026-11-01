@@ -2017,6 +2017,12 @@
       "why": "tests/c/process_vm_writev_refusal_probe.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/procfs_dotdot_spellings.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/procfs_dotdot_spellings.c is owned by hermit-cli/tests/cli.rs: the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux runs it on ptrace and run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux on KVM, each under run --strict --verify --verify-strict at bitwise parity at --proc=standard and --proc=minimal, and requires its transcript of spellings with .. of /proc/locks and of a descriptor's fdinfo (whether each reads the plain spelling's bytes, its errno, and what a stat reports) to equal the same guest's native run, with every /proc/locks spelling ENOENT at --proc=minimal (package K slice K8-d). A generic manifest cannot compare a backend's transcript with a native run or vary the --proc level."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/procfs_identity_agreement.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true)",
