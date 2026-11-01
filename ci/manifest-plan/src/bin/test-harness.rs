@@ -8449,7 +8449,10 @@ sys.exit(1 if failed else 0)
         // https://github.com/rrnewton/hermit/issues/5015); the
         // pinned-root conversion restored them, so their DBT and KVM
         // parity cells are reported again and add nothing here.
-        assert_eq!(unreported.len(), 10, "{unreported:?}");
+        // 10 + 1 for language-runtimes/go-os-exec-output@kvm: its verify
+        // cells are enabled on ptrace and KVM but stay out of full until the
+        // pinned validation root carries a Go toolchain.
+        assert_eq!(unreported.len(), 11, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))

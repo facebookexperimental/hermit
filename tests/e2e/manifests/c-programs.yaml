@@ -21824,3 +21824,75 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/concurrent-piped-spawns
+    description: Two threads spawn children whose stdout is a pipe, each holding the other's write end, while the main thread waits in pthread_join; every pipe reaches EOF
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/concurrent_piped_spawns.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+        - -pthread
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          kvm: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: New coverage of a KVM descriptor-table defect is established on KVM and the ptrace reference first; DBT ratchets against it separately
+          sabre: New coverage of a KVM descriptor-table defect is established on KVM and the ptrace reference first; SaBRe ratchets against it separately
+          liteinst: The in-guest runtime runs one thread of the guest and refuses execve; this guest spawns children from several threads
+          in-guest-trap: The in-guest runtime runs one thread of the guest and refuses execve; this guest spawns children from several threads
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: this cell asserts strict-verify determinism; it does not assert native nondeterminism'
+        backends_enabled: []
+        backends_disabled:
+          native: This cell asserts strict-verify determinism; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: this cell guards strict verification of concurrent spawns; their record/replay is a separate qualification'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: This cell guards strict verification of concurrent spawns; their record/replay is a separate qualification
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: this cell guards a descriptor-table defect, not schedule diversity'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: This cell guards a descriptor-table defect, not schedule diversity
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap

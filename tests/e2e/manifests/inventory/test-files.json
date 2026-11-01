@@ -265,6 +265,12 @@
       "why": "tests/c/close_range_releases_port.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test runs this close_range port-release probe on ptrace and on in-guest LiteInst and requires the same output from both; it remains a guest fixture because a generic manifest cannot express a cross-backend output equality."
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/c/concurrent_piped_spawns.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify mode; ci=true, ptrace and kvm)",
+      "why": "tests/c/concurrent_piped_spawns.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify mode; ci=true, ptrace and kvm): Two threads spawn children whose stdout is a pipe, each holding the other's write end while it reads its own pipe to EOF, and the main thread waits in pthread_join. It guards KVM's handling of a closed descriptor that other threads of the process had copied: without it each read waits for an EOF that never comes. The guest prints every result after the threads join, so its output is its own oracle."
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/c/condvar_join_deadlock.c",
       "runner": "hermit-cli/tests/cli.rs",
@@ -3841,6 +3847,12 @@
       "why": "tests/e2e/language-runtimes/gawk-random.sh is owned by target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml: GNU awk's pid-seeded rand() output varies natively and repeats under strict verification"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/language-runtimes/go-os-exec-output.sh",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml (verify mode; ci=false)",
+      "why": "tests/e2e/language-runtimes/go-os-exec-output.sh is owned by target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml (verify mode; ci=false): It runs Go os/exec Cmd.Output from four goroutines at once under strict verification, so every child's output and exec-error pipes must reach EOF while the runtime's other threads share their write ends. It stays outside blocking CI until the pinned validation root carries a Go toolchain."
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/e2e/language-runtimes/javascript.js",
       "runner": "tests/e2e/lib/language-runtimes/run.sh",
@@ -3911,6 +3923,12 @@
       "path": "tests/e2e/language-runtimes/python-random.sh",
       "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
       "why": "tests/e2e/language-runtimes/python-random.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/language-runtimes/python-subprocess-capture.sh",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml",
+      "why": "tests/e2e/language-runtimes/python-subprocess-capture.sh is owned by target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml: It runs Python subprocess.run with captured output from four threads at once under strict verification, so every child's output and exec-error pipes must reach EOF while the other threads share their write ends."
     },
     {
       "disposition": "guest-fixture",

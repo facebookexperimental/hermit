@@ -25,6 +25,8 @@ determinism-stress/thread-contention naked -
 language-runtimes/bash-random naked -
 language-runtimes/cpp-stl-determinism naked -
 language-runtimes/gawk-random naked -
+language-runtimes/go-os-exec-output verify kvm
+language-runtimes/go-os-exec-output verify ptrace
 language-runtimes/lua-random naked -
 language-runtimes/m4-macro-mkstemp naked -
 language-runtimes/node-v8-jit naked -

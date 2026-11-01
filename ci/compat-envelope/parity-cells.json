@@ -8,59 +8,59 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 3070,
-      "applicable": 2247,
-      "selectable": 1758,
-      "population": 3010,
-      "population_candidate_selected": 1758,
+      "cells": 3085,
+      "applicable": 2250,
+      "selectable": 1760,
+      "population": 3020,
+      "population_candidate_selected": 1760,
       "population_candidate_not_selected": 475,
-      "population_candidate_disabled": 777
+      "population_candidate_disabled": 785
     },
     "by_backend": {
       "dbt": {
-        "cells": 614,
+        "cells": 617,
         "applicable": 559,
         "selectable": 554,
-        "population": 602,
+        "population": 604,
         "population_candidate_selected": 554,
         "population_candidate_not_selected": 2,
-        "population_candidate_disabled": 46
+        "population_candidate_disabled": 48
       },
       "in-guest-trap": {
-        "cells": 614,
+        "cells": 617,
         "applicable": 314,
         "selectable": 314,
-        "population": 602,
+        "population": 604,
         "population_candidate_selected": 314,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 288
+        "population_candidate_disabled": 290
       },
       "kvm": {
-        "cells": 614,
-        "applicable": 582,
-        "selectable": 575,
-        "population": 602,
-        "population_candidate_selected": 575,
+        "cells": 617,
+        "applicable": 585,
+        "selectable": 577,
+        "population": 604,
+        "population_candidate_selected": 577,
         "population_candidate_not_selected": 3,
         "population_candidate_disabled": 24
       },
       "liteinst": {
-        "cells": 614,
+        "cells": 617,
         "applicable": 315,
         "selectable": 315,
-        "population": 602,
+        "population": 604,
         "population_candidate_selected": 315,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 287
+        "population_candidate_disabled": 289
       },
       "sabre": {
-        "cells": 614,
+        "cells": 617,
         "applicable": 477,
         "selectable": 0,
-        "population": 602,
+        "population": 604,
         "population_candidate_selected": 0,
         "population_candidate_not_selected": 470,
-        "population_candidate_disabled": 132
+        "population_candidate_disabled": 134
       }
     }
   },
@@ -190,6 +190,11 @@
     {"test_id":"c-programs/close-range-fds","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/close-range-fds","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/close-range-fds","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
+    {"test_id":"c-programs/concurrent-piped-spawns","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: New coverage of a KVM descriptor-table defect is established on KVM and the ptrace reference first; DBT ratchets against it separately"},
+    {"test_id":"c-programs/concurrent-piped-spawns","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The in-guest runtime runs one thread of the guest and refuses execve; this guest spawns children from several threads"},
+    {"test_id":"c-programs/concurrent-piped-spawns","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/concurrent-piped-spawns","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The in-guest runtime runs one thread of the guest and refuses execve; this guest spawns children from several threads"},
+    {"test_id":"c-programs/concurrent-piped-spawns","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: New coverage of a KVM descriptor-table defect is established on KVM and the ptrace reference first; SaBRe ratchets against it separately"},
     {"test_id":"c-programs/copy-file-range-refusal","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/copy-file-range-refusal","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/copy-file-range-refusal","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -2840,6 +2845,11 @@
     {"test_id":"language-runtimes/gawk-random","backend":"kvm","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"language-runtimes/gawk-random","backend":"liteinst","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: LiteInst awk support is tracked by backend compatibility"},
     {"test_id":"language-runtimes/gawk-random","backend":"sabre","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe requires its external runtime"},
+    {"test_id":"language-runtimes/go-os-exec-output","backend":"dbt","category":"language-runtimes","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: NOT-EXERCISED: the pinned validation root (ci/hermetic) has no Go toolchain, so --prepare cannot build the program there; it passes 21 of 21 at L2 on KVM and ptrace on a host with go 1.26.1, and joins validation once the root carries go."},
+    {"test_id":"language-runtimes/go-os-exec-output","backend":"in-guest-trap","category":"language-runtimes","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: NOT-EXERCISED: the pinned validation root (ci/hermetic) has no Go toolchain, so --prepare cannot build the program there; it passes 21 of 21 at L2 on KVM and ptrace on a host with go 1.26.1, and joins validation once the root carries go."},
+    {"test_id":"language-runtimes/go-os-exec-output","backend":"kvm","category":"language-runtimes","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: NOT-EXERCISED: the pinned validation root (ci/hermetic) has no Go toolchain, so --prepare cannot build the program there; it passes 21 of 21 at L2 on KVM and ptrace on a host with go 1.26.1, and joins validation once the root carries go."},
+    {"test_id":"language-runtimes/go-os-exec-output","backend":"liteinst","category":"language-runtimes","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: NOT-EXERCISED: the pinned validation root (ci/hermetic) has no Go toolchain, so --prepare cannot build the program there; it passes 21 of 21 at L2 on KVM and ptrace on a host with go 1.26.1, and joins validation once the root carries go."},
+    {"test_id":"language-runtimes/go-os-exec-output","backend":"sabre","category":"language-runtimes","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: NOT-EXERCISED: the pinned validation root (ci/hermetic) has no Go toolchain, so --prepare cannot build the program there; it passes 21 of 21 at L2 on KVM and ptrace on a host with go 1.26.1, and joins validation once the root carries go."},
     {"test_id":"language-runtimes/lua-random","backend":"dbt","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"language-runtimes/lua-random","backend":"in-guest-trap","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
     {"test_id":"language-runtimes/lua-random","backend":"kvm","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -2895,6 +2905,11 @@
     {"test_id":"language-runtimes/python-random","backend":"kvm","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"language-runtimes/python-random","backend":"liteinst","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: LiteInst Python support is tracked by backend compatibility"},
     {"test_id":"language-runtimes/python-random","backend":"sabre","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe requires its external runtime"},
+    {"test_id":"language-runtimes/python-subprocess-capture","backend":"dbt","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: New coverage of a KVM descriptor-table defect is established on KVM and the ptrace reference first; DBT ratchets against it separately"},
+    {"test_id":"language-runtimes/python-subprocess-capture","backend":"in-guest-trap","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The in-guest runtime runs one thread of the guest and refuses execve; this guest spawns children from several threads"},
+    {"test_id":"language-runtimes/python-subprocess-capture","backend":"kvm","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"language-runtimes/python-subprocess-capture","backend":"liteinst","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The in-guest runtime runs one thread of the guest and refuses execve; this guest spawns children from several threads"},
+    {"test_id":"language-runtimes/python-subprocess-capture","backend":"sabre","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: New coverage of a KVM descriptor-table defect is established on KVM and the ptrace reference first; SaBRe ratchets against it separately"},
     {"test_id":"language-runtimes/ruby-random","backend":"dbt","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"language-runtimes/ruby-random","backend":"in-guest-trap","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
     {"test_id":"language-runtimes/ruby-random","backend":"kvm","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

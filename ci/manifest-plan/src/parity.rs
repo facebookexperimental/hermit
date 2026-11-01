@@ -6295,8 +6295,12 @@ mod tests {
         // row each per candidate backend: 3065. c-programs/vfork-shares-memory
         // (a vfork child's stores are its parent's when the parent's call
         // returns, https://github.com/rrnewton/reverie/issues/1087) adds one
-        // row per candidate backend: 3070.
-        assert_eq!(parsed.cells.len(), 3070);
+        // row per candidate backend: 3070. c-programs/concurrent-piped-spawns,
+        // language-runtimes/python-subprocess-capture and
+        // language-runtimes/go-os-exec-output (spawns from several threads,
+        // each pipe's write end shared with the other threads until its
+        // close) add one row each per candidate backend: 3085.
+        assert_eq!(parsed.cells.len(), 3085);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448

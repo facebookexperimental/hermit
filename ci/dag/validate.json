@@ -1833,6 +1833,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/concurrent-piped-spawns",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/concurrent-piped-spawns",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/copy-file-range-refusal-probe",
           "mode": "replay",
           "backend": "ptrace"
@@ -28563,6 +28577,20 @@
         {
           "lane": "portable",
           "category": "language-runtimes",
+          "test": "language-runtimes/python-subprocess-capture",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-subprocess-capture",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
           "test": "language-runtimes/ruby-random",
           "mode": "replay",
           "backend": "ptrace"
@@ -33682,6 +33710,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/concurrent-piped-spawns",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/copy-file-range-refusal-probe",
           "mode": "verify",
           "backend": "ptrace"
@@ -35916,6 +35951,13 @@
           "lane": "portable",
           "category": "language-runtimes",
           "test": "language-runtimes/python-random",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-subprocess-capture",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -39312,6 +39354,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/close-range-fds",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/concurrent-piped-spawns",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -50421,6 +50470,13 @@
         {
           "lane": "portable",
           "category": "language-runtimes",
+          "test": "language-runtimes/python-subprocess-capture",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
           "test": "language-runtimes/ruby-random",
           "mode": "replay",
           "backend": "ptrace"
@@ -60517,6 +60573,20 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/close-range-fds",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/concurrent-piped-spawns",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/concurrent-piped-spawns",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -79137,6 +79207,20 @@
           "lane": "portable",
           "category": "language-runtimes",
           "test": "language-runtimes/python-random",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-subprocess-capture",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-subprocess-capture",
           "mode": "verify",
           "backend": "ptrace"
         },
