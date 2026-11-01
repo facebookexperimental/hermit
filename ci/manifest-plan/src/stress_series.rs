@@ -591,10 +591,16 @@ impl SeriesPressureAttempt {
             && self.status.is_some() != self.signal.is_some();
         let valid = match comparison.verdict {
             Verdict::Matched => {
-                let ordinary_exit = self.signal.is_none()
+                // A chaos guest that dies by the same signal on both runs
+                // is a matched disposition the runner PASSes, and a chaos
+                // row cannot declare an expected guest exit, so a chaos
+                // match may end by a signal exactly as it may end by any
+                // status. Other modes keep requiring status 0, no signal.
+                let ordinary_exit = (self.signal.is_none()
                     && self
                         .status
-                        .is_some_and(|status| mode == "chaos" || status == 0);
+                        .is_some_and(|status| mode == "chaos" || status == 0))
+                    || (mode == "chaos" && self.status.is_none() && self.signal.is_some());
                 let declared_exit = declared.is_some_and(|declared| {
                     validate_result_expected_guest_exit("declared_guest_exit", mode, Some(declared))
                         .is_ok()
@@ -4222,6 +4228,32 @@ mod tests {
         inner.status = None;
         inner.signal = Some(11);
         custom.validate_for_write().unwrap();
+    }
+
+    #[test]
+    fn pressure_history_admits_a_chaos_match_that_died_by_a_signal() {
+        // A chaos guest that dies by the same signal on both runs is a
+        // matched disposition the runner PASSes (the 2026-11-01 pressure
+        // survey's chaos/sabre cells), and a chaos row cannot declare an
+        // expected guest exit, so the inner history admits it undeclared.
+        let mut chaos = pressure_row();
+        chaos.series.cell = "fixture/test/chaos/sabre".into();
+        let inner = &mut chaos.series.pressure_evidence.as_mut().unwrap().attempts[0];
+        inner.status = None;
+        inner.signal = Some(11);
+        chaos.validate_for_write().unwrap();
+        chaos.validate_for_read().unwrap();
+        // The same undeclared signal death on a verify row stays refused:
+        // verify must declare the guest exit it expects.
+        let mut verify = pressure_row();
+        let inner = &mut verify.series.pressure_evidence.as_mut().unwrap().attempts[0];
+        inner.status = None;
+        inner.signal = Some(11);
+        let error = verify.validate_for_read().unwrap_err();
+        assert!(
+            error.contains("matched report contradicts its inner process disposition"),
+            "{error}"
+        );
     }
 
     #[test]
