@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Rewrite pinned test counts from a validation run record.
+
+Reads measured counts from the run record/receipt JSON (a top-level
+"counts" object, or "metrics"), finds every pinned site in
+ci/recount-pins.json, prints a diff, and with --apply rewrites pins
+(and regenerates DAG files via ci/dag's generator when present).
+
+Refuses when any measured count DROPS below its pin unless
+--allow-drop is given: losing tests must never be absorbed silently.
+
+Usage: ci/recount-pins RECEIPT.json [--apply] [--allow-drop]
+"""
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+REGISTRY = ROOT / "ci" / "recount-pins.json"
+
+
+def measured(receipt: Path) -> dict[str, int]:
+    data = json.loads(receipt.read_text())
+    counts = data.get("counts") or data.get("metrics") or {}
+    return {str(k): int(v) for k, v in counts.items()}
+
+
+def main(argv: list[str]) -> int:
+    args = [a for a in argv if not a.startswith("--")]
+    apply = "--apply" in argv
+    allow_drop = "--allow-drop" in argv
+    if len(args) != 1:
+        print(__doc__)
+        return 2
+    sites = json.loads(REGISTRY.read_text())["sites"] if REGISTRY.exists() else []
+    counts = measured(Path(args[0]))
+    drops: list[str] = []
+    changes: list[str] = []
+    for site in sites:
+        name, file, pattern = site["name"], ROOT / site["file"], site["pattern"]
+        if name not in counts or not file.exists():
+            continue
+        text = file.read_text()
+        m = re.search(pattern, text)
+        if not m:
+            continue
+        old, new = int(m.group("count")), counts[name]
+        if new == old:
+            continue
+        if new < old and not allow_drop:
+            drops.append(f"{name}: {old} -> {new} (DROP refused)")
+            continue
+        changes.append(f"{site['file']}: {name}: {old} -> {new}")
+        if apply:
+            file.write_text(text[: m.start("count")] + str(new) + text[m.end("count"):])
+    for line in drops + changes:
+        print(line)
+    if drops:
+        print("recount-pins: refusing dropped counts; rerun with --allow-drop to accept", file=sys.stderr)
+        return 1
+    if apply and changes:
+        gen = ROOT / "ci" / "dag" / "generate.py"
+        if gen.exists():
+            subprocess.run([sys.executable, str(gen)], cwd=ROOT, check=False)
+        print(f"recount-pins: applied {len(changes)} pin(s)")
+    elif changes:
+        print("recount-pins: dry run; pass --apply to write")
+    else:
+        print("recount-pins: all pins current")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

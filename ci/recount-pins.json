@@ -1,0 +1,12 @@
+{
+  "sites": [
+    {"name": "test.cli", "file": "ci/manifest-plan/src/validation_dag_static.rs", "pattern": "\\(\"test\\.cli\", (?P<count>[0-9]+)\\)"},
+    {"name": "test.regular_crates", "file": "ci/manifest-plan/src/validation_dag_static.rs", "pattern": "\\(\"test\\.regular_crates\", (?P<count>[0-9]+)\\)"},
+    {"name": "test.hermit_unit", "file": "ci/manifest-plan/src/validation_dag_static.rs", "pattern": "\\(\"test\\.hermit_unit\", (?P<count>[0-9]+)\\)"},
+    {"name": "test.detcore_unit", "file": "ci/manifest-plan/src/validation_dag_static.rs", "pattern": "\\(\"test\\.detcore_unit\", (?P<count>[0-9]+)\\)"},
+    {"name": "privileged-test.cli_kvm", "file": "ci/manifest-plan/src/validation_dag_static.rs", "pattern": "\\(\"privileged-test\\.cli_kvm\", (?P<count>[0-9]+)\\)"},
+    {"name": "test.hermit_integration_2", "file": "ci/manifest-plan/src/validation_dag_static.rs", "pattern": "\\(\"test\\.hermit_integration_2\", (?P<count>[0-9]+)\\)"},
+    {"name": "test.hermit_integration_3", "file": "ci/manifest-plan/src/validation_dag_static.rs", "pattern": "\\(\"test\\.hermit_integration_3\", (?P<count>[0-9]+)\\)"},
+    {"name": "test.record_replay", "file": "ci/manifest-plan/src/validation_dag_static.rs", "pattern": "\\(\"test\\.record_replay\", (?P<count>[0-9]+)\\)"}
+  ]
+}
