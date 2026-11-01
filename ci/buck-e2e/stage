@@ -9,7 +9,8 @@
 #   hermit      the cargo validate-profile hermit, for -c hermit_e2e.hermit=staged
 #   src/        `git archive HEAD`: the source snapshot cells read (no .git, no submodules)
 #   build/      `test-harness build` fixtures for every CI-selected cell, built from src/
-#   run-state/  the compat fixtures (tests/compat/prepare_real_compat_fixtures.sh)
+#   run-state/  the compat fixtures (tests/compat/prepare_real_compat_fixtures.sh,
+#               prepared inside the pinned root, as the cargo flow prepares them)
 #   SOURCE_SHA  HEAD
 #
 # usage: ci/buck-e2e/stage --from-cargo [--target-dir DIR]   build them here with cargo
@@ -310,6 +311,18 @@ for lane in portable privileged; do
     VALIDATE_RUN_STATE="$staged/run-state" E2E_RESULT_ROOT="$tmp/results" E2E_BUILD_ROOT="$staged/build" E2E_RUN_ID=buck-e2e-stage \
         "$staged/bin/test-harness" build --repo-root "$staged/src" --source-sha "$sha" --ci-only --lane "$lane" --jobs "$fixture_jobs" >/dev/null
 done
-env -C "$staged/src" ./tests/compat/prepare_real_compat_fixtures.sh "$staged/run-state/strict-compat/real-compat-fixtures" >/dev/null
+# The compat fixtures are prepared inside the pinned root, never on this host:
+# the corpus runs in the pinned root (cell.sh's pinned-root cells, like the
+# cargo flow's compatprep.fixtures_in_pinned_root), so a host preparation leaks
+# host paths into it -- with rustup on the staging host, toolchain/cargo links
+# to ~/.rustup/toolchains/.../bin/cargo, which does not exist in the image, and
+# compat/cargo's guest dies at its `test -x` (hermit --verify exit 125). The
+# staged snapshot's own wrapper pins the image by digest; its --check-image
+# names the remedy when the image is absent.
+"$staged/src/ci/hermetic/run-in-pinned-root.sh" --check-image ||
+    { echo "ci/buck-e2e/stage: the pinned-root image is required to prepare the compat fixtures (see above)" >&2; exit 1; }
+mkdir -p "$tmp/fixture-out"
+"$staged/src/ci/hermetic/run-in-pinned-root.sh" --src "$staged" --out "$tmp/fixture-out" --src-rw -- \
+    bash -c 'cd /src/src && ./tests/compat/prepare_real_compat_fixtures.sh /src/run-state/strict-compat/real-compat-fixtures' >/dev/null
 echo "$sha" >"$staged/SOURCE_SHA"
 echo "staged $(du -sh "$staged" | cut -f1) for $sha"
