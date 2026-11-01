@@ -5686,7 +5686,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if guest.thread_state().lone_slice_end.is_some() {
             // While a thread runs alone the only timer armed is the backstop
             // (`arm_lone_backstop`): no slice ends here. Process the ends it
-            // ran past, and keep running alone or arm the next end.
+            // ran past, and keep running alone or arm the next end. The DEBUG
+            // line lets a test see the backstop fire on any backend; where it
+            // lands changes no INFO record.
+            tracing::debug!(
+                target: "detcore::lone_backstop",
+                "[detcore, dtid {}] lone backstop timer event",
+                guest.thread_state().dettid
+            );
             self.catch_up_lone_slice_ends(guest).await;
             if let Some(end) = guest.thread_state().lone_slice_end {
                 let now = guest.read_clock().expect("Couldn't read clock");

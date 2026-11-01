@@ -426,8 +426,8 @@ time slice. Smaller values create more scheduling opportunities at additional
 runtime cost; positive values must be at least one RCB, which is 10 virtual
 nanoseconds at the default clock multiplier and scales with that multiplier.
 The cost grows steeply: each slice of a thread that computes without a syscall
-ends with a timer event, which the ptrace backend places by stepping the guest
-through up to the processor's skid margin (100 to 10000 RCBs, or
+ends with a timer event, which the ptrace and KVM backends place by stepping
+the guest through up to the processor's skid margin (100 to 10000 RCBs, or
 `--skid-margin`), so a CPU-bound guest can run thousands of times slower at
 `--max-timeslice=1000` than at the default. When a slice is at most ten skid
 margins long (on a processor with a 10000-RCB margin, `--max-timeslice` of

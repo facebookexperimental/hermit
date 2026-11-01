@@ -1292,20 +1292,21 @@ fn skipped_slice_ends_survive_the_backstop() {
     // The stretch must cross the backstop, or the case tests nothing: a
     // compiler that hoisted the loop's trap check would halve its branches
     // (measured: 19136 to 2519268 with GCC -O2, the backstop at 2019216).
-    // reverie_ptrace's debug line for an imprecise timer counts the backstop
-    // events, the only imprecise timer of a skipping run.
+    // Detcore's own debug line for a backstop timer event counts them on any
+    // backend that delivers timer events, where a backend's log line would
+    // count them on that backend only.
     let guest = fixture(&LONE_SPIN, "lone_spin_then_race");
     let (output, rendered) = strict_output_env(
         guest,
         &["long"],
         &["--log=info"],
         &["--chaos", "--seed=3", "--max-timeslice=1000000"],
-        &[("RUST_LOG", "reverie_ptrace::timer=debug")],
+        &[("RUST_LOG", "detcore::lone_backstop=debug")],
     );
     let (_, stderr) = checked(output, &rendered);
     let backstops = stderr
         .lines()
-        .filter(|line| line.contains("Imprecise timer event delivered"))
+        .filter(|line| line.contains("lone backstop timer event"))
         .count();
     assert_eq!(backstops, 1, "long: backstop events");
 }

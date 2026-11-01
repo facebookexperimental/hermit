@@ -43,9 +43,10 @@ pub enum FailureKind {
     /// `class=container-child-exit`. Two configurations of one policy reported
     /// opposite things about the same decision.
     PolicyRefusal,
-    /// A ptrace PMU timer interrupt arrived after its target. The count is
-    /// carried across the container boundary so the parent can publish the
-    /// named infrastructure error instead of leaving the pending no-result.
+    /// A precise PMU timer event (ptrace or KVM) arrived after its target. The
+    /// count is carried across the container boundary so the parent can
+    /// publish the named infrastructure error instead of leaving the pending
+    /// no-result.
     SkidOvershoot { count: u64 },
     /// The child stopped because HERMIT'S OWN `--timeout` BOUND was reached.
     ///

@@ -37,4 +37,3 @@ hermit-run::deadline_slice_cap$itimer_a_wait_mask_is_withdrawn_when_the_wait_ret
 hermit-run::deadline_slice_cap$itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue	E	https://github.com/rrnewton/hermit/issues/4929	failed	failed: ignored_remaining_us=	baseline
 hermit-run::deadline_slice_cap$itimer_generation_discard_follows_the_wait_mask	E+F'	https://github.com/rrnewton/hermit/issues/4929	failed	failed: poll: result=0 first_us=	baseline
 hermit-run::deadline_slice_cap$itimer_mixed_masks_keep_the_timer_running	G	https://github.com/rrnewton/hermit/issues/4929	failed	\npositive=<N> samples=20 progress=<N>\n\nnote: run with	baseline
-hermit-run::deadline_slice_cap$skipped_slice_ends_survive_the_backstop	J	https://github.com/rrnewton/hermit/issues/4929	failed	long: backstop events\n  left: 0\n right: 1	https://github.com/rrnewton/hermit/issues/4929#issuecomment-6552352070

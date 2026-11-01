@@ -1920,6 +1920,17 @@ mod tests {
         for (accepted, probe) in [
             (&["hermit", "analyze", "--", "/bin/true"][..], unreachable),
             (
+                &[
+                    "hermit",
+                    "--backend=sabre",
+                    "analyze",
+                    "--",
+                    "--strict",
+                    "/bin/true",
+                ][..],
+                unreachable,
+            ),
+            (
                 &["hermit", "analyze", "--", "--strict", "/bin/true"][..],
                 || None,
             ),
@@ -2021,6 +2032,10 @@ mod tests {
             (
                 &["hermit", "analyze", "--", "/bin/true"][..],
                 (|| None) as fn() -> _,
+            ),
+            (
+                &["hermit", "--backend=sabre", "analyze", "--", "/bin/true"][..],
+                unreachable,
             ),
             (
                 &[
@@ -2628,40 +2643,58 @@ mod tests {
         }
     }
 
+    /// A trial keeps the maximum its run arguments request: the inherited one, a
+    /// disabled one, or an explicit one where the backend delivers timer events
+    /// (KVM, as ptrace); a backend without the timer (SaBRe) refuses the
+    /// explicit request by name.
     #[test]
     fn trial_preemption_keeps_the_explicit_maximum_request() {
-        for maximum in [
-            None,
-            Some("--max-timeslice=disabled"),
-            Some("--max-timeslice=200000000"),
-        ] {
-            let mut argv = vec!["hermit", "--backend=kvm", "analyze", "--"];
-            argv.extend(maximum);
-            argv.push("/bin/true");
-            let args = crate::Args::try_parse_from(argv).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
-                panic!("expected analyze")
-            };
-            options.apply_global(&args.global);
-            let workspace = tempfile::tempdir().unwrap();
-            options.tmp_dir = Some(workspace.path().to_path_buf());
-            let result = RunData::new_baseline(&options, "preemption".to_owned());
-            // KVM delivers preemption timer events since Reverie 9443a6b2,
-            // so the explicit maximum is kept, not refused.
-            assert_eq!(
-                result
-                    .unwrap()
-                    .runopts
-                    .det_opts
-                    .det_config
-                    .max_timeslice
-                    .map(u64::from),
-                if maximum == Some("--max-timeslice=disabled") {
-                    None
+        for (backend, delivers_timer) in [("kvm", true), ("sabre", false)] {
+            for maximum in [
+                None,
+                Some("--max-timeslice=disabled"),
+                Some("--max-timeslice=200000000"),
+            ] {
+                let backend_flag = format!("--backend={backend}");
+                let mut argv = vec!["hermit", backend_flag.as_str(), "analyze", "--"];
+                argv.extend(maximum);
+                argv.push("/bin/true");
+                let args = crate::Args::try_parse_from(argv).unwrap();
+                let crate::Subcommand::Analyze(mut options) = args.command else {
+                    panic!("expected analyze")
+                };
+                options.apply_global(&args.global);
+                let workspace = tempfile::tempdir().unwrap();
+                options.tmp_dir = Some(workspace.path().to_path_buf());
+                let result = RunData::new_baseline(&options, "preemption".to_owned());
+                if maximum == Some("--max-timeslice=200000000") && !delivers_timer {
+                    let error = result.err().expect("explicit maximum must refuse");
+                    assert!(
+                        error
+                            .downcast_ref::<crate::container::PolicyRefusal>()
+                            .is_some()
+                    );
+                    assert!(format!("{error:#}").contains(&format!(
+                        "unsupported_preemption: --backend={backend} refuses --max-timeslice"
+                    )));
                 } else {
-                    Some(200_000_000)
+                    assert_eq!(
+                        result
+                            .unwrap_or_else(|error| panic!("{backend} {maximum:?}: {error:#}"))
+                            .runopts
+                            .det_opts
+                            .det_config
+                            .max_timeslice
+                            .map(u64::from),
+                        if maximum == Some("--max-timeslice=disabled") {
+                            None
+                        } else {
+                            Some(200_000_000)
+                        },
+                        "{backend} {maximum:?}"
+                    );
                 }
-            );
+            }
         }
     }
 

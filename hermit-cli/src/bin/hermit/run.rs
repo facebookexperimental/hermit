@@ -221,7 +221,8 @@ impl ForwardedDetlogPlan {
     }
 }
 
-/// Why this host cannot arm Reverie's ptrace PMU timer.
+/// Why this host cannot arm a PMU preemption timer (reverie-ptrace's or
+/// reverie-kvm's: both count retired conditional branches with perf events).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TimerUnavailable {
     /// `perf_event_open` cannot open a hardware counter here.
@@ -238,7 +239,7 @@ pub(crate) fn reverie_timer_support_for_tests() -> bool {
     reverie_timer_support().is_ok()
 }
 
-/// Whether this host can arm Reverie's ptrace PMU timer.
+/// Whether this host can arm a PMU preemption timer.
 fn reverie_timer_support() -> Result<(), TimerUnavailable> {
     if !reverie_ptrace::is_perf_supported() {
         return Err(TimerUnavailable::NoPerfEvents);
@@ -5100,16 +5101,37 @@ fn a_run_draw_picks_the_maximum_and_a_replay_takes_the_recorded_one() {
         error.contains("--chaos-timeslice-draw=run") && error.contains("usable PMU"),
         "{error}"
     );
-    // KVM admits the draw since Reverie 9443a6b2; DBT still refuses.
-    let mut unavailable = run_opts_for(&["hermit", "--backend=dbt", "run", "--chaos", run, "prog"]);
-    let error = format!(
-        "{:#}",
-        unavailable
-            .validate_args_with_perf_support(true)
-            .unwrap_err()
-    );
-    assert!(error.contains("unsupported_preemption"), "{error}");
-    assert!(error.contains("--chaos-timeslice-draw=run"), "{error}");
+    // A backend that delivers no preemption timer events refuses the draw;
+    // KVM delivers them, so it draws the same maximum as ptrace.
+    for backend in ["--backend=dbt", "--backend=sabre"] {
+        let mut unavailable = run_opts_for(&["hermit", backend, "run", "--chaos", run, "prog"]);
+        let error = format!(
+            "{:#}",
+            unavailable
+                .validate_args_with_perf_support(true)
+                .unwrap_err()
+        );
+        assert!(
+            error.contains("unsupported_preemption"),
+            "{backend}: {error}"
+        );
+        assert!(
+            error.contains("--chaos-timeslice-draw=run"),
+            "{backend}: {error}"
+        );
+    }
+    let kvm = validate(&[
+        "hermit",
+        "--backend=kvm",
+        "run",
+        "--chaos",
+        "--seed=7",
+        range,
+        run,
+        "prog",
+    ]);
+    assert_eq!(kvm.det_opts.det_config.max_timeslice, Some(drawn));
+    assert_eq!(kvm.det_opts.det_config.chaos_timeslice, Some(drawn));
     ro.validate_args_with_perf_support(true).unwrap();
     assert_eq!(
         ro.det_opts.det_config.max_timeslice,
@@ -5605,10 +5627,21 @@ fn run_installs_its_skid_margin() {
     }
 }
 
+/// `--skid-margin` configures the PMU preemption timer: a backend that
+/// delivers no timer events refuses it by name, and KVM, whose timer reads the
+/// same Reverie PMU configuration as reverie-ptrace's, accepts it.
 #[test]
-fn skid_margin_override_rejects_non_ptrace_backed_backends() {
-    // KVM delivers preemption timer events since Reverie 9443a6b2, so it
-    // admits --skid-margin like ptrace does.
+fn skid_margin_override_needs_a_timer_delivering_backend() {
+    let mut kvm = run_opts_for(&[
+        "hermit",
+        "--backend=kvm",
+        "run",
+        "--skid-margin=500",
+        "fakeprog",
+    ]);
+    kvm.validate_args_with_perf_support(true)
+        .unwrap_or_else(|error| panic!("kvm: {error:#}"));
+    assert_eq!(kvm.skid_margin, Some(500));
     for backend in ["dbt", "sabre"] {
         let mut opts = run_opts_for(&[
             "hermit",
@@ -6728,7 +6761,7 @@ fn in_guest_trap_refuses_the_options_liteinst_refuses() {
     ]);
     assert!(run.uses_in_guest_liteinst());
     assert!(run.forwards_in_guest_detlogs());
-    assert!(!run.arms_reverie_ptrace_pmu_timer());
+    assert!(!run.arms_pmu_preemption_timer());
 }
 
 #[test]
@@ -7634,6 +7667,8 @@ fn a_small_max_timeslice_gets_a_notice() {
         full.push("fakeprog");
         assert_eq!(notice(&full, margin), None, "{argv:?}");
     }
+    // KVM places a precise event by stepping too, so its small slices are
+    // costly in the same way.
     let kvm = run_opts_for(&[
         "hermit",
         "--backend=kvm",
@@ -7641,9 +7676,15 @@ fn a_small_max_timeslice_gets_a_notice() {
         "--max-timeslice=1000",
         "fakeprog",
     ]);
-    // KVM reads the branch counter since Reverie 9443a6b2, so the notice
-    // applies to it as it does to ptrace.
+    assert_eq!(
+        kvm.small_max_timeslice_notice(zen),
+        notice(&["hermit", "run", "--max-timeslice=1000", "fakeprog"], zen)
+    );
     assert!(kvm.small_max_timeslice_notice(zen).is_some());
+    // A backend without the timer keeps its inherited maximum and steps
+    // nothing.
+    let dbt = run_opts_for(&["hermit", "--backend=dbt", "run", "fakeprog"]);
+    assert_eq!(dbt.small_max_timeslice_notice(zen), None);
 }
 
 /// `main`'s branch-counter check: a run without `--strict` on a host whose
@@ -7748,7 +7789,6 @@ fn the_inexact_branch_counter_warning_says_what_may_not_reproduce_and_what_to_do
 
 #[test]
 fn strict_refuses_an_inexact_branch_counter_on_the_pmu_backends() {
-    // KVM counts retired branches since Reverie 9443a6b2.
     for backend in ["ptrace", "e9patch", "kvm"] {
         let backend_flag = format!("--backend={backend}");
         let mut options = run_opts_for(&["hermit", &backend_flag, "run", "--strict", "fakeprog"]);
@@ -8290,17 +8330,17 @@ fn strict_help_describes_compatibility_and_opt_outs() {
 }
 
 #[test]
-fn only_instrumented_ptrace_family_runs_depend_on_host_perf() {
+fn only_timer_delivering_runs_depend_on_host_perf() {
     let default = RunOpts::parse_from(["fakehermit", "fakeprog"]);
-    assert!(default.arms_reverie_ptrace_pmu_timer());
+    assert!(default.arms_pmu_preemption_timer());
     let namespace_only = RunOpts::parse_from(["fakehermit", "--namespace-only", "fakeprog"]);
     assert_eq!(namespace_only.selected_backend(), Backend::Ptrace);
-    assert!(!namespace_only.arms_reverie_ptrace_pmu_timer());
-    // KVM arms the timer since Reverie 9443a6b2 (its own RCB counter).
+    assert!(!namespace_only.arms_pmu_preemption_timer());
+    // KVM's timer counts with the same perf events.
     let kvm = run_opts_for(&["hermit", "--backend=kvm", "run", "fakeprog"]);
-    assert!(kvm.arms_reverie_ptrace_pmu_timer());
+    assert!(kvm.arms_pmu_preemption_timer());
     let liteinst = run_opts_for(&["hermit", "--backend=liteinst", "run", "fakeprog"]);
-    assert!(!liteinst.arms_reverie_ptrace_pmu_timer());
+    assert!(!liteinst.arms_pmu_preemption_timer());
 }
 
 #[test]
@@ -9715,7 +9755,7 @@ impl RunOpts {
             "--timeout has not been qualified for the in-guest runtime, whose run future does \
              not kill the guest when it is dropped"
         } else if self.skid_margin.is_some() {
-            "--skid-margin configures the Reverie ptrace PMU timer, which the in-guest runtime \
+            "--skid-margin configures the PMU preemption timer, which the in-guest runtime \
              does not arm"
         } else if config.gdbserver {
             "--gdbserver needs the ptrace tracer, which the in-guest runtime does not attach"
@@ -10465,7 +10505,7 @@ impl RunOpts {
         // by the strict counter check or a later one, still says which
         // counter it would have read.
         if let Some(path) = self.verify_json.as_deref()
-            && self.arms_reverie_ptrace_pmu_timer()
+            && self.arms_pmu_preemption_timer()
         {
             crate::verify::record_exact_branch_counter(branch_counter_verdict());
             crate::verify::write_pending_verification_json(path)?;
@@ -10650,7 +10690,7 @@ impl RunOpts {
         self.refuse_gdbserver_without_a_gdbserver()?;
         refuse_signal_state_check_env(std::env::var_os(SIGNAL_STATE_CHECK_ENV).as_deref())
             .map_err(Error::msg)?;
-        let timer = if self.arms_reverie_ptrace_pmu_timer() {
+        let timer = if self.arms_pmu_preemption_timer() {
             reverie_timer_support()
         } else {
             Ok(())
@@ -10659,8 +10699,9 @@ impl RunOpts {
         self.refuse_unqualified_liteinst_in_guest_options()
     }
 
-    /// Whether this run would arm Reverie ptrace's PMU timer for
-    /// `--max-timeslice`, and so depends on host `perf_event_open` support.
+    /// Whether this run would arm a PMU preemption timer for
+    /// `--max-timeslice` (reverie-ptrace's, or reverie-kvm's on KVM), and so
+    /// depends on host `perf_event_open` support.
     ///
     /// `--namespace-only` execs the guest directly without any instrumentation
     /// backend (see `run_with_namespace_only`), so it never arms that timer even
@@ -10670,15 +10711,16 @@ impl RunOpts {
     ///
     /// Runtimes without a timer refuse explicit timer requests before this
     /// host-counter probe. Their inherited scheduling configuration is retained.
-    fn arms_reverie_ptrace_pmu_timer(&self) -> bool {
-        !self.namespace_only && self.backend_arms_reverie_ptrace_pmu_timer()
+    fn arms_pmu_preemption_timer(&self) -> bool {
+        !self.namespace_only && self.backend_arms_pmu_preemption_timer()
     }
 
-    /// Whether the selected backend's own runtime arms Reverie ptrace's PMU
-    /// timer, before `--namespace-only` is considered. `RunOpts::run` launches
+    /// Whether the selected backend's own runtime arms a PMU preemption timer
+    /// (its `delivers_preemption_timer_events` capability), before
+    /// `--namespace-only` is considered. `RunOpts::run` launches
     /// that runtime even with `--namespace-only`: only `main` dispatches the
     /// flag to `run_with_namespace_only`.
-    fn backend_arms_reverie_ptrace_pmu_timer(&self) -> bool {
+    fn backend_arms_pmu_preemption_timer(&self) -> bool {
         hermit::backend_delivers_preemption_timer(self.selected_backend())
     }
 
@@ -10707,17 +10749,19 @@ impl RunOpts {
         self.resolve_chaos_timeslice_range()?;
         self.resolve_preemption_settings()?;
         let backend = self.selected_backend();
+        // The margin configures the PMU preemption timer of every backend that
+        // delivers its events (reverie-ptrace's, which e9patch preprocessing
+        // runs on, and reverie-kvm's: both read Reverie's PMU configuration).
         // LiteInst passes here so that the in-guest refusal, which names why
         // it cannot honour `--skid-margin`, is the one that stops the run.
         if self.skid_margin.is_some()
             && (self.namespace_only
-                || !matches!(
-                    backend,
-                    Backend::Ptrace | Backend::Liteinst | Backend::InGuestTrap | Backend::E9patch
-                ))
+                || !(hermit::backend_delivers_preemption_timer(backend)
+                    || matches!(backend, Backend::Liteinst | Backend::InGuestTrap)))
         {
             anyhow::bail!(
-                "--skid-margin configures the Reverie ptrace PMU timer and requires a ptrace-backed backend"
+                "--skid-margin configures the PMU preemption timer and requires a backend that \
+                 delivers its events"
             );
         }
         if self.fatal_core_dir.is_some()
@@ -13016,7 +13060,7 @@ impl RunOpts {
         options.fatal_core_run_label = Some("run");
         let comparison = verify_run::recorded_comparison(&self.verification_comparison_options());
         let exact_branch_counter = self
-            .arms_reverie_ptrace_pmu_timer()
+            .arms_pmu_preemption_timer()
             .then(branch_counter_verdict);
 
         let execute = || {
@@ -14403,7 +14447,7 @@ impl RunOpts {
             return Ok(());
         }
         // `--chaos`, which the flag requires, already refuses `--namespace-only`.
-        if !self.backend_arms_reverie_ptrace_pmu_timer() {
+        if !self.backend_arms_pmu_preemption_timer() {
             anyhow::bail!(
                 "--chaos-seeded-timeslice draws the maximum timeslice that the PMU timer \
                  enforces, and --backend={} has no such timer: run it on --backend=ptrace, or \
@@ -15145,8 +15189,8 @@ impl RunOpts {
     /// [`SMALL_TIMESLICE_SKID_MARGINS`] skid margins (`skid_margin`, normally
     /// [`installed_skid_margin`]). A thread that computes without returning to
     /// Detcore is stopped by a timer event at the end of every timeslice, and on
-    /// the ptrace backend a precise timer is placed by stepping the guest through
-    /// up to the margin, so at least a tenth of such a slice is stepped: a
+    /// the ptrace and KVM backends a precise timer is placed by stepping the guest
+    /// through up to the margin, so at least a tenth of such a slice is stepped: a
     /// CPU-bound guest runs orders of magnitude slower, and a run cut off by
     /// `--timeout` may not be hung.
     ///
@@ -15218,9 +15262,9 @@ impl RunOpts {
 
     /// Whether this run reads the retired-conditional-branch counter that
     /// [`Self::refuse_strict_with_inexact_branch_counter`] guards: on a
-    /// backend that arms Reverie's ptrace PMU timer, with a timeslice.
+    /// backend that arms a PMU preemption timer, with a timeslice.
     fn reads_the_branch_counter(&self) -> bool {
-        self.arms_reverie_ptrace_pmu_timer() && self.det_opts.det_config.max_timeslice.is_some()
+        self.arms_pmu_preemption_timer() && self.det_opts.det_config.max_timeslice.is_some()
     }
 
     /// [`Self::reads_the_branch_counter`] for an `analyze` or `bisect` trial.
@@ -15229,8 +15273,7 @@ impl RunOpts {
     /// (alias `--lite`) does not reach `run_with_namespace_only`: the trial
     /// still runs on the backend's runtime and its counter, and is not exempt.
     fn trial_reads_the_branch_counter(&self) -> bool {
-        self.backend_arms_reverie_ptrace_pmu_timer()
-            && self.det_opts.det_config.max_timeslice.is_some()
+        self.backend_arms_pmu_preemption_timer() && self.det_opts.det_config.max_timeslice.is_some()
     }
 
     /// [`Self::refuse_strict_with_inexact_branch_counter`] for an `analyze` or

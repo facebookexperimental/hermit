@@ -10,7 +10,11 @@
 //!
 //! This is launch policy, not a timer implementation or a replacement for
 //! Detcore's scheduling policy. Cooperative scheduling at existing guest
-//! events remains available without a preemption timer.
+//! events remains available without a preemption timer. Each refusal is keyed
+//! on a capability the backend states, never on its name: a runtime that
+//! delivers no preemption timer events refuses every timer request, and one
+//! that delivers them but cannot unwind guest stacks refuses the requests to
+//! print a stack at each preemption.
 
 use detcore::Config;
 
@@ -21,14 +25,33 @@ use crate::Backend;
 pub struct UnsupportedPreemption {
     backend: Backend,
     setting: &'static str,
+    missing: MissingCapability,
+}
+
+/// The backend capability whose absence refuses a setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingCapability {
+    /// `delivers_preemption_timer_events`: the setting needs timer events.
+    TimerEvents,
+    /// `provides_guest_backtraces`: the setting prints a guest stack at each
+    /// preemption, which this runtime cannot unwind.
+    GuestBacktraces,
 }
 
 impl std::fmt::Display for UnsupportedPreemption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self.missing {
+            MissingCapability::TimerEvents => {
+                "this runtime cannot deliver Detcore preemption timer events"
+            }
+            MissingCapability::GuestBacktraces => {
+                "this runtime cannot unwind guest stacks, so no preemption would have a \
+                 stack to print"
+            }
+        };
         write!(
             f,
-            "unsupported_preemption: --backend={} refuses {}: this runtime cannot deliver \
-             Detcore preemption timer events; the guest has not started",
+            "unsupported_preemption: --backend={} refuses {}: {reason}; the guest has not started",
             self.backend.as_str(),
             self.setting,
         )?;
@@ -61,14 +84,34 @@ impl std::error::Error for UnsupportedPreemption {}
 /// A schedule-event recording or cooperative target alone does not request a
 /// timer. Preemption-point replay does, and is refused without inspecting or
 /// silently reducing the requested recording to a cooperative subset.
+///
+/// A runtime that delivers timer events but cannot unwind guest stacks
+/// (`provides_guest_backtraces` false, as on KVM) accepts every timer request
+/// except the two that print a stack at each preemption, which would print
+/// none there.
 pub fn refuse_unsupported_preemption(
     config: &Config,
     backend: Backend,
     maximum_requested: bool,
     skid_margin_requested: bool,
 ) -> Result<(), UnsupportedPreemption> {
-    if crate::backend_delivers_preemption_timer(backend) {
-        return Ok(());
+    let capabilities = crate::backend_capabilities(backend);
+    if capabilities.delivers_preemption_timer_events {
+        if capabilities.provides_guest_backtraces {
+            return Ok(());
+        }
+        let setting = if config.preemption_stacktrace {
+            "--preemption-stacktrace"
+        } else if config.preemption_stacktrace_log_file.is_some() {
+            "--preemption-stacktrace-log-file"
+        } else {
+            return Ok(());
+        };
+        return Err(UnsupportedPreemption {
+            backend,
+            setting,
+            missing: MissingCapability::GuestBacktraces,
+        });
     }
     let setting = if config.chaos_timeslice_range.is_some() {
         // The range sets the maximum, a timer request in its own right.
@@ -95,7 +138,11 @@ pub fn refuse_unsupported_preemption(
     } else {
         return Ok(());
     };
-    Err(UnsupportedPreemption { backend, setting })
+    Err(UnsupportedPreemption {
+        backend,
+        setting,
+        missing: MissingCapability::TimerEvents,
+    })
 }
 
 /// A named, pre-guest refusal of a configuration that cannot replay a
@@ -286,6 +333,8 @@ mod tests {
             "--replay-preemptions-from=unused",
         ]);
         refuse_unqualified_annotated_replay(&qualified, Backend::Ptrace).unwrap();
+        // KVM delivers precise timer events too.
+        refuse_unqualified_annotated_replay(&qualified, Backend::Kvm).unwrap();
         for backend in TIMERLESS {
             let refusal = refuse_unqualified_annotated_replay(&qualified, backend).unwrap_err();
             assert_eq!(
@@ -381,6 +430,75 @@ mod tests {
             ..unsequentialized
         };
         refuse_unqualified_annotated_launch(&unannotated).unwrap();
+    }
+
+    /// KVM delivers timer events but cannot unwind guest stacks. It refuses
+    /// the two requests that print a stack at each preemption by name, for
+    /// its missing backtraces rather than for timer events, without rewriting
+    /// the configuration; ptrace and e9patch preprocessing, which unwind,
+    /// accept them, and the timerless backends still refuse them for their
+    /// missing timer events.
+    #[test]
+    fn preemption_stack_traces_need_guest_backtraces() {
+        for (args, setting) in [
+            (vec!["--preemption-stacktrace"], "--preemption-stacktrace"),
+            (
+                vec!["--preemption-stacktrace-log-file=unused"],
+                "--preemption-stacktrace-log-file",
+            ),
+        ] {
+            let config = Config::parse_from(["detcore", "--chaos"].into_iter().chain(args));
+            let before = serde_json::to_value(&config).unwrap();
+            let error =
+                refuse_unsupported_preemption(&config, Backend::Kvm, true, false).unwrap_err();
+            assert_eq!(error.setting, setting);
+            assert_eq!(error.missing, MissingCapability::GuestBacktraces);
+            let message = error.to_string();
+            assert!(
+                message.starts_with(&format!(
+                    "unsupported_preemption: --backend=kvm refuses {setting}: this runtime \
+                     cannot unwind guest stacks"
+                )),
+                "{message}"
+            );
+            assert!(
+                message.ends_with("; the guest has not started"),
+                "{message}"
+            );
+            assert_eq!(serde_json::to_value(&config).unwrap(), before);
+            refuse_unsupported_preemption(&config, Backend::Ptrace, true, false).unwrap();
+            refuse_unsupported_preemption(&config, Backend::E9patch, true, false).unwrap();
+            // The inherited maximum is not a request (`maximum_requested`
+            // false), so the stack-trace flag is what a timerless runtime
+            // refuses, for its missing timer events.
+            for backend in TIMERLESS {
+                let error =
+                    refuse_unsupported_preemption(&config, backend, false, false).unwrap_err();
+                assert_eq!(error.setting, setting, "{backend:?}");
+                assert_eq!(error.missing, MissingCapability::TimerEvents, "{backend:?}");
+            }
+        }
+    }
+
+    /// Every other timer request runs on KVM, as on ptrace: an explicit or
+    /// replayed maximum, imprecise timers, interrupt points, an overshoot
+    /// panic, a skid margin, preemption-point replay and a chaos range.
+    #[test]
+    fn kvm_accepts_every_timer_request_but_the_stack_traces() {
+        for args in [
+            vec!["--max-timeslice=1000"],
+            vec!["--preemption-timeout=1000"],
+            vec!["--max-timeslice=disabled", "--imprecise-timers"],
+            vec!["--max-timeslice=disabled", "--interrupt-at=3:1000"],
+            vec!["--panic-on-rcb-overshoot"],
+            vec!["--replay-preemptions-from=unused"],
+            vec!["--chaos", "--chaos-timeslice-range=1000..2000"],
+        ] {
+            let config = Config::parse_from(["detcore"].into_iter().chain(args.iter().copied()));
+            if let Err(error) = refuse_unsupported_preemption(&config, Backend::Kvm, true, true) {
+                panic!("{args:?}: {error}");
+            }
+        }
     }
 
     #[test]

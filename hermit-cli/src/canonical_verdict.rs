@@ -154,8 +154,9 @@ impl ContainerFailure {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum InfrastructureError {
-    /// A ptrace PMU timer interrupt arrived after its target. Both runs and
-    /// their comparison may still be retained, but the result is not admitted.
+    /// A precise PMU timer event (ptrace or KVM) arrived after its target.
+    /// Both runs and their comparison may still be retained, but the result
+    /// is not admitted.
     SkidOvershoot { count: u64 },
     /// The two runs diverged, and a host file the guest opened changed during
     /// one of them: `run` opened `path` again and found the host file `after`

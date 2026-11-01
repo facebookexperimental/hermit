@@ -116,9 +116,12 @@ fn explicit_maximum_is_refused_even_when_equal_to_the_parser_default() {
     }
 }
 
+/// Every backend that delivers preemption timer events keeps a positive
+/// maximum, inherited or given, and loses it only where the host has no usable
+/// counters: ptrace, e9patch preprocessing on it, and KVM.
 #[test]
-fn ptrace_and_e9patch_preprocessing_preserve_positive_maximums() {
-    for backend in [Backend::Ptrace, Backend::E9patch] {
+fn timer_delivering_backends_preserve_positive_maximums() {
+    for backend in [Backend::Ptrace, Backend::E9patch, Backend::Kvm] {
         for options in [vec![], vec!["--max-timeslice=1000"]] {
             let run = parse(backend, &options);
             let config_before = config_snapshot(&run);
@@ -620,9 +623,13 @@ fn a_seeded_run_is_the_run_with_its_drawn_maximum_given() {
 }
 
 /// A backend without a PMU timer has no maximum timeslice to draw; the
-/// refusal names the backend and the working options.
+/// refusal names the backend and the working options. KVM's timer can enforce
+/// a drawn maximum, so it draws one.
 #[test]
 fn chaos_seeded_timeslice_needs_a_pmu_timer() {
+    let mut kvm = parse(Backend::Kvm, &SEEDED);
+    kvm.resolve_seeded_chaos_timeslice()
+        .unwrap_or_else(|error| panic!("kvm: {error:#}"));
     for backend in TIMERLESS {
         let mut run = parse(backend, &SEEDED);
         let message = format!("{:#}", run.resolve_seeded_chaos_timeslice().unwrap_err());

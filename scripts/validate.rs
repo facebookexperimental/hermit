@@ -18833,7 +18833,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "112");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "116");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -18850,7 +18850,6 @@ mod nextest_timeout_tests {
         }
         assert!(filters.iter().all(|filter| filter == &filters[0]));
         let cli = std::fs::read_to_string(root.join("hermit-cli/tests/cli.rs")).unwrap();
-        let excluded = "run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting";
         let lines = cli.lines().collect::<Vec<_>>();
         let mut names = lines
             .iter()
@@ -18866,11 +18865,7 @@ mod nextest_timeout_tests {
                         line.is_empty() || line.starts_with("#[") || line.starts_with("///")
                     })
                     .any(|line| line.trim().starts_with("#[ignore"));
-                assert_eq!(
-                    ignored,
-                    name == excluded,
-                    "unexpected ignore state for {name}"
-                );
+                assert!(!ignored, "unexpected ignore state for {name}");
                 Some(name)
             })
             .collect::<Vec<_>>();
@@ -18939,13 +18934,19 @@ mod nextest_timeout_tests {
         // maximum requests an unavailable timer: 106 selected CLI tests remain.
         // Recount at 4e916633ca: the source holds 112 declarations (the chain
         // above undercounts three added without moving it), 111 selected.
+        // The rest of the KVM preemption timer flip (T2,
+        // https://github.com/rrnewton/hermit/issues/4954) selects the spinner,
+        // run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting,
+        // again (it was ignored and excluded while KVM refused its explicit
+        // maximum) and adds run_kvm_refuses_preemption_stack_traces_by_name,
+        // run_kvm_a_late_timer_event_refuses_the_run_by_name and
+        // run_kvm_a_late_timer_event_is_a_verify_infrastructure_error: 115
+        // declarations, every one selected.
         assert_eq!(
             names.len(),
-            112,
+            115,
             "update the exact CI inventory with new KVM tests"
         );
-        names.retain(|name| name != excluded);
-        assert_eq!(names.len(), 111);
         let required_cases = [
             "run_kvm_self_sigkill_from_nonleader_is_group_fatal",
             "run_kvm_synchronous_root_segv_preserves_guest_exit",
@@ -18987,6 +18988,10 @@ mod nextest_timeout_tests {
             "run_kvm_an_exec_the_host_refuses_memory_for_is_a_policy_refusal_not_a_guest_enomem",
             "run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences",
             "run_kvm_renders_proc_locks_from_the_lock_ledger",
+            "run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting",
+            "run_kvm_refuses_preemption_stack_traces_by_name",
+            "run_kvm_a_late_timer_event_refuses_the_run_by_name",
+            "run_kvm_a_late_timer_event_is_a_verify_infrastructure_error",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -19003,12 +19008,6 @@ mod nextest_timeout_tests {
                 )
             })
             .collect::<serde_json::Map<_, _>>();
-        cases.insert(
-            excluded.into(),
-            serde_json::json!({
-                "ignored": true, "filter-match": {"status": "mismatch"}
-            }),
-        );
         let inventory = serde_json::json!({"rust-suites": {"fixture": {"testcases": cases}}});
         let scratch = tempfile::tempdir().unwrap();
         let path = scratch.path().join("inventory.json");
@@ -19027,11 +19026,11 @@ mod nextest_timeout_tests {
             );
         };
         check(&inventory, 0);
-        // Neither an ignored match nor re-enabling the excluded spinner may
-        // silently join the exact active selection.
+        // An extra matching test, ignored or not, may not silently join the
+        // exact active selection.
         for ignored in [true, false] {
             let mut included = inventory.clone();
-            included["rust-suites"]["fixture"]["testcases"][excluded] = serde_json::json!({
+            included["rust-suites"]["fixture"]["testcases"]["run_kvm_unlisted_extra"] = serde_json::json!({
                 "ignored": ignored, "filter-match": {"status": "matches"}
             });
             check(&included, 1);
@@ -20101,7 +20100,12 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences and
         // run_kvm_renders_proc_locks_from_the_lock_ledger
         // (https://github.com/rrnewton/hermit/issues/4213): 112 selected.
-        ("privileged-only-test.cli_kvm", 112usize),
+        // The rest of the KVM preemption timer flip (T2) selects
+        // run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting
+        // again and adds run_kvm_refuses_preemption_stack_traces_by_name,
+        // run_kvm_a_late_timer_event_refuses_the_run_by_name and
+        // run_kvm_a_late_timer_event_is_a_verify_infrastructure_error: 116.
+        ("privileged-only-test.cli_kvm", 116usize),
     ] {
         let step = privileged
             .steps

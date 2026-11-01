@@ -52,19 +52,11 @@
           "outcome": "failed",
           "signature": "\\npositive=<N> samples=20 progress=<N>\\n\\nnote: run with",
           "status": "known-gap"
-        },
-        {
-          "gap": "J",
-          "id": "hermit-run::deadline_slice_cap$skipped_slice_ends_survive_the_backstop",
-          "issue": "https://github.com/rrnewton/hermit/issues/4929",
-          "outcome": "failed",
-          "signature": "long: backstop events\\n  left: 0\\n right: 1",
-          "status": "known-gap"
         }
       ],
       "ledger": "hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv",
       "node": "privileged-test.deadline_slice_cap_kvm",
-      "required_tests": 35
+      "required_tests": 36
     }
   ],
   "schema": 1

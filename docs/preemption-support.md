@@ -7,11 +7,15 @@ system call does not supply that mechanism.
 Hermit's CLI preserves an omitted maximum and the existing scheduling behavior.
 The parser default remains 200,000,000 virtual nanoseconds; the absence of a
 timer mechanism does not rewrite it to `None`. An explicit positive maximum, including
-`--max-timeslice=200000000`, is refused before guest startup on DBT, SaBRe, KVM,
+`--max-timeslice=200000000`, is refused before guest startup on DBT, SaBRe,
 LiteInst and in-guest-trap. Config-file and `--from` values are explicit inputs
 too; they retain the same precedence as command-line values. Explicit disabled
 or zero maximums pass this timer admission check. Ptrace and e9patch
 preprocessing keep their existing timer behavior and host-counter fallback.
+KVM arms its own retired-conditional-branch timer for every maximum, inherited
+or explicit, as its `delivers_preemption_timer_events` capability states, with
+the same host-counter fallback, `--skid-margin`, small-timeslice notice and
+`--strict` refusal of an inexact branch counter.
 LiteInst and in-guest-trap retain their earlier refusal of any configured
 positive maximum, including the inherited default; their default is not newly
 accepted.
@@ -29,6 +33,35 @@ started`, classified as `HERMIT_POLICY_REFUSAL` (exit 122). Timer-only requests
 are refused even when the maximum is disabled, including
 per-thread preemption-point replay. Chaos controls, including per-thread RCB
 slowdown, and schedule-event recording/replay retain their existing behavior.
+
+A runtime that delivers timer events but cannot unwind guest stacks (its
+`provides_guest_backtraces` capability is false, as on KVM) refuses only the
+two requests that print a stack at each preemption, `--preemption-stacktrace`
+and `--preemption-stacktrace-log-file`: `unsupported_preemption:
+--backend=NAME refuses FLAG: this runtime cannot unwind guest stacks, so no
+preemption would have a stack to print; the guest has not started`, also exit
+122.
+
+Known limits, the same on ptrace and KVM unless a line says otherwise:
+
+* A late precise event refuses the run through a process-global witness:
+  Reverie's late-event count (`reverie/src/timer.rs`), which Hermit clears when
+  a launch begins and takes when it ends
+  (https://github.com/rrnewton/reverie/issues/1219). A CLI run is unaffected:
+  each `hermit run` executes its launches one at a time in its container child
+  process, and the two runs of `--verify` are sequential. Library launches that
+  overlap in one process can lose a refusal, or charge one launch's late event
+  to the other. Detcore's own record of late events cannot replace the count: it
+  writes the same process-global counter, and it sees only a clock past the
+  target, not an exit exactly at the target that the backend did not step to.
+* `--strict` accepts `--imprecise-timers`. An imprecise slice end lands at the
+  first exit at or past its target, a host-timed point, so the schedule of such
+  a run can change from one run to the next.
+* Where the runtime cannot unwind guest stacks, `--stacktrace-event` (with or
+  without `--stacktrace-signal`, which acts only at those events) and the stack
+  phase of `hermit analyze` are not refused: they print `Could not read
+  backtrace!` in place of each stack
+  (https://github.com/rrnewton/hermit/issues/4961).
 
 Configuration and timer availability are separate metadata. The optional
 `preemption` object in a summary or run manifest contains `max_timeslice_ns`
@@ -70,7 +103,7 @@ not measured parity or a claim of bounded execution on a timerless backend.
 | DBT | `assert_dbt_execution_model` forcibly sets the maximum to `None` before Detcore runs. Its sampled syscall-entry branch count does not provide a threshold timer; timer methods return `ENOSYS`. | Hermit `detcore-dbt/src/lib.rs:460`; Reverie `reverie-dbt/src/lib.rs:751` |
 | LiteInst and in-guest-trap | The earlier CLI/library guards refuse any positive configured maximum, including the inherited default. The shared in-guest timer methods return `ENOSYS`; clock reads remain available. | Hermit `refuse_in_guest_liteinst_run` and the CLI in-guest guard; Reverie `reverie-inguest/src/guest/host.rs:3348` |
 | SaBRe | Preserves the inherited maximum. `read_clock` returns zero; timer methods report success without arming a timer. The positive maximum still affects shared logical-time costs and deadline selection. | Reverie `experimental/reverie-sabre/src/reverie_adapter.rs:1482` |
-| KVM | Preserves the inherited maximum and samples its actual guest RCB counter. Its count-only clock does not deliver timer events; timer methods return success without arming one. | Reverie `reverie-kvm/src/clock.rs`, `read_clock`; `reverie-kvm/src/runtime.rs:1789`; `reverie/src/capabilities.rs:323` |
+| KVM | Arms a retired-conditional-branch timer: a second guest-only counting event, sampling, whose overflow kicks the vCPU out of `KVM_RUN`; a precise event is then single-stepped to its exact count. A late precise event is recorded, delivered at the clock it found and refuses the run (exit 122), as on ptrace. It cannot unwind guest stacks, so the stack-trace requests are refused by name. | Reverie `reverie-kvm/src/preemption_timer.rs`, `reverie-kvm/src/clock.rs`; `reverie/src/capabilities.rs` (`delivers_preemption_timer_events`, `provides_guest_backtraces`); Hermit `hermit-cli/src/preemption_admission.rs` |
 | Hermit e9patch preprocessing | Executes through ptrace after rewriting and uses ptrace's timer. | Hermit e9patch preprocessing and ptrace dispatch in `hermit-cli/src/bin/hermit/run.rs` and `hermit-cli/src/lib.rs` |
 | Direct Reverie e9patch Tool host | Timer methods return an Unsupported error. This is a separate execution path and outside this CLI admission change. | Reverie `reverie-e9patch/src/tool_host.rs`, `set_timer` |
 
@@ -104,8 +137,8 @@ preserves these shared behaviors:
   guest boundary. `post_handler_hook` attempts `set_timer` or
   `set_timer_precise` when `max_timeslice_end` exists; the dropped-signal path
   also re-arms an existing timer when the maximum is present. Keeping these
-  baseline calls does not make KVM's or SaBRe's no-op timer methods deliver an
-  event (`detcore/src/lib.rs`).
+  baseline calls does not make SaBRe's no-op timer methods deliver an event
+  (`detcore/src/lib.rs`); on KVM they arm its timer.
 
 KVM's guest-only performance counter supplies real branch deltas between guest
 entries. Removing the maximum would suppress those samples and select the
@@ -120,9 +153,9 @@ configuration without changing scheduling behavior.
 | --- | --- |
 | `--imprecise-timers` | Selects an imprecise rather than precise timer arm in `post_handler_hook`. |
 | `--interrupt-at` | Needs a timer and RCB logical time to stop at the requested branch count. |
-| `--preemption-stacktrace`, `--preemption-stacktrace-log-file` | Produce the requested output in the timer-event handler. |
+| `--preemption-stacktrace`, `--preemption-stacktrace-log-file` | Produce the requested output in the timer-event handler. Refused where the runtime cannot unwind guest stacks (`provides_guest_backtraces`: false on KVM). |
 | `--panic-on-rbc-overshoot` (alias `--panic-on-rcb-overshoot`) | Checks a precise timer's branch-count overshoot during RCB sampling. |
-| `--skid-margin` | Configures the ptrace PMU timer, not a guest clock. |
+| `--skid-margin` | Configures the PMU timer's skid margin (ptrace and KVM), not a guest clock. |
 | `--replay-preemptions-from` | Loads per-thread preemption points. This CLI request refuses on a timerless backend rather than reducing the recording to a cooperative subset. |
 | `--chaos-per-thread-slowdown` | Retains its existing acceptance. It weights sampled RCB time at callbacks and does not itself need timer delivery. Its effect depends on the backend's clock progress and `use_rcb_time`. |
 
@@ -165,13 +198,14 @@ DBT/SaBRe cells that inherited a default remain selected with baseline backend
 behavior. These are configuration counts, not measurements of passing cells.
 This change adds no default-based cell disables.
 
-Two existing tests retain their bodies but are disabled with the named refusal:
-`run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting` supplies an
-explicit positive maximum through its helper; and
+One existing test retains its body but is disabled with the named refusal:
 `liteinst_replay_with_a_conflicting_epoch_is_refused_in_every_build` requests
 preemption-point replay, which now refuses before epoch reconciliation. The
-ptrace spinner and replay-epoch tests remain active. New admission tests check
-the timer refusal separately from those unsupported functional expectations.
+ptrace spinner and replay-epoch tests remain active, and so, since KVM delivers
+timer events, does
+`run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting`. New
+admission tests check the timer refusal separately from those unsupported
+functional expectations.
 
 The ten existing KVM clock/deadline regression expectations remain unchanged;
 the default-preservation checks must keep their guest assertions. The SaBRe

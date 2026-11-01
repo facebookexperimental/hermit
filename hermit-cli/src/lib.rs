@@ -2552,12 +2552,13 @@ impl Backend {
         }
     }
 
-    fn uses_ptrace_pmu_timers(self) -> bool {
-        match self {
-            Self::Ptrace | Self::E9patch => true,
-            // In-guest Detcore has no ptrace tracer to arm the PMU timer from.
-            Self::Liteinst | Self::InGuestTrap | Self::Dbt | Self::Sabre | Self::Kvm => false,
-        }
+    /// Whether a run on this backend can deliver a precise timer event late
+    /// (Reverie's skid-overshoot witness), which then refuses the run: exactly
+    /// the backends that deliver preemption timer events, as their capability
+    /// states ([`backend_delivers_preemption_timer`]). A backend that delivers
+    /// none cannot produce the witness, and must not consume another run's.
+    fn consumes_skid_overshoot_reports(self) -> bool {
+        backend_delivers_preemption_timer(self)
     }
 
     /// Returns backends whose Hermit integration prerequisites are met.
@@ -2635,8 +2636,9 @@ impl std::fmt::Display for BackendRunFailure {
 
 impl std::error::Error for BackendRunFailure {}
 
-/// A ptrace-backed run observed late precise-timer delivery, so Hermit refuses
-/// to treat the completed execution as deterministic evidence.
+/// A run on a backend that delivers precise timer events (ptrace, e9patch
+/// preprocessing on it, or KVM) observed late precise-timer delivery, so Hermit
+/// refuses to treat the completed execution as deterministic evidence.
 ///
 /// This is a type rather than a message match because it crosses the container
 /// error boundary as [`error::FailureKind::PolicyRefusal`].
@@ -4797,7 +4799,8 @@ pub fn run_with_backend_timeout(
             report.finish(result)
         });
     }
-    let skid_overshoot_report = SkidOvershootReport::begin(backend.uses_ptrace_pmu_timers());
+    let skid_overshoot_report =
+        SkidOvershootReport::begin(backend.consumes_skid_overshoot_reports());
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
     }
@@ -4950,11 +4953,11 @@ pub fn backend_capabilities(backend: Backend) -> reverie::BackendCapabilities {
     }
 }
 
-/// Whether `backend`'s runtime arms Reverie ptrace's PMU timer and delivers its
+/// Whether `backend`'s runtime arms a PMU preemption timer and delivers its
 /// events, so `--max-timeslice` really preempts a thread that makes no syscall:
-/// the backend's stated `delivers_preemption_timer_events`. Only ptrace does
-/// (e9patch preprocessing runs on it). SaBRe and KVM accept a timer request and
-/// deliver nothing; DBT and in-guest LiteInst refuse it.
+/// the backend's stated `delivers_preemption_timer_events`. ptrace (and e9patch
+/// preprocessing, which runs on it) and KVM do. SaBRe accepts a timer request
+/// and delivers nothing; DBT and in-guest LiteInst refuse it.
 pub fn backend_delivers_preemption_timer(backend: Backend) -> bool {
     backend_capabilities(backend).delivers_preemption_timer_events
 }
@@ -5597,7 +5600,8 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
             report.finish_with_count(result)
         });
     }
-    let skid_overshoot_report = SkidOvershootReport::begin(backend.uses_ptrace_pmu_timers());
+    let skid_overshoot_report =
+        SkidOvershootReport::begin(backend.consumes_skid_overshoot_reports());
     if backend == Backend::Kvm {
         // Reserve before the Tokio runtime can reuse a closed fd 0. KVM
         // verification consumes the explicit output snapshot in `run_kvm`;
@@ -7457,21 +7461,27 @@ mod tests {
         assert_eq!(
             reverie::take_skid_overshoot_count(),
             1,
-            "a backend that cannot produce ptrace PMU overshoots must not consume another run's evidence"
+            "a backend that cannot produce PMU overshoots must not consume another run's evidence"
         );
     }
 
+    /// The backends whose runs can deliver a precise timer event late are the
+    /// ones that deliver timer events at all: ptrace, e9patch preprocessing on
+    /// it, and KVM. The others deliver none, so a late-delivery witness in the
+    /// process cannot be theirs.
     #[test]
-    fn only_ptrace_hosted_backends_consume_skid_overshoot_reports() {
-        for backend in [Backend::Ptrace, Backend::E9patch] {
-            assert!(backend.uses_ptrace_pmu_timers(), "{backend:?}");
+    fn timer_delivering_backends_consume_skid_overshoot_reports() {
+        for backend in [Backend::Ptrace, Backend::E9patch, Backend::Kvm] {
+            assert!(backend.consumes_skid_overshoot_reports(), "{backend:?}");
         }
-        for backend in [Backend::Dbt, Backend::Sabre, Backend::Kvm] {
-            assert!(!backend.uses_ptrace_pmu_timers(), "{backend:?}");
+        for backend in [
+            Backend::Dbt,
+            Backend::Sabre,
+            Backend::Liteinst,
+            Backend::InGuestTrap,
+        ] {
+            assert!(!backend.consumes_skid_overshoot_reports(), "{backend:?}");
         }
-        // In-guest Detcore has no ptrace tracer to arm the PMU timer from.
-        assert!(!Backend::Liteinst.uses_ptrace_pmu_timers());
-        assert!(!Backend::InGuestTrap.uses_ptrace_pmu_timers());
     }
 
     #[cfg(feature = "liteinst")]

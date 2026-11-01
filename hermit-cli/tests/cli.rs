@@ -6305,6 +6305,159 @@ fn run_kvm_with_a_resolved_or_explicitly_disabled_maximum() {
     }
 }
 
+/// KVM delivers timer events but cannot unwind guest stacks, so the two
+/// requests to print a stack at each preemption are refused by name before
+/// the guest starts, rather than printing "Could not read backtrace!" at every
+/// preemption. The refusal names the missing stacks, not timer events.
+#[test]
+fn run_kvm_refuses_preemption_stack_traces_by_name() {
+    if kvm_unavailable("run_kvm_refuses_preemption_stack_traces_by_name") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let log_file = directory.path().join("stacks.log");
+    let log_arg = format!("--preemption-stacktrace-log-file={}", log_file.display());
+    for (flag, setting) in [
+        ("--preemption-stacktrace", "--preemption-stacktrace"),
+        (log_arg.as_str(), "--preemption-stacktrace-log-file"),
+    ] {
+        let args = [
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--chaos",
+            flag,
+            "--",
+            "/bin/echo",
+            "kvm-stack-guest-must-not-start",
+        ];
+        let output = hermit(&args);
+        let stderr = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "unsupported_preemption: --backend=kvm refuses {setting}: this runtime cannot \
+                 unwind guest stacks"
+            )),
+            "{stderr}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("kvm-stack-guest-must-not-start"),
+            "{args:?}: the guest started"
+        );
+        assert!(!log_file.exists(), "{args:?}: a stack log was written");
+    }
+}
+
+/// A `--backend=kvm --strict` run of a syscall-free loop with `--skid-margin=0`
+/// and 1 ms slices, plus `extra` Hermit options. On KVM an exit at a precise
+/// event's target counts as late unless the backend stepped there, and with no
+/// margin it steps nothing, so every slice end the loop reaches is a late
+/// event. Hermit is run directly: the `hermit()` helper retries exactly this
+/// refusal.
+fn kvm_late_timer_event_run(extra: &[&str]) -> Output {
+    let _guard = hermit_run_guard();
+    let loop_program = "awk 'BEGIN{s=0;for(i=0;i<3000000;i++)s+=i;print s}'";
+    let mut args = vec![
+        "--backend=kvm",
+        "run",
+        "--strict",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--skid-margin=0",
+        "--max-timeslice=1000000",
+    ];
+    args.extend_from_slice(extra);
+    args.extend(["--", "/bin/sh", "-c", loop_program]);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    append_hermit_args(&mut command, &args);
+    command
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"))
+}
+
+/// A late precise timer event refuses a KVM run by name, as on ptrace. The
+/// refusal is what keeps a host-timed late event from becoming an accepted run
+/// with another schedule, so this checks it end to end: through the KVM
+/// backend's late-event record, Hermit's skid report and the policy-refusal
+/// exit.
+#[test]
+fn run_kvm_a_late_timer_event_refuses_the_run_by_name() {
+    if kvm_unavailable("run_kvm_a_late_timer_event_refuses_the_run_by_name") {
+        return;
+    }
+    let output = kvm_late_timer_event_run(&[]);
+    let stderr = stderr(&output);
+    // The refusal line, once the recognizer has checked the exit status, a
+    // count above zero, a HERMIT_SKID_OVERSHOOT line and no second outcome.
+    let refusal = skid_overshoot_refusal(output.status.code(), &stderr).unwrap_or_else(|| {
+        panic!(
+            "expected only a named skid refusal (exit {HERMIT_POLICY_REFUSAL_EXIT}, \
+             {SKID_OVERSHOOT_REFUSAL_PREFIX}<count>, a HERMIT_SKID_OVERSHOOT line); got exit \
+             {:?}:\n{stderr}",
+            output.status.code()
+        )
+    });
+    let count: u64 = refusal[SKID_OVERSHOOT_REFUSAL_PREFIX.len()..]
+        .parse()
+        .unwrap_or_else(|error| panic!("{refusal}: {error}"));
+    assert!(count > 0, "{stderr}");
+}
+
+/// The same late events under `--verify --verify-strict --verify-json`: the
+/// verdict is an infrastructure error of kind skid_overshoot, never a match.
+#[test]
+fn run_kvm_a_late_timer_event_is_a_verify_infrastructure_error() {
+    if kvm_unavailable("run_kvm_a_late_timer_event_is_a_verify_infrastructure_error") {
+        return;
+    }
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report_path = directory.path().join("verify.json");
+    let report_arg = report_path.to_str().expect("report path should be UTF-8");
+    let output =
+        kvm_late_timer_event_run(&["--verify", "--verify-strict", "--verify-json", report_arg]);
+    let stderr = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(SKID_OVERSHOOT_REFUSAL_PREFIX),
+        "no named skid refusal:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("HERMIT_TASK_PANIC") && !stderr.contains("panicked at"),
+        "{stderr}"
+    );
+    let report = VerificationReport::from_current_json_value(
+        serde_json::from_slice(&fs::read(&report_path).expect("read the verify report"))
+            .expect("parse the verify report"),
+    )
+    .expect("read the current verify report");
+    assert_eq!(report.verdict, Verdict::InfrastructureError, "{stderr}");
+    assert!(!report.verified);
+    assert!(!report.bitwise_parity);
+    assert!(
+        matches!(
+            report.infrastructure_error,
+            Some(InfrastructureError::SkidOvershoot { count }) if count > 0
+        ),
+        "{:?}",
+        report.infrastructure_error
+    );
+}
+
 #[test]
 fn ptrace_still_accepts_an_explicit_maximum() {
     let _guard = hermit_run_guard();
@@ -22586,7 +22739,6 @@ fn a_draw_without_a_range_draws_from_the_recommended_range() {
 /// The same bound on KVM, where the spinner's getpid takes no scheduler turn
 /// either: 90 ms before, 4 ms now.
 #[test]
-#[ignore = "unsupported_preemption: --backend=kvm refuses the helper's explicit --max-timeslice=1000000"]
 fn run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting() {
     if !Path::new("/dev/kvm").exists() {
         eprintln!("skipping the KVM chaos spinner case: /dev/kvm is unavailable");
