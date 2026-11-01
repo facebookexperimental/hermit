@@ -98,6 +98,9 @@ fn refusal(profile: &str, reason: String) -> Box<RunSummary> {
     );
     summary.executed_tests = Some(0);
     summary.passed_tests = Some(0);
+    // Nothing executed, so the diagnostic count is exactly zero too: a
+    // current (schema 7) result states it rather than omitting it.
+    summary.diagnostic_failed_tests = Some(0);
     Box::new(summary)
 }
 
@@ -676,6 +679,7 @@ exit 91
             assert_eq!(read.executed_nodes, 0);
             assert_eq!(read.executed_tests, Some(0));
             assert_eq!(read.passed_tests, Some(0));
+            assert_eq!(read.diagnostic_failed_tests, Some(0));
             assert!(
                 read.detail
                     .unwrap()

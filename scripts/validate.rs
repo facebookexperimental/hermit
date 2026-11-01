@@ -33596,13 +33596,17 @@ mod final_validate_status_tests {
         refused.nodes_executed = 1;
         refused.executed_tests = Some(0);
         refused.passed_tests = Some(0);
+        refused.diagnostic_failed_tests = Some(0);
         let refused_path = temp.path().join("refused.json");
         write_validation_service_result(&refused_path, &refused).unwrap();
         let refused_result =
             ValidationServiceResult::from_json_slice(&std::fs::read(&refused_path).unwrap())
                 .unwrap();
-        // Detail arrived in schema 5; schema 6 added the delegated write-back.
-        assert_eq!(refused_result.schema_version, 6);
+        // Detail arrived in schema 5; the current schema is 7.
+        assert_eq!(
+            refused_result.schema_version,
+            hermit_manifest_plan::service_result::SCHEMA_VERSION
+        );
         assert_eq!(
             refused_result.final_validate_status,
             FinalValidateStatus::CouldNotRun
@@ -33620,6 +33624,7 @@ mod final_validate_status_tests {
         failed.nodes_executed = 1;
         failed.executed_tests = Some(2);
         failed.passed_tests = Some(1);
+        failed.diagnostic_failed_tests = Some(0);
         let failed_path = temp.path().join("failed.json");
         write_validation_service_result(&failed_path, &failed).unwrap();
         let failed_result =
@@ -33637,6 +33642,7 @@ mod final_validate_status_tests {
         passed.nodes_executed = 1;
         passed.executed_tests = Some(2);
         passed.passed_tests = Some(2);
+        passed.diagnostic_failed_tests = Some(0);
         let passed_path = temp.path().join("passed.json");
         write_validation_service_result(&passed_path, &passed).unwrap();
         let passed_result =
