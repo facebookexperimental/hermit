@@ -563,6 +563,7 @@ fn a_dequeued_controlled_alarm_restarts_at_the_next_quiesced_boundary() {
             assert_eq!(
                 s.apply_signal_dequeue(
                     leader,
+                    leader,
                     alarm_dequeue(1, reverie::SignalConsumer::ReturnToUser)
                 ),
                 Ok(super::real_timer::DequeueAck::Applied { sequence: 1 })
@@ -612,8 +613,12 @@ fn a_dequeued_controlled_alarm_restarts_at_the_next_quiesced_boundary() {
 fn an_in_turn_dequeue_restarts_the_controlled_alarm_at_its_reconcile_point() {
     let (mut s, _, leader) = published_periodic_alarm(5_000_000);
     assert_eq!(s.reconcile_alarm(leader, at(5_100_000)), None);
-    s.apply_signal_dequeue(leader, alarm_dequeue(1, reverie::SignalConsumer::SignalFd))
-        .unwrap();
+    s.apply_signal_dequeue(
+        leader,
+        leader,
+        alarm_dequeue(1, reverie::SignalConsumer::SignalFd),
+    )
+    .unwrap();
     assert!(s.blocked.timed_waiters.is_empty());
     let now = at(7_300_000);
     assert_eq!(s.reconcile_alarm(leader, now), Some(at(10_000_000)));
@@ -642,6 +647,7 @@ fn an_in_turn_dequeue_restarts_the_controlled_alarm_at_its_reconcile_point() {
     // O1 then the replacement, as `GlobalRequest::RegisterAlarm` runs them.
     let (mut s, _, leader) = published_periodic_alarm(5_000_000);
     s.apply_signal_dequeue(
+        leader,
         leader,
         alarm_dequeue(1, reverie::SignalConsumer::ReturnToUser),
     )
@@ -696,7 +702,7 @@ fn only_a_shared_queue_sigalrm_dequeue_restarts_the_controlled_alarm() {
     };
     for (dequeue, sequence) in [(private, 1), (other, 2)] {
         assert_eq!(
-            s.apply_signal_dequeue(leader, dequeue),
+            s.apply_signal_dequeue(leader, leader, dequeue),
             Ok(super::real_timer::DequeueAck::Applied { sequence })
         );
         assert!(s.real_timers.dequeued_processes().is_empty());
@@ -714,6 +720,7 @@ fn only_a_shared_queue_sigalrm_dequeue_restarts_the_controlled_alarm() {
     );
     assert_eq!(
         s.apply_signal_dequeue(
+            leader,
             leader,
             alarm_dequeue(3, reverie::SignalConsumer::ReturnToUser)
         ),
@@ -860,6 +867,7 @@ fn caught(control: &AlarmControl) -> ObservationFinish {
             site: control.site,
             selection_nonce: 1,
         },
+        dequeue: None,
     }
 }
 
@@ -1036,6 +1044,7 @@ fn controlled_restart_witness(worker_first: bool) -> (Vec<RestartTurn>, u64) {
                 .update_global_time(w, start + at(5_000), LogicalTime::ZERO);
             assert_eq!(
                 s.apply_signal_dequeue(
+                    w,
                     w,
                     alarm_dequeue_of(200, 1, reverie::SignalConsumer::ReturnToUser)
                 ),
@@ -1214,7 +1223,7 @@ fn take_signal(
         .update_global_time(tid, start + at(elapsed), LogicalTime::ZERO);
     let sequence = dequeue.sequence;
     assert_eq!(
-        s.apply_signal_dequeue(tid, dequeue),
+        s.apply_signal_dequeue(tid, tid, dequeue),
         Ok(super::real_timer::DequeueAck::Applied { sequence })
     );
 }
@@ -1595,8 +1604,12 @@ fn a_parked_alarm_restart_is_queued_before_the_empty_queue_jump() {
         let mut s = scheduler.lock().unwrap();
         assert_eq!(s.committed_time, start + at(500_000));
         assert_eq!(backend.publications.lock().unwrap().len(), 1);
-        s.apply_signal_dequeue(w, alarm_dequeue(1, reverie::SignalConsumer::ReturnToUser))
-            .unwrap();
+        s.apply_signal_dequeue(
+            w,
+            w,
+            alarm_dequeue(1, reverie::SignalConsumer::ReturnToUser),
+        )
+        .unwrap();
         file_inbound_signal(&mut s, w, mm);
     }
     let delivery = turn
@@ -1719,6 +1732,7 @@ fn a_later_refresh_pass_does_not_move_a_parked_alarm_restart() {
     {
         let mut s = scheduler.lock().unwrap();
         s.apply_signal_dequeue(
+            w,
             w,
             alarm_dequeue_of(200, 1, reverie::SignalConsumer::ReturnToUser),
         )
