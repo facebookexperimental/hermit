@@ -1243,7 +1243,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // units: 1938 + 20 = 1958, as test.regular_crates executed in the pinned root.
     // Full validate run1470 at 87daeb34 executed 1959 (one more than the
     // pin): 1958 + 1 = 1959, re-measured at this tip.
-    ("test.regular_crates", 1959),
+    // The composite-verdict schema adds two service_result units:
+    // 1959 + 2 = 1961, measured in the full validate at 73d15dd67f
+    // (1961 passed).
+    ("test.regular_crates", 1961),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5169,7 +5172,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.cli_on_host", 695),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
-    ("test.regular_crates_on_host", 1945),
+    // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
+    ("test.regular_crates_on_host", 1947),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6333,7 +6337,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The retry stack: the same three added cases: 1932 - 14 = 1918.
     // The integrated chain: the same six added cases: 1938 - 14 = 1924.
     // The same twenty known_gaps units, none of them hosted-excluded: 1959 - 14 = 1945.
-    ("test.regular_crates_on_host", 1945),
+    // The same two composite-verdict units: 1961 - 14 = 1947.
+    ("test.regular_crates_on_host", 1947),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
