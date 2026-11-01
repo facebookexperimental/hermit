@@ -49,6 +49,10 @@ enum OciSubcommand {
     #[clap(name = "pull")]
     Pull(PullOpts),
 
+    /// Remove materialized rootfs caches no local image references any more.
+    #[clap(name = "prune")]
+    Prune(PruneOpts),
+
     /// Run a program deterministically against an image's filesystem.
     #[clap(name = "run", trailing_var_arg = true)]
     Run(Box<OciRunOpts>),
@@ -71,6 +75,13 @@ struct InspectOpts {
 struct PullOpts {
     /// Image reference to download.
     image: String,
+}
+
+#[derive(Debug, Parser)]
+struct PruneOpts {
+    /// List what would be removed without removing it.
+    #[clap(long, short = 'n')]
+    dry_run: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -157,6 +168,7 @@ impl OciOpts {
             OciSubcommand::Ls(opts) => opts.main(),
             OciSubcommand::Inspect(opts) => opts.main(),
             OciSubcommand::Pull(opts) => opts.main(),
+            OciSubcommand::Prune(opts) => opts.main(),
             OciSubcommand::Run(opts) => opts.main(global),
         }
     }
@@ -203,6 +215,48 @@ impl PullOpts {
     }
 }
 
+impl PruneOpts {
+    fn main(&self) -> Result<ExitStatus, Error> {
+        let store = require_store()?;
+        let live_refs: Vec<String> = store
+            .list(true)?
+            .iter()
+            .map(|image| image.id.clone())
+            .collect();
+        let live = crate::image::live_cache_keys(&live_refs)?;
+        let Some(base) = crate::image::cache_base()? else {
+            println!("No OCI rootfs cache to prune.");
+            return Ok(ExitStatus::SUCCESS);
+        };
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(&base)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if live.contains(&name) {
+                continue;
+            }
+            if self.dry_run {
+                println!("would remove {}", entry.path().display());
+            } else {
+                std::fs::remove_dir_all(entry.path())?;
+                println!("removed {}", entry.path().display());
+            }
+            removed += 1;
+        }
+        println!(
+            "{} {} unreferenced rootfs cache(s); {} kept.",
+            if self.dry_run {
+                "Would remove"
+            } else {
+                "Removed"
+            },
+            removed,
+            live.len()
+        );
+        Ok(ExitStatus::SUCCESS)
+    }
+}
+
 /// Print the resolution result and the parts of the image config that change
 /// how hermit runs the guest.
 fn report(store: &PodmanStore, image: &ResolvedImage) -> Result<(), Error> {
@@ -239,10 +293,8 @@ fn report(store: &PodmanStore, image: &ResolvedImage) -> Result<(), Error> {
         println!("entrypoint: {:?}", config.entrypoint);
     }
     if !config.cmd.is_empty() {
-        // hermit always requires an explicit guest program, so say so rather
-        // than let the reader assume `hermit oci run <ref>` would use this.
         println!(
-            "cmd:        {:?}  (informational; hermit requires an explicit program)",
+            "cmd:        {:?}  (default program when `oci run` is given none)",
             config.cmd
         );
     }

@@ -1543,7 +1543,7 @@ pub(super) fn container_proc_mount() -> Mount {
 /// automatically-created private `/tmp`; a user-supplied `--tmp` remains
 /// unclaimed.
 ///
-/// The CLI currently enables this only for the ptrace backend. Other backends
+/// The CLI enables this for the ptrace and KVM backends. Other backends
 /// have distinct launch/runtime-file requirements and must be qualified before
 /// they can safely share this filesystem setup.
 pub(super) fn image_container(
@@ -1553,6 +1553,7 @@ pub(super) fn image_container(
     cpu_profile_source: Option<usize>,
     private_tmp: bool,
     placeholder: bool,
+    bind_kvm: bool,
 ) -> Result<(Container, IdentityGuard), Error> {
     let mut container = Container::new();
     container
@@ -1583,6 +1584,11 @@ pub(super) fn image_container(
     // defers dir creation to the pre-exec child on a tiny clone stack).
     let proc_target = rootfs.join("proc");
     container.mount(Mount::proc().allow_readonly_fallback().target(&proc_target));
+    // No sysfs is mounted into the image root: a fresh sysfs would expose
+    // host kernel state (DMI, block, NIC, CPU topology) on every path
+    // Detcore does not render, and mounting one also fails without a new
+    // network namespace. The guest therefore sees the image's empty /sys
+    // until Detcore serves a rendered sysfs; that gap is deliberate.
     // Detcore's placeholder directory, where the backend needs one
     // (`placeholder`, `detcore::needs_directory_placeholder`), on the image's
     // own procfs (`DIRECTORY_PLACEHOLDER`), which the image's table leaves
@@ -1621,6 +1627,15 @@ pub(super) fn image_container(
     // * `/dev/shm` -- a writable shared-memory area is cross-process shared state
     //   and a determinism question in its own right, and nothing in the current
     //   image workloads needs it.
+    // The KVM backend's VMM process opens /dev/kvm after chroot, so the host
+    // device must be bound inside the root for that backend only. Other
+    // backends keep the materializer's empty placeholder file.
+    if bind_kvm {
+        container.mount(Mount::bind(
+            Path::new("/dev/kvm"),
+            rootfs.join("dev").join("kvm"),
+        ));
+    }
     let dev_root = rootfs.join("dev");
     for node in crate::image::DEV_BIND_TARGETS {
         container.mount(Mount::bind(
@@ -6218,7 +6233,7 @@ mod tests {
             .checked_run(|| {
                 readonly_proc::deny_writable_mounts().map_err(|error| error.to_string())?;
                 let (mut container, _identity) =
-                    image_container(rootfs.path(), tmpfs.path(), false, None, true, true)
+                    image_container(rootfs.path(), tmpfs.path(), false, None, true, true, false)
                         .map_err(|error| error.to_string())?;
                 // This closure is already loaded, so the image needs no executable
                 // or libraries. It reads the proc mount after entering the chroot.
@@ -6278,7 +6293,7 @@ mod tests {
                 }
                 fs::create_dir(&tmpfs).map_err(|e| e.to_string())?;
                 let (mut container, _identity) =
-                    image_container(&rootfs, &tmpfs, false, None, true, true)
+                    image_container(&rootfs, &tmpfs, false, None, true, true, false)
                         .map_err(|error| error.to_string())?;
                 container
                     .checked_run(root_mount_flags)
@@ -6769,14 +6784,28 @@ mod tests {
     fn image_container_registers_only_an_automatic_private_tmp() {
         let rootfs = tempfile::TempDir::new().expect("create image rootfs");
         let private_tmp = tempfile::TempDir::new().expect("create private tmp");
-        let (_, generated) =
-            image_container(rootfs.path(), private_tmp.path(), false, None, true, true)
-                .expect("construct image container with generated tmp");
+        let (_, generated) = image_container(
+            rootfs.path(),
+            private_tmp.path(),
+            false,
+            None,
+            true,
+            true,
+            false,
+        )
+        .expect("construct image container with generated tmp");
         assert_eq!(generated.mountinfo_roots.len(), 1);
 
-        let (_, supplied) =
-            image_container(rootfs.path(), private_tmp.path(), false, None, false, true)
-                .expect("construct image container with user tmp");
+        let (_, supplied) = image_container(
+            rootfs.path(),
+            private_tmp.path(),
+            false,
+            None,
+            false,
+            true,
+            false,
+        )
+        .expect("construct image container with user tmp");
         assert!(supplied.mountinfo_roots.is_empty());
     }
 

@@ -1261,8 +1261,9 @@ pub struct RunOpts {
 
     /// Program to run. Bare names are resolved using the guest PATH. Paths under host `/tmp` are
     /// hidden by Hermit's isolated `/tmp` unless `--tmp=/tmp` or an explicit mount exposes them.
+    /// With `--image`, may be omitted: the image's Entrypoint/Cmd then supplies it.
     #[clap(value_name = "PROGRAM")]
-    program: PathBuf,
+    program: Option<PathBuf>,
 
     /// Arguments for the program.
     #[clap(value_name = "ARGS")]
@@ -1386,6 +1387,10 @@ pub struct RunOpts {
     /// not share names.
     #[clap(skip)]
     fatal_core_run_label: Option<&'static str>,
+
+    /// Runtime-only: Entrypoint/Cmd resolution already applied (idempotence).
+    #[clap(skip)]
+    image_program_resolved: bool,
 
     /// Runtime-only: the token naming this invocation's cores, made when
     /// `--fatal-core-dir` is opened (see [`fatal_core_owner_token`]). The
@@ -1714,10 +1719,10 @@ pub struct RunOpts {
     /// `--image docker.io/library/busybox@sha256:...`. The guest program path
     /// must resolve inside the image: give an absolute path (e.g. `/bin/sh`) or
     /// a relative path containing a `/` (e.g. `./bin/sh`), which is resolved
-    /// against the image working directory; a bare command name (PATH search
-    /// inside the image) is not yet supported. Requires namespaces (incompatible
-    /// with `--no-namespace`). The prototype currently supports only the ptrace
-    /// backend and does not yet compose with custom `--mount`/`--bind` options.
+    /// against the image working directory; a bare command name is searched
+    /// on the image's PATH. Requires namespaces (incompatible
+    /// with `--no-namespace`). The prototype supports the ptrace and kvm
+    /// backends and does not yet compose with custom `--mount`/`--bind` options.
     #[clap(long, value_name = "OCI-REFERENCE")]
     image: Option<String>,
 
@@ -2552,7 +2557,12 @@ impl fmt::Display for RunOpts {
         write!(
             f,
             " -- {}",
-            shell_words::quote(self.program.to_str().expect("valid unicode path"))
+            shell_words::quote(
+                self.program
+                    .as_deref()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("<image-default>")
+            )
         )?;
         if !self.args.is_empty() {
             write!(f, " {}", shell_words::join(&self.args))?;
@@ -7819,7 +7829,7 @@ fn strict_run_refuses_an_inexact_branch_counter_before_it_looks_at_the_program()
     // refusal fails on the missing program instead.
     let global = GlobalOpts::parse_from(["hermit"]);
     let mut options = RunOpts::parse_from(["run", "--strict", "/nonexistent-strict-pmu-guest"]);
-    assert!(!options.program.exists());
+    assert!(!options.program_path().exists());
     options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
     let error = options.main(&global).unwrap_err();
     assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
@@ -8028,6 +8038,33 @@ fn ptrace_backend_keeps_uts_assumption_with_namespaces() {
 }
 
 #[test]
+fn oci_argv_applies_entrypoint_and_cmd_defaults() {
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    // No explicit program: Entrypoint + Cmd.
+    assert_eq!(
+        RunOpts::oci_argv(&s(&["/entry", "a"]), &s(&["python3", "-V"]), None, vec![]),
+        Some((PathBuf::from("/entry"), s(&["a", "python3", "-V"])))
+    );
+    // Cmd alone supplies the program.
+    assert_eq!(
+        RunOpts::oci_argv(&[], &s(&["python3"]), None, vec![]),
+        Some((PathBuf::from("python3"), vec![]))
+    );
+    // Explicit program replaces Cmd; Entrypoint persists.
+    assert_eq!(
+        RunOpts::oci_argv(
+            &s(&["/entry"]),
+            &s(&["ignored"]),
+            Some(PathBuf::from("/bin/sh")),
+            s(&["-c", "x"])
+        ),
+        Some((PathBuf::from("/entry"), s(&["/bin/sh", "-c", "x"])))
+    );
+    // Nothing to run.
+    assert_eq!(RunOpts::oci_argv(&[], &[], None, vec![]), None);
+}
+
+#[test]
 fn image_conflicts_with_no_namespace_with_explanatory_error() {
     // The clap layer no longer lists `image` in `--no-namespace`'s
     // conflicts_with set, so parsing succeeds; the conflict is reported at
@@ -8061,9 +8098,20 @@ fn image_rejects_unqualified_backend_and_namespace_paths() {
         .unwrap_err()
         .to_string();
     assert!(
-        message.contains("only the ptrace backend"),
+        message.contains("supports the ptrace and kvm backends"),
         "message: {message}"
     );
+
+    // KVM is qualified for --image: validation must accept it.
+    let mut kvm = run_opts_for(&[
+        "hermit",
+        "--backend=kvm",
+        "run",
+        "--image=busybox@sha256:deadbeef",
+        "/bin/sh",
+    ]);
+    kvm.validate_args_with_perf_support(true)
+        .expect("kvm must be admitted with --image");
 
     let mut namespace_only = RunOpts::parse_from([
         "fakehermit",
@@ -8518,8 +8566,21 @@ fn normalize_guest_path(path: &Path) -> Result<PathBuf, Error> {
 ///   * a relative path that contains a `/` (e.g. `./bin/sh`, `bin/busybox`) is
 ///     resolved against `guest_cwd` (the image WorkingDir, or `/`), so the path
 ///     validated here is the same one the chrooted guest will execve;
-///   * a bare command name (no `/`) would require a PATH search inside the
-///     image, which the prototype does not implement, so it is rejected.
+///   * a bare command name (no `/`) is PATH-searched by the caller
+///     (`validate_program`) before this resolver sees it; seen here, it is rejected.
+///
+/// Search `path_env` (colon-separated guest dirs) for `name` inside `rootfs`,
+/// returning the guest-absolute path of the first existing entry.
+fn search_image_path(rootfs: &Path, name: &Path, path_env: &str) -> Option<PathBuf> {
+    for dir in path_env.split(':').filter(|d| !d.is_empty()) {
+        let guest = Path::new(dir).join(name);
+        if crate::image::resolve_in_rootfs(rootfs, &guest).exists() {
+            return Some(guest);
+        }
+    }
+    None
+}
+
 fn resolve_image_guest_program(requested: &Path, guest_cwd: &Path) -> Result<PathBuf, Error> {
     if requested.is_absolute() {
         Ok(requested.to_path_buf())
@@ -9216,6 +9277,109 @@ impl RunOpts {
     /// The `--image` reference this run was given, if any.
     pub(crate) fn image(&self) -> Option<&str> {
         self.image.as_deref()
+    }
+
+    /// The guest program, after [`Self::resolve_image_default_program`] has
+    /// filled an omitted one from the image's Entrypoint/Cmd.
+    fn program_path(&self) -> &Path {
+        self.program
+            .as_deref()
+            .expect("guest program resolved by validate_args")
+    }
+
+    /// Apply OCI Entrypoint/Cmd semantics when `--image` is set.
+    ///
+    /// With an explicit program, the image Entrypoint (if any) is prepended and
+    /// the explicit program replaces Cmd. With no program, Entrypoint+Cmd
+    /// becomes the program. Without an image this only enforces that a program
+    /// was given, as clap did when PROGRAM was required.
+    fn resolve_image_default_program(&mut self) -> Result<(), Error> {
+        if self.image_program_resolved {
+            return Ok(());
+        }
+        self.image_program_resolved = true;
+        // Pin the image identity once, here, so config reads, PATH search,
+        // and rootfs materialization all key against the same resolved ID
+        // even if a tag moves later in the run.
+        if let Some(image) = &self.image {
+            self.image = Some(crate::image::canonical_image_ref(image));
+        }
+        let Some(image) = self.image.clone() else {
+            if self.program.is_none() {
+                anyhow::bail!("no guest program given; pass a program after `--`");
+            }
+            return Ok(());
+        };
+        // Prefer the config persisted at materialization (digest-pinned);
+        // fall back to a single store probe for not-yet-materialized images.
+        let persisted = crate::image::read_image_config(&image).unwrap_or_default();
+        let config = if !persisted.cmd.is_empty() || !persisted.entrypoint.is_empty() {
+            Some(crate::podman_store::ImageRunConfig {
+                env: persisted.env.clone(),
+                workdir: persisted.workdir.clone(),
+                cmd: persisted.cmd.clone(),
+                entrypoint: persisted.entrypoint.clone(),
+            })
+        } else {
+            crate::podman_store::PodmanStore::probe()
+                .ok()
+                .flatten()
+                .and_then(|store| {
+                    store
+                        .resolve(&image)
+                        .ok()
+                        .and_then(|resolved| store.config(&resolved).ok())
+                })
+        };
+        let (entrypoint, cmd) = match config {
+            Some(c) => (c.entrypoint, c.cmd),
+            None => (Vec::new(), Vec::new()),
+        };
+        match Self::oci_argv(
+            &entrypoint,
+            &cmd,
+            self.program.take(),
+            std::mem::take(&mut self.args),
+        ) {
+            Some((program, args)) => {
+                self.program = Some(program);
+                self.args = args;
+                Ok(())
+            }
+            None => anyhow::bail!(
+                "image {image} declares no Entrypoint or Cmd to run by default; \
+                 pass an explicit guest program after `--`"
+            ),
+        }
+    }
+
+    /// OCI argv composition: Entrypoint is always prepended; an explicit program
+    /// replaces Cmd, otherwise Cmd supplies the default program. Returns `None`
+    /// when neither yields a program.
+    fn oci_argv(
+        entrypoint: &[String],
+        cmd: &[String],
+        program: Option<PathBuf>,
+        args: Vec<String>,
+    ) -> Option<(PathBuf, Vec<String>)> {
+        if let Some(program) = program {
+            if entrypoint.is_empty() {
+                return Some((program, args));
+            }
+            let mut out: Vec<String> = entrypoint[1..].to_vec();
+            out.push(program.to_string_lossy().into_owned());
+            out.extend(args);
+            return Some((PathBuf::from(&entrypoint[0]), out));
+        }
+        let mut argv: Vec<String> = entrypoint.to_vec();
+        argv.extend(cmd.iter().cloned());
+        if argv.is_empty() {
+            return None;
+        }
+        let program = PathBuf::from(&argv[0]);
+        let mut out: Vec<String> = argv[1..].to_vec();
+        out.extend(args);
+        Some((program, out))
     }
 
     fn selected_backend(&self) -> Backend {
@@ -10022,7 +10186,7 @@ impl RunOpts {
                 let guest = guest.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "--dap-listen cannot tell which file the guest runs for {}",
-                        self.program.display()
+                        self.program_path().display()
                     )
                 })?;
                 super::dap_adapter::identify_debuggee(guest_pid, guest, |path| {
@@ -10536,6 +10700,7 @@ impl RunOpts {
         // Callers other than `main` (analyze, oci, tests) reach validation
         // without `dispatch_before_validation`; lowering again is a no-op.
         self.lower_strace_only();
+        self.resolve_image_default_program()?;
         self.refuse_virtual_timeout_with_debugger()?;
         self.refuse_unready_exec_stop()?;
         // Before the timer settings are checked, which read the timeslice.
@@ -10596,9 +10761,9 @@ impl RunOpts {
                  tasks are created in, and so their IDs, is the host's"
             );
         }
-        if self.image.is_some() && backend != Backend::Ptrace {
+        if self.image.is_some() && !matches!(backend, Backend::Ptrace | Backend::Kvm) {
             anyhow::bail!(
-                "--image currently supports only the ptrace backend; backend `{}` has separate \
+                "--image supports the ptrace and kvm backends; backend `{}` has separate \
                  launcher/runtime-file requirements that have not been qualified inside the OCI rootfs",
                 backend.as_str()
             );
@@ -11259,7 +11424,7 @@ impl RunOpts {
         // time (e.g. --strace-only).
         let virtualize_time = self.det_opts.det_config.virtualize_time;
         if let Some(warning) =
-            vmm_time_virtualization_warning(&self.program, &self.args, virtualize_time)
+            vmm_time_virtualization_warning(self.program_path(), &self.args, virtualize_time)
         {
             // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
             crate::tracing::diagnostic_eprintln!("{warning}");
@@ -12101,6 +12266,35 @@ impl RunOpts {
                 .get_current_dir()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("/"));
+            // A bare name (the common shape of an image Cmd, e.g. `python3`)
+            // is searched along the image's own PATH inside the rootfs. The
+            // guest's execve repeats the same search at run time against the
+            // image Env, so validation only has to prove one entry exists.
+            let searched;
+            let requested =
+                if !requested.is_absolute() && !requested.to_string_lossy().contains('/') {
+                    let cfg = crate::image::read_image_config(image)?;
+                    let path_env = cfg
+                        .env
+                        .iter()
+                        .find(|(k, _)| k == "PATH")
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin");
+                    match search_image_path(&rootfs, requested, path_env) {
+                        Some(found) => {
+                            searched = found;
+                            &searched
+                        }
+                        None => anyhow::bail!(
+                            "With --image, program {:?} was not found on the image PATH \
+                         ({path_env}); use an absolute path like `/bin/sh`, or a path \
+                         containing '/' relative to the working directory.",
+                            requested
+                        ),
+                    }
+                } else {
+                    requested
+                };
             let guest_abs = resolve_image_guest_program(requested, &guest_cwd)?;
             // Resolve chroot-aware: images (nixos/nix especially) expose
             // `/bin/sh` as a symlink to an absolute `/nix/store/...` target that
@@ -12112,7 +12306,7 @@ impl RunOpts {
 
         if self.selected_backend() == Backend::E9patch {
             let (_, host) = self.resolve_guest_and_host_program()?;
-            return validate_executable(&host, &self.program, None);
+            return validate_executable(&host, self.program_path(), None);
         }
 
         let command = self.guest_command()?;
@@ -12616,7 +12810,7 @@ impl RunOpts {
                 "hermit run: the guest waits for one gdb client on 127.0.0.1:{0} before it \
                  starts; attach with: gdb -ex 'target remote 127.0.0.1:{0}' {1}",
                 port.port(),
-                self.program.display()
+                self.program_path().display()
             );
         }
         Ok(Some(port))
@@ -13857,6 +14051,7 @@ impl RunOpts {
                 self.det_opts.det_config.cpu_profile_source,
                 self.tmp.is_none(),
                 mounts_placeholder,
+                self.runtime_backend() == Backend::Kvm,
             )?;
             self.network
                 .configure(&mut container, self.analyze_networking);
@@ -13912,7 +14107,7 @@ impl RunOpts {
     #[cfg(feature = "dbt")]
     fn dbt_invocation(&self) -> Result<super::backends::DbtInvocation, Error> {
         super::backends::DbtInvocation::new(
-            &self.program,
+            self.program_path(),
             &self.args,
             &hermit::prepare_backend_config(self.effective_det_config(), Backend::Dbt),
             self.guest_command()?.get_captured_envs(),
@@ -14037,7 +14232,10 @@ impl RunOpts {
         &self,
         disable_sanitizer_leak_detection_for_guest: bool,
     ) -> Result<Command, Error> {
-        let program = self.e9patch_program.as_ref().unwrap_or(&self.program);
+        let program = self
+            .e9patch_program
+            .as_deref()
+            .unwrap_or_else(|| self.program_path());
         let mut command = Command::new(program);
         command.args(&self.args);
         // The guest's first process has the base ID; Detcore numbers the rest.
@@ -14045,7 +14243,7 @@ impl RunOpts {
             command.pid(reverie::process::Pid::from_raw(base));
         }
         if self.e9patch_program.is_some() {
-            command.arg0(&self.program);
+            command.arg0(self.program_path());
         }
         // PROTOTYPE (--image): the guest lives inside the OCI rootfs, so the
         // guest working directory must be one that exists under the image root.

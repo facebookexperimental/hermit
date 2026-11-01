@@ -3953,10 +3953,13 @@ async fn run_kvm(
     } else {
         standard_stream_aliases([stdin.as_ref().map(AsRawFd::as_raw_fd), Some(1), Some(2)])
     };
-    let requested_cwd = command
-        .get_current_dir()
-        .map(Path::to_owned)
-        .unwrap_or(std::env::current_dir()?);
+    // Lazy fallback: `unwrap_or(std::env::current_dir()?)` would evaluate
+    // the host cwd even when the command carries one, and inside an
+    // --image chroot that cwd is unreachable, so getcwd fails ENOENT.
+    let requested_cwd = match command.get_current_dir() {
+        Some(cwd) => cwd.to_owned(),
+        None => std::env::current_dir()?,
+    };
     let cwd = fs::canonicalize(&requested_cwd)
         .map_err(|error| kvm_cwd_resolution_error(&requested_cwd, &error))?;
     let program = command
