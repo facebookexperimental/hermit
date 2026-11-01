@@ -539,7 +539,6 @@ fn every_manifest_node_with_a_dbt_cell_orders_after_the_dbt_runtime_abi_check() 
             "e2e.manifest_determinism_stress_c".to_string(),
             "e2e.manifest_language_runtimes".to_string(),
             "e2e.manifest_shared_futex_c".to_string(),
-            "e2e.manifest_system_utils".to_string(),
             "e2e.manifest_util_c".to_string(),
             "privileged-e2e.manifest_applications".to_string(),
             "privileged-e2e.manifest_c_programs".to_string(),
@@ -548,11 +547,14 @@ fn every_manifest_node_with_a_dbt_cell_orders_after_the_dbt_runtime_abi_check() 
     // This counted integration target runs real DBT cases outside the
     // manifest buckets, so it must also wait for the same ABI check.
     let mut expected_dependents = needs;
-    // The privileged system-utils bucket keeps its ABI ordering even
-    // though its only DBT cells (the sysfs verify cells) are currently
-    // ci-disabled as a named image-mode loss
-    // (https://github.com/rrnewton/hermit/issues/5015); when they are
-    // re-enabled it joins `needs` again without a DAG change.
+    // Both system-utils buckets keep their ABI ordering even though
+    // their DBT verify cells are currently deselected as named losses:
+    // the privileged bucket's sysfs cells as an image-mode loss
+    // (https://github.com/rrnewton/hermit/issues/5015) and the portable
+    // bucket's DBT cells because hermit --image qualifies only ptrace
+    // and kvm (https://github.com/rrnewton/hermit/issues/5030). When
+    // they are re-enabled they join `needs` again without a DAG change.
+    expected_dependents.insert("e2e.manifest_system_utils".to_string());
     expected_dependents.insert("privileged-e2e.manifest_system_utils".to_string());
     expected_dependents.insert("test.inherited_terminal_read".to_string());
     // So does the isolation matrix node that runs the DBT cells.
