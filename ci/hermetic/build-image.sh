@@ -29,7 +29,12 @@ runner=()
 if command -v with-proxy >/dev/null 2>&1; then runner=(with-proxy); fi
 
 echo ":: building image from the committed lock"
-out=$("${runner[@]}" "${NIX[@]}" build --no-link --print-out-paths .#image)
+# Sandboxed builds are part of the pin's meaning (issue 5031): unsandboxed
+# builds embed the build host's random build directory, invoking user and
+# configure results, so the same lock yields different bytes per host. Force
+# the sandbox on regardless of host Nix config; a host that cannot run the
+# sandbox fails here rather than producing an unreproducible image.
+out=$("${runner[@]}" "${NIX[@]}" build --no-link --print-out-paths --option sandbox true .#image)
 echo ":: nix store path: $out"
 echo ":: tarball sha256: $(sha256sum "$out" | cut -d' ' -f1)"
 

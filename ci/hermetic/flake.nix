@@ -72,6 +72,14 @@
         cargo = rustToolchain;
         rustc = rustToolchain;
       };
+      # Deterministic Rust builds (issue 5031): remap the build directory
+      # out of panic/debug paths, force a single codegen unit and disable
+      # incremental codegen so the binaries do not depend on the build
+      # host's paths or parallelism. $PWD is the unpacked source root when
+      # preBuild runs.
+      deterministicRustFlags = ''
+        export RUSTFLAGS="--remap-path-prefix=$PWD=/build/source -C codegen-units=1 -C incremental=false"
+      '';
       rustScriptVersion = "0.36.0";
       rustScript = pinnedRustPlatform.buildRustPackage {
         pname = "rust-script";
@@ -83,6 +91,7 @@
           hash = "sha256-Bb8ULD2MmZiSW/Tx5vAAHv95OMJ0EdWgR+NFhBkTlDU=";
         };
         cargoHash = "sha256-kxnylNZ8FsaR2S1o/p7qtlaXsBLDNv2PsFye0rcf/+A=";
+        preBuild = deterministicRustFlags;
         doCheck = false;
       };
       cargoNextestVersion = "0.9.100";
@@ -96,6 +105,7 @@
           hash = "sha256-MbgX/n6TC5hz66gvRAc7A0xFWbF2Ec68gMxCgPFpeoQ=";
         };
         cargoHash = "sha256-jRBFjJB38JI9whFpImYlMx0znQj1+cdeu4Nc+nYc7OI=";
+        preBuild = deterministicRustFlags;
         cargoBuildFlags = [ "-p" "cargo-nextest" ];
         cargoTestFlags = [ "-p" "cargo-nextest" ];
         # The pinned nixpkgs cargo-auditable predates Rust edition 2024.
