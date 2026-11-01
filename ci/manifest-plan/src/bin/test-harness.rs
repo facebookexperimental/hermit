@@ -2781,6 +2781,7 @@ fn audit_compile(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode 
             .copied()
             .unwrap_or(inherited_cpu_timeout_seconds);
         let cell = hermit_manifest_plan::runner::SelectedCell {
+            image: None,
             category: category.into(),
             test: test.clone(),
             id: hermit_manifest_plan::runner::CellId {
