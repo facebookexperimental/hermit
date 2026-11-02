@@ -52,6 +52,7 @@ pub(crate) struct InjectGuest<T: RecordOrReplay<ThreadState = ()>> {
     registers: Option<libc::user_regs_struct>,
     refusal: Option<reverie::UnsupportedRefusal>,
     injected: Mutex<Vec<(Sysno, SyscallArgs)>>,
+    memory_map: Option<reverie::MemoryMap>,
     _tool: std::marker::PhantomData<T>,
 }
 
@@ -66,8 +67,15 @@ impl<T: RecordOrReplay<ThreadState = ()>> InjectGuest<T> {
             registers: None,
             refusal: None,
             injected: Mutex::new(Vec::new()),
+            memory_map: None,
             _tool: std::marker::PhantomData,
         }
+    }
+
+    /// Answer the `memory_map` fact with `map` rather than not providing it.
+    pub(crate) fn with_memory_map(mut self, map: reverie::MemoryMap) -> Self {
+        self.memory_map = Some(map);
+        self
     }
 
     /// Answer `regs` with `registers` rather than refusing to.
@@ -175,6 +183,11 @@ impl<T: RecordOrReplay<ThreadState = ()>> Guest<Detcore<T>> for InjectGuest<T> {
     }
     fn take_unsupported_refusal(&mut self) -> Option<reverie::UnsupportedRefusal> {
         self.refusal.take()
+    }
+    fn memory_map(&self, _tid: Pid) -> Result<reverie::MemoryMap, reverie::FactError> {
+        self.memory_map
+            .clone()
+            .ok_or(reverie::FactError::NotProvided)
     }
 }
 

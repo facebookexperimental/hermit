@@ -789,6 +789,63 @@ Another process's `maps`, which the open does not bind, and a descriptor read
 where the reader does not hold the bound address space (in another process
 that inherited it, or after an `exec`), are captured from the kernel as above.
 
+Where the guest's procfs is not the kernel's (KVM), there is no kernel
+`smaps`, `smaps_rollup` or `numa_maps` to sanitize, and Detcore renders each
+process's itself from the backend's memory map (package K slice N4 of
+<https://github.com/rrnewton/hermit/issues/4213>,
+`detcore/src/procfs/memory_map/smaps.rs`): a per-process file Detcore opens
+with a placeholder, as it does `statm`, whose open binds the task and its
+address space as a `maps` does, and whose first read prints what Linux's
+`show_smap`, `show_smaps_rollup` and `show_numa_map` print for the listed
+mappings, which the same sanitizers then normalize, so that the guest reads,
+for each mapping, the bytes ptrace's sanitized file gives. The fields the
+memory map does not list are derived from facts the same way on every
+backend: `KernelPageSize` and `MMUPageSize` from the page size;
+`THPeligible` from the host's transparent huge page settings, which a KVM
+guest reads in sysfs too and which ptrace's sanitized file also follows, the
+mapping's size and alignment, and whether the address space disabled huge
+pages (`PR_GET_THP_DISABLE`, asked of the backend), as Linux's
+`thp_vma_allowable_orders` decides it for an anonymous mapping (Detcore
+answers `MADV_HUGEPAGE` itself and never passes it on); `ProtectionKey`
+where the kernel serving the process enables protection keys
+(`arch_pkeys_enabled`), which Detcore asks of that kernel through the
+backend with a `pkey_mprotect` that changes nothing (key 0 of a page no
+mapping can hold: EINVAL without keys, ENOMEM with them); the initial
+stack's `VmFlags` from `setup_arg_pages`' flags and its protection;
+`numa_maps`' policy `default`, Detcore's one-node model, which records no
+policy; and its `kernelpagesize_kB`, which Linux prints only for a mapping
+with a resident page, for the initial stack, which holds one from exec on.
+What cannot be derived is refused by name through the unsupported-operation
+policy, never printed as a plausible value: any mapping but the initial
+stack (whose flags depend on how it was made, and whose residency is the
+host's); a listed mapping that `madvise(2)` access-pattern, fork or dump
+advice or `mlock(2)` reached (`MemoryMetadata::mapping_flags_changed`), and,
+in `numa_maps`, one that advice that discards pages reached
+(`MADV_DONTNEED`, `MADV_DONTNEED_LOCKED`, `MADV_GUARD_INSTALL`,
+`MADV_WIPEONFORK`: `MemoryMetadata::pages_discarded`), while advice on a
+mapping the memory map does not list refuses nothing; a kernel that enables
+protection keys, whose keys follow calls Detcore does not record
+(`mprotect(PROT_EXEC)` alone gives the execute-only key); `smaps_rollup` from
+a memory map that lists only some mappings (its header spans the whole
+address space); another process's file (the memory map describes the
+reader's own process only); and a read where the reader does not hold the
+bound address space. On KVM the memory map lists the stack window only, so
+`smaps` and `numa_maps` list `[stack]` alone, a named difference
+(<https://github.com/rrnewton/reverie/issues/1211>), with every byte of its
+block and row the same as ptrace's but for three named differences: its range
+and size, which LinuxEmu's window decides; the `ProtectionKey` line, which
+KVM's kernel does not print because it enables no protection keys (its vCPU
+runs with CR4.PKE clear, and LinuxEmu answers the protection-key calls as
+Linux on such a CPU), where the host kernel beneath ptrace prints one; and,
+on a host whose transparent huge page setting is `always`, `THPeligible`,
+which follows the mapping's size, so that KVM's 8188 kB window prints 1
+where a native-sized stack prints 0. `smaps_rollup`, a stack a split left in
+parts, advice that sets flags on the stack, and `numa_maps` after advice
+that discards the stack's pages are refused. Elsewhere the kernel's three
+files are captured and sanitized as above, as before Detcore rendered any:
+every spelling of them is the kernel's, decided from the backend's
+capabilities before any request to the global tool.
+
 This is not a complete host-independent representation of any of the three
 files. Fields not listed above remain exactly as the host kernel reported them,
 and a separately opened file receives a separate snapshot. The normalized
@@ -1070,6 +1127,7 @@ The main implementation entry points are:
 | FD model | `detcore/src/fd.rs` |
 | Deterministic procfs snapshots | `detcore/src/procfs.rs`, `detcore/src/syscalls/files.rs` |
 | A process's own `maps` from the backend's memory map | `detcore/src/procfs/memory_map.rs` |
+| A process's `smaps`, `smaps_rollup` and `numa_maps` from the backend's memory map | `detcore/src/procfs/memory_map/smaps.rs` |
 | Logical time | `detcore-model/src/time.rs`, `detcore/src/syscalls/time.rs` |
 | Signal handling | `detcore/src/syscalls/signal.rs` |
 | CPUID table | `detcore/src/cpuid.rs` |

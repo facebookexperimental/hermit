@@ -7226,6 +7226,258 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(rendered)
     }
 
+    /// The text of a process's `smaps`, `smaps_rollup` or `numa_maps` that
+    /// Detcore opened as rendered (`procfs::RenderedFiles::address_space`,
+    /// package K slice N4 of <https://github.com/rrnewton/hermit/issues/4213>)
+    /// at a read that takes its snapshot: the address space its open bound
+    /// (`ProcfsFile::bind_memory_map`), as the backend's memory map lists it
+    /// now, as Linux prints it (`procfs::memory_map::smaps`). The caller's
+    /// sanitizer then normalizes it as it does the kernel's file elsewhere.
+    ///
+    /// Linux's read first finds the task the open found (`m_start`,
+    /// `show_smaps_rollup`): ESRCH once it is reaped, whichever task holds
+    /// its number by then. It then reads the memory map the open took: none
+    /// for a task that held none at the open (a leader that exited while its
+    /// other threads run on), which `smaps` and `numa_maps` read as nothing
+    /// and `smaps_rollup` answers with ESRCH. Detcore renders the memory map
+    /// the backend gives the reader, so it renders the bound address space
+    /// only while the reader holds it, and a task of another process binds
+    /// none. Each case Detcore cannot answer, and each field the memory map
+    /// cannot give, is refused by name through the unsupported-operation
+    /// policy, never answered with a file Linux would not print
+    /// ([`Self::refuse_address_space_file`]).
+    async fn render_address_space_file<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        file: crate::procfs::AddressSpaceFile,
+    ) -> Result<Vec<u8>, Error> {
+        use crate::procfs::AddressSpaceFile;
+        use crate::procfs::memory_map::smaps;
+
+        let name = file.name();
+        let (binding, path) = guest.thread_state().with_detfd(fd, |detfd| {
+            (detfd.procfs_memory_map(), detfd.procfs_rendered_path())
+        })?;
+        let Some(binding) = binding else {
+            let task = path
+                .and_then(crate::procfs::per_process_name)
+                .map(|name| name.task);
+            let own = self.procfs_caller_ids(guest).map(|(pid, _)| pid);
+            if task.is_none() || task.map(|task| task.process) != own {
+                return Err(self
+                    .refuse_address_space_file(
+                        guest,
+                        format!(
+                            "Detcore renders a process's {name} from the backend's memory map, \
+                             which describes only the reader's own process, and this one is \
+                             another process's"
+                        ),
+                    )
+                    .await);
+            }
+            // The task held no address space at the open: Linux's file is
+            // empty while the task is there, and ESRCH once it is reaped;
+            // `smaps_rollup` is ESRCH either way.
+            let current = match path {
+                Some(path) => self
+                    .rendered_task_state(guest, path)
+                    .await
+                    .is_some_and(|(_, current)| current),
+                None => false,
+            };
+            if !current || file == AddressSpaceFile::SmapsRollup {
+                return Err(Errno::ESRCH.into());
+            }
+            return Ok(Vec::new());
+        };
+        let answer = crate::tool_global::procfs_task(guest, binding.task()).await;
+        if !binding.finds_its_task(&answer) {
+            return Err(Errno::ESRCH.into());
+        }
+        if !binding.held_by(guest.thread_state().mm_id) {
+            return Err(self
+                .refuse_address_space_file(
+                    guest,
+                    format!(
+                        "Detcore renders a process's {name} from the backend's memory map of the \
+                         reader's own address space, and this descriptor's open took another \
+                         one (the descriptor reached another process, or the process ran exec)"
+                    ),
+                )
+                .await);
+        }
+        let map = match guest.memory_map(guest.tid()) {
+            Ok(map) => map,
+            Err(error) => {
+                return Err(self
+                    .refuse_address_space_file(
+                        guest,
+                        format!(
+                            "Detcore renders a process's {name} from the backend's memory map, \
+                             which gave no answer ({error:?})"
+                        ),
+                    )
+                    .await);
+            }
+        };
+        let rendered = match file {
+            AddressSpaceFile::Smaps => match self.smaps_facts(guest).await {
+                Ok(facts) => smaps::render_smaps(&map, &facts),
+                Err(refusal) => Err(refusal),
+            },
+            AddressSpaceFile::SmapsRollup => smaps::render_smaps_rollup(&map),
+            AddressSpaceFile::NumaMaps => {
+                smaps::render_numa_maps(&map, guest.thread_state().pages_may_have_been_discarded())
+            }
+        };
+        match rendered {
+            Ok(rendered) => {
+                trace!(
+                    "{name} of fd {fd} rendered from the memory map: {} bytes",
+                    rendered.len()
+                );
+                Ok(rendered)
+            }
+            Err(refusal) => Err(self.refuse_address_space_file(guest, refusal).await),
+        }
+    }
+
+    /// What a rendered `smaps` derives its fields from beside the memory map
+    /// (`procfs::memory_map::smaps::SmapsFacts`): whether the kernel serving
+    /// the process enables protection keys, asked of it
+    /// ([`Self::serving_kernel_enables_protection_keys`]), the host kernel's
+    /// transparent huge page settings, and the reader's address space's
+    /// record (`MemoryMetadata`), with whether it disabled huge pages asked
+    /// of the backend (`PR_GET_THP_DISABLE`) where an order is allowed at
+    /// all. `Err` names a fact Detcore could not establish, and a kernel that
+    /// enables protection keys, whose keys follow calls Detcore does not
+    /// record (`mprotect(PROT_EXEC)` alone gives the execute-only key).
+    async fn smaps_facts<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<crate::procfs::memory_map::smaps::SmapsFacts, String> {
+        use crate::procfs::memory_map::smaps;
+
+        if self.serving_kernel_enables_protection_keys(guest).await? {
+            return Err(
+                "Linux's smaps prints each mapping's protection key where the kernel \
+                 serving the process enables protection keys, as this one does, and a \
+                 mapping's key follows calls Detcore does not record (mprotect with PROT_EXEC \
+                 alone gives the execute-only key)"
+                    .to_string(),
+            );
+        }
+        let protection_keys_enabled = false;
+        let thp_orders = smaps::host_thp()
+            .map_err(|error| {
+                format!(
+                    "Linux's smaps prints whether each mapping may have transparent huge pages, \
+                     which the host's settings decide, and they could not be read: {error}"
+                )
+            })?
+            .map_or(0, |thp| thp.anonymous_orders());
+        let thp_disabled = if thp_orders == 0 {
+            None
+        } else {
+            let asked = guest
+                .inject(syscalls::Prctl::new().with_option(libc::PR_GET_THP_DISABLE))
+                .await;
+            match asked {
+                Ok(disabled) => Some(disabled != 0),
+                Err(error) => {
+                    return Err(format!(
+                        "Linux's smaps prints whether each mapping may have transparent huge \
+                         pages, which the address space may have disabled, and the backend did \
+                         not say whether it did: {error:?}"
+                    ));
+                }
+            }
+        };
+        let state = guest.thread_state();
+        Ok(smaps::SmapsFacts {
+            protection_keys_enabled,
+            protection_keys_used: state.may_use_protection_keys(),
+            mapping_flags_changed: state.mapping_flags_may_have_changed(),
+            thp_orders,
+            thp_disabled,
+        })
+    }
+
+    /// Whether the kernel serving the process enables memory protection keys
+    /// (Linux's `arch_pkeys_enabled()`, `cpu_feature_enabled(OSPKE)`), asked
+    /// of that kernel through the backend with an injected call that changes
+    /// nothing either way: `pkey_mprotect` of the page at the bottom of the
+    /// kernel's half of the address space, where no mapping can be, with key
+    /// 0. `do_mprotect_pkey` (mm/mprotect.c, v6.17) checks the key before it
+    /// looks for a mapping, and key 0 is allocated (`mm_pkey_is_allocated`)
+    /// exactly where the kernel enables keys: `init_new_context` marks it so
+    /// at every exec there, and elsewhere `execute_only_pkey` is 0, which
+    /// that check refuses (arch/x86/include/asm/mmu_context.h and pkeys.h).
+    /// So EINVAL says the kernel has no keys, and ENOMEM (no mapping there)
+    /// that it has them. KVM's LinuxEmu answers EINVAL, as Linux on its vCPU,
+    /// whose CR4.PKE is clear, would. Any other answer is not a fact: `Err`.
+    pub(crate) async fn serving_kernel_enables_protection_keys<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<bool, String> {
+        // The lowest page of the upper half: above every user address on
+        // x86-64 with four- or five-level paging.
+        const KERNEL_HALF: usize = 0xffff_8000_0000_0000;
+        let probe = syscalls::PkeyMprotect::new()
+            .with_addr(AddrMut::from_raw(KERNEL_HALF))
+            .with_len(crate::page::page_size() as usize)
+            .with_prot(libc::PROT_NONE)
+            .with_pkey(0);
+        match guest.inject(probe).await {
+            Err(Errno::EINVAL) => Ok(false),
+            Err(Errno::ENOMEM) => Ok(true),
+            other => {
+                let refusal = guest
+                    .take_unsupported_refusal()
+                    .map(|refusal| format!(", refused by the backend: {}", refusal.diagnostic))
+                    .unwrap_or_default();
+                Err(format!(
+                    "Linux's smaps prints protection keys where the kernel serving the \
+                     process enables them, and asked whether it does (pkey_mprotect with \
+                     key 0 of a page no mapping can hold), the backend answered {other:?}{refusal}"
+                ))
+            }
+        }
+    }
+
+    /// Refuse a read of a rendered `smaps`, `smaps_rollup` or `numa_maps` by
+    /// name (`reason`) through the unsupported-operation policy, as another
+    /// process's procfs files are refused (`other_process_procfs`): the reason
+    /// goes to the log and, where the run ends, to stderr, which `--log=off`
+    /// does not hide; a fail-closed run stops with the policy's exit, and one
+    /// that allows unsupported operations gives the read EOPNOTSUPP. Never an
+    /// answer Linux would not give, such as a file without the mapping
+    /// Detcore cannot describe.
+    async fn refuse_address_space_file<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        reason: String,
+    ) -> Error {
+        crate::syscalls::helpers::report_refusal_reason(
+            self.cfg.panic_on_unsupported_syscalls,
+            &format!(
+                "[dtid {}] read refused: {reason}",
+                guest.thread_state().dettid
+            ),
+        );
+        if !self.cfg.panic_on_unsupported_syscalls {
+            crate::tool_global::report_unsupported_syscall(guest, Sysno::read).await;
+        }
+        match self
+            .refuse_unserviceable_operation_because(guest, Sysno::read, Errno::EOPNOTSUPP, &reason)
+            .await
+        {
+            Ok(_) => Errno::EOPNOTSUPP.into(),
+            Err(error) => error,
+        }
+    }
+
     async fn snapshot_procfs<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -8143,6 +8395,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if position == 0 && task_record {
                     self.require_rendered_task(guest, call.fd()).await?;
                 }
+                let address_space = guest.thread_state().with_detfd(call.fd(), |detfd| {
+                    detfd.procfs_rendered_address_space_file()
+                })?;
                 // A rendered `/proc/diskstats` starts from the host's table
                 // as the run first read it, from the coordinator, not from
                 // its template: one rebuilt from a placeholder in another
@@ -8161,6 +8416,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                                  is made from, could not be read: {errno}"
                             ))
                         })?
+                } else if let Some(file) = address_space {
+                    // A process's `smaps`, `smaps_rollup` or `numa_maps` Detcore
+                    // renders: the address space its open bound, from the
+                    // backend's memory map (package K slice N4).
+                    Box::pin(self.render_address_space_file(guest, call.fd(), file)).await?
                 } else {
                     // `/proc/locks` Detcore renders: its lock ledger's rows now
                     // (package K slice K8-h).
@@ -22986,5 +23246,49 @@ mod linux_uapi_statx_tests {
         assert!(!statx_arguments_valid(0x4000_0000, 0, false));
         // Preserve the existing descriptor/no-path rule for other flag bits.
         assert!(statx_arguments_valid(0x4000_0000, 0, true));
+    }
+}
+
+#[cfg(test)]
+mod serving_kernel_protection_key_tests {
+    use reverie::syscalls::Errno;
+    use reverie::syscalls::Sysno;
+
+    use crate::record_or_replay::NoopTool;
+    use crate::syscall_hot_path_tests::InjectGuest;
+
+    /// Whether the kernel serving the process enables protection keys is
+    /// asked of it with one `pkey_mprotect` of the kernel half's lowest page,
+    /// key 0, that changes nothing: EINVAL (key 0 is not allocated) says it
+    /// has none, ENOMEM (no mapping there) that it has them, and any other
+    /// answer, a backend's refusal among them, is no fact.
+    #[test]
+    fn the_serving_kernel_says_whether_it_enables_protection_keys() {
+        futures::executor::block_on(async {
+            let page = crate::page::page_size() as usize;
+            for (reply, answer) in [
+                (Err(Errno::EINVAL), Some(false)),
+                (Err(Errno::ENOMEM), Some(true)),
+                (Ok(0), None),
+                (Err(Errno::ENOSYS), None),
+                (Err(Errno::EINTR), None),
+            ] {
+                let tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+                let mut guest = InjectGuest::<NoopTool>::new(reply);
+                let asked = tool
+                    .serving_kernel_enables_protection_keys(&mut guest)
+                    .await;
+                assert_eq!(asked.clone().ok(), answer, "{reply:?}: {asked:?}");
+                let injected = guest.injected();
+                assert_eq!(injected.len(), 1, "{injected:?}");
+                let (sysno, args) = injected[0];
+                assert_eq!(sysno, Sysno::pkey_mprotect);
+                assert_eq!(
+                    (args.arg0, args.arg1, args.arg2, args.arg3),
+                    (0xffff_8000_0000_0000, page, libc::PROT_NONE as usize, 0),
+                    "{reply:?}"
+                );
+            }
+        })
     }
 }

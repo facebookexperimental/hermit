@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 3115,
-      "applicable": 2263,
-      "selectable": 1772,
+      "applicable": 2264,
+      "selectable": 1773,
       "population": 3050,
-      "population_candidate_selected": 1772,
+      "population_candidate_selected": 1773,
       "population_candidate_not_selected": 475,
-      "population_candidate_disabled": 803
+      "population_candidate_disabled": 802
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 623,
-        "applicable": 597,
-        "selectable": 588,
+        "applicable": 598,
+        "selectable": 589,
         "population": 610,
-        "population_candidate_selected": 588,
+        "population_candidate_selected": 589,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 19
+        "population_candidate_disabled": 18
       },
       "liteinst": {
         "cells": 623,
@@ -3097,7 +3097,7 @@
     {"test_id":"system-utils/proc-uptime","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Under SaBRe this guest's verify matches, but the harness refuses the run because SaBRe used fallback or native sites for bash and the utilities it runs (https://github.com/rrnewton/hermit/issues/4477)"},
     {"test_id":"system-utils/procfs-sanitized-paths","backend":"dbt","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/procfs-sanitized-paths","backend":"in-guest-trap","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Under in-guest-trap, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)"},
-    {"test_id":"system-utils/procfs-sanitized-paths","backend":"kvm","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM's own /proc refuses /proc/self/smaps with EACCES, so the guest fails (https://github.com/rrnewton/hermit/issues/4479, https://github.com/rrnewton/hermit/issues/4282)"},
+    {"test_id":"system-utils/procfs-sanitized-paths","backend":"kvm","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/procfs-sanitized-paths","backend":"liteinst","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Under in-guest LiteInst, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)"},
     {"test_id":"system-utils/procfs-sanitized-paths","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Under SaBRe this guest's verify matches, but the harness refuses the run because SaBRe used fallback or native sites for bash and the utilities it runs (https://github.com/rrnewton/hermit/issues/4477)"},
     {"test_id":"system-utils/ps-proc-table","backend":"dbt","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

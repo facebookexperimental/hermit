@@ -1353,6 +1353,77 @@ impl<T: RecordOrReplay> Detcore<T> {
         .await
     }
 
+    /// mlock, mlock2 and mlockall, passed through. A lock the backend may
+    /// have run sets VM_LOCKED or VM_LOCKONFAULT on mappings (and mlockall
+    /// with MCL_FUTURE on later ones), flags `smaps` prints that the
+    /// backend's memory map does not list
+    /// (`MemoryMetadata::mapping_flags_changed`). So where Detcore renders
+    /// `smaps` from that map ([`Self::renders_address_space_files`]), every
+    /// outcome is recorded but ENOSYS, which says the backend ran nothing
+    /// (KVM's LinuxEmu answers all three so): a lock can fail part way
+    /// (ENOMEM, EAGAIN) after locking the mappings before. Only a lock whose
+    /// range overlaps a mapping the map lists, the only mappings a rendered
+    /// file shows ([`Self::range_reaches_listed_mapping`]); mlockall reaches
+    /// every mapping. Recording after the call is the same as before it for
+    /// the reads that consult the record, as for protection keys
+    /// ([`Self::handle_protection_key_call`]).
+    async fn handle_memory_lock_call<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        let sysno = call.number();
+        let args = call.into_parts().1;
+        let result = self.passthrough(guest, call).await;
+        if !matches!(result, Err(Error::Errno(Errno::ENOSYS))) && self.renders_address_space_files()
+        {
+            // `mlock(2)` and `mlock2(2)` act on the pages that hold
+            // `[start, start + len)` (`do_mlock`); `mlockall(2)` on all.
+            let (start, len) = match sysno {
+                Sysno::mlockall => (0, u64::MAX),
+                _ => (args.arg0 as u64, args.arg1 as u64),
+            };
+            if Self::range_reaches_listed_mapping(guest, start, len) {
+                guest.thread_state().note_mapping_flags_changed();
+            }
+        }
+        result
+    }
+
+    /// Whether this session renders a process's `smaps`, `smaps_rollup` and
+    /// `numa_maps` from the backend's memory map
+    /// (`procfs::RenderedFiles::address_space`): exactly where the guest's
+    /// procfs is not the kernel's (`procfs_inode::tool_can_name_guest_descriptors`
+    /// is false, KVM). A function of the configuration alone.
+    pub(crate) fn renders_address_space_files(&self) -> bool {
+        !procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend)
+    }
+
+    /// Whether the pages that hold `[start, start + len)`, the range a call
+    /// acted on, overlap a mapping the backend's memory map lists, the only
+    /// mappings a rendered `smaps` or `numa_maps` shows
+    /// (`procfs::memory_map::smaps`). True where the backend gives no map,
+    /// which cannot show that the call reached none.
+    pub(crate) fn range_reaches_listed_mapping<G: Guest<Self>>(
+        guest: &G,
+        start: u64,
+        len: u64,
+    ) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let page = crate::page::page_size();
+        let first = start & !(page - 1);
+        let end = start.saturating_add(len).saturating_add(page - 1) & !(page - 1);
+        match guest.memory_map(guest.tid()) {
+            Ok(map) => map
+                .mappings
+                .iter()
+                .any(|mapping| mapping.start < end && first < mapping.end),
+            Err(_) => true,
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-643): Review unsupported-syscall reporting and fail-fast behavior.
     /// Applies the legacy policy to an explicitly listed but unsupported syscall.
@@ -4345,6 +4416,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             /* config.virtualize_keys */
             {
                 subscription.syscalls([Sysno::add_key, Sysno::request_key, Sysno::keyctl]);
+            }
+
+            // Where Detcore renders a process's `smaps` from the backend's
+            // memory map, a rendered file refuses a listed mapping once a lock
+            // may have set flags the map does not list
+            // (`MemoryMetadata::mapping_flags_changed`), which Detcore learns
+            // only from these calls; they still pass through. Elsewhere the
+            // kernel's file is served and nothing reads that record.
+            if !crate::procfs_inode::tool_can_name_guest_descriptors(&config.backend) {
+                subscription.syscalls([Sysno::mlock, Sysno::mlock2, Sysno::mlockall]);
             }
 
             if do_sched {
@@ -7363,6 +7444,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 {
                     Box::pin(self.handle_protection_key_call(guest, call)).await
                 }
+                // The memory-lock calls, boxed for the same reason.
+                SyscallClassification::PassThrough
+                    if matches!(
+                        call.number(),
+                        Sysno::mlock | Sysno::mlock2 | Sysno::mlockall
+                    ) =>
+                {
+                    Box::pin(self.handle_memory_lock_call(guest, call)).await
+                }
                 SyscallClassification::PassThrough => self.passthrough(guest, call).await,
                 // The kernel's restart of a wait Detcore emulates, or ran in the
                 // kernel as the guest made it, resumes it; any other
@@ -8055,6 +8145,37 @@ mod subscription_tests {
                 subscriptions.iter_syscalls().any(|sysno| sysno == syscall),
                 "passthru_opt let {syscall} bypass Detcore's protection-key handling"
             );
+        }
+    }
+
+    /// Under `--passthru-opt` the memory-lock calls reach Detcore exactly
+    /// where it renders a process's `smaps` from the backend's memory map
+    /// (KVM's capabilities), whose record of them a rendered file consults
+    /// (`MemoryMetadata::mapping_flags_changed`); where the kernel's file is
+    /// served (ptrace's), nothing reads that record, and they bypass Detcore
+    /// as before.
+    #[test]
+    fn passthru_opt_intercepts_the_memory_lock_calls_where_smaps_is_rendered() {
+        for (backend, intercepted) in [
+            (reverie::BackendCapabilities::KVM, true),
+            (reverie::BackendCapabilities::PTRACE, false),
+        ] {
+            let config = Config {
+                backend,
+                ..strict_config(true)
+            };
+            let subscriptions = <Detcore as Tool>::subscriptions(&config);
+            for syscall in [Sysno::mlock, Sysno::mlock2, Sysno::mlockall] {
+                assert_eq!(
+                    syscall_classification::classify_syscall(syscall),
+                    syscall_classification::SyscallClassification::PassThrough
+                );
+                assert_eq!(
+                    subscriptions.iter_syscalls().any(|sysno| sysno == syscall),
+                    intercepted,
+                    "{syscall} on {backend:?}"
+                );
+            }
         }
     }
 

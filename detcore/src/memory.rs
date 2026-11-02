@@ -77,6 +77,33 @@ pub(crate) struct MemoryMetadata {
     /// A fork copies the address space, keys included; an exec replaces it.
     #[serde(default)]
     pub(crate) protection_keys: bool,
+    /// Whether a call that sets flags on a mapping that the backend's memory
+    /// map (`reverie::MemoryMap`) does not list reached the backend for a
+    /// range overlapping a mapping that map lists, in a session that renders
+    /// a process's `smaps` from it (`procfs::RenderedFiles::address_space`):
+    /// `madvise(2)` access-pattern, fork and dump advice (VM_SEQ_READ,
+    /// VM_RAND_READ, VM_DONTCOPY, VM_DONTDUMP, VM_WIPEONFORK), and `mlock(2)`
+    /// or `mlock2(2)` (VM_LOCKED, VM_LOCKONFAULT), or any `mlockall(2)`. A
+    /// rendered `smaps` cannot then derive a listed mapping's `VmFlags`, and
+    /// is refused (`procfs::memory_map::smaps`); a call on a mapping the map
+    /// does not list changes nothing such a file shows. A fork copies the
+    /// address space, flags included; an exec replaces it. Never cleared
+    /// otherwise: advice that clears a flag (`MADV_NORMAL`, `MADV_DOFORK`)
+    /// changes flags too.
+    #[serde(default)]
+    pub(crate) mapping_flags_changed: bool,
+    /// Whether a call that discards a mapping's pages reached the backend for
+    /// a range overlapping a mapping the backend's memory map lists, in a
+    /// session that renders a process's `numa_maps` from it: `madvise(2)`
+    /// with `MADV_DONTNEED`, `MADV_DONTNEED_LOCKED` or `MADV_GUARD_INSTALL`,
+    /// and `MADV_WIPEONFORK`, which leaves the copy a later fork makes with
+    /// none. Whether that mapping still holds a resident page is then not a
+    /// fact, and Linux's `numa_maps` prints `kernelpagesize_kB` only for a
+    /// mapping that holds one (`show_numa_map`), so a rendered `numa_maps` is
+    /// refused (`procfs::memory_map::smaps`). A fork copies it; an exec
+    /// replaces the address space.
+    #[serde(default)]
+    pub(crate) pages_discarded: bool,
     /// aarch64: the file-backed ranges `crate::store_exclusive` has seen in
     /// this address space, and whether each was scanned for exclusive pairs.
     /// Not part of the serialized model.
@@ -120,6 +147,8 @@ impl MemoryMetadata {
             && self.brk_model.is_none()
             && self.brk_unmodeled.is_none()
             && !self.protection_keys
+            && !self.mapping_flags_changed
+            && !self.pages_discarded
     }
 
     /// Record a program break reported by a `brk(2)` return.

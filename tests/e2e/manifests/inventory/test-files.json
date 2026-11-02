@@ -2995,6 +2995,12 @@
       "why": "tests/c/sleeper_beside_newcomer.c is owned by hermit-cli/tests/cli.rs: The integration tests a_new_thread_behind_a_short_sleep_loop_gets_its_first_turn_within_a_second, a_thread_that_has_run_still_waits_behind_a_short_sleep_loop and a_thread_that_has_run_does_not_wait_behind_a_zero_length_sleep_loop run this guest under run --strict --chaos: a newly created thread must get its first turn within 1 s of virtual time beside a loop of 100 us sleeps (seeds 9, 23 and 24, with a bitwise-parity verify and a schedule replay), a thread that has run must still wake at least 1 s late behind it (seed 4), and with the zero argument, behind a loop of zero-length sleeps, it must wake within 1 s (seeds 4 and 8); a generic manifest cannot express the measured bounds or the parity and replay checks, and the cases need the PMU timer, so they run in privileged-test.pmu_cli_cases."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/smaps_and_numa_maps.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/smaps_and_numa_maps.c is owned by hermit-cli/tests/cli.rs: smaps_numa_maps_and_the_rollup_list_the_address_space_as_on_linux and run_kvm_smaps_and_numa_maps_render_the_stack_from_the_memory_map run it natively and on ptrace and KVM at bitwise parity, and require /proc/self/smaps, numa_maps and smaps_rollup to be what Linux prints (fs/proc/task_mmu.c) for a mapping of each kind, with every page count zero; on KVM, where Detcore renders them from the backend's memory map, the stack alone listed, its block and row the same as ptrace's but for its range and size and for the ProtectionKey the host kernel beneath ptrace prints, which KVM's kernel, enabling no protection keys, does not (with and without --no-virtualize-cpuid), advice on a mapping the memory map does not list changing nothing, and the rollup, a split stack, advice on the stack and numa_maps after the stack's pages were discarded refused by name; on ptrace a stack whose pages were all discarded has no kernelpagesize_kB, as natively (package K slice N4 of https://github.com/rrnewton/hermit/issues/4213). It stays a fixture because a generic manifest cannot compare a guest's output across backends or with its native run."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/so_incoming_cpu_tcp4.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

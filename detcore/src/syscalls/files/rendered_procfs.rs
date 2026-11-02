@@ -2077,7 +2077,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             // task a spelling names, its existence and identity from Detcore's
             // process table, and its owner's access (FileAccess).
             if procfs.per_process_name().is_some() {
-                if self.kernel_serves_every_comm(&procfs) {
+                if self.kernel_serves_every_comm(&procfs)
+                    || self.kernel_serves_every_address_space_file(&procfs)
+                {
                     return Ok(None);
                 }
                 let Some((pid, tid)) = self.procfs_caller_ids(guest) else {
@@ -2678,6 +2680,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Err(Errno::EINVAL.into());
         }
+        // A process's `smaps`, `smaps_rollup` or `numa_maps` takes the task's
+        // memory map at its open (`proc_maps_open`, `smaps_rollup_open`):
+        // bind the address space the task holds now where the task is of the
+        // opener's own process, whose address space it shares, which its
+        // reads render (`Detcore::render_address_space_file`), as a `maps`
+        // the kernel opened binds one (`memory_map::Binding`). A task of
+        // another process, or one that holds no address space, binds none.
+        let procfs = if procfs.lists_rendered_address_space() && !flags.contains(OFlag::O_PATH) {
+            let mut procfs = procfs;
+            if let Some(task) = procfs.bound_task()
+                && let Some((pid, _)) = self.procfs_caller_ids(guest)
+                && task.process == pid
+            {
+                let answer = crate::tool_global::procfs_task(guest, task).await;
+                let opener = guest.thread_state().mm_id;
+                if let Some(binding) =
+                    crate::procfs::memory_map::Binding::at_open(task, &answer, opener)
+                {
+                    procfs.bind_memory_map(binding);
+                }
+            }
+            procfs
+        } else {
+            procfs
+        };
         // A process's `auxv`: its snapshot is the process's auxiliary vector
         // now, which the open pins (`open_process_auxv`).
         // Boxed: the access check's injected calls would otherwise grow every
@@ -3771,7 +3798,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             && let Some(mut file) = ProcfsFile::from_path(&path)
             && file.per_process_name().is_some()
         {
-            if !self.renders_procfs(guest) || self.kernel_serves_every_comm(&file) {
+            if !self.renders_procfs(guest)
+                || self.kernel_serves_every_comm(&file)
+                || self.kernel_serves_every_address_space_file(&file)
+            {
                 return Ok(None);
             }
             let Some(task) = file.bound_task() else {
@@ -3917,6 +3947,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// global tool, so those backends pay nothing for the file.
     pub(super) fn kernel_serves_every_comm(&self, file: &ProcfsFile) -> bool {
         file.is_task_comm() && self.comm_source() == crate::procfs::task_stat::CommSource::Kernel
+    }
+
+    /// Whether `file` is a process's `smaps`, `smaps_rollup` or `numa_maps`
+    /// and the guest's procfs is the kernel's
+    /// ([`Detcore::renders_address_space_files`] is false): then every
+    /// spelling of every process's, its lookup, metadata and listing
+    /// included, is the kernel's, unclassified, exactly as before Detcore
+    /// rendered any (package K slice N4), decided before any request to the
+    /// global tool, so those backends pay nothing for the files.
+    pub(super) fn kernel_serves_every_address_space_file(&self, file: &ProcfsFile) -> bool {
+        file.lists_rendered_address_space() && !self.renders_address_space_files()
     }
 
     /// Resolve `path`, an absolute spelling with a `..`, where Detcore renders
@@ -7383,6 +7424,41 @@ mod tests {
             assert!(found.is_none());
             assert!(guest.injected().is_empty(), "{:?}", guest.injected());
         })
+    }
+
+    /// Where the guest's procfs is the kernel's (ptrace's capabilities),
+    /// every spelling of a process's `smaps`, `smaps_rollup` and `numa_maps`
+    /// is the kernel's, decided from the configuration before any request to
+    /// the global tool, as before Detcore rendered them (package K slice N4);
+    /// where it is not (KVM's), Detcore classifies them. Other per-process
+    /// files are not affected.
+    #[test]
+    fn the_kernel_serves_every_address_space_file_where_procfs_is_its() {
+        use crate::record_or_replay::NoopTool;
+        let mut tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+        for (backend, kernels) in [
+            (reverie::BackendCapabilities::PTRACE, true),
+            (reverie::BackendCapabilities::DBT, true),
+            (reverie::BackendCapabilities::LITEINST_IN_GUEST, true),
+            (reverie::BackendCapabilities::KVM, false),
+        ] {
+            tool.cfg.backend = backend;
+            assert_eq!(tool.renders_address_space_files(), !kernels);
+            for path in [
+                "/proc/self/smaps",
+                "/proc/3/smaps_rollup",
+                "/proc/self/task/3/numa_maps",
+            ] {
+                let file = ProcfsFile::from_path(Path::new(path)).expect(path);
+                assert_eq!(
+                    tool.kernel_serves_every_address_space_file(&file),
+                    kernels,
+                    "{path}"
+                );
+            }
+            let statm = ProcfsFile::from_path(Path::new("/proc/self/statm")).unwrap();
+            assert!(!tool.kernel_serves_every_address_space_file(&statm));
+        }
     }
 
     /// A guest for [`Detcore::bind_task_identity`]: its registers name the

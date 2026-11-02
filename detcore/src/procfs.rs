@@ -876,6 +876,11 @@ pub(crate) struct RenderedFiles {
     /// (`procfs_inode::tool_can_name_guest_descriptors`, KVM), so there is no
     /// kernel file to keep the guest's rows of.
     pub(crate) locks: bool,
+    /// Whether Detcore renders every process's `smaps`, `smaps_rollup` and
+    /// `numa_maps` from the backend's memory map (`memory_map::smaps`,
+    /// package K slice N4): exactly where the guest's procfs is not the
+    /// kernel's (KVM), so there is no kernel file to sanitize.
+    pub(crate) address_space: bool,
 }
 
 impl RenderedFiles {
@@ -885,6 +890,7 @@ impl RenderedFiles {
         cpuinfo: true,
         mounts: true,
         locks: true,
+        address_space: true,
     };
 
     /// The files Detcore renders in every session, without `/proc/cpuinfo`
@@ -893,6 +899,7 @@ impl RenderedFiles {
         cpuinfo: false,
         mounts: false,
         locks: false,
+        address_space: false,
     };
 
     /// The files a session renders whose configuration virtualizes CPUID
@@ -910,6 +917,31 @@ impl RenderedFiles {
             cpuinfo: virtualize_cpuid && cpuid_interception,
             mounts: mount_table,
             locks: backend_procfs,
+            address_space: backend_procfs,
+        }
+    }
+}
+
+/// A process's files that list its address space beside `maps`, which
+/// Detcore renders from the backend's memory map where the guest's procfs is
+/// not the kernel's ([`RenderedFiles::address_space`], `memory_map::smaps`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AddressSpaceFile {
+    /// `/proc/<pid>/smaps`.
+    Smaps,
+    /// `/proc/<pid>/smaps_rollup`.
+    SmapsRollup,
+    /// `/proc/<pid>/numa_maps`.
+    NumaMaps,
+}
+
+impl AddressSpaceFile {
+    /// The file's name in a process's directory.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Smaps => "smaps",
+            Self::SmapsRollup => "smaps_rollup",
+            Self::NumaMaps => "numa_maps",
         }
     }
 }
@@ -1265,7 +1297,10 @@ pub(crate) struct ProcfsFile {
     /// map, the task its open found and the address space the file lists, the
     /// one that task held at the open, which was the opener's own
     /// ([`ProcfsFile::bind_memory_map`]). `None` where the open bound none;
-    /// the file is then read from the kernel's, as before.
+    /// the file is then read from the kernel's, as before. For a process's
+    /// `smaps`, `smaps_rollup` and `numa_maps` Detcore opened as rendered,
+    /// the same; `None` there is a task of another process, or one that held
+    /// no address space at the open (`Detcore::render_address_space_file`).
     #[serde(default)]
     memory_map: Option<memory_map::Binding>,
     /// Whether this `maps` file's snapshot was rendered from the backend's
@@ -1943,6 +1978,7 @@ impl ProcfsFile {
             cpuinfo: self.rendered || files.cpuinfo,
             mounts: self.rendered || files.mounts,
             locks: self.rendered || files.locks,
+            address_space: self.rendered || files.address_space,
         })
     }
 
@@ -2027,11 +2063,13 @@ impl ProcfsFile {
 
     /// The per-process files Detcore renders, and their names. `mountinfo`
     /// and `mounts` only in a session with a container mount table
-    /// ([`RenderedFiles::mounts`]), and `arch_status` only in a session that
-    /// renders `/proc/cpuinfo` ([`RenderedFiles::cpuinfo`]). A name's index
+    /// ([`RenderedFiles::mounts`]), `arch_status` only in a session that
+    /// renders `/proc/cpuinfo` ([`RenderedFiles::cpuinfo`]), and `smaps`,
+    /// `smaps_rollup` and `numa_maps` only where the guest's procfs is not
+    /// the kernel's ([`RenderedFiles::address_space`]). A name's index
     /// numbers its files' inodes (`procfs_inode::per_process_inode`), so a new
     /// name goes last.
-    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 10] = [
+    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 13] = [
         (ProcfsKind::ProcessCgroup, "cgroup"),
         (ProcfsKind::ProcessAuxv, "auxv"),
         (ProcfsKind::Mountinfo, "mountinfo"),
@@ -2042,10 +2080,13 @@ impl ProcfsFile {
         (ProcfsKind::Statm, "statm"),
         (ProcfsKind::ProcessIo, "io"),
         (ProcfsKind::ArchStatus, "arch_status"),
+        (ProcfsKind::Smaps, "smaps"),
+        (ProcfsKind::SmapsRollup, "smaps_rollup"),
+        (ProcfsKind::NumaMaps, "numa_maps"),
     ];
 
     /// The names of the per-process files Detcore renders.
-    pub(crate) const PER_PROCESS_NAMES: [&'static str; 10] = [
+    pub(crate) const PER_PROCESS_NAMES: [&'static str; 13] = [
         "cgroup",
         "auxv",
         "mountinfo",
@@ -2056,6 +2097,9 @@ impl ProcfsFile {
         "statm",
         "io",
         "arch_status",
+        "smaps",
+        "smaps_rollup",
+        "numa_maps",
     ];
 
     /// Pin which view of the mounts this kernel-opened `mountinfo` or `mounts`
@@ -2148,10 +2192,34 @@ impl ProcfsFile {
     ///
     /// Nor `cmdline`, whose every read reads the process's memory again
     /// ([`Self::renders_at_every_read`]).
+    ///
+    /// Nor `smaps`, `smaps_rollup` and `numa_maps`, whose snapshot Detcore
+    /// takes at the first read and keeps, whether it renders the file
+    /// (package K slice N4) or the kernel opened it, so that every backend
+    /// serves them alike ([`Self::lists_address_space`]).
     pub(crate) fn shows_at_read(&self) -> bool {
         self.per_process_name().is_some()
             && !self.is_plain_process_file()
             && self.mount_table_rendering().is_none()
+            && !self.lists_rendered_address_space()
+    }
+
+    /// Whether this is a process's `smaps`, `smaps_rollup` or `numa_maps`,
+    /// the per-process files Detcore renders from the backend's memory map
+    /// where it renders them (`RenderedFiles::address_space`).
+    pub(crate) fn lists_rendered_address_space(&self) -> bool {
+        self.address_space_file().is_some()
+    }
+
+    /// Which of a process's `smaps`, `smaps_rollup` and `numa_maps` this is,
+    /// if it is one.
+    pub(crate) fn address_space_file(&self) -> Option<AddressSpaceFile> {
+        match self.kind {
+            ProcfsKind::Smaps => Some(AddressSpaceFile::Smaps),
+            ProcfsKind::SmapsRollup => Some(AddressSpaceFile::SmapsRollup),
+            ProcfsKind::NumaMaps => Some(AddressSpaceFile::NumaMaps),
+            _ => None,
+        }
     }
 
     /// Whether this is a process's `auxv`.
@@ -2393,6 +2461,14 @@ impl ProcfsFile {
             ProcfsKind::Diskstats => Some(Path::new("/proc/diskstats")),
             ProcfsKind::Fixed(file) => Some(file.path()),
             ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts if !files.mounts => None,
+            // A process's `smaps`, `smaps_rollup` and `numa_maps`, rendered
+            // from the backend's memory map where there is no kernel file to
+            // sanitize (`memory_map::smaps`).
+            ProcfsKind::Smaps | ProcfsKind::SmapsRollup | ProcfsKind::NumaMaps
+                if !files.address_space =>
+            {
+                None
+            }
             // A task's `arch_status` describes the CPU the guest's CPUID
             // instruction reports, so Detcore renders it exactly where it
             // renders `/proc/cpuinfo`, from the same table.
@@ -2500,6 +2576,7 @@ impl ProcfsFile {
             || self.shows_at_read()
             || self.mount_table_rendering().is_some()
             || self.lists_locks()
+            || self.lists_rendered_address_space()
     }
 
     /// Whether the snapshot of this file a first read takes is a function of
@@ -2588,6 +2665,10 @@ impl ProcfsFile {
             // The rows are the lock ledger's as the first read finds it
             // (`Detcore::ledger_locks_text`).
             ProcfsKind::Locks => b"",
+            // The text is the address space's mappings as the backend's
+            // memory map lists them at the first read
+            // (`Detcore::render_address_space_file`).
+            ProcfsKind::Smaps | ProcfsKind::SmapsRollup | ProcfsKind::NumaMaps => b"",
             _ => unreachable!("{:?} has no rendered path", self.kind),
         }
     }
@@ -2627,9 +2708,15 @@ impl ProcfsFile {
     /// Bind a process's `maps` to the task its open found and the address
     /// space that task held then, as Linux takes the task's memory map at the
     /// open (`proc_maps_open`). Only for a task of the opener's own process,
-    /// whose address space is the opener's.
+    /// whose address space is the opener's. So too a process's `smaps`,
+    /// `smaps_rollup` and `numa_maps` Detcore opened as rendered (package K
+    /// slice N4), whose opens take the memory map the same way
+    /// (`pid_smaps_open`, `smaps_rollup_open`, `pid_numa_maps_open`).
     pub(crate) fn bind_memory_map(&mut self, binding: memory_map::Binding) {
-        assert!(self.is_maps(), "only a maps file binds an address space");
+        assert!(
+            self.is_maps() || self.lists_rendered_address_space(),
+            "only a file that lists the address space binds one"
+        );
         self.memory_map = Some(binding);
     }
 
@@ -11380,7 +11467,7 @@ total_commit_ms 0\n"
     #[test]
     fn a_task_statm_io_and_arch_status_are_rendered_per_process_files() {
         assert_eq!(
-            ProcfsFile::PER_PROCESS_NAMES[7..],
+            ProcfsFile::PER_PROCESS_NAMES[7..10],
             ["statm", "io", "arch_status"]
         );
         for name in ["statm", "io", "arch_status"] {
@@ -11447,6 +11534,73 @@ total_commit_ms 0\n"
                 .unwrap()
                 .per_process_name()
                 .is_none()
+        );
+    }
+
+    /// A task's `smaps`, `smaps_rollup` and `numa_maps` are per-process files
+    /// Detcore renders only where the guest's procfs is not the kernel's
+    /// (package K slice N4); elsewhere the kernel opens them and Detcore
+    /// sanitizes its bytes, as before. Either way the snapshot is taken at
+    /// the first read and kept, with no `show` at each rewind, so that every
+    /// backend serves them alike.
+    #[test]
+    fn a_task_smaps_rollup_and_numa_maps_are_rendered_only_where_procfs_is_not_the_kernels() {
+        assert_eq!(
+            ProcfsFile::PER_PROCESS_NAMES[10..],
+            ["smaps", "smaps_rollup", "numa_maps"]
+        );
+        // KVM's session, and ptrace's (the kernel's procfs).
+        let backend_procfs = RenderedFiles::of(true, true, false, true);
+        let kernel_procfs = RenderedFiles::of(true, true, false, false);
+        for (name, file) in [
+            ("smaps", AddressSpaceFile::Smaps),
+            ("smaps_rollup", AddressSpaceFile::SmapsRollup),
+            ("numa_maps", AddressSpaceFile::NumaMaps),
+        ] {
+            assert_eq!(file.name(), name);
+            for (spelling, path) in [
+                (format!("/proc/self/{name}"), format!("/proc/3/{name}")),
+                (
+                    format!("/proc/thread-self/{name}"),
+                    format!("/proc/3/task/5/{name}"),
+                ),
+                (
+                    format!("/proc/7/task/9/{name}"),
+                    format!("/proc/7/task/9/{name}"),
+                ),
+            ] {
+                let mut procfs = ProcfsFile::from_path(Path::new(&spelling)).unwrap();
+                assert_eq!(procfs.per_process_name(), Some(name), "{spelling}");
+                assert_eq!(procfs.address_space_file(), Some(file), "{spelling}");
+                assert!(procfs.kernel_served(), "{spelling}");
+                assert!(!procfs.shows_at_read(), "{spelling}");
+                assert!(procfs.snapshot_at_first_read(), "{spelling}");
+                assert!(procfs.lists_address_space(), "{spelling}");
+                procfs.bind_task(3, 5);
+                assert_eq!(
+                    procfs.rendered_path(backend_procfs),
+                    Some(Path::new(&path)),
+                    "{spelling}"
+                );
+                assert_eq!(procfs.rendered_path(kernel_procfs), None, "{spelling}");
+                assert_eq!(
+                    procfs.rendered_path(RenderedFiles::WITHOUT_CPUINFO),
+                    None,
+                    "{spelling}"
+                );
+                assert!(rendered_path_is_seq_file(Path::new(&path)), "{spelling}");
+                let rendered = procfs.into_rendered();
+                assert!(rendered.rendering_template().is_empty(), "{spelling}");
+                assert!(!rendered.shows_at_read(), "{spelling}");
+                assert!(rendered.snapshot_at_first_read(), "{spelling}");
+                assert!(!rendered.snapshot_is_rerendered(), "{spelling}");
+            }
+        }
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/maps"))
+                .unwrap()
+                .address_space_file(),
+            None
         );
     }
 

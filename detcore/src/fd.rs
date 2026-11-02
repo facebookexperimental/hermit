@@ -2450,6 +2450,21 @@ impl DetFd {
         })
     }
 
+    /// Which of a process's `smaps`, `smaps_rollup` and `numa_maps` this
+    /// descriptor is, where Detcore opened it as rendered and renders its
+    /// snapshot from the backend's memory map
+    /// (`Detcore::render_address_space_file`).
+    pub(crate) fn procfs_rendered_address_space_file(
+        &self,
+    ) -> Option<crate::procfs::AddressSpaceFile> {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .filter(|procfs| procfs.is_rendered())
+                .and_then(ProcfsFile::address_space_file)
+        })
+    }
+
     /// Whether this is a task's `arch_status` (`ProcfsFile::is_arch_status`).
     pub(crate) fn procfs_is_arch_status(&self) -> bool {
         self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::is_arch_status))

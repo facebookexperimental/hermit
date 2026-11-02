@@ -48,6 +48,8 @@
 //! probed instruction it optimizes (`create_uprobe_trampoline` in
 //! `arch/x86/kernel/uprobes.c`), is not left out.
 
+pub(crate) mod smaps;
+
 use detcore_model::futex::MmId;
 use reverie::MappingBacking;
 use reverie::MappingFact;

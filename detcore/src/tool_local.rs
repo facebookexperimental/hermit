@@ -2036,6 +2036,7 @@ impl FileMetadata {
             // Rendered only where the tool runs outside the guest (KVM), which
             // never rediscovers its descriptors.
             locks: false,
+            address_space: false,
         };
         let found = self.within_proc_level(
             may_be_placeholder
@@ -7731,6 +7732,42 @@ impl<T> ThreadState<T> {
             .lock()
             .expect("memory metadata mutex poisoned")
             .protection_keys
+    }
+
+    /// Record that a call that sets mapping flags the backend's memory map
+    /// does not list reached the backend for a mapping that map lists
+    /// (`MemoryMetadata::mapping_flags_changed`).
+    pub(crate) fn note_mapping_flags_changed(&self) {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .mapping_flags_changed = true;
+    }
+
+    /// Whether such a call reached the backend for the address space.
+    pub(crate) fn mapping_flags_may_have_changed(&self) -> bool {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .mapping_flags_changed
+    }
+
+    /// Record that a call that discards pages reached the backend for a
+    /// mapping the backend's memory map lists
+    /// (`MemoryMetadata::pages_discarded`).
+    pub(crate) fn note_pages_discarded(&self) {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .pages_discarded = true;
+    }
+
+    /// Whether such a call reached the backend for the address space.
+    pub(crate) fn pages_may_have_been_discarded(&self) -> bool {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .pages_discarded
     }
 
     /// Record an anonymous shared mapping.

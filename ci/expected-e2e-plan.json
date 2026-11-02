@@ -45539,6 +45539,27 @@
       ],
       "test": "system-utils/flock-shared-exclusive",
       "timeout_seconds": 180
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "bash",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "system-utils/procfs-sanitized-paths",
+      "timeout_seconds": 180
     }
   ],
   "schema": 1

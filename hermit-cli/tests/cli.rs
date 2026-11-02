@@ -329,6 +329,7 @@ static CLONE_EXIT_SIGNAL_EFFECTIVE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static MAIN_STACK_MAPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static MAIN_STACK_BOUNDS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SMAPS_AND_NUMA_MAPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
@@ -9205,6 +9206,362 @@ fn run_kvm_the_main_stack_is_read_from_maps_as_on_linux() {
         return;
     }
     read_the_main_stack_from_maps_as_on_linux("kvm");
+}
+
+/// `tests/c/smaps_and_numa_maps.c`'s guest.
+fn smaps_and_numa_maps_guest() -> &'static Path {
+    compiled_c_guest(&SMAPS_AND_NUMA_MAPS_GUEST, "smaps_and_numa_maps")
+}
+
+/// What `smaps_and_numa_maps.c` prints in `mode` under Hermit on `backend`
+/// at `--proc=standard`, which lists `numa_maps` and `smaps_rollup`: at L2
+/// where `l2` (two runs at bitwise parity under `--verify-strict`, with the
+/// same nonzero number of INFO records compared, exit 0), else in one run.
+/// Hermit's exit status, the guest's stdout and Hermit's stderr.
+fn address_space_listing(backend: &str, mode: &str, l2: bool) -> (Option<i32>, String, String) {
+    address_space_listing_with(backend, mode, l2, &[])
+}
+
+/// [`address_space_listing`], with `extra` among Hermit's `run` arguments.
+fn address_space_listing_with(
+    backend: &str,
+    mode: &str,
+    l2: bool,
+    extra: &[&str],
+) -> (Option<i32>, String, String) {
+    let guest = smaps_and_numa_maps_guest().to_str().unwrap();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("verify.json");
+    let report = report.to_str().unwrap();
+    let mut hermit_args = vec![
+        "--log=info",
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--base-env=empty",
+        "--proc=standard",
+    ];
+    hermit_args.extend(extra);
+    if l2 {
+        hermit_args.extend(["--verify", "--verify-strict", "--verify-json", report]);
+    }
+    hermit_args.extend(["--", guest, mode]);
+    let (status, log) = run_with_deadline(
+        hermit_command(&hermit_args),
+        directory.path(),
+        Duration::from_secs(240),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    let code = status.and_then(|status| status.code());
+    if l2 {
+        assert_eq!(
+            code,
+            Some(0),
+            "{backend} {mode}:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_bitwise_parity(report, &format!("{backend} smaps_and_numa_maps {mode}"));
+    }
+    (code, stdout, log)
+}
+
+/// The part of `smaps_and_numa_maps.c`'s output about the stack: from its
+/// line `blocks ok` on, the stack's field labels, `numa_maps` row without
+/// page counts, and `smaps` block without its range and size, which the
+/// backend's layout decides (KVM's stack window is LinuxEmu's 8188 kB one,
+/// a native stack about 132 kB), as are the spaces that pad the name to its
+/// column. The guest prints the range on a line before `blocks ok`.
+fn stack_listing(output: &str) -> String {
+    let from = output
+        .find("blocks ok\n")
+        .unwrap_or_else(|| panic!("no checked listing:\n{output}"));
+    output[from..]
+        .lines()
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+/// A [`stack_listing`] without its `ProtectionKey` line and label, which
+/// Linux prints only where the kernel serving the process enables protection
+/// keys (`arch_pkeys_enabled`).
+fn without_protection_key(listing: &str) -> String {
+    listing
+        .lines()
+        .filter(|line| !line.starts_with("ProtectionKey:"))
+        .map(|line| match line.strip_prefix("stack labels ") {
+            Some(labels) => format!(
+                "stack labels {}\n",
+                labels
+                    .split(' ')
+                    .filter(|label| *label != "ProtectionKey")
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            None => format!("{line}\n"),
+        })
+        .collect()
+}
+
+/// A [`stack_listing`] without its `THPeligible` line, and that line's value.
+fn without_thp_eligible(listing: &str) -> (String, Option<String>) {
+    let mut value = None;
+    let rest = listing
+        .lines()
+        .filter(|line| match line.strip_prefix("THPeligible:") {
+            Some(eligible) => {
+                value = Some(eligible.trim().to_string());
+                false
+            }
+            None => true,
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    (rest, value)
+}
+
+/// The orders of transparent huge page this host lets an anonymous mapping
+/// that no `MADV_HUGEPAGE` marked have (`thp_vma_allowable_orders` with
+/// `TVA_ENFORCE_SYSFS`): each per-size setting `always`, and each `inherit`
+/// where the global one is `always` (the PMD order alone, 9, where the
+/// kernel has no per-size settings).
+fn host_anonymous_thp_orders() -> u64 {
+    let root = Path::new("/sys/kernel/mm/transparent_hugepage");
+    let selected = |path: &Path| -> Option<String> {
+        let text = fs::read_to_string(path).ok()?;
+        text.split_whitespace()
+            .find_map(|word| word.strip_prefix('[')?.strip_suffix(']'))
+            .map(str::to_owned)
+    };
+    let global_always = selected(&root.join("enabled")).as_deref() == Some("always");
+    let mut orders = 0;
+    let mut per_size = false;
+    for entry in fs::read_dir(root).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(kilobytes) = name
+            .strip_prefix("hugepages-")
+            .and_then(|size| size.strip_suffix("kB"))
+            .and_then(|size| size.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Some(setting) = selected(&entry.path().join("enabled")) else {
+            continue;
+        };
+        per_size = true;
+        let order = (kilobytes / 4).trailing_zeros();
+        if setting == "always" || (setting == "inherit" && global_always) {
+            orders |= 1 << order;
+        }
+    }
+    if !per_size && global_always {
+        orders |= 1 << 9;
+    }
+    // `THP_ORDERS_ALL_ANON`: orders 2 to `PMD_ORDER`.
+    orders & 0x3fc
+}
+
+/// Linux's `THPeligible` for an anonymous mapping `[start, end)` that no
+/// `MADV_HUGEPAGE` marked, in an address space that did not disable huge
+/// pages, on this host (`__thp_vma_allowable_orders` for smaps): whether it
+/// holds a naturally aligned block of an allowed order, tried from the
+/// largest (`thp_vma_suitable_order` at `vm_end` less the block).
+fn host_thp_eligible(start: u64, end: u64) -> &'static str {
+    let orders = host_anonymous_thp_orders();
+    let eligible = (2..=9)
+        .rev()
+        .filter(|order| orders & (1 << order) != 0)
+        .any(|order| {
+            let size = 4096u64 << order;
+            end.checked_sub(size).is_some_and(|address| {
+                let aligned = address & !(size - 1);
+                aligned >= start && aligned + size <= end
+            })
+        });
+    if eligible { "1" } else { "0" }
+}
+
+/// The stack range `smaps_and_numa_maps.c` printed (`stack range S-E`).
+fn printed_stack_range(output: &str) -> (u64, u64) {
+    let range = output
+        .lines()
+        .find_map(|line| line.strip_prefix("stack range "))
+        .unwrap_or_else(|| panic!("no stack range:\n{output}"));
+    let (start, end) = range.split_once('-').unwrap();
+    (
+        u64::from_str_radix(start, 16).unwrap(),
+        u64::from_str_radix(end, 16).unwrap(),
+    )
+}
+
+/// Why KVM refuses a process's `smaps_rollup` (package K slice N4): its
+/// header spans the whole address space, and KVM's memory map lists only the
+/// stack window.
+const KVM_ROLLUP_REFUSAL: &str = "Linux's smaps_rollup gives the range from the address space's \
+    first mapping to its last one, and the backend's memory map lists only some of its mappings";
+
+/// Why KVM refuses a process's `smaps` that lists a part of the stack window
+/// a split left: its flags are not in the memory map.
+const KVM_SPLIT_SMAPS_REFUSAL: &str = "they are not in the backend's memory map";
+
+/// Why KVM refuses a process's `smaps` once access-pattern advice reached
+/// LinuxEmu for the stack: the flag it sets (`rr`) is not in the memory map.
+const KVM_ADVISED_SMAPS_REFUSAL: &str = "madvise advice or mlock that reached the backend may have \
+    set flags on";
+
+/// Why KVM refuses a process's `numa_maps` once advice that discards pages
+/// reached LinuxEmu for the stack: whether it still holds a resident page,
+/// which decides `kernelpagesize_kB`, is not a fact.
+const KVM_DISCARDED_NUMA_MAPS_REFUSAL: &str = "madvise advice that discards pages reached the \
+    backend for";
+
+/// A process's `smaps`, `smaps_rollup` and `numa_maps`, as
+/// `tests/c/smaps_and_numa_maps.c` checks them against what Linux prints
+/// (fs/proc/task_mmu.c), for a mapping of each kind: anonymous memory, a
+/// file, the stack, the heap and the vDSO.
+///
+/// On ptrace the kernel's files, sanitized: every kind is listed, the
+/// stack's flags, `THPeligible`, `ProtectionKey` and `numa_maps` row are the
+/// native run's, and every page count is zero; the rollup, a split stack,
+/// access-pattern advice and advice on another mapping read too, and after
+/// the guest discards every page of its initial stack, the row lacks
+/// `kernelpagesize_kB`, as natively.
+///
+/// On KVM, where Detcore renders the files from the backend's memory map
+/// (package K slice N4 of <https://github.com/rrnewton/hermit/issues/4213>),
+/// the stack alone is listed, as in `maps` (the memory map lists the stack
+/// window only, <https://github.com/rrnewton/reverie/issues/1211>). Its
+/// block and row are compared with ptrace's, each exemption named:
+/// - the range and `Size` are left out by the guest, and the name's padding,
+///   all of which LinuxEmu's stack window decides;
+/// - `ProtectionKey` is left out of ptrace's: KVM's kernel enables no
+///   protection keys, so Linux prints none there (with and without
+///   `--no-virtualize-cpuid`, which shows the guest the vCPU's own CPUID),
+///   where the host kernel beneath ptrace prints one;
+/// - where the host lets an anonymous mapping have huge pages without
+///   `MADV_HUGEPAGE`, `THPeligible` follows the mapping's size and
+///   alignment, so KVM's is checked against Linux's rule for KVM's own
+///   window rather than against ptrace's, which is for a native-sized
+///   stack; elsewhere it is 0 on both and compared with the rest.
+///
+/// What the memory map cannot tell is refused by name: the rollup's range,
+/// the flags of a part a split left of the stack, the flags advice set on
+/// the stack, and the residency of a stack whose pages were discarded.
+/// Advice on a mapping the memory map does not list changes nothing KVM's
+/// files show, and refuses nothing.
+fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
+    let kvm = backend == "kvm";
+    let (_, files, _) = address_space_listing(backend, "files", true);
+    let listed = |kind: &str| files.contains(&format!("kind {kind} listed\n"));
+    for kind in ["anonymous", "file", "heap", "vdso"] {
+        assert_eq!(listed(kind), !kvm, "{kind}:\n{files}");
+    }
+    assert!(listed("stack"), "{files}");
+    assert!(
+        files.contains("blocks ok\nnuma ok\naccounting nonzero 0\nnuma counts 0\n"),
+        "{files}"
+    );
+    if kvm {
+        assert!(!files.contains("ProtectionKey"), "{files}");
+        let (_, ptrace, _) = address_space_listing("ptrace", "files", true);
+        let (kvm_listing, kvm_thp) = without_thp_eligible(&stack_listing(&files));
+        let (ptrace_listing, ptrace_thp) =
+            without_thp_eligible(&without_protection_key(&stack_listing(&ptrace)));
+        assert_eq!(kvm_listing, ptrace_listing);
+        let (start, end) = printed_stack_range(&files);
+        assert_eq!(
+            kvm_thp.as_deref(),
+            Some(host_thp_eligible(start, end)),
+            "KVM's THPeligible for its window {start:#x}-{end:#x}"
+        );
+        if host_anonymous_thp_orders() == 0 {
+            assert_eq!(kvm_thp, ptrace_thp);
+        }
+        // The guest shown the vCPU's own CPUID (OSPKE clear, PKU set) reads
+        // the same block: the kernel serving it decides, not the CPUID.
+        let (code, nocpuid, stderr) =
+            address_space_listing_with(backend, "files", false, &["--no-virtualize-cpuid"]);
+        assert_eq!(code, Some(0), "--no-virtualize-cpuid:\n{nocpuid}\n{stderr}");
+        assert!(!nocpuid.contains("ProtectionKey"), "{nocpuid}");
+        assert_eq!(stack_listing(&nocpuid), stack_listing(&files));
+        // Advice on the anonymous mapping, which the memory map does not
+        // list, leaves the stack's block and row as they were.
+        let (_, other, _) = address_space_listing(backend, "other", true);
+        assert_eq!(stack_listing(&other), stack_listing(&files));
+        for (mode, refusal) in [
+            ("rollup", KVM_ROLLUP_REFUSAL),
+            ("split", KVM_SPLIT_SMAPS_REFUSAL),
+            ("advise", KVM_ADVISED_SMAPS_REFUSAL),
+            ("discard", KVM_DISCARDED_NUMA_MAPS_REFUSAL),
+        ] {
+            let (code, stdout, stderr) = address_space_listing(backend, mode, false);
+            // EXIT-CLASS: hermit
+            assert_eq!(
+                code,
+                Some(HERMIT_POLICY_REFUSAL_EXIT),
+                "{mode}:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+                    && !stderr.contains("HERMIT_INTERNAL_FAILURE"),
+                "{mode}: {stderr}"
+            );
+            assert!(
+                stderr.contains("read refused: ") && stderr.contains(refusal),
+                "{mode}: {stderr}"
+            );
+        }
+    } else {
+        let guest = smaps_and_numa_maps_guest().to_str().unwrap().to_owned();
+        let native = native_main_stack_output(&guest, &["files"]);
+        let derived = |output: &str| -> Vec<String> {
+            output
+                .lines()
+                .filter(|line| {
+                    line.starts_with("stack labels ")
+                        || line.starts_with("stack numa ")
+                        || line.starts_with("THPeligible:")
+                        || line.starts_with("ProtectionKey:")
+                        || line.starts_with("VmFlags:")
+                })
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(derived(&files), derived(&native), "{native}");
+        assert!(!native.contains("accounting nonzero 0\n"), "{native}");
+        let (_, rollup, _) = address_space_listing(backend, "rollup", true);
+        assert_eq!(rollup, "rollup ok\naccounting nonzero 0\n");
+        for mode in ["split", "advise", "other"] {
+            let (_, output, _) = address_space_listing(backend, mode, true);
+            assert!(
+                output.contains("blocks ok\nnuma ok\naccounting nonzero 0\nnuma counts 0\n"),
+                "{mode}:\n{output}"
+            );
+        }
+        // Every page of the initial stack discarded: no kernelpagesize_kB,
+        // natively and through the sanitizer.
+        let native_discard = native_main_stack_output(&guest, &["discard"]);
+        assert_eq!(native_discard, "discard ok\nstack numa default stack\n");
+        let (_, discard, _) = address_space_listing(backend, "discard", true);
+        assert_eq!(discard, native_discard);
+    }
+}
+
+/// [`list_the_address_space_in_smaps_and_numa_maps`] on ptrace.
+#[test]
+fn smaps_numa_maps_and_the_rollup_list_the_address_space_as_on_linux() {
+    list_the_address_space_in_smaps_and_numa_maps("ptrace");
+}
+
+/// [`list_the_address_space_in_smaps_and_numa_maps`] on KVM.
+#[test]
+fn run_kvm_smaps_and_numa_maps_render_the_stack_from_the_memory_map() {
+    let test = "run_kvm_smaps_and_numa_maps_render_the_stack_from_the_memory_map";
+    if kvm_unavailable(test) {
+        return;
+    }
+    list_the_address_space_in_smaps_and_numa_maps("kvm");
 }
 
 /// A `readlink` of the caller's descriptor link to `/proc/self/fd`, open on

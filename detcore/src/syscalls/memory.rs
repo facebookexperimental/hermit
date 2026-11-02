@@ -84,6 +84,57 @@ const fn madvise_action(advice: i32) -> MadviseAction {
     }
 }
 
+/// Whether `advice`, once the backend runs it, may set or clear a flag Linux
+/// keeps on the mappings it covers (`madvise_vma_behavior`, mm/madvise.c in
+/// v6.17), which `smaps` prints (`VmFlags`) and the backend's memory map does
+/// not list (`MemoryMetadata::mapping_flags_changed`): the access-pattern
+/// advice (VM_SEQ_READ, VM_RAND_READ) and the fork and dump advice
+/// (VM_DONTCOPY, VM_DONTDUMP, VM_WIPEONFORK). The huge-page and KSM advice
+/// change flags too, but Detcore answers it itself and never passes it on
+/// ([`MadviseAction::Ignore`]); the rest acts on pages, not on flags.
+const fn advice_changes_mapping_flags(advice: i32) -> bool {
+    matches!(
+        advice,
+        libc::MADV_NORMAL
+            | libc::MADV_RANDOM
+            | libc::MADV_SEQUENTIAL
+            | libc::MADV_DONTFORK
+            | libc::MADV_DOFORK
+            | libc::MADV_DONTDUMP
+            | libc::MADV_DODUMP
+            | libc::MADV_WIPEONFORK
+            | libc::MADV_KEEPONFORK
+    )
+}
+
+/// Whether `advice`, once the backend runs it, may leave a mapping it covers
+/// without the pages it held (`madvise_dontneed_free` and
+/// `madvise_guard_install`, mm/madvise.c in v6.17): `MADV_DONTNEED` and
+/// `MADV_DONTNEED_LOCKED` zap them, `MADV_GUARD_INSTALL` zaps them and
+/// installs guard markers, and `MADV_WIPEONFORK` leaves a later fork's copy
+/// empty. `numa_maps` prints `kernelpagesize_kB` only for a mapping with a
+/// resident page (`MemoryMetadata::pages_discarded`). `MADV_FREE`,
+/// `MADV_COLD` and `MADV_PAGEOUT` would too, but Detcore answers them itself
+/// and never passes them on ([`MadviseAction::Ignore`]).
+const fn advice_discards_pages(advice: i32) -> bool {
+    matches!(
+        advice,
+        libc::MADV_DONTNEED
+            | libc::MADV_DONTNEED_LOCKED
+            | MADV_GUARD_INSTALL
+            | libc::MADV_WIPEONFORK
+    )
+}
+
+/// Whether a forwarded madvise call that returned `result` may have changed
+/// mapping flags or pages: every outcome but ENOSYS, which says the backend
+/// ran nothing (a backend that does not implement the advice). Linux applies
+/// advice to the mapped part of a range it then reports ENOMEM for, and may
+/// fail with EINVAL at a later mapping after changing earlier ones.
+fn madvise_may_have_run(result: &Result<i64, Errno>) -> bool {
+    !matches!(result, Err(Errno::ENOSYS))
+}
+
 fn validate_common_args(call: syscalls::Madvise) -> Result<(), Error> {
     let page = crate::page::page_size() as usize;
     let start = call.addr().map(AddrMut::as_raw).unwrap_or(0);
@@ -139,7 +190,30 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         match action {
             MadviseAction::ForwardHint | MadviseAction::ForwardSemantic => {
+                let advised = (
+                    call.addr().map_or(0, |addr| addr.as_raw() as u64),
+                    call.len() as u64,
+                );
                 let result = self.record_or_replay(guest, call).await;
+                // The backend's memory map lists neither the flags this advice
+                // sets nor the pages it discards, so a `smaps` or `numa_maps`
+                // Detcore renders from that map can no longer derive them for
+                // a listed mapping the advice reached
+                // (`MemoryMetadata::mapping_flags_changed`, `pages_discarded`).
+                let changes_flags = advice_changes_mapping_flags(advice);
+                let discards_pages = advice_discards_pages(advice);
+                if (changes_flags || discards_pages)
+                    && madvise_may_have_run(&result)
+                    && self.renders_address_space_files()
+                    && Self::range_reaches_listed_mapping(guest, advised.0, advised.1)
+                {
+                    if changes_flags {
+                        guest.thread_state().note_mapping_flags_changed();
+                    }
+                    if discards_pages {
+                        guest.thread_state().note_pages_discarded();
+                    }
+                }
                 if result.is_err()
                     && let Some(refusal) = guest.take_unsupported_refusal().filter(|refusal| {
                         refusal.operation == reverie::UnsupportedOperation::MemoryAdvice
@@ -911,6 +985,227 @@ VmFlags: rd wr mr mw me gd ac
             assert_eq!(madvise_action(advice), MadviseAction::Reject(Errno::EPERM));
         }
         assert_eq!(madvise_action(i32::MAX), MadviseAction::Unknown);
+    }
+
+    /// The advice that sets or clears a flag `smaps` prints is all advice
+    /// Detcore passes on, but for advice that acts on pages alone; the advice
+    /// that discards pages is `MADV_DONTNEED`, `MADV_DONTNEED_LOCKED`,
+    /// `MADV_GUARD_INSTALL` and `MADV_WIPEONFORK`, all passed on.
+    #[test]
+    fn flag_advice_is_forwarded_advice_that_does_not_act_on_pages_alone() {
+        let forwarded = (-1..=200).filter(|advice| {
+            matches!(
+                madvise_action(*advice),
+                MadviseAction::ForwardHint | MadviseAction::ForwardSemantic
+            )
+        });
+        let pages_alone = [
+            libc::MADV_WILLNEED,
+            libc::MADV_DONTNEED,
+            libc::MADV_DONTNEED_LOCKED,
+            MADV_GUARD_INSTALL,
+            MADV_GUARD_REMOVE,
+        ];
+        let discarding = [
+            libc::MADV_DONTNEED,
+            libc::MADV_DONTNEED_LOCKED,
+            MADV_GUARD_INSTALL,
+            libc::MADV_WIPEONFORK,
+        ];
+        for advice in forwarded {
+            assert_eq!(
+                advice_changes_mapping_flags(advice),
+                !pages_alone.contains(&advice),
+                "{advice}"
+            );
+            assert_eq!(
+                advice_discards_pages(advice),
+                discarding.contains(&advice),
+                "{advice}"
+            );
+        }
+        for advice in (-1..=200).filter(|advice| advice_discards_pages(*advice)) {
+            assert_eq!(
+                madvise_action(advice),
+                MadviseAction::ForwardSemantic,
+                "{advice}"
+            );
+        }
+        for advice in [
+            libc::MADV_HUGEPAGE,
+            libc::MADV_NOHUGEPAGE,
+            libc::MADV_MERGEABLE,
+        ] {
+            assert_eq!(madvise_action(advice), MadviseAction::Ignore);
+        }
+    }
+
+    /// A memory map that lists one stack window, `[0x7000_0000, 0x7002_0000)`,
+    /// for the tests below.
+    fn stack_window() -> reverie::MemoryMap {
+        let stack = reverie::MappingFact::new(
+            0x7000_0000,
+            0x7002_0000,
+            (libc::PROT_READ | libc::PROT_WRITE) as u32,
+            false,
+            0,
+            reverie::MappingBacking::Stack,
+        )
+        .unwrap();
+        reverie::MemoryMap::new(vec![stack], false).unwrap()
+    }
+
+    /// Flag advice marks the address space once the backend may have run it:
+    /// a success, and a failure Linux can return after changing a mapping;
+    /// not ENOSYS (the backend ran nothing), advice that acts on pages alone,
+    /// or advice Detcore answers itself. So does advice that discards pages,
+    /// in its own record. Each only where Detcore renders the files from the
+    /// memory map (KVM's capabilities), and only for a range that reaches a
+    /// mapping the map lists, or where the backend gives no map.
+    #[test]
+    fn advice_that_reaches_a_listed_mapping_marks_the_address_space() {
+        use crate::record_or_replay::NoopTool;
+        use crate::syscall_hot_path_tests::InjectGuest;
+
+        futures::executor::block_on(async {
+            let page = crate::page::page_size() as usize;
+            for (advice, reply, flags, discarded) in [
+                (libc::MADV_RANDOM, Ok(0), true, false),
+                (libc::MADV_SEQUENTIAL, Err(Errno::ENOMEM), true, false),
+                (libc::MADV_DONTFORK, Err(Errno::EINVAL), true, false),
+                (libc::MADV_NORMAL, Ok(0), true, false),
+                (libc::MADV_WIPEONFORK, Ok(0), true, true),
+                (libc::MADV_DONTDUMP, Err(Errno::ENOSYS), false, false),
+                (libc::MADV_WILLNEED, Ok(0), false, false),
+                (libc::MADV_DONTNEED, Ok(0), false, true),
+                (libc::MADV_DONTNEED_LOCKED, Err(Errno::EINVAL), false, true),
+                (MADV_GUARD_INSTALL, Ok(0), false, true),
+                (libc::MADV_DONTNEED, Err(Errno::ENOSYS), false, false),
+                (libc::MADV_HUGEPAGE, Ok(0), false, false),
+            ] {
+                for (backend, map, at, reached) in [
+                    // The stack window's first page, its last, a page past it,
+                    // and the first page with no map to tell.
+                    (reverie::BackendCapabilities::KVM, true, 0x7000_0000, true),
+                    (reverie::BackendCapabilities::KVM, true, 0x7001_f000, true),
+                    (reverie::BackendCapabilities::KVM, true, 0x7002_0000, false),
+                    (reverie::BackendCapabilities::KVM, false, 0x7002_0000, true),
+                    // Where the kernel's files are served, nothing reads it.
+                    (
+                        reverie::BackendCapabilities::PTRACE,
+                        true,
+                        0x7000_0000,
+                        false,
+                    ),
+                ] {
+                    let mut tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+                    tool.cfg.recordreplay_modes = false;
+                    tool.cfg.backend = backend;
+                    let mut guest = InjectGuest::<NoopTool>::new(reply);
+                    if map {
+                        guest = guest.with_memory_map(stack_window());
+                    }
+                    let addr = unsafe { AddrMut::<libc::c_void>::from_raw_unchecked(at) };
+                    let call = syscalls::Madvise::new()
+                        .with_addr(Some(addr))
+                        .with_len(page)
+                        .with_advice(advice);
+                    let _ = tool.handle_madvise(&mut guest, call).await;
+                    let state = guest.thread_state();
+                    let what = format!("{advice} {reply:?} at {at:#x} map {map}");
+                    assert_eq!(
+                        state.mapping_flags_may_have_changed(),
+                        flags && reached,
+                        "flags: {what}"
+                    );
+                    assert_eq!(
+                        state.pages_may_have_been_discarded(),
+                        discarded && reached,
+                        "pages: {what}"
+                    );
+                }
+            }
+        })
+    }
+
+    /// A memory lock marks the address space once the backend may have run
+    /// it, a part-way failure too; not ENOSYS, the answer of a backend that
+    /// runs none (KVM's LinuxEmu). Only where Detcore renders the files from
+    /// the memory map, and only for a lock whose range reaches a listed
+    /// mapping; `mlockall` reaches every mapping.
+    #[test]
+    fn a_memory_lock_that_reaches_a_listed_mapping_marks_the_address_space() {
+        use reverie::syscalls::Syscall;
+        use reverie::syscalls::SyscallArgs;
+        use reverie::syscalls::Sysno;
+
+        use crate::record_or_replay::NoopTool;
+        use crate::syscall_hot_path_tests::InjectGuest;
+
+        futures::executor::block_on(async {
+            for (backend, sysno, reply, at, marked) in [
+                (
+                    reverie::BackendCapabilities::KVM,
+                    Sysno::mlock,
+                    Ok(0),
+                    0x7000_0000,
+                    true,
+                ),
+                (
+                    reverie::BackendCapabilities::KVM,
+                    Sysno::mlock2,
+                    Err(Errno::ENOMEM),
+                    0x7001_ff00,
+                    true,
+                ),
+                (
+                    reverie::BackendCapabilities::KVM,
+                    Sysno::mlock,
+                    Ok(0),
+                    0x7002_0000,
+                    false,
+                ),
+                (
+                    reverie::BackendCapabilities::KVM,
+                    Sysno::mlockall,
+                    Ok(0),
+                    0,
+                    true,
+                ),
+                (
+                    reverie::BackendCapabilities::KVM,
+                    Sysno::mlock,
+                    Err(Errno::ENOSYS),
+                    0x7000_0000,
+                    false,
+                ),
+                (
+                    reverie::BackendCapabilities::KVM,
+                    Sysno::mlockall,
+                    Err(Errno::ENOSYS),
+                    0,
+                    false,
+                ),
+                (
+                    reverie::BackendCapabilities::PTRACE,
+                    Sysno::mlockall,
+                    Ok(0),
+                    0,
+                    false,
+                ),
+            ] {
+                let mut tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+                tool.cfg.backend = backend;
+                let mut guest = InjectGuest::<NoopTool>::new(reply).with_memory_map(stack_window());
+                let call = Syscall::from_raw(sysno, SyscallArgs::new(at, 4096, 0, 0, 0, 0));
+                let _ = tool.handle_memory_lock_call(&mut guest, call).await;
+                assert_eq!(
+                    guest.thread_state().mapping_flags_may_have_changed(),
+                    marked,
+                    "{sysno} {reply:?} at {at:#x}"
+                );
+            }
+        })
     }
 
     #[test]
