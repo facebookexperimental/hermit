@@ -207,7 +207,23 @@ pub struct CompositionV1 {
     pub original_failures_kept_in_flaky_metrics: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// One executed test case in a run's per-case result vector. `id` is
+/// `<node>::<runner result ID>` — the same ID `--tests` accepts — so a
+/// later rerun can select exactly the failed cases.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestCaseResultV1 {
+    pub id: String,
+    /// pass | fail | skip | error (error = producer-declared diagnostic
+    /// failure: classified, non-blocking, but not a pass).
+    pub outcome: String,
+    /// Per-case duration in seconds where the runner records one; null
+    /// where the producer does not surface one into validate's result
+    /// path (nextest producers and the e2e snapshot today).
+    pub duration_s: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationServiceResult {
     pub schema_version: u64,
@@ -247,6 +263,12 @@ pub struct ValidationServiceResult {
     /// half of a composition, or the composed receipt itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composition: Option<CompositionV1>,
+    /// Per-test-case result vector for this run (executed cases only).
+    /// Optional on the current schema like `composition`: a receipt either
+    /// lacks it (historical, or a run that recorded no per-case results)
+    /// or carries it in addition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_cases: Option<Vec<TestCaseResultV1>>,
 }
 
 impl ValidationServiceResult {
@@ -283,13 +305,29 @@ impl ValidationServiceResult {
         let actual_fields: BTreeSet<&str> = object.keys().map(String::as_str).collect();
         // Schema 6 gained one optional field after first publication:
         // `composition` (composite-verdict record). A schema-6 receipt
-        // either lacks it or carries exactly it in addition.
+        // either lacks it or carries exactly it in addition. The current
+        // schema likewise allows one further optional field, `test_cases`
+        // (per-case result vector), alone or together with `composition`.
         let with_composition: BTreeSet<&str> = expected_fields
             .iter()
             .copied()
             .chain(["composition"])
             .collect();
-        if actual_fields != expected_fields && actual_fields != with_composition {
+        let with_test_cases: BTreeSet<&str> = expected_fields
+            .iter()
+            .copied()
+            .chain(["test_cases"])
+            .collect();
+        let with_both: BTreeSet<&str> = with_composition
+            .iter()
+            .copied()
+            .chain(["test_cases"])
+            .collect();
+        if actual_fields != expected_fields
+            && actual_fields != with_composition
+            && actual_fields != with_test_cases
+            && actual_fields != with_both
+        {
             return Err(format!(
                 "validation-service-result-fields: schema {schema_version} expected {expected_fields:?}, got {actual_fields:?}"
             ));
@@ -558,6 +596,7 @@ mod tests {
             diagnostic_failed_tests: Some(0),
             scorecard_writeback: None,
             composition: None,
+            test_cases: None,
         }
         .validated()
         .unwrap()
@@ -624,6 +663,35 @@ mod tests {
     }
 
     #[test]
+    fn test_cases_vector_round_trips_and_is_optional() {
+        let mut result = valid();
+        result.test_cases = Some(vec![
+            TestCaseResultV1 {
+                id: "test.cli::hermit-run::cli$some_test".into(),
+                outcome: "fail".into(),
+                duration_s: None,
+            },
+            TestCaseResultV1 {
+                id: "e2e.manifest_compat::compat/java [ptrace/verify]".into(),
+                outcome: "pass".into(),
+                duration_s: Some(12.5),
+            },
+        ]);
+        let encoded = serde_json::to_vec(&result).unwrap();
+        assert_eq!(
+            ValidationServiceResult::from_json_slice(&encoded).unwrap(),
+            result
+        );
+        // Absence stays absence: a current-shape receipt without the
+        // vector decodes with `test_cases: None`, never an invented empty
+        // population.
+        let without =
+            ValidationServiceResult::from_json_slice(&serde_json::to_vec(&valid()).unwrap())
+                .unwrap();
+        assert_eq!(without.test_cases, None);
+    }
+
+    #[test]
     fn status_and_exit_must_agree() {
         let mut result = valid();
         result.exit_code = 1;
@@ -675,6 +743,7 @@ mod tests {
                 diagnostic_failed_tests: None,
                 scorecard_writeback: None,
                 composition: None,
+                test_cases: None,
             }
             .validated()
             .unwrap();

@@ -181,6 +181,7 @@ use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::resolved_cell_timeouts;
 use hermit_manifest_plan::service_result::FinalValidateStatus;
 use hermit_manifest_plan::service_result::ScorecardWriteback;
+use hermit_manifest_plan::service_result::TestCaseResultV1;
 use hermit_manifest_plan::service_result::ValidationServiceResult;
 #[cfg(test)]
 use hermit_manifest_plan::timeouts::DEFAULT_TEST_CPU_TIMEOUT_SECONDS;
@@ -13299,6 +13300,53 @@ mod case_selection_tests {
         }
         assert!(parse_argv(&argv(&["--tests", "bogus"])).is_err());
         assert!(parse_argv(&argv(&["--tests"])).is_err());
+    }
+
+    #[test]
+    fn case_vector_keeps_terminal_attempt_per_node_and_case() {
+        let observation = |node: &str, attempt: usize, id: &str, passed: bool| {
+            TestAttemptObservation {
+                node: node.into(),
+                attempt,
+                id: id.into(),
+                passed,
+                inner_attempts: 1,
+            }
+        };
+        let vector = test_case_vector(&[
+            observation("test.cli", 1, "hermit-run::cli$flaky", false),
+            observation("test.cli", 2, "hermit-run::cli$flaky", true),
+            observation("test.cli", 1, "hermit-run::cli$red", false),
+            observation("e2e.manifest_compat", 1, "compat/java [ptrace/verify]", true),
+        ]);
+        assert_eq!(
+            vector,
+            vec![
+                TestCaseResultV1 {
+                    id: "e2e.manifest_compat::compat/java [ptrace/verify]".into(),
+                    outcome: "pass".into(),
+                    duration_s: None,
+                },
+                TestCaseResultV1 {
+                    id: "test.cli::hermit-run::cli$flaky".into(),
+                    outcome: "pass".into(),
+                    duration_s: None,
+                },
+                TestCaseResultV1 {
+                    id: "test.cli::hermit-run::cli$red".into(),
+                    outcome: "fail".into(),
+                    duration_s: None,
+                },
+            ]
+        );
+        // The failed IDs in the vector are exactly what --tests parses back.
+        let failed: Vec<&str> = vector
+            .iter()
+            .filter(|case| case.outcome == "fail")
+            .map(|case| case.id.as_str())
+            .collect();
+        let parsed = parse_case_ids(failed.into_iter()).unwrap();
+        assert_eq!(parsed["test.cli"], vec!["hermit-run::cli$red"]);
     }
 
     #[test]
@@ -26997,6 +27045,9 @@ struct RunSummary {
     flaky: Vec<TestIdRetry>,
     /// Individual test ids that failed FINALLY, after any retries were exhausted.
     failed_ids: Vec<TestIdRetry>,
+    /// Per-test-case result vector (executed cases only), carried into the
+    /// service result so a later rerun can select exactly the failed cases.
+    test_cases: Vec<TestCaseResultV1>,
     /// Failed DAG nodes for which no individual failing test id was emitted.
     /// Kept separate so a node tag is never presented as a test id.
     failed_nodes_without_test_ids: Vec<String>,
@@ -27057,6 +27108,7 @@ impl RunSummary {
             diagnostic_failed_tests: None,
             flaky: Vec::new(),
             failed_ids: Vec::new(),
+            test_cases: Vec::new(),
             failed_nodes_without_test_ids: Vec::new(),
             retry_occurrences: 0,
             individual_test_results_complete: false,
@@ -27379,6 +27431,34 @@ fn e2e_test_observations_snapshot(
         (&left.id, left.attempt, &left.node).cmp(&(&right.id, right.attempt, &right.node))
     });
     Ok(observations)
+}
+
+/// The per-case result vector for the run record: one row per executed
+/// (node, case), terminal attempt only. IDs are `node::case` — exactly the
+/// IDs `--tests` accepts — so `--rerun-failed-from` can rerun precisely the
+/// failed cases. A case whose terminal observation passed after a retry is
+/// `pass` (the retry itself stays in the retry rollup, not erased here).
+/// Producers that surface no per-case duration through this path record
+/// `duration_s: None` rather than inventing one.
+fn test_case_vector(observations: &[TestAttemptObservation]) -> Vec<TestCaseResultV1> {
+    let mut terminal: BTreeMap<(&str, &str), &TestAttemptObservation> = BTreeMap::new();
+    for observation in observations {
+        let key = (observation.node.as_str(), observation.id.as_str());
+        match terminal.get(&key) {
+            Some(current) if current.attempt > observation.attempt => {}
+            _ => {
+                terminal.insert(key, observation);
+            }
+        }
+    }
+    terminal
+        .into_iter()
+        .map(|((node, id), observation)| TestCaseResultV1 {
+            id: format!("{node}::{id}"),
+            outcome: if observation.passed { "pass" } else { "fail" }.to_string(),
+            duration_s: None,
+        })
+        .collect()
 }
 
 fn test_id_summary(
@@ -27884,6 +27964,7 @@ fn write_validation_service_result(path: &Path, summary: &RunSummary) -> Result<
         diagnostic_failed_tests: summary.diagnostic_failed_tests,
         scorecard_writeback: summary.scorecard_writeback.clone(),
         composition: None,
+        test_cases: (!summary.test_cases.is_empty()).then(|| summary.test_cases.clone()),
     }
     .validated()?;
     let bytes = serde_json::to_vec(&result)
@@ -31166,6 +31247,7 @@ fn run(
              failed DAG nodes are listed separately below rather than mislabeled as test ids"
         )),
     }
+    let test_cases = test_case_vector(&test_observations);
     let test_summary = test_id_summary(test_observations, &attempts, &failed_finally);
 
     drop(run_record);
@@ -31326,6 +31408,7 @@ fn run(
     s.memory_caps = Some(memory_caps);
     s.flaky = test_summary.recovered;
     s.failed_ids = test_summary.failed;
+    s.test_cases = test_cases;
     s.failed_nodes_without_test_ids = test_summary.failed_nodes_without_test_ids;
     s.retry_occurrences = test_summary.retry_occurrences;
     s.individual_test_results_complete = individual_test_results_complete;
