@@ -21848,11 +21848,27 @@ impl Scheduler {
 
     /// The slice length a thread uses instead of `--max-timeslice` while it
     /// replays a record whose slices ran without that bound
-    /// (`uncapped_replay_backstop`): `None` once the record has run out, so
-    /// the run goes on under the bound, and for every other run.
+    /// (`uncapped_replay_backstop`): `None` once the record has run out or
+    /// the replay is over (`schedule_replay_over`), so the run goes on under
+    /// the bound, and for every other run.
     pub(crate) fn uncapped_backstop(&self) -> Option<LogicalTime> {
         self.uncapped_replay_backstop
-            .filter(|_| self.replay_has_records_left())
+            .filter(|_| !self.schedule_replay_over() && self.replay_has_records_left())
+    }
+
+    /// What the reply to a traced event of `dettid` tells the thread
+    /// (`schedule_replay_reply`), and the replay backstop it takes
+    /// (`uncapped_backstop`), read together. The reply is built after any wait
+    /// for the thread's turn in the schedule, and another thread's events can
+    /// end or release the schedule during that wait: read in one place, a
+    /// reply that says the schedule is over carries no backstop, and one that
+    /// carries a backstop says the schedule is not over.
+    pub(crate) fn trace_replay_reply(
+        &mut self,
+        dettid: DetTid,
+    ) -> (bool, bool, Option<LogicalTime>) {
+        let (released, over) = self.schedule_replay_reply(dettid);
+        (released, over, self.uncapped_backstop())
     }
 
     /// Mark the record as departed at the point the replayed schedule ran
@@ -23779,6 +23795,55 @@ mod test {
             uncapped_replay_backstop_for(0, &config),
             LogicalTime::from_nanos(100_000)
         );
+    }
+
+    /// A thread whose traced event must wait for its turn in the schedule is
+    /// answered after the wait, and another thread's events can end the
+    /// schedule meanwhile: here the waiting thread's event leaves only the
+    /// other thread's, which is the record's last. Its reply then says the
+    /// schedule is over and carries no backstop, although a backstop read
+    /// before the wait, when the record still had an event left, was set; a
+    /// reply that paired the two would let the thread's next ordinary slice
+    /// run to that backstop.
+    #[test]
+    fn a_reply_after_another_threads_last_event_carries_no_backstop() {
+        let (waiting, last) = (DetTid::from_raw(3), DetTid::from_raw(4));
+        let event = |dettid: DetTid| SchedEvent {
+            dettid,
+            op: detcore_model::schedule::Op::OtherInstructions,
+            count: 1,
+            start_rip: None,
+            end_rip: std::num::NonZeroUsize::new(100),
+            end_time: Some(LogicalTime::from_nanos(0)),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let schedule = directory.path().join("schedule.json");
+        std::fs::write(
+            &schedule,
+            serde_json::json!({
+                "per_thread": {},
+                "global": [event(waiting), event(last)],
+                "uncapped_slices": 9_400_000,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut scheduler = Scheduler::new(&Config {
+            replay_schedule_from: Some(schedule),
+            max_timeslice: std::num::NonZeroU64::new(100_000),
+            ..Config::default()
+        });
+        assert!(!scheduler.consume_schedevent(&event(waiting)).keep_running);
+        let read_before_the_wait = scheduler.uncapped_backstop();
+        assert_eq!(
+            read_before_the_wait,
+            Some(LogicalTime::from_nanos(9_500_000))
+        );
+        // The other thread's turn: it consumes the record's last event.
+        scheduler.consume_schedevent(&event(last));
+        assert!(scheduler.schedule_replay_over());
+        assert_eq!(scheduler.trace_replay_reply(waiting), (false, true, None));
+        assert_eq!(scheduler.trace_replay_reply(last), (false, true, None));
     }
 
     #[test]

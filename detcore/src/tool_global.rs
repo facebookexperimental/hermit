@@ -7931,7 +7931,7 @@ impl GlobalState {
 
         // Yield this guest thread if needed to follow schedule.
         let result = if self.cfg.replay_schedule_from.is_some() {
-            let (consumed, print_stack2, backstop) = {
+            let (consumed, print_stack2) = {
                 let mut sched = self.lock_rpc_scheduler(false).await;
                 if sched.thread_is_logically_killed(ev.dettid)
                     || !sched.rpc_incarnation_matches(ev.dettid, request_mm)
@@ -7947,7 +7947,7 @@ impl GlobalState {
                 } else {
                     None
                 };
-                (consumed, print_stack2, sched.uncapped_backstop())
+                (consumed, print_stack2)
             };
             let ConsumeResult {
                 keep_running,
@@ -7995,11 +7995,14 @@ impl GlobalState {
             // event made meanwhile, in an earlier turn, counts too, and so does
             // the end of the schedule. On a release the scheduler drops its
             // copy of this thread's callback checkpoints here, and the thread
-            // drops its own when this reply reaches it.
-            let (schedule_released, schedule_over) = self
+            // drops its own when this reply reaches it. The replay backstop is
+            // read under the same lock, so the reply never pairs the end of the
+            // schedule with a backstop from before it
+            // (`Scheduler::trace_replay_reply`).
+            let (schedule_released, schedule_over, backstop) = self
                 .lock_rpc_scheduler(false)
                 .await
-                .schedule_replay_reply(ev.dettid);
+                .trace_replay_reply(ev.dettid);
             TraceSchedEventResponse {
                 print_stack_strace: print_stack.or(print_stack2),
                 timeslice: end_of_timeslice,
@@ -12438,17 +12441,17 @@ pub async fn trace_schedevent_with_access<G, T>(
             if schedule_released {
                 guest.thread_state_mut().callback_history.release();
             }
-            if schedule_over {
-                guest.thread_state_mut().schedule_replay_over = true;
-            }
             if let Some(order) = watch {
                 crate::watch::adopt(guest, order);
             }
             let bound = guest.config().max_timeslice;
             let schedule_replay = guest.config().replay_schedule_from.is_some();
-            guest
-                .thread_state_mut()
-                .learn_uncapped_backstop(backstop, bound, schedule_replay);
+            guest.thread_state_mut().hear_schedule_replay_reply(
+                schedule_over,
+                backstop,
+                bound,
+                schedule_replay,
+            );
             if let Some(m_path) = print_stack_strace {
                 trace!("[trace_schedevent] writing stacktrace via Reverie...");
                 write_backtrace(guest, m_path.as_ref());
