@@ -3980,6 +3980,11 @@ impl AnalyzeOpts {
         // One endpoint of the bisection search:
         let mut target_endpoint_run = self.save_final_target_sched_events(min_run)?;
 
+        // Endpoints recorded while replaying preemptions ran slices longer
+        // than the bound, and every schedule made from them must say so: the
+        // prefix search's as well as the bisection's.
+        let target_out = target_endpoint_run.sched_path_out().to_owned();
+        self.adopt_uncapped_slices(&[target_out.as_path()])?;
         if self.prefix_search {
             return self.prefix_search_and_report(&mut target_endpoint_run);
         }
@@ -3989,9 +3994,6 @@ impl AnalyzeOpts {
         let mut baseline_endpoint_run =
             self.phase4_choose_baseline_sched_events(target_preempts)?;
 
-        // Endpoints recorded while replaying preemptions ran slices longer
-        // than the bound, and the bisection's schedules must say so.
-        let target_out = target_endpoint_run.sched_path_out().to_owned();
         let baseline_out = baseline_endpoint_run.sched_path_out().to_owned();
         self.adopt_uncapped_slices(&[target_out.as_path(), baseline_out.as_path()])?;
         let baseline_sched_name = baseline_endpoint_run.sched_out_file_name();
@@ -5516,6 +5518,36 @@ mod tests {
             assert_eq!(
                 std::fs::read_to_string(dir.path().join("final.stack2")).unwrap(),
                 "retained stack"
+            );
+        }
+    }
+
+    /// A prefix trial's written schedule keeps the uncapped-slices mark of
+    /// the target record it is a prefix of, also under an explicit
+    /// `--prefix-search`, which adopts no endpoint mark before its trials
+    /// run: writing a trial's record never lowers or drops a mark the record
+    /// already carries (`AnalyzeOpts::stamp_trial_record`).
+    #[test]
+    fn a_prefix_trials_written_schedule_keeps_the_uncapped_slices_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        options.tmp_dir = Some(dir.path().to_path_buf());
+        let target = PreemptionRecord::from_sched_events(critical(&[3, 5, 7], 1).failing_schedule)
+            .with_uncapped_slices(Some(9_400_000));
+        for (adopted, written) in [
+            (None, 9_400_000),
+            (Some(1_000), 9_400_000),
+            (Some(12_000_000), 12_000_000),
+        ] {
+            options.trial_schedules_uncapped.set(adopted);
+            let mut run = options
+                .prefix_trial("prefix_round_001", &target, 2)
+                .unwrap();
+            let path = run.sched_path_in().to_path_buf();
+            assert_eq!(
+                detcore::preemptions::read_recorded_uncapped_slices(&path),
+                Ok(Some(written)),
+                "adopted {adopted:?}"
             );
         }
     }

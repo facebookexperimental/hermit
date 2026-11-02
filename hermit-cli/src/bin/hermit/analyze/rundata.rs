@@ -1946,8 +1946,13 @@ impl AnalyzeOpts {
     /// It also carries the uncapped-slices mark of the schedules the trials
     /// come from (`trial_schedules_uncapped`): a trial's schedule has no event
     /// times, so without the mark its replay would end their long slices at
-    /// `--max-timeslice` and leave the schedule.
+    /// `--max-timeslice` and leave the schedule. A record that already
+    /// carries a mark (a prefix of a marked record,
+    /// `PreemptionRecord::schedule_prefix`) keeps the later of the two.
     pub fn stamp_trial_record(&self, record: PreemptionRecord) -> PreemptionRecord {
+        let uncapped = record
+            .uncapped_slices()
+            .max(self.trial_schedules_uncapped.get());
         let record = record
             .with_pipe_wake_latency(self.trial_pipe_wake_latency())
             .with_signal_state_copy(Some(self.trial_signal_state_copy()))
@@ -1960,7 +1965,7 @@ impl AnalyzeOpts {
             )
             .with_rewrite_exclusives(self.trial_rewrite_exclusives())
             .with_post_crash_timeslice(self.trial_post_crash_timeslice())
-            .with_uncapped_slices(self.trial_schedules_uncapped.get());
+            .with_uncapped_slices(uncapped);
         // Under `--no-namespace`, the guest IDs every trial takes, resolved
         // before the first (`prepare_trial_guest_ids`): a record without them
         // reads as numbered by a PID namespace, which no trial can replay.
