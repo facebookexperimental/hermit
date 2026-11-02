@@ -9512,6 +9512,85 @@ fn run_kvm_an_scm_rights_receipt_over_its_own_header_is_a_named_refusal() {
     an_scm_rights_receipt_over_its_own_header_refuses("kvm");
 }
 
+/// The receive of [`an_scm_rights_receipt_over_its_own_header_refuses`],
+/// after a `sendmmsg` whose `SCM_RIGHTS` message Detcore cannot read back
+/// (`tests/c/scm_rights_overlapping_receipt.c`'s modes): one that sends the
+/// message and then fails with EFAULT, its `mmsghdr` on a read-only page so
+/// that Linux cannot write `msg_len` back; one that sends a data-only message
+/// and then that one, the second entry on a read-only page, and returns 1;
+/// and one whose `msg_len`, written back after the send, lands on the
+/// message's `cmsg_level`. Natively each sends the descriptor and the guest
+/// runs to the end. Detcore used to take the first as sending nothing, the
+/// second as sending the data-only message alone, and the third as sending
+/// data alone, so the socket pair stayed one that carried no descriptor, and
+/// the receive, which may have installed one, went on unrefused. Each now
+/// counts as a send that may have carried descriptors, so a strict run ends
+/// at the receive as the named policy refusal (exit 122). This runs on
+/// ptrace: KVM does not implement sendmmsg.
+#[test]
+fn an_scm_rights_receipt_after_an_unread_sendmmsg_is_a_named_refusal() {
+    let guest = compiled_c_guest(
+        &SCM_RIGHTS_OVERLAPPING_RECEIPT_GUEST,
+        "scm_rights_overlapping_receipt",
+    )
+    .to_str()
+    .expect("guest path is UTF-8");
+    let _guard = hermit_run_guard();
+    for (mode, sent) in [
+        (
+            "sendmmsg-efault",
+            "sent by a sendmmsg that failed with EFAULT\n",
+        ),
+        (
+            "sendmmsg-partial",
+            "sent by a sendmmsg that counted only the message before it\n",
+        ),
+        (
+            "sendmmsg-alias",
+            "sent by a sendmmsg whose msg_len overwrote its cmsg_level\n",
+        ),
+    ] {
+        let native = Command::new(guest)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run the guest natively");
+        assert!(
+            native.status.success(),
+            "{mode} natively: {}\nstderr:\n{}",
+            native.status,
+            String::from_utf8_lossy(&native.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&native.stdout),
+            SCM_RIGHTS_OVERLAPPING_RECEIPT_LINUX.replacen("sent\n", sent, 1),
+            "{mode} natively"
+        );
+
+        let args = ["run", "--strict", "--base-env=minimal", "--", guest, mode];
+        let output = hermit(&args);
+        let refused_stdout = stdout(&output);
+        let refused_stderr = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{mode}: the receipt must end the strict run as a policy refusal\nstdout:\n{refused_stdout}\nstderr:\n{refused_stderr}"
+        );
+        assert!(
+            refused_stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+                && refused_stderr.contains(
+                    "recvmsg: the descriptors it may have received over SCM_RIGHTS cannot be \
+                     recorded (a buffer it writes overlaps a buffer or header it reads)"
+                ),
+            "{mode}: the run did not name the receipt refusal on stderr\nstderr:\n{refused_stderr}"
+        );
+        assert_eq!(
+            refused_stdout, sent,
+            "{mode}: the guest went on past the refused receipt"
+        );
+    }
+}
+
 /// A loopback address of this test process's own for
 /// `tests/c/scm_rights_exited_receiver_port.c`: the 22 bits of its PID in
 /// 127.192.0.0/10, so that the ports Detcore hands out are free there

@@ -4976,6 +4976,75 @@ where
     }
 }
 
+/// Whether a `msg_len` that a `sendmmsg` wrote back to one of the `sent`
+/// entries may lie over a byte of the control buffer of one of the entries
+/// at `read_back`, whose control data is read after the call. Linux writes
+/// each sent entry's `msg_len` after sending its message (`__sys_sendmmsg`),
+/// so control data read back after the call is then not necessarily what
+/// was sent: a `msg_len` over a `cmsg_level` hides an `SCM_RIGHTS` message.
+/// An entry whose header cannot be read counts as one whose control buffer
+/// a `msg_len` may cover.
+fn msg_len_may_overwrite_control<T, G>(guest: &G, sent: &[usize], read_back: &[usize]) -> bool
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut controls = Vec::with_capacity(read_back.len());
+    for &header in read_back {
+        let Some(message) = Addr::<Msghdr>::from_raw(header)
+            .and_then(|header| guest.memory().read_value::<_, Msghdr>(header).ok())
+        else {
+            return !sent.is_empty();
+        };
+        controls.push((message.msg_control as usize, message.msg_controllen));
+    }
+    let lengths: Vec<usize> = sent
+        .iter()
+        .map(|header| header + std::mem::offset_of!(Mmsghdr, msg_len))
+        .collect();
+    msg_lengths_meet_controls(&lengths, &controls)
+}
+
+/// Whether the `sendmmsg` entry at `header`, which the call did not count,
+/// may have carried descriptors. Linux sends an entry before it writes the
+/// entry's `msg_len` back, so an entry it did not count may have been sent;
+/// it reads the entry's header and control data before sending
+/// (`____sys_sendmsg`), so one whose header or control buffer cannot be read
+/// was not. One that may have been sent carried descriptors if its control
+/// data names `SCM_RIGHTS` descriptors, or is too long to read here.
+fn uncounted_entry_may_carry_rights<T, G>(guest: &G, header: usize) -> bool
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let Some(message) = Addr::<Msghdr>::from_raw(header)
+        .and_then(|header| guest.memory().read_value::<_, Msghdr>(header).ok())
+    else {
+        return false;
+    };
+    let Some(control) = Addr::<u8>::from_raw(message.msg_control as usize) else {
+        return false;
+    };
+    if message.msg_controllen > MAX_CONTROL_BYTES {
+        return true;
+    }
+    let mut bytes = vec![0; message.msg_controllen];
+    guest.memory().read_exact(control, &mut bytes).is_ok()
+        && !received_descriptors(&bytes).is_empty()
+}
+
+/// Whether one of the 4-byte `msg_len` fields at the addresses `lengths`
+/// shares a byte with one of the control buffers `controls`, each an address
+/// and a length. A buffer of no bytes shares none.
+fn msg_lengths_meet_controls(lengths: &[usize], controls: &[(usize, usize)]) -> bool {
+    lengths.iter().any(|&length| {
+        let end = length.saturating_add(std::mem::size_of::<u32>());
+        controls.iter().any(|&(control, size)| {
+            size != 0 && control < end && length < control.saturating_add(size)
+        })
+    })
+}
+
 fn sent_rights<T, G>(
     guest: &G,
     headers: &[usize],
@@ -5119,27 +5188,55 @@ impl<T: RecordOrReplay> Detcore<T> {
             let addressed = sends_to_a_name(guest, &headers[..headers.len().min(1)]);
             self.note_peer_gone(guest, call.sockfd(), addressed);
         }
+        // Linux sends each entry before it writes the entry's msg_len back,
+        // and stops at the first entry whose send or msg_len write fails,
+        // having counted the entries before it; with none counted the call
+        // fails, with EFAULT where that write faulted (`__sys_sendmmsg`). So
+        // the counted entries were sent, and the first one not counted may
+        // have been. Any other error is the first entry's own send failing.
+        let (counted, uncounted) = match &result {
+            Ok(count) => {
+                let counted = usize::try_from(*count).unwrap_or(0).min(headers.len());
+                (counted, (counted < headers.len()).then_some(counted))
+            }
+            Err(Error::Errno(Errno::EFAULT)) => (0, (!headers.is_empty()).then_some(0)),
+            Err(_) => (0, None),
+        };
+        if (counted != 0 || uncounted.is_some())
+            && let Some(stream) = self.rights_peer_is_stream(guest, call.sockfd())
+        {
+            let sent_headers = &headers[..counted];
+            let read_back = &headers[..uncounted.map_or(counted, |index| index + 1)];
+            if in_turn && !msg_len_may_overwrite_control(guest, sent_headers, read_back) {
+                if counted != 0 {
+                    // Each sent entry's bytes are what Linux wrote back to
+                    // its msg_len.
+                    let sent = sent_rights(guest, sent_headers, |header| {
+                        Addr::<u32>::from_raw(header + std::mem::offset_of!(Mmsghdr, msg_len))
+                            .and_then(|length| guest.memory().read_value(length).ok())
+                            .map_or(0, |length: u32| length as usize)
+                    });
+                    let out_of_band = call.flags() & libc::MSG_OOB != 0;
+                    self.queue_sent_rights(guest, call.sockfd(), stream, sent, out_of_band)
+                        .await?;
+                }
+                // The first entry not counted may have been sent unseen,
+                // with the descriptors it names.
+                if uncounted
+                    .is_some_and(|index| uncounted_entry_may_carry_rights(guest, headers[index]))
+                {
+                    self.lose_peer_lockstep(guest, call.sockfd());
+                }
+            } else {
+                // Outside the turn, or where a msg_len Linux wrote back after
+                // sending may lie over control data read back here, which
+                // then no longer names what was sent.
+                self.lose_peer_lockstep(guest, call.sockfd());
+            }
+        }
         let result = result?;
         if result > 0 {
             guest.thread_state().forget_flock_modes();
-        }
-        if let Some(stream) = self.rights_peer_is_stream(guest, call.sockfd()) {
-            if in_turn {
-                // The first `result` entries were sent, each of the bytes
-                // Linux wrote back to its `msg_len`.
-                let sent_headers =
-                    &headers[..usize::try_from(result).unwrap_or(0).min(headers.len())];
-                let sent = sent_rights(guest, sent_headers, |header| {
-                    Addr::<u32>::from_raw(header + std::mem::offset_of!(Mmsghdr, msg_len))
-                        .and_then(|length| guest.memory().read_value(length).ok())
-                        .map_or(0, |length: u32| length as usize)
-                });
-                let out_of_band = call.flags() & libc::MSG_OOB != 0;
-                self.queue_sent_rights(guest, call.sockfd(), stream, sent, out_of_band)
-                    .await?;
-            } else {
-                self.lose_peer_lockstep(guest, call.sockfd());
-            }
         }
         Ok(result)
     }
@@ -5768,6 +5865,41 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sent entry's `msg_len` (4 bytes at offset 56 of its `mmsghdr`)
+    /// meets a control buffer that shares one of its bytes, whichever entry
+    /// the buffer belongs to, and no buffer that ends where it starts,
+    /// starts where it ends, or holds no bytes.
+    #[test]
+    fn msg_len_meets_only_control_buffers_that_share_its_bytes() {
+        const ENTRY: usize = 0x1000;
+        let size = std::mem::size_of::<Mmsghdr>();
+        let msg_len = |entry: usize| ENTRY + entry * size + std::mem::offset_of!(Mmsghdr, msg_len);
+        assert_eq!(msg_len(0), ENTRY + 56);
+        let first = [msg_len(0)];
+        // A cmsghdr whose cmsg_level (bytes 8..12) is msg_len.
+        assert!(msg_lengths_meet_controls(&first, &[(msg_len(0) - 8, 24)]));
+        assert!(msg_lengths_meet_controls(&first, &[(msg_len(0) + 3, 1)]));
+        assert!(!msg_lengths_meet_controls(&first, &[(msg_len(0) - 16, 16)]));
+        assert!(!msg_lengths_meet_controls(&first, &[(msg_len(0) + 4, 16)]));
+        assert!(!msg_lengths_meet_controls(&first, &[(msg_len(0), 0)]));
+        // The second entry's buffer over the first entry's msg_len, and the
+        // first entry's buffer over the second entry's.
+        let both = [msg_len(0), msg_len(1)];
+        assert!(msg_lengths_meet_controls(
+            &both,
+            &[(0x9000, 24), (msg_len(0), 4)]
+        ));
+        assert!(msg_lengths_meet_controls(
+            &both,
+            &[(msg_len(1) - 2, 4), (0x9000, 24)]
+        ));
+        assert!(!msg_lengths_meet_controls(
+            &both,
+            &[(0x9000, 24), (0x9100, 24)]
+        ));
+        assert!(!msg_lengths_meet_controls(&[], &[(msg_len(0), 4)]));
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]

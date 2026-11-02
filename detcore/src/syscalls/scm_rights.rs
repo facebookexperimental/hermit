@@ -1657,7 +1657,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// left out of the table, as every received descriptor was before, is
     /// named in a warning: for each receive whose layout cannot be trusted
     /// (where it can have installed none, where unsupported operations are
-    /// allowed, on the background path, or in a binder transaction), each
+    /// allowed, on the background path, or in a binder transaction,
+    /// https://github.com/rrnewton/hermit/issues/5046), each
     /// receive on the background path, each
     /// number that already has a record, each anonymous inode other than an
     /// inotify instance, and each descriptor whose facts cannot be taken.
@@ -1715,7 +1716,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                      recorded ({reason}), and a call through one would leave the turn order"
                 );
                 // Named on stderr before the policy ends the run, as a
-                // backend's refusal is (`Detcore::report_backend_refusal`).
+                // backend's refusal is (`Detcore::report_backend_refusal`):
+                // on ptrace and KVM the policy's shutdown ends the process
+                // before the reason it files is printed
+                // (https://github.com/rrnewton/hermit/issues/5047).
                 let dettid = guest.thread_state().dettid;
                 crate::syscalls::helpers::report_refusal_reason(
                     true,
