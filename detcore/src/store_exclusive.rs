@@ -3237,8 +3237,7 @@ mod runtime {
         /// with `writes` they write this process's code through
         /// `/proc/<pid>/mem`, which Linux 6.12's `proc_mem.force_override`
         /// (or its build-time default) can refuse: a probe write to a private
-        /// read-only page says. A test that cannot run says why and checks
-        /// nothing.
+        /// read-only page says.
         fn cannot_run(writes: bool) -> Option<String> {
             // SAFETY: an all-zero `statvfs` is a valid buffer.
             let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -3283,11 +3282,14 @@ mod runtime {
             })
         }
 
-        /// Whether a test cannot run here, saying why on stderr.
-        fn skipped(writes: bool) -> bool {
-            cannot_run(writes)
-                .map(|reason| eprintln!("skipped: {reason}"))
-                .is_some()
+        /// Stop a test where this host cannot run it, naming what is missing.
+        /// These tests are `#[ignore]`d, so only a run that asks for them
+        /// (`--run-ignored`) selects them, and one on a host without what they
+        /// need fails here instead of passing without checking anything.
+        fn require_host(writes: bool) {
+            if let Some(reason) = cannot_run(writes) {
+                panic!("this host cannot run this test: {reason}");
+            }
         }
 
         /// An image file in a fresh directory on tmpfs: a file opened by name
@@ -3394,10 +3396,9 @@ mod runtime {
         /// it keep the loop. Asking again finds it done; a sequence that is
         /// not new, or a shared mapping, is left as the file has it.
         #[test]
+        #[ignore = "host-limited: runs code from /dev/shm and writes it through /proc/self/mem; run with --run-ignored where both work (docs/TESTING_ENVIRONMENTS.md)"]
         fn the_rewrite_writes_only_this_private_mapping_through_proc_mem() {
-            if skipped(true) {
-                return;
-            }
+            require_host(true);
             let (_dir, path, image) = image_file(&ONE_LOOP);
             let plan = plan_bytes(&image).unwrap().expect("an aarch64 image");
             let patch = &plan.patches[0];
@@ -3433,10 +3434,9 @@ mod runtime {
         /// A name that leads to another file than the mapped one plans
         /// nothing: the mapping is counted as failed and keeps its loop.
         #[test]
+        #[ignore = "host-limited: runs code from /dev/shm and writes it through /proc/self/mem; run with --run-ignored where both work (docs/TESTING_ENVIRONMENTS.md)"]
         fn a_mapping_whose_name_now_leads_elsewhere_is_not_written() {
-            if skipped(true) {
-                return;
-            }
+            require_host(true);
             let (dir, path, image) = image_file(&ONE_LOOP);
             let mapping = Mapping::new(&path, libc::MAP_PRIVATE);
             let elsewhere = dir.path().join("elsewhere");
@@ -3477,10 +3477,9 @@ mod runtime {
         /// in a page the cache samples, so this does not test the cache's
         /// comparison of whole bytes; the model's `ByteCache` test does.)
         #[test]
+        #[ignore = "host-limited: runs code from /dev/shm; run with --run-ignored where /dev/shm is not noexec (docs/TESTING_ENVIRONMENTS.md)"]
         fn the_plan_follows_the_files_bytes_through_the_cache() {
-            if skipped(false) {
-                return;
-            }
+            require_host(false);
             let (_dir, path, image) = image_file(&ONE_LOOP);
             let mapping = Mapping::new(&path, libc::MAP_PRIVATE);
             let (map, key) = mapping.listed();
