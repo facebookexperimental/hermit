@@ -1044,7 +1044,7 @@ fn regular_config_compatible(document: &DocumentMut) -> bool {
     else {
         return false;
     };
-    if default_timeout.get("period").and_then(Value::as_str) != Some("57s")
+    if default_timeout.get("period").and_then(Value::as_str) != Some("180s")
         || default_timeout
             .get("terminate-after")
             .and_then(Value::as_integer)
@@ -1569,7 +1569,7 @@ mod tests {
                 result
                     .entries
                     .iter()
-                    .all(|row| row.cpu_seconds == 22 && row.wall_seconds == 57)
+                    .all(|row| row.cpu_seconds == 22 && row.wall_seconds == 180)
             );
         }
         let mut legacy = context.clone();
@@ -1682,11 +1682,13 @@ mod tests {
             resolved
                 .entries
                 .iter()
-                .filter(|row| row.cpu_seconds == 22 && row.wall_seconds == 57)
+                .filter(|row| row.cpu_seconds == 22 && row.wall_seconds == 180)
                 .count(),
             2
         );
-        calibration.rows[0].historical_wall_millis = 19_084;
+        // 69.084 s historical wall: the formula's 3x branch gives 208 s,
+        // above the 180 s default, so it stays unresolved (formula exceeds).
+        calibration.rows[0].historical_wall_millis = 69_084;
         let unresolved = resolve_budgets(
             &inventory,
             context,
@@ -1701,7 +1703,7 @@ mod tests {
             unresolved
                 .entries
                 .iter()
-                .all(|row| row.cpu_seconds == 22 && row.wall_seconds == 57)
+                .all(|row| row.cpu_seconds == 22 && row.wall_seconds == 180)
         );
         assert!(
             unresolved
@@ -1731,7 +1733,7 @@ mod tests {
                 result
                     .entries
                     .iter()
-                    .all(|row| row.cpu_seconds == 22 && row.wall_seconds == 57)
+                    .all(|row| row.cpu_seconds == 22 && row.wall_seconds == 180)
             );
             assert!(result.applicability.starts_with("stale"));
         }
@@ -1800,7 +1802,7 @@ mod tests {
                 one.cpu_seconds,
                 one.nominal_wall_seconds
             ),
-            (3, 3, 66, 177)
+            (3, 3, 66, 546)
         );
         assert!(eight.nominal_wall_seconds < one.nominal_wall_seconds);
         let retried = nextest_cpu::population_budget(&result.entries[..1], 8, 1).unwrap();
@@ -1810,7 +1812,7 @@ mod tests {
                 retried.cpu_seconds,
                 retried.nominal_wall_seconds
             ),
-            (2, 44, 118)
+            (2, 44, 364)
         );
         assert!(nextest_cpu::population_budget(&result.entries, 0, 0).is_err());
         assert!(nextest_cpu::population_budget(&result.entries, 8, u64::MAX).is_err());
@@ -1841,7 +1843,7 @@ mod tests {
             .push(rule);
         assert!(!regular_config_compatible(&changed));
         let changed_default =
-            include_str!("../.config/nextest.toml").replace("period = \"57s\"", "period = \"58s\"");
+            include_str!("../.config/nextest.toml").replace("period = \"180s\"", "period = \"181s\"");
         assert!(!regular_config_compatible(
             &changed_default.parse::<DocumentMut>().unwrap()
         ));
@@ -2218,7 +2220,7 @@ mod tests {
                 assert_eq!(run_wrapper_count(&document, "ci").unwrap(), 0);
                 assert_eq!(
                     document["profile"]["default"]["slow-timeout"]["period"].as_str(),
-                    Some("57s")
+                    Some("180s")
                 );
                 let wall_overrides = document["profile"]["default"]["overrides"]
                     .as_array_of_tables()
@@ -2226,12 +2228,10 @@ mod tests {
                     .iter()
                     .filter(|entry| entry.contains_key("slow-timeout"))
                     .collect::<Vec<_>>();
-                let expected_wall = expected
-                    .filter(|_| {
-                        identity.binary == "hermit-run::liteinst_stacks"
-                            || identity == detcore_allocator_identity()
-                    })
-                    .map(|(_, cpu)| format!("{}s", cpu.parse::<u64>().unwrap() / 1_000_000 * 3));
+                // Every measured allowance now carries an 8x wall (owner
+                // policy 2026-11-01), so every selected identity renders one.
+                let expected_wall =
+                    expected.map(|(_, cpu)| format!("{}s", cpu.parse::<u64>().unwrap() / 1_000_000 * 8));
                 assert_eq!(wall_overrides.len(), usize::from(expected_wall.is_some()));
                 if let Some(entry) = wall_overrides.first() {
                     assert_eq!(
@@ -2302,7 +2302,7 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(
             (selected[0].cpu_seconds, selected[0].wall_seconds),
-            (36, Some(108))
+            (36, Some(288))
         );
         for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5)] {
             let rendered = scaled_config_with_allowances(
@@ -2328,7 +2328,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(walls.len(), 1);
             let wall_seconds =
-                timeouts::scale_timeout_seconds(108, wall_multiplier, "wall multiplier").unwrap();
+                timeouts::scale_timeout_seconds(288, wall_multiplier, "wall multiplier").unwrap();
             assert_eq!(
                 walls[0]["slow-timeout"]["period"].as_str(),
                 Some(format!("{wall_seconds}s").as_str())
@@ -2348,7 +2348,7 @@ mod tests {
     /// wrapper and budget, keeps the profile's wall, and nothing without
     /// prepared admission.
     #[test]
-    fn contended_host_allowances_have_their_measured_caps_and_keep_their_walls() {
+    fn contended_host_allowances_have_their_measured_caps_and_wall_backstops() {
         let mut expected = ESI_POLL_DEADLINE_TESTS
             .iter()
             .map(|(name, test)| {
@@ -2459,12 +2459,24 @@ mod tests {
                 let overrides = doc["profile"]["default"]["overrides"]
                     .as_array_of_tables()
                     .unwrap();
-                assert!(
-                    !overrides
-                        .iter()
-                        .any(|r| r.contains_key("slow-timeout")
-                            && r["filter"].as_str() == Some(&filter)),
-                    "{filter} keeps the profile's wall"
+                // 8x policy: each contended allowance now carries its own
+                // wall backstop instead of keeping the profile wall.
+                let matching = overrides
+                    .iter()
+                    .filter(|r| {
+                        r.contains_key("slow-timeout") && r["filter"].as_str() == Some(&filter)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(matching.len(), 1, "{filter}");
+                let wall_seconds = timeouts::scale_timeout_seconds(
+                    8 * *base,
+                    wall_multiplier,
+                    "wall multiplier",
+                )
+                .unwrap();
+                assert_eq!(
+                    matching[0]["slow-timeout"]["period"].as_str(),
+                    Some(format!("{wall_seconds}s").as_str())
                 );
             }
         }
@@ -2476,7 +2488,7 @@ mod tests {
     }
 
     #[test]
-    fn rr_thread_stress_has_its_measured_cap_and_keeps_its_wall() {
+    fn rr_thread_stress_has_its_measured_cap_and_wall_backstop() {
         let identity = nextest_cpu::AttemptIdentity {
             package: "hermit-run".into(),
             binary: "hermit-run::rr_suite".into(),
@@ -2490,7 +2502,7 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(
             (selected[0].cpu_seconds, selected[0].wall_seconds),
-            (34, None)
+            (34, Some(272))
         );
         for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5)] {
             let rendered = scaled_config_with_allowances(
@@ -2507,16 +2519,22 @@ mod tests {
                 wrapper_argv(&doc, RR_THREAD_STRESS_WRAPPER_NAME)[2],
                 (cpu_seconds * 1_000_000).to_string()
             );
-            // No wall override: the test keeps the profile's wall bound.
+            // 8x policy: the test carries its own wall backstop.
             let filter = exact_filter(&identity);
-            assert!(
-                !doc["profile"]["default"]["overrides"]
-                    .as_array_of_tables()
-                    .unwrap()
-                    .iter()
-                    .any(
-                        |r| r.contains_key("slow-timeout") && r["filter"].as_str() == Some(&filter)
-                    )
+            let matching = doc["profile"]["default"]["overrides"]
+                .as_array_of_tables()
+                .unwrap()
+                .iter()
+                .filter(|r| {
+                    r.contains_key("slow-timeout") && r["filter"].as_str() == Some(&filter)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1);
+            let wall_seconds =
+                timeouts::scale_timeout_seconds(272, wall_multiplier, "wall multiplier").unwrap();
+            assert_eq!(
+                matching[0]["slow-timeout"]["period"].as_str(),
+                Some(format!("{wall_seconds}s").as_str())
             );
         }
         // Without prepared admission the test keeps the ordinary 22-second cap.
@@ -2563,46 +2581,28 @@ mod tests {
                 constructor_period,
                 callback_period,
                 allocator_period,
+                standalone_period,
+                procfs_period,
             ) in [
                 (
-                    1.0,
-                    1.0,
-                    "22000000",
+                    1.0, 1.0, "22000000",
                     ["32000000", "55000000", "33000000", "36000000", "51000000"],
-                    "57s",
-                    "165s",
-                    "153s",
-                    "96s",
+                    "180s", "440s", "408s", "256s", "264s", "288s",
                 ),
                 (
-                    1.25,
-                    1.5,
-                    "28000000",
+                    1.25, 1.5, "28000000",
                     ["40000000", "69000000", "42000000", "45000000", "64000000"],
-                    "86s",
-                    "248s",
-                    "230s",
-                    "144s",
+                    "270s", "660s", "612s", "384s", "396s", "432s",
                 ),
                 (
-                    0.01,
-                    0.1,
-                    "1000000",
+                    0.01, 0.1, "1000000",
                     ["1000000", "1000000", "1000000", "1000000", "1000000"],
-                    "6s",
-                    "17s",
-                    "16s",
-                    "10s",
+                    "18s", "44s", "41s", "26s", "27s", "29s",
                 ),
                 (
-                    1.0,
-                    1.01,
-                    "22000000",
+                    1.0, 1.01, "22000000",
                     ["32000000", "55000000", "33000000", "36000000", "51000000"],
-                    "58s",
-                    "167s",
-                    "155s",
-                    "97s",
+                    "182s", "445s", "413s", "259s", "267s", "291s",
                 ),
             ] {
                 let rendered = scaled_config_with_allowances(
@@ -2624,15 +2624,14 @@ mod tests {
                     .iter()
                     .filter(|entry| entry.contains_key("slow-timeout"))
                     .collect::<Vec<_>>();
-                assert_eq!(
-                    wall_overrides.len(),
-                    usize::from(mask & 1 != 0)
-                        + usize::from(mask & 2 != 0)
-                        + usize::from(mask & 16 != 0)
-                );
+                // Every measured allowance carries a wall now (8x policy),
+                // so every selected identity renders an override.
+                assert_eq!(wall_overrides.len(), (mask & 31).count_ones() as usize);
                 for (index, expected_period) in [
                     (0, allocator_period),
                     (1, constructor_period),
+                    (2, standalone_period),
+                    (3, procfs_period),
                     (4, callback_period),
                 ] {
                     let matches = wall_overrides
@@ -2706,77 +2705,77 @@ mod tests {
             (
                 "artifact::tests::credits_exact_local_relative_got_route_and_direct_tailcall",
                 22,
-                66,
+                176,
             ),
             (
                 "artifact::tests::inline_endpoints_require_owned_allocator_allocation_methods",
                 22,
-                66,
+                176,
             ),
             (
                 "artifact::tests::missing_build_finished_is_a_failed_current_artifact_selection",
                 22,
-                66,
+                176,
             ),
             (
                 "artifact::tests::observed_integrated_detcore_e8_tls_whole_recipes",
                 22,
-                66,
+                176,
             ),
             (
                 "artifact::tests::refuses_new_or_unrecognized_guest_symbol_versions",
                 22,
-                66,
+                176,
             ),
             (
                 "artifact::tests::unresolved_or_preemptible_indirect_calls_do_not_earn_a_path",
                 22,
-                66,
+                176,
             ),
             (
                 "cold_constructor::caller_stack_samples_never_receive_constructor_placement_credit",
                 22,
-                66,
+                176,
             ),
             (
                 "cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack",
                 55,
-                165,
+                440,
             ),
             (
                 "cold_constructor::later_guard_cannot_alias_the_retained_bootstrap_extent",
                 22,
-                66,
+                176,
             ),
             (
                 "genuine_detcore_reaches_fixed_guarded_callback_and_altstack",
                 51,
-                153,
+                408,
             ),
             (
                 "genuine_standalone_registers_fixed_guarded_altstack_without_continuation",
                 47,
-                141,
+                376,
             ),
             (
                 "inert_preload_does_not_reserve_or_register_runtime_stacks",
                 49,
-                147,
+                392,
             ),
             (
                 "stack_observation::tests::rejects_foreign_and_unreached_callback_records",
                 22,
-                66,
+                176,
             ),
             (
                 "stack_observation::tests::rejects_unprobed_and_readable_guards",
                 22,
-                66,
+                176,
             ),
             (
                 "standalone_altstack_disabled_receives_no_owned_stack_credit",
                 46,
-                138,
+                368,
             ),
         ];
         let identities = expected
@@ -2930,7 +2929,7 @@ mod tests {
             );
             assert_eq!(
                 entries.get(0).unwrap()["slow-timeout"]["period"].as_str(),
-                Some("207s")
+                Some("550s")
             );
             let previous = entries.get(old_index).unwrap();
             assert_eq!(previous["filter"].as_str(), Some("all()"));
@@ -2965,14 +2964,14 @@ mod tests {
         }
         let source =
             "[profile.default]\nslow-timeout = { period = \"200s\", terminate-after = 1 }\n";
-        // The actual constructor wall is 165*.34 -> 57, exactly CPU55+2:
-        // equality refuses, even though the original default200*.34 is ample.
+        // The actual constructor wall is 440*.12 -> 53, below CPU55+2:
+        // it refuses, even though the original default200*.12 is ample.
         assert!(
-            scaled_config_with_allowances(source, 0.34, wrapper, &selected)
+            scaled_config_with_allowances(source, 0.12, wrapper, &selected)
                 .unwrap_err()
                 .contains("(55s)")
         );
-        let rendered = scaled_config_with_allowances(source, 0.35, wrapper, &selected).unwrap();
+        let rendered = scaled_config_with_allowances(source, 0.13, wrapper, &selected).unwrap();
         let document = rendered.parse::<DocumentMut>().unwrap();
         assert_eq!(
             document["profile"]["default"]["overrides"]
@@ -2993,7 +2992,7 @@ mod tests {
                 .is_ok()
         );
         // Two owned tests do not inherit each other's CPU maxima: a 66s
-        // ordinary stack backstop may coexist with constructor CPU55/wall165.
+        // ordinary stack backstop may coexist with constructor CPU55/wall440.
         assert!(
             scaled_config_with_allowances(
                 source,
@@ -3008,7 +3007,7 @@ mod tests {
                 DETCORE_CONSTRUCTOR_CPU_SECONDS,
                 DETCORE_CONSTRUCTOR_WALL_SECONDS
             ),
-            (55, 165)
+            (55, 440)
         );
     }
 
@@ -3016,13 +3015,15 @@ mod tests {
     fn unoverridden_allowances_keep_strict_cpu_cleanup_separation_from_every_finite_wall() {
         let source =
             "[profile.default]\nslow-timeout = { period = \"57s\", terminate-after = 1 }\n";
-        // These standalone-allocator/procfs assertions and boundaries are unchanged.
-        // (MEASURED_CPU_ALLOWANCES[0] is no longer unoverridden: it carries
-        // the 8x-CPU wall backstop, so it leaves this list.)
+        // No shipped allowance is wall-less any more (8x policy), so the
+        // wall-less separation rule is exercised on synthetic copies of the
+        // standalone-allocator/procfs allowances with the wall removed.
         for (allowance, seconds, cutoff, first_pass, collision, separated, period) in [
             (MEASURED_CPU_ALLOWANCES[2], 33, 35, 36, 0.75, 0.8, "46s"),
             (MEASURED_CPU_ALLOWANCES[3], 36, 38, 39, 0.8, 0.85, "49s"),
         ] {
+            let mut allowance = allowance;
+            allowance.wall_seconds = None;
             assert_eq!(allowance.cpu_seconds, seconds);
             assert!(allowance.wall_seconds.is_none());
             for source in [
@@ -3082,11 +3083,16 @@ mod tests {
                 );
             }
         }
-        // The largest non-owned cap remains 51 regardless of the stack rows
-        // (the recalibrated poll-deadline cap; see ESI_POLL_DEADLINE_CPU_SECONDS).
-        let mut reversed = MEASURED_CPU_ALLOWANCES.to_vec();
-        reversed.reverse();
-        for selected in [MEASURED_CPU_ALLOWANCES.as_slice(), reversed.as_slice()] {
+        // The largest cap remains 51 regardless of the stack rows (the
+        // recalibrated poll-deadline cap; see ESI_POLL_DEADLINE_CPU_SECONDS).
+        // All shipped allowances are owned now, so exercise the wall-less
+        // separation on a synthetic copy of the 51 s poll-deadline allowance.
+        let mut poll_deadline = *MEASURED_CPU_ALLOWANCES
+            .iter()
+            .find(|a| a.cpu_seconds == ESI_POLL_DEADLINE_CPU_SECONDS)
+            .unwrap();
+        poll_deadline.wall_seconds = None;
+        for selected in [&[poll_deadline][..]] {
             assert!(
                 scaled_config_with_allowances(
                     &source.replace("57s", "53s"),
@@ -3366,7 +3372,7 @@ mod tests {
                     .count(),
                 1
             );
-            assert!(rendered.contains("period = \"57s\""));
+            assert!(rendered.contains("period = \"180s\""));
         }
     }
 
@@ -3375,7 +3381,7 @@ mod tests {
         let source =
             "[profile.default]\nslow-timeout = { period = \"57s\", terminate-after = 1 }\n";
         // The ordinary 22+2 fits 34. The admitted allocator carries its own
-        // 96s wall backstop (3x its 32s CPU cap), checked against its own CPU
+        // 256s wall backstop (8x its 32s CPU cap), checked against its own CPU
         // plus grace, so a short default wall no longer refuses it.
         let short = source.replace("57s", "34s");
         assert!(scaled_config(&short, 1.0, Some((Path::new("/fixture/wrapper"), 1.0))).is_ok());

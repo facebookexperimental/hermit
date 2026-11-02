@@ -19276,7 +19276,7 @@ mod nextest_timeout_tests {
         };
         let resolved = resolved_cell_timeouts(cell, multipliers).unwrap();
         assert_eq!(resolved.cpu_seconds, 28);
-        assert_eq!(resolved.wall_seconds, 86);
+        assert_eq!(resolved.wall_seconds, 270);
         assert!(!manifest_command_is_prebuilt("quick.e2e_verify", &quick.cmd).unwrap());
         assert_eq!(
             require_manifest_selection_headroom(
@@ -19290,7 +19290,7 @@ mod nextest_timeout_tests {
                 10,
             )
             .unwrap(),
-            Some(1436)
+            Some(700)
         );
         assert_eq!(
             require_manifest_selection_headroom(
@@ -19304,7 +19304,7 @@ mod nextest_timeout_tests {
                 10,
             )
             .unwrap(),
-            Some(1608),
+            Some(1240),
             "prebuilt cells have no separate fixture-preparation wall window"
         );
 
@@ -19318,7 +19318,7 @@ mod nextest_timeout_tests {
             ),
             (
                 TimeoutMultipliers {
-                    cpu: 3.0,
+                    cpu: 9.0,
                     wall: 1.0,
                 },
                 "scaled wall timeout must remain greater",
@@ -19492,7 +19492,7 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
             .unwrap(),
             hermit_manifest_plan::timeouts::ResolvedTestTimeouts {
                 cpu_seconds: 28,
-                wall_seconds: 100,
+                wall_seconds: 315,
             }
         );
         for (name, value) in [
@@ -19831,9 +19831,9 @@ exec env -u HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER -u HERMIT_TEST_WALL_TIMEOUT_MULTI
                 (
                     Some("1.25"),
                     Some("1.75"),
-                    Ok("RESOLVED_CPU=28 RESOLVED_WALL=100"),
+                    Ok("RESOLVED_CPU=28 RESOLVED_WALL=315"),
                 ),
-                (None, None, Ok("RESOLVED_CPU=22 RESOLVED_WALL=57")),
+                (None, None, Ok("RESOLVED_CPU=22 RESOLVED_WALL=180")),
                 (
                     Some("malformed"),
                     Some("1.75"),
@@ -19850,7 +19850,7 @@ exec env -u HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER -u HERMIT_TEST_WALL_TIMEOUT_MULTI
                     Err("scaled wall timeout must remain greater"),
                 ),
                 (Some("1e308"), Some("1e308"), Err("overflows")),
-                (Some("1"), Some("4"), Err("can consume 1908s")),
+                (Some("1"), Some("4"), Err("can consume 2900s")),
             ] {
                 let output = run(&argv, cpu, wall);
                 let stdout = String::from_utf8_lossy(&output.stdout);

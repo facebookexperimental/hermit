@@ -16082,7 +16082,8 @@ fi
         };
         let resolved = resolved_cell_timeouts(cell, multipliers).unwrap();
         assert_eq!(resolved.cpu_seconds, 28);
-        assert_eq!(resolved.wall_seconds, 86);
+        // Wall backstop 180 s (8x policy) scaled by 1.5 = 270 s.
+        assert_eq!(resolved.wall_seconds, 270);
         let mut context = run_context(&root);
         context.timeout_multipliers = multipliers;
         let retained = infrastructure_error_result(&context, cell, "fixture".into());
