@@ -1514,7 +1514,7 @@ impl AccessTraceWriter {
     /// before it retires `former`'s id ([`Self::note_thread_gone`]), which
     /// would otherwise drop them: a sigqueue send to itself that keeps its
     /// process's deliveries of that signal without an edge
-    /// ([`SendKind::Queue`]), and a tkill whose delivery to the leader it
+    /// (`SendKind::Queue`), and a tkill whose delivery to the leader it
     /// causes.
     pub fn rekey_thread(&mut self, former: DetTid, leader: DetTid) {
         let edges = &mut self.edges;

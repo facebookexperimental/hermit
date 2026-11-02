@@ -48,6 +48,14 @@ use std::process::Command;
 /// already has four orphans rather than landing as an immediate red.
 const ALLOWLIST: &[(&str, &str)] = &[
     (
+        "scripts/check-no-sve.rs",
+        "Checks built aarch64 binaries for SVE/SME instructions; it takes \
+         binary paths, and no aarch64 binary exists at lint time on the \
+         x86_64 lint host. It is run by the aarch64 lane against built \
+         artifacts when that lane exists; scheduling it in lint-checks \
+         would check nothing.",
+    ),
+    (
         "scripts/check-default-build-warnings.sh",
         "Builds the workspace; its findings were never counted, so wiring it \
          untriaged could convert a silent gap into a standing red. Only \
