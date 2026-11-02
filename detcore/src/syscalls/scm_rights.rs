@@ -1325,92 +1325,149 @@ impl ReceiveGeometry {
         outputs_overlap_inputs(&inputs, &outputs)
     }
 
-    /// The header fields Linux writes back into `message` after its data and
-    /// control messages: `msg_namelen`, `msg_flags` and `msg_controllen`
-    /// (`____sys_recvmsg`), and for a batch its `msg_len` (`do_recvmmsg`).
-    fn written_back_fields(&self, message: &MessageInput) -> Vec<Range> {
+    /// The ranges Linux writes for `message` after its control messages,
+    /// rows 3 to 7 of [`Self::control_read_back_refused`]'s table: its name
+    /// and `msg_namelen` where `msg_name` is not NULL (`move_addr_to_user`),
+    /// `msg_flags` and `msg_controllen` (`____sys_recvmsg`), and for a batch
+    /// entry its `msg_len` (`do_recvmmsg`).
+    fn written_after_control(&self, message: &MessageInput) -> Vec<Range> {
         let at = message.header.0;
-        let mut fields = vec![
-            (
+        let mut ranges = Vec::new();
+        if message.fields.name != 0 {
+            ranges.push(message.name);
+            ranges.push((
                 at.saturating_add(std::mem::offset_of!(Msghdr, msg_namelen)),
                 size_of::<libc::socklen_t>(),
-            ),
-            (
-                at.saturating_add(std::mem::offset_of!(Msghdr, msg_flags)),
-                size_of::<libc::c_int>(),
-            ),
-            (
-                at.saturating_add(std::mem::offset_of!(Msghdr, msg_controllen)),
-                size_of::<usize>(),
-            ),
-        ];
+            ));
+        }
+        ranges.push((
+            at.saturating_add(std::mem::offset_of!(Msghdr, msg_flags)),
+            size_of::<libc::c_int>(),
+        ));
+        ranges.push((
+            at.saturating_add(std::mem::offset_of!(Msghdr, msg_controllen)),
+            size_of::<usize>(),
+        ));
         if self.batch {
-            fields.push((at.saturating_add(size_of::<Msghdr>()), size_of::<u32>()));
+            ranges.push((at.saturating_add(size_of::<Msghdr>()), size_of::<u32>()));
         }
-        fields
-    }
-
-    /// Every range Linux may write, in a receive with this geometry that
-    /// delivered `delivered` messages, after it finished message `index`:
-    /// each later delivered message's data, name, control messages and
-    /// written-back header fields, and the timeout (`do_recvmmsg`,
-    /// `__sys_recvmmsg`).
-    fn written_after_message(&self, delivered: usize, index: usize) -> Vec<Range> {
-        let mut ranges = Vec::new();
-        for message in self.messages.iter().take(delivered).skip(index + 1) {
-            ranges.extend(message.fields.segments.iter().copied());
-            ranges.extend([message.name, message.control]);
-            ranges.extend(self.written_back_fields(message));
-        }
-        ranges.extend(self.timeout);
         ranges
     }
 
-    /// Whether the `msg_controllen` of message `index`, read back after a
-    /// receive with this geometry that delivered `delivered` messages, may
-    /// not be the one Linux wrote for it: a write Linux makes after that
-    /// message (`Self::written_after_message`) overlaps the field, as a later
-    /// entry's iovec over an earlier entry's header does. A message the
-    /// geometry did not read counts as rewritten.
-    pub(crate) fn control_length_rewritten(&self, delivered: usize, index: usize) -> bool {
-        let Some(message) = self.messages.get(index) else {
-            return true;
+    /// Whether Detcore must refuse to look for the control messages a
+    /// receive with this geometry wrote, so that a host socket timestamp
+    /// among them could reach the guest unreplaced. One rule for `recvmsg`
+    /// and `recvmmsg`: a write the call makes for a message must not land on
+    /// a region read after that write, by the kernel or by Detcore.
+    ///
+    /// Each message (a `recvmmsg` entry, or the one `msghdr` of a `recvmsg`)
+    /// is written in this order (`____sys_recvmsg`, `do_recvmmsg`), every
+    /// region as the guest's structures named it before the call, and each
+    /// payload taken to fill its whole iovec:
+    ///
+    /// | # | region written                                   | when                  |
+    /// |---|--------------------------------------------------|-----------------------|
+    /// | 1 | each iovec's bytes (`iov_base`, `iov_len`)       | always                |
+    /// | 2 | its control messages (`msg_control`, at most     | `msg_control` not NULL|
+    /// |   | `msg_controllen` bytes)                          |                       |
+    /// | 3 | `msg_namelen`, then its name (`msg_name`, at     | `msg_name` not NULL   |
+    /// |   | most `msg_namelen` bytes)                        |                       |
+    /// | 4 | `msg_flags`                                      | always                |
+    /// | 5 | `msg_controllen`                                 | always                |
+    /// | 6 | `msg_len`                                        | `recvmmsg`            |
+    ///
+    /// and, after every entry, the remaining time into the timeout
+    /// (`__sys_recvmmsg`, a `recvmmsg` with one). Read after those writes:
+    ///
+    /// | region read                                      | by                    | after             |
+    /// |--------------------------------------------------|-----------------------|-------------------|
+    /// | each later entry's `mmsghdr`, iovec array and    | the kernel, reaching  | rows 1 to 6 of an |
+    /// | control buffer                                   | it; Detcore, after    | earlier entry     |
+    /// | each earlier entry's `msg_controllen` and control| Detcore, after the    | rows 1 to 6 of a  |
+    /// | buffer                                           | call                  | later entry       |
+    /// | every entry's `msg_controllen` and control buffer| Detcore, after the    | the timeout       |
+    /// |                                                  | call                  |                   |
+    /// | a message's own control messages, the            | Detcore, after the    | rows 3 to 6 of    |
+    /// | `msg_controllen` bytes the call wrote back       | call                  | that message      |
+    ///
+    /// The first three rows of the second table depend only on the guest's
+    /// structures, so they are judged before the call, with `extents` None,
+    /// and their regions are whole control buffers: a refusal then receives
+    /// nothing. A geometry read only in part (an iovec array that cannot be
+    /// read) is judged on the messages it holds: Linux stops at that entry,
+    /// and a delivered message the geometry lacks is refused after the call.
+    /// The last row needs each delivered message's control extent, its
+    /// `msg_controllen` after the call, which nothing later can have
+    /// replaced once the first judgement passed: with `extents` (one per
+    /// delivered message, in order) it is judged after the call, and refuses
+    /// only where that extent is nonempty, so a control buffer over its own
+    /// header refuses only a receive that wrote control messages there. A
+    /// message's own data comes before its control messages and its own
+    /// header was read before either, so neither is a region read after its
+    /// writes.
+    pub(crate) fn control_read_back_refused(&self, extents: Option<&[usize]>) -> bool {
+        let control = |message: &MessageInput| {
+            if message.control.0 == 0 {
+                (0, 0)
+            } else {
+                message.control
+            }
         };
-        let field = (
-            message
-                .header
-                .0
-                .saturating_add(std::mem::offset_of!(Msghdr, msg_controllen)),
-            size_of::<usize>(),
-        );
-        self.written_after_message(delivered, index)
-            .into_iter()
-            .any(|range| ranges_meet(range, field))
-    }
-
-    /// Whether one of the first `written` bytes of message `index`'s control
-    /// buffer, the control messages Linux wrote for it in a receive with
-    /// this geometry that delivered `delivered` messages, may have been
-    /// written again before the call returned: by that message's name and
-    /// written-back header fields, which Linux writes after its control
-    /// messages (`____sys_recvmsg`), or by a write Linux makes after that
-    /// message (`Self::written_after_message`). Then those bytes are not all
-    /// the message's control data. A message the geometry did not read
-    /// counts as rewritten.
-    pub(crate) fn control_bytes_rewritten(
-        &self,
-        delivered: usize,
-        index: usize,
-        written: usize,
-    ) -> bool {
-        let Some(message) = self.messages.get(index) else {
-            return true;
+        let length_field = |message: &MessageInput| {
+            (
+                message
+                    .header
+                    .0
+                    .saturating_add(std::mem::offset_of!(Msghdr, msg_controllen)),
+                size_of::<usize>(),
+            )
         };
-        let received = (message.control.0, written.min(message.control.1));
-        std::iter::once(message.name)
-            .chain(self.written_back_fields(message))
-            .chain(self.written_after_message(delivered, index))
-            .any(|range| ranges_meet(range, received))
+        let writes = |message: &MessageInput| {
+            let mut ranges: Vec<Range> = message.fields.segments.clone();
+            ranges.push(control(message));
+            ranges.extend(self.written_after_control(message));
+            ranges
+        };
+        let meet = |writes: &[Range], reads: &[Range]| {
+            writes.iter().any(|&write| {
+                write.0 != 0
+                    && reads
+                        .iter()
+                        .any(|&read| read.0 != 0 && ranges_meet(write, read))
+            })
+        };
+        match extents {
+            None => {
+                for (index, message) in self.messages.iter().enumerate() {
+                    let written = writes(message);
+                    let later: Vec<Range> = self.messages[index + 1..]
+                        .iter()
+                        .flat_map(|later| [later.header, later.iov_array, control(later)])
+                        .collect();
+                    let earlier: Vec<Range> = self.messages[..index]
+                        .iter()
+                        .flat_map(|earlier| [length_field(earlier), control(earlier)])
+                        .collect();
+                    if meet(&written, &later) || meet(&written, &earlier) {
+                        return true;
+                    }
+                }
+                let every: Vec<Range> = self
+                    .messages
+                    .iter()
+                    .flat_map(|message| [length_field(message), control(message)])
+                    .collect();
+                self.timeout
+                    .is_some_and(|timeout| meet(std::slice::from_ref(&timeout), &every))
+            }
+            Some(extents) => extents.iter().enumerate().any(|(index, &written)| {
+                let Some(message) = self.messages.get(index) else {
+                    return true;
+                };
+                let received = (control(message).0, written.min(control(message).1));
+                meet(&self.written_after_control(message), &[received])
+            }),
+        }
     }
 
     /// Whether the input-only fields read now, after the call, are the
@@ -3934,38 +3991,38 @@ mod tests {
         assert!(delivered.refused.is_some() && delivered.may_have_installed);
     }
 
-    /// A batch entry's msg_controllen, read back after the call, is the one
-    /// Linux wrote for it unless a write of a later delivered entry, or the
-    /// timeout, lands on it, as a later entry's iovec over the entry's header
-    /// does; its control bytes are its own unless one of those writes, or
-    /// its own name or written-back header fields, which Linux writes after
-    /// its control messages, lands on them. An entry's own data comes before
-    /// its control messages and counts for neither; an entry that was not
-    /// delivered wrote nothing; an empty extent meets nothing.
+    /// `ReceiveGeometry::control_read_back_refused`'s region table, one case
+    /// for each read region and for each write condition, on batches built
+    /// over real memory, each judged before the call (`None`) and, where it
+    /// passes, after it with control extents:
+    /// - an ordinary batch passes both;
+    /// - a later entry's iovec over an earlier entry's msg_controllen (the
+    ///   direct alias), an earlier entry's iovec over a later entry's iovec
+    ///   array (the indirect alias, which rewrites what Linux then reads), an
+    ///   earlier entry's control buffer over a later entry's header, a later
+    ///   entry's name buffer over an earlier control buffer, two entries
+    ///   sharing one control buffer, and the timeout over a control buffer
+    ///   each refuse before the call;
+    /// - one entry with msg_name NULL and its control buffer 8 bytes into its
+    ///   own header passes both: Linux writes no msg_namelen then, and its
+    ///   other fields (40, 48, 56) lie past the buffer's 32 bytes; with
+    ///   msg_name set, its msg_namelen (8) lands inside, so the extent 32
+    ///   refuses after the call, and an empty extent does not;
+    /// - a recvmsg whose control buffer covers its own msg_controllen refuses
+    ///   only with a nonempty extent.
     #[test]
-    fn a_batch_entry_keeps_its_control_length_and_bytes_unless_a_later_write_lands_on_them() {
+    fn one_region_table_decides_where_detcore_can_find_received_control_messages() {
         let memory = LocalMemory::new();
         #[repr(C, align(8))]
-        struct Control([u8; 64]);
-        let mut control = Control([0; 64]);
-        let mut data = [0_u8; 8];
-        // SAFETY: all-zero is a valid `mmsghdr`.
-        let mut vector: [Mmsghdr; 2] = unsafe { std::mem::zeroed() };
-        let own = [libc::iovec {
-            iov_base: data.as_mut_ptr().cast(),
-            iov_len: data.len(),
-        }];
-        vector[0].msg_hdr.msg_iov = own.as_ptr().cast_mut().cast();
-        vector[0].msg_hdr.msg_iovlen = 1;
-        vector[0].msg_hdr.msg_control = control.0.as_mut_ptr().cast();
-        vector[0].msg_hdr.msg_controllen = 32;
-        // Entry 1's data lands on entry 0's msg_controllen.
-        let over_length = [libc::iovec {
-            iov_base: (&raw mut vector[0].msg_hdr.msg_controllen).cast(),
-            iov_len: size_of::<usize>(),
-        }];
-        vector[1].msg_hdr.msg_iov = over_length.as_ptr().cast_mut().cast();
-        vector[1].msg_hdr.msg_iovlen = 1;
+        struct Buffers([u8; 256]);
+        let mut buffers = Buffers([0; 256]);
+        let base = buffers.0.as_mut_ptr();
+        // SAFETY: each offset below lies inside the 256-byte buffer.
+        let at = |offset: usize| unsafe { base.add(offset) };
+        let mut iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }; 4];
         let batch = |vector: &mut [Mmsghdr; 2], timeout: Option<*const Timespec>| {
             let call = syscalls::Recvmmsg::new()
                 .with_fd(7)
@@ -3977,45 +4034,119 @@ mod tests {
             };
             ReceiveGeometry::before(&memory, &Syscall::Recvmmsg(call)).unwrap()
         };
-        let geometry = batch(&mut vector, None);
-        assert!(geometry.control_length_rewritten(2, 0));
-        assert!(!geometry.control_length_rewritten(1, 0));
-        assert!(!geometry.control_bytes_rewritten(2, 0, 32));
-        assert!(!geometry.control_length_rewritten(2, 1));
+        // An ordinary batch: each entry's data, control buffer and name in
+        // a place of its own.
+        // SAFETY: all-zero is a valid `mmsghdr`.
+        let mut vector: [Mmsghdr; 2] = unsafe { std::mem::zeroed() };
+        iovecs[0] = libc::iovec {
+            iov_base: at(0).cast(),
+            iov_len: 16,
+        };
+        iovecs[1] = libc::iovec {
+            iov_base: at(16).cast(),
+            iov_len: 16,
+        };
+        for (index, entry) in vector.iter_mut().enumerate() {
+            entry.msg_hdr.msg_iov = (&raw mut iovecs[index]).cast();
+            entry.msg_hdr.msg_iovlen = 1;
+            entry.msg_hdr.msg_control = at(64 + 32 * index).cast();
+            entry.msg_hdr.msg_controllen = 32;
+            entry.msg_hdr.msg_name = at(160 + 16 * index).cast();
+            entry.msg_hdr.msg_namelen = 16;
+        }
+        let ordinary = batch(&mut vector, None);
+        assert!(!ordinary.control_read_back_refused(None));
+        assert!(!ordinary.control_read_back_refused(Some(&[32, 32])));
 
-        // Entry 1's data elsewhere, its name buffer over entry 0's control
-        // messages.
-        vector[1].msg_hdr.msg_iov = own.as_ptr().cast_mut().cast();
-        vector[1].msg_hdr.msg_name = control.0[16..].as_mut_ptr().cast();
-        vector[1].msg_hdr.msg_namelen = 16;
-        let geometry = batch(&mut vector, None);
-        assert!(!geometry.control_length_rewritten(2, 0));
-        assert!(geometry.control_bytes_rewritten(2, 0, 32));
-        assert!(!geometry.control_bytes_rewritten(2, 0, 16));
-        assert!(!geometry.control_bytes_rewritten(1, 0, 32));
-        assert!(!geometry.control_bytes_rewritten(2, 0, 0));
+        // The direct alias: entry 1's data on entry 0's msg_controllen.
+        iovecs[1] = libc::iovec {
+            iov_base: (&raw mut vector[0].msg_hdr.msg_controllen).cast(),
+            iov_len: size_of::<usize>(),
+        };
+        assert!(batch(&mut vector, None).control_read_back_refused(None));
+        // The indirect alias: entry 0's data over entry 1's iovec array,
+        // which Linux reads only when it reaches entry 1.
+        iovecs[1] = libc::iovec {
+            iov_base: at(16).cast(),
+            iov_len: 16,
+        };
+        iovecs[0] = libc::iovec {
+            iov_base: (&raw mut iovecs[1].iov_base).cast(),
+            iov_len: size_of::<usize>(),
+        };
+        assert!(batch(&mut vector, None).control_read_back_refused(None));
+        iovecs[0] = libc::iovec {
+            iov_base: at(0).cast(),
+            iov_len: 16,
+        };
+        // Entry 0's control buffer over entry 1's header.
+        vector[0].msg_hdr.msg_control = (&raw mut vector[1]).cast();
+        assert!(batch(&mut vector, None).control_read_back_refused(None));
+        vector[0].msg_hdr.msg_control = at(64).cast();
+        // Entry 1's name buffer over entry 0's control buffer.
+        vector[1].msg_hdr.msg_name = at(64 + 8).cast();
+        assert!(batch(&mut vector, None).control_read_back_refused(None));
+        vector[1].msg_hdr.msg_name = at(176).cast();
+        // Two entries sharing one control buffer.
+        vector[1].msg_hdr.msg_control = at(64).cast();
+        assert!(batch(&mut vector, None).control_read_back_refused(None));
+        vector[1].msg_hdr.msg_control = at(96).cast();
+        // The timeout, written after every entry, over a control buffer.
+        assert!(
+            batch(&mut vector, Some(at(96).cast_const().cast())).control_read_back_refused(None)
+        );
+        assert!(
+            !batch(&mut vector, Some(at(224).cast_const().cast())).control_read_back_refused(None)
+        );
 
-        // The timeout, written after every entry, over entry 0's control
-        // messages, and over its msg_controllen.
-        vector[1].msg_hdr.msg_name = std::ptr::null_mut();
-        vector[1].msg_hdr.msg_namelen = 0;
-        let geometry = batch(&mut vector, Some(control.0.as_ptr().cast()));
-        assert!(geometry.control_bytes_rewritten(1, 0, 32));
-        assert!(!geometry.control_length_rewritten(1, 0));
-        let at_length = (&raw const vector[0].msg_hdr.msg_controllen).cast::<Timespec>();
-        let geometry = batch(&mut vector, Some(at_length));
-        assert!(geometry.control_length_rewritten(1, 0));
+        // One entry, its control buffer 8 bytes into its own header.
+        // SAFETY: all-zero is a valid `mmsghdr`.
+        let mut one: [Mmsghdr; 1] = unsafe { std::mem::zeroed() };
+        one[0].msg_hdr.msg_iov = (&raw mut iovecs[2]).cast();
+        one[0].msg_hdr.msg_iovlen = 1;
+        iovecs[2] = libc::iovec {
+            iov_base: at(0).cast(),
+            iov_len: 16,
+        };
+        // SAFETY: 8 bytes into the 64-byte entry.
+        one[0].msg_hdr.msg_control = unsafe { (&raw mut one[0]).cast::<u8>().add(8) }.cast();
+        one[0].msg_hdr.msg_controllen = 32;
+        let single = |one: &mut [Mmsghdr; 1]| {
+            let call = syscalls::Recvmmsg::new()
+                .with_fd(7)
+                .with_mmsg(AddrMut::from_ptr(one.as_mut_ptr()))
+                .with_vlen(1);
+            ReceiveGeometry::before(&memory, &Syscall::Recvmmsg(call)).unwrap()
+        };
+        let unnamed = single(&mut one);
+        assert!(!unnamed.control_read_back_refused(None));
+        assert!(!unnamed.control_read_back_refused(Some(&[32])));
+        one[0].msg_hdr.msg_name = at(192).cast();
+        one[0].msg_hdr.msg_namelen = 16;
+        let named = single(&mut one);
+        assert!(!named.control_read_back_refused(None));
+        assert!(named.control_read_back_refused(Some(&[32])));
+        assert!(!named.control_read_back_refused(Some(&[0])));
 
-        // A control buffer over its own header: the header fields Linux
-        // writes back after the control messages land on them, but its own
-        // msg_controllen is the length it wrote.
-        let header = (&raw mut vector[0]).cast::<u8>();
-        vector[0].msg_hdr.msg_control = header.cast();
-        vector[0].msg_hdr.msg_controllen = size_of::<Mmsghdr>();
-        let geometry = batch(&mut vector, None);
-        assert!(!geometry.control_length_rewritten(1, 0));
-        assert!(geometry.control_bytes_rewritten(1, 0, 16));
-        assert!(!geometry.control_bytes_rewritten(1, 0, 0));
+        // A recvmsg whose control buffer, 24 bytes into its own header,
+        // covers its msg_controllen (40) and msg_flags (48).
+        // SAFETY: all-zero is a valid `msghdr`.
+        let mut message: Msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = (&raw mut iovecs[3]).cast();
+        message.msg_iovlen = 1;
+        iovecs[3] = libc::iovec {
+            iov_base: at(0).cast(),
+            iov_len: 16,
+        };
+        // SAFETY: 24 bytes into the 56-byte header.
+        message.msg_control = unsafe { (&raw mut message).cast::<u8>().add(24) }.cast();
+        message.msg_controllen = 32;
+        let own = ReceiveGeometry::before(&memory, &recvmsg_of(&mut message)).unwrap();
+        assert!(!own.control_read_back_refused(None));
+        assert!(own.control_read_back_refused(Some(&[32])));
+        assert!(!own.control_read_back_refused(Some(&[0])));
+        // The geometry read the iovecs through raw pointers.
+        std::hint::black_box(&iovecs);
     }
 
     /// Whatever the call may write over what it reads refuses the whole

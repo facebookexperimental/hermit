@@ -9592,72 +9592,138 @@ fn an_scm_rights_receipt_after_an_unread_sendmmsg_is_a_named_refusal() {
     }
 }
 
-/// A `recvmmsg` of two datagrams on a fresh `SOCK_DGRAM` socket pair with
-/// `SO_TIMESTAMPNS` and no descriptors in flight: entry 0 receives into a
-/// control buffer with room for one timestamp, and entry 1, with no control
-/// buffer, receives its eight zero bytes onto entry 0's `msg_controllen`.
-/// Linux finishes entry 0, then entry 1 (`do_recvmmsg`), so entry 0's
-/// timestamp message stays in its buffer while its `msg_controllen` reads 0.
-const RECVMMSG_CONTROL_LENGTH_ALIAS_GUEST: &str = r#"
+/// Receives on a fresh `SOCK_DGRAM` socket pair with `SO_TIMESTAMPNS` (none
+/// in mode "recvmsg-own-header-quiet"), with no descriptors in flight, in the
+/// geometry its argument names, and prints what Linux left:
+/// - "ordinary": a two-entry `recvmmsg`, each entry's data, control buffer
+///   and name in places of their own;
+/// - "direct": entry 1's iovec on entry 0's `msg_controllen`, so entry 1's
+///   eight zero bytes overwrite it;
+/// - "indirect": entry 0's iovec on entry 1's `iov_base`, so the address of
+///   entry 0's `msg_controllen`, which entry 0 receives, is where entry 1
+///   then receives its eight zero bytes;
+/// - "later-header": entry 0's control buffer over entry 1's header, which
+///   its timestamp message then garbles before Linux reads it;
+/// - "name-null": one entry, its control buffer 8 bytes into its own header
+///   and `msg_name` NULL, so Linux writes no `msg_namelen` into it;
+/// - "name-set": the same with `msg_name` set, so Linux writes `msg_namelen`
+///   over the start of the timestamp message;
+/// - "recvmsg-own-header": a `recvmsg` whose control buffer, 24 bytes into
+///   its own header, holds the `msg_controllen` and `msg_flags` Linux writes
+///   after the timestamp message;
+/// - "recvmsg-own-header-quiet": the same with no timestamp to receive.
+const RECEIVED_CONTROL_GEOMETRY_GUEST: &str = r#"
 #define _GNU_SOURCE
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
 
-int main(void) {
+static int is_timestamp(const void *at) {
+  struct cmsghdr header;
+  memcpy(&header, at, sizeof(header));
+  return header.cmsg_level == SOL_SOCKET && header.cmsg_type == SCM_TIMESTAMPNS &&
+         header.cmsg_len == CMSG_LEN(sizeof(struct timespec));
+}
+
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    return 2;
+  }
+  const char *mode = argv[1];
   int pair[2];
   int on = 1;
   if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) != 0 ||
-      setsockopt(pair[1], SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on)) != 0) {
+      (strcmp(mode, "recvmsg-own-header-quiet") != 0 &&
+       setsockopt(pair[1], SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on)) != 0)) {
     perror("setup");
     return 1;
   }
-  const char zeros[8] = {0};
-  if (send(pair[0], "first!!!", 8, 0) != 8 || send(pair[0], zeros, 8, 0) != 8) {
-    perror("send");
-    return 2;
-  }
-  union {
+  static struct mmsghdr entries[2];
+  static struct msghdr message;
+  static struct iovec iovecs[2];
+  static char data[2][16];
+  static char names[2][16];
+  static union {
     char bytes[CMSG_SPACE(sizeof(struct timespec))];
     struct cmsghdr align;
-  } control;
-  memset(&control, 0, sizeof(control));
-  char data[16];
-  struct mmsghdr entries[2];
-  memset(entries, 0, sizeof(entries));
-  struct iovec first = {.iov_base = data, .iov_len = sizeof(data)};
-  entries[0].msg_hdr.msg_iov = &first;
-  entries[0].msg_hdr.msg_iovlen = 1;
-  entries[0].msg_hdr.msg_control = control.bytes;
-  entries[0].msg_hdr.msg_controllen = sizeof(control.bytes);
-  struct iovec onto_length = {
-      .iov_base = &entries[0].msg_hdr.msg_controllen,
-      .iov_len = sizeof(entries[0].msg_hdr.msg_controllen),
-  };
-  entries[1].msg_hdr.msg_iov = &onto_length;
-  entries[1].msg_hdr.msg_iovlen = 1;
-  int count = recvmmsg(pair[1], entries, 2, 0, NULL);
-  struct cmsghdr* message = (struct cmsghdr*)control.bytes;
-  printf("recvmmsg returned %d; entry 0 msg_len %u, msg_controllen now %zu; entry 1 msg_len %u\n",
-         count, entries[0].msg_len, (size_t)entries[0].msg_hdr.msg_controllen,
-         entries[1].msg_len);
+  } controls[2];
+  const char zeros[8] = {0};
+  if (strncmp(mode, "recvmsg", 7) == 0) {
+    if (send(pair[0], "datagram", 8, 0) != 8) {
+      perror("send");
+      return 3;
+    }
+    iovecs[0] = (struct iovec){.iov_base = data[0], .iov_len = sizeof(data[0])};
+    message.msg_iov = &iovecs[0];
+    message.msg_iovlen = 1;
+    message.msg_control = (char *)&message + 24;
+    message.msg_controllen = CMSG_SPACE(sizeof(struct timespec));
+    ssize_t received = recvmsg(pair[1], &message, 0);
+    printf("recvmsg returned %zd; msg_controllen now %zu\n", received,
+           (size_t)message.msg_controllen);
+    printf("the control buffer holds a timestamp message: %s\n",
+           is_timestamp((char *)&message + 24) ? "yes" : "no");
+    return 0;
+  }
+  unsigned vlen = 2;
+  void *checked = controls[0].bytes;
+  for (int index = 0; index < 2; index++) {
+    iovecs[index] = (struct iovec){.iov_base = data[index], .iov_len = 8};
+    entries[index].msg_hdr.msg_iov = &iovecs[index];
+    entries[index].msg_hdr.msg_iovlen = 1;
+  }
+  entries[0].msg_hdr.msg_control = controls[0].bytes;
+  entries[0].msg_hdr.msg_controllen = sizeof(controls[0].bytes);
+  if (strcmp(mode, "ordinary") == 0) {
+    entries[1].msg_hdr.msg_control = controls[1].bytes;
+    entries[1].msg_hdr.msg_controllen = sizeof(controls[1].bytes);
+    for (int index = 0; index < 2; index++) {
+      entries[index].msg_hdr.msg_name = names[index];
+      entries[index].msg_hdr.msg_namelen = sizeof(names[index]);
+    }
+  } else if (strcmp(mode, "direct") == 0) {
+    iovecs[1].iov_base = &entries[0].msg_hdr.msg_controllen;
+  } else if (strcmp(mode, "indirect") == 0) {
+    iovecs[0] = (struct iovec){.iov_base = &iovecs[1].iov_base, .iov_len = 8};
+  } else if (strcmp(mode, "later-header") == 0) {
+    entries[0].msg_hdr.msg_control = &entries[1];
+    checked = &entries[1];
+  } else if (strcmp(mode, "name-null") == 0 || strcmp(mode, "name-set") == 0) {
+    vlen = 1;
+    entries[0].msg_hdr.msg_control = (char *)&entries[0] + 8;
+    checked = (char *)&entries[0] + 8;
+    if (strcmp(mode, "name-set") == 0) {
+      entries[0].msg_hdr.msg_name = names[0];
+      entries[0].msg_hdr.msg_namelen = sizeof(names[0]);
+    }
+  } else {
+    return 2;
+  }
+  void *first = strcmp(mode, "indirect") == 0 ? (void *)&entries[0].msg_hdr.msg_controllen
+                                             : (void *)"datagram";
+  if (send(pair[0], strcmp(mode, "indirect") == 0 ? (const void *)&first : first, 8, 0) != 8 ||
+      send(pair[0], zeros, 8, 0) != 8) {
+    perror("send");
+    return 3;
+  }
+  int count = recvmmsg(pair[1], entries, vlen, 0, NULL);
+  printf("recvmmsg returned %d; entry 0 msg_len %u, msg_controllen now %zu\n", count,
+         entries[0].msg_len, (size_t)entries[0].msg_hdr.msg_controllen);
   printf("entry 0's control buffer holds a timestamp message: %s\n",
-         message->cmsg_level == SOL_SOCKET && message->cmsg_type == SCM_TIMESTAMPNS &&
-                 message->cmsg_len == CMSG_LEN(sizeof(struct timespec))
-             ? "yes"
-             : "no");
+         is_timestamp(checked) ? "yes" : "no");
   return 0;
 }
 "#;
 
-fn recvmmsg_control_length_alias_guest() -> PathBuf {
-    let build_root = process_build_root("recvmmsg-control-length-alias");
+fn received_control_geometry_guest() -> PathBuf {
+    let build_root = process_build_root("received-control-geometry");
     fs::create_dir_all(&build_root).expect("failed to create the guest directory");
-    let source = build_root.join("recvmmsg_control_length_alias.c");
-    let guest = build_root.join("recvmmsg_control_length_alias");
+    let source = build_root.join("received_control_geometry.c");
+    let guest = build_root.join("received_control_geometry");
     if !guest.exists() {
-        fs::write(&source, RECVMMSG_CONTROL_LENGTH_ALIAS_GUEST).expect("failed to write the guest");
+        fs::write(&source, RECEIVED_CONTROL_GEOMETRY_GUEST).expect("failed to write the guest");
         let compiled = Command::new("cc")
             .args(["-O0", "-Wall", "-Wextra", "-Werror"])
             .arg(&source)
@@ -9670,51 +9736,113 @@ fn recvmmsg_control_length_alias_guest() -> PathBuf {
     guest
 }
 
-/// [`RECVMMSG_CONTROL_LENGTH_ALIAS_GUEST`]: natively entry 0's timestamp
-/// message stays in its control buffer while a later entry's data overwrote
-/// its `msg_controllen` with 0. Detcore reads each entry's control length
-/// back after the batch, so it read 0 and left that host timestamp in place,
-/// which differed between runs. Such an entry's timestamps cannot be found,
-/// so a strict run now ends at the batch as the named policy refusal (exit
-/// 122). Detcore's handling is the same on every backend; this runs on
-/// ptrace.
+/// [`RECEIVED_CONTROL_GEOMETRY_GUEST`]'s every mode, natively and under a
+/// strict ptrace run. Detcore replaces each socket timestamp a receive
+/// returns with logical time, reading the control messages back after the
+/// call, so it must refuse where a write the call makes after a message's
+/// control messages can replace them or the length naming them
+/// (`ReceiveGeometry::control_read_back_refused`). The aliasing batches
+/// (direct, indirect, a control buffer over a later header) refuse before
+/// they receive, a control buffer that a header field Linux writes after its
+/// control messages lands in (name-set, recvmsg-own-header) refuses after
+/// the call, and the rest run as natively: an ordinary batch, an own-header
+/// control buffer that no later write reaches (name-null), and one with no
+/// timestamp received (recvmsg-own-header-quiet). Detcore's handling is the
+/// same on every backend; this runs on ptrace.
 #[test]
-fn a_recvmmsg_entry_whose_control_length_a_later_entry_overwrote_is_a_named_refusal() {
-    let guest = recvmmsg_control_length_alias_guest();
+fn received_control_messages_detcore_cannot_find_are_refused_by_name() {
+    let guest = received_control_geometry_guest();
     let guest = guest.to_str().expect("guest path is UTF-8");
-    let native = Command::new(guest)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run the guest natively");
-    assert!(native.status.success(), "natively: {native:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&native.stdout),
-        "recvmmsg returned 2; entry 0 msg_len 8, msg_controllen now 0; entry 1 msg_len 8\n\
-         entry 0's control buffer holds a timestamp message: yes\n",
-        "natively"
-    );
+    let batch_refusal = "recvmmsg: the socket timestamps its entries may receive could not be \
+                         found to replace with logical time";
+    let own_refusal = |call: &str| {
+        format!(
+            "{call}: the socket timestamps it received could not be found to replace with \
+             logical time"
+        )
+    };
+    let aliased = "recvmmsg returned 2; entry 0 msg_len 8, msg_controllen now 0\n\
+                   entry 0's control buffer holds a timestamp message: yes\n";
+    let cases = [
+        (
+            "ordinary",
+            "recvmmsg returned 2; entry 0 msg_len 8, msg_controllen now 32\n\
+             entry 0's control buffer holds a timestamp message: yes\n",
+            None,
+        ),
+        ("direct", aliased, Some(batch_refusal.to_owned())),
+        ("indirect", aliased, Some(batch_refusal.to_owned())),
+        (
+            "later-header",
+            "recvmmsg returned 1; entry 0 msg_len 8, msg_controllen now 32\n\
+             entry 0's control buffer holds a timestamp message: yes\n",
+            Some(batch_refusal.to_owned()),
+        ),
+        (
+            "name-null",
+            "recvmmsg returned 1; entry 0 msg_len 8, msg_controllen now 32\n\
+             entry 0's control buffer holds a timestamp message: yes\n",
+            None,
+        ),
+        (
+            "name-set",
+            "recvmmsg returned 1; entry 0 msg_len 8, msg_controllen now 32\n\
+             entry 0's control buffer holds a timestamp message: no\n",
+            Some(own_refusal("recvmmsg")),
+        ),
+        (
+            "recvmsg-own-header",
+            "recvmsg returned 8; msg_controllen now 32\n\
+             the control buffer holds a timestamp message: yes\n",
+            Some(own_refusal("recvmsg")),
+        ),
+        (
+            "recvmsg-own-header-quiet",
+            "recvmsg returned 8; msg_controllen now 0\n\
+             the control buffer holds a timestamp message: no\n",
+            None,
+        ),
+    ];
     let _guard = hermit_run_guard();
-    let args = ["run", "--strict", "--base-env=minimal", "--", guest];
-    let output = hermit(&args);
-    let refused_stdout = stdout(&output);
-    let refused_stderr = stderr(&output);
-    assert_eq!(
-        output.status.code(),
-        Some(HERMIT_POLICY_REFUSAL_EXIT),
-        "the batch must end the strict run as a policy refusal\nstdout:\n{refused_stdout}\nstderr:\n{refused_stderr}"
-    );
-    assert!(
-        refused_stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
-            && refused_stderr.contains(
-                "recvmmsg: the socket timestamps entries [0] may have received cannot be found \
-                 to replace with logical time"
-            ),
-        "the run did not name the timestamp refusal on stderr\nstderr:\n{refused_stderr}"
-    );
-    assert_eq!(
-        refused_stdout, "",
-        "the guest went on past the refused batch"
-    );
+    for (mode, linux, refusal) in cases {
+        let native = Command::new(guest)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run the guest natively");
+        assert!(native.status.success(), "{mode} natively: {native:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&native.stdout),
+            linux,
+            "{mode} natively"
+        );
+        let args = ["run", "--strict", "--base-env=minimal", "--", guest, mode];
+        let output = hermit(&args);
+        let hermit_stdout = stdout(&output);
+        let hermit_stderr = stderr(&output);
+        match refusal {
+            None => {
+                assert_success(&output, &args);
+                assert_eq!(hermit_stdout, linux, "{mode}: Hermit's output");
+            }
+            Some(refusal) => {
+                assert_eq!(
+                    output.status.code(),
+                    Some(HERMIT_POLICY_REFUSAL_EXIT),
+                    "{mode}: the receive must end the strict run as a policy refusal\nstdout:\n{hermit_stdout}\nstderr:\n{hermit_stderr}"
+                );
+                assert!(
+                    hermit_stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+                        && hermit_stderr.contains(&refusal),
+                    "{mode}: the run did not name the refusal on stderr\nstderr:\n{hermit_stderr}"
+                );
+                assert_eq!(
+                    hermit_stdout, "",
+                    "{mode}: the guest went on past the refusal"
+                );
+            }
+        }
+    }
 }
 
 /// A loopback address of this test process's own for

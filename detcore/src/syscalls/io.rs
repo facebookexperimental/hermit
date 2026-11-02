@@ -938,6 +938,19 @@ const SCM_TIMESTAMPNS_NEW: libc::c_int = 64;
 const SCM_TIMESTAMPING_NEW: libc::c_int = 65;
 const MAX_CONTROL_BYTES: usize = 64 * 1024;
 
+/// Why a `recvmmsg` is refused before it receives
+/// (`ReceiveGeometry::control_read_back_refused`, judged on its structures).
+const BATCH_CONTROL_GEOMETRY_REFUSAL: &str = "the socket timestamps its entries may receive could \
+     not be found to replace with logical time: a write it makes for one entry can land on a \
+     header, iovec array, msg_controllen or control buffer that is read after that write";
+
+/// Why a `recvmsg` or `recvmmsg` is refused after it received
+/// (`ReceiveGeometry::control_read_back_refused`, judged on the control
+/// extents it wrote).
+const OWN_HEADER_CONTROL_REFUSAL: &str = "the socket timestamps it received could not be found \
+     to replace with logical time: a name or header field Linux writes after a message's control \
+     messages landed inside them";
+
 #[derive(Clone, Copy)]
 enum SocketTimestampKind {
     Timeval,
@@ -5452,11 +5465,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Validate the output region before consuming a datagram.
         guest.memory().read_exact(control_address, &mut control)?;
         let header = message_address.as_raw();
+        // Where Linux writes this message's name and header fields, which it
+        // does after its control messages
+        // (`ReceiveGeometry::control_read_back_refused`).
+        let geometry = ReceiveGeometry::before(&guest.memory(), &Syscall::Recvmsg(call));
 
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
         let now = self.observe_socket_receive(guest, call.sockfd()).await?;
-        // Only the control messages the receive wrote, msg_controllen bytes.
+        // Only the control messages the receive wrote, msg_controllen bytes,
+        // which Linux writes last, unless a name or header field written
+        // after them landed inside them.
         let written = written_control_length(guest, header);
+        if geometry
+            .as_ref()
+            .is_none_or(|geometry| geometry.control_read_back_refused(Some(&[written])))
+        {
+            self.refuse_unfound_control_messages(guest, Sysno::recvmsg)
+                .await?;
+            return Ok(result);
+        }
         let mut control = vec![0; written.min(control_len)];
         guest.memory().read_exact(control_address, &mut control)?;
         let Some(written) = canonicalize_written_timestamps(&mut control, written, now) else {
@@ -5846,10 +5873,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             controls
         };
         let entries = messages_address.as_raw();
-        // Which writes Linux makes after each entry's control messages
-        // (`ReceiveGeometry::control_length_rewritten`), read before the call
-        // as the controls are.
+        // Whether Detcore can find the control messages each entry receives
+        // (`ReceiveGeometry::control_read_back_refused`), judged first on the
+        // batch's own structures, before it receives anything.
         let geometry = ReceiveGeometry::before(&guest.memory(), &Syscall::Recvmmsg(call));
+        let Some(geometry) = geometry.filter(|geometry| !geometry.control_read_back_refused(None))
+        else {
+            let dettid = guest.thread_state().dettid;
+            crate::syscalls::helpers::report_refusal_reason(
+                self.cfg.panic_on_unsupported_syscalls,
+                &format!("[dtid {dettid}] recvmmsg: {BATCH_CONTROL_GEOMETRY_REFUSAL}"),
+            );
+            return self
+                .refuse_unserviceable_operation_because(
+                    guest,
+                    Sysno::recvmmsg,
+                    Errno::EOPNOTSUPP,
+                    BATCH_CONTROL_GEOMETRY_REFUSAL,
+                )
+                .await;
+        };
 
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
         let delivered = usize::try_from(result).unwrap_or(0).min(controls.len());
@@ -5857,35 +5900,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(result);
         }
         let now = self.observe_socket_receive(guest, call.fd()).await?;
+        // Only the control messages the receive wrote to each entry, its
+        // msg_controllen bytes; its msghdr begins the entry. The judgement
+        // above leaves no later write of the batch able to replace them.
+        let extents: Vec<usize> = controls
+            .iter()
+            .take(delivered)
+            .enumerate()
+            .map(|(index, control)| match control {
+                Some(_) => {
+                    written_control_length(guest, entries + index * std::mem::size_of::<Mmsghdr>())
+                }
+                None => 0,
+            })
+            .collect();
+        if geometry.control_read_back_refused(Some(&extents)) {
+            self.refuse_unfound_control_messages(guest, Sysno::recvmmsg)
+                .await?;
+            return Ok(result);
+        }
         let mut timestamped = Vec::new();
-        let mut unknown = Vec::new();
         for (index, control) in controls.into_iter().take(delivered).enumerate() {
             let Some((address, capacity)) = control else {
                 continue;
             };
-            // Only the control messages the receive wrote to this entry, its
-            // msg_controllen bytes; its msghdr begins the entry. Linux
-            // finishes each entry before the next and writes the timeout last
-            // (`do_recvmmsg`), so a later write of the batch can have replaced
-            // that length, or those bytes, by the time it returns, as a later
-            // entry's iovec over this entry's header does. Then they are not
-            // this entry's, and neither is anything read from them.
-            if geometry
-                .as_ref()
-                .is_none_or(|geometry| geometry.control_length_rewritten(delivered, index))
-            {
-                unknown.push(index);
-                continue;
-            }
-            let written =
-                written_control_length(guest, entries + index * std::mem::size_of::<Mmsghdr>());
-            if geometry
-                .as_ref()
-                .is_none_or(|geometry| geometry.control_bytes_rewritten(delivered, index, written))
-            {
-                unknown.push(index);
-                continue;
-            }
+            let written = extents[index];
             let address: AddrMut<'_, u8> = AddrMut::from_raw(address).ok_or(Errno::EFAULT)?;
             let mut bytes = vec![0; written.min(capacity)];
             guest.memory().read_exact(address, &mut bytes)?;
@@ -5894,39 +5933,42 @@ impl<T: RecordOrReplay> Detcore<T> {
                 timestamped.push((address, bytes));
             }
         }
-        if !unknown.is_empty() {
-            // The socket timestamps such an entry received, if any, are its
-            // host's: left as they are, they would differ between runs.
-            let refusal = format!(
-                "the socket timestamps entries {unknown:?} may have received cannot be found to \
-                 replace with logical time: a later write of the batch can have replaced their \
-                 msg_controllen or control data before it returned"
-            );
-            if self.cfg.panic_on_unsupported_syscalls {
-                // Named on stderr before the policy ends the run, as for an
-                // SCM_RIGHTS receipt (`Detcore::record_received_descriptors`).
-                let dettid = guest.thread_state().dettid;
-                crate::syscalls::helpers::report_refusal_reason(
-                    true,
-                    &format!("[dtid {dettid}] recvmmsg: {refusal}"),
-                );
-                // Only a fail-closed run asks: the batch has already run, so
-                // the errno a permissive run would get is never given.
-                return self
-                    .refuse_unserviceable_operation_because(
-                        guest,
-                        Sysno::recvmmsg,
-                        Errno::EOPNOTSUPP,
-                        &refusal,
-                    )
-                    .await;
-            }
-            tracing::warn!("[detcore] recvmmsg: {refusal}");
-        }
         for (address, bytes) in timestamped {
             guest.memory().write_exact(address, &bytes)?;
         }
         Ok(result)
+    }
+
+    /// After a receive whose control messages Detcore cannot find
+    /// (`ReceiveGeometry::control_read_back_refused` with their extents): a
+    /// fail-closed run ends as the named policy refusal, and a run that allows
+    /// unsupported operations is warned and keeps the result with its control
+    /// messages as the host wrote them, a host timestamp among them. The call
+    /// has already received, so the errno a permissive run would get is never
+    /// given.
+    async fn refuse_unfound_control_messages<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+    ) -> Result<(), Error> {
+        if self.cfg.panic_on_unsupported_syscalls {
+            // Named on stderr before the policy ends the run, as for an
+            // SCM_RIGHTS receipt (`Detcore::record_received_descriptors`).
+            let dettid = guest.thread_state().dettid;
+            crate::syscalls::helpers::report_refusal_reason(
+                true,
+                &format!("[dtid {dettid}] {sysno}: {OWN_HEADER_CONTROL_REFUSAL}"),
+            );
+            self.refuse_unserviceable_operation_because(
+                guest,
+                sysno,
+                Errno::EOPNOTSUPP,
+                OWN_HEADER_CONTROL_REFUSAL,
+            )
+            .await?;
+        }
+        tracing::warn!("[detcore] {sysno}: {OWN_HEADER_CONTROL_REFUSAL}");
+        Ok(())
     }
 }
 
