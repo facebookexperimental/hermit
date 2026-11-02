@@ -1953,7 +1953,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // kvm_failure_tests::kvm_vfork_child_refusals_are_policy_refusals
     // (https://github.com/rrnewton/hermit/issues/5025): 1330 + 1 = 1331,
     // measured by nextest list.
-    ("test.hermit_unit", 1331),
+    // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds two
+    // hermit-run units: 1331 + 2 = 1333, measured by the 216dbc929a full
+    // validate.
+    ("test.hermit_unit", 1333),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3229,7 +3232,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (hermits_inits_fdinfo_is_refused_by_name): 3361 + 1 = 3362.
     // The pipe retry identity regression adds one unit: 3362 + 1 = 3363,
     // Measured 3363 by compiled nextest list at the integration head.
-    ("test.detcore_unit", 3363),
+    // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds 21
+    // sync-edge and access-trace units: 3363 + 21 = 3384, measured by the
+    // 216dbc929a full validate.
+    ("test.detcore_unit", 3384),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3822,7 +3828,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4930): 226 + 2 = 228.
     // And record_replay_flocks_a_self_created_file_opened_by_relative_path
     // (https://github.com/rrnewton/hermit/issues/5007): 228 + 1 = 229.
-    ("test.record_replay", 229),
+    // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds two
+    // record/replay units: 229 + 2 = 231, measured by the 216dbc929a full
+    // validate.
+    ("test.record_replay", 231),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -4592,7 +4601,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Package K slice K8-d's
     // the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux: 779 + 1
     // = 780, measured by nextest list.
-    ("test.cli", 780),
+    // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds seven cli
+    // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
+    ("test.cli", 787),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
