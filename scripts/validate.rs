@@ -844,6 +844,13 @@ enum Focused {
         lane: String,
         nodes: String,
     },
+    /// `--tests node::case[,...]`: run only the named test cases (plus the
+    /// upstream steps those nodes need). The map is node tag -> case IDs as
+    /// they appear in per-node results (`<crate>::<binary>$<test name>` for
+    /// nextest producers; see `case_filter_expr`).
+    TestCases {
+        cases: std::collections::BTreeMap<String, Vec<String>>,
+    },
     Selective {
         shallow: bool,
     },
@@ -869,6 +876,7 @@ impl Focused {
             Focused::HostedPrivileged => "hosted-privileged".into(),
             Focused::RequalifyCell { .. } => "cell-requalification".into(),
             Focused::Only { lane, .. } => format!("only-{lane}"),
+            Focused::TestCases { .. } => "tests-portable".to_string(),
             Focused::Selective { .. } => "selective".into(),
             // Both spellings record ONE profile, matching validate.sh:382, so
             // envelope history stays continuous whether or not a baseline was
@@ -890,6 +898,7 @@ impl Focused {
             Focused::HostedPrivileged => "hosted-privileged-only",
             Focused::RequalifyCell { .. } => "requalify-cell",
             Focused::Only { .. } => "only",
+            Focused::TestCases { .. } => "tests",
             Focused::Selective { shallow } => {
                 if *shallow {
                     "shallow-select"
@@ -1288,6 +1297,14 @@ fn usage() -> &'static str {
      \x20 --only <lane> <group.job>[,...]  Run those lane node(s) with their own\n\
      \x20                  declared caps; outside deps are dropped; preflight tags\n\
      \x20                  reuse validate's canonical preflight nodes.\n\
+     \x20 --tests <node::case>[,...]     Run only the named test cases (portable\n\
+     \x20                  lane; upstream steps those nodes need still run). A case\n\
+     \x20                  ID is node tag + '::' + the runner result ID, e.g.\n\
+     \x20                  test.cli::hermit-run::cli$some_test; IDs are listed in a\n\
+     \x20                  run record's test_cases vector. Only nextest nodes can\n\
+     \x20                  be sliced by case; any other node fails loudly by name.\n\
+     \x20 --tests-file <path>            Same selection, one node::case ID per line\n\
+     \x20                  ('#' comments and blank lines are ignored).\n\
      \x20 --selective, --since-green    Only nodes affected since the last green baseline.\n\
      \x20                               This is the DEFAULT when no level, focused mode,\n\
      \x20                               --all, or --selected is named: a bare invocation\n\
@@ -1728,6 +1745,53 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 }
                 focused.push(Focused::Only { lane, nodes });
                 i += 2;
+            }
+            "--tests" => {
+                let Some(list) = argv.get(i + 1).filter(|v| !v.is_empty()) else {
+                    eprintln!(
+                        "validate: --tests needs a comma-separated list of node::case IDs \
+                         (e.g. --tests test.cli::hermit-run::cli$some_test); see --help"
+                    );
+                    return Err(2);
+                };
+                match parse_case_ids(list.split(',')) {
+                    Ok(cases) => focused.push(Focused::TestCases { cases }),
+                    Err(error) => {
+                        eprintln!("validate: {error}");
+                        return Err(2);
+                    }
+                }
+                i += 1;
+            }
+            "--tests-file" => {
+                let Some(path) = argv.get(i + 1).filter(|v| !v.is_empty()) else {
+                    eprintln!(
+                        "validate: --tests-file needs a file path (one node::case ID per line)"
+                    );
+                    return Err(2);
+                };
+                let text = match std::fs::read_to_string(path) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        eprintln!(
+                            "validate: cannot read --tests-file {path}: {error}; \
+                             write one node::case ID per line (see --help)"
+                        );
+                        return Err(2);
+                    }
+                };
+                let lines = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'));
+                match parse_case_ids(lines) {
+                    Ok(cases) => focused.push(Focused::TestCases { cases }),
+                    Err(error) => {
+                        eprintln!("validate: {error}");
+                        return Err(2);
+                    }
+                }
+                i += 1;
             }
             "-h" | "--help" => {
                 println!("{}", usage());
@@ -13179,6 +13243,199 @@ fn finish_committed_selection(mut plan: Plan, source_path: PathBuf, source_bytes
     plan
 }
 
+#[cfg(test)]
+mod case_selection_tests {
+    use super::*;
+
+    #[test]
+    fn case_ids_parse_and_group_by_node() {
+        let cases = parse_case_ids(
+            [
+                "test.cli::hermit-run::cli$some_test",
+                "test.cli::hermit-run::cli$other_test",
+                "test.hermit_unit::hermit-run::hermit-run$unit::x",
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(cases.len(), 2);
+        assert_eq!(cases["test.cli"].len(), 2);
+        assert_eq!(
+            cases["test.hermit_unit"],
+            vec!["hermit-run::hermit-run$unit::x"]
+        );
+        // Malformed IDs fail loudly with the expected form named.
+        for bad in ["test.cli", "no-node-separator", "testcli::x$y", "::a$b"] {
+            assert!(parse_case_ids([bad].into_iter()).is_err(), "{bad}");
+        }
+        assert!(parse_case_ids([].into_iter()).is_err());
+    }
+
+    #[test]
+    fn filter_expr_uses_binary_and_exact_test_name() {
+        assert_eq!(
+            case_filter_expr("hermit-run::cli$cli::some_test").as_deref(),
+            Some("(binary(cli) & test(=cli::some_test))")
+        );
+        assert_eq!(case_filter_expr("no-dollar-sign"), None);
+        assert_eq!(case_filter_expr("a::b$"), None);
+    }
+
+    #[test]
+    fn parse_tests_flag_selects_test_cases() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        match parse_argv(&argv(&[
+            "--tests",
+            "test.cli::hermit-run::cli$some_test,test.hermit_unit::hermit-run::hermit-run$x",
+        ]))
+        .unwrap()
+        .focused
+        {
+            Some(Focused::TestCases { cases }) => {
+                assert_eq!(cases.len(), 2);
+                assert_eq!(cases["test.cli"], vec!["hermit-run::cli$some_test"]);
+            }
+            other => panic!("--tests did not select test cases: {other:?}"),
+        }
+        assert!(parse_argv(&argv(&["--tests", "bogus"])).is_err());
+        assert!(parse_argv(&argv(&["--tests"])).is_err());
+    }
+
+    #[test]
+    fn injection_filters_nextest_nodes_and_refuses_others_by_name() {
+        let cfg = validate_plan::validation_config(&test_source_root()).unwrap();
+        let mut steps = cfg.steps.clone();
+        let cases = parse_case_ids(
+            ["test.cli::hermit-run::cli$some_test", "e2e.manifest_compat::compat/java [ptrace/verify]"].into_iter(),
+        )
+        .unwrap();
+        // The e2e node cannot be sliced yet: the error must name it.
+        let error = inject_case_filters(&mut steps, &cases).unwrap_err();
+        assert!(error.contains("e2e.manifest_compat"), "{error}");
+        assert!(error.contains("cannot select cases"), "{error}");
+
+        let cases =
+            parse_case_ids(["test.cli::hermit-run::cli$some_test"].into_iter()).unwrap();
+        inject_case_filters(&mut steps, &cases).unwrap();
+        let cli = steps.iter().find(|s| s.tag() == "test.cli").unwrap();
+        assert_eq!(
+            cli.env.get("HERMIT_NEXTEST_FILTER_EXPR").map(String::as_str),
+            Some("(binary(cli) & test(=some_test))")
+        );
+        assert_eq!(
+            cli.env.get("NEXTEST_EXPECTED_EXECUTED").map(String::as_str),
+            Some("1")
+        );
+    }
+}
+
+/// Parse `node::case` test-case IDs into node tag -> case IDs. A case ID is
+/// the runner's result ID as printed in run records (`test_cases` vector):
+/// `<crate>::<binary>$<test name>` for nextest producers. Node tags contain
+/// no `::`, so the first `::` is the separator.
+fn parse_case_ids<'a>(
+    entries: impl Iterator<Item = &'a str>,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
+    let mut cases: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for entry in entries {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((node, case)) = entry.split_once("::") else {
+            return Err(format!(
+                "test-case ID {entry:?} is not of the form node::case; expected e.g. \
+                 test.cli::hermit-run::cli$some_test (IDs are listed in a run record's \
+                 test_cases vector)"
+            ));
+        };
+        if node.is_empty() || !node.contains('.') || case.is_empty() {
+            return Err(format!(
+                "test-case ID {entry:?} is not of the form node::case; expected e.g. \
+                 test.cli::hermit-run::cli$some_test (IDs are listed in a run record's \
+                 test_cases vector)"
+            ));
+        }
+        cases
+            .entry(node.to_string())
+            .or_default()
+            .push(case.to_string());
+    }
+    if cases.is_empty() {
+        return Err(
+            "no test cases selected; --tests needs at least one node::case ID".to_string(),
+        );
+    }
+    Ok(cases)
+}
+
+/// The nextest filter expression selecting exactly one recorded case ID
+/// (`<crate>::<binary>$<test name>`), or None if the ID is not nextest-shaped.
+fn case_filter_expr(case: &str) -> Option<String> {
+    let (prefix, name) = case.split_once('$')?;
+    let binary = prefix.rsplit("::").next()?;
+    if binary.is_empty()
+        || name.is_empty()
+        || !binary
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '$'))
+    {
+        return None;
+    }
+    Some(format!("(binary({binary}) & test(={name}))"))
+}
+
+/// Inject the case filter for every selected node. Only nextest nodes can
+/// be sliced by case today; any other selected node is a loud error naming
+/// the node, never a silent whole-node run.
+fn inject_case_filters(
+    steps: &mut [dagrun::Step],
+    cases: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<(), String> {
+    for step in steps.iter_mut() {
+        let Some(node_cases) = cases.get(&step.tag()) else {
+            continue;
+        };
+        if !step.cmd.contains("run-nextest-counted.sh") {
+            return Err(format!(
+                "node {} cannot select cases: its runner has no per-case filter \
+                 (only nextest nodes can be sliced by case); run the whole node with \
+                 --only portable {} instead",
+                step.tag(),
+                step.tag()
+            ));
+        }
+        let mut exprs = Vec::new();
+        for case in node_cases {
+            let Some(expr) = case_filter_expr(case) else {
+                return Err(format!(
+                    "node {} cannot select case {case:?}: it is not a nextest result ID \
+                     (<crate>::<binary>$<test name>); select case IDs from a run record's \
+                     test_cases vector",
+                    step.tag()
+                ));
+            };
+            exprs.push(expr);
+        }
+        step.env.insert(
+            "HERMIT_NEXTEST_FILTER_EXPR".to_string(),
+            exprs.join(" | "),
+        );
+        // The counted wrapper refuses when the executed count differs from
+        // the expectation, so a case that does not exist in this node fails
+        // loudly instead of silently passing with zero tests run.
+        step.env.insert(
+            "NEXTEST_EXPECTED_EXECUTED".to_string(),
+            node_cases.len().to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn requested_step_ids(raw: &str, option: &str) -> Result<BTreeSet<String>, String> {
     let tags = raw
         .split(',')
@@ -13589,6 +13846,43 @@ fn keep_ancestor_baseline(
 fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
     let (committed, source_path, source_bytes) = load_committed_validation_dag(root)?;
 
+    if let Some(Focused::TestCases { cases }) = &args.focused {
+        // Like --only on the portable lane (same preflight, same dependency
+        // closure), plus a per-node case filter injected as step env below.
+        let lane = "portable".to_string();
+        let lane_cfg = dagrun::select_steps_by_labels(&committed, std::slice::from_ref(&lane))?;
+        let nodes = cases.keys().cloned().collect::<Vec<_>>().join(",");
+        let mut tags = requested_step_ids(&nodes, "--tests")?;
+        let preflight: &[&str] = if args.allow_local_off_the_record_run {
+            &["pre.submodules", PIN_GATE_TAG]
+        } else {
+            &[
+                "pre.submodules",
+                PIN_GATE_TAG,
+                RUST_SCRIPT_PRODUCER_TAG,
+                validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+                "gate.manifest",
+            ]
+        };
+        tags.extend(preflight.iter().map(|tag| (*tag).to_string()));
+        retain_focused_manifest_producers(&lane_cfg, &mut tags);
+        let mut cfg =
+            dagrun::select_steps_by_tags(&lane_cfg, &tags.into_iter().collect::<Vec<_>>(), true)?;
+        inject_case_filters(&mut cfg.steps, cases)?;
+        let plan = Plan {
+            planned_test_nodes: test_nodes_of(&cfg),
+            cfg,
+            profile: args
+                .focused
+                .as_ref()
+                .expect("matched focused mode")
+                .profile(),
+            selection_mode: "tests",
+            cacheable: false,
+            ..Default::default()
+        };
+        return finish_selection_for(args, plan, source_path, source_bytes);
+    }
     if let Some(Focused::Only { lane, nodes }) = &args.focused {
         let lane_cfg = dagrun::select_steps_by_labels(&committed, std::slice::from_ref(lane))?;
         let mut tags = requested_step_ids(nodes, "--only")?;

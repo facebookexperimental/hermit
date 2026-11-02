@@ -185,6 +185,25 @@ function run_nextest {
     local -a inventory_arguments=()
     local -a launch_arguments=()
     shift 7
+    # Case selection (validate --tests): HERMIT_NEXTEST_FILTER_EXPR holds a
+    # nextest filter expression selecting exactly the recorded cases. It is
+    # a nextest option, so it goes before the first `--`; the inventory and
+    # run invocations below share "$@" and stay consistent.
+    if [[ -n ${HERMIT_NEXTEST_FILTER_EXPR:-} ]]; then
+        local -a filtered_args=()
+        local inserted=0 arg
+        for arg in "$@"; do
+            if (( ! inserted )) && [[ $arg == -- ]]; then
+                filtered_args+=(--filter-expr "$HERMIT_NEXTEST_FILTER_EXPR")
+                inserted=1
+            fi
+            filtered_args+=("$arg")
+        done
+        if (( ! inserted )); then
+            filtered_args+=(--filter-expr "$HERMIT_NEXTEST_FILTER_EXPR")
+        fi
+        set -- "${filtered_args[@]}"
+    fi
 
     if [[ $cpu_report != - && $cpu_report == "${DAGRUN_TEST_COUNTS_PATH:--}" ]]; then
         printf 'run-nextest-counted: CPU report path must differ from DAGRUN_TEST_COUNTS_PATH\n' >&2

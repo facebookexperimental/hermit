@@ -657,6 +657,9 @@ const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     crate::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV,
     crate::timeouts::TEST_WALL_TIMEOUT_MULTIPLIER_ENV,
     "HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT",
+    // validate --tests sets this on case-selected nextest steps; forwarded
+    // only when set, it carries the case filter into the pinned root.
+    "HERMIT_NEXTEST_FILTER_EXPR",
     "HERMIT_VALIDATE_RELEASE_BUILD_MODE",
     "HERMIT_VALIDATE_BUCK_DOTSLASH",
     "L4_REPS",
