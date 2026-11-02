@@ -818,8 +818,6 @@ struct Run<'a> {
     untracked: BTreeMap<ChannelKey, Untracked>,
     /// Recorded edges that do not run forward; they are ignored.
     backward: Vec<HbEdge>,
-    /// Channels that may hold data queued before the trace starts.
-    predate: BTreeSet<ChannelId>,
 }
 
 impl<'a> Run<'a> {
@@ -854,7 +852,6 @@ impl<'a> Run<'a> {
             edges,
             untracked: data.untracked,
             backward,
-            predate: data.predate,
         }
     }
 
@@ -867,7 +864,7 @@ impl<'a> Run<'a> {
     }
 
     /// One note per channel that a call between `from` and `to` wrote or
-    /// read and whose data gives no edge, or may predate the trace.
+    /// read and whose data gives no edge.
     fn channel_notes_between(&self, from: EventIndex, to: EventIndex) -> BTreeSet<String> {
         let mut notes = BTreeSet::new();
         for sys in &self.syscalls {
@@ -886,14 +883,6 @@ impl<'a> Run<'a> {
                     continue;
                 };
                 let Some(untracked) = self.untracked.get(&channel_key(*open_file, *id)) else {
-                    if id.is_some_and(|id| self.predate.contains(&id)) {
-                        notes.insert(format!(
-                            "Data through {} may include bytes queued before the trace starts, \
-                             which the trace does not show being created: a read of them is \
-                             credited to a later write.",
-                            resource_text(access).text
-                        ));
-                    }
                     continue;
                 };
                 if untracked.since <= at {
@@ -945,15 +934,13 @@ struct Untracked {
 const NO_PEER: &str = "Hermit does not record the end it is connected to";
 const NO_SOCKET_TYPE: &str = "Hermit does not record its socket type";
 const UNSEEN_DATA: &str = "a read returned data the trace does not show being written";
+const PREDATES_TRACE: &str = "the trace does not show it being created, so a read can return bytes \
+                              queued before the trace starts instead of a traced write's";
 
 /// What [`data_edges`] derives from one trace.
 struct DataEdges {
     edges: Vec<HbEdge>,
     untracked: BTreeMap<ChannelKey, Untracked>,
-    /// Channels with data steps that the trace does not show being created
-    /// (a pipe or socketpair opened before it, any FIFO), which may hold data
-    /// queued before the trace starts.
-    predate: BTreeSet<ChannelId>,
 }
 
 /// Data edges (design section 7), derived from syscall results: the write
@@ -961,9 +948,18 @@ struct DataEdges {
 /// that returned it. For an eventfd, every write since the previous read
 /// reaches a read (in semaphore mode a read consumes one of them, which the
 /// trace cannot tell).
+///
+/// Only a channel the trace shows being created gives edges: a pipe or
+/// socketpair whose creating call is in it. Any other (one opened before the
+/// trace, and every FIFO, which an open joins rather than creates) may hold
+/// bytes queued before the trace starts, and a read that returns no more
+/// than the trace's writes cannot show which bytes it took. Crediting them
+/// to a traced write would claim an order the run need not have had, so such
+/// a channel gives no edge at all and is named as untracked
+/// ([`PREDATES_TRACE`]): every consumer of an ordered verdict sees no order
+/// through it.
 fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
     let (steps, mut untracked) = channel_steps(syscalls);
-    let edges = replay_channels(&steps, &mut untracked);
     let opened: BTreeSet<OpenFileId> = syscalls
         .iter()
         .flat_map(|sys| &sys.accesses)
@@ -976,16 +972,18 @@ fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
             _ => None,
         })
         .collect();
-    let predate = steps
-        .iter()
-        .map(|step| step.id)
-        .filter(|id| !matches!(id, ChannelId::Pair(first) if opened.contains(first)))
-        .collect();
-    DataEdges {
-        edges,
-        untracked,
-        predate,
+    for step in &steps {
+        if !matches!(step.id, ChannelId::Pair(first) if opened.contains(&first)) {
+            untracked
+                .entry(ChannelKey::Shared(step.id))
+                .or_insert(Untracked {
+                    since: 0,
+                    why: PREDATES_TRACE,
+                });
+        }
     }
+    let edges = replay_channels(&steps, &mut untracked);
+    DataEdges { edges, untracked }
 }
 
 /// One write or read that moved data through a channel.
@@ -1073,13 +1071,11 @@ struct Stream {
 }
 
 /// Replays the steps per stream and gives each read an edge from every write
-/// whose data it returned; a write's bytes are taken as contiguous. A read
-/// that returns more than the trace shows being written (data from before the
-/// trace) makes the channel's offsets unknown, and its edges stop there.
-/// Data queued before the trace starts that never makes a read exceed the
-/// trace's writes goes undetected: the reads are credited to later writes,
-/// which can give a false "ordered" or miss an edge. Such a channel is one the
-/// trace does not show being created, and gets a note.
+/// whose data it returned; a write's bytes are taken as contiguous. Channels
+/// in `untracked` are skipped: [`data_edges`] puts every channel the trace
+/// does not show being created there first. A read that returns more than
+/// the trace shows being written makes the channel's offsets unknown, and its
+/// edges stop there.
 fn replay_channels(
     steps: &[Step<'_>],
     untracked: &mut BTreeMap<ChannelKey, Untracked>,
@@ -3490,6 +3486,21 @@ mod tests {
         }
     }
 
+    /// Thread 7's call at `pre` that creates the channel whose first end is
+    /// `first` (a pipe, a socketpair or an eventfd): only a channel the trace
+    /// shows being created gives data edges.
+    fn creates(pre: EventIndex, first: OpenFileId) -> SyscallRecord {
+        call(
+            pre,
+            7,
+            0,
+            Sysno::pipe2,
+            &[0x3000, 0],
+            Some(0),
+            vec![fd(3, Some(first), opened("pipe"))],
+        )
+    }
+
     /// A call of thread `tid` (process 3) entering at `pre` and returning
     /// `result` at `pre + 1`; a `None` result never returns.
     fn call(
@@ -4004,6 +4015,7 @@ mod tests {
         // Each read is reached from the write that put its bytes in: offsets
         // per channel, not every earlier write.
         let calls = [
+            creates(1, file(7, 1)),
             write(10, 7, 1),
             write(12, 8, 1),
             read(14, 1, 4),
@@ -4036,6 +4048,7 @@ mod tests {
         };
         let (a, b) = (file(7, 5), file(7, 6));
         let calls = [
+            creates(1, file(7, 5)),
             call(
                 10,
                 7,
@@ -4087,6 +4100,7 @@ mod tests {
             op,
         };
         let calls = [
+            creates(1, file(7, 8)),
             call(
                 10,
                 7,
@@ -4124,26 +4138,9 @@ mod tests {
         assert!(data.untracked.is_empty(), "{:?}", data.untracked);
 
         // With the deciding event the write comes first and the read returns
-        // its bytes; without it the read finds the pipe empty.
-        let target = trace(vec![write(101, 7, 30), read(103, 40, 4)]);
-        let baseline = trace(vec![read(101, 40, EAGAIN), write(103, 7, 30)]);
-        let r = find(&target, &baseline, Some(9));
-        assert_eq!(r.status, RaceStatus::Found, "{}", r.reason);
-        let hb = r.happens_before.clone().unwrap();
-        assert_eq!(
-            hb.target,
-            Some(HbVerdict {
-                ordered: true,
-                edges: vec![channel((7, 101), (9, 104))],
-            })
-        );
-        assert_eq!(hb.baseline, unordered());
-        // The traces do not show the pipe being created, so bytes queued
-        // before them could be credited to the traced write.
-        assert_eq!(
-            r.notes,
-            vec!["Data through the pipe whose first end is file 1 opened by thread 7 may include bytes queued before the trace starts, which the trace does not show being created: a read of them is credited to a later write.".to_string()]
-        );
+        // its bytes; without it the read finds the pipe empty. The traces
+        // show the pipe being created, so the read's 4 bytes are the write's:
+        // an edge orders the two in the target.
         let created = call(
             90,
             7,
@@ -4158,10 +4155,115 @@ mod tests {
         );
         let target = trace(vec![created.clone(), write(101, 7, 30), read(103, 40, 4)]);
         let baseline = trace(vec![created, read(101, 40, EAGAIN), write(103, 7, 30)]);
+        let r = find(&target, &baseline, Some(9));
+        assert_eq!(r.status, RaceStatus::Found, "{}", r.reason);
+        let hb = r.happens_before.clone().unwrap();
         assert_eq!(
-            find(&target, &baseline, Some(9)).notes,
-            Vec::<String>::new()
+            hb.target,
+            Some(HbVerdict {
+                ordered: true,
+                edges: vec![channel((7, 101), (9, 104))],
+            })
         );
+        assert_eq!(hb.baseline, unordered());
+        assert_eq!(r.notes, Vec::<String>::new());
+    }
+
+    /// A pipe the traces do not show being created may hold bytes queued
+    /// before them: a 4-byte read after a traced 4-byte write may return
+    /// those bytes and leave the write's queued, so the run need not order
+    /// the write before the read. No data edge comes from such a channel,
+    /// or from any FIFO: the pair is unordered by the edges Hermit observes,
+    /// for every consumer of the verdict, and the report names the channel.
+    #[test]
+    fn a_channel_the_trace_does_not_create_gives_no_edge() {
+        let write = |pre| {
+            call(
+                pre,
+                7,
+                30,
+                Sysno::write,
+                &[4, 0x1000, 4],
+                Some(4),
+                vec![pipe(file(7, 2), ChannelOp::Write)],
+            )
+        };
+        let read = |pre, result| {
+            call(
+                pre,
+                9,
+                40,
+                Sysno::read,
+                &[3, 0x2000, 4],
+                Some(result),
+                vec![pipe(file(7, 1), ChannelOp::Read)],
+            )
+        };
+        let calls = [write(101), read(103, 4)];
+        let data = data_edges(&calls.iter().collect::<Vec<_>>());
+        assert_eq!(data.edges, Vec::<HbEdge>::new());
+        let shared = ChannelKey::Shared(ChannelId::Pair(file(7, 1)));
+        assert_eq!(
+            data.untracked.get(&shared).map(|u| (u.since, u.why)),
+            Some((0, PREDATES_TRACE))
+        );
+        // A FIFO is joined by its opens, never created by one: no edge
+        // either, even after a traced open.
+        let fifo = |open_file, op| Access::Channel {
+            open_file,
+            id: Some(ChannelId::Inode(detcore_model::fd::DetInode::mint(77))),
+            channel: ChannelKind::Fifo,
+            op,
+        };
+        let calls = [
+            call(
+                90,
+                7,
+                29,
+                Sysno::openat,
+                &[0, 0x3000, 0],
+                Some(3),
+                vec![fd(3, Some(file(7, 1)), opened("/tmp/fifo"))],
+            ),
+            call(
+                101,
+                7,
+                30,
+                Sysno::write,
+                &[3, 0x1000, 4],
+                Some(4),
+                vec![fifo(file(7, 1), ChannelOp::Write)],
+            ),
+            call(
+                103,
+                9,
+                40,
+                Sysno::read,
+                &[4, 0x2000, 4],
+                Some(4),
+                vec![fifo(file(9, 1), ChannelOp::Read)],
+            ),
+        ];
+        assert_eq!(
+            data_edges(&calls.iter().collect::<Vec<_>>()).edges,
+            Vec::<HbEdge>::new()
+        );
+
+        // The finder still finds the pair, now unordered in both runs, and
+        // names the pipe as giving no edge.
+        let target = trace(vec![write(101), read(103, 4)]);
+        let baseline = trace(vec![read(101, EAGAIN), write(103)]);
+        let r = find(&target, &baseline, Some(9));
+        assert_eq!(r.status, RaceStatus::Found, "{}", r.reason);
+        let hb = r.happens_before.clone().unwrap();
+        assert_eq!((hb.target, hb.baseline), (unordered(), unordered()));
+        assert_eq!(
+            r.notes,
+            vec!["Data through the pipe whose first end is file 1 opened by thread 7 gives no edge: the trace does not show it being created, so a read can return bytes queued before the trace starts instead of a traced write's.".to_string()]
+        );
+        assert!(render_racing_accesses(&r).contains("unordered by the edges Hermit observes"));
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["happens_before"]["target"]["ordered"], false);
     }
 
     #[test]
@@ -4621,12 +4723,18 @@ mod tests {
         );
         shutdown.post = Some(S);
         let target = trace(vec![
+            creates(50, file(7, 1)),
             shutdown.clone(),
             wait(Some(110)),
             send,
             receive(130, 1),
         ]);
-        let baseline = trace(vec![shutdown, wait(None), receive(132, 2)]);
+        let baseline = trace(vec![
+            creates(50, file(7, 1)),
+            shutdown,
+            wait(None),
+            receive(132, 2),
+        ]);
         let r = find_at(&target, &baseline, (3, 140));
         assert_eq!(r.status, RaceStatus::Candidates, "{}", r.reason);
         assert_eq!(
@@ -4699,12 +4807,19 @@ mod tests {
         let mut shutdown = log(98, 21, 40, 30);
         shutdown.post = Some(S);
         let mut target = vec![
+            creates(50, file(7, 1)),
             shutdown.clone(),
             log(110, 53, 150, 106),
             send(120),
             receive(130, 1),
         ];
-        let mut baseline = vec![shutdown, log(112, 53, 150, 121), send(122), receive(132, 2)];
+        let mut baseline = vec![
+            creates(50, file(7, 1)),
+            shutdown,
+            log(112, 53, 150, 121),
+            send(122),
+            receive(132, 2),
+        ];
         if poller {
             for calls in [&mut target, &mut baseline] {
                 calls.push(nap(101, 7, 60, Some(105)));
@@ -5761,14 +5876,27 @@ mod tests {
             Some(4),
             vec![pipe(file(7, 2), ChannelOp::Write)],
         );
-        let target = trace(vec![
-            before.clone(),
-            early.clone(),
-            write(103),
-            read(105, 4),
-        ]);
-        let baseline = trace(vec![before, early, read(101, EAGAIN), write(103)]);
-        let r = find(&target, &baseline, Some(9));
+        let target = vec![before.clone(), early.clone(), write(103), read(105, 4)];
+        let baseline = vec![before, early, read(101, EAGAIN), write(103)];
+        // The traces do not show the pipe being created: it gives no edge
+        // from their start.
+        let r = find(&trace(target.clone()), &trace(baseline.clone()), Some(9));
+        assert_eq!(r.status, RaceStatus::Found, "{}", r.reason);
+        assert_eq!(r.happens_before.as_ref().unwrap().target, unordered());
+        assert_eq!(
+            r.notes,
+            vec!["Data through the pipe whose first end is file 1 opened by thread 7 gives no edge: the trace does not show it being created, so a read can return bytes queued before the trace starts instead of a traced write's.".to_string()]
+        );
+        // Created in the traces, it gives no edge from the read that
+        // returned more than was written.
+        let created = |calls: Vec<SyscallRecord>| {
+            trace(
+                std::iter::once(creates(50, file(7, 1)))
+                    .chain(calls)
+                    .collect(),
+            )
+        };
+        let r = find(&created(target), &created(baseline), Some(9));
         assert_eq!(r.status, RaceStatus::Found, "{}", r.reason);
         assert_eq!(r.happens_before.as_ref().unwrap().target, unordered());
         assert_eq!(
