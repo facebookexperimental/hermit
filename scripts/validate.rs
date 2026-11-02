@@ -11059,6 +11059,99 @@ fn install_self_test_tool_authority(authority: &SelfTestToolAuthority) {
 /// must be an absolute, existing dev-hermit checkout; silently falling back to
 /// the state root would execute whatever code happens to be in the primary
 /// checkout instead of the code that admitted this run.
+/// Submodule paths whose `.gitmodules` entry sets `ignore = all`.
+///
+/// Git itself suppresses every change in such a submodule. The tool-root
+/// check forces `--ignore-submodules=none` so a real submodule gitlink move
+/// cannot hide, so it must re-apply that one declared suppression itself:
+/// without this, a submodule the superproject has told Git to ignore
+/// entirely (`.minibeads`, whose gitlink moves on every tracker write)
+/// makes the shared parent permanently "dirty" and no full validation can
+/// ever start. Only `ignore = all` qualifies; any other submodule, and any
+/// real file, remains dirt.
+fn ignore_all_submodule_paths(gitmodules_config_list: &str) -> Vec<String> {
+    let mut paths: BTreeMap<String, String> = BTreeMap::new();
+    let mut ignored: BTreeSet<String> = BTreeSet::new();
+    for line in gitmodules_config_list.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(rest) = key.strip_prefix("submodule.") else {
+            continue;
+        };
+        // Submodule names may contain dots; the field is the last component.
+        let Some((name, field)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        match field {
+            "path" => {
+                paths.insert(name.to_string(), value.trim().to_string());
+            }
+            "ignore" if value.trim() == "all" => {
+                ignored.insert(name.to_string());
+            }
+            _ => {}
+        }
+    }
+    let mut result: Vec<String> = ignored
+        .iter()
+        .filter_map(|name| paths.get(name))
+        .map(|path| path.trim_end_matches('/').to_string())
+        .filter(|path| !path.is_empty())
+        .collect();
+    result.sort();
+    result.dedup();
+    result
+}
+
+/// The path named by one `git status --porcelain=v1` line.
+///
+/// The caller's `git` helper trims the whole status output, so the first
+/// line may have lost its leading status space (`M .minibeads`, not
+/// ` M .minibeads`); splitting on the first space handles both shapes.
+fn porcelain_entry_path(line: &str) -> String {
+    let trimmed = line.trim_start();
+    let rest = trimmed
+        .split_once(' ')
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    // A rename/copy names `orig -> dest`; the live path is the destination.
+    let raw = rest.rsplit(" -> ").next().unwrap_or(rest).trim();
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        let inner = &raw[1..raw.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some(other) => out.push(other),
+                    None => out.push('\\'),
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Dirty lines that still count after dropping `ignore = all` submodules.
+fn remaining_tool_root_dirty_lines<'a>(dirty: &'a str, ignored: &[String]) -> Vec<&'a str> {
+    dirty
+        .lines()
+        .filter(|line| {
+            let path = porcelain_entry_path(line);
+            !ignored
+                .iter()
+                .any(|root| path == *root || path.starts_with(&format!("{root}/")))
+        })
+        .collect()
+}
+
 fn configured_tool_selection(
     parent: Option<&Path>,
 ) -> Result<
@@ -11188,11 +11281,17 @@ fn configured_tool_selection(
             "--ignore-submodules=none",
         ],
     )?;
-    if !dirty.is_empty() {
+    // `--ignore-submodules=none` also resurfaces submodules declared
+    // `ignore = all`, which Git would otherwise never report. Re-apply
+    // only that declared suppression; every other line remains dirt.
+    let gitmodules = git(&resolved, &["config", "-f", ".gitmodules", "--list"]).unwrap_or_default();
+    let ignored_submodules = ignore_all_submodule_paths(&gitmodules);
+    let remaining = remaining_tool_root_dirty_lines(&dirty, &ignored_submodules);
+    if !remaining.is_empty() {
         return Err(format!(
             "explicit {TOOL_ROOT_ENV} {} is dirty: {}",
             resolved.display(),
-            dirty.lines().next().unwrap_or("unknown change")
+            remaining.first().unwrap_or(&"unknown change")
         ));
     }
     Ok((Some(resolved), None))
@@ -24923,6 +25022,8 @@ fn tool_root_split_bracket() -> Result<(), String> {
     let target_root = root.join("cache/trees/1111111111111111111111111111111111111111");
     let other_root = root.join("other-root");
     let fake_root = root.join("fake-root");
+    let beads_donor = root.join("beads-donor");
+    let normal_donor = root.join("normal-donor");
     let checkout = root.join("checkout");
     let log = root.join("validate.log");
     let git = |dir: &Path, args: &[&str]| -> Result<(), String> {
@@ -24948,7 +25049,13 @@ fn tool_root_split_bracket() -> Result<(), String> {
         .map_err(|error| format!("tool-root split: cannot create fixture: {error}"))?;
     std::fs::write(
         state_root.join(".gitmodules"),
-        "[submodule \"hermit\"]\n\tpath = hermit\n\turl = fixture://hermit\n",
+        format!(
+            "[submodule \"hermit\"]\n\tpath = hermit\n\turl = fixture://hermit\n\
+             [submodule \"minibeads\"]\n\tpath = .minibeads\n\turl = {}\n\tignore = all\n\
+             [submodule \"normal\"]\n\tpath = normal-sub\n\turl = {}\n",
+            beads_donor.display(),
+            normal_donor.display()
+        ),
     )
     .and_then(|_| {
         std::fs::write(
@@ -24978,6 +25085,35 @@ fn tool_root_split_bracket() -> Result<(), String> {
         &["config", "user.email", "fixture@example.com"],
     )?;
     git(&state_root, &["config", "user.name", "fixture"])?;
+    // Two real submodules: `.minibeads` declared `ignore = all`, and
+    // `normal-sub` with no ignore, so their gitlink moves can be told apart.
+    for donor in [&beads_donor, &normal_donor] {
+        std::fs::create_dir_all(donor)
+            .map_err(|error| format!("tool-root split: cannot create donor: {error}"))?;
+        git(donor, &["init", "-b", "main"])?;
+        git(donor, &["config", "user.email", "fixture@example.com"])?;
+        git(donor, &["config", "user.name", "fixture"])?;
+        std::fs::write(donor.join("seed"), "fixture\n")
+            .map_err(|error| format!("tool-root split: cannot write donor: {error}"))?;
+        git(donor, &["add", "."])?;
+        git(donor, &["commit", "-m", "fixture"])?;
+    }
+    git(
+        &root,
+        &[
+            "clone",
+            beads_donor.to_str().unwrap(),
+            state_root.join(".minibeads").to_str().unwrap(),
+        ],
+    )?;
+    git(
+        &root,
+        &[
+            "clone",
+            normal_donor.to_str().unwrap(),
+            state_root.join("normal-sub").to_str().unwrap(),
+        ],
+    )?;
     git(&state_root, &["add", "."])?;
     git(&state_root, &["commit", "-m", "fixture"])?;
     git(
@@ -25080,6 +25216,52 @@ fn tool_root_split_bracket() -> Result<(), String> {
     if resolved != std::fs::canonicalize(&tool_root).map_err(|error| error.to_string())? {
         return Err("tool-root split: explicit tool root resolved to another checkout".into());
     }
+
+    // An `ignore = all` submodule's gitlink move is clean; a normal
+    // submodule's gitlink move, or a real file beside it, is still dirt.
+    git(
+        &tool_root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            ".minibeads",
+            "normal-sub",
+        ],
+    )?;
+    let advance = |sub: &Path| -> Result<(), String> {
+        git(sub, &["config", "user.email", "fixture@example.com"])?;
+        git(sub, &["config", "user.name", "fixture"])?;
+        std::fs::write(sub.join("moved"), "fixture\n")
+            .map_err(|error| format!("tool-root split: cannot advance submodule: {error}"))?;
+        git(sub, &["add", "."])?;
+        git(sub, &["commit", "-m", "move gitlink"])
+    };
+    advance(&tool_root.join(".minibeads"))?;
+    if let Err(error) = configured_tool_root(Some(&state_root)) {
+        return Err(format!(
+            "tool-root split: ignore=all submodule gitlink move did not count as clean: {error}"
+        ));
+    }
+    advance(&tool_root.join("normal-sub"))?;
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains(" is dirty:") && error.contains("normal-sub"))
+    {
+        return Err("tool-root split: normal submodule gitlink move did not refuse".into());
+    }
+    std::fs::write(tool_root.join("dirty"), "fixture\n")
+        .map_err(|error| format!("tool-root split: cannot dirty fixture: {error}"))?;
+    if !configured_tool_root(Some(&state_root))
+        .is_err_and(|error| error.contains(" is dirty:") && error.contains("dirty"))
+    {
+        return Err(
+            "tool-root split: real file beside an ignore=all gitlink move did not refuse".into(),
+        );
+    }
+    std::fs::remove_file(tool_root.join("dirty"))
+        .map_err(|error| format!("tool-root split: cannot clean fixture: {error}"))?;
 
     let valid_authority = create_self_test_tool_authority(
         &frozen_root,
