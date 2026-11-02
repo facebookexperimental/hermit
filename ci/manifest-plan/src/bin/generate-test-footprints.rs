@@ -465,6 +465,257 @@ fn load_rules(
     rules
 }
 
+/// One coarse backend-affinity rule from the policy. `paths` are Hermit-tree
+/// globs; `reverie_paths` are globs relative to the reverie submodule root.
+#[derive(Clone)]
+struct BackendRule {
+    id: String,
+    paths: Vec<String>,
+    reverie_paths: Vec<String>,
+    backends: Vec<String>,
+    lanes: Vec<String>,
+    extra_nodes: Vec<String>,
+    tier: String,
+}
+
+fn load_backend_rules(policy: &Value, nodes: &BTreeSet<String>) -> Vec<BackendRule> {
+    let raw = policy
+        .get("backend_rules")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| die(format!("{POLICY}: `backend_rules` must be an array")));
+    let mut rules = Vec::new();
+    let mut ids = BTreeSet::new();
+    for (index, item) in raw.iter().enumerate() {
+        let location = format!("{POLICY}: backend_rules[{index}]");
+        let id = item["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| die(format!("{location}: `id` must be a non-empty string")))
+            .to_owned();
+        if !ids.insert(id.clone()) {
+            die(format!("{location}: duplicate backend rule id `{id}`"));
+        }
+        let tier = item["tier"]
+            .as_str()
+            .unwrap_or_else(|| die(format!("{location}: `tier` must be a string")))
+            .to_owned();
+        if tier != "backend" && tier != "core" {
+            die(format!("{location}: `tier` must be `backend` or `core`"));
+        }
+        let paths = strings(item, "paths", &location);
+        let reverie_paths = strings(item, "reverie_paths", &location);
+        if paths.is_empty() && reverie_paths.is_empty() {
+            die(format!("{location}: rule needs `paths` or `reverie_paths`"));
+        }
+        let backends = strings(item, "backends", &location);
+        if backends.is_empty() {
+            die(format!("{location}: `backends` must be non-empty"));
+        }
+        let lanes = strings(item, "lanes", &location);
+        let extra_nodes = strings(item, "extra_nodes", &location);
+        for node in &extra_nodes {
+            if !known_selection_node(nodes, node) {
+                die(format!("{location}: unknown portable DAG node `{node}`"));
+            }
+        }
+        rules.push(BackendRule {
+            id,
+            paths,
+            reverie_paths,
+            backends,
+            lanes,
+            extra_nodes,
+            tier,
+        });
+    }
+    rules
+}
+
+/// Literal directory prefix of a glob: the text before the first `*`.
+fn glob_literal_prefix(glob: &str) -> &str {
+    match glob.find('*') {
+        Some(index) => &glob[..index],
+        None => glob,
+    }
+}
+
+/// Whether a backend rule's Hermit paths can match files under a package root.
+fn rule_overlaps_root(rule: &BackendRule, root: &str) -> bool {
+    if rule.tier != "backend" {
+        return false;
+    }
+    rule.paths.iter().any(|glob| {
+        let prefix = glob_literal_prefix(glob).trim_end_matches('/');
+        prefix == root
+            || prefix.starts_with(&format!("{root}/"))
+            || root.starts_with(&format!("{prefix}/"))
+    })
+}
+
+/// Whether a reverie rule glob covers crate directory `dir` (relative to
+/// the reverie root, e.g. `reverie-kvm` or `experimental/reverie-sabre`).
+fn reverie_rule_covers_dir(rule: &BackendRule, dir: &str) -> bool {
+    rule.reverie_paths.iter().any(|pat| {
+        let base = pat.strip_suffix("/**").unwrap_or(pat);
+        match base.find('*') {
+            Some(index) => dir.starts_with(&base[..index]),
+            None => dir == base || dir.starts_with(&format!("{base}/")),
+        }
+    })
+}
+
+fn normalize_reverie_path(base: &str, rel: &str) -> String {
+    let mut parts: Vec<&str> = base.split('/').filter(|p| !p.is_empty()).collect();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
+/// Design choice (item 4 alternative): full `cargo metadata` derivation
+/// for the reverie workspace is disproportionate here (separate workspace,
+/// submodule may be absent in some checkouts), so multi-backend crates are
+/// tiered `core` in the policy and this check refuses any backend-tier
+/// rule whose crate's reverse-dependency closure spans backends outside
+/// that rule. Closure is read from the reverie crates' own `path =`
+/// dependency edges. Skipped when the submodule is not checked out.
+fn check_reverie_backend_closure(root: &Path, rules: &[BackendRule]) {
+    let reverie = root.join("reverie");
+    if !reverie.join("Cargo.toml").exists() {
+        return;
+    }
+    // crate dir (relative to reverie root) -> dependency crate dirs
+    let mut deps: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for parent in [reverie.clone(), reverie.join("experimental")] {
+        if let Ok(entries) = fs::read_dir(&parent) {
+            for entry in entries.flatten() {
+                if entry.path().join("Cargo.toml").exists() {
+                    dirs.push(entry.path());
+                }
+            }
+        }
+    }
+    // The `reverie` crate itself lives at reverie/reverie/.
+    for path in dirs {
+        let rel = path
+            .strip_prefix(&reverie)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = fs::read_to_string(path.join("Cargo.toml")).unwrap_or_default();
+        let mut crate_deps = BTreeSet::new();
+        for needle in text.split("path = \"").skip(1) {
+            if let Some(end) = needle.find('"') {
+                let target = normalize_reverie_path(&rel, &needle[..end]);
+                // Only sibling-crate directories count; file paths do not.
+                if target.split('/').count() <= 2 && !target.contains('.') {
+                    crate_deps.insert(target);
+                }
+            }
+        }
+        deps.insert(rel, crate_deps);
+    }
+    let backends_of = |dir: &str| -> BTreeSet<String> {
+        // Experimental tools (e.g. reverie-sabre-strace) consume many
+        // backends without being a backend runtime; only the sabre
+        // backend crate itself under experimental/ counts.
+        if dir.starts_with("experimental/") && dir != "experimental/reverie-sabre" {
+            return BTreeSet::new();
+        }
+        rules
+            .iter()
+            .filter(|rule| rule.tier == "backend" && reverie_rule_covers_dir(rule, dir))
+            .flat_map(|rule| rule.backends.iter().filter(|b| b.as_str() != "*").cloned())
+            .collect()
+    };
+    for rule in rules.iter().filter(|rule| rule.tier == "backend") {
+        for dir in deps.keys() {
+            if !reverie_rule_covers_dir(rule, dir) {
+                continue;
+            }
+            // Reverse closure: every crate that transitively depends on dir.
+            let mut closure = BTreeSet::from([dir.clone()]);
+            loop {
+                let mut changed = false;
+                for (crate_dir, crate_deps) in &deps {
+                    if crate_deps.iter().any(|dep| closure.contains(dep)) {
+                        changed |= closure.insert(crate_dir.clone());
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            let mut spanned: BTreeSet<String> = BTreeSet::new();
+            for member in &closure {
+                spanned.extend(backends_of(member));
+            }
+            let allowed: BTreeSet<String> = rule.backends.iter().cloned().collect();
+            if !spanned.is_subset(&allowed) {
+                die(format!(
+                    "{POLICY}: backend rule `{}` covers reverie crate `{dir}`, whose \
+                     reverse-dependency closure spans backends {spanned:?} outside \
+                     {allowed:?}; classify the crate as tier `core` (everything) instead",
+                    rule.id
+                ));
+            }
+        }
+    }
+}
+
+/// E2E bucket nodes that contain at least one DBT cell, derived from
+/// `ci/expected-e2e-plan.json` (cells with `backend == "dbt"` grouped by
+/// `category`). v1 has no hand-picked bucket list: if a category gains or
+/// loses its last DBT cell, the derived set follows. Each bucket is emitted
+/// in both its local and hosted spellings when the DAG knows either.
+fn dbt_bucket_nodes(root: &Path, nodes: &BTreeSet<String>) -> Vec<String> {
+    let plan = read_json(&root.join("ci/expected-e2e-plan.json"));
+    let mut categories = BTreeSet::new();
+    if let Some(cells) = plan["cells"].as_array() {
+        for cell in cells {
+            if cell["backend"].as_str() == Some("dbt") {
+                if let Some(category) = cell["category"].as_str() {
+                    categories.insert(category.replace('-', "_"));
+                }
+            }
+        }
+    }
+    if categories.is_empty() {
+        die("ci/expected-e2e-plan.json: no DBT cells; cannot derive DBT buckets");
+    }
+    let mut out = Vec::new();
+    for category in categories {
+        for node in [
+            format!("e2e.manifest_{category}"),
+            format!("e2e.manifest_{category}_on_host"),
+        ] {
+            if known_selection_node(nodes, &node) {
+                out.push(node);
+            }
+        }
+    }
+    out
+}
+
+fn backend_rule_json(rule: &BackendRule) -> Value {
+    json!({
+        "id": rule.id,
+        "paths": rule.paths,
+        "reverie_paths": rule.reverie_paths,
+        "backends": rule.backends,
+        "lanes": rule.lanes,
+        "extra_nodes": rule.extra_nodes,
+        "tier": rule.tier,
+    })
+}
+
 fn validate_path_footprints(policy: &Value, nodes: &BTreeSet<String>) {
     for (index, footprint) in policy["path_footprints"]
         .as_array()
@@ -532,6 +783,20 @@ fn generated_footprints(root: &Path) -> Value {
     let (packages, defaults) = load_packages(root, &metadata);
     let (all_nodes, dag_targets) = load_dag_targets(&dag, &packages, &defaults);
     let rules = load_rules(&policy, &packages, &all_nodes);
+    let mut backend_rules = load_backend_rules(&policy, &all_nodes);
+    // v1: the DBT route's E2E buckets are derived, never hand-picked.
+    let derived_dbt_buckets = dbt_bucket_nodes(root, &all_nodes);
+    for rule in &mut backend_rules {
+        if rule.id == "dbt" && rule.tier == "backend" {
+            for node in &derived_dbt_buckets {
+                if !rule.extra_nodes.contains(node) {
+                    rule.extra_nodes.push(node.clone());
+                }
+            }
+            rule.extra_nodes.sort();
+        }
+    }
+    check_reverie_backend_closure(root, &backend_rules);
     let package_paths = load_package_paths(&policy, &packages);
     validate_path_footprints(&policy, &all_nodes);
 
@@ -549,6 +814,23 @@ fn generated_footprints(root: &Path) -> Value {
         let rule = rules.get(&package.name);
         if let Some(rule) = rule {
             selected_nodes.extend(rule.nodes.iter().cloned());
+        }
+        // Coarse backend affinity: fold every overlapping backend rule's
+        // backends and extra nodes into this package's footprint so a
+        // backend-crate change (e.g. hermit-run-kvm) yields that backend's
+        // E2E cells. Footprints that already select every backend keep
+        // their `e2e_all` and gain no narrower affinity.
+        let mut backend_backends: BTreeSet<String> = rule
+            .map(|rule| rule.e2e_backends.clone())
+            .unwrap_or_default();
+        let backend_all = rule.is_some_and(|rule| rule.e2e_all);
+        if !backend_all {
+            for backend_rule in &backend_rules {
+                if rule_overlaps_root(backend_rule, &package.root) {
+                    selected_nodes.extend(backend_rule.extra_nodes.iter().cloned());
+                    backend_backends.extend(backend_rule.backends.iter().cloned());
+                }
+            }
         }
 
         let mut footprint = Map::new();
@@ -575,19 +857,13 @@ fn generated_footprints(root: &Path) -> Value {
             "nodes".into(),
             Value::Array(selected_nodes.into_iter().map(Value::String).collect()),
         );
-        if rule.is_some_and(|rule| rule.e2e_all) {
+        if backend_all {
             footprint.insert("e2e_all".into(), Value::Bool(true));
         }
-        if let Some(rule) = rule.filter(|rule| !rule.e2e_backends.is_empty()) {
+        if !backend_backends.is_empty() {
             footprint.insert(
                 "e2e_backends".into(),
-                Value::Array(
-                    rule.e2e_backends
-                        .iter()
-                        .cloned()
-                        .map(Value::String)
-                        .collect(),
-                ),
+                Value::Array(backend_backends.into_iter().map(Value::String).collect()),
             );
         }
         package_footprints.push(Value::Object(footprint));
@@ -618,6 +894,7 @@ fn generated_footprints(root: &Path) -> Value {
         "groups": {},
         "force_full": policy["force_full"].clone(),
         "ci_irrelevant": policy["ci_irrelevant"].clone(),
+        "backend_rules": backend_rules.iter().map(backend_rule_json).collect::<Vec<_>>(),
         "footprints": package_footprints
     })
 }
@@ -716,6 +993,20 @@ mod tests {
                 }
             }
         }
+        let backend_rules = load_backend_rules(&policy, &nodes);
+        assert!(backend_rules.iter().any(|rule| rule.id == "dbt"));
+        // v1 scope cut: no scoped kvm/ptrace/liteinst/sabre/e9patch routes.
+        for dropped in ["kvm", "ptrace", "liteinst", "sabre", "e9patch"] {
+            assert!(
+                !backend_rules.iter().any(|rule| rule.id == dropped),
+                "dropped v1 backend route {dropped} must not reappear"
+            );
+        }
+        assert!(
+            backend_rules
+                .iter()
+                .any(|rule| rule.id == "reverie-core" && rule.tier == "core")
+        );
         let shared_runtime = policy["package_rules"]
             .as_array()
             .unwrap()

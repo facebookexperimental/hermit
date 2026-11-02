@@ -27,9 +27,65 @@ use reverie_inguest::launcher::exec_stop::register_words;
 
 use super::packet;
 use super::runtime_binding::RetainedImage;
+use super::runtime_support::init_trial::ObservationPolicy;
 use super::runtime_support::init_trial::Trial;
 use super::runtime_support::init_trial::hello_consumer::HelloConsumer;
 use super::runtime_support::*;
+
+// Capture owns only output endpoints and bytes. The mapped root below still
+// owns all execution, admission, physical retirement and finalization.
+mod stdio_capture;
+pub(crate) use stdio_capture::CapturePolicy;
+use stdio_capture::CaptureRequest;
+pub(crate) use stdio_capture::VerificationCapture;
+pub(crate) use stdio_capture::run_verification as capture_verification;
+
+struct RunOutput<'a> {
+    records: detcore::detlog::ForwardedRecordSink,
+    observation: ObservationPolicy,
+    print_summary: bool,
+    summary_json: &'a Option<std::path::PathBuf>,
+}
+struct CapturedExecution<'a> {
+    request: &'a mut CaptureRequest,
+    forwarded: Option<&'a mut crate::run::ForwardedDetlogPlan>,
+}
+
+fn check_mapped_command(command: &Command) -> io::Result<()> {
+    // PreparedExec owns an ordinary clone, not Command's requested-PID launch.
+    // Refuse before resolving the image or consuming any stream/configuration.
+    need(
+        command.get_pid().is_none(),
+        "mapped-command-requested-pid-unsupported",
+    )
+}
+
+/// The same original singleton owner, with caller-retained stdio capture.
+/// The caller fulfils run's exact qualified-image and containment contract.
+unsafe fn run_captured(
+    command: Command,
+    config: detcore::Config,
+    retained: &RetainedImage,
+    output: RunOutput<'_>,
+    capture: &mut CaptureRequest,
+    forwarded: Option<&mut crate::run::ForwardedDetlogPlan>,
+) -> anyhow::Result<ExitStatus> {
+    // SAFETY: identical singleton owner, source and cleanup contract.
+    unsafe {
+        run_inner_with_capture(
+            command,
+            config,
+            retained,
+            output,
+            Some(CapturedExecution {
+                request: capture,
+                forwarded,
+            }),
+            #[cfg(all(test, feature = "mm-cancellation-test-support"))]
+            None,
+        )
+    }
+}
 
 /// # Safety
 /// This is the intermediate bounded valid-path experiment, not a landing
@@ -68,10 +124,59 @@ unsafe fn run_inner(
     records: detcore::detlog::ForwardedRecordSink,
     print_summary: bool,
     summary_json: &Option<std::path::PathBuf>,
+    #[cfg(all(test, feature = "mm-cancellation-test-support"))] cancellation: Option<
+        &mut mm_cancel::Cancellation,
+    >,
+) -> anyhow::Result<ExitStatus> {
+    // The ordinary direct experiment keeps its original finite observation,
+    // live wait, and all existing cancellation controls.
+    unsafe {
+        run_inner_with_capture(
+            command,
+            config,
+            retained,
+            RunOutput {
+                records,
+                observation: ObservationPolicy::Qualification,
+                print_summary,
+                summary_json,
+            },
+            None,
+            #[cfg(all(test, feature = "mm-cancellation-test-support"))]
+            cancellation,
+        )
+    }
+}
+
+unsafe fn run_inner_with_capture(
+    mut command: Command,
+    config: detcore::Config,
+    retained: &RetainedImage,
+    output: RunOutput<'_>,
+    execution: Option<CapturedExecution<'_>>,
     #[cfg(all(test, feature = "mm-cancellation-test-support"))] mut cancellation: Option<
         &mut mm_cancel::Cancellation,
     >,
 ) -> anyhow::Result<ExitStatus> {
+    check_mapped_command(&command)?;
+    let (mut capture, forwarded) = match execution {
+        Some(CapturedExecution { request, forwarded }) => (Some(request), forwarded),
+        None => (None, None),
+    };
+    let RunOutput {
+        records,
+        observation,
+        print_summary,
+        summary_json,
+    } = output;
+    let capture_deadline = capture.as_ref().and_then(|request| request.deadline);
+    if let Some(request) = capture.as_ref() {
+        need(
+            request.capture.is_none() && request.secondary.is_empty(),
+            "capture request reused",
+        )?;
+        request.check()?;
+    }
     // Resolve with the ordinary Command's current directory and exact PATH.
     let program = command.find_program()?;
     let arguments: Vec<OsString> = std::iter::once(command.get_arg0().to_owned())
@@ -90,6 +195,7 @@ unsafe fn run_inner(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    stdio_capture::check(capture_deadline)?;
     let global = Arc::new(runtime.block_on(
         <detcore::GlobalState as GlobalTool>::init_global_state(&config),
     ));
@@ -123,12 +229,16 @@ unsafe fn run_inner(
     let lease = super::packet_lease::PendingPacketLease::new()?;
     let runtime_file = memfd_bytes(image_bytes, true)?;
     let handoff_file = memfd_bytes(&[], false)?;
-    let (sender, receiver) = crate::run::RunOpts::open_forwarded_detlog_channel()?
-        .ok_or_else(|| rpc("actual DETLOG channel absent"))?;
+    let channel = match forwarded {
+        Some(plan) => Some(plan.open_mapped_in_container()?),
+        None => crate::run::RunOpts::open_forwarded_detlog_channel()?,
+    };
+    let (sender, receiver) = channel.ok_or_else(|| rpc("actual DETLOG channel absent"))?;
     let sender = UnixStream::from(sender);
     let receiver = UnixStream::from(receiver);
     receiver.set_nonblocking(true)?;
-    let mut trial = Trial::register_with_sink(receiver.as_fd().try_clone_to_owned()?, records);
+    let mut trial =
+        Trial::register_with_sink(receiver.as_fd().try_clone_to_owned()?, records, observation);
     // Independent SEQPACKET observer; the original DETLOG collector never
     // receives binary diagnostic frames. Both actual sender OFDs are retained.
     let (observer_sender, observer_receiver) =
@@ -149,6 +259,7 @@ unsafe fn run_inner(
     let mut unused = RetainedPhysical::empty(CleanupReceipt::default());
     let mut panic_payload = None;
     let setup = catch_unwind(AssertUnwindSafe(|| -> io::Result<_> {
+        stdio_capture::check(capture_deadline)?;
         let request = PreparedExec::new(
             &program,
             &arguments,
@@ -164,8 +275,33 @@ unsafe fn run_inner(
         )
         .map_err(rpc)?
         .with_ptrace_launch_facts();
+        let request = if capture.is_some() {
+            request.with_stdio(command.take_prepared_stdio()?)
+        } else {
+            request
+        };
+        stdio_capture::check(capture_deadline)?;
         physical.retain_spawn(ExecStop::spawn(request, physical.receipt.clone()));
-        let stop = physical.initial()?;
+        if let Some(request) = capture.as_deref_mut() {
+            let endpoints = physical
+                .initial
+                .as_mut()
+                .and_then(|stop| stop.take_parent_stdio())
+                .or_else(|| {
+                    physical
+                        .launch_failure
+                        .as_mut()
+                        .and_then(|failure| failure.take_parent_stdio())
+                });
+            // Transfer before any fallible registration or launch diagnostic.
+            request.retain(endpoints);
+        }
+        let stop = physical.initial()?; // Preserve the original launch error first.
+        if let Some(request) = capture.as_deref_mut() {
+            let _enter = runtime.enter();
+            request.register()?;
+            request.check()?;
+        }
         observed_pid = Some(stop.pid().as_raw());
         #[cfg(all(test, feature = "mm-cancellation-test-support"))]
         if let Some(cancel) = cancellation.as_mut() {
@@ -173,6 +309,7 @@ unsafe fn run_inner(
         }
         private_resource_diagnostic(stop.pid().as_raw(), "exec-stop");
         let captured = stop.capture_initial_inputs().map_err(rpc)?;
+        stdio_capture::check(capture_deadline)?;
         let admission = runtime.block_on(admit_with_observer(
             &mut admissions,
             &global,
@@ -260,6 +397,7 @@ unsafe fn run_inner(
         handoff_file.set_len(wire.bytes.len() as u64)?;
         handoff_file.sync_all()?;
         seal_memfd(&handoff_file)?;
+        stdio_capture::check(capture_deadline)?;
         Ok((wire, sealed, admission))
     }));
     let mut primary = match setup {
@@ -275,6 +413,7 @@ unsafe fn run_inner(
     };
     if let Some((wire, sealed, admission)) = bundle.as_ref() {
         let outcome = catch_unwind(AssertUnwindSafe(|| -> io::Result<ExitStatus> {
+            stdio_capture::check(capture_deadline)?;
             // SAFETY: same original held birth and complete retained leases.
             unsafe {
                 physical.prepare(Preparation {
@@ -384,7 +523,7 @@ unsafe fn run_inner(
                         unsafe {
                             hello.as_mut()
                                 .ok_or_else(|| rpc("actual hello services absent"))?
-                                .handover_status(&trial, mapped)
+                                .handover_status(&trial, mapped, observation.is_qualification())
                                 .await
                         }
                     }
@@ -393,15 +532,22 @@ unsafe fn run_inner(
                 let task = observer_task
                     .as_mut()
                     .ok_or_else(|| rpc("observer task absent"))?;
-                tokio::select! {
-                    result = &mut execution => result,
-                    result = task => {
-                        observer_joined = true;
-                        result.map_err(rpc)?.map_err(rpc)?;
-                        // EOF can race the actual terminal wait. It never
-                        // authorizes completion; await that same physical owner.
-                        execution.await
+                let original_execution = async {
+                    tokio::select! {
+                        result = &mut execution => result,
+                        result = task => {
+                            observer_joined = true;
+                            result.map_err(rpc)?.map_err(rpc)?;
+                            // EOF can race the actual terminal wait. It never
+                            // authorizes completion; await that same physical owner.
+                            execution.await
+                        }
                     }
+                };
+                if let Some(request) = capture.as_deref_mut() {
+                    request.drive(original_execution).await
+                } else {
+                    original_execution.await
                 }
             })
         }));
@@ -419,6 +565,8 @@ unsafe fn run_inner(
     // actual receipt confirms reap before any borrowed resources are released.
     cleanup_all(&mut physical, &mut unused, &mut panic_payload);
     let mut errors = Vec::new();
+    let capture_receipt = physical.receipt.clone(); // same receipt, no new owner
+    let mut capture_failure_join_complete = admissions.is_empty();
     if primary.is_err()
         && physical.receipt.snapshot().confirmed
         && let Some(admission) = admissions.first()
@@ -435,7 +583,7 @@ unsafe fn run_inner(
             Ok::<(), io::Error>(())
         });
         match cancelled {
-            Some(Ok(_)) => {}
+            Some(Ok(_)) => capture_failure_join_complete = true,
             Some(Err(error)) => errors.push(format!("actual owned RPC cancellation: {error}")),
             None => errors.push("actual owned RPC cancellation panicked".to_owned()),
         }
@@ -455,6 +603,7 @@ unsafe fn run_inner(
     drop(sender);
     drop(observer_sender);
     let mut dispatch = None;
+    let mut capture_services_closed = false;
     let closed = retain_unwind(&mut panic_payload, || {
         runtime.block_on(async {
             if let Some(observer) = observer.as_ref() {
@@ -512,8 +661,17 @@ unsafe fn run_inner(
             if let Some(hello) = hello.as_mut() {
                 match hello.close(&mut trial, primary.is_ok()).await {
                     Ok(reports) => {
-                        if primary.is_ok() && reports.detlog.is_empty() {
+                        capture_services_closed = true;
+                        if primary.is_ok() && reports.observation.required_records_absent() {
                             errors.push("actual complete DETLOG empty".to_owned());
+                        }
+                        if capture.is_some() {
+                            tracing::debug!(
+                                "MAPPED_FORWARDED_OBSERVATION messages={} bytes={} qualification={}",
+                                reports.observation.messages,
+                                reports.observation.bytes,
+                                observation.is_qualification(),
+                            );
                         }
                         if let Some(slot) = admissions
                             .iter_mut()
@@ -540,8 +698,9 @@ unsafe fn run_inner(
                 }
             } else {
                 // Setup/start failure still unregisters/drains the actual source.
-                if let Err(error) = trial.close().await {
-                    errors.push(format!("actual setup services: {error}"));
+                match trial.close().await {
+                    Ok(_) => capture_services_closed = true,
+                    Err(error) => errors.push(format!("actual setup services: {error}")),
                 }
             }
             for slot in &mut admissions {
@@ -572,6 +731,40 @@ unsafe fn run_inner(
     });
     if closed.is_none() {
         errors.push("actual service cleanup panicked".to_owned());
+    }
+    if let Some(request) = capture {
+        // Hello/Trial close has already joined the existing RPC/service owner.
+        // On failure, its original synchronous cancel intent + successful join
+        // must ALSO have completed. No collector poll can bridge that gap.
+        // Empty admissions means Trial::start was never reachable (it requires
+        // admissions.first_mut); successful Trial::close confirms no service.
+        let retired = capture_receipt.snapshot();
+        request.cleanup = Some(retired.clone()); // actual observation only
+        if retired.child_created
+            && retired.confirmed
+            && retired.terminal_status.is_some()
+            && (primary.is_ok() || capture_failure_join_complete)
+            && capture_services_closed
+            && admissions.iter().all(|slot| slot.drained)
+            && panic_payload.is_none()
+        {
+            let drained = retain_unwind(&mut panic_payload, || {
+                let state = request
+                    .capture
+                    .as_mut()
+                    .ok_or_else(|| rpc("actual capture absent after reap"))?;
+                runtime.block_on(state.finish_after_reap(&capture_receipt))
+            });
+            match drained {
+                Some(Ok(())) => {}
+                Some(Err(error)) => request.secondary.push(error),
+                None => request.secondary.push(rpc("capture final EOF panicked")),
+            }
+        } else {
+            request.secondary.push(rpc(
+                "capture EOF unproved: physical/RPC/service retirement incomplete",
+            ));
+        }
     }
     // Last sender is gone only after physical borrows ended. This is the real
     // inherited socket, not a byte-count substitute for EOF.
@@ -692,3 +885,27 @@ fn private_resource_diagnostic(pid: i32, phase: &str) {
 
 #[cfg(all(test, feature = "mm-cancellation-test-support"))]
 pub(super) mod mm_cancel;
+
+#[cfg(test)]
+mod command_admission_tests {
+    use super::*;
+
+    #[test]
+    fn mapped_command_refuses_requested_pid_without_resolving_the_program() {
+        // Deliberately not an executable: admission must precede resolution,
+        // package adoption, stdio consumption and all child/global setup.
+        let mut command = Command::new("/not-an-executable/mapped-command-control");
+        assert!(check_mapped_command(&command).is_ok());
+        command.pid(reverie::process::Pid::from_raw(123));
+        let error = check_mapped_command(&command).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            error.to_string(),
+            "mapped-command-requested-pid-unsupported"
+        );
+        assert_eq!(
+            command.get_pid(),
+            Some(reverie::process::Pid::from_raw(123))
+        );
+    }
+}

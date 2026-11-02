@@ -25,7 +25,7 @@ use std::process::ExitCode;
 use reverie_dbt_inventory::REVERIE_DBT_FILES;
 
 const CRATE_RELATIVE: &str = "reverie-dbt";
-const VENDORED_CRATE: &str = "shim/third-party/rust/vendor/reverie-dbt-0.5.3";
+const VENDORED_CRATE: &str = "shim/third-party/rust/vendor/reverie-dbt-0.5.4";
 const TARGET_NAME: &str = "reverie-dbt-0.5-materialized-manifest";
 const PRELUDE_LOAD: &str = "load(\"@prelude//rust:cargo_buildscript.bzl\", \"buildscript_run\")\n";
 const MATERIALIZED_LOAD: &str =
@@ -170,8 +170,24 @@ fn walk_regular_files(
     Ok(())
 }
 
+/// The tracked files Cargo packages, and so vendors. Cargo leaves out every
+/// directory below the crate root that holds its own Cargo.toml: that
+/// directory is a separate package, such as a test fixture crate. The count
+/// check above still covers every tracked file.
+fn cargo_packaged_files(tracked: Vec<String>) -> Vec<String> {
+    let nested_roots = tracked
+        .iter()
+        .filter_map(|relative| relative.strip_suffix("/Cargo.toml"))
+        .map(|directory| format!("{directory}/"))
+        .collect::<Vec<_>>();
+    tracked
+        .into_iter()
+        .filter(|relative| !nested_roots.iter().any(|root| relative.starts_with(root)))
+        .collect()
+}
+
 fn verified_files(root: &Path) -> Result<Vec<String>, String> {
-    let tracked = tracked_reverie_files(root)?;
+    let tracked = cargo_packaged_files(tracked_reverie_files(root)?);
     let vendor_root = root.join(VENDORED_CRATE);
     let mut vendored = Vec::new();
     walk_regular_files(&vendor_root, &vendor_root, &mut vendored)
@@ -247,7 +263,7 @@ fn render_target(files: &[String]) -> String {
         target.push_str(&starlark_string(relative));
         target.push_str(": ");
         target.push_str(&starlark_string(&format!(
-            "vendor/reverie-dbt-0.5.3/{relative}"
+            "vendor/reverie-dbt-0.5.4/{relative}"
         )));
         target.push_str(",\n");
     }
@@ -422,6 +438,33 @@ mod tests {
 
     fn files() -> Vec<String> {
         vec!["Cargo.toml".to_owned(), "src/lib.rs".to_owned()]
+    }
+
+    #[test]
+    fn nested_packages_are_left_out_like_cargo_vendoring() {
+        let tracked = [
+            "Cargo.toml",
+            "build.rs",
+            "src/lib.rs",
+            "tests/fixtures/runtime/Cargo.toml",
+            "tests/fixtures/runtime/src/lib.rs",
+            "tests/fixtures/runtime-notes.md",
+            "tests/fixtures/plain.c",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        assert_eq!(
+            cargo_packaged_files(tracked),
+            [
+                "Cargo.toml",
+                "build.rs",
+                "src/lib.rs",
+                "tests/fixtures/runtime-notes.md",
+                "tests/fixtures/plain.c",
+            ]
+            .map(str::to_owned)
+            .to_vec()
+        );
     }
 
     #[test]

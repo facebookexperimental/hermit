@@ -203,82 +203,47 @@ impl Replayer {
         }
     }
 
-    /// This function look-aheads into following instruction to determine if
-    /// an explicit timer preemption is required while replaying. This is required when
-    /// the original run schedule was modified before replaying which should be a valid
-    /// usecase for hermit analyze. Returned LogicalTime is RELATIVE to the corresponding thread localtime
+    /// Whether the replay must stop the thread of `next`, a branch event, at
+    /// its branch count with a PMU timer, and if so the count, relative to the
+    /// thread's clock.
+    ///
+    /// A timer preemption records its branches alone, with the RIP the PMU
+    /// stopped at: the stop comes right after a branch, so the recording gives
+    /// it no OtherInstructions event (since 832ca40b7; before it, the stop had
+    /// one). Only then does the replay need the timer, to stop the thread
+    /// where the recording did, even when the thread is picked again and its
+    /// next check-in follows after no further branch. The fragments
+    /// split-branches and `hermit analyze` cut a branch event into carry no
+    /// RIP, but are followed directly by more branches or by another thread's
+    /// event, which marks them as stops too.
+    ///
+    /// Branches without a RIP followed by the thread's OtherInstructions
+    /// reached a check-in after them: a syscall, a trapped instruction, a
+    /// signal or an exec. The thread reaches that check-in on its own, and a
+    /// context switch the schedule puts after it happens there. A stop on the
+    /// branch count would land on the instructions between the last branch
+    /// and the check-in and end the slice there, with a scheduler turn the
+    /// recording does not have.
     fn resolve_time_to_run(&self, next: &SchedEvent) -> Option<LogicalTime> {
-        let cursor = &self.cursor;
-
-        if let Some(next_time_slice_in_brances) =
-            match (next, cursor.peek_nth(1), cursor.peek_nth(2)) {
-                (
-                    SchedEvent {
-                        op: Op::Branch,
-                        count,
-                        ..
-                    },
-                    Some(SchedEvent {
-                        op: Op::OtherInstructions,
-                        ..
-                    }),
-                    Some(SchedEvent { op: Op::Branch, .. }),
-                )
-                | (
-                    // this is currently impossible because we always have OtherInstruction
-                    // following a branch but this doesn't have to be the case and it might
-                    // be better to avoid this behavior in the future
-                    SchedEvent {
-                        op: Op::Branch,
-                        count,
-                        ..
-                    },
-                    Some(SchedEvent { op: Op::Branch, .. }),
-                    _,
-                ) => {
-                    trace!("branch count to set the next_timeslice: {}", count);
-                    Some(count)
-                }
-                (
-                    SchedEvent {
-                        op: Op::Branch,
-                        count,
-                        dettid: tid,
-                        ..
-                    },
-                    Some(SchedEvent {
-                        op: Op::OtherInstructions,
-                        ..
-                    }),
-                    Some(SchedEvent {
-                        dettid: next_tid, ..
-                    }),
-                )
-                | (
-                    SchedEvent {
-                        op: Op::Branch,
-                        count,
-                        dettid: tid,
-                        ..
-                    },
-                    Some(SchedEvent {
-                        dettid: next_tid, ..
-                    }),
-                    _,
-                ) if tid != next_tid => {
-                    trace!(
-                        "branch count to set before a context switch event: {}",
-                        count
-                    );
-                    Some(count)
-                }
-
-                _ => None,
-            }
-        {
-            return Some(LogicalTime::from_rcbs(*next_time_slice_in_brances as u64));
-        }
-        None
+        let SchedEvent {
+            op: Op::Branch,
+            count,
+            dettid,
+            end_rip,
+            ..
+        } = next
+        else {
+            return None;
+        };
+        let timer_preemption = end_rip.is_some()
+            || self
+                .cursor
+                .peek_nth(1)
+                .is_some_and(|following| following.op == Op::Branch || following.dettid != *dettid);
+        timer_preemption.then(|| {
+            trace!("branch count to stop at before the next event: {}", count);
+            LogicalTime::from_rcbs(u64::from(*count))
+        })
     }
 
     fn pop_next(&mut self) -> Option<SchedEvent> {
@@ -644,14 +609,15 @@ mod tests {
         );
     }
 
+    /// A timer preemption the thread runs on from (its branches followed by
+    /// more of its branches) is replayed with a stop on the branch count.
     #[test]
     fn test_respect_branch_count() {
         let mut b = builder::SchedTestBuilder::new();
         let schedule = vec![
             b.other(SOME_RIP, tid(3)), //current instruction
             b.branch(123, tid(3)),     // next to respect branches
-            b.other(SOME_RIP, tid(3)),
-            b.branch(1, tid(5)),
+            b.branch(1, tid(3)),
         ];
         let mut replayer = Replayer::new(schedule.clone());
         assert_eq!(
@@ -660,13 +626,14 @@ mod tests {
         );
     }
 
+    /// A timer preemption that switched threads (its branches followed by
+    /// another thread's event) is replayed with a stop on the branch count.
     #[test]
     fn test_respect_branch_context_switch() {
         let mut b = builder::SchedTestBuilder::new();
         let schedule = vec![
             b.other(SOME_RIP, tid(3)), //current instruction
             b.branch(123, tid(3)),     // next to respect branches
-            b.other(SOME_RIP, tid(3)),
             b.syscall_post(Sysno::exit, SOME_RIP, tid(5)),
         ];
         let mut replayer = Replayer::new(schedule.clone());
@@ -674,6 +641,54 @@ mod tests {
             replayer.observe_event(&schedule[0]),
             ReplayAction::Continue(Some(LogicalTime::from_rcbs(123)))
         );
+    }
+
+    /// A timer stop the recording gave its RIP keeps its stop when the thread
+    /// was picked again and reached its next check-in after no further
+    /// branch: its OtherInstructions follows directly.
+    #[test]
+    fn a_timer_stop_with_its_rip_keeps_its_stop_before_the_threads_check_in() {
+        let mut b = builder::SchedTestBuilder::new();
+        let schedule = vec![
+            b.other(SOME_RIP, tid(3)),
+            SchedEvent {
+                end_rip: detcore_model::schedule::InstructionPointer::new(SOME_RIP),
+                ..b.branch(123, tid(3))
+            },
+            b.other(SOME_RIP, tid(3)),
+            b.syscall_pre(Sysno::mmap, SOME_RIP, tid(3)),
+        ];
+        let mut replayer = Replayer::new(schedule.clone());
+        assert_eq!(
+            replayer.observe_event(&schedule[0]),
+            ReplayAction::Continue(Some(LogicalTime::from_rcbs(123)))
+        );
+    }
+
+    /// Branches the recording followed with the thread's OtherInstructions
+    /// reached a check-in, which the replayed thread reaches on its own: no
+    /// stop on their count, whether the schedule switches threads after the
+    /// check-in or the thread runs on.
+    #[test]
+    fn branches_before_a_recorded_check_in_get_no_stop() {
+        for switches in [true, false] {
+            let mut b = builder::SchedTestBuilder::new();
+            let mut schedule = vec![
+                b.other(SOME_RIP, tid(3)),
+                b.branch(123, tid(3)),
+                b.other(SOME_RIP, tid(3)),
+            ];
+            schedule.push(if switches {
+                b.syscall_post(Sysno::exit, SOME_RIP, tid(5))
+            } else {
+                b.branch(1, tid(3))
+            });
+            let mut replayer = Replayer::new(schedule.clone());
+            assert_eq!(
+                replayer.observe_event(&schedule[0]),
+                ReplayAction::Continue(None)
+            );
+        }
     }
 
     #[test]

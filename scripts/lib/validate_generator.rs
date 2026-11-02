@@ -305,9 +305,22 @@ pub(crate) fn generated_focused_compat_partition(
             vec!["compatprep.hermit_release".into()],
             1200,
             7200,
-            9 * 1024 * 1024 * 1024,
+            // 16 GiB at eight jobs, compatprep.hermit_release's cap for the
+            // same width; 9 GiB was sized for one job.
+            16 * 1024 * 1024 * 1024,
         );
         install.labels = vec![label.into()];
+        // Eight cores, as compatprep.hermit_release: dagrun hands a light
+        // node one core and exports CARGO_BUILD_JOBS=1, and on 2026-10-26 a
+        // fresh checkout's three single-job release builds (detcore-dbt 5 m
+        // 31 s, the Hermit set 10 m 53 s, then stage-detcore-liteinst's) ran
+        // past the 1,200 s wall cap.
+        // The width reaches the builds through CARGO_BUILD_JOBS, never a
+        // trailing -j, which would land on the final `test -x`.
+        install.hint.classification = dagrun::model::StepClass::CpuBound;
+        install.hint.preferred_inner_jobs = Some(8);
+        install.jobs_flag = Some(String::new());
+        install.jobs_env = Some("CARGO_BUILD_JOBS".into());
         install.description = format!(
             "Runs `cargo build --release --locked -p detcore-dbt`, then a release build of hermit with third-party-backends together with detcore-dbt, its shared object detcore-dbt-cdylib, detcore-sabre and hermit-install, both through ci/run-with-reverie-dbt-budget.sh (which sets Cargo's job count from the calibrated DBT build budget), then finalizes the ordinary Detcore preload with `target/release/stage-detcore-liteinst --git target` in the existing liteinst-runtime profile and unchanged constructor/source proof, and finally `test -x` on target/install_pkg/rsrcs/e9patch and e9tool. The {namespace} probes run the host release Hermit built by compatprep.hermit_release, which finds its packaged resources, the e9patch and e9tool binaries among them, through target/install_pkg; this node stages that tree for the e9patch-compat-only profile. If hermit-install stops staging e9tool, the final `test -x` fails here instead of in every probe."
         );

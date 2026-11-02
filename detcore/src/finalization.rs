@@ -27,6 +27,21 @@ impl std::error::Error for TerminalReplayRefusal {
     }
 }
 
+/// Priority-history replay of a callback-annotated record ended with recorded
+/// checkpoints unconsumed (`Config::annotated_priority_replay`). Constructed
+/// only by the scheduler's terminal summary, after the record it re-records
+/// is flushed; the run ends as a policy refusal.
+#[derive(Debug)]
+pub struct PriorityHistoryRefusal(pub(crate) String);
+
+impl fmt::Display for PriorityHistoryRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "terminal replay refusal: {}", self.0)
+    }
+}
+
+impl std::error::Error for PriorityHistoryRefusal {}
+
 /// An earlier error plus a later finalization failure. Only the primary is in
 /// the cause chain: a secondary policy refusal must not reclassify an I/O or
 /// backend failure. Both full diagnostics remain available through Display.

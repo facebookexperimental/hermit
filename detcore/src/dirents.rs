@@ -420,8 +420,12 @@ impl DirectoryOrder {
 /// Like the kernel's file position, the stream is shared by every descriptor
 /// that aliases the open file description through `dup` or `fork`.
 ///
-/// A descriptor Detcore does not track (one received through `SCM_RIGHTS`, for
-/// example) can alias the same open file and read it from the kernel position.
+/// A descriptor Detcore does not track (one received through `SCM_RIGHTS` and
+/// not recorded, `Detcore::record_received_descriptors`) can alias the same
+/// open file and read it from the kernel position. A received descriptor
+/// that Detcore records or discovers is a second model of the open file, with
+/// a stream and position of its own, even where the receiving process holds
+/// the original (<https://github.com/rrnewton/hermit/issues/4670>).
 /// The stream keeps that position where such a reader gets every entry the
 /// stream has not returned (see [`DirectoryStream::kernel_target`]). Such a
 /// reader can also get entries the stream already returned, which Linux never

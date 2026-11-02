@@ -17,9 +17,14 @@
 #[cfg(feature = "liteinst")]
 reverie_liteinst::declare_legacy_tool_backing!();
 
+#[cfg(all(test, feature = "dbt"))]
+#[path = "../tests/common/dbt_placement_probe.rs"]
+mod dbt_placement_probe;
+
 mod backend_stats;
 pub mod build_info;
 pub mod canonical_verdict;
+pub mod chaos_timeslice;
 mod chroot;
 use hermit_record_format::consts;
 pub mod logdiff_report;
@@ -29,6 +34,7 @@ pub mod e9patch;
 mod error;
 use hermit_record_format::event;
 use hermit_record_format::event_stream;
+pub mod gdbserver;
 pub mod happens_before;
 pub mod host_input_change;
 mod id;
@@ -443,6 +449,8 @@ use goblin::elf::header;
 use goblin::elf::section_header;
 pub use id::Id;
 use metadata::Metadata;
+pub use metadata::RecordOptions;
+pub use metadata::RecordedSchedule;
 pub use ptrace_completion::HermitCleanupStage;
 pub use ptrace_completion::HermitCleanupUnconfirmed;
 pub use ptrace_completion::HermitPtraceFailure;
@@ -1253,6 +1261,54 @@ pub fn scheduler_owns_guest_pid_namespace() -> bool {
 /// every route, whatever [`in_guest_signal_delivery_gate`] answers.
 #[cfg(feature = "liteinst")]
 const IN_GUEST_RUNTIME_DELIVERS_SIGNALS: bool = false;
+
+/// Set only in a test child that re-executed this test binary as PID 1 of its
+/// own user and PID namespaces (`in_guest_delivery_harness`, design D60): the
+/// gate's set points then take the runtime as delivering signals, so the dark
+/// 3c.1 mechanisms run end to end before the flip. No shipped build has it.
+#[cfg(all(test, feature = "liteinst"))]
+static FORCE_IN_GUEST_DELIVERY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the in-guest runtime delivers signals itself, at the gate's set
+/// points: [`IN_GUEST_RUNTIME_DELIVERS_SIGNALS`], or, in a test child,
+/// [`FORCE_IN_GUEST_DELIVERY`].
+#[cfg(feature = "liteinst")]
+fn runtime_delivers_signals() -> bool {
+    #[cfg(test)]
+    if FORCE_IN_GUEST_DELIVERY.load(std::sync::atomic::Ordering::Acquire) {
+        return true;
+    }
+    IN_GUEST_RUNTIME_DELIVERS_SIGNALS
+}
+
+/// How many launches in this test process computed the in-guest delivery
+/// gate on at one of its two set points. The forced-gate harness
+/// (`in_guest_delivery_harness`, design D60) reads it after a row's run, so
+/// that the row proves its own run was gated, not only that the force flag
+/// was set: another conjunct of [`in_guest_signal_delivery_gate`] turning
+/// the gate off would otherwise leave a row whose output Linux also prints
+/// passing with the gate off. Test builds only.
+#[cfg(all(test, feature = "liteinst"))]
+static GATED_LAUNCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The line a test child prints when a set point computes the gate on, for a
+/// row whose run ends the process (a stopping refusal) before it can read
+/// [`GATED_LAUNCHES`]. Test builds only.
+#[cfg(all(test, feature = "liteinst"))]
+const GATED_LAUNCH_WITNESS: &str = "IN-GUEST-DELIVERY-GATE-ON";
+
+/// The delivery gate as a set point computed it, recorded in test builds
+/// (`GATED_LAUNCHES`, `GATED_LAUNCH_WITNESS`) when on.
+#[cfg(feature = "liteinst")]
+fn record_delivery_gate(gate: bool) -> bool {
+    #[cfg(test)]
+    if gate {
+        GATED_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        println!("{GATED_LAUNCH_WITNESS}");
+    }
+    gate
+}
 
 /// The in-guest delivery gate (`detcore::Config::in_guest_signal_delivery`,
 /// D35 of the A5 step 3c design) for a run of `backend` on Hermit's default
@@ -3112,7 +3168,7 @@ async fn run_sabre(
     // The plugin is a separate artifact in the same target directory, so it can
     // be stale without looking it. Its check before connecting names the mismatch
     // instead of failing to decode Config or a later DetTime request field.
-    // See detcore_model::config_wire_fingerprint.
+    // See detcore::config_wire_fingerprint.
     setting(
         detcore::CONFIG_FINGERPRINT_ENV,
         OsStr::new(&detcore::config_wire_fingerprint()),
@@ -3295,6 +3351,9 @@ async fn run_sabre(
         backend_stats::request(print_summary_to_json_file),
         &stats,
     );
+    // SaBRe's plugin starts after the guest's dynamic loader, whose syscalls
+    // the histogram therefore misses.
+    global.note_syscall_observation_gap(detcore::SyscallObservationGap::InProcessRuntimeStart);
     let finalized = global
         .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
         .await;
@@ -3775,9 +3834,7 @@ async fn run_kvm(
     let envp = envp.iter().map(String::as_str).collect::<Vec<_>>();
 
     let setup_started = Instant::now();
-    // `prepare_backend_config` already copied `KvmBackend::capabilities()`,
-    // which reports the backend's own CPUID table and that, of the madvise
-    // advice with guest-visible semantics, it implements only MADV_DONTNEED.
+    // `prepare_backend_config` already copied `KvmBackend::capabilities()`.
     // KVM does not enter Hermit's UTS namespace, so Detcore must provide the
     // same synthetic identity that the namespace-backed ptrace path exposes.
     // TODO-HUMAN-REVIEW(PR-998): Review KVM UTS namespace parity.
@@ -3812,6 +3869,21 @@ async fn run_kvm(
     // a second copy of the program in host memory for the whole run: 75 MB
     // for node (https://github.com/rrnewton/reverie/issues/1063).
     drop(image);
+    // The placeholder directory Detcore serves `/proc` and the descriptor
+    // directories on (`DetConfig::directory_placeholder`, a container's
+    // empty read-only tmpfs at `/proc/fs/nfsd`): the executor reaches it only
+    // by Detcore's own open and stat of that exact path, and hides it from
+    // every other route a guest could take to it (a symbolic link it makes, a
+    // path relative to its working directory) with ENOENT, as Detcore hides
+    // `/proc/fs`, so that no answer of the tmpfs reaches the guest
+    // (https://github.com/rrnewton/hermit/issues/4781).
+    if let Some(placeholder) = config.directory_placeholder.as_deref() {
+        backend
+            .reserve_tool_directory(placeholder)
+            .map_err(|error| {
+                anyhow!("failed to reserve the KVM placeholder directory {placeholder:?}: {error}")
+            })?;
+    }
     // The KVM backend defaults to Tool-owned guest threads: CLONE_THREAD
     // workers are driven through the Detcore tool loop and their futex/CLEARTID
     // synchronization routes to Detcore, matching the golden ptrace model
@@ -3920,421 +3992,6 @@ mod kvm_execution_tests;
 #[cfg(feature = "dbt")]
 fn dbt_client_thread_start_failed(status: &std::process::ExitStatus) -> bool {
     status.code() == Some(reverie_dbt::CLIENT_THREAD_START_FAILURE_EXIT_CODE)
-}
-
-/// Keys that `HERMIT_DBT_DETCONFIG` still carries although [`DetConfig`] no
-/// longer has the switches they named. Each entry is the key, its fixed value,
-/// and the key it preceded in the old field order.
-///
-/// These are serialization constants. Nothing reads them back: the admitted
-/// DBT standalone path decodes the variable with
-/// [`detcore::decode_backend_config_json`], whose legacy reader ignores these
-/// keys. The values are the only ones the deleted switches ever took on any
-/// backend.
-const LEGACY_DBT_DETCONFIG_KEYS: [(&str, bool, &str); 3] = [
-    (
-        "use_thread_local_clock_reads",
-        false,
-        "detect_host_clock_futex_timeouts",
-    ),
-    (
-        "backend_serializes_fork_children",
-        false,
-        "backend_tracks_process_children",
-    ),
-    (
-        "backend_dispatches_thread_tools",
-        true,
-        "backend_tracks_process_children",
-    ),
-];
-
-/// Serialize `config` for the DBT runtime's `HERMIT_DBT_DETCONFIG` variable.
-///
-/// This is not plain `serde_json::to_string` because the variable sits in the
-/// guest's own environment. A guest can read it through `getenv`, `printenv`
-/// or `/proc/self/environ`, so its bytes are guest-visible. Two later changes
-/// to [`DetConfig`] would otherwise have changed what every DBT guest
-/// observes, and each is undone here:
-///
-/// - The backend facts moved into [`DetConfig::backend`].
-///   [`detcore::to_legacy_backend_json`] writes them back out as the fifteen
-///   separate keys they were, at the position the object carried them.
-/// - Three always-constant switches were deleted, which would have shortened
-///   the variable by 117 bytes. The keys in `LEGACY_DBT_DETCONFIG_KEYS` are
-///   re-inserted at their old positions.
-///
-/// When the legacy keys express every backend capability exactly, the output
-/// is byte-identical to what the same config produced before either change.
-/// That is pinned by golden bytes in the tests below. Otherwise a versioned
-/// envelope carries the exact capabilities alongside the legacy config.
-///
-/// Coordinated DBT startup receives the authoritative typed Config through the
-/// RPC handshake. This JSON remains guest-visible and supplies the admitted
-/// standalone fallback, so its representable bytes still need preservation.
-/// Remove this shim only when that variable no longer reaches the guest.
-#[doc(hidden)]
-pub fn dbt_detconfig_json(config: &DetConfig) -> serde_json::Result<String> {
-    let legacy = insert_legacy_dbt_detconfig_keys(&detcore::to_legacy_backend_json(config)?)?;
-    detcore::encode_backend_config_json(legacy, config.backend)
-}
-
-/// Re-insert [`LEGACY_DBT_DETCONFIG_KEYS`] into a serialized [`DetConfig`].
-///
-/// The insertion works on the parsed top-level object, never on substrings,
-/// so string values that happen to contain a key name cannot move it. It
-/// refuses, rather than guessing, when an anchor key is missing or repeated or
-/// when a legacy key is already present.
-fn insert_legacy_dbt_detconfig_keys(serialized: &str) -> serde_json::Result<String> {
-    use serde::de::MapAccess;
-    use serde::ser::Error as _;
-    use serde::ser::SerializeMap;
-    use serde_json::value::RawValue;
-
-    /// The top-level members of a JSON object in document order, each value
-    /// kept as its exact serialized bytes.
-    struct Members<'a>(Vec<(&'a str, &'a RawValue)>);
-
-    impl<'de> serde::Deserialize<'de> for Members<'de> {
-        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            struct MembersVisitor;
-            impl<'de> serde::de::Visitor<'de> for MembersVisitor {
-                type Value = Members<'de>;
-                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    formatter.write_str("a serialized Detcore config object")
-                }
-                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                    let mut members = Vec::new();
-                    while let Some(member) = map.next_entry()? {
-                        members.push(member);
-                    }
-                    Ok(Members(members))
-                }
-            }
-            deserializer.deserialize_map(MembersVisitor)
-        }
-    }
-
-    impl serde::Serialize for Members<'_> {
-        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            let mut map = serializer.serialize_map(None)?;
-            for (key, value) in &self.0 {
-                for (legacy_key, fixed_value, anchor) in LEGACY_DBT_DETCONFIG_KEYS {
-                    if anchor == *key {
-                        map.serialize_entry(legacy_key, &fixed_value)?;
-                    }
-                }
-                map.serialize_entry(key, value)?;
-            }
-            map.end()
-        }
-    }
-
-    let members: Members<'_> = serde_json::from_str(serialized)?;
-    for (legacy_key, _, anchor) in LEGACY_DBT_DETCONFIG_KEYS {
-        let anchors = members.0.iter().filter(|(key, _)| *key == anchor).count();
-        if anchors != 1 {
-            return Err(serde_json::Error::custom(format!(
-                "cannot place legacy DBT config key {legacy_key:?}: its anchor key {anchor:?} \
-                 appears {anchors} times, expected exactly once"
-            )));
-        }
-        if members.0.iter().any(|(key, _)| *key == legacy_key) {
-            return Err(serde_json::Error::custom(format!(
-                "legacy DBT config key {legacy_key:?} is already present; it must come only \
-                 from the fixed legacy table"
-            )));
-        }
-    }
-    serde_json::to_string(&members)
-}
-
-#[cfg(test)]
-mod dbt_detconfig_tests {
-    use std::path::PathBuf;
-
-    use clap::Parser;
-    use detcore_model::config::MountInfoRootRewrite;
-
-    use super::Backend;
-    use super::DetConfig;
-    use super::dbt_detconfig_json;
-    use super::insert_legacy_dbt_detconfig_keys;
-    use super::prepare_backend_config;
-
-    /// `HERMIT_DBT_DETCONFIG` bytes for each config below, captured with
-    /// `serde_json::to_string` from a build of
-    /// 806cf2fa38d13b806195d54aeba22d282d79f33d, which still had the legacy
-    /// switches. Any later change to `DetConfig`'s serialized fields also
-    /// changes this guest-visible variable, so this test is meant to fail on
-    /// it and make that change a deliberate one.
-    ///
-    /// Two deliberate changes since that capture: the empty
-    /// `fdinfo_unlisted_mount_ids` key was renamed `mount_id_assignment_order`
-    /// when Detcore began numbering mount IDs in first-observation order
-    /// (RECORD_VERSION 0x122), and the `proc_level` key was added by the
-    /// `/proc` levels (https://github.com/rrnewton/hermit/issues/4266), whose
-    /// default is `Minimal`. Every other byte is the 806cf2fa output.
-    const GOLDEN: [(&str, &str); 3] = [
-        (
-            "default",
-            include_str!("../tests/fixtures/dbt/detconfig-806cf2fa-default.json"),
-        ),
-        (
-            "dbt",
-            include_str!("../tests/fixtures/dbt/detconfig-806cf2fa-dbt.json"),
-        ),
-        (
-            "rich_dbt",
-            include_str!("../tests/fixtures/dbt/detconfig-806cf2fa-rich_dbt.json"),
-        ),
-    ];
-
-    /// `Config::default()` with its three environment-backed fields
-    /// (`HERMIT_EPOCH`, `HERMIT_PRNG`, `HERMIT_SCHED_SEED`) pinned, so the
-    /// result does not depend on the test process's environment.
-    fn env_free(epoch: &str, seed: &str) -> DetConfig {
-        let mut config = DetConfig::parse_from(["hermit", epoch, seed, "--sched-seed=0"]);
-        config.sched_seed = None;
-        config
-    }
-
-    fn default_config() -> DetConfig {
-        env_free("--epoch=2026-01-01T00:00:00Z", "--seed=0")
-    }
-
-    /// Non-default values in fields that serialize as strings, floats,
-    /// options, and nested arrays. The path holds legacy anchor key names, so
-    /// a substring-based insertion would put a key inside a string value.
-    fn rich_config() -> DetConfig {
-        let mut config = env_free("--epoch=2000-12-31T23:59:59Z", "--seed=7");
-        config.rng_seed = Some(13);
-        config.sched_seed = Some(11);
-        config.clock_multiplier = Some(1.5);
-        config.chaos = true;
-        config.record_preemptions_to = Some(PathBuf::from(
-            "/tmp/a,\"detect_host_clock_futex_timeouts\":true,\"backend_tracks_process_children\":{",
-        ));
-        config.mountinfo_root_rewrites = vec![MountInfoRootRewrite {
-            raw_mount_id: 41,
-            deterministic_root: b"/".to_vec(),
-            raw_root_prefix: Some(b"/tmp/x".to_vec()),
-            deterministic_root_prefix: Some(b"/tmp".to_vec()),
-            raw_mountpoint_prefix: None,
-            deterministic_mountpoint_prefix: None,
-        }];
-        config.stacktrace_event = vec![(3, Some(PathBuf::from("/s")))];
-        config
-    }
-
-    fn cases() -> [(&'static str, DetConfig); 3] {
-        [
-            ("default", default_config()),
-            (
-                "dbt",
-                prepare_backend_config(default_config(), Backend::Dbt),
-            ),
-            (
-                "rich_dbt",
-                prepare_backend_config(rich_config(), Backend::Dbt),
-            ),
-        ]
-    }
-
-    #[test]
-    fn default_case_is_config_default_with_pinned_environment_fields() {
-        let pinned = default_config();
-        let from_default = DetConfig {
-            epoch: pinned.epoch,
-            seed: pinned.seed,
-            sched_seed: pinned.sched_seed,
-            ..DetConfig::default()
-        };
-        assert_eq!(
-            serde_json::to_string(&from_default).unwrap(),
-            serde_json::to_string(&pinned).unwrap()
-        );
-    }
-
-    #[test]
-    fn dbt_detconfig_matches_806cf2fa_bytes() {
-        for ((name, mut config), (golden_name, golden)) in cases().into_iter().zip(GOLDEN) {
-            // Keep the historical capability value as well as its byte oracle.
-            // Current DBT descriptor facts need the versioned transport below.
-            config.backend.tool_shares_guest_descriptor_table = false;
-            config.backend.rediscovers_descriptors_after_exec = false;
-            // These three were `Config` fields, false unless the host set them
-            // for the backend, until they became stated capabilities.
-            config.backend.supports_blocked_wait_signal_interruption = false;
-            config.backend.delivers_preemption_timer_events = false;
-            config.backend.runs_guest_code_between_injections = false;
-            assert_eq!(name, golden_name);
-            let encoded = dbt_detconfig_json(&config).unwrap();
-            assert_eq!(
-                encoded, golden,
-                "HERMIT_DBT_DETCONFIG for the {name} config differs from the 806cf2fa bytes"
-            );
-        }
-    }
-
-    /// The DBT standalone fallback decodes the variable with
-    /// `detcore::decode_backend_config_json` and falls back to its default
-    /// config on a parse error. The three deleted switches' keys must be
-    /// accepted and ignored, and the fifteen backend keys must decode back to
-    /// the backend facts, so the runtime sees exactly the config that was
-    /// encoded.
-    #[test]
-    fn dbt_detconfig_decodes_to_the_encoded_config() {
-        for (name, config) in cases() {
-            let encoded = dbt_detconfig_json(&config).unwrap();
-            let decoded = detcore::decode_backend_config_json(&encoded)
-                .unwrap_or_else(|error| panic!("{name}: DBT config does not decode: {error}"));
-            assert_eq!(
-                serde_json::to_string(&decoded).unwrap(),
-                serde_json::to_string(&config).unwrap(),
-                "{name}: decoded config differs from the encoded one"
-            );
-        }
-    }
-
-    #[test]
-    fn current_dbt_uses_exact_descriptor_facts_without_host_timed_turns() {
-        let config = prepare_backend_config(default_config(), Backend::Dbt);
-        assert!(config.backend.tool_shares_guest_descriptor_table);
-        assert!(config.backend.rediscovers_descriptors_after_exec);
-        assert!(!config.backend.internal_pipe_turns_are_host_timed);
-        assert!(!config.backend.loopback_pollers_yield_to_peers);
-        let encoded = dbt_detconfig_json(&config).unwrap();
-        assert!(detcore::from_legacy_backend_json(&encoded).is_err());
-        let decoded = detcore::decode_backend_config_json(&encoded).unwrap();
-        assert_eq!(decoded.backend, reverie::BackendCapabilities::DBT);
-        assert_eq!(decoded.backend, config.backend);
-    }
-
-    #[test]
-    fn dbt_detconfig_keeps_descriptor_facts_independent() {
-        // Exercise the real CLI encoder and the admitted standalone JSON
-        // reader. In particular, descriptor discovery must not silently
-        // opt into host-timed turns or loopback poller yielding.
-        for mask in 0_u8..16 {
-            let mut config = prepare_backend_config(default_config(), Backend::Dbt);
-            config.backend.tool_shares_guest_descriptor_table = mask & 1 != 0;
-            config.backend.rediscovers_descriptors_after_exec = mask & 2 != 0;
-            config.backend.internal_pipe_turns_are_host_timed = mask & 4 != 0;
-            config.backend.loopback_pollers_yield_to_peers = mask & 8 != 0;
-            let encoded = dbt_detconfig_json(&config).unwrap();
-            assert_eq!(
-                detcore::from_legacy_backend_json(&encoded).is_ok(),
-                mask == 0 || mask == 15,
-                "only coupled facts fit the legacy form: mask {mask}"
-            );
-            let decoded = detcore::decode_backend_config_json(&encoded).unwrap();
-            assert_eq!(decoded.backend, config.backend, "capability mask {mask}");
-            assert_eq!(
-                serde_json::to_string(&decoded).unwrap(),
-                serde_json::to_string(&config).unwrap(),
-                "configuration mask {mask}"
-            );
-        }
-    }
-
-    #[test]
-    fn representable_descriptor_facts_keep_the_current_config_bytes() {
-        for discover in [false, true] {
-            let mut config = prepare_backend_config(rich_config(), Backend::Dbt);
-            config.backend.tool_shares_guest_descriptor_table = discover;
-            config.backend.rediscovers_descriptors_after_exec = discover;
-            config.backend.internal_pipe_turns_are_host_timed = discover;
-            config.backend.loopback_pollers_yield_to_peers = discover;
-            let legacy = detcore::to_legacy_backend_json(&config).unwrap();
-            assert_eq!(
-                dbt_detconfig_json(&config).unwrap(),
-                insert_legacy_dbt_detconfig_keys(&legacy).unwrap()
-            );
-        }
-    }
-
-    #[test]
-    fn versioned_dbt_config_rejects_unknown_or_malformed_envelopes() {
-        let config = prepare_backend_config(default_config(), Backend::Dbt);
-        let legacy =
-            insert_legacy_dbt_detconfig_keys(&detcore::to_legacy_backend_json(&config).unwrap())
-                .unwrap();
-        let legacy_backend = detcore::from_legacy_backend_json(&legacy).unwrap().backend;
-        let backend = serde_json::to_string(&config.backend).unwrap();
-        let envelope = |version: &str| {
-            format!(
-                "{{\"dbt_config_version\":{version},\"config\":{legacy},\"backend\":{backend}}}"
-            )
-        };
-        for version in ["0", "2", "-1", "null", "\"1\""] {
-            assert!(
-                detcore::decode_backend_config_json(&envelope(version)).is_err(),
-                "version {version} must be refused"
-            );
-            let tagged_legacy =
-                legacy.replacen('{', &format!("{{\"dbt_config_version\":{version},"), 1);
-            assert_eq!(
-                detcore::decode_backend_config_json(&tagged_legacy)
-                    .unwrap()
-                    .backend,
-                legacy_backend,
-                "an unknown legacy key must remain ignored"
-            );
-        }
-        let duplicate = format!(
-            "{{\"dbt_config_version\":1,\"dbt_config_version\":1,\"config\":{legacy},\"backend\":{backend}}}"
-        );
-        assert!(detcore::decode_backend_config_json(&duplicate).is_err());
-        let missing_backend = format!("{{\"dbt_config_version\":1,\"config\":{legacy}}}");
-        assert!(detcore::decode_backend_config_json(&missing_backend).is_err());
-        let missing_config = format!("{{\"dbt_config_version\":1,\"backend\":{backend}}}");
-        assert!(detcore::decode_backend_config_json(&missing_config).is_err());
-        for duplicate in [
-            format!("\"config\":{legacy}"),
-            format!("\"backend\":{backend}"),
-            "\"unknown\":true".to_owned(),
-        ] {
-            let json = envelope("1").replacen('{', &format!("{{{duplicate},"), 1);
-            assert!(detcore::decode_backend_config_json(&json).is_err());
-        }
-    }
-
-    #[test]
-    fn legacy_key_insertion_refuses_a_missing_repeated_or_present_key() {
-        let complete = r#"{"a":1,"detect_host_clock_futex_timeouts":false,"backend_tracks_process_children":true}"#;
-        assert_eq!(
-            insert_legacy_dbt_detconfig_keys(complete).unwrap(),
-            concat!(
-                r#"{"a":1,"use_thread_local_clock_reads":false,"#,
-                r#""detect_host_clock_futex_timeouts":false,"#,
-                r#""backend_serializes_fork_children":false,"#,
-                r#""backend_dispatches_thread_tools":true,"#,
-                r#""backend_tracks_process_children":true}"#,
-            )
-        );
-
-        let missing = r#"{"detect_host_clock_futex_timeouts":false}"#;
-        let error = insert_legacy_dbt_detconfig_keys(missing).unwrap_err();
-        assert!(
-            error.to_string().contains("appears 0 times"),
-            "unexpected error: {error}"
-        );
-
-        let repeated = r#"{"detect_host_clock_futex_timeouts":false,"detect_host_clock_futex_timeouts":false,"backend_tracks_process_children":true}"#;
-        let error = insert_legacy_dbt_detconfig_keys(repeated).unwrap_err();
-        assert!(
-            error.to_string().contains("appears 2 times"),
-            "unexpected error: {error}"
-        );
-
-        let present = r#"{"use_thread_local_clock_reads":true,"detect_host_clock_futex_timeouts":false,"backend_tracks_process_children":true}"#;
-        let error = insert_legacy_dbt_detconfig_keys(present).unwrap_err();
-        assert!(
-            error.to_string().contains("already present"),
-            "unexpected error: {error}"
-        );
-    }
 }
 
 /// The program a DBT launch runs and the working directory it runs from, as
@@ -4454,6 +4111,181 @@ pub fn record_dbt_launched_image(
         .exe = exe;
 }
 
+/// Refuses the DBT runtime at `runtime` unless it exports
+/// [`detcore_dbt::FINGERPRINT_CHECK_SYMBOL`], so unless it refuses a
+/// coordinator from another tree itself
+/// (`detcore_dbt::CONFIG_FINGERPRINT_ENV`). A runtime built before that check
+/// takes this Hermit's configuration whatever its own build, and with the
+/// global RPC changed since, it would keep a host value Detcore now replaces
+/// (an inotify rename cookie, for one) rather than be refused by name.
+#[cfg(feature = "dbt")]
+pub fn require_dbt_runtime_fingerprint_check(runtime: &std::path::Path) -> Result<(), Error> {
+    let symbols = defined_dynamic_symbols(runtime)
+        .map_err(|error| error.context("failed to read the Detcore DBT runtime's exports"))?;
+    if symbols
+        .iter()
+        .any(|symbol| symbol == detcore_dbt::FINGERPRINT_CHECK_SYMBOL)
+    {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "the Detcore DBT runtime {} predates its check of the coordinator's fingerprint (it \
+             exports no {}), so it would run with this hermit whatever tree it was built from. \
+             Rebuild it from Hermit's tree (`cargo build -p detcore-dbt-cdylib`)",
+            runtime.display(),
+            detcore_dbt::FINGERPRINT_CHECK_SYMBOL
+        ))
+    }
+}
+
+/// The names of the symbols the ELF image at `path` defines in its dynamic
+/// symbol table, the table the dynamic loader binds from. This reads only the
+/// parts of the file the loader uses for them -- the ELF and program headers,
+/// the dynamic segment, the symbol hash table, and the dynamic symbol and
+/// string tables: 6,467 bytes of a 19.5 MB release DBT runtime -- and so does
+/// not need the section headers or `.symtab`, which stripping can remove.
+#[cfg(feature = "dbt")]
+fn defined_dynamic_symbols(path: &std::path::Path) -> Result<Vec<String>, Error> {
+    use std::os::unix::fs::FileExt;
+
+    use goblin::container::Ctx;
+    use goblin::elf::dynamic::Dynamic;
+    use goblin::elf::dynamic::DynamicInfo;
+    use goblin::elf::program_header::PT_DYNAMIC;
+    use goblin::elf::program_header::ProgramHeader;
+    use goblin::elf::section_header::SHN_UNDEF;
+    use goblin::elf::sym::Sym;
+    use goblin::elf::sym::Symtab;
+    use goblin::strtab::Strtab;
+
+    let file = fs::File::open(path)
+        .map_err(|error| anyhow!("failed to open {}: {error}", path.display()))?;
+    let length = file
+        .metadata()
+        .map_err(|error| anyhow!("failed to stat {}: {error}", path.display()))?
+        .len();
+    let not_elf = |error: &dyn std::fmt::Display| anyhow!("{} is not ELF: {error}", path.display());
+    let read = |offset: u64, size: usize| -> Result<Vec<u8>, Error> {
+        if offset
+            .checked_add(size as u64)
+            .is_none_or(|end| end > length)
+        {
+            return Err(not_elf(&format_args!(
+                "{size} bytes at {offset:#x} would end past its {length} bytes"
+            )));
+        }
+        let mut bytes = vec![0; size];
+        file.read_exact_at(&mut bytes, offset)
+            .map_err(|error| anyhow!("failed to read {}: {error}", path.display()))?;
+        Ok(bytes)
+    };
+
+    let header = Elf::parse_header(&read(0, goblin::elf64::header::SIZEOF_EHDR)?)
+        .map_err(|error| not_elf(&error))?;
+    let ctx = Ctx::new(
+        header.container().map_err(|error| not_elf(&error))?,
+        header.endianness().map_err(|error| not_elf(&error))?,
+    );
+    let count = usize::from(header.e_phnum);
+    let program_headers = ProgramHeader::parse(
+        &read(header.e_phoff, count * ProgramHeader::size(ctx))?,
+        0,
+        count,
+        ctx,
+    )
+    .map_err(|error| not_elf(&error))?;
+    // An image without a dynamic segment exports nothing.
+    let Some(segment) = program_headers
+        .iter()
+        .find(|header| header.p_type == PT_DYNAMIC)
+    else {
+        return Ok(Vec::new());
+    };
+    // `Dynamic::parse` reads the segment from the bytes it is given at the
+    // segment's file offset, so it is given the segment alone, at offset 0.
+    // Its addresses are then mapped to file offsets with every header.
+    let entries = read(
+        segment.p_offset,
+        usize::try_from(segment.p_filesz).map_err(|error| not_elf(&error))?,
+    )?;
+    let alone = ProgramHeader {
+        p_offset: 0,
+        ..segment.clone()
+    };
+    let Some(dynamic) = Dynamic::parse(&entries, &[alone], ctx).map_err(|error| not_elf(&error))?
+    else {
+        return Ok(Vec::new());
+    };
+    let info = DynamicInfo::new(&dynamic.dyns, &program_headers);
+    let count = dynamic_symbol_count(&read, &info, ctx)?;
+    if count == 0 || info.symtab == 0 || info.strtab == 0 {
+        return Ok(Vec::new());
+    }
+    let symbols = read(
+        info.symtab as u64,
+        count.saturating_mul(Sym::size(ctx.container)),
+    )?;
+    let symbols = Symtab::parse(&symbols, 0, count, ctx).map_err(|error| not_elf(&error))?;
+    let names = read(info.strtab as u64, info.strsz)?;
+    let names = Strtab::parse(&names, 0, info.strsz, 0).map_err(|error| not_elf(&error))?;
+    Ok(symbols
+        .iter()
+        .filter(|symbol| symbol.st_shndx != SHN_UNDEF as usize)
+        .filter_map(|symbol| names.get_at(symbol.st_name).map(str::to_owned))
+        .collect())
+}
+
+/// How many entries an ELF image's dynamic symbol table has, which only the
+/// section headers record; without them it comes from the symbol hash table,
+/// as goblin and readelf find it. A GNU hash table leaves out the first
+/// `symoffset` symbols and chains every later one, so the count is one past
+/// the end of the chain that starts last (a chain's final entry has its low
+/// bit set); a SysV hash table's chain count is the symbol count.
+#[cfg(feature = "dbt")]
+fn dynamic_symbol_count(
+    read: &dyn Fn(u64, usize) -> Result<Vec<u8>, Error>,
+    info: &goblin::elf::dynamic::DynamicInfo,
+    ctx: goblin::container::Ctx,
+) -> Result<usize, Error> {
+    let word = |bytes: &[u8], index: usize| {
+        let bytes: [u8; 4] = bytes[4 * index..4 * index + 4]
+            .try_into()
+            .expect("four bytes");
+        if ctx.is_little_endian() {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        }
+    };
+    if let Some(table) = info.gnu_hash {
+        // nbuckets, symoffset, bloom_size and bloom_shift; then the bloom
+        // filter's address-sized words, the buckets, and the chains.
+        let header = read(table, 16)?;
+        let buckets = word(&header, 0) as usize;
+        let first = word(&header, 1) as usize;
+        let starts_at = table + 16 + u64::from(word(&header, 2)) * ctx.size() as u64;
+        let starts = read(starts_at, 4 * buckets)?;
+        let Some(last) = (0..buckets)
+            .map(|bucket| word(&starts, bucket) as usize)
+            .max()
+            .filter(|&last| last >= first)
+        else {
+            return Ok(first);
+        };
+        let chains_at = starts_at + 4 * buckets as u64;
+        let mut symbol = last;
+        while word(&read(chains_at + 4 * (symbol - first) as u64, 4)?, 0) & 1 == 0 {
+            symbol += 1;
+        }
+        Ok(symbol + 1)
+    } else if let Some(table) = info.hash {
+        // nbucket, then nchain.
+        Ok(word(&read(table, 8)?, 1) as usize)
+    } else {
+        Ok(0)
+    }
+}
+
 /// Declares, for a DBT run through `drrun`, the image the kernel execs in the
 /// guest's place: DynamoRIO's library (`lib64/release/libdynamorio.so` beside
 /// `drrun`'s `bin64`), which loads the guest itself. So the kernel's `exe`
@@ -4504,15 +4336,25 @@ async fn run_dbt(
              --no-sequentialize-threads (or --strace-only) to run under --backend dbt"
         ));
     }
+    // Strict schedule boundaries have never run on this backend: the
+    // configuration form that once carried Detcore's configuration to the DBT
+    // runtime could not express them, which refused such a run. They stay
+    // refused, by name.
+    if config.strict_schedule_boundaries {
+        return Err(anyhow!(
+            "the dbt backend does not run --strict-schedule-boundaries"
+        ));
+    }
 
-    // The guest sees this string in its environment, so it keeps the encoding
-    // it had before the backend facts moved into `Config::backend` and before
-    // three constant switches were deleted; see `dbt_detconfig_json`. The DBT
-    // runtime decodes the backend facts back out of it (here DBT's own); when
-    // the string is absent or does not parse, it uses the strict default's
-    // facts, which are ptrace's.
+    // The DBT runtime receives this configuration through the coordinator's
+    // first RPC frame (`detcore_dbt::initial_dbt_config`), never through the
+    // guest's environment, which carries only what the guest was given.
     let (drrun, client) = detcore_dbt::prepare_native_client()
         .map_err(|error| anyhow!("failed to prepare the Detcore DynamoRIO client: {error}"))?;
+    require_dbt_runtime_fingerprint_check(
+        &detcore_dbt::runtime_library_path()
+            .map_err(|error| anyhow!("failed to find the Detcore DBT runtime: {error}"))?,
+    )?;
     let mut config = config;
     declare_dbt_launcher(&mut config, &drrun)?;
     record_dbt_launched_image(
@@ -4524,7 +4366,10 @@ async fn run_dbt(
             .get(std::ffi::OsStr::new("PATH"))
             .map(std::ffi::OsString::as_os_str),
     );
-    let config_json = dbt_detconfig_json(&config)
+    // The coordinator's first RPC frame carries this configuration to the
+    // runtime. One that cannot be serialized (a path option that is not
+    // UTF-8, say) is refused here, before any guest runs.
+    serde_json::to_vec(&config)
         .map_err(|error| anyhow!("failed to serialize the Detcore config for DBT: {error}"))?;
     let panic_on_unsupported_syscalls = config.panic_on_unsupported_syscalls;
     // Bind native diagnostics to the controller before guest output capture.
@@ -4542,6 +4387,8 @@ async fn run_dbt(
                 client.display()
             )
         })?
+        .private_environment_prefix(detcore_dbt::PRIVATE_ENV_PREFIX)?
+        .private_placement(detcore_dbt::PRIVATE_PLACEMENT)
         .summary(print_summary)
         .isolated_process_group(panic_on_unsupported_syscalls)
         .tool_answers_brk(true)
@@ -4554,7 +4401,13 @@ async fn run_dbt(
 
     let program = command.get_program().to_owned();
     let mut environment = command.get_captured_envs();
-    environment.insert(detcore_dbt::DETCONFIG_ENV.into(), config_json.into());
+    // The runtime checks this against its own build before it reads the
+    // configuration frame (`detcore_dbt::CONFIG_FINGERPRINT_ENV`); the
+    // runner's private prefix keeps it from the guest.
+    environment.insert(
+        detcore_dbt::CONFIG_FINGERPRINT_ENV.into(),
+        detcore::config_wire_fingerprint().into(),
+    );
     let guest = command.into_std_lossy();
     tracing::info!(
         target: "hermit::dbt",
@@ -5087,6 +4940,7 @@ async fn dispatch_backend(
 ) -> Result<ExitStatus, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
+    crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;
     config.launch_image = launched_image(&command);
     if backend == Backend::Kvm {
         return Ok(run_kvm(
@@ -5147,12 +5001,14 @@ async fn dispatch_backend(
             // The delivery gate, from the final configuration and whether
             // this process owns the guests' PID namespace; off until the
             // runtime takes it (A5 step 3c.1, D35, D52).
-            config.in_guest_signal_delivery = IN_GUEST_RUNTIME_DELIVERS_SIGNALS
-                && in_guest_signal_delivery_gate(
-                    &config,
-                    backend,
-                    scheduler_owns_guest_pid_namespace(),
-                );
+            config.in_guest_signal_delivery = record_delivery_gate(
+                runtime_delivers_signals()
+                    && in_guest_signal_delivery_gate(
+                        &config,
+                        backend,
+                        scheduler_owns_guest_pid_namespace(),
+                    ),
+            );
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
             let (exit_status, mut global_state, dispatch_stats, process_reports) =
@@ -5200,6 +5056,11 @@ async fn dispatch_backend(
                 global_state.force_shutdown_with_error();
                 global_state.cancel_internal_scheduler().await;
             }
+            // The in-guest runtime starts after the guest's dynamic loader,
+            // whose syscalls the histogram therefore misses.
+            global_state.note_syscall_observation_gap(
+                detcore::SyscallObservationGap::InProcessRuntimeStart,
+            );
             let finalized = global_state
                 .clean_up_with_dispatch_stats(
                     print_summary,
@@ -5235,7 +5096,10 @@ async fn dispatch_backend(
     let tracer = hermit_run_ptrace::spawn_tracer(
         command,
         config.clone(),
-        config.gdbserver.then_some(config.gdbserver_port),
+        config
+            .gdbserver
+            .then(|| gdbserver::connection(config.gdbserver_port))
+            .transpose()?,
         config.sequentialize_threads,
         stats_request,
     )
@@ -5431,6 +5295,7 @@ async fn dispatch_output_backend(
 ) -> Result<Output, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
+    crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;
     config.launch_image = launched_image(&command);
     if backend == Backend::Kvm {
         return run_kvm(
@@ -5494,12 +5359,14 @@ async fn dispatch_output_backend(
             // The delivery gate, from the final configuration and whether
             // this process owns the guests' PID namespace; off until the
             // runtime takes it (A5 step 3c.1, D35, D52).
-            config.in_guest_signal_delivery = IN_GUEST_RUNTIME_DELIVERS_SIGNALS
-                && in_guest_signal_delivery_gate(
-                    &config,
-                    backend,
-                    scheduler_owns_guest_pid_namespace(),
-                );
+            config.in_guest_signal_delivery = record_delivery_gate(
+                runtime_delivers_signals()
+                    && in_guest_signal_delivery_gate(
+                        &config,
+                        backend,
+                        scheduler_owns_guest_pid_namespace(),
+                    ),
+            );
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
             let (output, mut global_state, dispatch_stats, process_reports) =
@@ -5544,6 +5411,11 @@ async fn dispatch_output_backend(
                 global_state.force_shutdown_with_error();
                 global_state.cancel_internal_scheduler().await;
             }
+            // The in-guest runtime starts after the guest's dynamic loader,
+            // whose syscalls the histogram therefore misses.
+            global_state.note_syscall_observation_gap(
+                detcore::SyscallObservationGap::InProcessRuntimeStart,
+            );
             let finalized = global_state
                 .clean_up_with_dispatch_stats(
                     print_summary,
@@ -5586,7 +5458,10 @@ async fn dispatch_output_backend(
     let tracer = hermit_run_ptrace::spawn_tracer(
         command,
         config.clone(),
-        config.gdbserver.then_some(config.gdbserver_port),
+        config
+            .gdbserver
+            .then(|| gdbserver::connection(config.gdbserver_port))
+            .transpose()?,
         config.sequentialize_threads,
         stats_request,
     )
@@ -5707,8 +5582,6 @@ impl HermitData {
                 MountProvenance::default(),
                 None,
                 None,
-                None,
-                detcore_model::cpu_profile::CpuProfile::default(),
                 control,
             )
             .await?;
@@ -5743,8 +5616,6 @@ impl HermitData {
                 },
                 Some(mount_ids),
                 None,
-                None,
-                detcore_model::cpu_profile::CpuProfile::default(),
                 control,
             )
             .await?;
@@ -6213,8 +6084,6 @@ pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
             MountProvenance::default(),
             None,
             None,
-            None,
-            detcore_model::cpu_profile::CpuProfile::default(),
             control,
         )
         .await
@@ -6222,9 +6091,9 @@ pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
 }
 
 /// Records with producer-owned mountinfo provenance. The directory-lifetime
-/// obligation is the same as [`record_to`]. `local_networking` and
-/// `proc_level` are stored in the recording's `metadata.json`, and a replay
-/// uses that network and that `/proc` level.
+/// obligation is the same as [`record_to`]. `options` are stored in the
+/// recording's `metadata.json`, and a replay uses the same network, `/proc`
+/// level, CPU profile and schedule.
 ///
 /// The ptrace session runs on a tracer thread, so the calling thread needs no
 /// particular stack; see [`run`].
@@ -6232,9 +6101,7 @@ pub fn record_to_with_mountinfo(
     command: Command,
     dir: &Path,
     mountinfo: MountProvenance,
-    local_networking: bool,
-    proc_level: detcore_model::config::ProcLevel,
-    cpu_profile: detcore_model::cpu_profile::CpuProfile,
+    options: RecordOptions,
 ) -> Result<ExitStatus, Error> {
     let dir = dir.to_owned();
     let command = tracer_thread::SendCommand::new(command);
@@ -6256,9 +6123,7 @@ pub fn record_to_with_mountinfo(
             &dir,
             mountinfo,
             Some(mount_ids),
-            Some(local_networking),
-            Some(proc_level),
-            cpu_profile,
+            Some(options),
             control,
         )
         .await
@@ -6267,31 +6132,20 @@ pub fn record_to_with_mountinfo(
 
 // Private plumbing: Record::spawn_with_mountinfo's parameters plus the
 // ptrace completion control.
-#[allow(clippy::too_many_arguments)]
 async fn record_to_async(
     command: Command,
     dir: &Path,
     mountinfo: MountProvenance,
     mountinfo_mount_ids: Option<Vec<u64>>,
-    local_networking: Option<bool>,
-    proc_level: Option<detcore_model::config::ProcLevel>,
-    cpu_profile: detcore_model::cpu_profile::CpuProfile,
+    options: Option<RecordOptions>,
     control: std::rc::Rc<ptrace_completion::Control>,
 ) -> Result<ExitStatus, Error> {
     let report = SkidOvershootReport::begin(true);
     let result = async {
-        Record::spawn_with_mountinfo(
-            command,
-            dir,
-            mountinfo,
-            mountinfo_mount_ids,
-            local_networking,
-            proc_level,
-            cpu_profile,
-        )
-        .await?
-        .wait(control)
-        .await
+        Record::spawn_with_mountinfo(command, dir, mountinfo, mountinfo_mount_ids, options)
+            .await?
+            .wait(control)
+            .await
     }
     .await;
     report.finish(result)
@@ -6313,8 +6167,6 @@ pub fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error>
             MountProvenance::default(),
             None,
             None,
-            None,
-            detcore_model::cpu_profile::CpuProfile::default(),
             control,
         )
         .await
@@ -6322,7 +6174,7 @@ pub fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error>
 }
 
 /// Records with captured output and exact mountinfo provenance.
-/// `local_networking` and `proc_level` are as for [`record_to_with_mountinfo`].
+/// `options` are as for [`record_to_with_mountinfo`].
 ///
 /// The ptrace session runs on a tracer thread, so the calling thread needs no
 /// particular stack; see [`run`].
@@ -6330,9 +6182,7 @@ pub fn record_with_output_with_mountinfo(
     command: Command,
     dir: &Path,
     mountinfo: MountProvenance,
-    local_networking: bool,
-    proc_level: detcore_model::config::ProcLevel,
-    cpu_profile: detcore_model::cpu_profile::CpuProfile,
+    options: RecordOptions,
 ) -> Result<Output, Error> {
     let dir = dir.to_owned();
     let command = tracer_thread::SendCommand::new(command);
@@ -6354,9 +6204,7 @@ pub fn record_with_output_with_mountinfo(
             &dir,
             mountinfo,
             Some(mount_ids),
-            Some(local_networking),
-            Some(proc_level),
-            cpu_profile,
+            Some(options),
             control,
         )
         .await
@@ -6365,15 +6213,12 @@ pub fn record_with_output_with_mountinfo(
 
 // Private plumbing: Record::spawn_with_mountinfo's parameters plus the
 // ptrace completion control.
-#[allow(clippy::too_many_arguments)]
 async fn record_with_output_async(
     mut command: Command,
     dir: &Path,
     mountinfo: MountProvenance,
     mountinfo_mount_ids: Option<Vec<u64>>,
-    local_networking: Option<bool>,
-    proc_level: Option<detcore_model::config::ProcLevel>,
-    cpu_profile: detcore_model::cpu_profile::CpuProfile,
+    options: Option<RecordOptions>,
     control: std::rc::Rc<ptrace_completion::Control>,
 ) -> Result<Output, Error> {
     let report = SkidOvershootReport::begin(true);
@@ -6381,18 +6226,10 @@ async fn record_with_output_async(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     let result = async {
-        Record::spawn_with_mountinfo(
-            command,
-            dir,
-            mountinfo,
-            mountinfo_mount_ids,
-            local_networking,
-            proc_level,
-            cpu_profile,
-        )
-        .await?
-        .wait_with_output(control)
-        .await
+        Record::spawn_with_mountinfo(command, dir, mountinfo, mountinfo_mount_ids, options)
+            .await?
+            .wait_with_output(control)
+            .await
     }
     .await;
     report.finish(result)
@@ -6470,6 +6307,9 @@ pub fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Result<Out
         report.finish(result)
     })
 }
+
+#[cfg(all(test, feature = "liteinst"))]
+mod in_guest_delivery_harness;
 
 #[cfg(test)]
 mod tests {
@@ -8358,9 +8198,10 @@ mod tests {
             command.env_clear().env("PATH", &search);
             command
         }));
-        // Without a cleared environment the launch searches Hermit's own PATH,
-        // not the command's, so the static image is not found by either.
-        assert!(!check(&|| {
+        // Without a cleared environment the command's explicit PATH still
+        // wins over the inherited one (Reverie cf745200 makes program lookup
+        // read the environment the child receives), so both find the image.
+        assert!(check(&|| {
             let mut command = Command::new(name);
             command.env("PATH", &search);
             command
@@ -8676,6 +8517,123 @@ mod tests {
         assert!(reason.contains("build the hermit binary and cdylib"));
         assert!(!reason.contains("not enabled in this build"));
         assert!(!reason.contains("has not been checked"));
+    }
+
+    /// A DBT runtime that does not export the fingerprint check's symbol, as
+    /// one built before the check does not, is refused before DBT starts
+    /// (this test's own executable exports no such symbol), and so is a file
+    /// that is not ELF.
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn a_dbt_runtime_without_the_fingerprint_check_is_refused() {
+        let image = std::env::current_exe().unwrap();
+        let refusal = super::require_dbt_runtime_fingerprint_check(&image)
+            .expect_err("an image without the symbol is refused");
+        let message = format!("{refusal:#}");
+        assert!(
+            message.contains("predates its check of the coordinator's fingerprint")
+                && message.contains(detcore_dbt::FINGERPRINT_CHECK_SYMBOL),
+            "{message}"
+        );
+        let refusal = super::require_dbt_runtime_fingerprint_check(std::path::Path::new(
+            "/proc/self/cmdline",
+        ))
+        .expect_err("a file that is not ELF is refused");
+        assert!(format!("{refusal:#}").contains("is not ELF"), "{refusal:#}");
+    }
+
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn defined_dynamic_symbols_are_read_from_the_dynamic_segment_alone() {
+        // The libc this test runs with, against goblin's parse of all of it.
+        let maps = fs::read_to_string("/proc/self/maps").unwrap();
+        let libc = maps
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(5))
+            .find(|path| {
+                path.rsplit('/')
+                    .next()
+                    .is_some_and(|name| name.starts_with("libc.so"))
+            })
+            .expect("this test runs with a dynamically linked libc");
+        let ours = super::defined_dynamic_symbols(std::path::Path::new(libc)).unwrap();
+        let bytes = fs::read(libc).unwrap();
+        let elf = goblin::elf::Elf::parse(&bytes).unwrap();
+        let named = |symbol: &goblin::elf::sym::Sym| elf.dynstrtab.get_at(symbol.st_name);
+        assert!(
+            elf.dynsyms
+                .iter()
+                .any(|symbol| symbol.st_shndx == 0 && named(&symbol).is_some_and(|n| !n.is_empty())),
+            "{libc} imports a symbol, which is not one of its exports"
+        );
+        let theirs: Vec<String> = elf
+            .dynsyms
+            .iter()
+            .filter(|symbol| symbol.st_shndx != 0)
+            .filter_map(|symbol| named(&symbol).map(str::to_owned))
+            .collect();
+        assert!(ours.iter().any(|name| name == "malloc"), "{ours:?}");
+        assert_eq!(ours, theirs);
+    }
+
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn the_dynamic_symbol_count_comes_from_the_hash_table() {
+        use goblin::container::Container;
+        use goblin::container::Ctx;
+        use goblin::container::Endian;
+        use goblin::elf::dynamic::DynamicInfo;
+
+        let ctx = Ctx::new(Container::Big, Endian::Little);
+        let image = |words: &[u32]| -> Vec<u8> {
+            words.iter().flat_map(|word| word.to_le_bytes()).collect()
+        };
+        let reader = |image: Vec<u8>| {
+            move |offset: u64, size: usize| -> Result<Vec<u8>, anyhow::Error> {
+                let start = offset as usize;
+                image
+                    .get(start..start + size)
+                    .map(<[u8]>::to_vec)
+                    .ok_or_else(|| anyhow::anyhow!("{size} bytes at {offset} are past the end"))
+            }
+        };
+        let gnu = DynamicInfo {
+            gnu_hash: Some(0),
+            ..Default::default()
+        };
+        // nbuckets 2, symoffset 1, bloom_size 1, bloom_shift 6; one 8-byte
+        // bloom word; buckets starting at symbols 1 and 3; the chains of
+        // symbols 1 to 4, where a set low bit ends a chain. Symbol 0 is not
+        // hashed, so the table has 5 symbols.
+        let table = image(&[2, 1, 1, 6, 0, 0, 1, 3, 0x10, 0x21, 0x30, 0x41]);
+        assert_eq!(
+            super::dynamic_symbol_count(&reader(table), &gnu, ctx).unwrap(),
+            5
+        );
+        // With every bucket empty, only the 3 symbols before symoffset.
+        let table = image(&[1, 3, 1, 6, 0, 0, 0]);
+        assert_eq!(
+            super::dynamic_symbol_count(&reader(table), &gnu, ctx).unwrap(),
+            3
+        );
+        // A chain that runs past the image is refused, not counted.
+        let table = image(&[1, 1, 1, 6, 0, 0, 1, 0x10]);
+        super::dynamic_symbol_count(&reader(table), &gnu, ctx).unwrap_err();
+        // A SysV table: nbucket, then nchain.
+        let sysv = DynamicInfo {
+            hash: Some(0),
+            ..Default::default()
+        };
+        let table = image(&[1, 7, 0]);
+        assert_eq!(
+            super::dynamic_symbol_count(&reader(table), &sysv, ctx).unwrap(),
+            7
+        );
+        // With neither, the loader can bind nothing.
+        assert_eq!(
+            super::dynamic_symbol_count(&reader(Vec::new()), &DynamicInfo::default(), ctx).unwrap(),
+            0
+        );
     }
     #[cfg(feature = "sabre")]
     use std::ffi::OsStr;
@@ -9013,31 +8971,23 @@ mod tests {
         let sabre = prepare_backend_config(config.clone(), Backend::Sabre).backend;
         assert!(sabre.tool_shares_guest_descriptor_table);
         assert!(sabre.rediscovers_descriptors_after_exec);
-        assert!(sabre.internal_pipe_turns_are_host_timed);
         assert!(sabre.loopback_pollers_yield_to_peers);
         assert!(sabre.guest_clock_reads_bypass_backend);
-        assert!(sabre.virtualizes_syscall_clobbers);
         assert!(sabre.needs_killed_thread_rpc_cancellation);
         assert!(sabre.reports_physical_process_exits);
-        assert!(sabre.signal_interrupts_external_syscalls);
         assert!(sabre.tracks_process_children);
         assert!(!sabre.runs_exit_robust_list);
         assert!(!sabre.requires_thread_directed_process_signals);
-        assert!(!sabre.defers_vfork_child_registration);
         let ptrace = prepare_backend_config(config, Backend::Ptrace).backend;
         assert!(!ptrace.tool_shares_guest_descriptor_table);
         assert!(!ptrace.rediscovers_descriptors_after_exec);
-        assert!(!ptrace.internal_pipe_turns_are_host_timed);
         assert!(!ptrace.loopback_pollers_yield_to_peers);
         assert!(!ptrace.guest_clock_reads_bypass_backend);
-        assert!(!ptrace.virtualizes_syscall_clobbers);
         assert!(!ptrace.needs_killed_thread_rpc_cancellation);
         assert!(!ptrace.reports_physical_process_exits);
-        assert!(!ptrace.signal_interrupts_external_syscalls);
         assert!(ptrace.tracks_process_children);
         assert!(ptrace.runs_exit_robust_list);
         assert!(!ptrace.requires_thread_directed_process_signals);
-        assert!(!ptrace.defers_vfork_child_registration);
     }
 
     #[test]
@@ -9091,7 +9041,6 @@ mod tests {
         assert!(kvm.backend.tracks_process_children);
         assert!(!kvm.backend.runs_exit_robust_list);
         assert!(!kvm.backend.requires_thread_directed_process_signals);
-        assert!(kvm.backend.defers_vfork_child_registration);
 
         // A controlled run needs both the backend's process-signal control and
         // sequentialized threads; neither alone admits one.
@@ -9136,11 +9085,10 @@ mod tests {
     /// refusal (Reverie d78f770f), `failed_gettimeofday_may_store_host_time`
     /// the guest's storable-memory report (Reverie 8bfb450e) and
     /// `user_address_limit` the guest's user address limit query (Reverie
-    /// 6f75cc4c). Four fields are newer than that transcription:
+    /// 6f75cc4c). Three fields are newer than that transcription:
     /// `process_exits_complete_asynchronously` (Reverie 056c8cac), true only
     /// for in-guest LiteInst, whose process exits complete some time after the
-    /// tool grants them, `supports_madv_dontneed` (Reverie 8d8697aa), true for
-    /// every backend, and `reports_child_exit_publication` (Reverie 9cb6f7b7),
+    /// tool grants them, `reports_child_exit_publication` (Reverie 9cb6f7b7),
     /// true for ptrace and e9patch, whose tracer reports when the kernel
     /// publishes a process's exit to its parent, and
     /// `virtualizes_guest_sigalrm` (Reverie 7142ff8c), true only for in-guest
@@ -9149,8 +9097,7 @@ mod tests {
     /// which changes how a syscall reaches the Tool and nothing the Tool host
     /// can do, so it has exactly in-guest LiteInst's row.
     /// DBT now also shares the guest descriptor table and rediscovers it after
-    /// exec (Reverie 15374907); its host-timed-turn and poller-yield
-    /// capabilities remain false. `reports_sigreturns` (A5 step 2) is true
+    /// exec (Reverie 15374907); its poller-yield capability remains false. `reports_sigreturns` (A5 step 2) is true
     /// for ptrace, and so for e9patch preprocessing, whose guest Hermit runs
     /// on ptrace. `reports_kernel_child_exit_signals` is true for ptrace,
     /// e9patch and SaBRe, whose signal callbacks see the kernel's child-exit
@@ -9164,23 +9111,17 @@ mod tests {
         serde_json::json!({
             "tool_shares_guest_descriptor_table": sabre || dbt,
             "rediscovers_descriptors_after_exec": sabre || dbt,
-            "internal_pipe_turns_are_host_timed": sabre,
             "loopback_pollers_yield_to_peers": sabre,
             "guest_clock_reads_bypass_backend": sabre,
-            "virtualizes_syscall_clobbers": sabre,
             "needs_killed_thread_rpc_cancellation": in_guest_liteinst || sabre || dbt || kvm,
             "reports_physical_process_exits": sabre,
             "process_exits_complete_asynchronously": in_guest_liteinst,
             "virtualizes_guest_sigalrm": in_guest_liteinst,
-            "signal_interrupts_external_syscalls": sabre,
             "tracks_process_children": !dbt,
             "runs_exit_robust_list": matches!(backend, Backend::Ptrace | Backend::E9patch),
             "requires_thread_directed_process_signals": dbt,
             "supports_parked_write_signal_interruption":
                 matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Kvm),
-            "defers_vfork_child_registration": kvm,
-            "supports_madvise": !kvm,
-            "supports_madv_dontneed": true,
             "reports_child_exit_publication":
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "reports_kernel_child_exit_signals":
@@ -9311,21 +9252,17 @@ mod tests {
         config
     }
 
-    /// `HERMIT_DBT_DETCONFIG` is in the guest's environment, so a guest can
-    /// read it with `getenv` or `/proc/self/environ`. These fixtures are the
-    /// output of `serde_json::to_string` on the same configs, captured from a
-    /// build of the commit before Detcore read [`reverie::BackendCapabilities`],
-    /// when `Config` still had one boolean field per backend switch. They are
-    /// the variable's bytes before `dbt_detconfig_json` re-inserts the three
-    /// deleted switches' keys; `dbt_detconfig_matches_806cf2fa_bytes` pins the
-    /// complete variable. Every DBT run sequentializes threads, so the DBT
-    /// cases do too. The fixtures carry one deliberate later change, the
-    /// `fdinfo_unlisted_mount_ids` -> `mount_id_assignment_order` key rename
-    /// described on `dbt_detconfig_tests::GOLDEN`. Preserve the historical DBT
-    /// descriptor capabilities here as well as the historical bytes. Current
-    /// DBT's independent descriptor facts require the typed envelope, whose
-    /// exact round trip and all sixteen coupled-flag combinations are checked
-    /// by `dbt_detconfig_tests`.
+    /// The legacy configuration form, which a standalone DBT run's
+    /// `HERMIT_DBT_DETCONFIG` may still carry, reads and writes these bytes.
+    /// These fixtures are the output of `serde_json::to_string` on the same
+    /// configs, captured from a build of the commit before Detcore read
+    /// [`reverie::BackendCapabilities`], when `Config` still had one boolean
+    /// field per backend switch. Every DBT run sequentializes threads, so the
+    /// DBT cases do too. The fixtures carry one deliberate later change, the
+    /// `fdinfo_unlisted_mount_ids` -> `mount_id_assignment_order` key rename.
+    /// Preserve the historical DBT descriptor capabilities here as well as the
+    /// historical bytes. Current DBT's independent descriptor facts require
+    /// the typed envelope, whose round trip detcore-dbt's tests check.
     #[test]
     fn historical_dbt_capabilities_preserve_legacy_detconfig_bytes() {
         let sequential = |mut config: DetConfig| {
@@ -9359,7 +9296,7 @@ mod tests {
             assert_eq!(
                 detcore::to_legacy_backend_json(&config).unwrap(),
                 before,
-                "HERMIT_DBT_DETCONFIG for the {name} config changed"
+                "the legacy form of the {name} config changed"
             );
             // A reader of the earlier bytes recovers the capabilities.
             let decoded = detcore::from_legacy_backend_json(before).unwrap();
@@ -9406,7 +9343,15 @@ mod tests {
     /// first, `cpuid_virtualized_by_backend`, is written false for every
     /// backend now that no backend installs a CPUID profile of its own, and so
     /// is the fourteenth, `backend_virtualizes_capability_prctls`, now that
-    /// the capability prctls reach the kernel on every backend.
+    /// the capability prctls reach the kernel on every backend, and so is the
+    /// fifth, `syscall_clobbers_virtualized_by_backend`, now that Reverie's
+    /// backend contract requires every backend to leave the syscall-clobbered
+    /// registers as a native return would (with the exceptions it names). The
+    /// second, `backend_supports_madvise`, is written true for every backend
+    /// now that every backend takes every madvise advice and refuses what it
+    /// does not implement itself, and the fifteenth,
+    /// `backend_defers_vfork_child_registration`, false for every backend now
+    /// that Detcore waits for a vfork child however late it registers.
     #[test]
     fn every_backend_encodes_its_current_legacy_projection() {
         for (backend, unsequenced, sequential) in [
@@ -9414,9 +9359,9 @@ mod tests {
             (Backend::E9patch, "010000011000100", "010000011000100"),
             (Backend::Liteinst, "010001010000000", "010001010000000"),
             (Backend::InGuestTrap, "010001010000000", "010001010000000"),
-            (Backend::Sabre, "011111110000000", "011111110000000"),
+            (Backend::Sabre, "011101110000000", "011101110000000"),
             (Backend::Dbt, "011001000100000", "011001000100000"),
-            (Backend::Kvm, "000001010010101", "000001010011101"),
+            (Backend::Kvm, "010001010010100", "010001010011100"),
         ] {
             for (sequentialize_threads, expected) in [(false, unsequenced), (true, sequential)] {
                 let config = prepare_backend_config(
@@ -9452,7 +9397,6 @@ mod tests {
         assert!(!config.backend.tracks_process_children);
         assert!(!config.backend.runs_exit_robust_list);
         assert!(config.backend.requires_thread_directed_process_signals);
-        assert!(!config.backend.defers_vfork_child_registration);
     }
 
     #[test]
@@ -9932,6 +9876,26 @@ mod tests {
 
     #[test]
     #[cfg(feature = "dbt")]
+    fn dbt_public_dispatch_refuses_strict_schedule_boundaries() {
+        let command = super::Command::new("/bin/true");
+        let config = super::DetConfig {
+            sequentialize_threads: true,
+            strict_schedule_boundaries: true,
+            ..Default::default()
+        };
+
+        let error = super::run_with_output_backend(command, config, false, &None, Backend::Dbt)
+            .expect_err("DBT must refuse strict schedule boundaries");
+        assert!(
+            error
+                .to_string()
+                .contains("dbt backend does not run --strict-schedule-boundaries"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
     fn dbt_public_dispatch_requires_sequentialized_threads() {
         let command = super::Command::new("/bin/true");
         let config = super::DetConfig {
@@ -9947,6 +9911,137 @@ mod tests {
                 .contains("dbt backend requires sequentialized threads"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dbt_library_environment_privacy_is_caller_selected() {
+        #[cfg(not(feature = "dbt"))]
+        {
+            assert!(
+                std::env::var_os("HERMIT_REQUIRE_DBT").is_none(),
+                "HERMIT_REQUIRE_DBT is set, but this test binary was built WITHOUT \
+                 the `dbt` feature; rebuild with --features dbt to exercise the \
+                 library's environment-privacy policy",
+            );
+            eprintln!(
+                "skipping dbt_library_environment_privacy_is_caller_selected: \
+                 built without the `dbt` feature",
+            );
+        }
+        #[cfg(feature = "dbt")]
+        {
+            let mut command = super::Command::new("/usr/bin/env");
+            command
+                .env_clear()
+                .env("HERMIT_DBT_PRIVACY_SENTINEL", "known")
+                .env("HERMIT_APP_VISIBLE", "known");
+            let mut config = env_free_detconfig("--epoch=2026-01-01T00:00:00Z", "--seed=0");
+            config.sequentialize_threads = true;
+            config.deterministic_io = true;
+            config.panic_on_unsupported_syscalls = true;
+            config.validate();
+            let config = super::prepare_backend_config(config, Backend::Dbt);
+            let output = super::run_dbt(command, config, false, true)
+                .await
+                .expect("run /usr/bin/env through the real DBT library constructor");
+            assert_eq!(
+                output.status,
+                super::ExitStatus::Exited(0),
+                "guest did not exit 0.\n--- guest stderr ---\n{}\n--- guest stdout ---\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout),
+            );
+            let printed = String::from_utf8(output.stdout).expect("synthetic environment is UTF-8");
+            assert_eq!(
+                printed
+                    .lines()
+                    .filter(|line| *line == "HERMIT_APP_VISIBLE=known")
+                    .count(),
+                1,
+                "public sentinel missing or duplicated: {printed}",
+            );
+            assert!(
+                !printed.contains("HERMIT_DBT_PRIVACY_SENTINEL="),
+                "Hermit private environment sentinel leaked to guest: {printed}",
+            );
+            assert_eq!(printed, "HERMIT_APP_VISIBLE=known\n");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_private_placement_preserves_library_dispatch() {
+        use clap::Parser;
+
+        Backend::Dbt
+            .ensure_available()
+            .expect("DBT placement control requires the real packaged runtime");
+        const CHILD: &str = "HERMIT_TEST_DBT_PLACEMENT_LIBRARY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let probe = super::dbt_placement_probe::Probe::new(false);
+            let (install, bind) = probe.launch();
+            assert!(bind.is_none());
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::dbt_private_placement_preserves_library_dispatch",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env(super::dbt_placement_probe::OBSERVER_ENV, probe.observer())
+                .env("HERMIT_INSTALL_DIR", install)
+                .env("HERMIT_REQUIRE_DBT", "1")
+                .output()
+                .expect("run isolated DBT library placement and output checks");
+            let diagnostics = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                diagnostics
+                    .lines()
+                    .filter(|line| line.starts_with("reverie-dbt: tool=Detcore "))
+                    .count()
+                    >= 2,
+                "DBT native summaries did not prove both Detcore dispatches: {diagnostics}"
+            );
+            assert!(!diagnostics.contains("guest-stderr"), "{diagnostics}");
+            probe.assert_zero(2, false);
+            return;
+        }
+
+        let mut command = super::Command::new("/bin/echo");
+        command.arg("hello");
+        let observer = std::env::var_os(super::dbt_placement_probe::OBSERVER_ENV)
+            .expect("isolated placement observer path");
+        command.env("LD_PRELOAD", &observer);
+        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
+        config.sequentialize_threads = true;
+        config.validate();
+        let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
+            .expect("run /bin/echo through DbtGuest<Detcore>");
+
+        // Include captured output so a failed backend launch reports its diagnostics.
+        assert_eq!(
+            output.status,
+            super::ExitStatus::Exited(0),
+            "guest did not exit 0.\n--- guest stderr ---\n{}\n--- guest stdout ---\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert_eq!(output.stdout, b"hello\n");
+        assert_eq!(output.stderr, b"");
+
+        let mut command = super::Command::new("/bin/sh");
+        command.args(["-c", "printf 'guest-stderr\\n' >&2"]);
+        command.env("LD_PRELOAD", &observer);
+        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
+        config.sequentialize_threads = true;
+        config.validate();
+        let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
+            .expect("capture nonempty guest stderr through DbtGuest<Detcore>");
+        assert_eq!(output.status, super::ExitStatus::Exited(0), "{output:?}");
+        assert_eq!(output.stdout, b"");
+        assert_eq!(output.stderr, b"guest-stderr\n");
     }
 
     #[test]

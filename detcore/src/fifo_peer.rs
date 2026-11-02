@@ -120,6 +120,28 @@ pub(crate) fn any_guest_made() -> bool {
     !GUEST_MADE.lock().unwrap().is_empty()
 }
 
+/// A set of guest-made FIFOs, as a removal consults it
+/// (`Detcore::guest_made_fifos_removed_from`).
+pub(crate) trait GuestMadeFifos {
+    /// Whether the set has any FIFO ([`any_guest_made`]).
+    fn any(&self) -> bool;
+    /// Whether the set has `fifo` ([`is_guest_made`]).
+    fn contains(&self, fifo: (u64, u64)) -> bool;
+}
+
+/// The run's guest-made FIFOs ([`GUEST_MADE`]).
+pub(crate) struct GuestMadeRegistry;
+
+impl GuestMadeFifos for GuestMadeRegistry {
+    fn any(&self) -> bool {
+        any_guest_made()
+    }
+
+    fn contains(&self, fifo: (u64, u64)) -> bool {
+        is_guest_made(fifo)
+    }
+}
+
 /// The guest blocking opens of each FIFO waiting, in polling turns, for the
 /// other end ([`PendingOpen`]). On Linux a blocking open counts as a reader
 /// or writer while it waits, so a waiting reader completes a writer's open
@@ -389,16 +411,50 @@ pub(crate) fn guest_descriptors_are_visible(
 /// descriptors are not visible ([`guest_descriptors_are_visible`]). (An
 /// absolute symlink is resolved from the tracer's root, which only a chrooted
 /// guest sees differently; a FIFO missed that way is opened as before.)
+///
+/// A path's leading `/proc/self` or `/proc/thread-self`, which the tracer's
+/// lookup would resolve for the tracer, is spelled with the guest's own
+/// numbers (`own`, its pid and tid as its `/proc` names them,
+/// `Detcore::procfs_caller_ids`), which the lookup through the guest's root
+/// finds in the guest's `/proc`: so the FIFO behind one of the guest's
+/// descriptor links (`/proc/self/fd/N`, the spelling a name below a
+/// descriptor directory takes, `syscalls::files::descriptor_directory`) is
+/// found, and its open waits in polling turns rather than in the kernel.
 pub(crate) fn fifo_at(
     backend: &reverie::BackendCapabilities,
     physical_tid: Option<i32>,
     tid: i32,
+    own: Option<(i32, i32)>,
     dirfd: i32,
     path: &Path,
 ) -> Option<((u64, u64), std::ffi::OsString)> {
     if !guest_descriptors_are_visible(backend, physical_tid) {
         return None;
     }
+    let respelled;
+    let path = match (own, path.strip_prefix("/proc")) {
+        (Some((pid, tid)), Ok(below)) => {
+            let mut components = below.components();
+            match components.next() {
+                Some(std::path::Component::Normal(name)) if name == "self" => {
+                    respelled = Path::new("/proc")
+                        .join(pid.to_string())
+                        .join(components.as_path());
+                    respelled.as_path()
+                }
+                Some(std::path::Component::Normal(name)) if name == "thread-self" => {
+                    respelled = Path::new("/proc")
+                        .join(pid.to_string())
+                        .join("task")
+                        .join(tid.to_string())
+                        .join(components.as_path());
+                    respelled.as_path()
+                }
+                _ => path,
+            }
+        }
+        _ => path,
+    };
     let base = if path.is_absolute() {
         format!("/proc/{tid}/root")
     } else if dirfd == libc::AT_FDCWD {
@@ -709,6 +765,13 @@ impl Drop for StagedPage {
 fn leave_orphaned_page(page: OrphanedPage) {
     ORPHANED_PAGES.lock().unwrap().push(page);
     ANY_ORPHANED_PAGE.store(true, Ordering::SeqCst);
+}
+
+/// Whether a page may be left ([`ANY_ORPHANED_PAGE`]): the load
+/// [`take_orphaned_pages`] makes first, which answers no page while it is
+/// false.
+pub(crate) fn any_orphaned_page() -> bool {
+    ANY_ORPHANED_PAGE.load(Ordering::SeqCst)
 }
 
 /// The pages ([`ORPHANED_PAGES`]) left in the address space `mm`, each

@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::pid::DetTid;
+use crate::syscall_histogram::SyscallHistogramSummary;
 use crate::time::LogicalTime;
 
 /// Per-execution SaBRe path evidence written as one JSON object per line.
@@ -190,6 +191,14 @@ pub struct RunSummary {
     /// summary, whose INFO view is compared by `--verify`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_stats: Option<DispatchStats>,
+
+    /// Per-syscall entries and outcomes over all guest threads, with the
+    /// scope of what was observed ([`crate::syscall_histogram`]); its `calls`
+    /// sum to `syscalls` ([`RunSummary::syscall_histogram_is_consistent`]).
+    /// Absent from summaries written before it existed. Not part of the
+    /// human-readable summary, whose INFO view is compared by `--verify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syscall_histogram: Option<SyscallHistogramSummary>,
 }
 
 /// The full human-readable report, including recorded launch configuration.
@@ -214,6 +223,13 @@ impl fmt::Display for RunSummaryInfo<'_> {
 }
 
 impl RunSummary {
+    /// Whether the histogram, when present, counts exactly the `syscalls`
+    /// total. `None` when either is absent.
+    pub fn syscall_histogram_is_consistent(&self) -> Option<bool> {
+        let histogram = self.syscall_histogram.as_ref()?;
+        Some(Some(histogram.total_calls()) == self.syscalls)
+    }
+
     pub fn info<'a>(&'a self, reprio_description: Option<&'a str>) -> RunSummaryInfo<'a> {
         RunSummaryInfo {
             summary: self,
@@ -245,6 +261,7 @@ impl RunSummary {
             per_thread_timeslice,
             preemption,
             dispatch_stats: _,
+            syscall_histogram: _,
         } = self;
         writeln!(f, "Final thread-tree was: {}", threads_descrip)?;
         writeln!(

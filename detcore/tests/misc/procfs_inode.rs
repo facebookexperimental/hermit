@@ -334,7 +334,7 @@ fn without_sequentialized_threads_a_path_is_not_opened_again() {
                 fd
             };
             let free = lowest_free();
-            std::fs::symlink_metadata("/proc/self/stat").unwrap();
+            std::fs::symlink_metadata("/proc/self/statm").unwrap();
             assert_eq!(lowest_free(), free, "the stat left a descriptor open");
         },
     );
@@ -345,7 +345,7 @@ fn without_sequentialized_threads_a_descriptor_is_not_named() {
     without_sequentialized_threads_nothing_is_named(
         "without_sequentialized_threads_a_descriptor_is_not_named",
         || {
-            let file = File::open("/proc/self/stat").unwrap();
+            let file = File::open("/proc/self/statm").unwrap();
             file.metadata().unwrap();
         },
     );
@@ -601,7 +601,7 @@ fn naming_an_entry_leaves_the_guests_errno() {
     in_its_own_process("naming_an_entry_leaves_the_guests_errno", || {
         under_detcore(|| {
             const SENTINEL: i32 = 4242;
-            let path = CString::new("/proc/self/stat").unwrap();
+            let path = CString::new("/proc/self/statm").unwrap();
             let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
             unsafe { *libc::__errno_location() = SENTINEL };
             let result = unsafe {
@@ -736,7 +736,10 @@ fn filter_close_and_lstat() {
 /// Install the seccomp filter `filter` installs, then run a guest that fills
 /// the descriptors below `FILTERED_FD`, so that the `O_PATH` descriptor
 /// Detcore opens to name a procfs path takes it, and then stats a procfs
-/// path, following the link as `std::fs::metadata` does. The filter leaves
+/// path, following the link as `std::fs::metadata` does. The path is
+/// `/proc/self/statm`, a file the kernel serves: the process's own `stat`,
+/// which these tests used, is Detcore's rendered file since package K slice
+/// D4c-1, and a stat of it names nothing. The filter leaves
 /// that descriptor open in the guest, so the run must record a determinism
 /// loss, and must end.
 #[cfg(target_arch = "x86_64")]
@@ -756,7 +759,7 @@ fn stat_a_procfs_path_with_close_filtered(filter: impl FnOnce()) -> Option<Strin
             FILTERED_FD - 1,
             "a descriptor below {FILTERED_FD} was free"
         );
-        std::fs::metadata("/proc/self/stat").unwrap();
+        std::fs::metadata("/proc/self/statm").unwrap();
         assert!(open(FILTERED_FD), "Detcore's O_PATH descriptor was closed");
     });
     detcore::detlog::determinism_loss()
@@ -851,7 +854,7 @@ fn a_descriptor_numbered_as_openat_is_detcores_when_it_was_free() {
                     OPENAT_OWN_NUMBER - 1,
                     "a descriptor below {OPENAT_OWN_NUMBER} was free"
                 );
-                std::fs::metadata("/proc/self/stat").unwrap();
+                std::fs::metadata("/proc/self/statm").unwrap();
                 assert!(
                     !open(OPENAT_OWN_NUMBER),
                     "Detcore's O_PATH descriptor stayed open"

@@ -25,12 +25,13 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -89,14 +90,15 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           kvm: true
           sabre: false
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
           - sabre
         backends_disabled:
-          dbt: Concurrent shell stdout differed between strict verification runs
           liteinst: The preload runtime cannot survive the shell script's post-start exec
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -161,9 +163,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -223,9 +225,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -289,9 +291,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: "The in-guest runtime runs one thread of the guest and refuses thread creation (reverie 2d68a3bd, hermit d9d98c01); this guest creates threads with pthread_create, so its clone3 is refused and the run ends: in-guest-trap reports the refusal as missing LiteInst statistics, and liteinst as process 3 exiting without deregistering, because the fail-closed exit runs inside the guest process (hermit b3362616 validate, 2026-10-16)"
           in-guest-trap: "The in-guest runtime runs one thread of the guest and refuses thread creation (reverie 2d68a3bd, hermit d9d98c01); this guest creates threads with pthread_create, so its clone3 is refused and the run ends: in-guest-trap reports the refusal as missing LiteInst statistics, and liteinst as process 3 exiting without deregistering, because the fail-closed exit runs inside the guest process (hermit b3362616 validate, 2026-10-16)"
@@ -390,11 +392,11 @@ test:
         backends_disabled:
           native: Native scheduling need not visit a representative set of interleavings in a bounded run
       verify:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled:
+          - dbt
         backends_disabled:
           ptrace: Chaos mode owns this guest; Hermit verifies same-seed repeatability inside every chaos attempt
-          dbt: DBT coverage is owned by its backend parity partition
           kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition

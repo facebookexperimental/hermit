@@ -262,7 +262,7 @@ fn step_running(workflow: &str, command: &str) -> Result<String, String> {
 
 /// Below the builder's 12 GiB warning line, the hosted rebuild logs its peak
 /// memory only because this step turns phase timing on
-/// (https://github.com/rrnewton/dev-hermit/issues/515). Dropping or overriding
+/// (the builder holds the whole ledger in memory). Dropping or overriding
 /// the variable would silently remove that log line.
 fn require_phase_timing(errors: &mut Vec<String>, workflow: &str) {
     let step = match step_running(workflow, REBUILD_COMMAND) {

@@ -9,11 +9,23 @@ set -euo pipefail
 
 case ${1:-} in
     --prepare)
-        command -v python3 >/dev/null
+        test -x /usr/bin/python3
         test -x /usr/bin/sort
         ;;
     --run)
-        exec python3 - <<'PYTHON'
+        # Name the interpreter by its path, matching the --prepare gate, so the
+        # cell runs the same system interpreter whatever the host puts first on
+        # PATH. A host whose /usr/local/bin/python3 is a launcher would otherwise
+        # be measured instead (https://github.com/rrnewton/hermit/issues/4598).
+        #
+        # Python's subprocess closes every descriptor above 2 in the child. An interpreter
+        # without close_range(2) lists /proc/self/fd for them, which Detcore
+        # serves from its own descriptor table on ptrace and KVM (package K
+        # slice F1). Before that, the KVM backend refused the open with
+        # EACCES and the child called close() on each number up to
+        # RLIMIT_NOFILE, about a million calls per spawn, which a pinned soft
+        # limit used to hide (https://github.com/rrnewton/hermit/issues/4604).
+        exec /usr/bin/python3 - <<'PYTHON'
 import hashlib
 import os
 import shutil

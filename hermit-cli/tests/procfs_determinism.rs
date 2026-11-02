@@ -13,6 +13,10 @@ mod hermit_test;
 mod readonly_proc;
 
 #[cfg(feature = "dbt")]
+#[path = "common/dbt_placement_probe.rs"]
+mod dbt_placement_probe;
+
+#[cfg(feature = "dbt")]
 #[path = "common/mapping_capture_live.rs"]
 mod mapping_capture_live;
 
@@ -289,8 +293,15 @@ fn proc_self_stat_is_deterministic() {
         let comm_end = text.rfind(") ").expect("stat has no comm terminator");
         let fields = text[comm_end + 2..].split_whitespace().collect::<Vec<_>>();
         assert!(fields.len() >= 50, "stat has too few fields");
-        for field in [10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 24, 39, 42, 43, 44] {
+        for field in [10, 11, 12, 13, 21, 22, 24, 39, 42, 43, 44] {
             assert_eq!(fields[field - 3], "0", "stat field {field} is volatile");
+        }
+        // The CPU times (14-17) are Detcore's CPU accounting, the same in
+        // every run, which the comparison of the runs checks.
+        for field in 14..=17 {
+            fields[field - 3]
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("stat field {field} is not a tick count"));
         }
     });
 }

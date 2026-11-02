@@ -70,11 +70,21 @@ const STANDALONE_ALLOCATOR_CPU_SECONDS: u64 = 33;
 // Earlier CPU22 timeouts stay censored, not successful completion samples.
 const DETCORE_STACK_CPU_SECONDS: u64 = 51;
 const RENDERED_PROCFS_WRAPPER_NAME: &str = "hermit-rendered-procfs-cpu";
-// hermit-run::cli detcore_renders_its_procfs_files_on_every_backend runs a
-// --verify of one guest on every backend this build has, DBT's among them, plus
-// a DBT chroot run. Completed cgroup CPU seconds in the 13 full validations of
-// 2026-10-15/16 that ran it: 4.5 to 14.9 (12.8, 12.9 and 14.6 at 2f640c23,
-// 90dec733 and d7efd4cb), at 18-24 s wall. dbbbdc86's was stopped by the
+// hermit-run::cli detcore_renders_its_procfs_files_on_dbt_as_on_ptrace runs
+// DBT's --verify of one guest and ptrace's, to compare them. Until 2026-10-26
+// both ran in detcore_renders_its_procfs_files_on_every_backend, which also
+// verified the guest on KVM and e9patch and ran a DBT chroot run and a forged
+// placeholder run on each backend; that test now leaves DBT's verified run to
+// this one and DBT's other two runs to a third
+// (https://github.com/rrnewton/hermit/issues/4783). This test does a part of
+// the whole test's work, so the whole test's measurements below bound it.
+// Measured 2026-10-26, one test at a time: quiet, the whole test took 18.1 s
+// and 5.9 CPU seconds, this part 14.9 s and 3.9; pinned to 2 CPUs shared with
+// 16 CPU-bound spinners, the whole test took 54.9 to 58.1 s (three of five
+// runs past 57 s, the one under nextest stopped there), this part 35.4 to
+// 36.8 s. The whole test's completed cgroup CPU seconds in the 13 full
+// validations of 2026-10-15/16 that ran it: 4.5 to 14.9 (12.8, 12.9 and 14.6
+// at 2f640c23, 90dec733 and d7efd4cb), at 18-24 s wall. dbbbdc86's was stopped by the
 // 22-second cap at 23.6 (32.9 s wall), in a run where every DBT test cost more
 // (detcore_fixes_the_virtual_kernel_files_on_dbt 17.6 against 14.0-15.6).
 // ceil(1.5 * 23.6) = 36 covers that censored run with half again; the
@@ -164,13 +174,11 @@ const CPU_PROFILE_V3_GUEST_WRAPPER_NAME: &str = "hermit-cpu-profile-v3-guest-cpu
 // maximum, beside cpu_profile_v3_cpuinfo_matches_cpuid at 23.2 s wall in the
 // same node. ceil(1.5 * 23.99) = 36.
 const CPU_PROFILE_V3_GUEST_CPU_SECONDS: u64 = 36;
-const SIGNAL_DISCARD_WRAPPER_NAME: &str = "hermit-signal-discard-no-take-cpu";
-// hermit-run::cli a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take:
-// 121 of 122 completed at 6.47 to 21.81 CPU seconds, 99% of the 22-second cap
-// (at most 45.4 s wall). ceil(1.5 * 21.81) = 33. The other, d1f777df's, was
-// stopped by the 57-second wall at 10.22 CPU seconds, which this cap does not
-// change.
-const SIGNAL_DISCARD_CPU_SECONDS: u64 = 33;
+// hermit-run::cli a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take
+// had a 33-second allowance here: as one test of 45 Hermit verify rows, 121 of
+// 122 runs completed at 6.47 to 21.81 CPU seconds (at most 45.4 s wall). Its
+// rows are now split across three tests of 15, each about a third of that
+// cost, so all three keep the ordinary 22-second cap.
 const PARITY_POST_PASS_NO_GUEST_WRAPPER_NAME: &str = "hermit-parity-post-pass-no-guest-cpu";
 // hermit-manifest-plan's test-harness
 // tests::the_parity_post_pass_changes_no_determinism_output_and_runs_no_guest
@@ -197,13 +205,12 @@ const EPOLL_PWAIT2_STRICT_WRAPPER_NAME: &str = "hermit-epoll-pwait2-strict-cpu";
 const EPOLL_PWAIT2_STRICT_CPU_SECONDS: u64 = 35;
 const EPOLL_PWAIT_MASK_WRAPPER_NAME: &str = "hermit-epoll-pwait-mask-cpu";
 const EPOLL_PWAIT_MASK_CPU_SECONDS: u64 = 34;
-// hermit-run::cli a_cross_process_sigkill_notification_verifies_at_bitwise_parity:
-// 155 of 158 completed at 6.76 to 21.77 CPU seconds (7.1 to 9.6 in ops-tick
-// validations, 10.5 to 21.77 in coordinator validations, at most 53.5 s wall);
-// 2 were stopped by the cap at 22.07 and 22.21 (30.5 and 33.5 s wall) and 1 by
-// the wall at 9.92. ceil(1.5 * 22.21) = 34.
-const CROSS_PROCESS_SIGKILL_WRAPPER_NAME: &str = "hermit-cross-process-sigkill-cpu";
-const CROSS_PROCESS_SIGKILL_CPU_SECONDS: u64 = 34;
+// hermit-run::cli a_cross_process_sigkill_notification_verifies_at_bitwise_parity
+// had a 34-second allowance here: as one test of 15 modes (45 verified runs),
+// 155 of 158 runs completed at 6.76 to 21.77 CPU seconds (at most 53.5 s
+// wall). Its modes are now split across three tests of 5, each about a third
+// of that cost, so all three keep the ordinary 22-second cap
+// (https://github.com/rrnewton/hermit/issues/4783).
 const CPU_TERMINATION_GRACE_SECONDS: u64 = 2;
 
 #[derive(Clone, Copy)]
@@ -238,7 +245,7 @@ impl MeasuredCpuAllowance {
     }
 }
 
-const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
+const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 30] = [
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_ALLOCATOR_WRAPPER_NAME,
         package: "hermit-run",
@@ -267,7 +274,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         wrapper_name: RENDERED_PROCFS_WRAPPER_NAME,
         package: "hermit-run",
         binary: "hermit-run::cli",
-        test: "detcore_renders_its_procfs_files_on_every_backend",
+        test: "detcore_renders_its_procfs_files_on_dbt_as_on_ptrace",
         cpu_seconds: RENDERED_PROCFS_CPU_SECONDS,
         wall_seconds: None,
     },
@@ -417,14 +424,6 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         wall_seconds: None,
     },
     MeasuredCpuAllowance {
-        wrapper_name: SIGNAL_DISCARD_WRAPPER_NAME,
-        package: "hermit-run",
-        binary: "hermit-run::cli",
-        test: "a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take",
-        cpu_seconds: SIGNAL_DISCARD_CPU_SECONDS,
-        wall_seconds: None,
-    },
-    MeasuredCpuAllowance {
         wrapper_name: PARITY_POST_PASS_NO_GUEST_WRAPPER_NAME,
         package: "hermit-manifest-plan",
         binary: "hermit-manifest-plan::bin/test-harness",
@@ -446,14 +445,6 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         binary: "hermit-run::epoll_determinism",
         test: "epoll_pwait_sleeps_under_its_temporary_mask",
         cpu_seconds: EPOLL_PWAIT_MASK_CPU_SECONDS,
-        wall_seconds: None,
-    },
-    MeasuredCpuAllowance {
-        wrapper_name: CROSS_PROCESS_SIGKILL_WRAPPER_NAME,
-        package: "hermit-run",
-        binary: "hermit-run::cli",
-        test: "a_cross_process_sigkill_notification_verifies_at_bitwise_parity",
-        cpu_seconds: CROSS_PROCESS_SIGKILL_CPU_SECONDS,
         wall_seconds: None,
     },
 ];
@@ -1170,7 +1161,7 @@ fn resolve_budgets(
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
         println!(
-            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), signal discard ({SIGNAL_DISCARD_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), cross-process SIGKILL ({CROSS_PROCESS_SIGKILL_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. Every exact prepared selected liteinst_stacks identity, and the CPU-profile v3 host loader, gets a separate base wall backstop of three times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. Every exact prepared selected liteinst_stacks identity, and the CPU-profile v3 host loader, gets a separate base wall backstop of three times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
         );
         return Ok(());
     }
@@ -2295,13 +2286,6 @@ mod tests {
                 36,
             ),
             (
-                "hermit-run",
-                "hermit-run::cli",
-                "a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take",
-                SIGNAL_DISCARD_WRAPPER_NAME,
-                33,
-            ),
-            (
                 "hermit-manifest-plan",
                 "hermit-manifest-plan::bin/test-harness",
                 "tests::the_parity_post_pass_changes_no_determinism_output_and_runs_no_guest",
@@ -2320,13 +2304,6 @@ mod tests {
                 "hermit-run::epoll_determinism",
                 "epoll_pwait_sleeps_under_its_temporary_mask",
                 EPOLL_PWAIT_MASK_WRAPPER_NAME,
-                34,
-            ),
-            (
-                "hermit-run",
-                "hermit-run::cli",
-                "a_cross_process_sigkill_notification_verifies_at_bitwise_parity",
-                CROSS_PROCESS_SIGKILL_WRAPPER_NAME,
                 34,
             ),
         ]);
@@ -2458,7 +2435,7 @@ mod tests {
             "package(=hermit-run) & binary_id(=hermit-run::liteinst_allocator) & test(=genuine_detcore_leaf_keeps_scope_free_work_private)",
             "package(=hermit-run) & binary_id(=hermit-run::liteinst_stacks) & test(=cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack)",
             "package(=hermit-run) & binary_id(=hermit-run::liteinst_allocator) & test(=genuine_standalone_leaf_keeps_scope_free_work_private)",
-            "package(=hermit-run) & binary_id(=hermit-run::cli) & test(=detcore_renders_its_procfs_files_on_every_backend)",
+            "package(=hermit-run) & binary_id(=hermit-run::cli) & test(=detcore_renders_its_procfs_files_on_dbt_as_on_ptrace)",
             "package(=hermit-run) & binary_id(=hermit-run::liteinst_stacks) & test(=genuine_detcore_reaches_fixed_guarded_callback_and_altstack)",
         ];
         for mask in 0..(1 << names.len()) {
@@ -2692,7 +2669,7 @@ mod tests {
             prepared_selected_cpu_allowances(true, || Ok(serde_json::to_vec(&inventory).unwrap()))
                 .unwrap();
         assert_eq!(selected.len(), 15);
-        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 32);
+        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 30);
         for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5), (0.01, 0.1)] {
             let rendered = scaled_config_with_allowances(
                 include_str!("../.config/nextest.toml"),

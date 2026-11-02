@@ -23,9 +23,9 @@ The most important boundary is:
 These rules bind every backend and every change, and a review checks a change
 against them (owner, 2026-10-15). A *backend* is a Reverie implementation of
 the `Tool`/`Guest` contract (ptrace, dbt, in-guest-trap, liteinst, sabre,
-e9patch, kvm); the *tool* is Detcore. Known violations are listed in the
-[backend architecture audit](https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/2026-10-15-kvm-backend-architecture-audit.md)
-and tracked from https://github.com/rrnewton/hermit/issues/4485.
+e9patch, kvm); the *tool* is Detcore. Known violations are tracked from
+https://github.com/rrnewton/hermit/issues/4485 and its successor
+https://github.com/rrnewton/hermit/issues/4659.
 
 1. **A backend only intercepts.** It hooks guest syscalls and other events and
    delivers them to the tool through the standard callbacks. How it hooks, and
@@ -136,8 +136,8 @@ time) stays in the hermit process.
 | **dbt** | DynamoRIO pre-syscall event in a DynamoRIO client (`reverie-dbt`, `detcore-dbt`) | Inside the guest, in the DynamoRIO client | Experimental; handles clone, fork, exec and signals in its own C client, contrary to principle 4 |
 | **in-guest-trap** | A seccomp filter turns every syscall into `SIGSYS`, and a handler inside the guest calls Detcore (`reverie-inguest`) | Inside the guest, in a preloaded runtime | Experimental; `fork` only: `execve` and thread creation are refused, signal handling is limited, and no preemption timer yet |
 | **liteinst** | in-guest-trap plus run-time patching: a syscall site that has trapped once is rewritten to jump straight to the handler (`reverie-liteinst`, `liteinst2`) | As in-guest-trap | Experimental; the same runtime as in-guest-trap with site patching on, so it has the same limits |
-| **sabre** | Load-time rewriting of syscall sites by the SaBRe loader, with a ptrace supervisor as the backstop for sites it missed (`reverie-sabre`, `detcore-sabre`) | Inside the guest, in a SaBRe plugin | Experimental |
-| **e9patch** | Ahead-of-time empty rewrite of the main ELF's candidate sites, then the ordinary ptrace path | In the tracer, as ptrace | Experimental; see below |
+| **sabre** | Load-time rewriting of syscall sites by the SaBRe loader, with a ptrace supervisor as the backstop for sites it missed (`reverie-sabre`, `detcore-sabre`) | Inside the guest, in a SaBRe plugin | Archived (nightly only) since 2026-10-25: builds and has a per-commit smoke test, no feature work; see `ci/manifest-plan/src/archived.rs` |
+| **e9patch** | Ahead-of-time empty rewrite of the main ELF's candidate sites, then the ordinary ptrace path | In the tracer, as ptrace | Archived (nightly only) since 2026-10-25: preprocessing, not a backend, with per-commit build and contract checks and no feature work; see below |
 | **kvm** | The guest runs in a KVM virtual machine and traps by VM exit (`reverie-kvm`) | In the hermit process, driven by the KVM executor | Experimental; the executor implements part of the Linux personality itself, including an allowlisted `/proc`, contrary to principles 2 and 3 |
 
 in-guest-trap and liteinst are one runtime with a switch: Hermit sets
@@ -703,9 +703,15 @@ synthesize a full virtual filesystem, Detcore takes a **snapshot-and-normalize**
 approach for a small allow-list of volatile files (`detcore/src/procfs.rs`):
 
 - `/proc/self/stat` — a fixed set of volatile numeric fields (the page-fault
-  counters, `utime`/`stime`/`cutime`/`cstime`, `itrealvalue`, `starttime`, the
-  last-run `processor`, and the trailing delay/guest-time accounting fields) are
-  rewritten to `0`, while the `comm` string and structural fields are preserved.
+  counters, `itrealvalue`, `starttime`, the last-run `processor`, and the
+  trailing delay/guest-time accounting fields) are rewritten to `0`, while the
+  `comm` string and structural fields are preserved. Where Detcore renders the
+  reader's own process's `stat`, `utime`/`stime`/`cutime`/`cstime` are its
+  logical CPU accounting, the one `times(2)`, `getrusage(2)` and the CPU-time
+  clocks report; elsewhere they are `0`.
+- `/proc/<pid>/schedstat` — the task's runtime from the same accounting, for
+  a thread of the reader's own process where its `stat` is rendered (else
+  `0`), and `0` for the run-queue wait and the run count.
 - `/proc/self/status` — the CPU affinity mask/list are pinned to virtual CPU 0,
   and `voluntary_ctxt_switches` and `nonvoluntary_ctxt_switches` are pinned to
   `0`.

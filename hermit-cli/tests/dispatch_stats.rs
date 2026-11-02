@@ -6,7 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! The ptrace and e9patch dispatch records, and the DEBUG-only rule.
+//! The ptrace and e9patch dispatch records, the DEBUG-only rule, and the
+//! syscall histogram's repeatability.
 //!
 //! The harness in `common/dispatch_stats.rs` checks what every backend's
 //! record must satisfy; the SaBRe case lives in `sabre_examples.rs`, whose
@@ -23,6 +24,7 @@ use dispatch_stats::GUEST_SYSCALLS;
 use dispatch_stats::REPORT_MARKERS;
 use dispatch_stats::build_guest;
 use dispatch_stats::dispatch_record;
+use dispatch_stats::guest_summary;
 use dispatch_stats::run_guest;
 
 #[test]
@@ -48,6 +50,29 @@ fn ptrace_reports_seccomp_stops_and_no_patching() {
             .as_ref()
             .is_some_and(|processes| !processes.is_empty()),
         "ptrace attributes its stops per process: {record}"
+    );
+}
+
+/// The syscall histogram is counted from the guest's deterministic execution,
+/// so two runs of one guest report the same histogram, entry for entry and
+/// outcome for outcome. (`guest_summary` checks each run's own invariants.)
+#[test]
+fn ptrace_syscall_histograms_of_two_runs_are_identical() {
+    let guest = build_guest("guest-histogram", &[]);
+    let hermit = Path::new(env!("CARGO_BIN_EXE_hermit"));
+    let first = guest_summary("ptrace", hermit, &[], &[], &guest);
+    let second = guest_summary("ptrace", hermit, &[], &[], &guest);
+    let first = first.syscall_histogram.expect("checked by guest_summary");
+    let second = second.syscall_histogram.expect("checked by guest_summary");
+    assert_eq!(first, second);
+    let getppid = first
+        .get("getppid")
+        .expect("checked by guest_summary")
+        .counts;
+    assert_eq!(
+        getppid.detcore + getppid.backend + getppid.refused,
+        GUEST_SYSCALLS,
+        "{getppid:?}"
     );
 }
 

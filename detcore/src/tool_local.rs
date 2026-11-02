@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use detcore_model::pedigree::Pedigree;
 use detcore_model::summary::TimesliceStats;
+use detcore_model::syscall_histogram::SyscallHistogram;
 use nix::fcntl::OFlag;
 use nix::sys::stat;
 use nix::unistd::Pid;
@@ -51,6 +52,7 @@ use crate::record_or_replay::NoopTool;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ChaosEpochTransition;
 use crate::resources::Device;
+use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -126,6 +128,43 @@ pub struct FileMetadata {
     /// says whether they are placeholders (`decide_cpuinfo_placeholders`).
     #[serde(default)]
     pending_cpuinfo_placeholders: Vec<RawFd>,
+    /// Descriptors open in this table that Detcore keeps no description of,
+    /// with whether each is close-on-exec: a received anonymous inode, or a
+    /// received descriptor whose facts could not be taken
+    /// (`Detcore::record_received_descriptors`). Listed in the table's
+    /// descriptor directory (`syscalls::files::descriptor_directory`), so a
+    /// close-all loop reaches them; forgotten when the number is closed or
+    /// replaced.
+    #[serde(default)]
+    present_unmodelled: BTreeMap<RawFd, bool>,
+    /// Whether a receive may have installed descriptors in this table whose
+    /// numbers Detcore does not know (a receive whose layout could not be
+    /// trusted, one on the background path, or one without sequentialized
+    /// threads): then a listing of the table cannot come from Detcore's
+    /// model.
+    #[serde(default)]
+    unaccounted_receipts: bool,
+    /// The capacity Linux's descriptor table has (`max_fds`): 64
+    /// (`NR_OPEN_DEFAULT`) until a descriptor at or above it is installed,
+    /// then the next power of two above the highest one installed
+    /// (`expand_files`, `alloc_fdtable`); a fork's copy is sized from the
+    /// descriptors open at the fork (`dup_fd`, `sane_fdtable_size`); `exec`
+    /// keeps the table. The end of a descriptor directory's listing.
+    #[serde(default = "default_descriptor_capacity")]
+    descriptor_capacity: u64,
+    /// Whether the exec that made this table dropped a close-on-exec
+    /// description whose locks Detcore follows (`DetFd::is_lock_tracked`):
+    /// the post-exec handler then names the surviving ones to
+    /// `procfs::locks::LockLedger` even where none survived, so that the
+    /// ledger releases a placeholder `flock` the exec closed
+    /// (`LockLedger::exec_kept`).
+    #[serde(default)]
+    exec_dropped_lock_tracked: bool,
+}
+
+/// `NR_OPEN_DEFAULT` on 64-bit Linux.
+fn default_descriptor_capacity() -> u64 {
+    64
 }
 
 /// Deserializes a descriptor table with its aliases restored, so a table
@@ -431,6 +470,10 @@ struct PosixTimer {
     /// for a timer created with no `sigevent` (`do_timer_create`).
     #[serde(default)]
     value: u64,
+    /// Created on a CPU clock (`crate::cpu_clock`). Its relative armings
+    /// count down on the virtual clock like any other timer's.
+    #[serde(default)]
+    cpu_clock: bool,
 }
 
 /// The set of POSIX timers owned by a *process*.
@@ -453,12 +496,14 @@ impl PosixTimers {
     /// Allocate a new (disarmed) timer, returning its deterministic id.
     /// `thread` is the thread a `SIGEV_THREAD_ID` timer notifies, and
     /// `value` its `sigev_value`, or `None` for a timer created with no
-    /// `sigevent`, whose `si_value` is its id.
+    /// `sigevent`, whose `si_value` is its id. `cpu_clock` says the timer was
+    /// created on a CPU clock.
     pub(crate) fn create(
         &mut self,
         signal: Option<i32>,
         thread: Option<DetTid>,
         value: Option<u64>,
+        cpu_clock: bool,
     ) -> i32 {
         let id = self.next_id;
         self.next_id += 1;
@@ -470,9 +515,15 @@ impl PosixTimers {
                 signal,
                 thread,
                 value: value.unwrap_or(id as u32 as u64),
+                cpu_clock,
             },
         );
         id
+    }
+
+    /// Whether timer `id` exists and was created on a CPU clock.
+    pub(crate) fn on_cpu_clock(&self, id: i32) -> bool {
+        self.timers.get(&id).is_some_and(|timer| timer.cpu_clock)
     }
 
     /// The `si_value` of timer `id`'s signal.
@@ -808,6 +859,78 @@ impl FileMetadata {
             next_accept_wait: 0,
             cpuinfo_placeholders: None,
             pending_cpuinfo_placeholders: Vec::new(),
+            present_unmodelled: BTreeMap::new(),
+            unaccounted_receipts: false,
+            descriptor_capacity: default_descriptor_capacity(),
+            exec_dropped_lock_tracked: false,
+        }
+    }
+
+    /// Note that descriptor `fd` was installed in this table: it is no
+    /// longer an unmodelled one, and the table grows to hold it as Linux's
+    /// does ([`Self::descriptor_capacity`]).
+    fn note_installed(&mut self, fd: RawFd) {
+        self.present_unmodelled.remove(&fd);
+        self.grow_to_hold(fd);
+    }
+
+    /// Grow the table to hold descriptor `fd`, as Linux's `expand_files`
+    /// does ([`Self::descriptor_capacity`]): for an installed descriptor, and
+    /// for the target of a `dup2` or `dup3` that then fails because its old
+    /// descriptor is not open, which `ksys_dup3` expands the table for first
+    /// (<https://github.com/torvalds/linux/blob/v6.17/fs/file.c#L1408-L1415>).
+    fn grow_to_hold(&mut self, fd: RawFd) {
+        if let Ok(fd) = u64::try_from(fd)
+            && fd >= self.descriptor_capacity
+        {
+            self.descriptor_capacity = (fd + 1)
+                .checked_next_power_of_two()
+                .unwrap_or(u64::MAX / 2)
+                .max(default_descriptor_capacity());
+        }
+    }
+
+    /// Set the close-on-exec flag of descriptor `fd` if it is one this table
+    /// lists without modelling ([`Self::present_unmodelled`]); whether it is.
+    fn set_unmodelled_cloexec(&mut self, fd: RawFd, cloexec: bool) -> bool {
+        match self.present_unmodelled.get_mut(&fd) {
+            Some(flag) => {
+                *flag = cloexec;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The descriptors open in this table that it knows of, ascending:
+    /// those it models and those it does not ([`Self::present_unmodelled`]).
+    fn descriptor_numbers(&self) -> Vec<RawFd> {
+        let mut numbers: Vec<RawFd> = self
+            .file_handles
+            .keys()
+            .copied()
+            .chain(self.present_unmodelled.keys().copied())
+            .collect();
+        numbers.sort_unstable();
+        numbers.dedup();
+        numbers
+    }
+
+    /// The capacity a fork's copy of this table gets: `dup_fd` sizes it from
+    /// the highest descriptor open, rounded up to a multiple of
+    /// `BITS_PER_LONG` (`sane_fdtable_size`), and allocates a larger table
+    /// only past `NR_OPEN_DEFAULT`, to the next power of two
+    /// (`alloc_fdtable`).
+    fn forked_descriptor_capacity(&self) -> u64 {
+        let open = self
+            .descriptor_numbers()
+            .last()
+            .and_then(|fd| u64::try_from(*fd).ok())
+            .map_or(0, |fd| (fd + 1).next_multiple_of(64));
+        if open <= default_descriptor_capacity() {
+            default_descriptor_capacity()
+        } else {
+            open.checked_next_power_of_two().unwrap_or(u64::MAX / 2)
         }
     }
 
@@ -978,6 +1101,10 @@ impl FileMetadata {
             next_accept_wait: 0,
             cpuinfo_placeholders: self.cpuinfo_placeholders,
             pending_cpuinfo_placeholders: self.pending_cpuinfo_placeholders.clone(),
+            present_unmodelled: self.present_unmodelled.clone(),
+            unaccounted_receipts: self.unaccounted_receipts,
+            descriptor_capacity: self.forked_descriptor_capacity(),
+            exec_dropped_lock_tracked: false,
         }
     }
 
@@ -996,6 +1123,18 @@ impl FileMetadata {
             next_accept_wait: 0,
             cpuinfo_placeholders: self.cpuinfo_placeholders,
             pending_cpuinfo_placeholders: self.pending_cpuinfo_placeholders.clone(),
+            present_unmodelled: self
+                .present_unmodelled
+                .iter()
+                .filter(|(_, cloexec)| !**cloexec)
+                .map(|(fd, cloexec)| (*fd, *cloexec))
+                .collect(),
+            unaccounted_receipts: self.unaccounted_receipts,
+            descriptor_capacity: self.descriptor_capacity,
+            exec_dropped_lock_tracked: self
+                .file_handles
+                .values()
+                .any(|detfd| detfd.is_cloexec() && detfd.is_lock_tracked()),
         }
     }
 
@@ -1446,32 +1585,18 @@ impl FileMetadata {
         }
         let raw_stat =
             stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).map_err(|_| Errno::last())?;
-        let file_type = stat::SFlag::from_bits_truncate(raw_stat.st_mode);
-        let ty = if file_type.contains(stat::SFlag::S_IFIFO) {
-            FdType::Pipe
-        } else if file_type.contains(stat::SFlag::S_IFSOCK) {
-            FdType::Socket
-        } else if status_flags & libc::O_PATH == 0
-            && crate::fd::is_random_device(raw_stat.st_mode, raw_stat.st_rdev)
-        {
-            // Linux's random devices by device number, as an open classifies
-            // them (`Detcore::handle_openat`).
-            FdType::Rng
-        } else {
-            FdType::Regular
-        };
-        let mut flags = OFlag::from_bits_truncate(status_flags);
-        let physically_nonblocking = flags.contains(OFlag::O_NONBLOCK);
-        // Discovered descriptors have unknown provenance, so an observed
-        // O_NONBLOCK bit must remain guest-visible. Detcore-created scheduler
-        // pipes are registered when created and do not reach this fallback.
-        if fd_flags & libc::FD_CLOEXEC != 0 {
-            flags.insert(OFlag::O_CLOEXEC);
-        }
-        self.add_fd(owner, fd, flags, ty, Some(raw_stat.into()))?;
-        // This newly discovered description predates our observation. Its
-        // kernel lock may be held, but no cached lock claim existed to go stale.
-        self.with_detfd(fd, |detfd| detfd.mark_flock_mode_unobserved())?;
+        // An anonymous inode has no file type; its link names what it is.
+        let link = (raw_stat.st_mode & libc::S_IFMT == 0)
+            .then(|| own_fd_link(fd))
+            .flatten();
+        self.add_discovered_fd(
+            owner,
+            fd,
+            fd_flags,
+            status_flags,
+            &raw_stat,
+            link.as_deref(),
+        )?;
         // A placeholder for a procfs file Detcore renders, which the backend
         // rediscovers after `exec`: the file again, at the position the old
         // image left and with the snapshot it took, as a backend that keeps
@@ -1536,6 +1661,61 @@ impl FileMetadata {
         if let Some(resource) = stdio_resource(fd) {
             self.with_detfd(fd, |detfd| detfd.set_resource(resource.clone()))?;
         }
+        Ok(())
+    }
+
+    /// Record descriptor `fd`, whose creation Detcore did not see, from the
+    /// kernel's facts about it: its descriptor flags `fd_flags` (`F_GETFD`),
+    /// status flags `status_flags` (`F_GETFL`) and `raw_stat` (`fstat`). Its
+    /// type is the file's (pipe, socket, random device or regular), or, for
+    /// an anonymous inode whose descriptor link (`link`) names an inotify
+    /// instance, inotify; its
+    /// flags are the kernel's (an observed `O_NONBLOCK` stays guest-visible:
+    /// the provenance is unknown), and its lock state is unobserved. Shared by
+    /// the in-guest discovery ([`Self::discover_fd_from_current_process`])
+    /// and by the record of a descriptor received over `SCM_RIGHTS`
+    /// (`Detcore::record_received_descriptors`), so both make the same
+    /// description from the same facts.
+    fn add_discovered_fd(
+        &mut self,
+        owner: DetTid,
+        fd: RawFd,
+        fd_flags: libc::c_int,
+        status_flags: libc::c_int,
+        raw_stat: &libc::stat,
+        link: Option<&[u8]>,
+    ) -> Result<(), Errno> {
+        let file_type = stat::SFlag::from_bits_truncate(raw_stat.st_mode);
+        let ty = if raw_stat.st_mode & libc::S_IFMT == 0
+            && link == Some(crate::syscalls::inotify::INOTIFY_LINK)
+        {
+            // Its reads renumber rename cookies (`crate::syscalls::inotify`).
+            FdType::Inotify
+        } else if file_type.contains(stat::SFlag::S_IFIFO) {
+            FdType::Pipe
+        } else if file_type.contains(stat::SFlag::S_IFSOCK) {
+            FdType::Socket
+        } else if status_flags & libc::O_PATH == 0
+            && crate::fd::is_random_device(raw_stat.st_mode, raw_stat.st_rdev)
+        {
+            // Linux's random devices by device number, as an open classifies
+            // them (`Detcore::handle_openat`).
+            FdType::Rng
+        } else {
+            FdType::Regular
+        };
+        let mut flags = OFlag::from_bits_truncate(status_flags);
+        let physically_nonblocking = flags.contains(OFlag::O_NONBLOCK);
+        // Discovered descriptors have unknown provenance, so an observed
+        // O_NONBLOCK bit must remain guest-visible. Detcore-created scheduler
+        // pipes are registered when created and do not reach this fallback.
+        if fd_flags & libc::FD_CLOEXEC != 0 {
+            flags.insert(OFlag::O_CLOEXEC);
+        }
+        self.add_fd(owner, fd, flags, ty, Some((*raw_stat).into()))?;
+        // This newly discovered description predates our observation. Its
+        // kernel lock may be held, but no cached lock claim existed to go stale.
+        self.with_detfd(fd, |detfd| detfd.mark_flock_mode_unobserved())?;
         if ty == FdType::Pipe && physically_nonblocking {
             self.with_detfd(fd, |detfd| detfd.set_physically_nonblocking())?;
         }
@@ -1617,6 +1797,7 @@ impl FileMetadata {
     /// add a detfd
     fn add_detfd(&mut self, detfd: DetFd) {
         let fd = detfd.fd;
+        self.note_installed(fd);
         self.file_handles.insert(fd, detfd);
     }
 
@@ -1637,12 +1818,15 @@ impl FileMetadata {
 
     /// remove a rawfd
     fn remove_fd(&mut self, fd: RawFd) -> Option<OpenFileId> {
+        self.present_unmodelled.remove(&fd);
         let detfd = self.file_handles.remove(&fd)?;
         (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())
     }
 
     /// Remove every modeled descriptor in an inclusive close_range interval.
     fn remove_fd_range(&mut self, first: u32, last: u32) -> Vec<OpenFileId> {
+        self.present_unmodelled
+            .retain(|fd, _| !(*fd >= 0 && first <= *fd as u32 && *fd as u32 <= last));
         let mut descriptors: Vec<_> = self
             .file_handles
             .keys()
@@ -1664,13 +1848,28 @@ impl FileMetadata {
         flags: OFlag,
     ) -> Result<Option<OpenFileId>, Errno> {
         if oldfd == newfd {
+            if self.present_unmodelled.contains_key(&oldfd) {
+                return Ok(None);
+            }
             self.with_detfd(oldfd, |_| ())?;
             return Ok(None);
+        }
+        // A copy of a descriptor Detcore keeps no description of is another
+        // such descriptor, which the kernel has installed.
+        if !self.file_handles.contains_key(&oldfd) && self.present_unmodelled.contains_key(&oldfd) {
+            self.note_installed(newfd);
+            self.present_unmodelled
+                .insert(newfd, flags.contains(OFlag::O_CLOEXEC));
+            let replaced = self.file_handles.remove(&newfd);
+            return Ok(replaced.and_then(|detfd| {
+                (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())
+            }));
         }
 
         let detfd = self.with_detfd(oldfd, |old_detfd| {
             old_detfd.clone().with_fd(newfd).with_fd_flags(flags)
         })?;
+        self.note_installed(newfd);
         let replaced = self.file_handles.insert(newfd, detfd);
         Ok(replaced
             .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
@@ -1706,6 +1905,7 @@ impl FileMetadata {
         }
 
         let detfd = captured.detfd.with_fd(newfd).with_fd_flags(flags);
+        self.note_installed(newfd);
         let replaced = self.file_handles.insert(newfd, detfd);
         Ok(replaced
             .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
@@ -1741,15 +1941,15 @@ mod posix_timers_tests {
     #[test]
     fn ids_are_deterministic_and_sequential() {
         let mut timers = PosixTimers::default();
-        assert_eq!(timers.create(None, None, None), 0);
-        assert_eq!(timers.create(Some(libc::SIGALRM), None, None), 1);
-        assert_eq!(timers.create(None, None, None), 2);
+        assert_eq!(timers.create(None, None, None, false), 0);
+        assert_eq!(timers.create(Some(libc::SIGALRM), None, None, false), 1);
+        assert_eq!(timers.create(None, None, None, false), 2);
     }
 
     #[test]
     fn settime_reports_previous_arming_and_remaining_uses_virtual_clock() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(None, None, None);
+        let id = timers.create(None, None, None, false);
 
         // Arm a one-shot timer for 100ns at t=0. A freshly created timer was
         // disarmed, so the reported old value is zero.
@@ -1765,7 +1965,7 @@ mod posix_timers_tests {
     #[test]
     fn resetting_reports_old_remaining() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(None, None, None);
+        let id = timers.create(None, None, None, false);
         timers.settime(id, 0, Some(t(100)), t(0));
         // Re-arm at t=30 (70ns remained) with a periodic 50ns timer.
         let old = timers
@@ -1780,7 +1980,7 @@ mod posix_timers_tests {
     #[test]
     fn periodic_remaining_advances_past_each_deadline() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(Some(libc::SIGALRM), None, None);
+        let id = timers.create(Some(libc::SIGALRM), None, None, false);
         timers.settime(id, 50, Some(t(100)), t(0));
 
         assert_eq!(timers.gettime(id, t(100)), Some((50, 50)));
@@ -1792,7 +1992,7 @@ mod posix_timers_tests {
     #[test]
     fn disarm_and_unknown_ids() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(None, None, None);
+        let id = timers.create(None, None, None, false);
         timers.settime(id, 0, Some(t(100)), t(0));
         // Disarm: value of 0 -> deadline None -> remaining 0.
         timers.settime(id, 0, None, t(10));
@@ -1807,7 +2007,7 @@ mod posix_timers_tests {
     #[test]
     fn delete_removes_timer() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(None, None, None);
+        let id = timers.create(None, None, None, false);
         assert!(timers.contains(id));
         assert!(timers.remove(id));
         assert!(!timers.contains(id));
@@ -2382,6 +2582,98 @@ mod file_metadata_tests {
     /// descriptor Detcore discovers afresh, as it does one it did not create
     /// (one received over `SCM_RIGHTS`), has none
     /// (<https://github.com/rrnewton/hermit/issues/4380>).
+    /// The capacity a descriptor directory's end follows is Linux's: it
+    /// grows to the next power of two above an installed descriptor, keeps
+    /// it when the descriptor closes, and a fork's copy is sized from what
+    /// is open (measured: `dup2(0, 100); close(100)` ends at 130, and a
+    /// fork's child after it at 66).
+    #[test]
+    fn the_descriptor_capacity_follows_linuxs_allocation() {
+        let owner = DetTid::from_raw(9031);
+        let mut table = FileMetadata::new(owner);
+        assert_eq!(table.descriptor_capacity, 64);
+        table
+            .add_fd(owner, 100, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        assert_eq!(table.descriptor_capacity, 128);
+        table.remove_fd(100);
+        assert_eq!(table.descriptor_capacity, 128);
+        assert_eq!(
+            table.fork_for(DetTid::from_raw(9032)).descriptor_capacity,
+            64
+        );
+        table
+            .add_fd(owner, 70, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        assert_eq!(
+            table.fork_for(DetTid::from_raw(9033)).descriptor_capacity,
+            128
+        );
+        assert_eq!(table.for_exec(owner).descriptor_capacity, 128);
+    }
+
+    /// A `dup2` or `dup3` to 100 whose old descriptor is not open grows the
+    /// table to 128 slots, as `ksys_dup3` expands it before it looks the old
+    /// descriptor up (measured: `dup2(-1, 100)` fails with EBADF and a
+    /// listing then ends at 130); a target below the capacity changes
+    /// nothing.
+    #[test]
+    fn a_failed_dup_grows_the_table_for_its_target() {
+        let owner = DetTid::from_raw(9041);
+        let mut table = FileMetadata::new(owner);
+        table.grow_to_hold(10);
+        assert_eq!(table.descriptor_capacity, 64);
+        table.grow_to_hold(100);
+        assert_eq!(table.descriptor_capacity, 128);
+        assert!(table.descriptor_numbers().is_empty());
+        table.grow_to_hold(-1);
+        assert_eq!(table.descriptor_capacity, 128);
+    }
+
+    /// A descriptor listed without modelling keeps the close-on-exec flag
+    /// `F_SETFD`, `FIOCLEX` and `FIONCLEX` give it, which decides whether it
+    /// survives `exec`; any other descriptor is not one.
+    #[test]
+    fn an_unmodelled_descriptor_keeps_its_close_on_exec_changes() {
+        let owner = DetTid::from_raw(9042);
+        let mut table = FileMetadata::new(owner);
+        table.present_unmodelled.insert(5, false);
+        table.present_unmodelled.insert(6, true);
+        assert!(table.set_unmodelled_cloexec(5, true));
+        assert!(table.set_unmodelled_cloexec(6, false));
+        assert!(!table.set_unmodelled_cloexec(7, true));
+        let after = table.for_exec(owner);
+        assert!(!after.present_unmodelled.contains_key(&5));
+        assert_eq!(after.present_unmodelled.get(&6), Some(&false));
+    }
+
+    /// A descriptor open in the table that Detcore does not model (a
+    /// received anonymous inode) is listed until it is closed or replaced,
+    /// survives `exec` unless it is close-on-exec, and a `dup` of it is
+    /// another such descriptor.
+    #[test]
+    fn an_unmodelled_descriptor_is_listed_until_it_goes() {
+        let owner = DetTid::from_raw(9034);
+        let mut table = FileMetadata::new(owner);
+        table
+            .add_fd(owner, 0, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        table.present_unmodelled.insert(5, false);
+        table.present_unmodelled.insert(6, true);
+        assert_eq!(table.descriptor_numbers(), vec![0, 5, 6]);
+        assert_eq!(table.for_exec(owner).descriptor_numbers(), vec![0, 5]);
+        assert_eq!(table.dup_fd(5, 9, OFlag::O_CLOEXEC).unwrap(), None);
+        assert_eq!(table.present_unmodelled.get(&9), Some(&true));
+        table.remove_fd(5);
+        table
+            .add_fd(owner, 6, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        assert_eq!(table.descriptor_numbers(), vec![0, 6, 9]);
+        assert!(!table.present_unmodelled.contains_key(&6));
+        table.remove_fd_range(0, 100);
+        assert!(table.descriptor_numbers().is_empty());
+    }
+
     #[test]
     fn a_pipe_channel_follows_its_description_through_dup_and_fork() {
         let owner = DetTid::from_raw(9018);
@@ -2422,6 +2714,90 @@ mod file_metadata_tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// A descriptor received over `SCM_RIGHTS` on a backend whose tool does
+    /// not share the guest's table is recorded from injected facts
+    /// (`add_discovered_fd`); an in-guest backend discovers the same
+    /// descriptor in process. Both make the same description: type, status
+    /// flags, close-on-exec, physical nonblocking and an unobserved lock.
+    #[test]
+    fn a_received_descriptor_is_recorded_as_the_in_guest_discovery_records_it() {
+        let owner = DetTid::from_raw(9031);
+        let facts = |fd: RawFd| {
+            // SAFETY: fcntl and fstat only read this test's descriptor.
+            let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+            (fd_flags, status, stat)
+        };
+        let shape = |metadata: &FileMetadata, fd: RawFd| {
+            let detfd = &metadata.file_handles[&fd];
+            (
+                detfd.ty(),
+                detfd.status_flags(),
+                detfd.is_cloexec(),
+                detfd.physically_nonblocking(),
+                detfd.is_nonblocking(),
+                detfd.known_flock_mode(),
+                detfd.flock_may_have_been_granted(),
+                detfd.stat().map(|stat| stat.raw_inode()),
+            )
+        };
+        let (pipe_read, _pipe_write) =
+            nix::unistd::pipe2(OFlag::O_NONBLOCK | OFlag::O_CLOEXEC).unwrap();
+        let (socket, _peer) = nix::sys::socket::socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::Stream,
+            None,
+            nix::sys::socket::SockFlag::empty(),
+        )
+        .unwrap();
+        let file = std::fs::File::open("/proc/self/exe").unwrap();
+        let random = std::fs::File::open("/dev/urandom").unwrap();
+        // SAFETY: inotify_init1 takes no pointer; the descriptor is owned here.
+        let inotify = unsafe {
+            <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(libc::inotify_init1(
+                libc::IN_NONBLOCK | libc::IN_CLOEXEC,
+            ))
+        };
+        let cases = [
+            (pipe_read.as_raw_fd(), FdType::Pipe),
+            (socket.as_raw_fd(), FdType::Socket),
+            (file.as_raw_fd(), FdType::Regular),
+            (random.as_raw_fd(), FdType::Rng),
+            (inotify.as_raw_fd(), FdType::Inotify),
+        ];
+        for (fd, ty) in cases {
+            let mut recorded = FileMetadata::new(owner);
+            let (fd_flags, status, stat) = facts(fd);
+            // As the receipt reads it: only an anonymous inode's link.
+            let link = (stat.st_mode & libc::S_IFMT == 0)
+                .then(|| super::own_fd_link(fd))
+                .flatten();
+            recorded
+                .add_discovered_fd(owner, fd, fd_flags, status, &stat, link.as_deref())
+                .unwrap();
+            let mut discovered = FileMetadata::new(owner);
+            discovered
+                .discover_fd_from_current_process(owner, fd)
+                .unwrap();
+            assert_eq!(shape(&recorded, fd), shape(&discovered, fd), "fd {fd}");
+            assert_eq!(recorded.file_handles[&fd].ty(), ty, "fd {fd}");
+            // Recorded unobserved: no lock claim, and one may be held.
+            assert_eq!(recorded.file_handles[&fd].known_flock_mode(), None);
+        }
+        let pipe = pipe_read.as_raw_fd();
+        let mut recorded = FileMetadata::new(owner);
+        let (fd_flags, status, stat) = facts(pipe);
+        recorded
+            .add_discovered_fd(owner, pipe, fd_flags, status, &stat, None)
+            .unwrap();
+        let detfd = &recorded.file_handles[&pipe];
+        // The kernel's flags are what the record knows: O_NONBLOCK stays
+        // visible and physical, and FD_CLOEXEC is the slot's.
+        assert!(detfd.is_cloexec() && detfd.is_nonblocking() && detfd.physically_nonblocking());
     }
 
     /// Under `--pipe-wake-latency` a rediscovering exec carries each surviving
@@ -3535,6 +3911,16 @@ pub struct ThreadStats {
     /// A simple count of how many syscalls have been handled on this thread.
     pub syscall_count: u64,
 
+    /// This thread's syscall entries by number, with the outcome of each
+    /// completed one (`crate::syscall_histogram`). Its total is
+    /// `syscall_count`. Handed to the scheduler when the thread deregisters.
+    pub syscall_histogram: SyscallHistogram,
+
+    /// A Detcore refusal policy answered the current syscall
+    /// (`crate::syscall_histogram::mark_refused`). Cleared at each syscall
+    /// entry.
+    pub syscall_refused: bool,
+
     /// This thread's happens-before counting state: per (syscall, fd, futex
     /// operation) a syscall-occurrence anchor names, how many of this thread's
     /// syscall entries matched, and the origin of each relative anchor whose
@@ -3593,11 +3979,12 @@ impl ThreadStats {
         Default::default()
     }
 
-    // TODO: this can evolve to keep a full histogram:
-    /// Increment the count of system calls
-    pub fn count_syscall(&mut self) {
+    /// Count one entry of `sysno`.
+    pub fn count_syscall(&mut self, sysno: Sysno) {
         self.syscall_count += 1;
         self.timeslice_syscall_count += 1;
+        self.syscall_histogram.enter(sysno);
+        self.syscall_refused = false;
     }
 
     /// Increment the count of signals.
@@ -3632,6 +4019,9 @@ impl ThreadStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingVfork {
     pub parent_dettid: DetTid,
+    /// The parent's `BlockingVfork` operation, which identifies this vfork's
+    /// scheduler barrier.
+    pub op: ExternalOpId,
     pub parent_detpid: DetPid,
     pub child_tid_addr: usize,
     pub flags: CloneFlags,
@@ -3721,6 +4111,13 @@ impl ChildCpuPublication {
 pub(crate) struct ProcessCpuTime {
     snapshot: ProcessCpuSnapshot,
     exited_children: BTreeMap<DetPid, ProcessCpuSnapshot>,
+    /// Each thread's own (user, system) time as of its last accounting, which
+    /// another thread's CPU clock of it reads (`crate::cpu_clock`). An entry
+    /// leaves once its thread has exited and left the scheduler, unless the
+    /// thread leads the process: a leader that exits before its threads stays
+    /// a zombie whose clock still reads its final time, as on Linux.
+    #[serde(default)]
+    threads: BTreeMap<DetTid, (LogicalTime, LogicalTime)>,
     // Runtime ownership, not record-format state. ThreadState clones retain the
     // same parent accounting Arc; notification tokens also retain their identity.
     #[serde(skip)]
@@ -3740,6 +4137,27 @@ impl ProcessCpuTime {
     fn add_thread_delta(&mut self, user: LogicalTime, system: LogicalTime) {
         self.snapshot.user = self.snapshot.user + user;
         self.snapshot.system = self.snapshot.system + system;
+    }
+
+    /// Record `thread`'s own (user, system) time, which its process total now
+    /// includes.
+    fn record_thread(&mut self, thread: DetTid, own: (LogicalTime, LogicalTime)) {
+        self.threads.insert(thread, own);
+    }
+
+    /// `thread`'s own (user, system) time as of its last accounting. A thread
+    /// that has not been accounted yet has not run, and has used none.
+    fn thread_time(&self, thread: DetTid) -> (LogicalTime, LogicalTime) {
+        self.threads
+            .get(&thread)
+            .copied()
+            .unwrap_or((LogicalTime::ZERO, LogicalTime::ZERO))
+    }
+
+    /// `thread` exited: its time stays in the process total, as an exited
+    /// thread's stays in Linux's (`thread_group_cputime`).
+    fn forget_thread(&mut self, thread: DetTid) {
+        self.threads.remove(&thread);
     }
 
     fn record_exited_child(&mut self, pid: DetPid, child: ProcessCpuSnapshot) {
@@ -3936,6 +4354,13 @@ pub struct ThreadState<T> {
     /// alone does not imply that this thread was admitted to the scheduler.
     pub(crate) thread_start_entered: bool,
 
+    /// The parent's `BlockingVfork` operation, if a `CLONE_VFORK` call
+    /// created this thread. A vfork child that is torn down before its
+    /// scheduler registration completes reports it in its deregistration, so
+    /// the barrier of exactly that vfork ends
+    /// ([`crate::scheduler::Scheduler::record_unregistered_vfork_child_exit`]).
+    pub(crate) vfork_origin: Option<ExternalOpId>,
+
     /// Host thread ID supplied by a backend whose scheduler identity is
     /// virtual. `None` keeps the existing direct-ID behavior for other
     /// backends.
@@ -3951,6 +4376,26 @@ pub struct ThreadState<T> {
     /// Stable identity used when allocating deterministic open-file descriptions.
     #[serde(default)]
     pub(crate) open_file_creator: Option<DetTid>,
+
+    /// The input geometry of the `recvmsg` or `recvmmsg` this thread is
+    /// running, while Detcore needs it to name the descriptors it receives:
+    /// `Some` from the handler's entry, re-read before each attempt of the
+    /// internal polling loop so that it is the geometry of the attempt that
+    /// succeeds (`retry_nonblocking_syscall_helper`), taken when the call
+    /// returns. Never carried across a fork or a migration.
+    #[serde(skip)]
+    pub(crate) receive_geometry: Option<Option<crate::syscalls::scm_rights::ReceiveGeometry>>,
+
+    /// The `sendmsg` or `sendmmsg` this thread is running, while its
+    /// `SCM_RIGHTS` descriptors matter to the `/proc` directories Detcore
+    /// serves on placeholders: `Some` from the handler's inspection
+    /// (`Detcore::inspect_placeholder_send`), read before each attempt of the
+    /// internal polling loop, which refuses by name an attempt whose messages
+    /// pass other placeholders than were inspected
+    /// (`retry_nonblocking_syscall_helper`), taken when the call returns.
+    /// Never carried across a fork or a migration.
+    #[serde(skip)]
+    pub(crate) send_inspection: Option<crate::syscalls::SendInspection>,
 
     /// Linux memory address space shared by tasks created with `CLONE_VM`.
     pub mm_id: MmId,
@@ -4030,9 +4475,22 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) changed_root: Arc<std::sync::atomic::AtomicBool>,
 
+    /// This thread's working and root directories may not be its
+    /// thread-group leader's: it, or the thread it was created by, was
+    /// created as a thread without `CLONE_FS`, so it holds filesystem
+    /// information of its own. Its process's `/proc/<pid>/cwd` and
+    /// `/proc/<pid>/root` links, which Linux reads from the leader, are then
+    /// not the thread's own `getcwd` (`Detcore::readlink_own_task_link`). A
+    /// leader, a new process, and a thread after its exec (which makes it
+    /// the leader) hold their own.
+    #[serde(default)]
+    pub(crate) fs_apart_from_leader: bool,
+
     /// The image this thread's process executes ([`crate::exec_record`]),
-    /// which answers the process's `/proc/<pid>/exe` link; `None` leaves the
-    /// link to the kernel. A new task starts with its creator's, and a
+    /// which answers the process's `/proc/<pid>/exe` link on KVM while it
+    /// names the image exactly (`Detcore::readlink_own_task_link`), and in a
+    /// launched run (`Detcore::launched_exe`); `None` leaves the link to the
+    /// path it took before. A new task starts with its creator's, and a
     /// successful exec replaces it (`tool_global::mark_past_first_execve`).
     #[serde(default)]
     pub(crate) exe: Option<Arc<crate::exec_record::ExecRecord>>,
@@ -4079,6 +4537,20 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) restart_block: Option<crate::syscalls::helpers::RestartBlock>,
 
+    /// The calling thread's working directory in the guest's view, read for
+    /// the syscall it is running where the tool cannot read it from host
+    /// procfs (`procfs_inode::tool_can_read_guest_cwd`: KVM): its path where
+    /// an injected `getcwd` answered one, else, where `getcwd` rendered none
+    /// (a removed directory, or one whose path is longer than `PATH_MAX`),
+    /// the directories the syscall's spellings climb to out of it with `..`
+    /// (`syscalls::SyscallCwd`); `None` until it is read, at most
+    /// once per syscall (`Detcore::prepare_guest_cwd`). Each syscall starts
+    /// without it (`Detcore::handle_syscall_event`), so a later syscall never
+    /// decides by a directory read before it. Never carried across a fork or
+    /// a migration.
+    #[serde(skip)]
+    pub(crate) syscall_cwd: Option<crate::syscalls::SyscallCwd>,
+
     /// Whether this thread's process has a guest handler for SIGALRM, so that
     /// signal phase 1's table (`sigalrm_phase1`) gates its syscalls. Set by the
     /// runtime's handler admission (phase 1 step I3), in the same turn it
@@ -4107,6 +4579,15 @@ pub struct ThreadState<T> {
     /// takes the registers' own answer.
     #[serde(skip)]
     pub(crate) delivery_interruption: Option<reverie::Interruption>,
+
+    /// Under the in-guest delivery gate, what ended the current syscall's wait
+    /// for a signal (A5 step 3c.1c, design D40): set by the path that ends
+    /// the wait, and taken by the restart checkpoint straight after the
+    /// dispatch `match` (`Detcore::wait_end_checkpoint`), which turns the
+    /// wait's restart code into the guest's result. `None` on every other
+    /// call, and always with the gate off.
+    #[serde(skip)]
+    pub(crate) wait_signal_end: Option<crate::wait_signal_end::WaitSignalEnd>,
 
     /// With `delivery_interruption` `AfterFrame`, the handler address the
     /// kernel's frame jumps to: a further delivery at the same exit, before
@@ -4798,12 +5279,47 @@ impl<T> ThreadState<T> {
         let system = self.thread_logical_time.system_cpu_time();
         let user_delta = user - self.last_accounted_user_time;
         let system_delta = system - self.last_accounted_system_time;
+        let own = self.thread_cpu_time();
+        let mut process = self
+            .process_cpu_time
+            .lock()
+            .expect("process CPU time mutex poisoned");
+        process.add_thread_delta(user_delta, system_delta);
+        process.record_thread(self.dettid, own);
+        drop(process);
+        self.last_accounted_user_time = user;
+        self.last_accounted_system_time = system;
+    }
+
+    /// Drop this exited thread's entry from its process's per-thread table,
+    /// once its final time is accounted: a thread other than the leader is
+    /// gone for good, and its id names no thread's clock any more.
+    pub(crate) fn forget_thread_cpu_time(&self) {
         self.process_cpu_time
             .lock()
             .expect("process CPU time mutex poisoned")
-            .add_thread_delta(user_delta, system_delta);
-        self.last_accounted_user_time = user;
-        self.last_accounted_system_time = system;
+            .forget_thread(self.dettid);
+    }
+
+    /// Another thread of this process's own (user, system) time, as of that
+    /// thread's last accounting, which happens at each of its syscalls and
+    /// each RCB commit: with threads sequentialized, where it last stopped.
+    pub(crate) fn sibling_cpu_time(&self, thread: DetTid) -> (LogicalTime, LogicalTime) {
+        self.process_cpu_time
+            .lock()
+            .expect("process CPU time mutex poisoned")
+            .thread_time(thread)
+    }
+
+    /// The own (user, system) time of `thread`, this thread or another of
+    /// its process: this thread's now ([`Self::thread_cpu_time`]), another's
+    /// as of its last accounting ([`Self::sibling_cpu_time`]).
+    pub(crate) fn task_cpu_time(&self, thread: DetTid) -> (LogicalTime, LogicalTime) {
+        if thread == self.dettid {
+            self.thread_cpu_time()
+        } else {
+            self.sibling_cpu_time(thread)
+        }
     }
 
     /// Decide whether the syscall this thread is making now charges its cost
@@ -5023,9 +5539,12 @@ impl<T> ThreadState<T> {
             dettid: pid,
             detpid: None, // Initialized later.
             thread_start_entered: false,
+            vfork_origin: None, // The root thread.
             physical_tid: None,
             signal_task_identity: None,
             open_file_creator: None,
+            receive_geometry: None,
+            send_inspection: None,
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
             pedigree: Pedigree::new(), // Root thread.
@@ -5036,6 +5555,7 @@ impl<T> ThreadState<T> {
             default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             nested_pid_namespace: false,
             changed_root: Default::default(),
+            fs_apart_from_leader: false,
             exe: None,
             process_files,
             posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
@@ -5045,10 +5565,12 @@ impl<T> ThreadState<T> {
             parent_process_cpu_time: None,
             parent_cpu_publication: None,
             restart_block: None,
+            syscall_cwd: None,
             sigalrm_handled: false,
             signal_shadow: None,
             signal_shadow_lost: false,
             delivery_interruption: None,
+            wait_signal_end: None,
             delivery_frame_handler: 0,
             delivery_frame_signal: 0,
             delivery_frame_orig_ax: 0,
@@ -5490,6 +6012,23 @@ impl<T> ThreadState<T> {
         }
     }
 
+    /// Record that the address space allocated or applied a protection key
+    /// (`MemoryMetadata::protection_keys`).
+    pub(crate) fn note_protection_keys(&self) {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .protection_keys = true;
+    }
+
+    /// Whether the address space has allocated or applied a protection key.
+    pub(crate) fn may_use_protection_keys(&self) -> bool {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .protection_keys
+    }
+
     /// Record an anonymous shared mapping.
     pub(crate) fn map_shared_anonymous(&self, start: usize, len: usize) {
         self.memory_metadata
@@ -5565,6 +6104,8 @@ impl<T> ThreadState<T> {
             slice_boundary: None,
             guest_signal_mask: None,
             callback_checkpoint: None,
+            priority_row: None,
+            slice_expired: false,
         }
     }
 
@@ -5578,6 +6119,62 @@ impl<T> ThreadState<T> {
     /// get file metadata
     fn metadata(&self) -> MutexGuard<'_, FileMetadata> {
         self.file_metadata.lock().unwrap()
+    }
+
+    /// The descriptors this thread's table holds, ascending, modelled or not
+    /// (`FileMetadata::descriptor_numbers`), its capacity
+    /// (`FileMetadata::descriptor_capacity`), and whether a receive may have
+    /// installed descriptors Detcore does not know
+    /// (`FileMetadata::unaccounted_receipts`).
+    pub(crate) fn descriptor_table(&self) -> (Vec<RawFd>, u64, bool) {
+        let metadata = self.metadata();
+        (
+            metadata.descriptor_numbers(),
+            metadata.descriptor_capacity,
+            metadata.unaccounted_receipts,
+        )
+    }
+
+    /// Record that descriptor `fd`, close-on-exec or not, is open in this
+    /// thread's table though Detcore keeps no description of it
+    /// (`FileMetadata::present_unmodelled`).
+    pub(crate) fn note_unmodelled_descriptor(&self, fd: RawFd, cloexec: bool) {
+        let mut metadata = self.metadata();
+        if !metadata.file_handles.contains_key(&fd) {
+            metadata.note_installed(fd);
+            metadata.present_unmodelled.insert(fd, cloexec);
+        }
+    }
+
+    /// Grow this thread's table to hold descriptor `fd`, as a `dup2` or
+    /// `dup3` to it of a descriptor that is not open does on Linux
+    /// (`FileMetadata::grow_to_hold`): `newfd` below `RLIMIT_NOFILE`, as
+    /// Detcore keeps it for the process.
+    pub(crate) fn note_failed_dup_target(&self, fd: RawFd) {
+        let limit = self
+            .resource_limits
+            .lock()
+            .unwrap()
+            .get(reverie::syscalls::linux_abi::RLIMIT_NOFILE)
+            .map_or(0, |limit| limit.current);
+        if u64::try_from(fd).is_ok_and(|fd| fd < limit) {
+            self.metadata().grow_to_hold(fd);
+        }
+    }
+
+    /// Set the close-on-exec flag of descriptor `fd` if Detcore lists it
+    /// without modelling it (`FileMetadata::present_unmodelled`), after the
+    /// kernel changed it (`F_SETFD`, `FIOCLEX`, `FIONCLEX`); whether it is
+    /// one.
+    pub(crate) fn set_unmodelled_cloexec(&self, fd: RawFd, cloexec: bool) -> bool {
+        self.metadata().set_unmodelled_cloexec(fd, cloexec)
+    }
+
+    /// Record that a receive may have installed descriptors in this thread's
+    /// table whose numbers Detcore does not know
+    /// (`FileMetadata::unaccounted_receipts`).
+    pub(crate) fn note_unaccounted_receipt(&self) {
+        self.metadata().unaccounted_receipts = true;
     }
 
     /// Identity of this thread's descriptor table.
@@ -5626,6 +6223,28 @@ impl<T> ThreadState<T> {
             flags,
             ty,
             stat,
+        )
+    }
+
+    /// Record descriptor `fd`, which Linux installed by a route Detcore did not
+    /// model as it ran (`SCM_RIGHTS`), from the kernel's facts about it, as an
+    /// in-guest backend records a descriptor it discovers
+    /// (`FileMetadata::add_discovered_fd`).
+    pub(crate) fn add_discovered_fd(
+        &self,
+        fd: RawFd,
+        fd_flags: libc::c_int,
+        status_flags: libc::c_int,
+        raw_stat: &libc::stat,
+        link: Option<&[u8]>,
+    ) -> Result<(), Errno> {
+        self.metadata().add_discovered_fd(
+            self.open_file_creator.unwrap_or(self.dettid),
+            fd,
+            fd_flags,
+            status_flags,
+            raw_stat,
+            link,
         )
     }
 
@@ -5926,6 +6545,21 @@ impl<T> ThreadState<T> {
         u32::try_from(count).unwrap_or(u32::MAX)
     }
 
+    /// Whether the exec that made this thread's table dropped a close-on-exec
+    /// description whose locks Detcore follows (`FileMetadata::exec_dropped_lock_tracked`).
+    pub(crate) fn exec_dropped_lock_tracked(&self) -> bool {
+        self.metadata().exec_dropped_lock_tracked
+    }
+
+    /// Whether this thread's table holds a descriptor Detcore serves as a
+    /// `/proc` directory on a placeholder (`DetFd::placeholder`).
+    pub(crate) fn holds_placeholder(&self) -> bool {
+        self.metadata()
+            .file_handles
+            .values()
+            .any(|detfd| detfd.placeholder().is_some())
+    }
+
     /// The descriptions in this thread's table whose locks
     /// `procfs::locks::LockLedger` follows, each with how many slots name it,
     /// in description order.
@@ -6012,10 +6646,10 @@ impl<T> ThreadState<T> {
     }
 
     /// Install `detfd`, which refers to an open file description Detcore
-    /// models, as descriptor `detfd.fd` of this table: a descriptor that
-    /// reached the description by a route Detcore does not model
-    /// (`SCM_RIGHTS`), adopted when the guest first names it
-    /// (`Detcore::adopt_received_placeholders`).
+    /// models, as descriptor `detfd.fd` of this table: a rendered procfs
+    /// descriptor that reached the description over `SCM_RIGHTS`, adopted
+    /// when it is received (`Detcore::record_received_descriptors`) or when
+    /// the guest first names it (`Detcore::adopt_received_placeholders`).
     pub(crate) fn install_alias(&self, detfd: DetFd) {
         self.metadata().add_detfd(detfd);
     }
@@ -6110,6 +6744,40 @@ impl<T> ThreadState<T> {
             );
             self.end_of_timeslice = Some(cap);
         }
+    }
+
+    /// The recorded priority-history row whose end the current slice waits
+    /// for, under `--replay-preemptions-from`; `None` without a history.
+    /// Derived from the history's own cursor: rows are installed as slice
+    /// ends in order, and the final slice follows the last.
+    pub(crate) fn active_priority_row(
+        &self,
+    ) -> Option<crate::preemptions::callback_history::ActiveRow> {
+        use crate::preemptions::callback_history::ActiveRow;
+        let history = self.preemption_points.as_ref()?;
+        Some(if self.stats.last_recorded_slice.is_some() {
+            ActiveRow::Exhausted
+        } else {
+            match history.installed_rows() {
+                0 => ActiveRow::BeforeFirst,
+                installed => ActiveRow::Row(installed - 1),
+            }
+        })
+    }
+
+    /// The active row's callback checkpoint, when the row has one and it has
+    /// not been consumed (`Config::annotated_priority_replay`).
+    pub(crate) fn pending_checkpoint(
+        &self,
+    ) -> Option<&crate::preemptions::callback_history::Checkpoint> {
+        use crate::preemptions::callback_history::ActiveRow;
+        let ActiveRow::Row(row) = self.active_priority_row()? else {
+            return None;
+        };
+        if !self.callback_history.annotates(row) {
+            return None;
+        }
+        self.callback_history.remaining().next()
     }
 
     /// Whether this thread has consumed its current logical timeslice.
@@ -7993,6 +8661,7 @@ mod native_exec_cut_tests {
                 5 => {
                     thread.pending_vfork = Some(PendingVfork {
                         parent_dettid: binding.dettid,
+                        op: ExternalOpId::new(binding.dettid, 0),
                         parent_detpid: binding.detpid,
                         child_tid_addr: 0,
                         flags: CloneFlags::CLONE_VFORK,
@@ -8217,9 +8886,9 @@ fn thread_rng_from_parent_entropy_labeled(
 /// <https://github.com/rrnewton/hermit/issues/4263>). Read with raw
 /// system calls (under in-guest backends the tool shares the guest's C
 /// library).
-/// The fixed procfs file the kernel opened at `fd`, if its descriptor link
-/// names one (`ProcfsFile::snapshot_is_fixed`).
-fn fixed_procfs_behind(fd: RawFd) -> Option<crate::procfs::ProcfsFile> {
+/// What this thread's descriptor `fd` links to (`/proc/thread-self/fd/<fd>`),
+/// read with a raw `readlinkat` as the in-guest runtime must.
+fn own_fd_link(fd: RawFd) -> Option<Vec<u8>> {
     // The calling thread's own table: `/proc/self/fd` is the leader's.
     let link = std::ffi::CString::new(format!("/proc/thread-self/fd/{fd}")).ok()?;
     let mut target = [0_u8; 256];
@@ -8240,8 +8909,15 @@ fn fixed_procfs_behind(fd: RawFd) -> Option<crate::procfs::ProcfsFile> {
     let length = usize::try_from(length)
         .ok()
         .filter(|length| *length < target.len())?;
+    Some(target[..length].to_vec())
+}
+
+/// The fixed procfs file the kernel opened at `fd`, if its descriptor link
+/// names one (`ProcfsFile::snapshot_is_fixed`).
+fn fixed_procfs_behind(fd: RawFd) -> Option<crate::procfs::ProcfsFile> {
+    let target = own_fd_link(fd)?;
     let path = std::path::Path::new(
-        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&target[..length]),
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&target),
     );
     crate::procfs::ProcfsFile::from_path(path).filter(crate::procfs::ProcfsFile::snapshot_is_fixed)
 }

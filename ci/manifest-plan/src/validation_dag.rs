@@ -395,6 +395,33 @@ pub const HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS: &[&str] = &[
     "verify_run_strict_rust_exit_group",
 ];
 
+/// `test.hermit_unit` cases the GitHub-hosted portable profile excludes by
+/// exact name.
+///
+/// The forced-gate rows of A5 step 3c.1's harness
+/// (hermit-cli/src/in_guest_delivery_harness.rs, design D60) each launch a
+/// guest on in-guest-trap, whose in-guest LiteInst runtime needs CPUID
+/// faulting before the guest's first instruction, the facility
+/// [`HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS`] keeps off GitHub-hosted
+/// runners; the harness counts a skip as a failure, so on those runners they
+/// could never pass. The local `test.hermit_unit` keeps running every one in
+/// the pinned root, as root. Only its hosted twin excludes them, with one
+/// exact-name filterset placed before the test binary's own arguments; the
+/// harness's `the_parent_runner_never_forces_the_gate`, which launches no
+/// guest, still runs there.
+pub const HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS: &[&str] = &[
+    "in_guest_delivery_harness::forced_gate_a_managed_wait4_publishes_the_guests_own_mask",
+    "in_guest_delivery_harness::forced_gate_a_masked_waits_arrivals_are_removed",
+    "in_guest_delivery_harness::forced_gate_a_send_to_a_vfork_parent_is_refused_by_name",
+    "in_guest_delivery_harness::forced_gate_d37_removal_runs_through_the_tools_injection",
+    "in_guest_delivery_harness::forced_gate_mask_calls_act_on_the_saved_mask_in_linuxs_order",
+    "in_guest_delivery_harness::forced_gate_the_polled_guest_sigtimedwait_runs",
+];
+
+/// Where the hosted unit twin's filterset goes: before the test binary's own
+/// arguments, which follow its one ` -- `.
+const HERMIT_UNIT_ARGUMENTS: &str = " -- ";
+
 /// Where the hosted regular-crates twin's filterset goes: after its selection.
 const REGULAR_CRATES_SELECTION_END: &str = "--exclude hermetic_infra_hermit_flaky-tests";
 
@@ -566,6 +593,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.isolation_matrix_dbt_in_guest",
     "test.isolated_detcore_workdir",
     "test.sabre_examples",
+    "sabrecompat.sabre_examples",
     "test.hermit_modes",
     "test.app_strict_verify",
     "test.command_strict_verify",
@@ -771,8 +799,8 @@ const PROFILES: [Profile; 11] = [
         // Its closure gained build.liteinst_runtime_in_pinned_root through
         // build.workspace_in_pinned_root: 2/14 before.
         label: "sabre-compat-only",
-        direct_steps: 2,
-        selected_steps: 15,
+        direct_steps: 3,
+        selected_steps: 16,
     },
     // The rr run type: the same shape again.
     Profile {
@@ -1416,7 +1444,7 @@ pub(crate) fn refresh_pinned_root_environment(tag: &str, command: &str) -> Resul
 /// with no seed and no cap: peaks of 1,133,400,064 and 1,142,509,568 bytes
 /// (most of it page cache from writing a ~958 MB Cargo home), 20-22 s. The
 /// earlier 1 GiB cap OOM-killed every cold fetch, which is every
-/// `--frozen-validate` run (https://github.com/rrnewton/dev-hermit/issues/549).
+/// `--frozen-validate` run, because such a run starts with an empty Cargo home.
 /// 1.5x the higher peak is 1,713,764,352 bytes, rounded up to 7 x 256 MiB.
 fn pinned_root_fetch() -> Result<Step, String> {
     let text = format!(
@@ -1545,6 +1573,24 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
                     &format!(
                         "--test rr_suite{} -j 1",
                         hosted_exclusion_filterset(HOSTED_PORTABLE_PMU_TIMER_RR_TESTS)
+                    ),
+                    1,
+                );
+            }
+            if hosted.tag() == "test.hermit_unit" {
+                if hosted.cmd.matches(HERMIT_UNIT_ARGUMENTS).count() != 1 {
+                    return Err(format!(
+                        "test.hermit_unit must pass its test binary's arguments after one \
+                         `{HERMIT_UNIT_ARGUMENTS}`"
+                    ));
+                }
+                hosted.cmd = hosted.cmd.replacen(
+                    HERMIT_UNIT_ARGUMENTS,
+                    &format!(
+                        "{}{HERMIT_UNIT_ARGUMENTS}",
+                        hosted_exclusion_filterset(
+                            HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS
+                        )
                     ),
                     1,
                 );
@@ -2207,13 +2253,25 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
     // Since reproducible staging (https://github.com/rrnewton/hermit/pull/3948)
     // it builds in a fixed directory: six full validations on 2026-10-08/09
     // measured 172.6 to 181.2 s wall and 2438 to 2561 CPU-s.
-    // The CPU bound is the next 300-s bucket above 1.5 x 2561 (3842). The wall
-    // bound keeps build.buck_release_artifact's 1800 s for the same builds,
+    // The CPU bound was the next 300-s bucket above 1.5 x 2561 (3842), 3900.
+    // Until 2026-10-26 every stage was cold (the fixed directory was wiped
+    // before and after). It is now kept and refreshed by content, so most stages
+    // rebuild only what changed, but a stage is still cold when its directory is
+    // new, at least once a day and over its size bound, so the bounds below stay
+    // those of a cold stage. The work grew by
+    // about 500 CPU-s when d4594afa (2026-10-17) added a cold build of the
+    // liteinst-runtime profile to the stage, which b42f1992 then ran beside the
+    // other builds (its throttled time doubled, its CPU did not change). Across
+    // the 169 passing full validations from d4594afa to 2026-10-24, the step's cgroup
+    // CPU was 2558 to 3801 CPU-s (median 3269, p99 3597), and the validation of
+    // 46be6638 was killed at 3901 CPU-s and 215 s wall, before its builds
+    // finished. The CPU bound is the next 300-s bucket above 1.5 x 3901 (5851).
+    // The wall bound keeps build.buck_release_artifact's 1800 s for the same builds,
     // about 10 times the measurement; it also encloses the stage's lock wait,
     // whose default (HERMIT_BUCK_STAGE_LOCK_TIMEOUT, 1200 s) leaves room for one
     // stage after it.
     stage.timeout = 1800;
-    stage.cpu_timeout = 3900;
+    stage.cpu_timeout = 6000;
     stage.hint.est_duration_s = 177.0;
     // The baseline cloned from build.buck_release_artifact (8.39 GiB) is below
     // what ci/buck-e2e/stage peaks at with its builds running side by side:
@@ -3032,9 +3090,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // test.pmu_integration_cases_2, the second PMU integration shard, adds one.
     // 145 since the isolation matrix's three nodes joined as Conformance
     // producers (2026-10-17).
-    if expected.len() != 145 {
+    // 146 with sabrecompat.sabre_examples, the archived SaBRe suite's tests
+    // outside the per-commit smoke pair (2026-10-26).
+    if expected.len() != 146 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 145",
+            "structured result producer registry has {} entries, expected 146",
             expected.len()
         ));
     }
@@ -3056,9 +3116,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // privileged-cpuid.cpu_profile_v3 adds one more
     // (https://github.com/rrnewton/hermit/issues/4243).
     // The second PMU integration shard adds one.
-    if expected_counts.len() != 50 {
+    // sabrecompat.sabre_examples, the archived SaBRe suite outside the smoke
+    // pair, adds one.
+    if expected_counts.len() != 51 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 50",
+            "Nextest expected-count registry has {} entries, expected 51",
             expected_counts.len()
         ));
     }
@@ -3210,7 +3272,8 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // (https://github.com/rrnewton/hermit/issues/4243).
     // The second PMU integration shard adds the 77th Nextest writer.
     // Conformance 3: the three isolation-matrix nodes (2026-10-17).
-    if actual_group_counts != [77, 56, 7, 2, 3] {
+    // sabrecompat.sabre_examples adds the 78th Nextest writer (2026-10-26).
+    if actual_group_counts != [78, 56, 7, 2, 3] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -4418,9 +4481,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // Detcore runtime's prebuild ahead of its packaging finalizer; its host
     // original has no hosted label and no local consumer, so it is retired
     // (441 + 1).
-    if cfg.steps.len() != 442 {
+    // 443 with sabrecompat.sabre_examples, the archived SaBRe suite's tests
+    // outside the per-commit smoke pair, in the SaBRe run type (442 + 1).
+    if cfg.steps.len() != 443 {
         return Err(format!(
-            "superset has {} steps, expected 442",
+            "superset has {} steps, expected 443",
             cfg.steps.len()
         ));
     }
@@ -4593,7 +4658,8 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
                 .map(|value| (*value).to_string())
                 .collect::<Vec<_>>()
         || focused_release.timeout != 420
-        || focused_release.cpu_timeout != 840
+        // 2400 since 2026-10-26: a cold build measured 1,155 CPU-s.
+        || focused_release.cpu_timeout != 2400
         || focused_release.hint.hard_mem_max_bytes != Some(16 * 1024 * 1024 * 1024)
         || focused_release.hint.preferred_inner_jobs != Some(8)
     {
@@ -6866,6 +6932,40 @@ sys.exit(37)
                     ),
                     1,
                 )
+            } else if local_tag == "test.hermit_unit" {
+                // The hosted twin excludes exactly the forced-gate harness
+                // rows, by exact name, which the local selection must keep
+                // running: no local filter names one, and no local substring
+                // --skip matches one.
+                let local_argv = shell_words::split(&local_payload).unwrap();
+                assert!(!local_argv.iter().any(|arg| arg == "-E"));
+                for name in HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS {
+                    assert!(
+                        !local_payload.contains(name),
+                        "test.hermit_unit must keep running {name}"
+                    );
+                    for pattern in local_argv
+                        .windows(2)
+                        .filter(|pair| pair[0] == "--skip")
+                        .map(|pair| &pair[1])
+                    {
+                        assert!(
+                            !name.contains(pattern.as_str()),
+                            "test.hermit_unit's --skip {pattern} skips {name}"
+                        );
+                    }
+                }
+                assert_eq!(local_payload.matches(HERMIT_UNIT_ARGUMENTS).count(), 1);
+                local_payload.replacen(
+                    HERMIT_UNIT_ARGUMENTS,
+                    &format!(
+                        "{}{HERMIT_UNIT_ARGUMENTS}",
+                        hosted_exclusion_filterset(
+                            HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS
+                        )
+                    ),
+                    1,
+                )
             } else if local_tag == "test.rr_suite_contract" {
                 // The hosted twin excludes exactly the PMU-timer rr cases,
                 // which the local selection must keep running.
@@ -6919,6 +7019,7 @@ sys.exit(37)
             // else is excluded.
             let hosted_only_skips = match local_tag.as_str() {
                 "test.cli" => HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS.len(),
+                "test.hermit_unit" => HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS.len(),
                 "test.rr_suite_contract" => HOSTED_PORTABLE_PMU_TIMER_RR_TESTS.len(),
                 "test.regular_crates" => HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS.len(),
                 _ => 0,

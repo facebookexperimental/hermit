@@ -31,6 +31,12 @@ reporting it so the run can be repeated. `--strict` also requires every input
 of the run on the command line, so it needs `--epoch` (or `HERMIT_EPOCH`). See
 [USER_GUIDE.md](USER_GUIDE.md) for the full set of mode-selection options.
 
+To debug a run, add `--gdbserver` and attach gdb with
+`gdb -ex 'target remote 127.0.0.1:1234' PROGRAM`. This works for a `--strict`
+run too: its guest keeps the isolated network, and every strict refusal
+applies. What the debugger does is an input of the run; see
+[USER_GUIDE.md](USER_GUIDE.md) for what that changes.
+
 Hermit preserves standard input, output and error at CLI entry and closes other
 unsolicited file descriptors inherited from its caller. Pass guest inputs through
 the documented file, mount and standard-stream options. An operating system that

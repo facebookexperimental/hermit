@@ -377,7 +377,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "cli",
         ]),
-        "test.sabre_examples" => Some(&[
+        "test.sabre_examples" | "sabrecompat.sabre_examples" => Some(&[
             "-p",
             "hermit-run",
             "--features",
@@ -939,7 +939,12 @@ mod tests {
             // test moves there from frontier_app_benchmarks, plus
             // a_declared_redis_pair_is_used_only_when_declared and
             // a_bad_redis_declaration_is_refused_rather_than_replaced (+2): 691.
-            assert_eq!(population, 691);
+            // Separately name the optional e9patch source-inspection leg (+1): 692.
+            // And the two-run syscall-histogram test in dispatch_stats (+1): 693.
+            // random_determinism's
+            // a_schedule_replay_hands_the_guest_the_recorded_random_values (+1):
+            // 694.
+            assert_eq!(population, 694);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

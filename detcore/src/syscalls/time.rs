@@ -29,6 +29,10 @@ use tracing::trace;
 
 use super::signal::SleepCheck;
 use super::signal::SleepSignal;
+use crate::cpu_clock;
+use crate::cpu_clock::ClockIdClass;
+use crate::cpu_clock::ClockLookup;
+use crate::cpu_clock::ClockTask;
 use crate::detlog;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
@@ -55,11 +59,16 @@ use crate::types::SigWrapper;
 /// clock, or a clock descriptor; whether it is valid depends on the process
 /// or descriptor it names, so it is accepted here as before.
 fn clock_id_is_known(clockid: ClockId) -> bool {
-    use reverie::syscalls::FromToRaw;
-    match clockid.into_raw() as i32 {
+    match raw_clock_id(clockid) {
         0..=9 | 11 => true,
         id => id < 0,
     }
+}
+
+/// `clockid` as the kernel's `clockid_t`.
+fn raw_clock_id(clockid: ClockId) -> i32 {
+    use reverie::syscalls::FromToRaw;
+    clockid.into_raw() as i32
 }
 
 /// Linux's answer to `timer_create` for `clockid` alone, which it gives
@@ -125,6 +134,21 @@ fn timespec_to_ns(ts: libc::timespec) -> u64 {
     let secs = ts.tv_sec.max(0) as u64;
     let nsec = ts.tv_nsec.max(0) as u64;
     secs.saturating_mul(1_000_000_000).saturating_add(nsec)
+}
+
+/// The CPU time an absolute CPU-clock sleep to `deadline` still has to wait
+/// for when the clock reads `now`: none once the deadline has passed, where
+/// Linux returns at once (`posix_cpu_timer_set` fires an expired timer,
+/// kernel/time/posix-cpu-timers.c:729-735 at v6.16). The caller checked the
+/// request's fields; the deadline saturates.
+fn cpu_sleep_remaining(deadline: &Timespec, now: LogicalTime) -> Duration {
+    let deadline =
+        LogicalTime::ZERO + Duration::new(deadline.tv_sec as u64, deadline.tv_nsec as u32);
+    if deadline > now {
+        deadline.duration_since(now)
+    } else {
+        Duration::ZERO
+    }
 }
 
 /// Inverse of [`timespec_to_ns`].
@@ -671,7 +695,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(secs)
     }
 
-    /// clock_gettime
+    /// clock_gettime. A CPU clock reads Detcore's logical CPU accounting
+    /// (`crate::cpu_clock`); every other clock reads the guest clock. Every
+    /// accepted id first makes the guest-clock observation, a global request,
+    /// as every clock read always has, so a CPU-clock read keeps its place in
+    /// the schedule and only the value it returns is the CPU clock's.
     pub async fn handle_clock_gettime<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -680,7 +708,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !clock_id_is_known(call.clockid()) {
             return Err(Errno::EINVAL.into());
         }
-        let time_ns = guest_clock_time(guest).await;
+        let guest_time = guest_clock_time(guest).await;
+        let time_ns = match cpu_clock::classify(raw_clock_id(call.clockid())) {
+            ClockIdClass::Other => guest_time,
+            ClockIdClass::NoCpuClock => return Err(Errno::EINVAL.into()),
+            ClockIdClass::Cpu(clock) => {
+                self.read_cpu_clock(guest, Sysno::clock_gettime, clock)
+                    .await?
+            }
+        };
         trace!("Converting nanoseconds into clock_gettime: {}", time_ns);
 
         let tp = call.tp().ok_or(Errno::EFAULT)?;
@@ -700,6 +736,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         if !clock_id_is_known(call.clockid()) {
             return Err(Errno::EINVAL.into());
+        }
+        // A CPU clock is valid while the thread or process it names lives
+        // (`posix_cpu_clock_getres`, kernel/time/posix-cpu-timers.c:159-176 at
+        // v6.16), which is how glibc's `clock_getcpuclockid` checks a pid.
+        match cpu_clock::classify(raw_clock_id(call.clockid())) {
+            ClockIdClass::Other => {}
+            ClockIdClass::NoCpuClock => return Err(Errno::EINVAL.into()),
+            ClockIdClass::Cpu(clock) => {
+                self.cpu_clock_task(guest, Sysno::clock_getres, clock.owner, ClockLookup::Other)
+                    .await?;
+            }
         }
         // A NULL `res` pointer is valid for clock_getres: the kernel validates
         // the clockid and returns 0 without storing the resolution. GHC's RTS
@@ -895,6 +942,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(guest.inject(Syscall::from(call)).await?);
         }
 
+        // The CPU clocks are Detcore's own only where it virtualizes time;
+        // otherwise the host's clocks are read and slept on.
+        let clock_class = if self.cfg.virtualize_time {
+            // `clock_thread` has no `nsleep` (kernel/time/posix-cpu-timers.c:1666-1670
+            // at v6.16), so Linux answers EOPNOTSUPP before it reads the
+            // request (`clock_nanosleep`, kernel/time/posix-timers.c:1385-1386).
+            // glibc answers EINVAL itself, without the syscall.
+            if raw_clock_id(call.clockid()) == libc::CLOCK_THREAD_CPUTIME_ID {
+                return Err(Errno::EOPNOTSUPP.into());
+            }
+            cpu_clock::classify(raw_clock_id(call.clockid()))
+        } else {
+            ClockIdClass::Other
+        };
+
         let addr = call.req().ok_or(Errno::EFAULT)?;
         let t: Timespec = guest.memory().read_value(addr)?;
 
@@ -917,21 +979,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EINVAL.into());
         }
 
+        let cpu_deadline_remaining = match clock_class {
+            ClockIdClass::Other => None,
+            ClockIdClass::NoCpuClock => return Err(Errno::EINVAL.into()),
+            ClockIdClass::Cpu(clock) => self.cpu_clock_sleep(guest, call, clock, &t).await?,
+        };
+        if let Some(remaining) = cpu_deadline_remaining {
+            return self.sleep_for(guest, call, remaining).await;
+        }
+
         match call.flags() {
             0 => {
-                if self.cfg.sequentialize_threads {
-                    let time = Duration::from_secs(t.tv_sec as u64)
-                        + Duration::from_nanos(t.tv_nsec as u64);
-                    let request = Self::sleep_request(guest, time).await;
-                    trace!(
-                        "nanosleep adding delta {:?} to yield request {:?}",
-                        time, &request
-                    );
-                    self.wait_and_return(guest, request, call).await
-                } else {
-                    trace!("Not sequentializing threads, letting nanosleep through...");
-                    Ok(guest.inject(Syscall::from(call)).await?)
-                }
+                let time =
+                    Duration::from_secs(t.tv_sec as u64) + Duration::from_nanos(t.tv_nsec as u64);
+                self.sleep_for(guest, call, time).await
             }
             libc::TIMER_ABSTIME => {
                 let target_time = LogicalTime::from_secs(t.tv_sec as u64)
@@ -971,6 +1032,83 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             _ => unreachable!("Unexpected, unhandled flag value"),
         }
+    }
+
+    /// Sleep for `time`: on the virtual clock where threads are
+    /// sequentialized, otherwise in the kernel on the call's own clock. A
+    /// relative call goes to the kernel as it is. An absolute CPU-clock call,
+    /// which `cpu_clock_sleep` made relative to Detcore's reading of the
+    /// clock, goes as a relative sleep for the rest.
+    async fn sleep_for<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: NanosleepFamily,
+        time: Duration,
+    ) -> Result<i64, Error> {
+        if self.cfg.sequentialize_threads {
+            let request = Self::sleep_request(guest, time).await;
+            trace!(
+                "nanosleep adding delta {:?} to yield request {:?}",
+                time, &request
+            );
+            return self.wait_and_return(guest, request, call).await;
+        }
+        trace!("Not sequentializing threads, letting nanosleep through...");
+        if call.flags() & libc::TIMER_ABSTIME == 0 {
+            return Ok(guest.inject(Syscall::from(call)).await?);
+        }
+        let mut stack = guest.stack().await;
+        let req = stack.push(Timespec {
+            tv_sec: time.as_secs() as i64,
+            tv_nsec: time.subsec_nanos() as i64,
+        });
+        stack.commit()?;
+        let relative = syscalls::ClockNanosleep::new()
+            .with_clockid(call.clockid())
+            .with_flags(0)
+            .with_req(Some(req))
+            .with_rem(None);
+        Ok(guest.inject(relative).await?)
+    }
+
+    /// Linux's CPU-clock sleep (`posix_cpu_nsleep`,
+    /// kernel/time/posix-cpu-timers.c:1570-1595 at v6.16) for a `clock`
+    /// Detcore reads: EINVAL for the caller's own thread's clock (:1579-1582)
+    /// and for a clock of no live task, as `posix_cpu_timer_create` answers
+    /// (:386-397). Linux sleeps until the clock's task has used the CPU time
+    /// requested, which only its other threads can spend while it sleeps.
+    /// Detcore runs one thread at a time, so those threads spend CPU time at
+    /// the virtual clock's rate, and a CPU-clock sleep counts down on the
+    /// virtual clock, as it always has. `None` is a relative sleep, which
+    /// takes the ordinary path. An absolute deadline is made relative to the
+    /// clock's current reading, the time clock_gettime reads for it
+    /// ([`cpu_sleep_remaining`]); this needs the reading, so a deadline on
+    /// another process's clock is refused (`cpu_clock_reading`).
+    async fn cpu_clock_sleep<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: NanosleepFamily,
+        clock: cpu_clock::CpuClock,
+        request: &Timespec,
+    ) -> Result<Option<Duration>, Error> {
+        let task = self
+            .cpu_clock_task(
+                guest,
+                Sysno::clock_nanosleep,
+                clock.owner,
+                ClockLookup::Other,
+            )
+            .await?;
+        if task == ClockTask::OwnThread {
+            return Err(Errno::EINVAL.into());
+        }
+        if call.flags() & libc::TIMER_ABSTIME == 0 {
+            return Ok(None);
+        }
+        let now = self
+            .cpu_clock_reading(guest, Sysno::clock_nanosleep, task, clock.kind)
+            .await?;
+        Ok(Some(cpu_sleep_remaining(request, now)))
     }
 
     async fn relative_time_from_abs_target<G: Guest<Self>>(
@@ -1110,9 +1248,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         if signal == Some(Signal::SIGALRM) {
             refuse_sigalrm(guest, SigalrmControl::ArmProducer).await?;
         }
+        let on_cpu_clock = matches!(
+            cpu_clock::classify(raw_clock_id(clockid)),
+            ClockIdClass::Cpu(_)
+        );
         let id = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
-            timers.create(signo, thread, value)
+            timers.create(signo, thread, value, on_cpu_clock)
         };
         guest
             .memory()
@@ -1157,6 +1299,30 @@ impl<T: RecordOrReplay> Detcore<T> {
         let new: libc::itimerspec = guest.memory().read_value(new_ptr)?;
         let interval_ns = timespec_to_ns(new.it_interval);
         let value_ns = timespec_to_ns(new.it_value);
+
+        // A CPU clock's absolute expiration is a CPU time of the task the
+        // timer was created for (`posix_cpu_timer_set`,
+        // kernel/time/posix-cpu-timers.c:622-739 at v6.16), which Detcore's
+        // timers, counting down on the virtual clock, do not record: refused
+        // rather than read as a virtual time that has long passed.
+        if self.cfg.virtualize_time
+            && value_ns != 0
+            && call.flags() & libc::TIMER_ABSTIME != 0
+            && guest
+                .thread_state()
+                .posix_timers
+                .lock()
+                .unwrap()
+                .on_cpu_clock(id)
+        {
+            return Err(self
+                .refuse_cpu_clock(
+                    guest,
+                    Sysno::timer_settime,
+                    "an absolute expiration on a CPU-clock timer: Detcore's timers count down on the virtual clock and do not record the task whose CPU time an absolute expiration names",
+                )
+                .await);
+        }
 
         let now = thread_observe_time(guest).await;
         let deadline = if value_ns == 0 {
@@ -1408,6 +1574,37 @@ mod tests {
         for id in [10, 12, 99, (!1 << 3) | 7, (!0 << 3) | 7] {
             assert_eq!(refusal(id), Some(Errno::EINVAL), "{id}");
         }
+    }
+
+    /// An absolute CPU-clock deadline waits for the CPU time still to come,
+    /// and none once the clock has passed it.
+    #[test]
+    fn an_absolute_cpu_deadline_waits_for_the_rest() {
+        let deadline = Timespec {
+            tv_sec: 2,
+            tv_nsec: 500,
+        };
+        let at = LogicalTime::from_nanos;
+        assert_eq!(
+            cpu_sleep_remaining(&deadline, at(1_999_999_000)),
+            Duration::from_nanos(1_500)
+        );
+        assert_eq!(
+            cpu_sleep_remaining(&deadline, at(2_000_000_500)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            cpu_sleep_remaining(&deadline, at(9_000_000_000)),
+            Duration::ZERO
+        );
+        let far = Timespec {
+            tv_sec: i64::MAX,
+            tv_nsec: 999_999_999,
+        };
+        assert_eq!(
+            cpu_sleep_remaining(&far, LogicalTime::ZERO),
+            Duration::from_nanos(u64::MAX)
+        );
     }
 
     #[test]

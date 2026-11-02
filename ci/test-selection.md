@@ -60,7 +60,8 @@ A change is a set of changed files. Each file is classified:
 
 The outcome is one of three decisions:
 
-- **skip** — *every* changed file is ci_irrelevant. Run nothing.
+- **skip** — *every* changed file is ci_irrelevant. Run preflight only
+  (the PREFLIGHT checks plus `lint.rustfmt`/`lint.clippy`).
 - **selective** — files map to a subset. Run that subset, closed over the DAG's
   build `deps`, plus a small always-on preflight (`check.skill_discovery`,
   `check.script_sigpipe`, `lint.rustfmt`, `check.backend_abstraction`,
@@ -98,26 +99,37 @@ to the jobs a workflow would launch.
   sabre/liteinst ⇒ build-aux). `build-debug` is emitted whenever any shard or
   cell runs.
 
-### Per-backend selection (backend affinity)
+### Selective scope (v1: DBT-only)
 
-A footprint entry may carry an e2e affinity that filters the cell matrix:
+v1 keeps exactly two scoped outcomes besides **full**:
 
-| Footprint key | Meaning | Cells run |
+| Change | Decision | Runs |
 | --- | --- | --- |
-| `"e2e_backends": ["dbt"]` | change only affects that backend's e2e path | only `dbt` cells |
-| `"e2e_all": true` | change can affect any backend (core Detcore, the CLI, a guest fixture) | every cell |
-| *neither* | pure lint/doc/script change | no cells |
+| every file CI-irrelevant (docs/notes/images) | skip | preflight only; unselected nodes/cells recorded SKIPPED |
+| confined to `detcore-dbt/**`, `detcore-dbt-cdylib/**` or `reverie-dbt/**` (expanded pin) | selective (DBT route) | the generated common-core footprint for those crates (incl. `check.dbt_runtime_abi`, `test.cli`, all `test.hermit_integration` shards) plus **every** E2E bucket containing a DBT cell, portable and privileged |
+| anything else (shared/core code, another backend, mixed, unknown) | full | the full label: all privileged nodes, `test.record_replay`, all `test.hermit_integration` shards, isolation matrices and PMU nodes |
 
-So a `detcore-dbt/**` change runs the DBT parity shard + only the 8 DBT cells +
-`build-dbt` (not `build-aux`); a `detcore-sabre/**` change runs the SaBRe shard +
-only the 4 SaBRe cells + `build-aux`; a core `detcore/**` change runs all 52
-cells. `force_full` and unknown paths still run the full cell matrix (fail-safe).
+The DBT bucket set is **derived, not hand-picked**: the generator reads
+`ci/expected-e2e-plan.json`, takes the categories of cells with
+`backend=dbt`, and emits those `e2e.manifest_*` buckets. Today that is all
+9 portable buckets (applications, bin-c, c-programs, debugger-c,
+determinism-stress-c, language-runtimes, shared-futex-c, system-utils,
+util-c) plus the privileged c-programs bucket. If a category
+loses its last DBT cell, its bucket drops out automatically.
 
-> **KVM note.** KVM is a known backend but is `unsupported` in the portable
-> manifest plan (no `/dev/kvm` in portable CI), so it contributes **zero portable
-> cells**; KVM e2e runs in the privileged lane. KVM *guest* code lives under
-> `detcore/**`, which maps to `e2e_all` — a KVM-touching core change correctly
-> runs the full portable matrix and the privileged lane exercises KVM itself.
+The ledger's `selective_scope.cells` records only cells proven by
+terminal per-cell result rows, with complete identities
+(lane, category, test, mode, backend). Planned buckets are recorded
+separately as `planned_cells`; when no terminal per-cell evidence
+exists, `cells` is empty and `cells_unknown_reason` states that the
+executed set is unknown rather than inferred from planned buckets.
+
+Residual future work (deliberately not v1 routes): scoped kvm, ptrace,
+liteinst/in-guest-trap and sabre routes, and an e9patch-preprocessing
+route. Each must derive its buckets from its selected cells (as the DBT
+route does); a Reverie-crate route must additionally select at least the
+union of its direct Hermit dependents' footprints. Until then, any such
+path selects the full label.
 
 ### GitHub matrix output
 

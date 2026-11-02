@@ -24,9 +24,10 @@
  *             Linux kills the child with the signal. Hermit's in-guest
  *             backends refuse each send of a signal they keep with EPERM and
  *             the child exits 0; in-guest-trap delivers SIGTRAP as Linux does.
- *             Hermit's ptrace backend kills the child too, except that a
- *             SIGTRAP from another process never reaches it and it exits 0
- *             (https://github.com/rrnewton/hermit/issues/4555).
+ *             Hermit's ptrace backend kills the child too, SIGTRAP
+ *             included (it dropped a SIGTRAP from another process before
+ *             Reverie a8e9d1d52b31; a residue under --chaos stays open as
+ *             https://github.com/rrnewton/hermit/issues/4555).
  *   siginfo   Send each signal to a waiting child by rt_sigqueueinfo,
  *             rt_tgsigqueueinfo and pidfd_send_signal with a siginfo Linux
  *             refuses before any permission check: one at an unmapped

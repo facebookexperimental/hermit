@@ -234,6 +234,7 @@ impl InterpolateOpts {
     pub fn run(&self, _common_args: &CommonOpts) -> anyhow::Result<bool> {
         let latency = Self::common_pipe_wake_latency(&self.file_a, &self.file_b)?;
         let copy = Self::common_signal_state_copy(&self.file_a, &self.file_b)?;
+        let charged_once = Self::common_expired_wait_charge(&self.file_a, &self.file_b)?;
         let first_schedule = legacy_schedule(&self.file_a, "schedule diff/interpolation")?;
         let second_schedule = legacy_schedule(&self.file_b, "schedule diff/interpolation")?;
         // let i = 0;
@@ -256,7 +257,8 @@ impl InterpolateOpts {
         let sched_path = tmpdir_path.join(format!("interpolate_{}.events", self.interpolate));
         let next_sched = PreemptionRecord::from_sched_events(requested_schedule)
             .with_pipe_wake_latency(latency)
-            .with_signal_state_copy(copy);
+            .with_signal_state_copy(copy)
+            .with_expired_wait_runs_charged_once(charged_once);
         next_sched.write_to_disk(&sched_path).unwrap();
 
         Ok(true)
@@ -281,6 +283,34 @@ impl InterpolateOpts {
                 file_b.display(),
                 a,
                 b
+            );
+        }
+        Ok(a)
+    }
+
+    /// How both schedules' runs charged a run of expired timed waits
+    /// (`--expired-wait-charge`), which the interpolated schedule carries;
+    /// schedules recorded under different rules are refused, since no single
+    /// replay could charge as both did.
+    fn common_expired_wait_charge(
+        file_a: &std::path::Path,
+        file_b: &std::path::Path,
+    ) -> anyhow::Result<bool> {
+        let read = |path: &std::path::Path| {
+            detcore::preemptions::read_recorded_expired_wait_runs_charged_once(path)
+                .map_err(anyhow::Error::msg)
+        };
+        let (a, b) = (read(file_a)?, read(file_b)?);
+        if a != b {
+            let show =
+                |once| detcore_model::config::ExpiredWaitCharge::from_charged_once(once).as_str();
+            anyhow::bail!(
+                "{} and {} were recorded under different --expired-wait-charge rules ({} and \
+                 {}); no interpolation of them can be replayed",
+                file_a.display(),
+                file_b.display(),
+                show(a),
+                show(b)
             );
         }
         Ok(a)
@@ -503,6 +533,31 @@ mod tests {
             let error = common(a, b).unwrap_err();
             assert!(error.to_string().contains("signal-state copy"), "{error}");
         }
+    }
+
+    /// Two schedules whose runs charged expired timed waits differently
+    /// cannot be interpolated; agreeing ones give their rule to the result.
+    #[test]
+    fn interpolate_refuses_schedules_recorded_under_different_expired_wait_charges() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, once: bool| {
+            let path = dir.path().join(name);
+            let record = PreemptionRecord::from_sched_events(Vec::new())
+                .with_expired_wait_runs_charged_once(once);
+            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+            path
+        };
+        let each = write("each.json", false);
+        let once = write("once.json", true);
+        assert!(!InterpolateOpts::common_expired_wait_charge(&each, &each).unwrap());
+        assert!(InterpolateOpts::common_expired_wait_charge(&once, &once).unwrap());
+        let error = InterpolateOpts::common_expired_wait_charge(&each, &once).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("different --expired-wait-charge rules (each and once)"),
+            "{error}"
+        );
     }
 
     /// Two schedules recorded under different `--pipe-wake-latency` values,

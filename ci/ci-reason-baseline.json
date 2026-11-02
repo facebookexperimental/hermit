@@ -669,7 +669,6 @@
     "determinism-stress/thread-interleaving::custom",
     "determinism-stress/thread-interleaving::naked",
     "determinism-stress/thread-interleaving::replay",
-    "determinism-stress/thread-interleaving::verify",
     "determinism-stress/thread-output::chaos",
     "determinism-stress/thread-output::custom",
     "determinism-stress/thread-output::naked",

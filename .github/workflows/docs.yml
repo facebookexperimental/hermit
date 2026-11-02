@@ -76,8 +76,7 @@ jobs:
     # starting on a runner too small for it. "Keep a self-hosted run off the
     # host's shared state" and the runner.environment conditions below keep the
     # job from changing that host. Return the rebuild to ubuntu-latest once the
-    # builder streams the ledger instead of holding it
-    # (https://github.com/rrnewton/dev-hermit/issues/515).
+    # builder streams the ledger instead of holding it whole in memory.
     runs-on: ${{ (github.event_name == 'schedule' || inputs.rebuild_compatibility) && fromJSON('["self-hosted", "gate", "docs-rebuild"]') || 'ubuntu-latest' }}
     # Room for the 180-minute rebuild step below plus the steps around it
     # (about 10 minutes on 2026-09-27, with an 11-minute public-byte check cap).
@@ -299,7 +298,7 @@ jobs:
       # The rebuild's projection child peaked at 13.85 GB on 2026-10-03 (9.77 GB
       # on 2026-10-01), and the step's cgroup reached ~16.2 GB of the runner's
       # 16.77 GB. The next two runs ran out of memory in stage1.projection
-      # (https://github.com/rrnewton/dev-hermit/issues/515). This swap is the
+      # because the projection holds its whole input in memory. This swap is the
       # stopgap until the projection streams its input; remove it then.
       run: |
         set -euo pipefail
@@ -359,8 +358,10 @@ jobs:
         RUSTUP_AUTO_INSTALL: "0"
         PYTHONDONTWRITEBYTECODE: "1"
         # Print one wall/CPU line per build phase to this step's log, so the
-        # step's duration can be split by phase from the log alone
-        # (https://github.com/rrnewton/dev-hermit/issues/391).
+        # step's duration can be split by phase from the log alone. Before
+        # this, the hosted rebuild step took 3700 s, 3001 s and 2586 s on three
+        # Docs runs (36461693420, 36470493141, 36491135006; recorded in
+        # d3a0a4ae3d16) and its slow phase was not visible.
         COMPATIBILITY_WEBSITE_PHASE_TIMING: "1"
         LEDGER_COMMIT: ${{ steps.website-source.outputs.ledger_commit }}
         VALIDATION_HISTORY_COMMIT: ${{ steps.website-history.outputs.validation_history_commit }}
@@ -424,7 +425,7 @@ jobs:
       if: always() && (github.event_name == 'schedule' || inputs.rebuild_compatibility)
       # The rebuild's resource receipt does not count swapped-out pages, so its
       # memory peaks stop near physical RAM once swap is on. Log the swap the
-      # rebuild actually used (https://github.com/rrnewton/dev-hermit/issues/515).
+      # rebuild actually used.
       run: |
         set -uo pipefail
         swapon --show --bytes || true

@@ -22,8 +22,11 @@ if [[ ${1:-} == --self-test ]]; then
     shift
 fi
 
-mkdir -p target/ci
-compile_dir=$(mktemp -d "$ROOT_DIR/target/ci/check-reverie-pin.XXXXXX")
+# Like the Cargo calls this wrapper guards, resolve a relative target at ROOT_DIR.
+# An unset or empty override preserves the existing source-local default.
+compile_root="${CARGO_TARGET_DIR:-$ROOT_DIR/target}/ci"
+mkdir -p -- "$compile_root"
+compile_dir=$(mktemp -d -- "$compile_root/check-reverie-pin.XXXXXX")
 checker="$compile_dir/checker"
 trap 'rm -rf -- "$compile_dir"' EXIT
 if [[ $mode == test ]]; then

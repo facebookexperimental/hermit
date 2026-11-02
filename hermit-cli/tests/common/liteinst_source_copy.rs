@@ -150,10 +150,16 @@ fn copied_source_checks(case: &Path, original: &Path, runner: &mut Runner) -> Re
             .as_array()
             .unwrap()
             .len(),
-        // The reviewed catalog binds 53 runtime/artifact inputs, including the
-        // separate Bootstrap descriptor, role, env/aux and site leaves.
+        // The reviewed catalog binds 77 runtime/artifact inputs, including the
+        // pidfd-self modules and their lifecycle and Guest entry points, the
+        // signal-mask gate's runtime_mask module and its callers, the typed
+        // Tool configuration (reverie/src/tool_configuration.rs and
+        // reverie-inguest/src/guest/rpc.rs, added by Reverie 38c3e024), and
+        // the shared Tool process ownership, callback outcomes and reserved
+        // RPC protocol (seven rows added by the native caller-Tool join).
+        // Four package-role proof/fixture inputs are also bound.
         // The separately bound qualifier source adds one input.
-        54
+        78
     );
     let alias = case.join("cargo-alias");
     let private_home = case.join("cargo-home");

@@ -539,6 +539,8 @@ fn context(source: &Path, outcomes: &[StepOutcome], run_id: &str) -> LedgerCtx {
         executed_tests,
         passed_tests,
         filtered_tests,
+        selective_skipped_nodes: Vec::new(),
+        selective_scope: None,
     }
 }
 

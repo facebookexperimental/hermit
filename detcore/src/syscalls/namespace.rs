@@ -11,6 +11,8 @@
 #[cfg(test)]
 #[path = "namespace/own_getters_tests.rs"]
 mod own_getters_tests;
+#[path = "namespace/own_links.rs"]
+mod own_links;
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -125,7 +127,7 @@ fn decimal_u32(component: &OsStr) -> Option<u32> {
         .then(|| value.parse().ok())?
 }
 
-fn decimal_fd(component: &OsStr) -> Option<i32> {
+pub(crate) fn decimal_fd(component: &OsStr) -> Option<i32> {
     let value = component.to_str()?;
     // procfs names descriptors without leading zeros (`name_to_int`).
     (!value.is_empty()
@@ -1521,6 +1523,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         (dirfd, path): (i32, Option<PathPtr<'_>>),
     ) -> Option<Vec<u8>> {
         const CAPACITY: usize = libc::PATH_MAX as usize;
+        // The working directory a relative spelling needs is read before
+        // the stack scratch is taken: the translation of the call below can
+        // reach `Detcore::prepare_guest_cwd`, whose reads take that scratch
+        // too, which KVM refuses with a panic while it is held.
+        if let Some(Ok(spelling)) = path.map(|path| path.read(&guest.memory())) {
+            let spelling: PathBuf = spelling;
+            Self::prepare_guest_cwd(guest, dirfd, &spelling).await;
+        }
         let mut stack = guest.stack().await;
         if stack.capacity() < CAPACITY {
             return None;
@@ -1532,7 +1542,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_path(path)
             .with_buf(Some(scratch))
             .with_buf_len(CAPACITY);
-        let length = usize::try_from(guest.inject(call).await.ok()?).ok()?;
+        // The guest's path, respelled for this injection where it leads below
+        // a descriptor directory, as the guest's own call is.
+        let length = usize::try_from(
+            Self::inject_translated(guest, Syscall::from(call))
+                .await
+                .ok()?,
+        )
+        .ok()?;
         let mut target = vec![0; length.min(CAPACITY)];
         let read = guest.memory().read_exact(scratch.cast(), &mut target);
         drop(guard);
@@ -1965,6 +1982,54 @@ impl<T: RecordOrReplay> Detcore<T> {
         .await
     }
 
+    /// The absolute spelling of a `readlink` of `path` from `dirfd` that may
+    /// be a descriptor link of the caller's to a placeholder directory
+    /// (`syscalls::files::descriptor_directory`), whose link Detcore answers
+    /// so that the placeholder's own path never reaches the guest: an
+    /// absolute path as it is; a name relative to a placeholder descriptor
+    /// below its directory's spelling; a name relative to the working
+    /// directory, from the guest's working directory (`Detcore::observed_path`,
+    /// which the caller prepares, `Detcore::prepare_guest_cwd`: where the tool
+    /// cannot read it from host procfs, KVM, the guest's own `getcwd` names
+    /// it, <https://github.com/rrnewton/hermit/issues/4541>). `None` for any
+    /// other.
+    fn placeholder_link_spelling<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        dirfd: i32,
+        path: &Path,
+    ) -> Option<PathBuf> {
+        if path.is_absolute() {
+            return Some(path.to_path_buf());
+        }
+        if let Some(spelled) = Self::spelling_below_placeholder(guest, dirfd, path) {
+            return Some(spelled);
+        }
+        (dirfd == libc::AT_FDCWD && !path.as_os_str().is_empty())
+            .then(|| Self::observed_path(guest, dirfd, path).ok())
+            .flatten()
+            .filter(|observed| observed.is_absolute())
+    }
+
+    /// Answer a `readlink` of `path` from `dirfd` if it is a descriptor link
+    /// of the caller's to a placeholder directory
+    /// ([`Self::placeholder_link_spelling`],
+    /// `Detcore::answer_descriptor_directory_link`). Boxed by its callers, so
+    /// that the spelling it holds does not grow every system call's future.
+    async fn answer_placeholder_link_at<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        dirfd: i32,
+        path: &Path,
+        buf: Option<reverie::syscalls::AddrMut<'_, libc::c_char>>,
+        buf_len: usize,
+    ) -> Option<Result<i64, Error>> {
+        Self::prepare_guest_cwd(guest, dirfd, path).await;
+        let spelled = self.placeholder_link_spelling(guest, dirfd, path)?;
+        self.answer_descriptor_directory_link(guest, &spelled, buf, buf_len)
+            .await
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#877)
     /// Preserve Linux readlink errors and canonicalize procfs namespace identities.
@@ -1976,6 +2041,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Linux refuses a size that is not positive before it reads the path.
         readlink_size(call.bufsize())?;
         let path: PathBuf = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        if let Some(answer) = Box::pin(self.answer_placeholder_link_at(
+            guest,
+            libc::AT_FDCWD,
+            &path,
+            call.buf(),
+            call.bufsize(),
+        ))
+        .await
+        {
+            return answer;
+        }
+        if let Some(result) = self
+            .readlink_own_task_link(
+                guest,
+                reverie::syscalls::Sysno::readlink,
+                &path,
+                (call.buf(), call.bufsize()),
+            )
+            .await?
+        {
+            return Ok(result);
+        }
         if let Some(exe) = self
             .launched_exe(guest, (libc::AT_FDCWD, &path), false)
             .await
@@ -2027,6 +2114,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Readlink,
         path: PathBuf,
     ) -> Result<i64, Error> {
+        if self
+            .readlink_names_runtime_fd(guest, libc::AT_FDCWD, &path)
+            .await
+        {
+            return Err(Errno::ENOENT.into());
+        }
         if let Some(result) = self
             .readlink_rendered_procfs(guest, &path, call.buf(), call.bufsize())
             .await?
@@ -2101,6 +2194,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Linux refuses a size that is not positive before it reads the path.
         readlink_size(call.buf_len())?;
         let path: PathBuf = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        if let Some(answer) = Box::pin(self.answer_placeholder_link_at(
+            guest,
+            call.dirfd(),
+            &path,
+            call.buf(),
+            call.buf_len(),
+        ))
+        .await
+        {
+            return answer;
+        }
+        if path.is_absolute()
+            && let Some(result) = self
+                .readlink_own_task_link(
+                    guest,
+                    reverie::syscalls::Sysno::readlinkat,
+                    &path,
+                    (call.buf(), call.buf_len()),
+                )
+                .await?
+        {
+            return Ok(result);
+        }
         if let Some(exe) = self.launched_exe(guest, (call.dirfd(), &path), false).await {
             let saved = saved_exe_link_bytes(guest, call.buf(), call.buf_len());
             let result = self.record_or_replay(guest, call).await?;
@@ -2147,7 +2263,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // looks it up (`Detcore::procfs_spelling_at`): below a `/proc/self`
         // or `/proc/<pid>` directory, the task the directory was opened on
         // (ESRCH once that task is gone), and below a descriptor Detcore has
-        // no record of (one received over `SCM_RIGHTS`), the procfs directory
+        // no recorded path for (one received over `SCM_RIGHTS`), the procfs directory
         // the kernel names for it; so a namespace or descriptor link there is
         // modeled and canonicalized as the same link spelled absolutely. Any
         // other such name stays relative, and the kernel decides.
@@ -2173,6 +2289,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             lexical.clone()
         };
+        if self
+            .readlink_names_runtime_fd(guest, call.dirfd(), &path)
+            .await
+        {
+            return Err(Errno::ENOENT.into());
+        }
         // The directory names a task or a kernel path Detcore knows.
         let named_by_directory = below_directory && observed_path != lexical;
         if let Some(result) = self
@@ -2194,6 +2316,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 && recorded
                     .as_deref()
                     .is_some_and(|directory| directory == Path::new("/proc")));
+        // The caller's own `exe`, `cwd` and `root` links, by a name below a
+        // descriptor on `/proc` or one of its process directories.
+        if decidable
+            && !path.is_absolute()
+            && let Some(result) = self
+                .readlink_own_task_link(
+                    guest,
+                    reverie::syscalls::Sysno::readlinkat,
+                    &observed_path,
+                    (call.buf(), call.buf_len()),
+                )
+                .await?
+        {
+            return Ok(result);
+        }
         if decidable
             && let Some(result) = self
                 .readlink_decided_link(

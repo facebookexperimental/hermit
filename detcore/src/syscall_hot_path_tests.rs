@@ -42,35 +42,44 @@ use crate::types::DetPid;
 const TID: i32 = 4242;
 
 /// A thread that records every syscall injected through it and answers each
-/// with `reply`. Nothing else it offers is expected to be used.
-struct InjectGuest<T: RecordOrReplay<ThreadState = ()>> {
-    config: Config,
+/// with `reply`. Nothing else it offers is expected to be used, but for its
+/// registers where a test supplies them (`with_registers`).
+pub(crate) struct InjectGuest<T: RecordOrReplay<ThreadState = ()>> {
+    pub(crate) config: Config,
     thread: ThreadState<()>,
     reply: Result<i64, Errno>,
+    registers: Option<libc::user_regs_struct>,
     injected: Mutex<Vec<(Sysno, SyscallArgs)>>,
     _tool: std::marker::PhantomData<T>,
 }
 
 impl<T: RecordOrReplay<ThreadState = ()>> InjectGuest<T> {
-    fn new(reply: Result<i64, Errno>) -> Self {
+    pub(crate) fn new(reply: Result<i64, Errno>) -> Self {
         let config = Config::default();
         let thread = ThreadState::new(DetPid::from_raw(TID), &config, ());
         Self {
             config,
             thread,
             reply,
+            registers: None,
             injected: Mutex::new(Vec::new()),
             _tool: std::marker::PhantomData,
         }
     }
 
-    fn injected(&self) -> Vec<(Sysno, SyscallArgs)> {
+    /// Answer `regs` with `registers` rather than refusing to.
+    pub(crate) fn with_registers(mut self, registers: libc::user_regs_struct) -> Self {
+        self.registers = Some(registers);
+        self
+    }
+
+    pub(crate) fn injected(&self) -> Vec<(Sysno, SyscallArgs)> {
         self.injected.lock().unwrap().clone()
     }
 }
 
-struct UnusedStack;
-struct UnusedStackGuard;
+pub(crate) struct UnusedStack;
+pub(crate) struct UnusedStackGuard;
 impl Drop for UnusedStackGuard {
     fn drop(&mut self) {}
 }
@@ -129,7 +138,8 @@ impl<T: RecordOrReplay<ThreadState = ()>> Guest<Detcore<T>> for InjectGuest<T> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
-        panic!("forwarding a syscall needs no registers")
+        self.registers
+            .expect("forwarding a syscall needs no registers")
     }
     async fn stack(&mut self) -> UnusedStack {
         panic!("forwarding a syscall needs no scratch stack")
@@ -156,7 +166,7 @@ impl<T: RecordOrReplay<ThreadState = ()>> Guest<Detcore<T>> for InjectGuest<T> {
     }
 }
 
-fn detcore<T: RecordOrReplay<ThreadState = ()>>() -> Detcore<T> {
+pub(crate) fn detcore<T: RecordOrReplay<ThreadState = ()>>() -> Detcore<T> {
     <Detcore<T> as Tool>::new(Pid::from_raw(TID), &Config::default())
 }
 

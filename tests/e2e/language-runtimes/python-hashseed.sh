@@ -23,8 +23,12 @@ prog+='
 ctl = sum(i * i for i in range(1, 101))
 print("order=" + ",".join(s) + " hash=" + str(hash("hermit-determinism-corpus")) + " ctl=" + str(ctl))'
 
+# The interpreter is named by its path, so the cell runs the same system
+# interpreter whatever the host puts first on PATH. A host whose
+# /usr/local/bin/python3 is a launcher would otherwise be measured instead
+# (https://github.com/rrnewton/hermit/issues/4598).
 case ${1:-} in
-    --prepare) command -v python3 >/dev/null ;;
-    --run) exec python3 -c "$prog" ;;
+    --prepare) test -x /usr/bin/python3 ;;
+    --run) exec /usr/bin/python3 -c "$prog" ;;
     *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
 esac

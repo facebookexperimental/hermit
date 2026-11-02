@@ -1142,7 +1142,7 @@ pub enum CellResultsValue {
     /// JSON text instead of a `Value` tree. A `Value` costs about 7 bytes of
     /// heap per byte of JSON: on the 2026-10-10 ledger the 616 rows with cell
     /// results held 728 MB of JSON as 4.9 GB of `Value`
-    /// (<https://github.com/rrnewton/dev-hermit/issues/552>). It reads,
+    /// (validate-status holds every ledger row this way). It reads,
     /// compares and serializes exactly as `Other` holding the same value.
     Retained(RetainedJson),
     /// Decode-only duplicate identity state. Historical serialization and typed
@@ -2587,8 +2587,7 @@ mod tests {
     }
 
     /// An untyped shape is kept as compact text, and every reader sees exactly
-    /// what it saw when the shape was a `Value`
-    /// (<https://github.com/rrnewton/dev-hermit/issues/552>).
+    /// what it saw when the shape was a `Value`, at a fraction of the memory.
     #[test]
     fn untyped_cell_results_are_retained_as_text_and_read_exactly_as_a_value() {
         let json = serde_json::json!({

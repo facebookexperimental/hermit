@@ -78,6 +78,10 @@ use crate::stress_series::HostCapabilityVerdict;
 #[cfg(test)]
 use crate::timeouts::COMPAT_REPLAY_FULL_2026_10_20_ENABLED_CELL_COUNT;
 #[cfg(test)]
+use crate::timeouts::DBT_2026_10_25_TIMEOUT_CALIBRATIONS;
+#[cfg(test)]
+use crate::timeouts::DBT_FLIP_2026_10_27_TIMEOUT_CALIBRATIONS;
+#[cfg(test)]
 use crate::timeouts::DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS;
 #[cfg(test)]
 use crate::timeouts::DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS;
@@ -669,7 +673,9 @@ pub const DEFAULT_RUN_TYPE: &str = "full";
 /// empty. A selection keeps a cell when the cell's run types meet the
 /// selection's `--label`s, and a selection without `--label` selects the
 /// default run type, so a cell labelled only with a focused run type (such as
-/// `sabre-compat-only`) is required there and nowhere else.
+/// `sabre-compat-only`) is required there and nowhere else. On an archived
+/// backend ([`crate::archived`]) the default run type is
+/// [`crate::archived::ARCHIVED_RUN_TYPE`] instead.
 pub fn cell_labels<'a>(
     test: &'a TestRecipe,
     recipe: &'a ModeRecipe,
@@ -681,6 +687,10 @@ pub fn cell_labels<'a>(
     }
     if labels.is_empty() {
         labels.insert(DEFAULT_RUN_TYPE);
+    }
+    if backend.is_some_and(crate::archived::is_archived_backend) && labels.remove(DEFAULT_RUN_TYPE)
+    {
+        labels.insert(crate::archived::ARCHIVED_RUN_TYPE);
     }
     labels
 }
@@ -1369,6 +1379,42 @@ pub fn validate_expected_guest_exit(
         ));
     }
     Ok(())
+}
+
+/// Check a declared guest exit that a result row, or a series row built from
+/// one, carries in `mode`. A replay cell inherits its verify recipe's
+/// declaration ([`cell_expected_guest_exit`]) and passes on it only through
+/// the verify cell's gate (a matched canonical replay whose guest and Hermit
+/// both end exactly that way), so a row may carry it in verify or replay mode.
+/// A recipe may still declare it only in verify mode
+/// ([`validate_expected_guest_exit`]).
+pub fn validate_result_expected_guest_exit(
+    id: &str,
+    mode: &str,
+    expected: Option<&ExpectedGuestExit>,
+) -> Result<(), String> {
+    let recipe_mode = if mode == "replay" { "verify" } else { mode };
+    validate_expected_guest_exit(id, recipe_mode, expected)
+}
+
+/// Whether `hermit_args`, an attempt's argv before the guest separator, is an
+/// invocation the runner writes for a cell whose declared nonzero exit it
+/// checks: a verify cell's comparison with `--verify-allow=failure`, or a
+/// replay cell's `record start`, whose comparison takes `--verify-allow=both`
+/// (`verified_invocation_argv`). A reader re-deciding a declared exit from a
+/// retained row requires one of these.
+pub fn invocation_admits_declared_guest_exit<S: AsRef<str>>(mode: &str, hermit_args: &[S]) -> bool {
+    let has = |flag: &str| hermit_args.iter().any(|arg| arg.as_ref() == flag);
+    match mode {
+        "verify" => has("--verify-allow=failure"),
+        "replay" => {
+            has("--verify-allow=both")
+                && hermit_args
+                    .windows(2)
+                    .any(|pair| pair[0].as_ref() == "record" && pair[1].as_ref() == "start")
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -3004,6 +3050,12 @@ pub enum ObservedResult {
     Oom,
     SandboxDenied,
     InfrastructureError,
+    /// A chaos cell whose every attempt matched, failed by its own population
+    /// floor (`assert.min_distinct`, `min_passes`, `min_failures` or
+    /// `min_normalized_entropy`): the schedules no longer expose what the cell
+    /// exists to observe. No attempt crashed, so it is not a crash-error, and
+    /// none diverged, so it is not a determinism failure.
+    ChaosFloorFailure,
 }
 
 impl ObservedResult {
@@ -3016,6 +3068,7 @@ impl ObservedResult {
             "crash-error" => Ok(Self::CrashError),
             "timeout" => Ok(Self::Timeout),
             "oom" => Ok(Self::Oom),
+            "chaos-floor-failure" => Ok(Self::ChaosFloorFailure),
             "sandbox-denied" => Err(
                 "pressure summary contains a sandbox-denied operation; refusing to store it as product behavior"
                     .into(),
@@ -3039,6 +3092,7 @@ impl ObservedResult {
             Self::Oom => "oom",
             Self::SandboxDenied => "sandbox-denied",
             Self::InfrastructureError => "infrastructure-error",
+            Self::ChaosFloorFailure => "chaos-floor-failure",
         }
     }
 
@@ -3055,7 +3109,8 @@ impl ObservedResult {
             Self::DeterminismFailure
             | Self::ParityFailure
             | Self::ReplayFailure
-            | Self::CrashError => Some(FailureClass::ProductFailure),
+            | Self::CrashError
+            | Self::ChaosFloorFailure => Some(FailureClass::ProductFailure),
             Self::Timeout | Self::Oom => Some(FailureClass::NoResult),
             Self::SandboxDenied | Self::InfrastructureError => {
                 Some(FailureClass::UnderstoodInfrastructureFailure)
@@ -3639,6 +3694,11 @@ pub struct RunContext {
     pub timeout_multipliers: TimeoutMultipliers,
     pub scheduled_worker_capacity: ScheduledWorkerCapacity,
     pub isolated_workdir: Option<PathBuf>,
+    /// Whether verify and chaos attempts run their two executions under
+    /// `hermit verify-inputs`, sharing one sealed copy of the host's
+    /// `/etc/ld.so.cache` (`shared_inputs_argv`). Decided once per run:
+    /// true where the host has the cache.
+    pub shares_ld_so_cache: bool,
 }
 
 /// The epoch a cell gets when `HERMIT_EPOCH` is unset, re-exported for the
@@ -3832,6 +3892,7 @@ impl RunContext {
             timeout_multipliers: timeout_multipliers_from_env()?,
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir,
+            shares_ld_so_cache: Path::new(LD_SO_CACHE_PATH).exists(),
         })
     }
 
@@ -4810,8 +4871,40 @@ fn verify_attempt_invocation_error<'a>(
     comparator: Comparator,
 ) -> Result<Option<&'a str>, String> {
     // The paired program ([`VERIFY_PAIR_SCRIPT`]): the comparison, then the
-    // run command.
-    let paired = &attempt.argv;
+    // run command, optionally below the original single sealed-input owner.
+    // A mapped image and the host linker cache share that same manifest.
+    let mapped_holder = attempt
+        .argv
+        .get(1..=MAPPED_INPUTS_PREFIX.len())
+        .is_some_and(|words| words.iter().map(String::as_str).eq(MAPPED_INPUTS_PREFIX));
+    let (paired, shared) = if mapped_holder {
+        let rest = &attempt.argv[1 + MAPPED_INPUTS_PREFIX.len()..];
+        let cache = rest.get(..2).is_some_and(|words| {
+            words
+                .iter()
+                .map(String::as_str)
+                .eq(["--input", LD_SO_CACHE_INPUT])
+        });
+        (&rest[if cache { 2 } else { 0 }..], cache)
+    } else {
+        let shared = attempt
+            .argv
+            .get(1..=SHARED_INPUTS_PREFIX.len())
+            .is_some_and(|words| words.iter().map(String::as_str).eq(SHARED_INPUTS_PREFIX));
+        if attempt.argv.get(1).map(String::as_str) == Some("verify-inputs") && !shared {
+            return Err(
+                "does not use the original input holder with its exact manifest descriptor".into(),
+            );
+        }
+        (
+            &attempt.argv[if shared {
+                1 + SHARED_INPUTS_PREFIX.len()
+            } else {
+                0
+            }..],
+            shared,
+        )
+    };
     let program = ["bash", "-c", VERIFY_PAIR_SCRIPT, VERIFY_PAIR_NAME];
     if paired
         .get(..program.len())
@@ -4829,6 +4922,12 @@ fn verify_attempt_invocation_error<'a>(
         .map(|offset| offset + 1)
         .ok_or("has no run command after its comparison")?;
     let (comparison, argv) = commands.split_at(run_start);
+    if mapped_holder && (attempt.argv.first() != argv.first() || backend != "in-guest-trap") {
+        return Err("mapped-input holder differs from the run's executable or backend".into());
+    }
+    if shared && attempt.argv.first() != argv.first() {
+        return Err("seals its shared inputs with a Hermit other than the run's".into());
+    }
     let head = ["--log", "info", "--backend", backend, "run"];
     if argv
         .get(1..=head.len())
@@ -4891,6 +4990,18 @@ fn verify_attempt_invocation_error<'a>(
             "lacks `--verify-run {VERIFY_RUN_DIR_PLACEHOLDER}` where the executor writes it"
         ));
     }
+    let cache_only_holder = shared && !mapped_holder;
+    if tokens.flag(SHARED_INPUTS_FLAG) != cache_only_holder {
+        return Err(if cache_only_holder {
+            format!("seals shared inputs but its run lacks `{SHARED_INPUTS_FLAG}`")
+        } else if mapped_holder {
+            format!(
+                "carries `{SHARED_INPUTS_FLAG}` although the mapped-input holder uses only fd 197"
+            )
+        } else {
+            format!("carries `{SHARED_INPUTS_FLAG}` without the `hermit verify-inputs` holder")
+        });
+    }
     paired_comparison_error(comparison, &argv[0], expects_exit)
         .map_err(|error| format!("compares with a command that {error}"))?;
     // The execution root (`append_execution_root_args`): a tmpfs mounted at
@@ -4918,6 +5029,10 @@ fn verify_attempt_invocation_error<'a>(
                 "gives `--env` the value {assignment:?}, which assigns nothing"
             ));
         }
+    }
+    if mapped_holder {
+        tokens.require("--in-guest-exec-stop")?;
+        tokens.require("--native-exec-shared-inputs=197")?;
     }
     match tokens.0.first() {
         Some(token) => Err(format!(
@@ -5717,6 +5832,71 @@ pub const VERIFY_RUN_DIR_PLACEHOLDER: &str = "@VERIFY_RUN_DIR@";
 /// <run1>` in the replay's.
 const VERIFY_REPLAY_OF_PLACEHOLDER: &str = "@VERIFY_REPLAY_OF@";
 
+/// The descriptor `hermit verify-inputs` places a verified attempt's
+/// shared-input manifest at: above 2 and outside the native adapter's
+/// reserved 198-204.
+const SHARED_INPUTS_FD: &str = "9";
+
+/// The run option that adopts that manifest, the same word in both runs, so
+/// the two guests still see one Hermit command line.
+const SHARED_INPUTS_FLAG: &str = "--native-exec-shared-inputs=9";
+
+/// The host's dynamic-linker cache, as the holder seals it: Hermit binds the
+/// copy the run adopts under this role in place of reading the host's file
+/// at each run's setup.
+const LD_SO_CACHE_PATH: &str = "/etc/ld.so.cache";
+const LD_SO_CACHE_INPUT: &str = "ld-so-cache:/etc/ld.so.cache";
+
+/// The words before a paired program that [`shared_inputs_argv`] puts there,
+/// after the Hermit binary.
+///
+/// No `--` ends the holder's options: the program follows them directly, so
+/// the first `--` of the recorded command line is still the run's guest
+/// separator, where its readers ([`ParityGuestInputs`](crate::parity), the
+/// SaBRe selection, the scorecard) find the end of Hermit's options.
+const MAPPED_INPUTS_PREFIX: [&str; 4] = [
+    "verify-inputs",
+    "--in-guest-exec-stop",
+    "--manifest-fd",
+    "197",
+];
+
+const SHARED_INPUTS_PREFIX: [&str; 5] = [
+    "verify-inputs",
+    "--manifest-fd",
+    SHARED_INPUTS_FD,
+    "--input",
+    LD_SO_CACHE_INPUT,
+];
+
+/// `paired` run under `hermit verify-inputs`, which seals the host's
+/// `/etc/ld.so.cache` once for the attempt and hands both runs that one copy.
+///
+/// A host package manager replaces the cache many times an hour. Each run
+/// used to freeze its own copy when its container was set up, so a
+/// replacement between the two runs gave them different caches: the
+/// loader's `fstat` of it differed, and the comparison reported a
+/// divergence that no host-input check could name
+/// (https://github.com/rrnewton/hermit/issues/4693).
+fn shared_inputs_argv(hermit: &str, mut paired: Vec<String>) -> Vec<String> {
+    if paired
+        .get(1..=MAPPED_INPUTS_PREFIX.len())
+        .is_some_and(|words| words.iter().map(String::as_str).eq(MAPPED_INPUTS_PREFIX))
+    {
+        // Reuse the mapped holder, rather than nesting a second process whose
+        // manifest would replace the first owner at CLI entry.
+        paired.splice(
+            1 + MAPPED_INPUTS_PREFIX.len()..1 + MAPPED_INPUTS_PREFIX.len(),
+            ["--input".into(), LD_SO_CACHE_INPUT.into()],
+        );
+        return paired;
+    }
+    let mut argv = vec![hermit.to_owned()];
+    argv.extend(SHARED_INPUTS_PREFIX.map(String::from));
+    argv.extend(paired);
+    argv
+}
+
 /// The `--verify-run` directories of a paired attempt, below its
 /// `verify-runs/<attempt>` directory.
 fn verify_run_directories(verify_runs: &Path) -> [PathBuf; 2] {
@@ -5804,6 +5984,10 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
         }
         VerifiedInvocation::Verify => None,
     };
+    // A `record start` takes no shared inputs, and a host without a cache has
+    // none to seal.
+    let shares_ld_so_cache =
+        !matches!(invocation, VerifiedInvocation::Replay { .. }) && context.shares_ld_so_cache;
     match invocation {
         VerifiedInvocation::Replay {
             record_timeout_seconds,
@@ -5818,11 +6002,12 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
         }
         VerifiedInvocation::Verify => {
             argv.extend(["--verify-run".into(), VERIFY_RUN_DIR_PLACEHOLDER.into()]);
+            argv.extend(shares_ld_so_cache.then(|| SHARED_INPUTS_FLAG.to_owned()));
         }
         VerifiedInvocation::Chaos { seed } => {
+            argv.extend(["--verify-run".into(), VERIFY_RUN_DIR_PLACEHOLDER.into()]);
+            argv.extend(shares_ld_so_cache.then(|| SHARED_INPUTS_FLAG.to_owned()));
             argv.extend([
-                "--verify-run".into(),
-                VERIFY_RUN_DIR_PLACEHOLDER.into(),
                 "--chaos".into(),
                 "--sched-heuristic=random".into(),
                 format!("--seed={seed}"),
@@ -5830,7 +6015,7 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
         }
     }
     let mut comparison = vec![
-        hermit,
+        hermit.clone(),
         "log-diff".into(),
         "--verify-json".into(),
         verdict.to_string_lossy().into_owned(),
@@ -5867,14 +6052,38 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     }
     argv.push("--".into());
     argv.extend(guest_argv.iter().cloned());
-    paired_verification_argv(comparison, argv)
+    let paired = paired_verification_argv(comparison, argv);
+    if shares_ld_so_cache {
+        shared_inputs_argv(&hermit, paired)
+    } else {
+        paired
+    }
 }
 
 /// The argv of `VERIFY_PAIR_SCRIPT` comparing two executions of the `run`
 /// command with the `comparison` command, as the executor runs every
 /// verified attempt. `run` carries `--verify-run @VERIFY_RUN_DIR@`; the last
 /// two words of `comparison` are the attempt's run1 and run2 directories.
-pub fn paired_verification_argv(comparison: Vec<String>, run: Vec<String>) -> Vec<String> {
+pub fn paired_verification_argv(comparison: Vec<String>, mut run: Vec<String>) -> Vec<String> {
+    // Reuse the existing holder and pair script: only the retained runtime
+    // transport changes. Both runs keep one command line and independent
+    // open descriptions of the holder's frozen stdin.
+    let separator = run.iter().position(|word| word == "--");
+    let mapped =
+        separator.is_some_and(|end| run[..end].iter().any(|word| word == "--in-guest-exec-stop"));
+    let holder = mapped.then(|| run[0].clone());
+    if mapped {
+        // The original cache-sharing command used fd 9. Both resources now
+        // travel in the mapped owner's fd 197; keep exactly one run option.
+        if let Some(index) = run[..separator.unwrap()]
+            .iter()
+            .position(|arg| arg == SHARED_INPUTS_FLAG)
+        {
+            run.remove(index);
+        }
+        let separator = run.iter().position(|word| word == "--").unwrap();
+        run.insert(separator, "--native-exec-shared-inputs=197".into());
+    }
     let mut paired = vec![
         "bash".into(),
         "-c".into(),
@@ -5883,7 +6092,14 @@ pub fn paired_verification_argv(comparison: Vec<String>, run: Vec<String>) -> Ve
     ];
     paired.extend(comparison);
     paired.extend(run);
-    paired
+    if let Some(hermit) = holder {
+        let mut owned = vec![hermit];
+        owned.extend(MAPPED_INPUTS_PREFIX.map(String::from));
+        owned.extend(paired);
+        owned
+    } else {
+        paired
+    }
 }
 
 fn current_verification_report(bytes: &[u8]) -> Result<VerificationReport, String> {
@@ -8298,6 +8514,29 @@ fn observed_result(
     typed
 }
 
+/// A chaos cell that its population floor failed while every attempt matched
+/// is [`ObservedResult::ChaosFloorFailure`], not the crash-error
+/// [`observed_result`] would infer from the FAIL alone, which no attempt
+/// supports (the stress series refused such rows: "framework result has no
+/// supporting canonical typed attempt"). Any other result is kept: a
+/// divergence, a timeout, a crash an attempt does support, or a framework
+/// failure.
+fn chaos_floor_result(
+    result: Option<ObservedResult>,
+    floor_failed: bool,
+    attempts: &[AttemptResult],
+) -> Option<ObservedResult> {
+    let every_attempt_matched = !attempts.is_empty()
+        && attempts
+            .iter()
+            .all(|attempt| verification_verdict(attempt) == Some(Verdict::Matched));
+    if floor_failed && every_attempt_matched && result == Some(ObservedResult::CrashError) {
+        Some(ObservedResult::ChaosFloorFailure)
+    } else {
+        result
+    }
+}
+
 fn observed_result_from_typed_evidence(
     mode: &str,
     outcome: &str,
@@ -8861,6 +9100,7 @@ fn run_cell_inner(
         outcome = "FAIL".into();
         reason = Some(format!("custom observed {distinct} distinct outcomes"));
     }
+    let mut chaos_floor_failed = false;
     if cell.id.mode == "chaos" {
         let assert = mode.assert.as_ref().cloned().unwrap_or_default();
         let (pass_count, failure_count, timed_out_count) = chaos_population_counts(attempts);
@@ -8899,6 +9139,7 @@ fn run_cell_inner(
                 .min_normalized_entropy
                 .is_some_and(|minimum| normalized_entropy < minimum)
         {
+            chaos_floor_failed = outcome != "ERROR";
             apply_failed_chaos_assertion(
                 &mut outcome,
                 &mut reason,
@@ -8949,7 +9190,11 @@ fn run_cell_inner(
         error_kind = Some("infrastructure".into());
         reason = Some("Hermit binary changed while the cell was executing".into());
     }
-    let result = observed_result(&cell.id.mode, &outcome, attempts, error_kind.as_deref());
+    let result = chaos_floor_result(
+        observed_result(&cell.id.mode, &outcome, attempts, error_kind.as_deref()),
+        chaos_floor_failed,
+        attempts,
+    );
     let failure_class = failure_class(&outcome, result, error_kind.as_deref());
     let cpu_usage_usec = attempts
         .iter()
@@ -11764,6 +12009,59 @@ corpus:
         }
     }
 
+    /// A cell on an archived backend (crate::archived) that names no focused
+    /// run type belongs to the archived run type instead of full, so neither
+    /// full validation nor its required plan selects it; a focused label it
+    /// carries is kept, and other backends' cells stay full's.
+    #[test]
+    fn an_archived_backends_cell_leaves_full_for_the_archived_run_type() {
+        use crate::archived::ARCHIVED_RUN_TYPE;
+        let mut test = recipe(true);
+        let mode = test.modes.get_mut("verify").unwrap();
+        mode.backends_enabled.push("sabre".into());
+        mode.backends_disabled.remove("sabre");
+        let mode = &test.modes["verify"];
+        assert_eq!(
+            cell_labels(&test, mode, Some("sabre")),
+            BTreeSet::from([ARCHIVED_RUN_TYPE])
+        );
+        assert_eq!(
+            cell_labels(&test, mode, Some("ptrace")),
+            BTreeSet::from([DEFAULT_RUN_TYPE])
+        );
+        assert!(
+            focused_run_type_reason(&test, mode, Some("sabre"))
+                .is_some_and(|reason| reason.contains(ARCHIVED_RUN_TYPE))
+        );
+        let mut labelled = test.clone();
+        labelled.modes.get_mut("verify").unwrap().labels =
+            BTreeMap::from([("sabre".into(), vec!["sabre-compat-only".into()])]);
+        assert_eq!(
+            cell_labels(&labelled, &labelled.modes["verify"], Some("sabre")),
+            BTreeSet::from(["sabre-compat-only"])
+        );
+        let set = ManifestSet {
+            documents: Vec::new(),
+            tests: BTreeMap::from([(
+                test.id.clone(),
+                ("fixture".into(), 15, DEFAULT_TEST_CPU_TIMEOUT_SECONDS, test),
+            )]),
+        };
+        let backends = |labels: &[&str]| {
+            set.select(&Selection {
+                population: Some(Population::Required),
+                labels: labels.iter().map(|l| l.to_string()).collect(),
+                ..Selection::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|cell| cell.id.backend.unwrap())
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(backends(&[]), ["ptrace"]);
+        assert_eq!(backends(&[ARCHIVED_RUN_TYPE]), ["sabre"]);
+    }
+
     #[test]
     fn labels_select_only_the_tests_that_carry_them() {
         let mut strict = recipe(true);
@@ -11827,10 +12125,139 @@ corpus:
         assert_eq!(error, "--label super names no test in any manifest");
     }
 
+    #[test]
+    fn explicit_mapped_pair_uses_original_holder_and_guest_literals_do_not_select_it() {
+        for (backend, is_run, explicit, mapped) in [
+            ("in-guest-trap", true, false, false),
+            ("in-guest-trap", true, true, true),
+            ("ptrace", true, false, false),
+            ("liteinst", true, false, false),
+            ("in-guest-trap", false, false, false),
+        ] {
+            let mut run = vec![
+                "hermit".into(),
+                "--backend".into(),
+                backend.into(),
+                if is_run {
+                    "run".into()
+                } else {
+                    "record".into()
+                },
+                "--verify-run".into(),
+                VERIFY_RUN_DIR_PLACEHOLDER.into(),
+            ];
+            if explicit {
+                run.push("--in-guest-exec-stop".into());
+            }
+            assert_eq!(
+                run.iter()
+                    .filter(|word| *word == "--in-guest-exec-stop")
+                    .count(),
+                usize::from(mapped)
+            );
+            run.extend(["--".into(), "guest".into(), "--in-guest-exec-stop".into()]);
+            let comparison = vec![
+                "hermit".into(),
+                "log-diff".into(),
+                "report".into(),
+                "run1".into(),
+                "run2".into(),
+            ];
+            let paired = paired_verification_argv(comparison, run);
+            assert_eq!(
+                paired.get(1).map(String::as_str) == Some("verify-inputs"),
+                mapped
+            );
+            let inner = without_mapped_input_holder(&paired);
+            assert_eq!(
+                &inner[..4],
+                ["bash", "-c", VERIFY_PAIR_SCRIPT, VERIFY_PAIR_NAME]
+            );
+            assert_eq!(
+                paired
+                    .iter()
+                    .filter(|word| *word == "--native-exec-shared-inputs=197")
+                    .count(),
+                usize::from(mapped)
+            );
+            assert_eq!(
+                &paired[paired.len() - 3..],
+                ["--", "guest", "--in-guest-exec-stop"]
+            );
+        }
+    }
+
     fn relaxed_host() -> HostLevel {
         HostLevel {
             level: StrictnessLevel::Relaxed,
             reason: Some("this host has no exact branch counter (fixture)".into()),
+        }
+    }
+
+    /// Inspect the same paired command behind its one exact input holder.
+    fn without_mapped_input_holder(argv: &[String]) -> &[String] {
+        if argv.get(1).map(String::as_str) == Some("verify-inputs") {
+            assert_eq!(&argv[1..5], MAPPED_INPUTS_PREFIX);
+            let mut rest = &argv[5..];
+            if rest.first().map(String::as_str) == Some("--input") {
+                assert_eq!(&rest[..2], ["--input", LD_SO_CACHE_INPUT]);
+                rest = &rest[2..];
+            }
+            assert_eq!(
+                &rest[..4],
+                ["bash", "-c", VERIFY_PAIR_SCRIPT, VERIFY_PAIR_NAME]
+            );
+            rest
+        } else {
+            argv
+        }
+    }
+
+    /// An explicit pair API caller's inputs, taken from an ordinary cell's
+    /// comparison and run. Manifest enrollment still selects no loader: the
+    /// caller adds its option before the run's first guest separator, then
+    /// uses the public pair builder and the existing single cache owner.
+    fn explicit_mapped_pair_argv(ordinary: Vec<String>) -> Vec<String> {
+        let shared = ordinary.get(1).map(String::as_str) == Some("verify-inputs");
+        let paired = if shared {
+            assert_eq!(
+                &ordinary[1..=SHARED_INPUTS_PREFIX.len()],
+                SHARED_INPUTS_PREFIX
+            );
+            &ordinary[1 + SHARED_INPUTS_PREFIX.len()..]
+        } else {
+            ordinary.as_slice()
+        };
+        assert_eq!(
+            &paired[..4],
+            ["bash", "-c", VERIFY_PAIR_SCRIPT, VERIFY_PAIR_NAME]
+        );
+        let commands = &paired[4..];
+        let run_start = commands
+            .iter()
+            .skip(1)
+            .position(|word| word == &commands[0])
+            .map(|offset| offset + 1)
+            .unwrap();
+        let comparison = commands[..run_start].to_vec();
+        let mut run = commands[run_start..].to_vec();
+        assert_eq!(
+            &run[1..6],
+            ["--log", "info", "--backend", "in-guest-trap", "run"]
+        );
+        let separator = run.iter().position(|word| word == "--").unwrap();
+        assert!(
+            !run[..separator]
+                .iter()
+                .any(|word| word == "--in-guest-exec-stop")
+        );
+        run.insert(separator, "--in-guest-exec-stop".into());
+        let hermit = run[0].clone();
+        let mapped = paired_verification_argv(comparison, run);
+        if shared {
+            shared_inputs_argv(&hermit, mapped)
+        } else {
+            mapped
         }
     }
 
@@ -12261,6 +12688,60 @@ corpus:
         }
     }
 
+    #[test]
+    fn explicit_pair_api_uses_the_existing_holder_for_an_ordinary_trap_cell() {
+        let mut spec = verify_spec("in-guest-trap", true, BTreeMap::new(), None);
+        spec.argv = explicit_mapped_pair_argv(spec.argv);
+        assert_eq!(
+            &spec.argv[1..6],
+            [
+                "verify-inputs",
+                "--in-guest-exec-stop",
+                "--manifest-fd",
+                "197",
+                "bash"
+            ]
+        );
+        let paired = without_mapped_input_holder(&spec.argv);
+        assert_eq!(
+            &paired[..4],
+            ["bash", "-c", VERIFY_PAIR_SCRIPT, VERIFY_PAIR_NAME]
+        );
+        assert_eq!(
+            paired
+                .iter()
+                .filter(|word| *word == "--native-exec-shared-inputs=197")
+                .count(),
+            1
+        );
+        assert_eq!(
+            paired
+                .iter()
+                .filter(|word| *word == "--in-guest-exec-stop")
+                .count(),
+            1
+        );
+        for backend in ["ptrace", "liteinst", "in-guest-trap"] {
+            let ordinary = verify_spec(backend, true, BTreeMap::new(), None);
+            assert_ne!(
+                ordinary.argv.get(1).map(String::as_str),
+                Some("verify-inputs")
+            );
+            assert!(
+                !ordinary
+                    .argv
+                    .iter()
+                    .any(|word| word == "--native-exec-shared-inputs=197")
+            );
+            assert!(
+                !ordinary
+                    .argv
+                    .iter()
+                    .any(|word| word == "--in-guest-exec-stop")
+            );
+        }
+    }
+
     fn verify_spec_of(cell: SelectedCell) -> CellRunSpec {
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -12286,6 +12767,7 @@ corpus:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         build_spec(
@@ -12307,8 +12789,9 @@ corpus:
     #[test]
     fn a_probed_in_guest_cell_runs_without_a_preemption_timer() {
         let timeslices = |spec: &CellRunSpec| {
-            let separator = spec.argv.iter().position(|a| a == "--").unwrap();
-            spec.argv[..separator]
+            let argv = without_mapped_input_holder(&spec.argv);
+            let separator = argv.iter().position(|a| a == "--").unwrap();
+            argv[..separator]
                 .iter()
                 .filter(|a| a.starts_with("--max-timeslice"))
                 .cloned()
@@ -12357,6 +12840,277 @@ corpus:
         assert_eq!(probe_relaxation(&sabre, "sabre"), None);
     }
 
+    /// Physical package qualification, deliberately outside ordinary manifest
+    /// enrollment. The tracked opt-in script supplies the actual successful
+    /// inline run's CLI, cat, package and complete report, then selects this
+    /// ignored test exactly. Missing inputs fail instead of skipping.
+    #[test]
+    #[ignore = "requires ci/qualify-loader-verification.sh and a genuine qualified private package"]
+    fn mapped_saved_pair_uses_actual_holder_and_matches_inline_verification() {
+        use crate::verify_run_record::RecordedStatus;
+        use crate::verify_run_record::VerifyRunOutcome;
+        use crate::verify_run_record::VerifyRunRecord;
+
+        const INPUT: &[u8] = b"first\0line\nlast-without-newline\xff";
+        let required_path = |name: &str| {
+            let value = std::env::var_os(name)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| panic!("{name} is required by the package qualification"));
+            fs::canonicalize(value).unwrap_or_else(|error| panic!("{name}: {error}"))
+        };
+        let record_path = required_path("HERMIT_LOADER_QUALIFICATION_RECORD");
+        let record: JsonValue = serde_json::from_slice(&fs::read(record_path).unwrap()).unwrap();
+        assert_eq!(record["schema"], 1);
+        assert_eq!(record["stdin_sha256"], hex_digest(INPUT));
+        let install = required_path("HERMIT_INSTALL_DIR");
+        assert_eq!(record["install"], install.to_str().unwrap());
+        let check_inputs = || {
+            for role in ["hermit", "cat", "image", "descriptor"] {
+                let path = Path::new(record[role]["path"].as_str().unwrap());
+                assert!(path.is_file(), "missing actual {role}: {}", path.display());
+                assert_eq!(
+                    file_digest(path).as_deref(),
+                    Some(record[role]["sha256"].as_str().unwrap()),
+                    "the actual {role} changed between qualification consumers"
+                );
+            }
+            assert_eq!(
+                fs::canonicalize(install.join("rsrcs/detcore_private_runtime.elf")).unwrap(),
+                Path::new(record["image"]["path"].as_str().unwrap())
+            );
+            assert_eq!(
+                fs::canonicalize(install.join("rsrcs/detcore_private_runtime.package.json"))
+                    .unwrap(),
+                Path::new(record["descriptor"]["path"].as_str().unwrap())
+            );
+        };
+        check_inputs();
+        let root = required_path("HERMIT_LOADER_QUALIFICATION_OUTPUT").join("saved-pair");
+        fs::create_dir(&root).expect("new saved-pair output; never reuse a prior attempt");
+        let directories = verify_run_directories(&root);
+        let report_path = root.join("report.json");
+        let manifest_path = root.join("holder-manifest.json");
+        let mut run: Vec<String> = serde_json::from_value(record["inline_argv"].clone()).unwrap();
+        assert_eq!(
+            fs::canonicalize(&run[0]).unwrap(),
+            Path::new(record["hermit"]["path"].as_str().unwrap())
+        );
+        let hermit = run[0].clone();
+        let guest = run.iter().position(|word| word == "--").unwrap();
+        for flag in [
+            "--in-guest-exec-stop",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+        ] {
+            assert_eq!(run[..guest].iter().filter(|word| *word == flag).count(), 1);
+        }
+        assert_eq!(run[guest + 1..].len(), 1);
+        assert_eq!(
+            fs::canonicalize(&run[guest + 1]).unwrap(),
+            Path::new(record["cat"]["path"].as_str().unwrap())
+        );
+        // Change only the public run mode and its output location. Preserve
+        // the inline invocation's exact epoch, seeds, guest and root flags.
+        let verify = run[..guest]
+            .iter()
+            .position(|word| word == "--verify")
+            .unwrap();
+        run.remove(verify);
+        let output = run.iter().position(|word| word == "--verify-json").unwrap();
+        run[output] = "--verify-run".into();
+        run[output + 1] = VERIFY_RUN_DIR_PLACEHOLDER.into();
+        let comparison = vec![
+            hermit.clone(),
+            "log-diff".into(),
+            "--verify-json".into(),
+            report_path.to_str().unwrap().into(),
+            "--verify-allow=success".into(),
+            directories[0].to_str().unwrap().into(),
+            directories[1].to_str().unwrap().into(),
+        ];
+        // Match the production RunContext: a root without a linker cache
+        // still uses the mapped holder, but has no cache input to seal.
+        let shares_ld_so_cache = Path::new(LD_SO_CACHE_PATH)
+            .try_exists()
+            .expect("observe the qualification root's linker cache");
+        let paired = paired_verification_argv(comparison, run);
+        let mut argv = if shares_ld_so_cache {
+            shared_inputs_argv(&hermit, paired)
+        } else {
+            paired
+        };
+        assert_eq!(&argv[1..5], MAPPED_INPUTS_PREFIX);
+        let program_index = if shares_ld_so_cache {
+            assert_eq!(&argv[5..7], ["--input", LD_SO_CACHE_INPUT]);
+            7
+        } else {
+            5
+        };
+        assert_eq!(
+            &argv[program_index..program_index + 4],
+            ["bash", "-c", VERIFY_PAIR_SCRIPT, VERIFY_PAIR_NAME]
+        );
+        // Observe the actual holder's wire record, then exec the unchanged
+        // maintained pair program. This adds no second holder or comparator
+        // and reopening fd 197 leaves its inherited open-description offset.
+        argv.splice(
+            program_index..program_index,
+            [
+                "bash".into(),
+                "-c".into(),
+                "set -eu; cat /proc/self/fd/197 > \"$1\"; shift; exec \"$@\"".into(),
+                "loader-package-manifest-observer".into(),
+                manifest_path.to_str().unwrap().into(),
+            ],
+        );
+        fs::write(
+            root.join("argv.json"),
+            serde_json::to_vec_pretty(&argv).unwrap(),
+        )
+        .unwrap();
+        let stdin_path = root.join("stdin");
+        fs::write(&stdin_path, INPUT).unwrap();
+        // This test runs only through the official counted Nextest CPU/wall
+        // owner in the qualification script. It makes one actual pair, with
+        // no internal retry or alternate execution route.
+        let output = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(File::open(&stdin_path).unwrap())
+            .env("HERMIT_EPOCH", CANONICAL_TEST_EPOCH)
+            .output()
+            .expect("start the actual mapped saved pair");
+        fs::write(root.join("controller.stdout"), &output.stdout).unwrap();
+        fs::write(root.join("controller.stderr"), &output.stderr).unwrap();
+        fs::write(
+            root.join("controller.status"),
+            format!("{:?}\n", output.status),
+        )
+        .unwrap();
+        check_inputs();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout, INPUT,
+            "the public saved pair must emit the guest output once"
+        );
+
+        let manifest: JsonValue =
+            serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["schema"], 3, "{manifest}");
+        assert_eq!(manifest["sealed"]["producer"], "hermit-sealed-files");
+        assert_eq!(
+            manifest["package"]["image"]["sha256"],
+            record["image"]["sha256"]
+        );
+        assert_eq!(
+            manifest["package"]["descriptor"]["sha256"],
+            record["descriptor"]["sha256"]
+        );
+        assert_ne!(manifest["image_fd"], manifest["descriptor_fd"]);
+        let roles = manifest["sealed"]["objects"].as_array().unwrap();
+        assert_eq!(roles.len(), usize::from(shares_ld_so_cache), "{manifest}");
+        if shares_ld_so_cache {
+            assert_eq!(roles[0]["role"], "ld-so-cache");
+        }
+        assert_eq!(
+            Path::new(LD_SO_CACHE_PATH).try_exists().unwrap(),
+            shares_ld_so_cache,
+            "the qualification root's cache presence changed during the pair"
+        );
+        for directory in &directories {
+            let actual = VerifyRunRecord::read(directory).unwrap();
+            assert_eq!(actual.backend, "in-guest-trap");
+            // The saved record uses DateTime::to_rfc3339(), which spells
+            // the requested canonical UTC epoch with an explicit offset.
+            assert_eq!(actual.epoch, "2026-01-01T00:00:00+00:00");
+            assert!(
+                matches!(
+                    &actual.outcome,
+                    VerifyRunOutcome::Completed {
+                        status: RecordedStatus::Exited { code: 0 },
+                        skid_overshoots: 0,
+                        ..
+                    }
+                ),
+                "{actual:?}"
+            );
+            assert_eq!(fs::read(directory.join("stdout")).unwrap(), INPUT);
+            assert_eq!(fs::read(directory.join("stderr")).unwrap(), b"");
+            assert!(!fs::read(directory.join("run.log")).unwrap().is_empty());
+        }
+        let bytes = fs::read(&report_path).unwrap();
+        current_verification_report(&bytes).expect("complete current producer report");
+        let verdict: JsonValue = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            verdict, record["inline_report"],
+            "saved and inline reports must match in full"
+        );
+        assert_eq!(verdict["verdict"], "matched");
+        assert_eq!(verdict["verified"], true);
+        assert_eq!(verdict["bitwise_parity"], true);
+        let policy = &verdict["comparison"];
+        assert_eq!(policy["strictness"], "canonical");
+        assert_eq!(policy["record_envelope"], "all_records_v1");
+        assert_eq!(policy["log_scope"], "info");
+        for field in [
+            "compare_logs",
+            "compare_io_buffers",
+            "full_trace",
+            "exact_remainder",
+        ] {
+            assert_eq!(policy[field], true, "{field}: {verdict}");
+        }
+        for field in ["strip_lines", "ignore_lines", "skip_commit", "skip_detlog"] {
+            assert_eq!(policy[field], false, "{field}: {verdict}");
+        }
+        let compared = &verdict["compared_log_messages"];
+        assert!(compared["left"].as_u64().is_some_and(|count| count > 0));
+        assert_eq!(compared["left"], compared["right"]);
+        for side in ["left", "right"] {
+            let actual = &verdict["compared_outputs"][side];
+            assert_eq!(actual["exit_code"], 0);
+            assert!(actual["signal"].is_null());
+            assert_eq!(actual["stdout_bytes"], INPUT.len());
+            assert_eq!(actual["stdout_sha256"], hex_digest(INPUT));
+            assert_eq!(actual["stderr_bytes"], 0);
+            assert_eq!(actual["stderr_sha256"], hex_digest(b""));
+        }
+
+        // A changed retained output must be rejected by the SAME production
+        // log-diff. Preserve the original bytes beside the negative record.
+        let changed = directories[1].join("stdout");
+        fs::copy(&changed, root.join("run2.stdout.original")).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&changed)
+            .unwrap()
+            .write_all(b"!")
+            .unwrap();
+        let refused_path = root.join("changed-output.json");
+        let refused = Command::new(&hermit)
+            .args(["log-diff", "--verify-json"])
+            .arg(&refused_path)
+            .args(&directories)
+            .output()
+            .unwrap();
+        fs::write(root.join("changed-output.stdout"), &refused.stdout).unwrap();
+        fs::write(root.join("changed-output.stderr"), &refused.stderr).unwrap();
+        fs::write(
+            root.join("changed-output.status"),
+            format!("{:?}\n", refused.status),
+        )
+        .unwrap();
+        assert!(!refused.status.success());
+        let refused = current_verification_report(&fs::read(refused_path).unwrap()).unwrap();
+        assert_eq!(refused.verdict, Verdict::Diverged);
+        assert!(!refused.verified && !refused.bitwise_parity);
+        check_inputs();
+    }
     /// [`VERIFY_PAIR_SCRIPT`] follows `run --verify`: run 2 starts only when
     /// run 1 left a record with a status `--verify-allow` admits; a run that
     /// leaves no record ends the attempt with its own status and output, its
@@ -12655,6 +13409,7 @@ esac
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: Some(PathBuf::from("/test")),
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let spec_on = |cell: &SelectedCell| {
@@ -13183,6 +13938,7 @@ esac
     /// The guest of an equalized verify cell names only guest paths, and each
     /// of the cell's input directories is bound at the path it names.
     fn assert_equalized_guest_env(argv: &[String], dir: &str, tmp: &str, jobs: &str) {
+        let argv = without_mapped_input_holder(argv);
         assert_minimal_base_env(argv);
         assert_eq!(
             guest_env_args(argv),
@@ -13364,6 +14120,7 @@ esac
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         }
     }
@@ -14476,6 +15233,7 @@ fi
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         assert_eq!(
@@ -14863,7 +15621,8 @@ fi
         // Its liteinst and in-guest-trap verify cells join the same day too,
         // from ten clean in-guest verify runs each with the maximum timeslice
         // disabled (https://github.com/rrnewton/hermit/issues/3745), again with
-        // the default timeouts.
+        // the default timeouts. Its SaBRe verify cell left the required
+        // population when SaBRe was archived on 2026-10-25 (crate::archived).
         assert_eq!(
             regular_sink,
             BTreeSet::from([
@@ -14872,7 +15631,6 @@ fi
                 ("verify", Some("kvm")),
                 ("verify", Some("liteinst")),
                 ("verify", Some("ptrace")),
-                ("verify", Some("sabre"))
             ])
         );
         // https://github.com/rrnewton/hermit/pull/3231 qualifies three new
@@ -14924,7 +15682,9 @@ fi
         // (https://github.com/rrnewton/hermit/issues/3606). The checks here
         // are of the named batches' bounds.
         // The SaBRe verify selections of 2026-10-03 have the ordinary bounds,
-        // and the ones that were enabled with ci:false are now required.
+        // and the ones that were enabled with ci:false became required. Since
+        // SaBRe was archived on 2026-10-25 (crate::archived) they are required
+        // by the archived run type instead of full.
         fn sabre_verify<'a>(
             population: &'a [SelectedCell],
             test: &str,
@@ -14935,8 +15695,19 @@ fi
                     && cell.id.backend.as_deref() == Some("sabre")
             })
         }
+        let archived = manifests
+            .select(&Selection {
+                population: Some(Population::Required),
+                labels: vec![crate::archived::ARCHIVED_RUN_TYPE.into()],
+                ..Selection::default()
+            })
+            .unwrap();
         for test in SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS {
-            let cell = sabre_verify(&required, test)
+            assert!(
+                sabre_verify(&required, test).is_none(),
+                "{test} verify/sabre is required by full though SaBRe is archived"
+            );
+            let cell = sabre_verify(&archived, test)
                 .unwrap_or_else(|| panic!("{test} verify/sabre is not required"));
             assert_eq!(cell.cpu_timeout_seconds, DEFAULT_TEST_CPU_TIMEOUT_SECONDS);
             assert_eq!(cell.timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
@@ -15083,6 +15854,18 @@ fi
             };
             assert_eq!(*bounds, (59, wall), "{test}");
         }
+        // The four compat DBT cells with a `slow` budget (git, ld, node,
+        // pkg-config at 33/57) are not ptrace corpus cells; assert them
+        // apart and return them to the calibrated set below.
+        let (compat_dbt_slow, compat): (BTreeMap<_, _>, BTreeMap<_, _>) = compat
+            .into_iter()
+            .partition(|((_, _, backend), _)| *backend == "dbt");
+        assert_eq!(compat_dbt_slow.len(), 4);
+        for ((test, mode, _), bounds) in &compat_dbt_slow {
+            assert_eq!(*mode, "verify", "{test}");
+            assert_eq!(*bounds, (33, 57), "{test}");
+        }
+        let observed: BTreeMap<_, _> = observed.into_iter().chain(compat_dbt_slow).collect();
         assert_eq!(
             compat.len(),
             STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
@@ -15094,6 +15877,8 @@ fi
         let expected = EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)
+            .chain(&DBT_2026_10_25_TIMEOUT_CALIBRATIONS)
+            .chain(&DBT_FLIP_2026_10_27_TIMEOUT_CALIBRATIONS)
             .map(|calibration| {
                 (
                     (calibration.test, calibration.mode, calibration.backend),
@@ -16697,6 +17482,30 @@ fi
 
     #[test]
     fn a_run_without_cgroups_measures_with_the_process_group_scan_under_its_own_source_name() {
+        const CHILD: &str = "HERMIT_TEST_PROCESS_GROUP_SCAN_ROW_CHILD";
+        const CASE: &str = "runner::tests::a_run_without_cgroups_measures_with_the_process_group_scan_under_its_own_source_name";
+        if std::env::var_os(CHILD).is_none() {
+            // The assertion below is that a budgeted command that lives long
+            // enough is polled at least once. In the parallel libtest process
+            // every other test's monitor queues on the same process-global CPU
+            // registry and session census, and a monitor can be delayed past
+            // its command's whole life, so the measurement is made in an
+            // isolated child process, as the descriptor-reserve test above
+            // isolates its process-wide rlimit.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
         // With the marker set and no cgroup available, the agent-utils scan
         // measures the command, and every row says so: no row of such a run
         // carries the cgroup source, so no reader can count it as one.
@@ -16760,6 +17569,27 @@ fi
 
     #[test]
     fn a_budgeted_cell_row_names_the_invocation_cgroup_as_its_cpu_source() {
+        const CHILD: &str = "HERMIT_TEST_INVOCATION_CGROUP_ROW_CHILD";
+        const CASE: &str =
+            "runner::tests::a_budgeted_cell_row_names_the_invocation_cgroup_as_its_cpu_source";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolated in a child process for the same reason as the
+            // process-group scan row above: the live-CPU poll must not queue
+            // behind every other test's monitor in this process.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
         let test = "a_budgeted_cell_row_names_the_invocation_cgroup_as_its_cpu_source";
         let Some(probe) = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
         else {
@@ -17976,6 +18806,32 @@ fi
 
     #[test]
     fn failed_later_launch_retains_prior_attempt_and_cpu_observations() {
+        const CHILD: &str = "HERMIT_TEST_PRIOR_WORK_BEFORE_SPAWN_FAILURE_CHILD";
+        const CASE: &str =
+            "runner::tests::failed_later_launch_retains_prior_attempt_and_cpu_observations";
+        if std::env::var_os(CHILD).is_none() {
+            // The first attempt must finish well inside the cell's wall
+            // backstop so the second attempt reaches its spawn and fails
+            // there. In the parallel libtest process a trivial first command
+            // can sit unscheduled for seconds behind every other test's
+            // children, and the second attempt then reports the backstop
+            // instead of the spawn failure, so the cell runs in an isolated
+            // child process, as the descriptor-reserve test isolates its
+            // process-wide rlimit.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
         let root = cpu_reader_test_root("prior-work-before-spawn-failure");
         let context = run_context(&root);
         let program = root.join("remove-self");
@@ -18024,6 +18880,31 @@ fi
 
     #[test]
     fn native_zombie_then_reaped_child_has_no_double_cpu_charge() {
+        const CHILD: &str = "HERMIT_TEST_ZOMBIE_REAP_CPU_CHILD";
+        const CASE: &str =
+            "runner::tests::native_zombie_then_reaped_child_has_no_double_cpu_charge";
+        if std::env::var_os(CHILD).is_none() {
+            // The phase handshake below advances on the monitor's poll
+            // samples inside a five-second deadline. In the parallel libtest
+            // process those samples queue on the same process-global CPU
+            // registry as every other test's monitor, and a delayed sample
+            // lets the deadline stop the fixture mid-handshake, so the
+            // measurement is made in an isolated child process, as the
+            // descriptor-reserve test isolates its process-wide rlimit.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
         use std::io::Read;
         use std::os::unix::net::UnixListener;
 
@@ -18534,6 +19415,7 @@ int main(int argc, char **argv) {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
 
@@ -18612,6 +19494,7 @@ int main(int argc, char **argv) {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let result = host_inapplicable_result(
@@ -18740,6 +19623,7 @@ int main(int argc, char **argv) {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let path = root.join("results.jsonl");
@@ -19020,6 +19904,7 @@ backends_disabled:
                 timeout_multipliers: TimeoutMultipliers::default(),
                 scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
                 isolated_workdir: None,
+                shares_ld_so_cache: false,
                 exact_branch_counter: None,
             };
             let spec = build_spec(
@@ -19099,6 +19984,7 @@ backends_disabled:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let spec = build_spec(
@@ -19160,6 +20046,7 @@ backends_disabled:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(7),
             isolated_workdir: Some(PathBuf::from("/test")),
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let spec = build_spec(
@@ -19577,6 +20464,7 @@ backends_disabled:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let spec = build_spec(
@@ -19707,13 +20595,15 @@ backends_disabled:
                 (host, spec)
             };
             let after_separator = |spec: &CellRunSpec| {
-                let separator = spec.argv.iter().position(|arg| arg == "--").unwrap();
-                spec.argv[separator + 1..].to_vec()
+                let argv = without_mapped_input_holder(&spec.argv);
+                let separator = argv.iter().position(|arg| arg == "--").unwrap();
+                argv[separator + 1..].to_vec()
             };
             // What the guest can see: argv, environment and each bind target.
             let guest_view = |spec: &CellRunSpec| {
-                let separator = spec.argv.iter().position(|arg| arg == "--").unwrap();
-                let before = &spec.argv[..separator];
+                let argv = without_mapped_input_holder(&spec.argv);
+                let separator = argv.iter().position(|arg| arg == "--").unwrap();
+                let before = &argv[..separator];
                 let targets = before
                     .iter()
                     .filter_map(|arg| arg.strip_prefix("--bind="))
@@ -19939,6 +20829,7 @@ backends_disabled:
             timeout_multipliers: crate::timeouts::timeout_multipliers_from_env().unwrap(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let manifests = ManifestSet::load(&root).unwrap();
@@ -20073,6 +20964,7 @@ backends_disabled:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(7),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let spec = build_spec(
@@ -20728,6 +21620,54 @@ backends_disabled:
             .expect("typed sandbox denial is a current non-product result");
     }
 
+    /// A chaos cell its population floor failed while every attempt matched
+    /// is a chaos-floor failure: a product failure no attempt contradicts,
+    /// where the FAIL alone would have been inferred a crash-error that no
+    /// attempt supports. A divergence, an attempt that did not match, or a
+    /// FAIL the floor did not cause keeps its own result.
+    #[test]
+    fn a_chaos_floor_failure_over_matched_attempts_is_named_not_a_crash() {
+        let mut matched = attempt_with_sabre_evidence("");
+        matched.verification_report =
+            Some(serde_json::to_string(&canonical_verification_report()).unwrap());
+        let attempts = vec![matched.clone(), matched.clone()];
+        let inferred = observed_result("chaos", "FAIL", &attempts, None);
+        assert_eq!(inferred, Some(ObservedResult::CrashError));
+        assert_eq!(
+            chaos_floor_result(inferred, true, &attempts),
+            Some(ObservedResult::ChaosFloorFailure)
+        );
+        assert_eq!(
+            ObservedResult::ChaosFloorFailure.failure_class(),
+            Some(FailureClass::ProductFailure)
+        );
+        // Not caused by the floor: unchanged.
+        assert_eq!(chaos_floor_result(inferred, false, &attempts), inferred);
+        // An attempt without a matched report: the crash stands.
+        let mut unmatched = matched.clone();
+        unmatched.verification_report = None;
+        let mixed = vec![matched.clone(), unmatched];
+        assert_eq!(
+            chaos_floor_result(inferred, true, &mixed),
+            Some(ObservedResult::CrashError)
+        );
+        // A divergence keeps its own result.
+        let mut report = canonical_verification_report();
+        report.verified = false;
+        report.bitwise_parity = false;
+        report.verdict = Verdict::Diverged;
+        let mut diverged = matched.clone();
+        diverged.verification_report = Some(serde_json::to_string(&report).unwrap());
+        let with_divergence = vec![matched, diverged];
+        let divergence = observed_result("chaos", "FAIL", &with_divergence, None);
+        assert_eq!(divergence, Some(ObservedResult::DeterminismFailure));
+        assert_eq!(
+            chaos_floor_result(divergence, true, &with_divergence),
+            Some(ObservedResult::DeterminismFailure)
+        );
+        assert_eq!(chaos_floor_result(None, true, &attempts), None);
+    }
+
     #[test]
     fn framework_classifies_divergence_and_crash_before_pressure_reads_them() {
         let mut divergence = attempt_with_sabre_evidence("");
@@ -21359,6 +22299,53 @@ exit "$(cat "$PWD/exit-status")"
                 "the kvm cell passes no expected pipe capacity (ptrace, dbt and sabre pass \
                  8192), so its guest prints F_GETPIPE_SZ without asserting Detcore's pin",
             ),
+            (
+                "c-programs/proc-own-links",
+                "dbt",
+                "`--no-leader-exit`, `--no-exe-changes` and `--base-exe-truncation` skip the \
+                 process whose leader exits, whose remaining thread's readlinks fail with ESRCH \
+                 under DBT (https://github.com/rrnewton/hermit/issues/4697), and the exec'd copy's \
+                 changes to its own image, whose exe link DBT refuses by name, and check its exe \
+                 answer for a short buffer as DBT's base EINVAL \
+                 (https://github.com/rrnewton/hermit/issues/4711), both as at the base",
+            ),
+            (
+                "c-programs/proc-own-links",
+                "kvm",
+                "`--no-leader-exit` and `--no-fs-threads` skip the process whose leader exits, \
+                 whose join of the exited leader waits in one run and not in another under KVM \
+                 (https://github.com/rrnewton/hermit/issues/4563), and the thread created without \
+                 CLONE_FS, which KVM refuses (https://github.com/rrnewton/hermit/issues/4698)",
+            ),
+            (
+                "c-programs/proc-own-links",
+                "liteinst",
+                "`--no-threads` and `--no-exec` skip the thread, the process whose leader exits \
+                 and the exec'd copy: in-guest LiteInst creates no threads and runs no exec",
+            ),
+            (
+                "c-programs/proc-own-links",
+                "in-guest-trap",
+                "`--no-threads` and `--no-exec` skip the thread, the process whose leader exits \
+                 and the exec'd copy: in-guest LiteInst creates no threads and runs no exec",
+            ),
+            (
+                "c-programs/proc-fd-directory",
+                "kvm",
+                "`--no-private-tables` and `--no-fifo-threads` skip the two checks KVM cannot \
+                 run: it gives no thread a descriptor table of its own, and its executor holds \
+                 the turn in a blocking FIFO open",
+            ),
+            (
+                "c-programs/scm-rights-received-descriptors",
+                "in-guest-trap",
+                "`--no-exec` skips the exec check: in-guest LiteInst refuses execve",
+            ),
+            (
+                "c-programs/scm-rights-received-descriptors",
+                "liteinst",
+                "`--no-exec` skips the exec check: in-guest LiteInst refuses execve",
+            ),
         ];
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let manifests = ManifestSet::load(&root).unwrap();
@@ -21387,11 +22374,14 @@ exit "$(cat "$PWD/exit-status")"
             .filter_map(|cell| cell.id.backend.as_deref())
             .collect::<BTreeSet<_>>();
         assert!(
-            ["dbt", "kvm", "sabre"]
+            ["dbt", "kvm"]
                 .iter()
                 .all(|backend| backends.contains(backend)),
             "{backends:?}"
         );
+        // SaBRe is archived (crate::archived): full validation selects none
+        // of its cells, so none is a selected candidate.
+        assert!(!backends.contains("sabre"), "{backends:?}");
         assert!(
             candidates
                 .iter()
@@ -21747,13 +22737,25 @@ exit "$(cat "$PWD/exit-status")"
     /// does not record (a workdir, a guest environment) or a context with
     /// another execution root or log retention.
     fn with_executor_invocation_for(
-        mut row: CellResult,
+        row: CellResult,
         context: &RunContext,
         cell: &SelectedCell,
     ) -> CellResult {
+        with_executor_invocation_argv_for(row, context, cell, |argv| argv)
+    }
+
+    /// Build the pair before recording any command fields. Explicit pair
+    /// callers use the same cell's comparison/run inputs through the public
+    /// pair API; ordinary manifest rows keep `build_spec`'s argv unchanged.
+    fn with_executor_invocation_argv_for(
+        mut row: CellResult,
+        context: &RunContext,
+        cell: &SelectedCell,
+        build_pair: impl Fn(Vec<String>) -> Vec<String>,
+    ) -> CellResult {
         let dir = context.root.join("results/cell");
         for (position, attempt) in row.attempts.iter_mut().enumerate() {
-            let spec = build_spec(
+            let mut spec = build_spec(
                 context,
                 cell,
                 dir.clone(),
@@ -21763,6 +22765,7 @@ exit "$(cat "$PWD/exit-status")"
                 3,
             )
             .unwrap();
+            spec.argv = build_pair(spec.argv);
             attempt.cwd = spec.cwd.to_string_lossy().into_owned();
             attempt.shell_command = shell_command(&attempt.cwd, &spec.env, &spec.argv);
             attempt.argv = spec.argv;
@@ -21943,6 +22946,49 @@ exit "$(cat "$PWD/exit-status")"
         );
         assert!(has(&kept, "--verify-log-dir"));
         accepted_skid("a row whose verify logs were kept", &kept, 2);
+        // The pair under `hermit verify-inputs`, sharing one sealed copy of
+        // the host's /etc/ld.so.cache (https://github.com/rrnewton/hermit/issues/4693).
+        let shared = rendered(
+            &base,
+            &context(&|context| context.shares_ld_so_cache = true),
+            &|_| {},
+        );
+        assert_eq!(
+            shared.argv[1..=SHARED_INPUTS_PREFIX.len()],
+            SHARED_INPUTS_PREFIX.map(String::from),
+            "{:?}",
+            shared.argv
+        );
+        assert_eq!(
+            shared.argv[0],
+            shared.argv[at(&shared.argv, "log-diff") - 1]
+        );
+        assert_eq!(
+            shared.argv[at(&shared.argv, VERIFY_RUN_DIR_PLACEHOLDER) + 1],
+            SHARED_INPUTS_FLAG
+        );
+        accepted_skid("a row whose pair shares the host's ld.so.cache", &shared, 2);
+        refused(
+            "a shared-input holder whose run does not adopt the inputs",
+            &with_argv(&shared, |argv| {
+                let index = at(argv, SHARED_INPUTS_FLAG);
+                argv.remove(index);
+            }),
+            "lacks `--native-exec-shared-inputs=9`",
+        );
+        refused(
+            "a run that adopts shared inputs no holder sealed",
+            &with_argv(&base, |argv| {
+                let index = at(argv, VERIFY_RUN_DIR_PLACEHOLDER) + 1;
+                argv.insert(index, SHARED_INPUTS_FLAG.to_owned());
+            }),
+            "without the `hermit verify-inputs` holder",
+        );
+        refused(
+            "a holder that is not the run's Hermit",
+            &with_argv(&shared, |argv| argv[0] = "/elsewhere/hermit".to_owned()),
+            "seals its shared inputs with a Hermit other than the run's",
+        );
         let test = cell_recorded_by(&base).id.test;
         let parity = rendered(
             &base,
@@ -22097,6 +23143,167 @@ exit "$(cat "$PWD/exit-status")"
             cell.test.proc = None;
             assert!(proc_level_mismatch(&row, &cell).is_some(), "{mode}");
         }
+
+        // A mapped pair is the same script and comparator, beneath one exact
+        // retained-input holder. Each malformed transport still fails this
+        // retained-row proof; metadata never stands in for a guest result.
+        let mut mapped = base.clone();
+        mapped.backend = Some("in-guest-trap".into());
+        let explicit_pair = |row: &CellResult, context: &RunContext| {
+            let cell = cell_recorded_by(row);
+            with_executor_invocation_argv_for(
+                row.clone(),
+                context,
+                &cell,
+                explicit_mapped_pair_argv,
+            )
+        };
+        let mapped = explicit_pair(&mapped, &context(&|_| {}));
+        // Exercise the public pair API with a caller's explicit selector,
+        // before recording the command fields checked by the retained proof.
+        assert!(mapped.argv.iter().any(|arg| arg == "--in-guest-exec-stop"));
+        assert_eq!(
+            mapped.argv[0],
+            root.join("hermit").to_string_lossy().into_owned()
+        );
+        accepted("mapped pair with its original shared-input holder", &mapped);
+        assert_eq!(mapped.argv[1], "verify-inputs");
+        refused(
+            "mapped holder with another manifest descriptor",
+            &with_argv(&mapped, replace_after("--manifest-fd", "196")),
+            "exact manifest descriptor",
+        );
+        refused(
+            "mapped run without its inherited manifest",
+            &with_argv(&mapped, without("--native-exec-shared-inputs=197", 0)),
+            "lacks `--native-exec-shared-inputs=197`",
+        );
+        refused(
+            "mapped holder and run executable differ",
+            &with_argv(&mapped, |argv| argv[0] = "different-hermit".into()),
+            "differs from the run's executable or backend",
+        );
+        refused(
+            "mapped selection missing from run",
+            &with_argv(&mapped, |argv| {
+                let index = argv
+                    .iter()
+                    .rposition(|x| x == "--in-guest-exec-stop")
+                    .unwrap();
+                argv.remove(index);
+            }),
+            "lacks `--in-guest-exec-stop`",
+        );
+
+        // The mapped image/stdin and linker cache belong to one holder and
+        // one inherited manifest. Removing the cache itself is a valid shape
+        // on hosts without it; malformed roles and transport remain refused.
+        let mapped_shared = explicit_pair(
+            &mapped,
+            &context(&|context| context.shares_ld_so_cache = true),
+        );
+        accepted(
+            "mapped pair sharing its holder with the linker cache",
+            &mapped_shared,
+        );
+        assert_eq!(
+            &mapped_shared.argv[1..7],
+            [
+                "verify-inputs",
+                "--in-guest-exec-stop",
+                "--manifest-fd",
+                "197",
+                "--input",
+                LD_SO_CACHE_INPUT
+            ]
+        );
+        assert_eq!(
+            without_mapped_input_holder(&mapped_shared.argv),
+            without_mapped_input_holder(&mapped.argv)
+        );
+        for (token, count) in [
+            ("verify-inputs", 1),
+            ("--native-exec-shared-inputs=197", 1),
+            (SHARED_INPUTS_FLAG, 0),
+            (VERIFY_PAIR_SCRIPT, 1),
+            ("log-diff", 1),
+        ] {
+            assert_eq!(
+                mapped_shared
+                    .argv
+                    .iter()
+                    .filter(|arg| *arg == token)
+                    .count(),
+                count
+            );
+        }
+        let encoded = serde_json::to_vec(&mapped_shared).unwrap();
+        let reread: CellResult = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(reread.argv, mapped_shared.argv);
+        accepted(
+            "mapped cache holder after retained-row JSON roundtrip",
+            &reread,
+        );
+        refused(
+            "mapped cache holder with a different cache role",
+            &with_argv(
+                &mapped_shared,
+                replace_after("--input", "ld-so-cache:/tmp/other"),
+            ),
+            "not the paired verification program",
+        );
+        refused(
+            "mapped cache holder with a duplicate cache input",
+            &with_argv(
+                &mapped_shared,
+                insert_before("bash", &["--input", LD_SO_CACHE_INPUT]),
+            ),
+            "not the paired verification program",
+        );
+        refused(
+            "mapped cache holder with a missing input flag",
+            &with_argv(&mapped_shared, without("--input", 0)),
+            "not the paired verification program",
+        );
+        refused(
+            "mapped cache holder using the cache-only descriptor",
+            &with_argv(
+                &mapped_shared,
+                replace_after("--manifest-fd", SHARED_INPUTS_FD),
+            ),
+            "exact manifest descriptor",
+        );
+        refused(
+            "mapped cache run with a second manifest adoption flag",
+            &with_argv(&mapped_shared, |argv| {
+                let index = at(argv, VERIFY_RUN_DIR_PLACEHOLDER) + 1;
+                argv.insert(index, SHARED_INPUTS_FLAG.into());
+            }),
+            "carries `--native-exec-shared-inputs=9`",
+        );
+        refused(
+            "mapped cache run with duplicate inherited mapped descriptors",
+            &with_argv(
+                &mapped_shared,
+                insert_before("--", &["--native-exec-shared-inputs=197"]),
+            ),
+            "carries `--native-exec-shared-inputs=197` where the executor writes nothing",
+        );
+        refused(
+            "nested cache owner around the mapped owner",
+            &with_argv(&mapped_shared, |argv| {
+                let mut nested = vec![argv[0].clone()];
+                nested.extend(SHARED_INPUTS_PREFIX.map(String::from));
+                nested.extend(argv.iter().cloned());
+                *argv = nested;
+            }),
+            "not the paired verification program",
+        );
+        refused(
+            "mapped holder with a separator before the pair script",
+            &with_argv(&mapped_shared, insert_before("bash", &["--"])),
+            "not the paired verification program",
+        );
 
         // The backend.
         refused(
@@ -24796,6 +26003,48 @@ cp "{}" "$verdict"
         assert_ne!(undeclared.outcome, "PASS", "{:?}", undeclared.reason);
     }
 
+    /// A result row may carry a declared guest exit in verify or replay mode,
+    /// since a replay cell inherits its verify recipe's declaration, while a
+    /// recipe may declare one only in verify mode. A reader credits it only
+    /// from the invocation the runner writes for it: a verify comparison with
+    /// `--verify-allow=failure`, or a replay's `record start`, whose
+    /// comparison takes `--verify-allow=both`.
+    #[test]
+    fn a_replay_result_row_may_carry_its_inherited_declaration() {
+        let expected = expected_exit(Some(7), None);
+        for mode in ["verify", "replay"] {
+            validate_result_expected_guest_exit("row", mode, Some(&expected)).unwrap();
+        }
+        for mode in ["chaos", "naked"] {
+            assert!(
+                validate_result_expected_guest_exit("row", mode, Some(&expected)).is_err(),
+                "{mode}"
+            );
+        }
+        assert!(validate_expected_guest_exit("recipe", "replay", Some(&expected)).is_err());
+        let zero = expected_exit(Some(0), None);
+        assert!(validate_result_expected_guest_exit("row", "replay", Some(&zero)).is_err());
+        let verify = ["hermit", "run", "--verify-allow=failure"];
+        let replay = [
+            "hermit-verify-pair",
+            "hermit",
+            "log-diff",
+            "--verify-allow=both",
+            "hermit",
+            "record",
+            "start",
+        ];
+        assert!(invocation_admits_declared_guest_exit("verify", &verify));
+        assert!(invocation_admits_declared_guest_exit("replay", &replay));
+        assert!(!invocation_admits_declared_guest_exit("replay", &verify));
+        assert!(!invocation_admits_declared_guest_exit("verify", &replay));
+        assert!(!invocation_admits_declared_guest_exit(
+            "replay",
+            &["hermit", "log-diff", "--verify-allow=both", "hermit", "run"]
+        ));
+        assert!(!invocation_admits_declared_guest_exit("chaos", &replay));
+    }
+
     fn replay_cell_with_verify(verify: ModeRecipe, replay: ModeRecipe) -> SelectedCell {
         let mut cell = ptrace_cell("replay");
         cell.test.modes.insert("verify".into(), verify);
@@ -25044,6 +26293,171 @@ cp "{}" "$verdict"
                 VERIFY_REPLAY_OF_PLACEHOLDER
             ]));
         assert_eq!(spec.argv.last().map(String::as_str), Some("/bin/true"));
+    }
+
+    /// Where the host has /etc/ld.so.cache, verify and chaos pairs run under
+    /// `hermit verify-inputs` and both runs adopt its one sealed copy; a
+    /// replay pair, whose first command is `record start`, does not
+    /// (https://github.com/rrnewton/hermit/issues/4693).
+    #[test]
+    fn verify_and_chaos_pairs_share_the_hosts_ld_so_cache_and_replay_pairs_do_not() {
+        let mut context = run_context(Path::new("/repo"));
+        context.shares_ld_so_cache = true;
+        let spec_of = |context: &RunContext, cell: &SelectedCell| {
+            build_spec(
+                context,
+                cell,
+                PathBuf::from("/repo/results/shared-cell"),
+                vec!["/bin/true".into()],
+                "1",
+                (cell.id.mode == "chaos").then_some(7),
+                15,
+            )
+            .unwrap()
+        };
+        let hermit = context.hermit_bin.to_string_lossy().into_owned();
+        for backend in ["ptrace", "liteinst", "in-guest-trap"] {
+            for mode in ["verify", "chaos"] {
+                let mut cell = ptrace_cell(mode);
+                cell.id.backend = Some(backend.into());
+                let spec = spec_of(&context, &cell);
+                assert_eq!(spec.argv[0], hermit, "{backend}/{mode}: {:?}", spec.argv);
+                assert_eq!(
+                    spec.argv[1..=SHARED_INPUTS_PREFIX.len()],
+                    SHARED_INPUTS_PREFIX.map(String::from),
+                    "{backend}/{mode}: {:?}",
+                    spec.argv
+                );
+                assert_eq!(
+                    spec.argv[1 + SHARED_INPUTS_PREFIX.len()..][..3],
+                    ["bash", "-c", VERIFY_PAIR_SCRIPT],
+                    "{backend}/{mode}"
+                );
+                assert!(
+                    spec.argv.windows(3).any(|window| window
+                        == [
+                            "--verify-run",
+                            VERIFY_RUN_DIR_PLACEHOLDER,
+                            SHARED_INPUTS_FLAG
+                        ]),
+                    "{backend}/{mode}: {:?}",
+                    spec.argv
+                );
+                for (token, count) in [
+                    ("verify-inputs", 1),
+                    (SHARED_INPUTS_FLAG, 1),
+                    ("--in-guest-exec-stop", 0),
+                    ("--native-exec-shared-inputs=197", 0),
+                    (VERIFY_PAIR_SCRIPT, 1),
+                    ("log-diff", 1),
+                ] {
+                    assert_eq!(
+                        spec.argv.iter().filter(|arg| *arg == token).count(),
+                        count,
+                        "{backend}/{mode}: {token}"
+                    );
+                }
+
+                // Without the cache ordinary cells acquire no input holder.
+                let mut plain_context = context.clone();
+                plain_context.shares_ld_so_cache = false;
+                let plain = spec_of(&plain_context, &cell);
+                assert_eq!(plain.argv[..3], ["bash", "-c", VERIFY_PAIR_SCRIPT]);
+                for token in [
+                    "verify-inputs",
+                    SHARED_INPUTS_FLAG,
+                    "--in-guest-exec-stop",
+                    "--native-exec-shared-inputs=197",
+                ] {
+                    assert!(
+                        !plain.argv.iter().any(|arg| arg == token),
+                        "{backend}/{mode}: {token}"
+                    );
+                }
+            }
+            let base = ptrace_cell("verify").test.modes["verify"].clone();
+            let mut cell = replay_cell_with_verify(base.clone(), base);
+            cell.id.backend = Some(backend.into());
+            let replay = spec_of(&context, &cell);
+            assert_eq!(replay.argv[..3], ["bash", "-c", VERIFY_PAIR_SCRIPT]);
+            for token in [
+                "verify-inputs",
+                SHARED_INPUTS_FLAG,
+                "--in-guest-exec-stop",
+                "--native-exec-shared-inputs=197",
+            ] {
+                assert!(
+                    !replay.argv.iter().any(|arg| arg == token),
+                    "{backend}/replay: {token}"
+                );
+            }
+        }
+    }
+
+    /// Explicit pair API callers seal the image, stdin and optional loader
+    /// cache through one manifest. The cache changes no inner pair command;
+    /// ordinary verify/chaos manifest cells do not enroll in the loader.
+    #[test]
+    fn explicit_mapped_verify_and_chaos_pairs_share_one_manifest_with_the_loader_cache() {
+        let guest: Vec<String> = ["/bin/true", "--", "--in-guest-exec-stop"]
+            .map(String::from)
+            .into();
+        for mode in ["verify", "chaos"] {
+            let mut cell = ptrace_cell(mode);
+            cell.id.backend = Some("in-guest-trap".into());
+            let spec_of = |shares_ld_so_cache| {
+                let mut context = run_context(Path::new("/repo"));
+                context.run_verify_strict = true;
+                context.shares_ld_so_cache = shares_ld_so_cache;
+                let mut spec = build_spec(
+                    &context,
+                    &cell,
+                    PathBuf::from("/repo/results/mapped-shared-cell"),
+                    guest.clone(),
+                    "1",
+                    (mode == "chaos").then_some(7),
+                    15,
+                )
+                .unwrap();
+                spec.argv = explicit_mapped_pair_argv(spec.argv);
+                spec
+            };
+            let plain = spec_of(false);
+            let cached = spec_of(true);
+            for spec in [&plain, &cached] {
+                assert_eq!(&spec.argv[1..5], MAPPED_INPUTS_PREFIX, "{mode}");
+                for (token, count) in [
+                    ("verify-inputs", 1),
+                    ("--native-exec-shared-inputs=197", 1),
+                    (SHARED_INPUTS_FLAG, 0),
+                    (VERIFY_PAIR_SCRIPT, 1),
+                    ("log-diff", 1),
+                ] {
+                    assert_eq!(
+                        spec.argv.iter().filter(|arg| *arg == token).count(),
+                        count,
+                        "{mode}: {token}: {:?}",
+                        spec.argv
+                    );
+                }
+                let separator = spec.argv.iter().position(|arg| arg == "--").unwrap();
+                assert_eq!(&spec.argv[separator + 1..], guest.as_slice(), "{mode}");
+                assert_eq!(
+                    spec.argv[..separator]
+                        .iter()
+                        .filter(|arg| *arg == "--in-guest-exec-stop")
+                        .count(),
+                    2,
+                    "{mode}: one holder selector and one run selector"
+                );
+            }
+            assert_eq!(&cached.argv[5..7], ["--input", LD_SO_CACHE_INPUT], "{mode}");
+            assert_eq!(
+                without_mapped_input_holder(&plain.argv),
+                without_mapped_input_holder(&cached.argv),
+                "{mode}: adding the cache must preserve the pair script, comparison and run"
+            );
+        }
     }
 
     /// A canonical matched report whose two runs printed `first` and
@@ -26303,6 +27717,7 @@ cp "{}" "$verdict"
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let error = run_preparation(
@@ -26364,6 +27779,7 @@ cp "{}" "$verdict"
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let test = recipe(true);
@@ -26551,6 +27967,7 @@ cp "{}" "$verdict"
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
 

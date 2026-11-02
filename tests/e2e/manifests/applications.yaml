@@ -123,7 +123,7 @@ test:
           ptrace: true
           # DBT timed-progress: 20/20 strict canonical pairs at ed4a5dd9, plus c0216c84 control; full 50 x 20 ms example.
           dbt: true
-          kvm: false
+          kvm: true
           liteinst: true
           in-guest-trap: true
         backends_enabled:
@@ -134,8 +134,6 @@ test:
           - in-guest-trap
         backends_disabled:
           sabre: SaBRe does not yet determinize busy-wait polling on virtual wall-clock advancement; keep the identical example workload unqualified
-        ci_disabled_reason:
-          kvm: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -263,10 +261,10 @@ test:
       verify:
         ci: true
         backends_enabled:
+          - dbt
           - kvm
         backends_disabled:
           ptrace: This test specifically asserts the KVM execution path
-          dbt: This test specifically asserts the KVM execution path
           sabre: This test specifically asserts the KVM execution path
           liteinst: This test specifically asserts the KVM execution path
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)

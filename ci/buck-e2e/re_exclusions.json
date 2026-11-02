@@ -296,6 +296,26 @@
     }
    ],
    "reason": "the guest exits 1 on the RE worker image (passes locally)"
+  },
+  "compat/node": {
+   "cells": [
+    "compat/node/verify@dbt"
+   ],
+   "evidence": [
+    {
+     "cell": "compat/node/verify@dbt",
+     "local_run": "flip-measure-2 (test-harness run on the host named in docs/TESTING_ENVIRONMENTS.md under Named measurement hosts, 2026-10-27): PASS, 16.219 CPU s, 27.415 wall s",
+     "re_error_kind": "infrastructure",
+     "re_reason": "guest launch refused before execution: guest program not found (/bin/node absent on the RE worker image)",
+     "re_runs": [
+      "validate-claude-coord-77635530182d-1793110993703397267-2909067-cea0fa4e"
+     ],
+     "re_verdicts": [
+      "FAIL"
+     ]
+    }
+   ],
+   "reason": "the RE worker image has no /bin/node guest program (validate of 77635530182d refused the cell before execution); the cell passes locally under DBT, so it runs on the local Buck route"
   }
  }
 }

@@ -165,7 +165,7 @@ struct CorpusFocused {
 /// cell shares the corpus's environment, comparator and single-attempt reason,
 /// with optional environment additions for individual rows on this backend;
 /// its Hermit flags and their reason are its own, it has the global default
-/// budget, and it is never a diagnostic. In the expanded test the flags join
+/// budget unless a `slow` group names the row, and it is never a diagnostic. In the expanded test the flags join
 /// the verify mode's per-backend `hermit_args`, so the manifest validator's
 /// flag allowlist applies to them as to every other cell's, and a row whose
 /// flagged cells have different reasons gets a per-backend
@@ -174,6 +174,11 @@ struct CorpusFocused {
 #[serde(deny_unknown_fields)]
 struct CorpusAdditional {
     backend: String,
+    /// Rows on this backend with their own budget instead of the global
+    /// default, each group with the measurement behind it (same shape as
+    /// the replay section's `slow`).
+    #[serde(default)]
+    slow: Vec<CorpusReplaySlow>,
     #[serde(default)]
     hermit_args: Vec<String>,
     hermit_args_reason: Option<String>,
@@ -693,10 +698,22 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             kind: CellKind::Lane,
             budget: Some((timeout, cpu_timeout, slow_reason)),
         })
-        .chain(additional.iter().map(|additional| CorpusCell {
-            backend: additional.backend.as_str(),
-            kind: CellKind::Additional,
-            budget: None,
+        .chain(additional.iter().map(|additional| {
+            CorpusCell {
+                backend: additional.backend.as_str(),
+                kind: CellKind::Additional,
+                budget: additional
+                    .slow
+                    .iter()
+                    .find(|group| group.rows.iter().any(|label| label == &row.label))
+                    .map(|group| {
+                        (
+                            group.timeout_seconds,
+                            group.cpu_timeout_seconds,
+                            group.slow_reason.as_str(),
+                        )
+                    }),
+            }
         }))
         .chain(focused.iter().map(|focused| CorpusCell {
             backend: focused.backend.as_str(),

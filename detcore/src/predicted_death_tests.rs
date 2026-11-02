@@ -107,6 +107,13 @@ impl GlobalRPC<GlobalState> for DyingGuest {
                 scheduler.queue_request_for_test(request.tid, request);
                 GlobalResponse::RequestResources(ResumeStatus::Normal)
             }
+            // A5 step 3c.1e A, IR-15: answered by the real scheduler.
+            GlobalRequest::InPidNamespaceInit(dettid) => GlobalResponse::InPidNamespaceInit(
+                scheduler
+                    .thread_tree
+                    .process_of(dettid)
+                    .is_some_and(|process| scheduler.thread_tree.is_pid_namespace_init(process)),
+            ),
             request => panic!("a predicted death sent an unexpected RPC: {request:?}"),
         };
         (None, response)
@@ -276,4 +283,44 @@ async fn an_exit_status_is_not_a_predicted_death() {
         Err(Errno::EINVAL)
     );
     assert!(guest.sent.lock().unwrap().is_empty());
+}
+
+/// A5 step 3c.1e A, IR-15: a predicted death of a process that is the init
+/// of a PID namespace it created (`CLONE_NEWPID`) is refused with
+/// `EPROTONOSUPPORT` before the turn is held: Linux marks such an init
+/// `SIGNAL_UNKILLABLE`, so a default-fatal signal sent from inside its
+/// namespace is queued and then discarded at dequeue (`get_signal`,
+/// kernel/signal.c:2843-2845 at v6.12). The same process when it is not an
+/// init dies as before. Mutation "guard removed": the init row holds the turn
+/// and files its group's `Exit`.
+#[tokio::test]
+async fn a_predicted_death_of_a_pid_namespace_init_is_refused_before_the_hold() {
+    for init in [true, false] {
+        let (tool, mut guest) = setup(true, true);
+        {
+            let mut scheduler = guest.scheduler.lock().unwrap();
+            scheduler.thread_tree.add_child(DECIDER, DECIDER, true);
+            if init {
+                scheduler
+                    .thread_tree
+                    .mark_pid_namespace_init(DetPid::from_raw(DECIDER.as_raw()));
+            }
+        }
+        let result = tool
+            .exit_for_predicted_death(&mut guest, ExitStatus::signaled(libc::SIGTERM, false))
+            .await;
+        if init {
+            assert_eq!(result, Err(Errno::EPROTONOSUPPORT));
+            assert!(
+                guest.sent.lock().unwrap().is_empty(),
+                "refused before the hold"
+            );
+        } else {
+            assert_eq!(result, Ok(()));
+            assert_eq!(
+                *guest.sent.lock().unwrap(),
+                vec![Sent::Hold(DECIDER), Sent::Request(vec![group_exit(&guest)])]
+            );
+        }
+    }
 }

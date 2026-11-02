@@ -29,14 +29,21 @@ Both classes above stage in place (HERMIT_BUCK_STAGE_REPRODUCIBLE=0): the check 
 builds are the same code under reproducible staging, which only re-runs stage from a
 copy. StageReproducibleTest covers that wrapper, with the same fake cargo. The builds
 run in the fixed directory's copy of the checkout, with CARGO_HOME reached through the
-fixed directory's symlink and SOURCE_DATE_EPOCH at HEAD's commit time, and the copy, the
-symlink and the holder note are removed afterwards; a failed build keeps the previous
-staging and returns its status; a stage that cannot take the lock within
+fixed directory's symlink and SOURCE_DATE_EPOCH at HEAD's commit time; the symlink and
+the holder note are removed afterwards, and the copy and its target are kept for the next
+stage, which refreshes the copy by content (an unchanged file keeps its time, a changed
+or new file is written anew, a removed one goes) from the files Git tracks only (an
+ignored or untracked file in the checkout, such as another node's build output, is
+never read, and what the stage itself wrote into the copy stays) unless the copy is
+older than HERMIT_BUCK_STAGE_MAX_AGE_SECONDS, larger than HERMIT_BUCK_STAGE_MAX_BYTES or
+without a record of what was copied, when it is wiped and the stage is cold; a failed build keeps the previous staging and returns its
+status; a stage that cannot take the lock within
 HERMIT_BUCK_STAGE_LOCK_TIMEOUT fails naming the holder, runs no build and leaves the
 holder's note alone; a missing host package is refused before the lock; and an
 uncommitted change is refused even when the copy cannot read a submodule whose .git file
 names its gitdir by a relative path (git status fails there and prints nothing), and a
-status git cannot read at all is refused rather than taken as clean.
+status git cannot read at all is refused rather than taken as clean (under reproducible
+staging the listing of tracked files fails on it first, by name).
 """
 
 from __future__ import annotations
@@ -46,18 +53,20 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 
 STAGE = Path(__file__).resolve().parent / "buck-e2e" / "stage"
 RETRY = Path(__file__).resolve().parent / "retry-on-compiler-crash.sh"
+REFRESH = Path(__file__).resolve().parent / "buck-e2e" / "refresh_copy.py"
 TOOLS = ("patchelf", "readelf", "strip", "cmake")
 LIBS = ("libunwind.so.8", "libunwind-x86_64.so.8")
 # Commands stage runs on its way to the check and just after it.
 HOST_COMMANDS = ("dirname", "realpath", "rm", "mkdir", "git", "cp", "python3", "du", "cut", "cat")
 # And the reproducible-staging wrapper's own.
-WRAPPER_COMMANDS = ("flock", "ln", "date")
+WRAPPER_COMMANDS = ("flock", "ln", "date", "rsync", "stat", "sort", "comm", "xargs", "mv")
 DOC = '(docs/BUCK2_OSS.md, "Host prerequisites for Buck validation")'
 
 
@@ -317,6 +326,8 @@ class StageCargoOverlapTest(unittest.TestCase):
         # stage runs each cargo build through this wrapper; a clean or plainly
         # failing fake cargo passes through it unchanged.
         shutil.copy2(RETRY, tree / "ci" / "retry-on-compiler-crash.sh")
+        # Reproducible staging refreshes its copy with this helper, from the checkout.
+        shutil.copy2(REFRESH, self.stage.parent / "refresh_copy.py")
         (tree / ".gitignore").write_text("ci/buck-e2e/staged/\n")
         git = ["git", "-C", str(tree), "-c", "user.email=t@example.invalid", "-c", "user.name=t",
                "-c", "commit.gpgsign=false"]
@@ -574,9 +585,201 @@ class StageReproducibleTest(unittest.TestCase):
                               text=True, timeout=60)
 
     def assert_cleaned_up_and_previous_staging_kept(self, proc: subprocess.CompletedProcess) -> None:
-        for leftover in (self.fixed / "src", self.fixed / "cargo", Path(f"{self.fixed}.holder")):
+        # The copy and its target stay for the next stage (warm staging); the
+        # CARGO_HOME symlink and the holder note do not.
+        for leftover in (self.fixed / "cargo", Path(f"{self.fixed}.holder")):
             self.assertFalse(leftover.exists() or leftover.is_symlink(), f"{leftover} left behind: {proc.stderr}")
+        self.assertTrue((self.fixed / "src" / ".stage-born").is_file(), proc.stderr)
         self.assertEqual(self.sentinel.read_text(), "previous staging\n", proc.stderr)
+
+    def commit_tree(self, message: str) -> None:
+        git = ["git", "-C", str(self.tree), "-c", "user.email=t@example.invalid", "-c", "user.name=t",
+               "-c", "commit.gpgsign=false"]
+        subprocess.run(git + ["add", "-A"], check=True)
+        subprocess.run(git + ["commit", "-qm", message], check=True)
+
+    def test_a_later_stage_refreshes_the_kept_copy_by_content_and_keeps_its_target(self) -> None:
+        for name in ("keep.txt", "change.txt", "gone.txt"):
+            (self.tree / name).write_text(f"{name} 1\n")
+        self.commit_tree("files")
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        src = self.fixed / "src"
+        # As the earlier stage left them: copied long ago, and a build output.
+        for name in ("keep.txt", "change.txt"):
+            os.utime(src / name, (1000, 1000))
+        (src / "target").mkdir(exist_ok=True)
+        (src / "target" / "built").write_text("object\n")
+        (self.tree / "change.txt").write_text("change.txt 2\n")
+        (self.tree / "gone.txt").unlink()
+        (self.tree / "new.txt").write_text("new.txt 1\n")
+        self.commit_tree("change")
+        before = time.time() - 1
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertEqual((src / "keep.txt").stat().st_mtime, 1000, "an unchanged file was rewritten")
+        self.assertEqual((src / "change.txt").read_text(), "change.txt 2\n")
+        # Written now, newer than any build, whatever the checkout's own time.
+        self.assertGreaterEqual((src / "change.txt").stat().st_mtime, before)
+        self.assertGreaterEqual((src / "new.txt").stat().st_mtime, before)
+        self.assertFalse((src / "gone.txt").exists())
+        self.assertEqual((src / "target" / "built").read_text(), "object\n")
+        self.assertNotIn("this stage is cold", proc.stderr)
+
+    def test_only_tracked_files_are_copied_and_the_stages_own_files_stay(self) -> None:
+        # Another node builds into the checkout while the stage copies it (the
+        # validate of 3b0374ae: build.rust_scripts wrote agent-utils/rs/target and
+        # rsync failed with code 24 when a compiler temporary vanished). Ignored and
+        # untracked files are never read.
+        (self.tree / ".gitignore").write_text("ci/buck-e2e/staged/\ntool/target/\n")
+        (self.tree / "tracked.txt").write_text("tracked\n")
+        self.commit_tree("tracked")
+        (self.tree / "tool" / "target" / "deps").mkdir(parents=True)
+        (self.tree / "tool" / "target" / "deps" / "x.rcgu.o").write_text("in progress\n")
+        (self.tree / "scratch.txt").write_text("untracked\n")
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        src = self.fixed / "src"
+        self.assertEqual((src / "tracked.txt").read_text(), "tracked\n")
+        self.assertTrue((src / ".git").exists(), "the checkout's .git link was not copied")
+        self.assertFalse((src / "tool" / "target").exists(), "another node's build output was copied")
+        self.assertFalse((src / "scratch.txt").exists(), "an untracked file was copied")
+        copied = (self.fixed / "src.copied").read_bytes().split(b"\0")
+        self.assertIn(b"tracked.txt", copied)
+        # What a build writes into the copy is the stage's own, and stays.
+        (src / "generated.txt").write_text("written by a build script\n")
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertEqual((src / "generated.txt").read_text(), "written by a build script\n")
+        self.assertNotIn("this stage is cold", proc.stderr)
+
+    def test_a_copy_without_a_record_of_what_was_copied_is_wiped(self) -> None:
+        # The first warm version copied everything but target/ and ignored/,
+        # other nodes' build output included, and kept no record of it.
+        junk = self.fixed / "src" / "agent-utils" / "rs" / "target" / "deps" / "x.rcgu.o"
+        junk.parent.mkdir(parents=True)
+        junk.write_text("copied build output\n")
+        (self.fixed / "src" / ".stage-born").write_text("")
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("it has no record of what was copied; this stage is cold", proc.stderr)
+        self.assertFalse(junk.exists())
+        self.assertTrue((self.fixed / "src.copied").is_file())
+
+    def test_a_tracked_file_that_becomes_a_directory_and_back_is_copied_each_way(self) -> None:
+        src = self.fixed / "src"
+        (self.tree / "foo").write_text("a file\n")
+        self.commit_tree("foo is a file")
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertEqual((src / "foo").read_text(), "a file\n")
+        # File to directory: cleanup must not delete the directory it just copied.
+        (self.tree / "foo").unlink()
+        (self.tree / "foo").mkdir()
+        (self.tree / "foo" / "bar").write_text("in a directory\n")
+        self.commit_tree("foo is a directory")
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertEqual((src / "foo" / "bar").read_text(), "in a directory\n")
+        # Directory to file, with something the stage's build wrote in it: rsync
+        # cannot replace a nonempty directory, so it is cleared first.
+        (src / "foo" / "generated").write_text("written by a build\n")
+        shutil.rmtree(self.tree / "foo")
+        (self.tree / "foo").write_text("a file again\n")
+        self.commit_tree("foo is a file again")
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertEqual((src / "foo").read_text(), "a file again\n")
+        self.assertNotIn("this stage is cold", proc.stderr)
+
+    def test_a_git_directory_then_a_git_link_replaces_the_copy(self) -> None:
+        # The shared copy moves from a checkout whose .git is a directory to a
+        # linked worktree, whose .git is a file.
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertTrue((self.fixed / "src" / ".git").is_dir(), proc.stderr)
+        worktree = self.tmp / "linked"
+        subprocess.run(["git", "-C", str(self.tree), "worktree", "add", "-q", "--detach", str(worktree)],
+                       check=True)
+        base = {"PATH": str(self.bin), "HOME": str(self.tmp), "HERMIT_STAGE_HOST_LIBDIR": str(self.libdir),
+                "FAKE_CARGO_LOG": str(self.log), "CARGO_HOME": str(self.cargo_home),
+                "FAKE_CARGO_FAIL": "release"}
+        proc = subprocess.run(["/bin/bash", str(worktree / "ci" / "buck-e2e" / "stage"), "--from-cargo"],
+                              env=base, capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        git_link = self.fixed / "src" / ".git"
+        self.assertTrue(git_link.is_file(), proc.stderr)
+        self.assertTrue(git_link.read_text().startswith("gitdir: "))
+        # And back: the directory replaces the link.
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertTrue(git_link.is_dir(), proc.stderr)
+
+    def test_a_refresh_that_did_not_finish_wipes_the_copy_at_the_next_stage(self) -> None:
+        # rsync copies new.txt, then fails on an unreadable tracked file: the
+        # refresh did not finish and its record still names the old tree. A later
+        # checkout that tracks neither must not keep new.txt as though the stage
+        # had written it.
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        (self.tree / "new.txt").write_text("copied before the failure\n")
+        (self.tree / "unreadable.txt").write_text("rsync cannot read this\n")
+        self.commit_tree("two new files")
+        (self.tree / "unreadable.txt").chmod(0)
+        self.log.unlink(missing_ok=True)
+        try:
+            proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        finally:
+            (self.tree / "unreadable.txt").chmod(0o644)
+        self.assertNotIn(proc.returncode, (0, 3), proc.stderr)
+        self.assertFalse(self.log.exists(), "a build ran after a failed refresh")
+        self.assertTrue((self.fixed / "src" / "new.txt").exists(), "the failed refresh copied nothing")
+        self.assertTrue((self.fixed / "src.refreshing").exists())
+        (self.tree / "new.txt").unlink()
+        (self.tree / "unreadable.txt").unlink()
+        self.commit_tree("neither")
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("an earlier refresh of it did not finish; this stage is cold", proc.stderr)
+        self.assertFalse((self.fixed / "src" / "new.txt").exists())
+        self.assertFalse((self.fixed / "src.refreshing").exists())
+
+    def test_a_failing_submodule_listing_fails_the_stage_before_any_later_entry(self) -> None:
+        # A submodule whose gitdir is gone, then another tracked entry after it,
+        # and status told to ignore the submodule: the listing must still fail.
+        git = ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t", "-c", "commit.gpgsign=false"]
+        sub = self.tree / "sub"
+        sub.mkdir()
+        (sub / "file").write_text("sub\n")
+        subprocess.run(git + ["init", "-q", f"--separate-git-dir={self.tmp / 'sub-gitdir'}", str(sub)], check=True)
+        subprocess.run(git + ["-C", str(sub), "add", "file"], check=True)
+        subprocess.run(git + ["-C", str(sub), "commit", "-qm", "sub"], check=True)
+        (self.tree / "zzz-after-sub.txt").write_text("listed after sub\n")
+        subprocess.run(git + ["-C", str(self.tree), "add", "sub", "zzz-after-sub.txt"], check=True)
+        subprocess.run(git + ["-C", str(self.tree), "commit", "-qm", "add sub"], check=True)
+        subprocess.run(["git", "-C", str(self.tree), "config", "submodule.sub.ignore", "all"], check=True)
+        shutil.rmtree(self.tmp / "sub-gitdir")
+        proc = self.run_stage()
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn(f"ci/buck-e2e/stage: cannot list the files Git tracks in {self.tree}", proc.stderr)
+        self.assertFalse(self.log.exists(), "a build ran without a complete listing")
+        self.assertFalse((self.fixed / "src" / "zzz-after-sub.txt").exists())
+
+    def test_an_old_or_large_kept_copy_is_wiped_and_that_stage_is_cold(self) -> None:
+        for bound, value in (("HERMIT_BUCK_STAGE_MAX_AGE_SECONDS", "86400"), ("HERMIT_BUCK_STAGE_MAX_BYTES", "1")):
+            proc = self.run_stage(FAKE_CARGO_FAIL="release")
+            self.assertEqual(proc.returncode, 3, proc.stderr)
+            src = self.fixed / "src"
+            (src / "target").mkdir(exist_ok=True)
+            (src / "target" / "built").write_text("object\n")
+            if bound == "HERMIT_BUCK_STAGE_MAX_AGE_SECONDS":
+                old = time.time() - 2 * 86400
+                os.utime(src / ".stage-born", (old, old))
+            proc = self.run_stage(FAKE_CARGO_FAIL="release", **{bound: value})
+            self.assertEqual(proc.returncode, 3, proc.stderr)
+            self.assertIn("this stage is cold", proc.stderr, bound)
+            self.assertFalse((src / "target" / "built").exists(), bound)
+            self.assertTrue((src / ".stage-born").is_file(), bound)
 
     def test_builds_run_in_the_fixed_copy_with_a_fixed_cargo_home_and_epoch(self) -> None:
         proc = self.run_stage(FAKE_CARGO_FAIL="detcore-dbt+detcore-dbt-cdylib",
@@ -671,7 +874,9 @@ class StageReproducibleTest(unittest.TestCase):
         shutil.rmtree(self.tmp / "sub-gitdir")
         proc = self.run_stage()
         self.assertEqual(proc.returncode, 2, proc.stderr)
-        self.assertIn(f"ci/buck-e2e/stage: cannot read the status of {self.tree}", proc.stderr)
+        # Under reproducible staging the copy lists the tracked files first, and
+        # that git read fails the same way, before the status is read.
+        self.assertIn(f"ci/buck-e2e/stage: cannot list the files Git tracks in {self.tree}", proc.stderr)
         self.assertFalse(self.log.exists(), "a build ran without a readable status")
         self.assert_cleaned_up_and_previous_staging_kept(proc)
 

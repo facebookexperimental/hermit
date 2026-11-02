@@ -86,6 +86,83 @@ pub fn refuse_unsupported_preemption(
     Err(UnsupportedPreemption { backend, setting })
 }
 
+/// A named, pre-guest refusal of a configuration that cannot replay a
+/// callback-annotated priority history (`Config::annotated_priority_replay`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnqualifiedAnnotatedReplay {
+    /// The selected backend for a command line; `None` for a library launch,
+    /// whose configuration is judged on the capabilities it carries.
+    backend: Option<Backend>,
+    setting: &'static str,
+}
+
+impl std::fmt::Display for UnqualifiedAnnotatedReplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE: --replay-preemptions-from names a record \
+             with callback checkpoints, which replay only with precise PMU preemption timer \
+             events; "
+        )?;
+        match self.backend {
+            Some(backend) => write!(f, "--backend={} {}", backend.as_str(), self.setting)?,
+            None => write!(f, "the launch configuration {}", self.setting)?,
+        }
+        write!(f, "; the guest has not started")
+    }
+}
+
+impl std::error::Error for UnqualifiedAnnotatedReplay {}
+
+/// Refuse to replay a callback-annotated priority history where its row ends
+/// cannot be honored: they are actual callback endpoints at exact RCB counts,
+/// guarded one RCB past each. The requirements are
+/// `Config::annotated_priority_replay_unqualified`'s, judged here on the
+/// command line's configuration with the selected backend's capabilities, so
+/// the refusal comes before input is read and names the backend. Without
+/// them a replay would neither reach nor bound those endpoints, and silently
+/// falling back to the legacy expiry would replay the wrong schedule. A
+/// record without checkpoints keeps its existing admission; this check never
+/// rewrites the configuration.
+pub fn refuse_unqualified_annotated_replay(
+    config: &Config,
+    backend: Backend,
+) -> Result<(), UnqualifiedAnnotatedReplay> {
+    let effective = Config {
+        backend: crate::backend_capabilities(backend),
+        ..config.clone()
+    };
+    match effective.annotated_priority_replay_unqualified() {
+        None => Ok(()),
+        Some(setting) => Err(UnqualifiedAnnotatedReplay {
+            backend: Some(backend),
+            setting,
+        }),
+    }
+}
+
+/// The library launches' backstop for the same requirements, on the
+/// prepared configuration a backend is about to run: a library caller passes
+/// no command line, and its configuration reaches here unqualified. An
+/// annotated configuration must meet `annotated_priority_replay_unqualified`
+/// on the capabilities it carries. Its record is not reread here: Detcore
+/// refuses a record whose checkpoints disagree with the flag before any
+/// thread starts. Nothing is changed or forced.
+pub fn refuse_unqualified_annotated_launch(
+    config: &Config,
+) -> Result<(), UnqualifiedAnnotatedReplay> {
+    if !config.annotated_priority_replay {
+        return Ok(());
+    }
+    match config.annotated_priority_replay_unqualified() {
+        None => Ok(()),
+        Some(setting) => Err(UnqualifiedAnnotatedReplay {
+            backend: None,
+            setting,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -172,6 +249,116 @@ mod tests {
             );
         }
         refuse_unsupported_preemption(&config, Backend::Ptrace, true, true).unwrap();
+    }
+
+    /// A callback-annotated priority history replays only with precise PMU
+    /// preemption timer events and RCB time. Every other configuration is
+    /// refused by name, without rewriting it; the qualified one passes.
+    #[test]
+    fn an_annotated_priority_history_replays_only_with_precise_rcb_timers() {
+        let qualified = Config::parse_from([
+            "detcore",
+            "--chaos",
+            "--sequentialize-threads",
+            "--max-timeslice=1000000",
+            "--replay-preemptions-from=unused",
+        ]);
+        refuse_unqualified_annotated_replay(&qualified, Backend::Ptrace).unwrap();
+        for backend in TIMERLESS {
+            let refusal = refuse_unqualified_annotated_replay(&qualified, backend).unwrap_err();
+            assert_eq!(
+                refusal.setting,
+                "cannot deliver Detcore preemption timer events"
+            );
+            let message = refusal.to_string();
+            assert!(
+                message.starts_with("HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE"),
+                "{message}"
+            );
+            assert!(message.contains(backend.as_str()), "{message}");
+        }
+        for (flags, setting) in [
+            (
+                ["--max-timeslice=1000000", "--chaos"],
+                "does not sequentialize threads (--no-sequentialize-threads)",
+            ),
+            (
+                ["--max-timeslice=disabled", "--sequentialize-threads"],
+                "has its preemption timer disabled (--max-timeslice=disabled)",
+            ),
+            (
+                ["--sequentialize-threads", "--imprecise-timers"],
+                "requests imprecise timers (--imprecise-timers)",
+            ),
+            (
+                ["--sequentialize-threads", "--no-rcb-time"],
+                "requests logical time without RCBs (--no-rcb-time)",
+            ),
+        ] {
+            let config = Config::parse_from(
+                ["detcore", "--replay-preemptions-from=unused"]
+                    .into_iter()
+                    .chain(flags),
+            );
+            let flag = flags[1];
+            let before = serde_json::to_value(&config).unwrap();
+            let refusal =
+                refuse_unqualified_annotated_replay(&config, Backend::Ptrace).unwrap_err();
+            assert_eq!(refusal.setting, setting, "{flag}");
+            assert_eq!(serde_json::to_value(&config).unwrap(), before);
+        }
+    }
+
+    /// A library launch is judged on the prepared configuration's own
+    /// capabilities: an annotated configuration nobody prepared (no timer
+    /// events), or one without sequentialized threads, is refused by name,
+    /// without being changed; the same configuration with ptrace's
+    /// capabilities and every requirement met passes, and an unannotated
+    /// configuration keeps its existing admission.
+    #[test]
+    fn a_library_launch_of_an_annotated_history_is_judged_on_its_own_configuration() {
+        let unprepared = Config {
+            annotated_priority_replay: true,
+            ..Config::parse_from([
+                "detcore",
+                "--sequentialize-threads",
+                "--max-timeslice=1000000",
+                "--replay-preemptions-from=unused",
+            ])
+        };
+        let refusal = refuse_unqualified_annotated_launch(&unprepared).unwrap_err();
+        assert_eq!(
+            refusal.setting,
+            "cannot deliver Detcore preemption timer events"
+        );
+        let message = refusal.to_string();
+        assert!(
+            message.starts_with("HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE")
+                && message.contains("the launch configuration cannot deliver"),
+            "{message}"
+        );
+        let prepared = Config {
+            backend: crate::backend_capabilities(Backend::Ptrace),
+            ..unprepared.clone()
+        };
+        refuse_unqualified_annotated_launch(&prepared).unwrap();
+        let unsequentialized = Config {
+            sequentialize_threads: false,
+            ..prepared.clone()
+        };
+        let before = serde_json::to_value(&unsequentialized).unwrap();
+        assert_eq!(
+            refuse_unqualified_annotated_launch(&unsequentialized)
+                .unwrap_err()
+                .setting,
+            "does not sequentialize threads (--no-sequentialize-threads)"
+        );
+        assert_eq!(serde_json::to_value(&unsequentialized).unwrap(), before);
+        let unannotated = Config {
+            annotated_priority_replay: false,
+            ..unsequentialized
+        };
+        refuse_unqualified_annotated_launch(&unannotated).unwrap();
     }
 
     #[test]

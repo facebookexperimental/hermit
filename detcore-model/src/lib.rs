@@ -185,6 +185,7 @@ pub mod pid;
 pub mod procfs;
 pub mod schedule;
 pub mod summary;
+pub mod syscall_histogram;
 pub mod time;
 
 /// Exact native runtime/dispatch-sequence envelope, separate from admission.

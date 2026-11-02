@@ -92,7 +92,6 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::ioctl::Request;
-use reverie::syscalls::linux_abi::Cmsghdr;
 use reverie::syscalls::linux_abi::Mmsghdr;
 use reverie::syscalls::linux_abi::Msghdr;
 
@@ -114,6 +113,7 @@ use crate::syscalls::helpers::get_fd;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::poll_nfds;
 use crate::syscalls::helpers::record_retry_event;
+use crate::syscalls::scm_rights::received_descriptors;
 use crate::tool_global::GlobalRequest;
 use crate::tool_global::GlobalResponse;
 use crate::tool_global::ResumeStatus;
@@ -503,36 +503,6 @@ fn names_abstract_unix_address(bytes: &[u8], addrlen: usize, binding: bool) -> b
         2 => binding,
         _ => bytes.get(2) == Some(&0),
     }
-}
-
-/// The descriptors carried by the `SCM_RIGHTS` messages in a sent or
-/// received control buffer.
-pub(crate) fn received_descriptors(control: &[u8]) -> Vec<RawFd> {
-    const HEADER: usize = size_of::<Cmsghdr>();
-    let align = |length: usize| length.next_multiple_of(size_of::<usize>());
-    let mut descriptors = Vec::new();
-    let mut offset = 0;
-    while let Some(header) = control.get(offset..offset + HEADER) {
-        let length = usize::from_ne_bytes(header[..8].try_into().unwrap());
-        let level = i32::from_ne_bytes(header[8..12].try_into().unwrap());
-        let kind = i32::from_ne_bytes(header[12..16].try_into().unwrap());
-        let Some(data) = control.get(offset + HEADER..offset.saturating_add(length)) else {
-            break;
-        };
-        if level == libc::SOL_SOCKET && kind == libc::SCM_RIGHTS {
-            descriptors.extend(
-                data.as_chunks::<{ size_of::<RawFd>() }>()
-                    .0
-                    .iter()
-                    .map(|fd| RawFd::from_ne_bytes(*fd)),
-            );
-        }
-        if length < HEADER {
-            break;
-        }
-        offset += align(length);
-    }
-    descriptors
 }
 
 /// The `sockaddr` bytes Linux reports for `address`.
@@ -2617,46 +2587,6 @@ mod tests {
             false
         ));
         assert!(!names_abstract_unix_address(&[], 0, true));
-    }
-
-    #[test]
-    fn rights_are_found_in_every_control_message() {
-        fn message(level: i32, kind: i32, fds: &[RawFd]) -> Vec<u8> {
-            let length = size_of::<Cmsghdr>() + size_of_val(fds);
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(&length.to_ne_bytes());
-            bytes.extend_from_slice(&level.to_ne_bytes());
-            bytes.extend_from_slice(&kind.to_ne_bytes());
-            fds.iter()
-                .for_each(|fd| bytes.extend_from_slice(&fd.to_ne_bytes()));
-            bytes.resize(length.next_multiple_of(size_of::<usize>()), 0);
-            bytes
-        }
-        let mut control = message(libc::SOL_SOCKET, libc::SCM_CREDENTIALS, &[1, 2, 3]);
-        control.extend(message(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[5]));
-        control.extend(message(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[6, 7]));
-        assert_eq!(received_descriptors(&control), vec![5, 6, 7]);
-        // A truncated message carries nothing.
-        assert_eq!(received_descriptors(&control[..control.len() - 8]), vec![5]);
-        let mut zero_length = control.clone();
-        zero_length[..8].copy_from_slice(&0usize.to_ne_bytes());
-        assert_eq!(received_descriptors(&zero_length), Vec::<RawFd>::new());
-        assert_eq!(received_descriptors(&[]), Vec::<RawFd>::new());
-    }
-
-    #[test]
-    fn rights_control_length_is_not_truncated_to_wrapper_width() {
-        let mut control = [0u8; 24];
-        control[..8].copy_from_slice(&((1usize << 32) + 20).to_ne_bytes());
-        control[8..12].copy_from_slice(&libc::SOL_SOCKET.to_ne_bytes());
-        control[12..16].copy_from_slice(&libc::SCM_RIGHTS.to_ne_bytes());
-        control[16..20].copy_from_slice(&42i32.to_ne_bytes());
-        assert!(received_descriptors(&control).is_empty());
-        // The identical low-width valid message must still yield its FD.
-        control[..8].copy_from_slice(&20usize.to_ne_bytes());
-        assert_eq!(received_descriptors(&control), vec![42]);
-        control[..8].copy_from_slice(&usize::MAX.to_ne_bytes());
-        assert!(received_descriptors(&control).is_empty());
     }
 
     #[test]

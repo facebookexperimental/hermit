@@ -250,6 +250,14 @@ read, resolve `--series-root` relative to the current directory.
   --series-root ../hermit_test_ledger/series --refreshed-at STAMP                         # series
 ```
 
+Once ledger retention moves original series files to its archive, the
+published tree keeps only `series/ARCHIVE.json`, and a series worktree can no
+longer show every row. The publisher then runs `project-observations-snapshot
+--snapshot FILE --snapshot-sha256 HEX --refreshed-at STAMP` with one
+`scorecard-series-snapshot/v1` file holding the authenticated rows. It writes
+exactly what `project-observations` writes for the same rows, commit and tree,
+and refuses a snapshot that holds unpublished local rows.
+
 `project-observations` records the selected source as a canonical
 repository-relative path together with the exact commit and Git tree object
 whose series rows it projected. Different paths to the same ledger checkout

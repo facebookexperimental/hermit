@@ -150,6 +150,7 @@ fn is_policy_refusal(err: &Error) -> bool {
     fn refuses(cause: &(dyn std::error::Error + 'static)) -> bool {
         cause.is::<detcore::UnsupportedSyscallError>()
             || cause.is::<detcore::TerminalReplayRefusal>()
+            || cause.is::<detcore::PriorityHistoryRefusal>()
             || cause.is::<reverie_ptrace::UntracedStubSyscall>()
     }
     if err.chain().any(refuses) {
@@ -220,6 +221,9 @@ fn classify_unwrapped(error: &Error) -> FailureKind {
         || error
             .chain()
             .any(|cause| cause.is::<crate::preemption_admission::UnsupportedPreemption>())
+        || error
+            .chain()
+            .any(|cause| cause.is::<crate::preemption_admission::UnqualifiedAnnotatedReplay>())
     {
         FailureKind::PolicyRefusal
     } else if error.downcast_ref::<crate::GuestTimedOut>().is_some() {

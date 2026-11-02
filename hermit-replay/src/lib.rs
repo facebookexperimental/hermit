@@ -33,6 +33,7 @@ pub use replayer::Replayer;
 pub use replayer::registered_materialized_count;
 pub use replayer::remember_materialized_object;
 use reverie::process::Command;
+use reverie_ptrace::GdbConnection;
 
 /// The replay tracer: `detcore::Detcore<Replayer>` under `reverie_ptrace`.
 pub type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
@@ -41,22 +42,22 @@ pub type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
 pub type SpawnTracer = Pin<Box<dyn Future<Output = Result<Tracer, reverie::Error>>>>;
 
 /// Spawns COMMAND under the replay tool with CONFIG, as `hermit replay` does:
-/// serving a gdb remote on GDBSERVER when given, and telling gdbserver the
-/// guest is already sequentialized when SEQUENTIALIZED_GUEST.
+/// serving a gdb remote on the GDBSERVER connection when given, and telling
+/// gdbserver the guest is already sequentialized when SEQUENTIALIZED_GUEST.
 ///
 /// The future is boxed so the async body, and everything it instantiates, is
 /// compiled in this crate rather than in its caller.
 pub fn spawn_tracer(
     command: Command,
     config: detcore::Config,
-    gdbserver: Option<u16>,
+    gdbserver: Option<GdbConnection>,
     sequentialized_guest: bool,
 ) -> SpawnTracer {
     Box::pin(async move {
         let mut builder = reverie_ptrace::TracerBuilder::<detcore::Detcore<Replayer>>::new(command)
             .config(config);
-        if let Some(port) = gdbserver {
-            builder = builder.gdbserver(port);
+        if let Some(connection) = gdbserver {
+            builder = builder.gdbserver(connection);
         }
         if sequentialized_guest {
             builder = builder.sequentialized_guest();

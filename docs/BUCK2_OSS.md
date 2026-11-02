@@ -67,7 +67,7 @@ Then invoke the guarded wrapper with explicit absolute paths:
   --dotslash /absolute/path/to/public/dotslash \
   --cargo-binary "$PWD/target/release/hermit" \
   --install-bundle "$PWD/target/install_pkg" \
-  --safehermit /absolute/path/to/dev-hermit/bin/safehermit
+  --safehermit /absolute/path/to/safehermit
 ```
 
 The wrapper always regenerates dependencies, refuses missing release metadata

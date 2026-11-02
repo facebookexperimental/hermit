@@ -391,6 +391,17 @@ for seed in 1 2 3 4 5; do
 done
 ```
 
+On a host whose retired-branch counter fails Reverie's performance-counter
+validation (`hermit host-capabilities` reports `exact-branch-counter: ABSENT`),
+the same seed is not guaranteed to reproduce a schedule when the run has a
+timeslice, because preemptions are timed with that counter. On the ptrace and
+e9patch backends `--strict` refuses such a run; without it, `hermit run`,
+`hermit analyze`, `hermit bisect` and `hermit record start` go on but first
+print one line that starts `WARNING: this host's retired-branch counter failed`.
+Rerun a finding from such a host on one where `hermit host-capabilities`
+reports `exact-branch-counter: PRESENT` with the validation passed before
+treating it as reproducible.
+
 The seed options have distinct roles:
 
 - `--sched-seed=N` controls scheduler randomness.
@@ -411,6 +422,50 @@ boundaries; it is useful for workloads that enter the kernel frequently.
 CPU-bound code that rarely makes system calls. The old
 `--preemption-timeout` spelling is a deprecated alias for
 `--max-timeslice`.
+
+The value that finds a race depends on the race. Chaos ends each timeslice
+after a random number of retired conditional branches whose mean is the
+maximum timeslice. A race whose window spans a few branches needs a mean of
+about a hundred branches (`--max-timeslice=1000`); a race whose other thread
+must first run far into its own work needs a mean long enough to get there,
+and short slices miss it. No single value finds both. Rather than guessing,
+let each seed draw its own value:
+
+```bash
+for seed in $(seq 0 63); do
+  hermit run --chaos --chaos-seeded-timeslice --sched-seed="$seed" -- ./target/debug/hello_race
+done
+```
+
+Two in five seeds draw their maximum from 1000 to 2000 virtual nanoseconds
+(slices of about 100 to 200 branches, for windows of a few dozen branches), two
+in five from 1000000 to 200000000 (for races whose other thread must first run
+far), and one in five from the decades between, each log-uniformly within its
+range. The races measured so far needed one end or the other: a 46-branch
+window in a multithreaded C++ test binary failed in 9 of 32 seeds at 1000 and
+in none of 32 at 1e4, 1e5, 1e6 or the default. Hermit prints the value:
+`[hermit] --chaos-seeded-timeslice: scheduler seed 7 drew
+--max-timeslice=...`. Rerunning the seed reproduces the run, and so does
+passing the printed value as `--max-timeslice` instead of the flag. The draw is
+part of what a seed selects, so a Hermit release that changed it would change
+every seed's schedule; the printed value pins it. Seeds that draw small values
+run much slower: every timeslice ends with a timer event, and the ptrace
+backend steps the guest through the last skid margin (100 to 10000 branches,
+depending on the processor) of every slice. The option needs the PMU timer of
+the ptrace backend; on other backends, set chaos's cooperative deadline with
+`--target-timeslice`.
+
+Every scheduler turn adds a fixed charge to the guest-visible clock
+(`--scheduler-turn-cost`, 500000 virtual nanoseconds by default), including
+the turn that ends a timeslice. With slices far shorter than the charge,
+CPU-bound work therefore appears about `1 + charge / slice` times slower to
+the guest: 501 times at `--max-timeslice=1000`, so a test's own timeouts can
+expire before the code under test runs. `--cap-preemption-charge` charges a
+turn that ends an expired slice at most the virtual time its thread ran since
+its previous turn, which bounds that factor at 2; slices at least one charge
+long are charged as before. It changes the guest-visible time of short-slice
+runs, so a recorded schedule stores the setting and a replay under the other
+is refused.
 
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with
@@ -618,6 +673,22 @@ hermit log-diff --verify-json report.json rec rep
 `rec/recording` holds the recording. Give both commands the same options; the
 comparison writes the report `record start --verify --verify-json` writes.
 
+To record a racy failure, record under chaos scheduling and try seeds until one
+fails, then replay that recording under GDB:
+
+```bash
+for seed in $(seq 1 64); do
+  hermit record start --chaos --seed="$seed" -- PROGRAM || break
+done
+hermit replay
+```
+
+The recording stores its schedule, and replay follows it. `--seed` (also
+spelled `--sched-seed`, as for `hermit run`) seeds only the scheduler; the
+guest's random numbers are recorded. Recording runs under a different
+configuration from `hermit run`, so a seed that fails under
+`hermit run --chaos` does not necessarily fail under `hermit record`.
+
 Replay depends on the captured data and compatible Hermit behavior. Keep the
 recording directory intact and prefer the same Hermit revision for recording
 and replay.
@@ -650,10 +721,12 @@ reproducible target condition.
 | `--no-deterministic-io` | Disables Hermit's deterministic short-I/O completion behavior. |
 | `--chaos` | Uses seeded randomized deterministic scheduling. |
 | `--sched-seed=N` | Selects a reproducible chaos schedule. |
+| `--chaos-seeded-timeslice` | With `--chaos`, draws `--max-timeslice` from the scheduler seed (two in five seeds 1000 to 2000 virtual nanoseconds, two in five 1000000 to 200000000, one in five between) and prints the value. |
 | `--target-timeslice=N` | Ends a logical turn at the first syscall boundary after N virtual nanoseconds. |
 | `--max-timeslice=N` | Sets the maximum virtual time slice (minimum one scaled RCB) and requires PMU support. |
 | `--max-timeslice=disabled` | Disables PMU timer preemption. |
 | `--preemption-timeout=N` | Deprecated alias for `--max-timeslice=N`. |
+| `--cap-preemption-charge` | Charges a turn that ends an expired timeslice at most the time its thread ran since its previous turn. |
 
 `--no-sequentialize-threads` is useful for compatibility experiments and
 workloads such as virtual machines that need real host parallelism. It removes
@@ -685,15 +758,46 @@ the default equal-priority policy.
 | --- | --- |
 | `--seed=N` | Sets the fallback random seed. |
 | `--rng-seed=N` | Sets only guest random-data generation. |
-| `--epoch=TIMESTAMP` | Sets the virtual clock's RFC 3339 starting time. When omitted, `hermit run` and `hermit oci run` capture the host wall clock once at invocation start, print the resolved value, and use it as an immutable input for the whole run (including both `--verify` executions). Bypass modes such as `--namespace-only` and `--strace-only` neither capture nor report a virtual epoch. Pass a printed value explicitly to reproduce the same virtual-time trajectory. |
+| `--epoch=TIMESTAMP` | Sets the virtual clock's RFC 3339 starting time. When omitted, `hermit run` and `hermit oci run` capture the host wall clock once at invocation start, print the resolved value, and use it as an immutable input for the whole run (including both `--verify` executions). Bypass modes such as `--namespace-only` and `--strace-only` neither capture nor report a virtual epoch. Pass a printed value explicitly to reproduce the same virtual-time trajectory. A guest that checks TLS certificates over the host network (`--network=host` or `--record-networking`) checks them against this clock, so an epoch outside a server certificate's validity fails the HTTPS connections to that server (curl exits 60 with "SSL certificate problem: certificate is not yet valid" or "certificate has expired"; a libcurl caller sees "SSL peer certificate or SSH remote key was not OK"). For those runs omit `--epoch`: the run then starts the clock at the current time and saves it in its manifest, and `hermit run --from last-run` repeats it with that epoch. |
 | `--clock-multiplier=F` | Changes the rate of virtual time. |
 | `--no-virtualize-time` | Uses host time; also requires `--no-virtualize-metadata`. |
 | `--no-virtualize-cpuid` | Exposes host CPUID behavior. |
 | `--cpu-profile x86-64-v3` | Gives the guest an x86-64-v3 CPU instead of the default x86-64-v2; see below. |
 | `--cpu-profile host-no-rdrand` | Intercepts CPUID and returns host features with hardware randomness and unvirtualized timing features hidden; ptrace only, with CPUID faulting required. |
+| `--virtual-cpus=N` | Tells the guest it has N CPUs (1 to 128) instead of one, so thread pools start N workers; see below. |
 
 Disabling a virtualization feature introduces a host-dependent input. Do it to
 diagnose compatibility problems, not when asserting full reproducibility.
+
+#### Virtual CPUs
+
+Without `--virtual-cpus`, a guest sees one CPU. A program that sizes a thread
+pool from the CPU count (TBB, folly, `std::thread::hardware_concurrency`,
+`sysconf(_SC_NPROCESSORS_ONLN)`) then starts one worker, and races between
+workers cannot happen under any schedule. `--virtual-cpus=4` presents four
+CPUs everywhere a program can count them: `sched_getaffinity`, `sysconf`,
+`/sys/devices/system/cpu`, `/proc/cpuinfo`, `/proc/stat`, `Cpus_allowed` in
+`/proc/<pid>/status`, CPUID's APIC IDs and `getcpu`. They form four
+single-core sockets on one NUMA node. Hermit still runs one thread at a time,
+so `--chaos` explores the pool's interleavings deterministically:
+
+```
+hermit run --chaos --sched-seed=7 --virtual-cpus=4 -- ./pool_program
+```
+
+`sched_setaffinity` then behaves as on a four-CPU Linux machine: the mask
+reads back, and a mask naming none of the four CPUs is refused with `EINVAL`.
+A thread's `getcpu` is a CPU of its mask chosen by the order threads were
+created, and changes only when the mask leaves that CPU out. The host must
+have at least N online CPUs, because the guest sees the host's `cpuN`
+directories, rendered for the virtual CPUs. Only the ptrace backend (and
+e9patch preprocessing on it) takes the option: other backends, `--lite` and
+`hermit record` refuse it.
+
+More CPUs can change more than the pool size. Some runtimes spin-wait
+instead of sleeping when they see more than one CPU: OpenMP's spin count, Go's
+scheduler, adaptive mutexes. Under serialized threads such a spin ends only at
+a preemption, so a run can be slower than with one CPU.
 
 #### The x86-64-v3 CPU profile
 
@@ -846,17 +950,58 @@ runtime mappings absent from the supplied ownership facts.
 
 Network modes are:
 
-- `--network=local` (default): isolated loopback networking.
+- `--network=local` (default): isolated loopback networking. Each run has its
+  own network namespace, so its ports and abstract unix socket names are its
+  own.
 - `--network=host`: host networking. External responses and port state become
-  nondeterministic inputs.
+  nondeterministic inputs, and the guest shares the host's ports and abstract
+  unix socket names with every other program, other Hermit runs included.
 
-`hermit run --gdbserver` needs a host gdb client to reach the gdbserver port.
-Because `--network=local` binds that port inside the guest's isolated network
-namespace, run mode forces host networking (printing a warning) whenever
-`--gdbserver` is set so the debugger can attach. Attach from another terminal
-with `gdb -ex 'target remote :PORT'` (default port 1234, override with
-`--gdbserver-port=PORT`). `--gdbserver` cannot be combined with
-`--analyze-networking`, which requires the isolated namespace.
+Prefer `--network=local` unless the guest must reach the host's network. An
+abstract unix socket name (`@name`, a `sun_path` that starts with a NUL byte)
+belongs to the network namespace, not the file system. Every Hermit guest's
+first process is pid 3, and Hermit picks autobind names (`@` and five hex
+digits) the same way in every run. So two concurrent `--network=host` runs
+whose guests bind the same abstract name, for instance one built from the pid,
+collide: the second bind fails with `EADDRINUSE`, although natively each
+process would have used its own name. On the ptrace backend, when a
+`--network=host` guest binds an abstract name, or fails to with `EADDRINUSE`,
+Hermit prints one notice per run on stderr:
+
+```text
+hermit: NOTICE: the guest bound the abstract unix socket "@myapp:3" under --network=host. Abstract names belong to the network namespace, ...
+```
+
+The bind itself is unchanged. Run such guests with `--network=local`, or one at
+a time when they need the host's network. `--strace-only` includes
+`--network=host`; to give such a run its own names, spell out its expansion
+with `--network=local` instead.
+
+`hermit run --gdbserver` serves the guest to one gdb client and waits for it
+before the guest runs; only the ptrace backend (the default) serves gdb, and
+the other backends refuse the flag. Attach from another terminal with
+`gdb -ex 'target remote 127.0.0.1:PORT' PROGRAM` (default port 1234; override
+it with `--gdbserver-port=PORT`, or pass `0` for any free port, which the run
+prints). Hermit binds that port in the host's network namespace before it
+makes the guest's, so the guest keeps the network `--network` gives it,
+`--analyze-networking` included. A `--strict` run can be debugged with every
+strict refusal in force:
+
+```bash
+hermit run --strict --epoch=2026-01-01T00:00:00Z --gdbserver -- PROGRAM
+```
+
+The debugger is an input of the run that `--strict` cannot control.
+Breakpoints write `int3` into the guest's code, and writes to its memory or
+registers, the signals gdb sends and the moment it interrupts the guest all
+change the run; another session repeats the run only if it does the same.
+With a gdbserver, Detcore also takes no reports of the guest's signal-handler
+returns (docs/SIGNAL_STATE_CHECK.md), as in a recording and its replays: after
+a handler that took a scheduler turn, another thread can run before the next
+signal is delivered, so a multithreaded guest can be scheduled differently
+than without a debugger. A replay served to gdb (`hermit replay`,
+`--serve-only`, `hermit record start --verify-with-gdbex`) binds its port the
+same way and keeps the network the recording used.
 
 Environment controls include `--base-env=empty`, `--base-env=minimal`,
 `--base-env=host`, `-e NAME[=VALUE]`, and `--workdir=PATH`.

@@ -4658,6 +4658,79 @@ fn record_socketpair_read_after_clearing_nonblocking_waits_for_its_writer() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// Records `program` under `hermit record start` with `record_args` and then
+/// replays it with `hermit replay --autopilot`, each under a timeout. Returns
+/// the recording's stdout when both phases exit 0 and the replay prints the
+/// same stdout, and otherwise a description of the failure.
+fn record_then_replay_stdout(program: &Path, record_args: &[&str]) -> Result<String, String> {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "record", "start", "--record-timeout=30"])
+        .args(record_args)
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(program);
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()));
+    let mut stdouts = Vec::new();
+    for (phase, mut command) in [("record", record), ("replay", replay)] {
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if !output.status.success() {
+            return Err(format!(
+                "{record_args:?} {phase}: status {}\nstdout:\n{stdout}stderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        stdouts.push(stdout);
+    }
+    if stdouts[0] != stdouts[1] {
+        return Err(format!(
+            "{record_args:?}: replay printed {:?}, the recording {:?}",
+            stdouts[1], stdouts[0]
+        ));
+    }
+    Ok(stdouts.swap_remove(0))
+}
+
+/// `hermit record start --chaos --seed=N` records under chaos scheduling, and
+/// the recording stores the schedule so that its replay follows it (see
+/// `tests/c/record_replay_chaos_race.c`, whose output is its interleaving).
+/// Before, record had no chaos mode, so a failure that only a chaos seed
+/// provokes could not be captured as a recording and replayed under a
+/// debugger. Each seed's replay must print its recording's interleaving, and
+/// the seeds must between them record more than one interleaving, which the
+/// default scheduler alone never does.
+#[test]
+fn record_chaos_schedule_replays_under_its_seed() {
+    let _guard = hermit_record_lock();
+    let program = &workload("c_record_replay_chaos_race").path;
+    let mut failures = Vec::new();
+    let mut interleavings = std::collections::BTreeSet::new();
+    for seed in 1..=4 {
+        let seed = format!("--seed={seed}");
+        match record_then_replay_stdout(program, &["--chaos", &seed]) {
+            Ok(stdout) => {
+                interleavings.insert(stdout);
+            }
+            Err(failure) => failures.push(failure),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        interleavings.len() > 1,
+        "four chaos seeds recorded one interleaving: {interleavings:?}"
+    );
+}
+
 /// A guest that accepts its own loopback TCP connections (see
 /// `tests/c/record_replay_tcp_accept.c`). Record used to let `accept(2)` and
 /// `accept4(2)` run live and logged nothing, so replay issued them against a

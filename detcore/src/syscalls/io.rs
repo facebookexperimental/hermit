@@ -63,7 +63,8 @@ use crate::syscalls::helpers::result_after_restore;
 use crate::syscalls::helpers::retry_blocking_wait_under_mask;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::helpers::unblocked_by;
-use crate::syscalls::network_trace::received_descriptors;
+use crate::syscalls::scm_rights::ReceiveGeometry;
+use crate::syscalls::scm_rights::received_descriptors;
 use crate::syscalls::signal::STACK_RED_ZONE;
 use crate::syscalls::signal::kernel_installed_signal_mask;
 use crate::syscalls::signal::read_kernel_sigset;
@@ -74,6 +75,8 @@ use crate::tool_global::*;
 use crate::tool_local::Detcore;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
+
+mod temporary_mask_forms;
 
 // Printing helper
 // TODO: this should be subsumed by better syscall printing.
@@ -948,6 +951,25 @@ where
     }
 }
 
+/// The result Detcore gives the guest for a `poll` it ran in the kernel. A
+/// signal pending while the poll runs ends it with `ERESTART_RESTARTBLOCK`,
+/// even with a zero timeout, which cannot wait (`do_poll` checks for a signal
+/// before it honours the timeout), and with no handler to run the kernel
+/// restarts it through `restart_syscall`. The poll returns the code Detcore's
+/// own polls return for it instead (`NonblockableSyscall::kernel_restart_errno`).
+/// A zero or infinite timeout keeps no deadline (`do_restart_poll` reruns the
+/// poll as issued), so that code is `ERESTARTNOHAND`, which the kernel restarts
+/// by running the call again; a positive timeout keeps Linux's own. A handler
+/// turns either code into `EINTR`. Under a tracer a default-ignored `SIGCHLD`
+/// is still queued, so a child that exits while its parent polls is such a
+/// signal, and so is the backend's own timer signal under `--imprecise-timers`.
+fn kernel_poll_result(call: &syscalls::Poll, result: Result<i64, Error>) -> Result<i64, Error> {
+    match result {
+        Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK)) => Err(call.kernel_restart_errno().into()),
+        result => result,
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// poll syscall (MAYHANG)
     // TODO-HUMAN-REVIEW(PR-1023): Review zero-timeout poll scheduling across backends.
@@ -967,14 +989,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 zero_timeout_poll_request(guest.thread_state().dettid, yield_to_peer),
             )
             .await;
-            if self.cfg.recordreplay_modes {
-                Ok(self.record_or_replay(guest, call).await?)
+            let result = if self.cfg.recordreplay_modes {
+                self.record_or_replay(guest, call).await
             } else {
                 // A virtual timerfd among the fds is readable exactly when its
                 // deadline has passed (`crate::syscalls::timerfd`).
                 crate::syscalls::timerfd::publish_expired(guest).await;
-                Ok(guest.inject(call).await?)
-            }
+                guest.inject(call).await
+            };
+            kernel_poll_result(&call, result.map_err(Error::from))
         } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
             // In replay mode, we cannot assume the existence of FILES during replay.
             // Thus we must record the poll and replay it from the trace.
@@ -1204,6 +1227,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !self.cfg.sequentialize_threads {
             return Ok(guest.inject(call).await?);
         }
+        // Under the in-guest delivery gate (A5 step 3c.1d) the forms follow
+        // design D39 and D50, and no probe carries the guest's temporary mask
+        // (IR-9): `gated_pselect6`.
+        if self.cfg.in_guest_signal_delivery {
+            return Box::pin(self.gated_pselect6(guest, call)).await;
+        }
 
         if call.nfds() < 0 {
             return Ok(guest.inject(call).await?);
@@ -1391,30 +1420,74 @@ impl<T: RecordOrReplay> Detcore<T> {
         sigmask: Option<u64>,
     ) -> Result<i64, Error> {
         let len = pselect6_fd_set_len(call.nfds())?;
+        // Under the in-guest delivery gate (A5 step 3c.1d, D50 reader (3)):
+        // no probe carries the temporary mask (IR-9); each turn that finds
+        // nothing ready decides from the thread's `/proc` status under the
+        // temporary mask (`temporary_mask_check`), or under the guest's own
+        // mask without one (`gated_wait_ends`); a masked call's first probe
+        // and its check run in the call's own turn, before any request, so
+        // that check sees exactly the instances pending at entry (IR-7,
+        // round-1 ruling 2), and a result that first probe finds is returned
+        // after one yielding empty request
+        // (`temporary_mask_forms::yield_after_in_turn_result`, round-2 ruling
+        // 5); the request publishes the temporary mask; and a set Detcore
+        // cannot read is EFAULT only where Linux's copy faults
+        // (`temporary_mask_forms::read_gated_fd_sets`).
+        let gated = self.cfg.in_guest_signal_delivery;
+        // A masked call under the gate observes the clock only after its first
+        // probe and check (round-3 ruling 1,
+        // `temporary_mask_forms::observe_deadline`): `deferred` holds the
+        // timeout until then. Gate off, as before.
+        let in_turn_first = gated && sigmask.is_some();
+        let deferred = if in_turn_first { timeout } else { None };
         let deadline = match timeout {
-            Some(timeout) => Some(thread_observe_time(guest).await + timeout),
-            None => None,
+            Some(timeout) if !in_turn_first => Some(thread_observe_time(guest).await + timeout),
+            _ => None,
         };
-        let original_readfds = match read_pselect6_fd_set(guest, call.readfds(), len) {
-            Ok(value) => value,
-            Err(error) => {
-                self.write_pselect6_remaining(guest, call, deadline).await?;
-                return Err(error);
+        // Gate off, the three sets are read into locals as before the gate,
+        // with no allocation (round-2 ruling 1).
+        let (original_readfds, original_writefds, original_exceptfds) = if gated {
+            // Boxed: the gate-off future stays its size.
+            match Box::pin(temporary_mask_forms::read_gated_fd_sets(
+                guest, "pselect6", call, len,
+            ))
+            .await
+            {
+                Ok(sets) => sets,
+                Err(error) => {
+                    let deadline = match deferred {
+                        Some(_) => temporary_mask_forms::observe_deadline(guest, deferred)
+                            .await
+                            .map(|(_, deadline)| deadline),
+                        None => deadline,
+                    };
+                    self.write_pselect6_remaining(guest, call, deadline).await?;
+                    return Err(error);
+                }
             }
-        };
-        let original_writefds = match read_pselect6_fd_set(guest, call.writefds(), len) {
-            Ok(value) => value,
-            Err(error) => {
-                self.write_pselect6_remaining(guest, call, deadline).await?;
-                return Err(error);
-            }
-        };
-        let original_exceptfds = match read_pselect6_fd_set(guest, call.exceptfds(), len) {
-            Ok(value) => value,
-            Err(error) => {
-                self.write_pselect6_remaining(guest, call, deadline).await?;
-                return Err(error);
-            }
+        } else {
+            let original_readfds = match read_pselect6_fd_set(guest, call.readfds(), len) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.write_pselect6_remaining(guest, call, deadline).await?;
+                    return Err(error);
+                }
+            };
+            let original_writefds = match read_pselect6_fd_set(guest, call.writefds(), len) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.write_pselect6_remaining(guest, call, deadline).await?;
+                    return Err(error);
+                }
+            };
+            let original_exceptfds = match read_pselect6_fd_set(guest, call.exceptfds(), len) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.write_pselect6_remaining(guest, call, deadline).await?;
+                    return Err(error);
+                }
+            };
+            (original_readfds, original_writefds, original_exceptfds)
         };
 
         let mut stack = guest.stack().await;
@@ -1433,15 +1506,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `KernelSignalWait` below decides interruption against the temporary
         // mask instead (`with_wait_mask`), and the probes carry no mask.
         let kernel_signal_wait = self.cfg.backend.supports_blocked_wait_signal_interruption;
-        let probe_sigmask = sigmask.filter(|_| !kernel_signal_wait).map(|mask| {
-            let sigset = stack.push(mask);
-            stack
-                .push(Pselect6SigmaskArg {
-                    sigmask: sigset.as_raw(),
-                    sigsetsize: KERNEL_SIGSET_SIZE,
-                })
-                .cast()
-        });
+        let probe_sigmask = sigmask
+            .filter(|_| !kernel_signal_wait && !gated)
+            .map(|mask| {
+                let sigset = stack.push(mask);
+                stack
+                    .push(Pselect6SigmaskArg {
+                        sigmask: sigset.as_raw(),
+                        sigsetsize: KERNEL_SIGSET_SIZE,
+                    })
+                    .cast()
+            });
         // On a backend whose kernel reports the guest's signal state, only a
         // signal that would end the wait natively does; the mask cell lets the
         // wait block signals under the one scratch-stack guard
@@ -1486,11 +1561,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.fyi("pselect6");
         resources.poll_deadline = poll_deadline_for(guest, deadline);
+        if gated {
+            resources.blocked_signal_mask = sigmask;
+        }
         // Keep the request metadata accurate, but do not make it eligible for
         // the scheduler's ERESTARTSYS wakeup. A cross-task signal must first be
         // checked against pselect6's snapshotted temporary mask and disposition.
         resources.set_signal_interrupt_errno(Errno::EINTR);
 
+        // A masked call's entry and end under the gate (A5 step 3c.1e A,
+        // `temporary_mask_forms::TemporaryMaskCall`: IR-23 and D37's R2).
+        // Boxed, and `None` with the gate off, so the gate-off future stays
+        // its size.
+        let mut masked: Option<Box<temporary_mask_forms::TemporaryMaskCall>> = None;
         // Every exit, including a `?` on a guest-memory write, must reach the mask
         // restore below, so the loop runs in its own async block.
         let result: Result<i64, Error> = {
@@ -1501,12 +1584,55 @@ impl<T: RecordOrReplay> Detcore<T> {
             let resources = &mut resources;
             let published = &mut published;
             let deliver_under_temporary_mask = &mut deliver_under_temporary_mask;
+            let masked = &mut masked;
             async move {
+                // Under the gate a masked call's first probe and its check run
+                // in the call's own turn (see `entry` above); an unmasked one,
+                // which has no entry rule, requests before each probe as
+                // `select` does (round-2 ruling 4).
+                let mut first_turn = in_turn_first;
+                let mut deadline = deadline;
+                let mut deferred = deferred;
+                // The at-entry set of the first check, from the entry before
+                // the first timerfd publication (`TemporaryMaskCall::enter`),
+                // and the deadline, observed after the first probe and check
+                // (`observe_deadline`; round-3 ruling 1), or at the entry with
+                // an armed virtual timerfd (IR-23(c)).
+                if in_turn_first && let Some(mask) = sigmask {
+                    let call = Box::pin(temporary_mask_forms::TemporaryMaskCall::enter(
+                        guest, mask, deferred,
+                    ))
+                    .await?;
+                    if call.observes_deadline_at_entry() {
+                        deadline = call.entry_deadline().map(|(_, deadline)| deadline);
+                        deferred = None;
+                    }
+                    *masked = Some(Box::new(call));
+                }
+                let mut entry = masked.as_deref().map(|call| call.entry());
+                macro_rules! settle_deadline {
+                    () => {
+                        if deferred.is_some() {
+                            deadline = Box::pin(temporary_mask_forms::observe_deadline(
+                                guest,
+                                deferred.take(),
+                            ))
+                            .await
+                            .map(|(_, deadline)| deadline);
+                        }
+                    };
+                }
                 loop {
-                    let signaled = matches!(
-                        resource_request(guest, resources.clone()).await,
-                        ResumeStatus::Signaled(_)
-                    );
+                    let in_turn = first_turn;
+                    if !in_turn && let Some(call) = masked.as_deref_mut() {
+                        call.note_request();
+                    }
+                    let signaled = !in_turn
+                        && matches!(
+                            resource_request(guest, resources.clone()).await,
+                            ResumeStatus::Signaled(_)
+                        );
+                    first_turn = false;
                     // Virtual timerfds first (`crate::syscalls::timerfd`).
                     let next_timerfd =
                         crate::syscalls::timerfd::publish_expired_in(guest, Some(timerfd_scratch))
@@ -1539,7 +1665,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // the wait gets EBADF, where Linux reports it ready. Without the
                     // kernel's signal state, a scheduler `Signaled` answer still ends
                     // the call before the probe.
-                    if signals.is_none() && signaled {
+                    if signals.is_none() && signaled && !gated {
                         self.write_pselect6_remaining(guest, call, deadline).await?;
                         return Err(Errno::EINTR.into());
                     }
@@ -1577,7 +1703,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                         } else {
                             Ok(())
                         };
+                        settle_deadline!();
                         self.write_pselect6_remaining(guest, call, deadline).await?;
+                        // D37's R2 as the result is decided, before the yield
+                        // (A5 step 3c.1e A).
+                        let decided: Result<i64, Error> = match &result {
+                            Ok(count) => Ok(*count),
+                            Err(errno) => Err((*errno).into()),
+                        };
+                        if let Some(call) = masked.as_deref_mut()
+                            && let Err(error) = Box::pin(call.finish(guest, &decided)).await
+                        {
+                            break Err(error);
+                        }
+                        if in_turn {
+                            // Boxed: the gate-off future stays its size.
+                            Box::pin(temporary_mask_forms::yield_after_in_turn_result(guest)).await;
+                        }
                         copy_result?;
                         break result.map_err(Into::into);
                     }
@@ -1586,6 +1728,47 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // `Signaled` answer is only a hint here; the kernel's state decides.
                     // pselect6 returns ERESTARTNOHAND: EINTR after a handler, a restart
                     // with the remaining timeout after a stop.
+                    if gated {
+                        let ends = match sigmask {
+                            Some(mask) => {
+                                // Boxed: the gate-off future stays its size.
+                                let check =
+                                    Box::pin(crate::syscalls::helpers::temporary_mask_check(
+                                        guest,
+                                        mask,
+                                        entry.take(),
+                                        false,
+                                    ))
+                                    .await;
+                                if let (Ok(check), Some(call)) = (&check, masked.as_deref_mut()) {
+                                    call.note_check(*check);
+                                }
+                                match check {
+                                    Ok(crate::syscalls::helpers::TemporaryMaskCheck::Waits) => None,
+                                    Ok(crate::syscalls::helpers::TemporaryMaskCheck::Fatal) => {
+                                        Some(Errno::ERESTARTNOHAND)
+                                    }
+                                    Ok(_) => Some(Errno::EINTR),
+                                    Err(error) => break Err(error),
+                                }
+                            }
+                            None => match crate::syscalls::helpers::gated_wait_ends(guest, None) {
+                                Ok(true) => Some(Errno::ERESTARTNOHAND),
+                                Ok(false) => None,
+                                Err(error) => break Err(error),
+                            },
+                        };
+                        settle_deadline!();
+                        if let Some(errno) = ends {
+                            self.write_pselect6_remaining(guest, call, deadline).await?;
+                            break Err(errno.into());
+                        }
+                        resources.poll_deadline = crate::syscalls::timerfd::poll_deadline_with(
+                            guest,
+                            deadline,
+                            next_timerfd,
+                        );
+                    }
                     if let Some(signals) = signals.as_ref() {
                         match signals.interrupted_with_state() {
                             Ok((false, _)) => {}
@@ -1633,6 +1816,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
             .await
+        };
+        // D37's R2 at any other end of a masked call (A5 step 3c.1e A); a
+        // no-op once it ran before a yield, and with the gate off.
+        let result = match masked.as_deref_mut() {
+            Some(call) => match Box::pin(call.finish(guest, &result)).await {
+                Ok(()) => result,
+                Err(error) => Err(error),
+            },
+            None => result,
         };
         let result = match &mut signals {
             Some(signals) => {
@@ -1856,6 +2048,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_exceptfds(exceptfds)
             .with_timeout(Some(probe_timeout));
 
+        // Under the in-guest delivery gate (A5 step 3c.1d, D50 reader (4)): a
+        // turn that finds nothing ready decides from the thread's `/proc`
+        // status under the mask it published, its own (`gated_wait_ends`).
+        let gated = self.cfg.in_guest_signal_delivery;
         let mut resources = Resources::new(guest.thread_state().dettid);
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.fyi("select");
@@ -1906,7 +2102,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // the wait gets EBADF, where Linux reports it ready. Without the
                     // kernel's signal state, a scheduler `Signaled` answer still ends
                     // the call before the probe.
-                    if signals.is_none() && signaled {
+                    if signals.is_none() && signaled && !gated {
                         self.write_select_remaining(guest, call, deadline).await?;
                         return Err(Errno::EINTR.into());
                     }
@@ -1952,6 +2148,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // `Signaled` answer is only a hint here; the kernel's state decides.
                     // select returns ERESTARTNOHAND: EINTR after a handler, a restart
                     // with the remaining timeout after a stop.
+                    if gated {
+                        match crate::syscalls::helpers::gated_wait_ends(guest, None) {
+                            Ok(true) => {
+                                self.write_select_remaining(guest, call, deadline).await?;
+                                break Err(Errno::ERESTARTNOHAND.into());
+                            }
+                            Ok(false) => {}
+                            Err(error) => break Err(error),
+                        }
+                    }
                     if let Some(signals) = signals.as_ref() {
                         match signals.interrupted_with_state() {
                             Ok((false, _)) => {}
@@ -2046,6 +2252,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Ppoll,
     ) -> Result<i64, Error> {
+        // A masked ppoll under the in-guest delivery gate (A5 step 3c.1d, D50
+        // reader (5)): `gated_masked_ppoll`, which reads the timeout itself.
+        if self.cfg.in_guest_signal_delivery
+            && call.sigmask().is_some()
+            && !ppoll_uses_kernel_wait(self.cfg.sequentialize_threads, self.cfg.recordreplay_modes)
+        {
+            return Box::pin(self.gated_masked_ppoll(guest, call)).await;
+        }
         let timeout_address = call.timeout();
         let timeout = match timeout_address {
             Some(timeout) => Some(ppoll_timeout_duration(guest.memory().read_value(timeout)?)?),
@@ -2578,9 +2792,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(0)
         } else {
             print_poll(&call);
-            Ok(self
+            let result = self
                 .record_or_replay_blocking(guest, Syscall::Poll(call))
-                .await?)
+                .await;
+            kernel_poll_result(&call, result)
         }
     }
 
@@ -2669,6 +2884,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         // of its temporary mask (`Resources::blocked_signal_mask`).
         if call.sigmask().is_some() && self.cfg.recordreplay_modes && call.timeout() != 0 {
             return self.record_or_replay_masked_epoll_pwait(guest, call).await;
+        }
+        // Under the in-guest delivery gate (A5 step 3c.1d, D39) a masked call
+        // polls with no mask on its probes and decides under its temporary
+        // mask, with D37's EINTR exception; a zero timeout makes one maskless
+        // probe (`gated_masked_epoll_pwait`; IR-9).
+        if call.sigmask().is_some()
+            && self.cfg.sequentialize_threads
+            && self.cfg.in_guest_signal_delivery
+        {
+            return Box::pin(self.gated_masked_epoll_pwait(guest, call)).await;
         }
         if call.sigmask().is_some()
             && call.timeout() != 0
@@ -2936,6 +3161,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         // epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize)
         let (_, args) = call.into_parts();
+        // Under the in-guest delivery gate (A5 step 3c.1d, D39), as a masked
+        // epoll_pwait (`gated_masked_epoll_pwait2`), whose D41 check comes
+        // before anything else, the observation and the timeout's read below
+        // included (round-2 ruling 3); its mask's read is then the call's
+        // first injection.
+        if !self.cfg.recordreplay_modes
+            && self.cfg.sequentialize_threads
+            && args.arg4 != 0
+            && self.cfg.in_guest_signal_delivery
+        {
+            return Box::pin(self.gated_masked_epoll_pwait2(guest, args, true)).await;
+        }
         // The call's first injection, if it makes one; when it does not, the
         // mask's read below is the first.
         let observed = self
@@ -3329,9 +3566,74 @@ impl<T: RecordOrReplay> Detcore<T> {
             .into_iter()
             .collect();
         self.refuse_sending_virtual_timerfds(guest, &headers);
-        let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
+        // The placeholder descriptions it sends, counted in flight, and what
+        // each attempt checks again, or its refusal by name
+        // (`Detcore::inspect_placeholder_send`).
+        let (copies, outside_turn) = match self
+            .inspect_send_placeholders(guest, Sysno::sendmsg, call.fd(), &headers, call)
+            .await
+        {
+            Ok(inspected) => inspected,
+            Err(refusal) => return refusal,
+        };
+        let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+        guest.thread_state_mut().send_inspection = None;
+        if outside_turn
+            && Self::may_send_placeholders(guest)
+            && let Some(refusal) =
+                Box::pin(self.placeholder_send_after(guest, Sysno::sendmsg, call.fd())).await
+        {
+            return refusal;
+        }
+        if result.is_err() && !copies.is_empty() {
+            let _ = crate::tool_global::placeholder_copies(
+                guest,
+                crate::procfs::locks::PlaceholderCopies::Unsent(copies),
+            )
+            .await;
+        }
+        let result = result?;
         guest.thread_state().forget_flock_modes();
         Ok(result)
+    }
+
+    /// The placeholder step of a send `call` (`sysno`, on `socket`), whose
+    /// messages' headers are at the guest addresses `headers`, where its
+    /// `SCM_RIGHTS` descriptors can matter to the `/proc` directories Detcore
+    /// serves (`Detcore::may_send_placeholders`): the inspection
+    /// (`Detcore::inspect_placeholder_send`), kept for the attempts the call
+    /// makes (`ThreadState::send_inspection`), with the descriptions it
+    /// counted in flight, or the refusal by name; and, for every send,
+    /// whether the call runs outside this thread's turn in a run that
+    /// sequentializes threads (a blocking call), after which
+    /// `Detcore::placeholder_send_after` checks what joined the table. The
+    /// inspection is boxed: only a send that may pass a placeholder carries
+    /// it.
+    async fn inspect_send_placeholders<G, C>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        socket: RawFd,
+        headers: &[usize],
+        call: C,
+    ) -> Result<(Vec<crate::types::OpenFileId>, bool), Result<i64, Error>>
+    where
+        G: Guest<Self>,
+        C: SyscallInfo + Into<Syscall> + Copy,
+    {
+        // Without sequentialized threads no thread has a turn: every check
+        // Detcore makes may race the guest's other threads, that mode's named
+        // residual, which a refusal here would not narrow.
+        let outside_turn =
+            self.cfg.sequentialize_threads && self.nonblockable_call_runs_outside_turn(guest, call);
+        if !Self::may_send_placeholders(guest) {
+            return Ok((Vec::new(), outside_turn));
+        }
+        let (copies, inspection) =
+            Box::pin(self.inspect_placeholder_send(guest, sysno, socket, headers, outside_turn))
+                .await?;
+        guest.thread_state_mut().send_inspection = Some(inspection);
+        Ok((copies, outside_turn))
     }
 
     /// Mark every accept-in-turn listener (`DetFd::is_accept_in_turn_eligible`)
@@ -3409,7 +3711,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 /// The descriptors the messages at `headers` name in `SCM_RIGHTS`, and
 /// whether a header or control buffer could not be read in full, in which case
 /// the list may be incomplete (`mark_exported_listeners`).
-fn sent_descriptors<T, G>(guest: &G, headers: &[usize]) -> (Vec<RawFd>, bool)
+pub(crate) fn sent_descriptors<T, G>(guest: &G, headers: &[usize]) -> (Vec<RawFd>, bool)
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
@@ -3479,7 +3781,26 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .collect()
         });
         self.refuse_sending_virtual_timerfds(guest, &headers);
-        let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
+        // A placeholder sent in a batch is refused by name: which of its
+        // messages the batch sent is not known (`descriptor_directory`). Each
+        // attempt checks again that the batch passes none.
+        let outside_turn = match self
+            .inspect_send_placeholders(guest, Sysno::sendmmsg, call.sockfd(), &headers, call)
+            .await
+        {
+            Ok((_, outside_turn)) => outside_turn,
+            Err(refusal) => return refusal,
+        };
+        let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+        guest.thread_state_mut().send_inspection = None;
+        if outside_turn
+            && Self::may_send_placeholders(guest)
+            && let Some(refusal) =
+                Box::pin(self.placeholder_send_after(guest, Sysno::sendmmsg, call.sockfd())).await
+        {
+            return refusal;
+        }
+        let result = result?;
         if result > 0 {
             guest.thread_state().forget_flock_modes();
         }
@@ -3516,10 +3837,80 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(timestamp)
     }
 
+    /// Receive one message, then record the descriptors it received over
+    /// `SCM_RIGHTS` (`Detcore::record_received_descriptors`) and read their
+    /// locks (`Detcore::refresh_description_locks`). Both read only the
+    /// control bytes Linux reports writing, at the control buffer the
+    /// message named before the call (`ReceiveGeometry`).
+    pub async fn handle_recvmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Recvmsg,
+    ) -> Result<i64, Error> {
+        let discovered = self.discovers_received_descriptors(guest);
+        let wanted = !discovered || self.cfg.virtualize_time;
+        let in_turn = self.receipt_is_observable(guest, call);
+        Self::begin_receive_geometry(guest, wanted, &Syscall::Recvmsg(call));
+        let result = self.receive_one_message(guest, call).await;
+        let geometry = guest.thread_state_mut().receive_geometry.take().flatten();
+        let result = result?;
+        let delivered = geometry
+            .map(|geometry| geometry.delivered(&guest.memory(), result))
+            .unwrap_or_default();
+        let cloexec =
+            Syscall::Recvmsg(call).into_parts().1.arg2 as i32 & libc::MSG_CMSG_CLOEXEC != 0;
+        let recorded = self
+            .record_received_descriptors(guest, &delivered, in_turn, cloexec)
+            .await;
+        // Where the tool discovers received descriptors, recvmsg's refresh
+        // covers every descriptor delivered, as before; elsewhere only those
+        // this receipt recorded.
+        let refreshed = if discovered {
+            delivered.fds.as_slice()
+        } else {
+            recorded.as_slice()
+        };
+        self.refresh_received_locks(guest, refreshed, super::files::LockCall::Recvmsg)
+            .await?;
+        Ok(result)
+    }
+
+    /// Keep the input geometry of `call` (a `recvmsg` or `recvmmsg`) in the
+    /// thread state when `wanted`: read here, at entry, and again before each
+    /// attempt of the internal polling loop, so that the geometry the caller
+    /// takes when the call returns is that of the attempt that completed
+    /// (`ThreadState::receive_geometry`).
+    fn begin_receive_geometry<G: Guest<Self>>(guest: &mut G, wanted: bool, call: &Syscall) {
+        guest.thread_state_mut().receive_geometry =
+            wanted.then(|| ReceiveGeometry::before(&guest.memory(), call));
+    }
+
+    /// A descriptor received over `SCM_RIGHTS` that Detcore models joins
+    /// this process's table in `procfs::locks::LockLedger` with whatever OFD
+    /// or flock locks its description holds, and is marked as received, so
+    /// that a lock change through it invalidates the identity the sender's
+    /// tables know the description by. One Detcore keeps no model of (not
+    /// recorded, `Detcore::record_received_descriptors`) is left out, so its
+    /// locks are hidden once no modelled table names the description (a
+    /// named residual).
+    async fn refresh_received_locks<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fds: &[RawFd],
+        call: super::files::LockCall,
+    ) -> Result<(), Error> {
+        if self.cfg.virtualize_time {
+            for &fd in fds {
+                self.refresh_description_locks(guest, fd, call).await?;
+            }
+        }
+        Ok(())
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-901)
     /// Receive one message and replace host socket timestamps with logical time.
-    pub async fn handle_recvmsg<G: Guest<Self>>(
+    async fn receive_one_message<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Recvmsg,
@@ -3562,16 +3953,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         let now = self.observe_socket_receive(guest, call.sockfd()).await?;
         let mut control = vec![0; control_len];
         guest.memory().read_exact(control_address, &mut control)?;
-        // A descriptor received over `SCM_RIGHTS` that Detcore models (an
-        // in-guest backend discovers it as it is used) joins this process's
-        // table in `procfs::locks::LockLedger` with whatever OFD or flock
-        // locks its description holds. One Detcore keeps no model of (ptrace)
-        // is left out, so its locks are hidden once no modelled table names
-        // the description (a named residual).
-        for fd in received_descriptors(&control) {
-            self.refresh_description_locks(guest, fd, super::files::LockCall::Recvmsg)
-                .await?;
-        }
         if socket_timestamp_messages(&control).is_empty() {
             return Ok(result);
         }
@@ -3862,10 +4243,38 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(result)
     }
 
+    /// Receive a message batch, then record the descriptors it received over
+    /// `SCM_RIGHTS` (`Detcore::record_received_descriptors`) and read their
+    /// locks, as for `recvmsg`.
+    pub async fn handle_recvmmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Recvmmsg,
+    ) -> Result<i64, Error> {
+        let wanted = !self.discovers_received_descriptors(guest);
+        let in_turn = self.receipt_is_observable(guest, call);
+        Self::begin_receive_geometry(guest, wanted, &Syscall::Recvmmsg(call));
+        let result = self.receive_message_batch(guest, call).await;
+        let geometry = guest.thread_state_mut().receive_geometry.take().flatten();
+        let result = result?;
+        let delivered = geometry
+            .map(|geometry| geometry.delivered(&guest.memory(), result))
+            .unwrap_or_default();
+        let cloexec =
+            Syscall::Recvmmsg(call).into_parts().1.arg3 as i32 & libc::MSG_CMSG_CLOEXEC != 0;
+        let recorded = self
+            .record_received_descriptors(guest, &delivered, in_turn, cloexec)
+            .await;
+        // Only the descriptors this receipt recorded.
+        self.refresh_received_locks(guest, &recorded, super::files::LockCall::Recvmmsg)
+            .await?;
+        Ok(result)
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-901)
     /// Receive a message batch and replace every host socket timestamp with logical time.
-    pub async fn handle_recvmmsg<G: Guest<Self>>(
+    async fn receive_message_batch<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Recvmmsg,
@@ -3954,6 +4363,35 @@ mod tests {
                 assert_eq!(call.timeout(), 1);
             }
         });
+    }
+
+    #[test]
+    fn a_kernel_poll_without_a_deadline_restarts_by_running_again() {
+        let restart_block = || Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK));
+        for timeout in [0, -1] {
+            let call = syscalls::Poll::new().with_timeout(timeout);
+            assert!(matches!(
+                kernel_poll_result(&call, restart_block()),
+                Err(Error::Errno(Errno::ERESTARTNOHAND))
+            ));
+        }
+        // A positive timeout keeps its deadline in the kernel's restart block.
+        let timed = syscalls::Poll::new().with_timeout(5);
+        assert!(matches!(
+            kernel_poll_result(&timed, restart_block()),
+            Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK))
+        ));
+        // Every other result is the call's own.
+        let zero = syscalls::Poll::new().with_timeout(0);
+        assert!(matches!(kernel_poll_result(&zero, Ok(2)), Ok(2)));
+        assert!(matches!(
+            kernel_poll_result(&zero, Err(Error::Errno(Errno::EINTR))),
+            Err(Error::Errno(Errno::EINTR))
+        ));
+        assert!(matches!(
+            kernel_poll_result(&zero, Err(Error::Errno(Errno::ERESTARTSYS))),
+            Err(Error::Errno(Errno::ERESTARTSYS))
+        ));
     }
 
     #[test]

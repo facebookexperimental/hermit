@@ -38,6 +38,12 @@
 //! ([`retire_inherited_keeping_shared_inputs`]): [`adopt`] checks every object
 //! against the manifest and keeps the descriptors from reaching the guest.
 //!
+//! With `--in-guest-exec-stop`, this SAME holder retains the actual mapped
+//! runtime image/package and adds the typed schema-3 envelope. An optional
+//! native declaration remains on its existing capture path.
+//! Each child adopts the inherited package through the existing RetainedImage;
+//! no resource path is opened again and no second holder is started.
+//!
 //! Stdin is not part of the manifest. The pair program hands each run its own
 //! open file description of the frozen bytes by reopening
 //! `/proc/self/fd/0`, so every run reads them from the start whether the runs
@@ -164,6 +170,75 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
         "shared-input path encoding differs from manifest schema"
     );
     Ok(manifest)
+}
+
+// Schema 3 is an envelope around an UNCHANGED schema-1/2 sealed input set.
+// Its two fixed package members are original regular files, authenticated by
+// RetainedImage's original identity/byte contract, never a seal exemption for
+// an arbitrary role. These records confer no runtime/source qualification.
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetainedPackageFileMeta {
+    pub(crate) state: [u64; 8],
+    pub(crate) sha256: String,
+}
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MappedPackageMeta {
+    pub(crate) image: RetainedPackageFileMeta,
+    pub(crate) descriptor: RetainedPackageFileMeta,
+}
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MappedPackageManifest {
+    schema: u32,
+    sealed: Manifest,
+    package: MappedPackageMeta,
+    image_fd: RawFd,
+    descriptor_fd: RawFd,
+}
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+fn decode_with_mapped_package(bytes: &[u8]) -> Result<(Manifest, Option<MappedPackageManifest>)> {
+    // The final concrete decoder still denies unknown fields and schemas.
+    // A schema probe changes no legacy schema or sealed-role validation.
+    #[derive(Deserialize)]
+    struct Version {
+        schema: u32,
+    }
+    if serde_json::from_slice::<Version>(bytes)?.schema != 3 {
+        return Ok((decode_manifest(bytes)?, None));
+    }
+    let mut envelope: MappedPackageManifest = serde_json::from_slice(bytes)?;
+    ensure!(
+        envelope.schema == 3,
+        "unknown mapped package manifest schema"
+    );
+    let sealed = decode_manifest(&serde_json::to_vec(&envelope.sealed)?)?;
+    // Move the sealed objects into the original adoption path once.
+    envelope.sealed.objects.clear();
+    Ok((sealed, Some(envelope)))
+}
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+fn package_fd_set(
+    package: &MappedPackageManifest,
+    manifest_fd: RawFd,
+) -> Result<std::collections::BTreeSet<RawFd>> {
+    let mut seen = std::collections::BTreeSet::new();
+    for fd in [package.image_fd, package.descriptor_fd] {
+        ensure!(
+            fd > 2 && fd != manifest_fd && !NATIVE_RESERVED_FDS.contains(&fd) && seen.insert(fd),
+            "mapped package descriptor is reserved, aliased or duplicated"
+        );
+        // SAFETY: F_GETFD queries the descriptor before ownership is adopted.
+        ensure!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
+            "mapped package descriptor is closed"
+        );
+    }
+    Ok(seen)
 }
 
 /// Plain sealed files, the set the holder seals from `--input ROLE:PATH`.
@@ -325,18 +400,48 @@ pub struct VerifyInputsOpts {
     #[clap(long = "input", value_name = "ROLE:PATH")]
     inputs: Vec<String>,
 
+    /// Retain the mapped runtime package once for the existing pair program.
+    /// Each child must explicitly adopt it; this grants no entry authority.
+    #[clap(long)]
+    in_guest_exec_stop: bool,
+
     /// Capture the declared native cohort once for the existing pair program.
     #[cfg(feature = "native-exec")]
     #[clap(long, conflicts_with = "inputs", value_name = "DECLARATION")]
     native_exec_declaration: Option<PathBuf>,
 
-    /// The pair program and its arguments.
-    #[clap(last = true, required = true)]
+    /// The pair program and its arguments, after the options; a `--` before
+    /// it is accepted and not needed. Without one, the first `--` of the whole
+    /// command line stays the one inside the pair program (the run's guest
+    /// separator), which is where readers of a recorded command line look for
+    /// the end of Hermit's options.
+    #[clap(trailing_var_arg = true, required = true)]
     program: Vec<String>,
 }
 
 impl VerifyInputsOpts {
+    // The holder captures and exports one input set. Selection changes only
+    // launch-specific file roles; both variants use the existing sealed owner.
+    fn capture_objects(
+        &self,
+        inputs: &[(String, PathBuf)],
+    ) -> Result<(String, Vec<(SharedObjectMeta, OwnedFd)>)> {
+        #[cfg(feature = "native-exec")]
+        if let Some(declaration) = &self.native_exec_declaration {
+            ensure!(
+                !self.in_guest_exec_stop,
+                "exec-stop-runtime-not-ready: native successor verification is not admitted"
+            );
+            return super::native_exec_cli::Capture::prepare_shared(declaration)?.export();
+        }
+        SealedFiles::seal(inputs)?.export()
+    }
     pub fn main(&self) -> Result<hermit::ExitStatus> {
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        ensure!(
+            !self.in_guest_exec_stop,
+            "exec-stop-launcher-not-compiled: mapped verify-inputs requires the loader feature"
+        );
         ensure!(
             self.manifest_fd > 2 && !NATIVE_RESERVED_FDS.contains(&self.manifest_fd),
             "--manifest-fd {} must be above 2 and outside the native adapter's reserved {}-{}",
@@ -358,20 +463,25 @@ impl VerifyInputsOpts {
                 Ok((role.to_string(), PathBuf::from(path)))
             })
             .collect::<Result<Vec<_>>>()?;
+        // Authenticate resources once, before consuming real stdin. The
+        // inherited original OFDs, not later path discovery, serve both runs.
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        let image = self
+            .in_guest_exec_stop
+            .then(super::mapped_first_admission::RetainedImage::open)
+            .transpose()?;
         let stdin = freeze_stdin(super::startup_stdin()?)?;
-        #[cfg(feature = "native-exec")]
-        let (producer, objects) = if let Some(declaration) = &self.native_exec_declaration {
-            super::native_exec_cli::Capture::prepare_shared(declaration)?.export()?
+        let (producer, objects) = self.capture_objects(&inputs)?;
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        let bytes = if let Some(image) = image {
+            encode_with_mapped_package(producer, objects, self.manifest_fd, image)?
         } else {
-            SealedFiles::seal(&inputs)?.export()?
+            serde_json::to_vec(&place(producer, objects, self.manifest_fd)?)?
         };
-        #[cfg(not(feature = "native-exec"))]
-        let (producer, objects) = SealedFiles::seal(&inputs)?.export()?;
-        let manifest = place(producer, objects, self.manifest_fd)?;
-        let (manifest_fd, _, _) = seal_into_memfd(
-            c"hermit-shared-inputs-manifest",
-            &mut serde_json::to_vec(&manifest)?.as_slice(),
-        )?;
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        let bytes = serde_json::to_vec(&place(producer, objects, self.manifest_fd)?)?;
+        let (manifest_fd, _, _) =
+            seal_into_memfd(c"hermit-shared-inputs-manifest", &mut bytes.as_slice())?;
         inherit_at(stdin, libc::STDIN_FILENO)?;
         inherit_at(manifest_fd, self.manifest_fd)?;
         let error = Command::new(&self.program[0])
@@ -401,20 +511,7 @@ fn place(
     };
     let mut placed = Vec::with_capacity(objects.len());
     for (meta, fd) in objects {
-        let mut raw = fd.as_raw_fd();
-        let mut owned = fd;
-        while raw <= 2 || raw == manifest_fd || NATIVE_RESERVED_FDS.contains(&raw) {
-            // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor at or above the
-            // given number; the old one closes when `owned` is replaced.
-            let next = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, raw.max(205)) };
-            if next < 0 {
-                return Err(std::io::Error::last_os_error()).context("F_DUPFD_CLOEXEC");
-            }
-            // SAFETY: `next` is the new descriptor fcntl returned.
-            owned = unsafe { OwnedFd::from_raw_fd(next) };
-            raw = next;
-        }
-        set_cloexec(raw, false)?;
+        let (raw, owned) = place_object_fd(fd, manifest_fd)?;
         placed.push(ManifestObject {
             path: if schema == 1 {
                 ManifestPath::Utf8(
@@ -447,15 +544,77 @@ fn place(
     })
 }
 
+// Shared placement for sealed objects and the two typed original package
+// files; both remain owned until their manifest entries are constructed.
+fn place_object_fd(fd: OwnedFd, manifest_fd: RawFd) -> Result<(RawFd, OwnedFd)> {
+    let mut raw = fd.as_raw_fd();
+    let mut owned = fd;
+    while raw <= 2 || raw == manifest_fd || NATIVE_RESERVED_FDS.contains(&raw) {
+        // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor at or above the
+        // given number; the old one closes when `owned` is replaced.
+        let next = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, raw.max(205)) };
+        if next < 0 {
+            return Err(std::io::Error::last_os_error()).context("F_DUPFD_CLOEXEC");
+        }
+        // SAFETY: `next` is the new descriptor fcntl returned.
+        owned = unsafe { OwnedFd::from_raw_fd(next) };
+        raw = next;
+    }
+    set_cloexec(raw, false)?;
+    Ok((raw, owned))
+}
+
+/// Encode the existing holder's input manifest with one retained package.
+/// Consumes the holder's image after exporting its original OFDs. The caller
+/// seals these bytes with its original manifest producer; neither child run
+/// may re-discover a resource path.
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+pub(crate) fn encode_with_mapped_package(
+    producer: String,
+    objects: Vec<(SharedObjectMeta, OwnedFd)>,
+    manifest_fd: RawFd,
+    image: super::mapped_first_admission::RetainedImage,
+) -> Result<Vec<u8>> {
+    ensure!(
+        manifest_fd > 2 && !NATIVE_RESERVED_FDS.contains(&manifest_fd),
+        "invalid pair manifest descriptor"
+    );
+    let (package, files) = image.export_pair_inputs()?;
+    // Only the exported references survive to the pair. Drop the original
+    // holder descriptors before its caller installs the manifest at a number
+    // that could have belonged to one of those original descriptors.
+    drop(image);
+    let [image, descriptor] = files;
+    let sealed = place(producer, objects, manifest_fd)?;
+    let (image_fd, image) = place_object_fd(image, manifest_fd)?;
+    let (descriptor_fd, descriptor) = place_object_fd(descriptor, manifest_fd)?;
+    let envelope = MappedPackageManifest {
+        schema: 3,
+        sealed,
+        package,
+        image_fd,
+        descriptor_fd,
+    };
+    let bytes = serde_json::to_vec(&envelope)?;
+    // Same inheritable lifetime as the original place(): the pair exec owns
+    // them, and each run adopts its inherited references before retirement.
+    std::mem::forget(image);
+    std::mem::forget(descriptor);
+    Ok(bytes)
+}
+
 /// The pair's frozen stdin: the bytes the existing stdin snapshot owner would
 /// replay (`hermit::reserve_output_stdin_snapshot`), sealed, so neither run can
 /// see the caller change them. A terminal or an absent stdin is `/dev/null`,
-/// as there.
+/// as there, and so is the null device itself: it holds no bytes to freeze,
+/// and an empty sealed file in its place would change what each guest finds
+/// at its standard input (a regular file, not the character device a run
+/// without the holder gives it).
 fn freeze_stdin(stdin: Option<File>) -> Result<OwnedFd> {
     let Some(mut stdin) = stdin.filter(|file| {
         // SAFETY: isatty only queries the descriptor.
         let terminal = unsafe { libc::isatty(file.as_raw_fd()) } == 1;
-        !terminal
+        !terminal && !is_null_device(file)
     }) else {
         return Ok(File::open("/dev/null")?.into());
     };
@@ -466,6 +625,16 @@ fn freeze_stdin(stdin: Option<File>) -> Result<OwnedFd> {
     Ok(fd)
 }
 
+/// Whether `file` is the null device (character device 1:3, Linux
+/// Documentation/admin-guide/devices.txt).
+fn is_null_device(file: &File) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().is_ok_and(|metadata| {
+        metadata.file_type().is_char_device() && metadata.rdev() == libc::makedev(1, 3)
+    })
+}
+
 /// The inputs a run adopted from `--native-exec-shared-inputs`, checked
 /// against the manifest and kept from the guest.
 #[derive(Debug)]
@@ -473,21 +642,101 @@ pub(crate) struct AdoptedInputs {
     producer: String,
     manifest: OwnedFd,
     objects: Vec<(SharedObjectMeta, OwnedFd)>,
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    mapped_package: Option<super::mapped_first_admission::RetainedImage>,
 }
 
 impl AdoptedInputs {
     /// Hand the checked objects to their owner's [`SharedInputs::adopt`].
     #[allow(dead_code)] // The native-exec consumer is the first caller.
     pub(crate) fn into_inputs<T: SharedInputs>(self) -> Result<T> {
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        ensure!(
+            self.mapped_package.is_none(),
+            "mapped package must be explicitly retained before consuming inputs"
+        );
         T::adopt(&self.producer, self.objects)
+    }
+
+    /// The set `hermit verify-inputs --input ROLE:PATH...` would hand a run,
+    /// sealed here in-process, for tests of what a run does with it.
+    #[cfg(test)]
+    pub(crate) fn sealed_for_test(inputs: &[(String, PathBuf)]) -> Result<Self> {
+        let (producer, objects) = SealedFiles::seal(inputs)?.export()?;
+        Ok(Self {
+            producer,
+            manifest: File::open("/dev/null")?.into(),
+            objects,
+            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            mapped_package: None,
+        })
+    }
+
+    /// Whether the holder sealed an object for `role`.
+    pub(crate) fn has_role(&self, role: &str) -> bool {
+        self.objects.iter().any(|(meta, _)| meta.role == role)
+    }
+
+    /// The bytes of the one object the holder sealed (`hermit verify-inputs
+    /// --input ROLE:PATH`) for `role`, or `None` when the set has none. That
+    /// object must come from [`SealedFiles`] and record `path`, so a role
+    /// cannot stand for a different file.
+    pub(crate) fn read_role(&self, role: &str, path: &std::path::Path) -> Result<Option<Vec<u8>>> {
+        let mut found = self.objects.iter().filter(|(meta, _)| meta.role == role);
+        let Some((meta, fd)) = found.next() else {
+            return Ok(None);
+        };
+        ensure!(
+            found.next().is_none(),
+            "the shared inputs seal the role {role:?} more than once"
+        );
+        ensure!(
+            self.producer == SealedFiles::PRODUCER,
+            "the shared input {role:?} comes from {:?}, not {:?}",
+            self.producer,
+            SealedFiles::PRODUCER
+        );
+        ensure!(
+            meta.path.as_deref() == Some(path),
+            "the shared input {role:?} records {:?}, not {}",
+            meta.path,
+            path.display()
+        );
+        // A fresh open description: its own offset, from the start.
+        let mut bytes = Vec::new();
+        File::open(format!("/proc/self/fd/{}", fd.as_raw_fd()))?.read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 == meta.size,
+            "the shared input {role:?} read {} bytes, not its sealed {}",
+            bytes.len(),
+            meta.size
+        );
+        Ok(Some(bytes))
+    }
+    /// Presence DATA only, so callers can reject a mapped package in a
+    /// non-mapped domain before retaining unrelated generic inputs.
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    pub(crate) fn has_mapped_package(&self) -> bool {
+        self.mapped_package.is_some()
+    }
+    /// Transfer the original image owner once; native/ordinary sealed inputs
+    /// remain here for their existing consumer. Missing/repeated take refuses.
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    pub(crate) fn take_mapped_package(
+        &mut self,
+    ) -> Result<super::mapped_first_admission::RetainedImage> {
+        self.mapped_package
+            .take()
+            .context("shared mapped package missing or already taken")
     }
 }
 
-/// Read and check the manifest at `manifest_fd` and every object it names:
-/// each must be open, carry its recorded seals and at least
-/// [`REQUIRED_SEALS`], and have its recorded size and sha256. Every adopted
-/// descriptor, the manifest's included, becomes close-on-exec, so none
-/// reaches the guest.
+/// Read and check the sealed manifest and its original sealed objects:
+/// every original object must carry its recorded seals and at least
+/// [`REQUIRED_SEALS`], with the recorded size and sha256. A schema-3 envelope
+/// additionally delegates its two original regular files to RetainedImage's
+/// exact identity/byte/package validation. Every adopted descriptor, including
+/// the manifest and package, becomes close-on-exec and is kept from the guest.
 pub(crate) fn adopt(manifest_fd: RawFd) -> Result<AdoptedInputs> {
     ensure!(
         manifest_fd > 2 && !NATIVE_RESERVED_FDS.contains(&manifest_fd),
@@ -507,7 +756,17 @@ pub(crate) fn adopt(manifest_fd: RawFd) -> Result<AdoptedInputs> {
     let manifest_owner = unsafe { OwnedFd::from_raw_fd(manifest_fd) };
     let mut bytes = Vec::new();
     File::open(format!("/proc/self/fd/{manifest_fd}"))?.read_to_end(&mut bytes)?;
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    let (manifest, package) = decode_with_mapped_package(&bytes)?;
+    #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
     let manifest = decode_manifest(&bytes)?;
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    let mut seen = package
+        .as_ref()
+        .map(|package| package_fd_set(package, manifest_fd))
+        .transpose()?
+        .unwrap_or_default();
+    #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
     let mut seen = std::collections::BTreeSet::new();
     let mut objects = Vec::with_capacity(manifest.objects.len());
     for object in manifest.objects {
@@ -547,10 +806,29 @@ pub(crate) fn adopt(manifest_fd: RawFd) -> Result<AdoptedInputs> {
         };
         objects.push((meta, owned));
     }
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    let mapped_package = package
+        .map(|package| {
+            let files = [package.image_fd, package.descriptor_fd].map(|fd| {
+                set_cloexec(fd, true)?;
+                // SAFETY: package_fd_set checked live, unique descriptors distinct
+                // from the manifest and every original sealed object.
+                Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+            });
+            let [image, descriptor]: [Result<OwnedFd>; 2] = files;
+            super::mapped_first_admission::RetainedImage::adopt_pair_inputs(
+                package.package,
+                [image?, descriptor?],
+            )
+            .map_err(anyhow::Error::from)
+        })
+        .transpose()?;
     Ok(AdoptedInputs {
         producer: manifest.producer,
         manifest: manifest_owner,
         objects,
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        mapped_package,
     })
 }
 
@@ -563,6 +841,10 @@ static ENTRY_ADOPTION: std::sync::Mutex<Option<(RawFd, Result<AdoptedInputs>)>> 
 /// The descriptor a raw command line passes as `--native-exec-shared-inputs`
 /// before its first `--`, which ends Hermit's own options. Only the two exact
 /// spellings clap accepts count; anything else is left to clap to refuse.
+///
+/// The holder (`hermit verify-inputs`) takes no such flag, and its pair
+/// program follows its options without a `--`: the scan stops at that
+/// subcommand, so the flag of a run inside the program is not the holder's.
 fn shared_inputs_fd_in(argv: &[std::ffi::OsString]) -> Option<String> {
     const FLAG: &[u8] = b"--native-exec-shared-inputs";
     // Other operands (including the declaration path) are opaque Unix bytes.
@@ -570,7 +852,7 @@ fn shared_inputs_fd_in(argv: &[std::ffi::OsString]) -> Option<String> {
     let mut words = argv.iter().skip(1).map(|word| word.as_bytes());
     while let Some(word) = words.next() {
         match word {
-            b"--" => return None,
+            b"--" | b"verify-inputs" => return None,
             word if word == FLAG => {
                 return words
                     .next()
@@ -614,6 +896,10 @@ pub(crate) fn retire_inherited_keeping_shared_inputs(
     if let Some((_, Ok(adopted))) = entry.as_ref() {
         kept.push(adopted.manifest.as_fd());
         kept.extend(adopted.objects.iter().map(|(_, object)| object.as_fd()));
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        if let Some(package) = &adopted.mapped_package {
+            kept.extend(package.pair_fds());
+        }
     }
     retire(&kept)
 }
@@ -643,6 +929,314 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_cli_entry_keeps_default_admission_order_and_adopts_mapped_once() {
+        // Exercise the real CLI-entry adoption and top-level dispatch. These
+        // empty sealed inputs need no runtime fixture and never start a guest.
+        // The host callback stops dispatch after checking the ownership order.
+        let install = |backend: &str, explicit: bool| {
+            let manifest = Manifest {
+                schema: 2,
+                producer: SealedFiles::PRODUCER.into(),
+                objects: Vec::new(),
+            };
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            let (fd, _, _) = seal_into_memfd(c"entry-order-test", &mut bytes.as_slice()).unwrap();
+            // Use the holder's legal range even when the test process already
+            // has many descriptors open. CLI entry becomes the sole owner.
+            // SAFETY: fcntl borrows the live memfd and returns a new descriptor.
+            let fd = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 205) };
+            assert!(fd >= 205);
+            let mut argv: Vec<std::ffi::OsString> = [
+                "hermit",
+                backend,
+                "run",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--verify-run=/unused/entry-order",
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+            argv.push(format!("--native-exec-shared-inputs={fd}").into());
+            if explicit {
+                argv.push("--in-guest-exec-stop".into());
+            }
+            argv.extend(["--".into(), "/bin/true".into()]);
+            retire_inherited_keeping_shared_inputs(&argv, |kept| {
+                assert_eq!(kept.len(), 1);
+                assert_eq!(kept[0].as_raw_fd(), fd);
+                Ok(())
+            })
+            .unwrap();
+            (super::super::Args::try_parse_from(argv).unwrap(), fd)
+        };
+        let (mut args, fd) = install("--backend=ptrace", false);
+        let called = std::cell::Cell::new(false);
+        let error = args
+            .command
+            .main_with_host_admission(&args.global, |_| {
+                assert!(
+                    ENTRY_ADOPTION.lock().unwrap().is_some(),
+                    "omitted loader flag keeps main's host-admission order"
+                );
+                called.set(true);
+                Err(anyhow::Error::new(std::io::Error::from_raw_os_error(
+                    libc::ECANCELED,
+                )))
+            })
+            .unwrap_err();
+        assert!(called.get());
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(libc::ECANCELED)
+        );
+        let super::super::Subcommand::Run(run) = &mut args.command else {
+            unreachable!()
+        };
+        // RunOpts::main performs the same preparation for direct callers. The
+        // already transferred owner survives that preparation; no second take.
+        run.adopt_verification_inputs().unwrap();
+        run.adopt_verification_inputs().unwrap();
+        assert!(
+            take_adopted(fd)
+                .unwrap_err()
+                .to_string()
+                .contains("was not adopted at entry")
+        );
+        drop(args);
+
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        {
+            // A wrong backend must retain its typed refusal before consuming
+            // even an ordinary holder. Cover top-level and direct entry.
+            for direct in [false, true] {
+                let (mut args, fd) = install("--backend=ptrace", true);
+                let error = if direct {
+                    let super::super::Subcommand::Run(run) = &mut args.command else {
+                        unreachable!()
+                    };
+                    run.main(&args.global).unwrap_err()
+                } else {
+                    args.command
+                        .main_with_host_admission(&args.global, |_| {
+                            panic!("wrong-backend mapped request reached host admission")
+                        })
+                        .unwrap_err()
+                };
+                assert!(
+                    error.is::<super::super::container::PolicyRefusal>(),
+                    "{error:#}"
+                );
+                assert!(error.to_string().contains("exec-stop-runtime-not-ready"));
+                assert!(
+                    ENTRY_ADOPTION.lock().unwrap().is_some(),
+                    "option refusal must precede taking the holder's entry"
+                );
+                drop(take_adopted(fd).unwrap());
+                assert!(ENTRY_ADOPTION.lock().unwrap().is_none());
+            }
+
+            // Omission keeps ordinary preload admission. An explicit loader
+            // request must refuse this ordinary manifest before host admission.
+            for explicit in [false, true] {
+                let (mut args, fd) = install("--backend=in-guest-trap", explicit);
+                let called = std::cell::Cell::new(false);
+                let error = args
+                    .command
+                    .main_with_host_admission(&args.global, |_| {
+                        if explicit {
+                            panic!("a missing mapped package must not reach host admission");
+                        }
+                        assert!(
+                            ENTRY_ADOPTION.lock().unwrap().is_some(),
+                            "omitted loader flag keeps main's host-admission order"
+                        );
+                        called.set(true);
+                        Err(anyhow::Error::new(std::io::Error::from_raw_os_error(
+                            libc::ECANCELED,
+                        )))
+                    })
+                    .unwrap_err();
+                assert_eq!(called.get(), !explicit);
+                if explicit {
+                    assert!(
+                        format!("{error:#}")
+                            .contains("shared mapped package missing or already taken")
+                    );
+                } else {
+                    assert_eq!(
+                        error
+                            .downcast_ref::<std::io::Error>()
+                            .and_then(std::io::Error::raw_os_error),
+                        Some(libc::ECANCELED)
+                    );
+                    let super::super::Subcommand::Run(run) = &mut args.command else {
+                        unreachable!()
+                    };
+                    run.adopt_verification_inputs().unwrap();
+                    run.adopt_verification_inputs().unwrap();
+                }
+                assert!(ENTRY_ADOPTION.lock().unwrap().is_none());
+                assert!(
+                    take_adopted(fd)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("was not adopted at entry")
+                );
+            }
+        }
+    }
+
+    #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+    #[test]
+    fn mapped_holder_without_feature_refuses_before_stdin_or_program() {
+        let opts = VerifyInputsOpts::try_parse_from([
+            "verify-inputs",
+            "--in-guest-exec-stop",
+            "--manifest-fd=197",
+            "--",
+            "/nonexistent/must-not-run",
+        ])
+        .unwrap();
+        let error = opts.main().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exec-stop-launcher-not-compiled"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn holder_plain_capture_still_exports_exact_sealed_input_roles() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("data");
+        std::fs::write(&path, b"original DATA").unwrap();
+        let opts = VerifyInputsOpts::try_parse_from([
+            "verify-inputs",
+            "--manifest-fd",
+            "197",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let (producer, objects) = opts
+            .capture_objects(&[("data".into(), path.clone())])
+            .unwrap();
+        assert_eq!(producer, SealedFiles::PRODUCER);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].0.path, Some(path.clone()));
+        assert_eq!(objects[0].0.role, "data");
+        assert_eq!(objects[0].0.seals & REQUIRED_SEALS, REQUIRED_SEALS);
+        std::fs::write(&path, b"replacement").unwrap();
+        assert_eq!(
+            sha256_of_fd(objects[0].1.as_raw_fd()).unwrap(),
+            (13, *detcore::Digest::new(b"original DATA"))
+        );
+    }
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    fn numeric_package_envelope() -> serde_json::Value {
+        // Decoder DATA only: this does not model an executable package positive.
+        serde_json::json!({"schema":3,
+            "sealed":{"schema":2,"producer":"existing-owner","objects":[
+                {"path":null,"role":"existing-sealed-role","size":1,
+                 "sha256":"11".repeat(32),"seals":REQUIRED_SEALS,"fd":205}]},
+            "package":{"image":{"state":[1,2,3,4,5,6,7,8],"sha256":"22".repeat(32)},
+                       "descriptor":{"state":[9,10,11,12,13,14,15,16],"sha256":"33".repeat(32)}},
+            "image_fd":206,"descriptor_fd":207})
+    }
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[test]
+    fn package_envelope_preserves_legacy_schema_and_all_sealed_metadata() {
+        let value = numeric_package_envelope();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(decode_manifest(&bytes).is_err()); // Not a legacy seal exemption.
+        let (sealed, package) = decode_with_mapped_package(&bytes).unwrap();
+        assert_eq!(serde_json::to_value(sealed).unwrap(), value["sealed"]);
+        assert!(package.is_some());
+        let old = serde_json::to_vec(&value["sealed"]).unwrap();
+        assert!(decode_with_mapped_package(&old).unwrap().1.is_none());
+        for (schema, path) in [
+            (1, serde_json::Value::Null),
+            (2, serde_json::json!("/wrong-encoding")),
+            (3, serde_json::Value::Null),
+        ] {
+            let mut bad = value.clone();
+            bad["sealed"]["schema"] = schema.into();
+            bad["sealed"]["objects"][0]["path"] = path;
+            assert!(decode_with_mapped_package(&serde_json::to_vec(&bad).unwrap()).is_err());
+        }
+    }
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[test]
+    fn package_envelope_refuses_foreign_missing_duplicate_and_unknown_members() {
+        let value = numeric_package_envelope();
+        for key in ["package", "image_fd", "descriptor_fd", "sealed"] {
+            let mut bad = value.clone();
+            bad.as_object_mut().unwrap().remove(key);
+            assert!(decode_with_mapped_package(&serde_json::to_vec(&bad).unwrap()).is_err());
+        }
+        for field in ["image", "descriptor"] {
+            let mut bad = value.clone();
+            bad["package"].as_object_mut().unwrap().remove(field);
+            assert!(decode_with_mapped_package(&serde_json::to_vec(&bad).unwrap()).is_err());
+        }
+        for at in ["top", "package", "file"] {
+            let mut bad = value.clone();
+            match at {
+                "top" => bad["foreign"] = true.into(),
+                "package" => bad["package"]["runtime_override"] = true.into(),
+                _ => bad["package"]["image"]["ready"] = true.into(),
+            }
+            assert!(decode_with_mapped_package(&serde_json::to_vec(&bad).unwrap()).is_err());
+        }
+        let encoded = serde_json::to_string(&value).unwrap();
+        let duplicate = format!("{{\"schema\":3,{}", &encoded[1..]);
+        assert!(decode_with_mapped_package(duplicate.as_bytes()).is_err());
+        let mut unknown = value;
+        unknown["schema"] = 4.into();
+        assert!(decode_with_mapped_package(&serde_json::to_vec(&unknown).unwrap()).is_err());
+    }
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[test]
+    fn package_descriptors_require_distinct_live_nonreserved_numbers() {
+        let high_file = || {
+            let file = tempfile::tempfile().unwrap();
+            // SAFETY: obtain a new owned descriptor above all reserved slots.
+            let raw = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 205) };
+            assert!(raw >= 205);
+            // SAFETY: raw is the fresh duplicate returned above.
+            unsafe { OwnedFd::from_raw_fd(raw) }
+        };
+        let first = high_file();
+        let second = high_file();
+        let mut value = numeric_package_envelope();
+        value["image_fd"] = first.as_raw_fd().into();
+        value["descriptor_fd"] = second.as_raw_fd().into();
+        let decode = |value: &serde_json::Value| {
+            decode_with_mapped_package(&serde_json::to_vec(value).unwrap())
+                .unwrap()
+                .1
+                .unwrap()
+        };
+        let valid = decode(&value);
+        let numbers = package_fd_set(&valid, 197).unwrap();
+        assert_eq!(numbers.len(), 2);
+        assert!(numbers.contains(&first.as_raw_fd()));
+        let closed = high_file();
+        let closed_fd = closed.as_raw_fd();
+        drop(closed);
+        let mut bad = value.clone();
+        bad["descriptor_fd"] = closed_fd.into();
+        assert!(package_fd_set(&decode(&bad), 197).is_err());
+        for fd in [0, 1, 2, 197, 198, 204, first.as_raw_fd(), -1] {
+            let mut bad = value.clone();
+            bad["descriptor_fd"] = fd.into();
+            assert!(package_fd_set(&decode(&bad), 197).is_err());
+        }
+    }
+    #[test]
     fn a_sealed_input_keeps_the_bytes_it_was_sealed_with() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("input");
@@ -657,6 +1251,110 @@ mod tests {
         // A sealed object refuses writes.
         let mut file = File::from(fd.try_clone().unwrap());
         assert!(file.write_all(b"x").is_err());
+    }
+
+    // The run side of /etc/ld.so.cache sharing
+    // (https://github.com/rrnewton/hermit/issues/4693): the one object sealed
+    // for a role, from the plain-files producer, at the path the caller names.
+    #[test]
+    fn a_role_reads_its_one_sealed_object_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ld.so.cache");
+        std::fs::write(&path, b"sealed cache").unwrap();
+        let adopted = |producer: &str| {
+            let (_, objects) = SealedFiles::seal(&[("ld-so-cache".into(), path.clone())])
+                .unwrap()
+                .export()
+                .unwrap();
+            AdoptedInputs {
+                producer: producer.into(),
+                manifest: File::open("/dev/null").unwrap().into(),
+                objects,
+                #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+                mapped_package: None,
+            }
+        };
+        let inputs = adopted(SealedFiles::PRODUCER);
+        std::fs::write(&path, b"replaced on the host").unwrap();
+        assert_eq!(
+            inputs.read_role("ld-so-cache", &path).unwrap().as_deref(),
+            Some(&b"sealed cache"[..])
+        );
+        assert_eq!(inputs.read_role("absent", &path).unwrap(), None);
+        let elsewhere = dir.path().join("other");
+        assert!(inputs.read_role("ld-so-cache", &elsewhere).is_err());
+        assert!(
+            adopted("another-producer")
+                .read_role("ld-so-cache", &path)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_null_device_stays_the_null_device_and_a_file_is_frozen() {
+        use std::os::unix::fs::FileTypeExt;
+        let null = File::from(freeze_stdin(Some(File::open("/dev/null").unwrap())).unwrap());
+        assert!(is_null_device(&null));
+        assert!(null.metadata().unwrap().file_type().is_char_device());
+
+        let mut input = tempfile::tempfile().unwrap();
+        input.write_all(b"guest input").unwrap();
+        let frozen = freeze_stdin(Some(input)).unwrap();
+        assert_eq!(
+            seals_of(frozen.as_raw_fd()).unwrap() & REQUIRED_SEALS,
+            REQUIRED_SEALS
+        );
+        let mut bytes = Vec::new();
+        File::open(format!("/proc/self/fd/{}", frozen.as_raw_fd()))
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"guest input");
+    }
+
+    // The pair program follows the holder's options with or without a `--`,
+    // and every word of it -- its own `--` (the run's guest separator)
+    // included -- reaches the program unchanged.
+    #[test]
+    fn a_misspelled_holder_option_is_refused_not_run() {
+        let error = VerifyInputsOpts::try_parse_from([
+            "verify-inputs",
+            "--manifest-fd",
+            "9",
+            "--inptu",
+            "r:/p",
+            "bash",
+        ])
+        .expect_err("clap refuses an unknown option before the program");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn the_pair_program_follows_the_options_with_or_without_a_separator() {
+        let program = [
+            "bash",
+            "-c",
+            "script",
+            "name",
+            "--log",
+            "--",
+            "/bin/true",
+            "--x",
+        ];
+        let parse = |words: &[&str]| {
+            VerifyInputsOpts::try_parse_from(
+                ["verify-inputs", "--manifest-fd", "9", "--input", "r:/p"]
+                    .iter()
+                    .chain(words),
+            )
+            .unwrap()
+        };
+        for words in [&program[..], &[&["--"][..], &program[..]].concat()[..]] {
+            let opts = parse(words);
+            assert_eq!(opts.program, program, "{words:?}");
+            assert_eq!(opts.manifest_fd, 9);
+            assert_eq!(opts.inputs, ["r:/p"]);
+        }
     }
 
     #[test]
@@ -686,6 +1384,23 @@ mod tests {
             None
         );
         assert_eq!(scan(&["run", "--", "true"]), None);
+        // The holder's pair program is not Hermit's options.
+        assert_eq!(
+            scan(&[
+                "verify-inputs",
+                "--manifest-fd",
+                "9",
+                "bash",
+                "-c",
+                "x",
+                "hermit",
+                "run",
+                "--native-exec-shared-inputs=9",
+                "--",
+                "true",
+            ]),
+            None
+        );
     }
 
     #[test]

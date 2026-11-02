@@ -27,14 +27,6 @@ use crate::types::MmId;
 use crate::types::RcbTimeMultiplier;
 use crate::types::SigWrapper;
 
-/// Names the outer resource turn for a physically nonblocking, guest-internal pipe
-/// operation on a backend whose internal pipe turns are host-timed
-/// (`BackendCapabilities::internal_pipe_turns_are_host_timed`; today only SaBRe). Such a
-/// backend reports these inherited stdio pipes as device resources before Detcore's
-/// `InternalIOPolling` turn. The name is descriptive only: the log comparison counts these
-/// turns like any other.
-pub(crate) const HOST_TIMED_INTERNAL_PIPE_IO_FYI: &str = "sabre-internal-pipe-io";
-
 /// Identifies the strong one-turn yield issued before a task with a loopback peer performs
 /// a zero-timeout poll, on a backend whose loopback pollers yield to their peers
 /// (`BackendCapabilities::loopback_pollers_yield_to_peers`; today only SaBRe). The scheduler
@@ -52,6 +44,14 @@ pub(crate) const PAUSE_FYI: &str = "pause";
 /// which a cross-task signal that interrupts it ends before its deadline
 /// (`scheduler::sleep_signal`).
 pub(crate) const NANOSLEEP_FYI: &str = "nanosleep";
+
+/// Identifies the parked `rt_sigsuspend` of the in-guest delivery gate
+/// (`SleepUntil(INDEFINITE)`; A5 step 3c.1d, design D39): the scheduler ends
+/// it as it ends a `pause` (`scheduler::sleep_signal`), for a signal its
+/// temporary mask, which the request publishes (`blocked_signal_mask`), lets
+/// in. Phase 1's SIGALRM ledger never sees it: phase 1 refuses
+/// `rt_sigsuspend` in a process that handles SIGALRM.
+pub(crate) const RT_SIGSUSPEND_FYI: &str = "rt_sigsuspend";
 
 /// The SIGALRM action read in the owner turn of an emulated in-guest sleep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -749,6 +749,23 @@ pub struct Resources {
     /// Serde preserves the same positional and JSON payload bytes.
     #[serde(default)]
     pub(crate) callback_checkpoint: Option<Box<crate::preemptions::callback_history::Origin>>,
+    /// The recorded priority-history row a priority-change request ends,
+    /// under `Config::annotated_priority_replay`: the scheduler acknowledges
+    /// that row, and its checkpoint if it has one, when it selects the
+    /// request. `None` on every other request. Appended last, with no
+    /// skip_serializing_if, for the same positional RPCs.
+    #[serde(default)]
+    pub(crate) priority_row: Option<u64>,
+    /// Set on the request that ends a timeslice because the slice's time ran
+    /// out: its logical target, its PMU maximum, or a replayed slice end
+    /// (`Detcore::end_timeslice_with_checkpoint`). An explicit `sched_yield`
+    /// ends a slice too but is a syscall the guest asked for, so it is not
+    /// marked. Under `--cap-preemption-charge` the scheduler charges such a
+    /// turn at most the virtual time its thread ran since its previous turn
+    /// (`Scheduler::bump_global_time`). Appended last, like the fields above,
+    /// because `Resources` crosses positional RPCs.
+    #[serde(default)]
+    pub(crate) slice_expired: bool,
 }
 
 impl fmt::Debug for Resources {
@@ -813,6 +830,9 @@ impl fmt::Debug for Resources {
         if let Some(mask) = self.guest_signal_mask {
             debug.field("guest_signal_mask", &mask);
         }
+        if self.slice_expired {
+            debug.field("slice_expired", &true);
+        }
         debug.finish()
     }
 }
@@ -860,6 +880,8 @@ impl Resources {
             slice_boundary: None,
             guest_signal_mask: None,
             callback_checkpoint: None,
+            priority_row: None,
+            slice_expired: false,
         }
     }
 

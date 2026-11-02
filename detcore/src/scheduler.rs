@@ -11,9 +11,16 @@
 mod boundary_controller;
 mod boundary_replayer;
 pub(crate) mod child_exit_sigchld;
+#[cfg(test)]
+mod cpu_affinity_tests;
 pub(crate) mod discarded_at_send;
 #[cfg(test)]
 pub(crate) mod exec_teardown_tests;
+#[cfg(test)]
+mod gated_wait_tests;
+pub(crate) mod guest_mask_publication;
+#[cfg(test)]
+mod guest_mask_publication_tests;
 pub(crate) mod itimer_coalesce;
 pub(crate) mod parked;
 #[cfg(test)]
@@ -56,6 +63,9 @@ use detcore_model::happens_before::Strength;
 use detcore_model::happens_before::ThreadRef;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
+use detcore_model::syscall_histogram::SparseSyscallHistogram;
+use detcore_model::syscall_histogram::SyscallHistogram;
+use detcore_model::syscall_histogram::SyscallObservationScope;
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::Shared;
@@ -93,6 +103,9 @@ use tracing::warn;
 
 use crate::config::Config;
 use crate::config::RunsPostFork;
+use crate::cpu_set::CpuSet;
+use crate::cpu_set::TaskAffinity;
+use crate::cpu_set::TaskCpus;
 use crate::detlog_debug;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionWriter;
@@ -180,6 +193,22 @@ pub enum SchedResponse {
     InGuestFatalAlarm,
     // TODO: Time to exit, or an exit is already under way
     // Exit,
+}
+
+/// What the scheduler holds, under the in-guest delivery gate, for a thread
+/// whose latest request is a kernel-run call (`ResourceID::is_kernel_run_blocking`)
+/// and whose continuation turn has not been granted (A5 step 3c.1c, D44): the
+/// answer to `GlobalRequest::KernelRunTarget`. It travels in a bincode RPC,
+/// so it has no `skip_serializing_if`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelRunBlock {
+    /// The call is a vfork parent's wait (`BlockingVfork`), which Linux ends
+    /// only for a fatal signal that is not core-dumping.
+    pub vfork: bool,
+    /// The guest mask the request published (`Resources::guest_signal_mask`:
+    /// the call's temporary mask, or the thread's own), `None` when it
+    /// published none.
+    pub mask: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialOrd, PartialEq, Eq, Serialize, Deserialize)]
@@ -1171,6 +1200,15 @@ impl BackgroundReadSignals {
     }
 }
 
+/// The least virtual time between two timed poll upgrades
+/// (`Scheduler::upgrade_pollers_on_time`), whatever the maximum timeslice: a
+/// period near one turn charge would ready every filed retry at every pass
+/// and switch the pollers' backoff off. The period is also at least
+/// `POLLING_UPGRADE_INTERVAL` turn charges, so a round of readied retries,
+/// one turn per poller, cannot use it up before the queueing-operation
+/// interval would have upgraded anyway.
+const MIN_POLL_UPGRADE_PERIOD_NS: u64 = 200_000_000;
+
 /// The state for the deterministic scheduler.
 #[derive(Debug)]
 pub struct Scheduler {
@@ -1220,10 +1258,56 @@ pub struct Scheduler {
     /// The logical, global time consumed by actions that have been committed already.
     pub committed_time: LogicalTime,
 
-    /// The thread of the last committed turn, so that `bump_global_time` can
-    /// tell a signal delivery to the thread that was already running from one
-    /// that switches threads (<https://github.com/rrnewton/hermit/issues/4139>).
+    /// The thread of the last committed turn, not counting host-timed polling
+    /// retries or a schedule replay's own switch turns, so that
+    /// `bump_global_time` can tell a signal delivery to the thread that was
+    /// already running from one that switches threads
+    /// (<https://github.com/rrnewton/hermit/issues/4139>).
     previous_turn_tid: Option<DetTid>,
+
+    /// Whether the last committed turn (as for `previous_turn_tid`, not a
+    /// host-timed polling retry or a replay's switch turn) ended an expired timed wait
+    /// (`expired_wait_grant`), so that `bump_global_time` charges a run of
+    /// such turns once.
+    previous_turn_expired_wait: bool,
+
+    /// Whether a run of consecutive turns that end expired timed waits is
+    /// charged one scheduler turn (`bump_global_time`), as
+    /// `--expired-wait-charge` says (`Config::expired_wait_runs_charged_once`):
+    /// by default on outside race search and off under `--chaos` or a
+    /// heuristic that does not select by priority, where each expired wait
+    /// keeps its turn charge: the time those charges add stretches short
+    /// waits, and real sleep-ordered races in timing-sensitive tests
+    /// reproduced under chaos only with it (measured in rrnewton/hermit#4632).
+    /// A replay that leaves the option unset takes the value its record
+    /// states (`PreemptionRecord::expired_wait_runs_charged_once`), and a
+    /// recording stores it, so both charge alike.
+    expired_wait_runs_charged_once: bool,
+
+    /// The thread whose grant, in the turn just committed, ended a timed wait
+    /// at its deadline: a `FutexWait` answered `TimeOut`, or a sleep
+    /// (`SleepUntil` with a deadline, not a yield) already due. Set by
+    /// `unblock_guest`, taken by the next `bump_global_time`.
+    expired_wait_grant: Option<DetTid>,
+
+    /// A cached copy of the same (immutable) field in Config: charge a turn
+    /// that ends a timeslice at most the time its thread ran since its
+    /// previous turn (`Scheduler::preemption_charge_cap`).
+    cap_preemption_charge: bool,
+
+    /// Under `cap_preemption_charge`, each live thread's clock
+    /// (`GlobalTime::threads_duration`) when its last committed turn that was
+    /// neither a host-timed polling retry nor a schedule replay's switch turn
+    /// was granted, while the thread was still stopped at that turn's request
+    /// (`Scheduler::note_granted_turn`). Empty otherwise.
+    turn_clocks: BTreeMap<DetTid, LogicalTime>,
+
+    /// The cap on the charge of the turn granted last, when that turn ended
+    /// an expired timeslice: its thread and the virtual time the thread ran
+    /// in that slice (`Scheduler::note_granted_turn`). The charge is applied
+    /// at the next pass (`bump_global_time`), after the thread has already
+    /// run on, which is why the length is taken at the grant.
+    preemption_cap: Option<(DetTid, u64)>,
 
     /// INVARIANT: Thread IDs in `blocked` are absent from `run_queue`.
     pub blocked: BlockedPool,
@@ -1242,6 +1326,15 @@ pub struct Scheduler {
     /// against this record instead of the barrier. A new vfork by the same
     /// TID clears a stale record ([`Scheduler::begin_vfork_barrier`]).
     dead_vfork_parents: BTreeSet<DetTid>,
+    /// Vfork parents whose child was torn down before its registration
+    /// completed (it died before its first stop, or its registration was
+    /// refused), so it will never register. The barrier ends at the parent's
+    /// continuation, a point that does not depend on when the host reported
+    /// the teardown ([`Scheduler::record_unregistered_vfork_child_exit`]).
+    unregistered_vfork_child_exits: BTreeSet<DetTid>,
+    /// The `BlockingVfork` operation that began each vfork barrier, which a
+    /// child's teardown must name to end that barrier and no other.
+    vfork_barrier_ops: BTreeMap<DetTid, ExternalOpId>,
     /// Vfork parents that died while their registered child was still known
     /// to the scheduler. Their barrier is kept until the child's next release
     /// edge, which happens at a deterministic point: its `Exit` grant, its
@@ -1434,6 +1527,12 @@ pub struct Scheduler {
     /// the gate before step 3c.1f.
     in_guest_signal_delivery: bool,
 
+    /// The in-guest runtime's reserved signals
+    /// (`Config::in_guest_reserved_signals`), which never end a parked wait
+    /// under the gate (`gated_deliverable`): their `SigCgt` bit is the
+    /// runtime's handler, not a guest disposition.
+    in_guest_reserved_signals: u64,
+
     /// Signals that a host-timed source armed by a guest can post to a process,
     /// keyed by that process: no gated wait of the process ends for them
     /// (`host_timed_signals`). An entry is added in the turn of the call that
@@ -1548,6 +1647,24 @@ pub struct Scheduler {
     /// Set when step2a's valve expires; `sched_loop_inner` ends the run with
     /// it (`exit_on_scheduler_refusal`).
     vfork_barrier_refusal: Option<VforkBarrierRefusal>,
+
+    /// Under the in-guest delivery gate, each thread whose latest filed
+    /// request is a kernel-run call, until its continuation turn is granted
+    /// (A5 step 3c.1c, D44): recorded as the request is filed, in the
+    /// thread's own turn (`record_request_kernel_run`), and cleared when the
+    /// continuation is granted or the thread is retired, both ordered points.
+    /// It never reads which blocked pool holds the thread, which the
+    /// background harvest changes at moments host timing decides.
+    kernel_run_requests: BTreeMap<DetTid, KernelRunBlock>,
+
+    /// Set, under the in-guest delivery gate, when a signal the scheduler
+    /// sends would interrupt a thread blocked in a kernel-run call (D44's
+    /// arming assertion, `wake_signaled_guest_as`); `sched_loop_inner` ends
+    /// the run with it (`exit_on_scheduler_refusal`), rather than waiting, as
+    /// the release barrier's 30-second valve would where signal targets are
+    /// modelled, or holding the signal pending under the runtime's mask for
+    /// as long as the call blocks.
+    kernel_run_signal_refusal: Option<String>,
 
     /// When the SIGKILL fence started waiting for the current committed
     /// victims, in host time (`sigkill_retirement`).
@@ -1788,6 +1905,38 @@ pub struct Scheduler {
     /// take it too (`read_thread_blocked_mask_result`).
     saved_guest_sigmasks: BTreeMap<DetTid, u64>,
 
+    /// Under the in-guest delivery gate, the threads that have published
+    /// their own guest mask at a request (`record_request_guest_mask`), which
+    /// shows that their backend keeps the guest's mask apart from the
+    /// kernel's (IR-18): only for them does a rejoin that publishes nothing
+    /// leave the mask unknown. Empty with the gate off, and on every backend
+    /// before step 3c.1e B (no backend implements
+    /// `Guest::resume_signal_mask` yet).
+    own_mask_publishers: BTreeSet<DetTid>,
+
+    /// Under the in-guest delivery gate, the threads whose published guest
+    /// mask is unknown (IR-18, `guest_mask_publication::PublishedGuestMask`):
+    /// never also in `saved_guest_sigmasks`. Every scheduler-internal reader
+    /// takes such a thread as having published nothing; the `/proc` status
+    /// reader refuses by name. Empty with the gate off.
+    unknown_guest_sigmasks: BTreeSet<DetTid>,
+
+    /// Under the in-guest delivery gate, each thread's temporary-mask
+    /// publication in force (IR-23(a), `guest_mask_publication`): D37's held
+    /// masks, the committed-send window record, and what a withdrawal puts
+    /// back. Empty with the gate off.
+    temporary_mask_publications: BTreeMap<DetTid, guest_mask_publication::TemporaryMaskPublication>,
+
+    /// Under the in-guest delivery gate, the threads whose published guest
+    /// mask is a call's temporary mask rather than the guest's own: one a
+    /// request published for a call that sleeps under a temporary mask
+    /// (`Resources::blocked_signal_mask`), a temporary-mask publication
+    /// (IR-23(a)), or a rejoin from such a call. Fork-child seeding never
+    /// copies such a mask (`guest_mask_publication`,
+    /// `Scheduler::seed_child_guest_sigmask`): Linux's child copies its
+    /// creator's own mask. Empty with the gate off.
+    temporary_guest_sigmasks: BTreeSet<DetTid>,
+
     /// Each thread's mask as Detcore's signal-state copy holds it, published
     /// by the thread before each request that can let another thread run
     /// (A5 step 2b, `syscalls::signal_shadow::publish_mask`), where it is the
@@ -2012,6 +2161,15 @@ pub struct Scheduler {
     /// transferred incarnation began reporting under the same leader TID.
     transferred_exec_syscall_offsets: BTreeMap<DetTid, u64>,
 
+    /// Final syscall histogram reported by each thread when it deregisters,
+    /// kept exactly like `per_thread_syscalls`, whose counts are its totals.
+    /// Kept in the nonzero-only form: a dense histogram per exited thread
+    /// cost 14,784 bytes each until the run ended.
+    per_thread_syscall_histograms: BTreeMap<DetTid, SparseSyscallHistogram>,
+
+    /// The histograms behind `transferred_exec_syscall_offsets`.
+    transferred_exec_syscall_histograms: BTreeMap<DetTid, SparseSyscallHistogram>,
+
     /// A record of which preemptions occured on each thread.  Only used IF `--record-preemptions`
     /// was specified in the Config, otherwise this remains empty.
     pub preemption_writer: Option<PreemptionWriter>,
@@ -2027,6 +2185,15 @@ pub struct Scheduler {
     >,
     callback_checkpoint_desyncs: Vec<String>,
     pub(crate) callback_progress: BTreeMap<DetTid, crate::preemptions::callback_history::Progress>,
+    /// `Config::annotated_priority_replay`: the priority history replayed
+    /// carries callback checkpoints, consumed per thread in row order.
+    pub(crate) annotated_priority_replay: bool,
+    /// Under `annotated_priority_replay`, the next recorded row of each
+    /// thread whose priority-change request has not been selected yet.
+    priority_rows: BTreeMap<DetTid, u64>,
+    /// Under `annotated_priority_replay`, the threads whose start this run has
+    /// granted. A thread's history replays from its first row once only.
+    priority_births: BTreeSet<DetTid>,
 
     // New-format construction remains disabled until actual callback and
     // lifecycle integration is complete. Controller tests install it directly.
@@ -2080,6 +2247,19 @@ pub struct Scheduler {
     poll_deadlines: BTreeSet<(LogicalTime, DetTid)>,
     /// Each thread's entry in `poll_deadlines`.
     poll_deadline_of: BTreeMap<DetTid, LogicalTime>,
+    /// When the next timed poll upgrade is due (`upgrade_pollers_on_time`),
+    /// and the run queue's upgrade count when that was set: an upgrade the
+    /// queueing-operation interval runs first restarts the period. `None`
+    /// until the first scheduler pass.
+    next_timed_poll_upgrade: Option<(LogicalTime, u64)>,
+    /// The committed time `upgrade_pollers_on_time` last looked at: it looks
+    /// once per committed time.
+    timed_poll_upgrade_checked: Option<LogicalTime>,
+    /// The most virtual time between two poll upgrades
+    /// (`upgrade_pollers_on_time`): the maximum timeslice, but at least
+    /// `MIN_POLL_UPGRADE_PERIOD_NS` and `POLLING_UPGRADE_INTERVAL` turn
+    /// charges.
+    poll_upgrade_period: Duration,
     /// A cached copy of the same (immutable) field in Config.
     fuzz_futexes: bool,
     /// A cached copy of the same (immutable) field in Config. When set (and only
@@ -2203,6 +2383,50 @@ pub struct ThreadTree {
     /// Each nested task's pid in each namespace it belongs to, recorded at its
     /// creation (`pid_namespaces`).
     pub(crate) pid_namespaces: pid_namespaces::PidNamespaces,
+    /// Each task's name, Linux's `task_struct::comm` (`procfs::task_stat`),
+    /// which a rendered `/proc/<pid>/stat` shows where its guest threads are
+    /// not host tasks whose name the tool reads (`Detcore::comm_source`,
+    /// KVM): set after each
+    /// exec from the new image's `AT_EXECFN` (`Scheduler::set_task_comm`),
+    /// inherited by every new task from the task that created it, as
+    /// `copy_process` copies `comm`, and replaced by `PR_SET_NAME`. A task
+    /// with no entry has no recorded name (its process has not exec'd an
+    /// image Detcore saw). Entries are kept for the run, as the tree's own
+    /// entries are (about 40 bytes a task), and replaced when a number is
+    /// given out again.
+    task_comms: HashMap<DetTid, crate::procfs::task_stat::TaskComm>,
+    /// Each task's CPU affinity under `--virtual-cpus`, Linux's
+    /// `task_struct::cpus_mask`, where a `sched_setaffinity` narrowed it
+    /// (`Scheduler::set_cpu_affinity`); a task with no entry may run on every
+    /// virtual CPU. Inherited by every new task from the task that created
+    /// it, as `dup_task_struct` copies the mask, and kept by exec. Like
+    /// `task_comms`, entries are kept for the run and replaced when a number
+    /// is given out again. Without `--virtual-cpus` no `sched_setaffinity`
+    /// records one, so it stays empty.
+    cpu_affinities: HashMap<DetTid, CpuSet>,
+    /// Each task's home: how many tasks the run had created before it
+    /// ([`Self::cpu_homes_given`]), which places it among the CPUs it may run
+    /// on (`TaskCpus::current`), so tasks created one after another take the
+    /// CPUs in turn, as Linux places each new task on an idle CPU. Kept by
+    /// exec, and replaced when a number is given out again. Every task has
+    /// one; only `--virtual-cpus` reads it.
+    cpu_homes: HashMap<DetTid, u32>,
+    /// How many tasks the run has created, the next task's home.
+    cpu_homes_given: u32,
+    /// The guest-visible parent of each process whose real parent is outside
+    /// the guest's process tree, its own `getppid` answer
+    /// (`Scheduler::record_external_parent`): the run's root process, and a
+    /// process the root (or another such process) created with
+    /// `CLONE_PARENT`, which shares its creator's parent. That parent is the
+    /// container's init or a process outside its PID namespace (0), and does
+    /// not change during the run.
+    external_parents: HashMap<DetPid, i32>,
+    /// Each process's virtual soft `RLIMIT_RSS` where it is not
+    /// `RLIM_INFINITY`, every process's starting limit
+    /// (`Scheduler::set_rss_limit`), which a rendered `stat` shows (field
+    /// 25, `rsslim`) whoever reads it: copied to a forked child, kept by
+    /// exec, as Linux keeps `signal->rlim`.
+    rss_limits: HashMap<DetPid, u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2384,7 +2608,42 @@ impl ThreadTree {
         // Linux's copy_process starts every new task with no parent-death
         // signal; a reused tid does not keep the old task's.
         self.parent_death_signals.remove(&child_dettid);
+        // And with its creator's name (`dup_task_struct` copies `comm`); the
+        // root starts with none until its first image names it.
+        match self
+            .task_comms
+            .get(&parent_dettid)
+            .copied()
+            .filter(|_| parent_dettid != child_dettid)
+        {
+            Some(comm) => self.task_comms.insert(child_dettid, comm),
+            None => self.task_comms.remove(&child_dettid),
+        };
+        // And with its creator's CPU affinity (`dup_task_struct` copies
+        // `cpus_mask`).
+        match self
+            .cpu_affinities
+            .get(&parent_dettid)
+            .copied()
+            .filter(|_| parent_dettid != child_dettid)
+        {
+            Some(cpus) => self.cpu_affinities.insert(child_dettid, cpus),
+            None => self.cpu_affinities.remove(&child_dettid),
+        };
+        self.cpu_homes.insert(child_dettid, self.cpu_homes_given);
+        self.cpu_homes_given = self.cpu_homes_given.wrapping_add(1);
         if is_group_leader {
+            // A new process starts with its creator's resource limits
+            // (`copy_signal` copies `rlim`) and no recorded outside parent.
+            let creator = self.thread_to_leader.get(&parent_dettid).copied();
+            match creator
+                .filter(|_| parent_dettid != child_dettid)
+                .and_then(|creator| self.rss_limits.get(&creator).copied())
+            {
+                Some(limit) => self.rss_limits.insert(child_dettid, limit),
+                None => self.rss_limits.remove(&child_dettid),
+            };
+            self.external_parents.remove(&child_dettid);
             self.thread_group_leaders.insert(child_dettid);
             self.thread_to_leader.insert(child_dettid, child_dettid);
             // A reused pid starts with neither Linux attribute: the flag is
@@ -2564,6 +2823,20 @@ impl ThreadTree {
             Some(signal) => self.parent_death_signals.insert(leader, signal),
             None => self.parent_death_signals.remove(&leader),
         };
+        // The surviving task keeps its own name under the leader's tid until
+        // the exec's edge names the new image (`Scheduler::set_task_comm`).
+        match self.task_comms.remove(&former) {
+            Some(comm) => self.task_comms.insert(leader, comm),
+            None => self.task_comms.remove(&leader),
+        };
+        // So do its CPU affinity and home: exec does not move a task.
+        match self.cpu_affinities.remove(&former) {
+            Some(cpus) => self.cpu_affinities.insert(leader, cpus),
+            None => self.cpu_affinities.remove(&leader),
+        };
+        if let Some(home) = self.cpu_homes.remove(&former) {
+            self.cpu_homes.insert(leader, home);
+        }
     }
 
     /// `process`'s successful exec count (`exec_generations`).
@@ -3100,6 +3373,11 @@ async fn sched_loop_inner(
         // `step2_drain_prefix`.
         let vfork_refusal = sched.lock().unwrap().vfork_barrier_refusal.take();
         if let Some(refusal) = vfork_refusal {
+            exit_on_scheduler_refusal(&refusal);
+        }
+        // D44's arming assertion under the in-guest delivery gate.
+        let kernel_run_refusal = sched.lock().unwrap().kernel_run_signal_refusal.take();
+        if let Some(refusal) = kernel_run_refusal {
             exit_on_scheduler_refusal(&refusal);
         }
         // A SIGKILL whose victims' deaths or exit publications never arrived
@@ -3681,6 +3959,7 @@ pub async fn do_a_turn_blocking(
                                 timed_event_processed = state.step2b_process_timed(&global_time);
                             }
                             state.step2b_restore_due_pollers();
+                            state.upgrade_pollers_on_time();
                             if let Err(error) = state.select_parked_alarm() {
                                 state.fail_parked_selection(error);
                             }
@@ -3825,6 +4104,7 @@ pub(crate) async fn finish_selected_turn(
     // The logical COMMIT point for the turn is during step4:
     mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
     mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
+    mg.note_granted_turn(&rsrcs, &global_time);
     let requeue = mg.requeue_after(&rsrcs);
     mg.step6_reenquue(next_dtid, requeue);
     if let Some(call) = rsrcs.as_exit_syscall() {
@@ -4038,6 +4318,26 @@ impl Scheduler {
                 },
             ),
         };
+        // A replay that leaves `--expired-wait-charge` unset charges runs of
+        // expired timed waits as its record says (a record that does not say,
+        // older or written by an `each` run, by default race search, charged
+        // every wait); any
+        // other run as `Config::expired_wait_runs_charged_once` says. `hermit
+        // run` has refused an explicit value that disagrees with the record.
+        let replayed_record = cfg
+            .replay_schedule_from
+            .as_ref()
+            .or(cfg.replay_preemptions_from.as_ref());
+        let expired_wait_runs_charged_once = match replayed_record {
+            Some(path) if cfg.expired_wait_charge.is_none() && !cfg.recordreplay_modes => {
+                crate::preemptions::read_recorded_expired_wait_runs_charged_once(path)
+                    // A file that cannot be read fails the replay's own
+                    // loader: the schedule's just above, the preemptions'
+                    // in `tool_global` right after this.
+                    .unwrap_or(false)
+            }
+            _ => cfg.expired_wait_runs_charged_once(),
+        };
         // The strict verifier explicitly selects the complete protocol. Ordinary
         // producers and the recovery/editor path keep the legacy representation.
         let boundaries = cfg.strict_schedule_boundaries;
@@ -4045,7 +4345,10 @@ impl Scheduler {
             let writer = PreemptionWriter::new(cfg.record_preemptions_to.clone())
                 .with_epoch(cfg.epoch)
                 .with_pipe_wake_latency(cfg.pipe_wake_latency_in_effect())
-                .with_signal_state_copy(cfg.signal_state_copy);
+                .with_signal_state_copy(cfg.signal_state_copy)
+                .with_rng_seed(cfg.rng_seed())
+                .with_expired_wait_runs_charged_once(expired_wait_runs_charged_once)
+                .with_cap_preemption_charge(cfg.cap_preemption_charge);
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -4064,12 +4367,16 @@ impl Scheduler {
         Self {
             preemption_writer,
             callback_history_active: crate::preemptions::callback_history::recording_enabled(cfg)
+                || cfg.annotated_priority_replay
                 || callback_checkpoints
                     .values()
                     .any(|points| !points.is_empty()),
             callback_checkpoints,
             callback_checkpoint_desyncs: Vec::new(),
             callback_progress: BTreeMap::new(),
+            annotated_priority_replay: cfg.annotated_priority_replay,
+            priority_rows: BTreeMap::new(),
+            priority_births: BTreeSet::new(),
             replayer,
             boundary_replayer,
             boundary_stacktrace_events,
@@ -4086,6 +4393,18 @@ impl Scheduler {
             ),
             poll_deadlines: BTreeSet::new(),
             poll_deadline_of: BTreeMap::new(),
+            next_timed_poll_upgrade: None,
+            timed_poll_upgrade_checked: None,
+            poll_upgrade_period: Duration::from_nanos(
+                cfg.max_timeslice
+                    .map_or(0, std::num::NonZeroU64::get)
+                    .max(MIN_POLL_UPGRADE_PERIOD_NS)
+                    .max(
+                        cfg.scheduler_turn_charge()
+                            .unwrap_or(0)
+                            .saturating_mul(runqueue::POLLING_UPGRADE_INTERVAL),
+                    ),
+            ),
             run_queue: RunQueue::new(
                 cfg.sched_heuristic,
                 cfg.sched_seed(),
@@ -4099,12 +4418,20 @@ impl Scheduler {
             bg_action_pool: Default::default(),
             committed_time: Default::default(),
             previous_turn_tid: None,
+            previous_turn_expired_wait: false,
+            expired_wait_runs_charged_once,
+            expired_wait_grant: None,
+            cap_preemption_charge: cfg.cap_preemption_charge,
+            turn_clocks: BTreeMap::new(),
+            preemption_cap: None,
             blocked: Default::default(),
             vfork_barriers: Default::default(),
             background_entry_barriers: Default::default(),
             background_entry_valve: Duration::from_secs(30),
             vfork_registration_origins: Default::default(),
             dead_vfork_parents: Default::default(),
+            unregistered_vfork_child_exits: Default::default(),
+            vfork_barrier_ops: Default::default(),
             dead_parent_vfork_barriers: Default::default(),
             released_vfork_barriers: Default::default(),
             vfork_rejoin_edges: Default::default(),
@@ -4131,6 +4458,7 @@ impl Scheduler {
             pending_cross_task_signals: Default::default(),
             models_signal_targets: cfg.models_signal_targets(),
             in_guest_signal_delivery: cfg.in_guest_signal_delivery,
+            in_guest_reserved_signals: cfg.in_guest_reserved_signals,
             host_timed_signals: Default::default(),
             host_timed_signals_everywhere: startup_host_timed_signals(cfg),
             #[cfg(test)]
@@ -4158,6 +4486,8 @@ impl Scheduler {
             signaled_background_refusal: None,
             vfork_barrier_wait_since: None,
             vfork_barrier_refusal: None,
+            kernel_run_requests: Default::default(),
+            kernel_run_signal_refusal: None,
             sigkill_fence_wait_since: None,
             sigkill_fence_refusal: None,
             sigkill_fence_valve: Self::SIGKILL_FENCE_VALVE,
@@ -4228,6 +4558,10 @@ impl Scheduler {
             delivery_mask_override: None,
             signal_control_caller: None,
             saved_guest_sigmasks: Default::default(),
+            unknown_guest_sigmasks: Default::default(),
+            own_mask_publishers: Default::default(),
+            temporary_mask_publications: Default::default(),
+            temporary_guest_sigmasks: Default::default(),
             published_masks: Default::default(),
             published_dispositions: Default::default(),
             pending_real_time_expirations: Default::default(),
@@ -4265,6 +4599,8 @@ impl Scheduler {
             per_thread_timeslice: Default::default(),
             per_thread_syscalls: Default::default(),
             transferred_exec_syscall_offsets: Default::default(),
+            per_thread_syscall_histograms: Default::default(),
+            transferred_exec_syscall_histograms: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
             chaos: cfg.chaos,
@@ -4939,6 +5275,43 @@ impl Scheduler {
         result
     }
 
+    /// Under `--replay-schedule-from`, wake the thread the trace switches to
+    /// now if it is still in a timed wait whose deadline has passed, so it is
+    /// runnable when the next turn is chosen.
+    ///
+    /// A scheduler pass wakes at most one due timed waiter
+    /// (`step2b_process_timed`), so how many due waiters are runnable when a
+    /// turn is chosen depends on how many passes ran since their deadlines
+    /// passed. The recording's passes include its chaos change points and
+    /// slice ends, which the replay does not repeat, so a timed waiter the
+    /// recording had woken in an extra pass could still be waiting when the
+    /// replay switched to it. The switch then fell through to another
+    /// runnable thread, a desync ("expected to be running thread 5, but
+    /// running 7"). This is rare while every turn charges half a millisecond
+    /// and deadlines pass several passes early. Where a run of expired timed
+    /// waits is charged one turn (`expired_wait_runs_charged_once`), deadlines
+    /// pass as committed time creeps forward between the turns of that run,
+    /// often at the last turn before the switch. Waking the target at its
+    /// passed deadline is what the next pass would do anyway, just ahead of
+    /// the other due waiters, which the following passes wake as before.
+    fn wake_due_replay_target(&mut self, target: DetTid) {
+        if self.run_queue.contains_tid(target) {
+            return;
+        }
+        let Some(deadline) = self.blocked.timed_waiters.thread_deadline(target) else {
+            return;
+        };
+        if deadline > self.committed_time || deadline.is_indefinite() {
+            return;
+        }
+        self.blocked.timed_waiters.remove(target);
+        trace!(
+            "[replay] dtid {} woken at its passed deadline {} (committed {}) for the trace's switch",
+            target, deadline, self.committed_time
+        );
+        self.wake_timed_event(deadline, target);
+    }
+
     /// Verify that the event we're replaying matches what just happened.  Set up the next
     /// (replayed) event to run.  Return true if the current thread will keep running and false if
     /// it needs to be descheduled.
@@ -4977,6 +5350,7 @@ impl Scheduler {
                 replayer::ReplayAction::ContextSwitch(is_now, new_tid, timeslice_remaining) => {
                     self.requeue_with_new_priority(mytid, REPLAY_DEFERRED_PRIORITY);
                     self.requeue_with_new_priority(new_tid, REPLAY_FOREGROUND_PRIORITY);
+                    self.wake_due_replay_target(new_tid);
                     if !self.run_queue.contains_tid(new_tid) {
                         // If it is not yet in next_turns, that is because it was JUST spawned and
                         // hasn't showed up yet, but it will by the next scheduler turn.
@@ -5182,6 +5556,13 @@ impl Scheduler {
         self.release_vfork_child(*dtid, false);
         self.vfork_registration_origins.remove(dtid);
         self.saved_guest_sigmasks.remove(dtid);
+        if self.in_guest_signal_delivery {
+            self.unknown_guest_sigmasks.remove(dtid);
+            self.temporary_mask_publications.remove(dtid);
+            self.temporary_guest_sigmasks.remove(dtid);
+            self.own_mask_publishers.remove(dtid);
+        }
+        self.kernel_run_requests.remove(dtid);
         self.published_masks.remove(dtid);
         let retired = self
             .discarded_at_send
@@ -5201,6 +5582,7 @@ impl Scheduler {
         self.retire_parked_requests(*dtid);
 
         let _ = self.priorities.remove(dtid);
+        self.turn_clocks.remove(dtid);
         let first_removal = self.next_turns.contains_key(dtid);
         match self.next_turns.remove(dtid) {
             None => {
@@ -5822,10 +6204,17 @@ impl Scheduler {
         let former = reconnect.caller;
         let leader = reconnect.new_leader;
         let consumed_syscalls = self.per_thread_syscalls.get(&leader).copied().unwrap_or(0);
+        let consumed_histogram = self
+            .per_thread_syscall_histograms
+            .get(&leader)
+            .cloned()
+            .unwrap_or_default();
         let retired = self.reconnect_exec(reconnect, replay_resume);
         self.retired_transferred_exec_callers.insert(former);
         self.transferred_exec_syscall_offsets
             .insert(leader, consumed_syscalls);
+        self.transferred_exec_syscall_histograms
+            .insert(leader, consumed_histogram);
         retired
     }
 
@@ -6009,6 +6398,11 @@ impl Scheduler {
         }
         self.started_up.try_put(());
 
+        // The survivor's clock moves to the leader's identity
+        // (`GlobalTime::reassign_thread`), and so does its last turn's clock.
+        if let Some(clock) = self.turn_clocks.remove(&caller) {
+            self.turn_clocks.insert(new_leader, clock);
+        }
         self.logically_kill_thread(&caller, &detpid, pre_exec_mm);
         self.timeslices.remove(&caller);
         retired.push(caller);
@@ -6042,6 +6436,8 @@ impl Scheduler {
         self.dead_parent_vfork_barriers.remove(&parent);
         self.released_vfork_barriers.remove(&parent);
         self.vfork_rejoin_edges.remove(&parent);
+        self.unregistered_vfork_child_exits.remove(&parent);
+        self.vfork_barrier_ops.remove(&parent);
     }
 
     /// `parent` is being logically killed. With no child registered yet, its
@@ -6105,6 +6501,10 @@ impl Scheduler {
             .retain(|parent| self.vfork_barriers.contains_key(parent));
         self.vfork_rejoin_edges
             .retain(|parent| self.vfork_barriers.contains_key(parent));
+        self.unregistered_vfork_child_exits
+            .retain(|parent| self.vfork_barriers.contains_key(parent));
+        self.vfork_barrier_ops
+            .retain(|parent, _| self.vfork_barriers.contains_key(parent));
     }
 
     #[cfg(test)]
@@ -6397,6 +6797,7 @@ impl Scheduler {
         self.exec_incarnations.insert(tid, mm);
         self.deregistration_accounted.remove(&tid);
         self.transferred_exec_syscall_offsets.remove(&tid);
+        self.transferred_exec_syscall_histograms.remove(&tid);
         self.retired_transferred_exec_callers.remove(&tid);
     }
 
@@ -6686,15 +7087,78 @@ impl Scheduler {
     /// 18.16: the guest mask at the call's request). Its publication is
     /// recorded when the thread is readmitted, an ordered step-2 point
     /// (`keep_mask_for_continuation`).
+    ///
+    /// A request that publishes the thread's own mask (`Some`, with no
+    /// temporary mask and not unknown) shows that the backend keeps the
+    /// guest's mask apart from the kernel's for that thread
+    /// (`own_mask_publishers`, IR-18).
     pub(crate) fn record_request_guest_mask(&mut self, dettid: DetTid, rs: &Resources) -> bool {
-        self.in_guest_signal_delivery
-            && !rs.is_rejoin()
-            && self.set_saved_guest_sigmask(dettid, rs.guest_signal_mask)
+        if !self.in_guest_signal_delivery || rs.is_rejoin() {
+            return false;
+        }
+        let recorded = self.set_saved_guest_sigmask(dettid, rs.guest_signal_mask);
+        if recorded && Self::publishes_own_mask(rs) {
+            self.own_mask_publishers.insert(dettid);
+        }
+        if recorded && rs.guest_signal_mask.is_some() && rs.blocked_signal_mask.is_some() {
+            self.temporary_guest_sigmasks.insert(dettid);
+        }
+        recorded
+    }
+
+    /// Whether `rs` publishes its thread's own guest mask, which only a
+    /// backend that keeps the guest's mask apart from the kernel's
+    /// (`Guest::resume_signal_mask` is `Some`) can do: a mask, with no
+    /// temporary mask and not an unknown one.
+    fn publishes_own_mask(rs: &Resources) -> bool {
+        rs.guest_signal_mask.is_some()
+            && rs.blocked_signal_mask.is_none()
+            && !rs.blocked_signal_mask_unknown
+    }
+
+    /// Under the in-guest delivery gate only (A5 step 3c.1c, D44): as `rs` is
+    /// filed, in `dettid`'s own turn, record whether it is a kernel-run call
+    /// (`kernel_run_requests`), with the mask it published, or forget an
+    /// earlier record when it is any other request. A rejoin, which host
+    /// timing files while the thread is still outside the schedule, changes
+    /// nothing: the record holds until the continuation is granted
+    /// (`block_for_one_resource`). Returns whether a record is held.
+    pub(crate) fn record_request_kernel_run(&mut self, dettid: DetTid, rs: &Resources) -> bool {
+        if !self.in_guest_signal_delivery || rs.is_rejoin() {
+            return self.kernel_run_requests.contains_key(&dettid);
+        }
+        match rs.resources.keys().find(|rid| rid.is_kernel_run_blocking()) {
+            Some(rid) => {
+                self.kernel_run_requests.insert(
+                    dettid,
+                    KernelRunBlock {
+                        vfork: matches!(rid, ResourceID::BlockingVfork(_)),
+                        mask: rs.guest_signal_mask,
+                    },
+                );
+                true
+            }
+            None => {
+                self.kernel_run_requests.remove(&dettid);
+                false
+            }
+        }
+    }
+
+    /// The answer to `GlobalRequest::KernelRunTarget` (D44): what the
+    /// scheduler holds for `dettid` if its latest committed request is a
+    /// kernel-run call whose continuation turn has not been granted, read from
+    /// committed state alone (`kernel_run_requests`).
+    pub(crate) fn kernel_run_block(&self, dettid: DetTid) -> Option<KernelRunBlock> {
+        self.kernel_run_requests.get(&dettid).copied()
     }
 
     /// Record (`Some`) or clear (`None`) the mask Linux's `blocked` holds for
     /// `dettid` while its kernel `SigBlk` differs (`saved_guest_sigmasks`).
-    /// Returns false for a thread the scheduler no longer knows.
+    /// Returns false for a thread the scheduler no longer knows. Under the
+    /// in-guest delivery gate this new publication also ends an unknown mask
+    /// (IR-18) and supersedes a temporary-mask publication in force
+    /// (IR-23(a), `guest_mask_publication`); both are empty with the gate off.
     pub(crate) fn set_saved_guest_sigmask(&mut self, dettid: DetTid, mask: Option<u64>) -> bool {
         if !self.next_turns.contains_key(&dettid) {
             return false;
@@ -6703,6 +7167,11 @@ impl Scheduler {
             Some(mask) => self.saved_guest_sigmasks.insert(dettid, mask),
             None => self.saved_guest_sigmasks.remove(&dettid),
         };
+        if self.in_guest_signal_delivery {
+            self.unknown_guest_sigmasks.remove(&dettid);
+            self.temporary_guest_sigmasks.remove(&dettid);
+            self.forget_temporary_mask_publication(dettid);
+        }
         true
     }
 
@@ -7154,7 +7623,6 @@ impl Scheduler {
             !waiters.is_empty()
         });
         self.pending_run_queue_admissions.remove(dtid);
-        self.parked.exits_awaiting_permit.remove(dtid);
         self.chaos_passed_over.remove(dtid);
         self.forget_poll_deadline(*dtid);
         let _ = self.remove_futex_waiter(dtid);
@@ -7882,6 +8350,7 @@ impl Scheduler {
         }
         self.step2b_process_timed(global_time);
         self.step2b_restore_due_pollers();
+        self.upgrade_pollers_on_time();
         // A timed signal that just armed a background thread is followed by an
         // empty pass, so the barrier above requeues it at the top of the next
         // one whether or not its continuation is already posted.
@@ -8097,16 +8566,18 @@ impl Scheduler {
 
     /// Keep scheduling inside an active vfork until the parent can continue.
     /// Before child registration no guest may run; afterward step 3 selects the
-    /// child first (see [`Self::step3_peek`]). A failed clone reaches the parent
-    /// continuation without a child.
+    /// child first (see [`Self::step3_peek`]). A failed clone posts
+    /// `VforkFailed` instead of the parent's continuation and has no child.
     ///
-    /// On the ptrace backend the kernel keeps the vfork parent blocked inside the injected
-    /// `clone(2)` until the child execs or exits, so a registered child (barrier `Some`) is always
-    /// present by the time the parent posts its continuation; an unfulfilled barrier (`None`) at
-    /// that point therefore means the clone failed and the barrier must be dropped. On a backend
-    /// that defers the child spawn (see `defers_vfork_child_registration`, e.g. KVM) the
-    /// child registers only *after* the parent posts its continuation, so an unfulfilled barrier at
-    /// parent continuation means the child is still on its way and the barrier must be kept.
+    /// The child of a successful clone may register before or after the parent posts its
+    /// continuation (Reverie's backend contract, "When a `vfork` child registers": on ptrace the
+    /// kernel keeps the parent inside the injected `clone(2)` until the child execs or exits, so
+    /// the child has registered first; KVM starts the child only after the parent's call has
+    /// returned). So an unfulfilled barrier (`None`) at the parent's continuation means the child
+    /// is still on its way, and the barrier is kept until the child registers. A barrier
+    /// ends without a registered child only at `VforkFailed`, at the parent's exit, or at
+    /// the continuation once the child was torn down before registering
+    /// ([`Self::record_unregistered_vfork_child_exit`]).
     ///
     /// Two states make every pass skip its turn until a backend event arrives:
     /// a `Pending` barrier waits for its child's registration, and a
@@ -8124,7 +8595,6 @@ impl Scheduler {
     fn step2a_wait_for_vfork_barrier(&mut self) -> Result<(), SkipTurn> {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-1152): Review deferred vfork child registration.
-        let defers_registration = self.backend.defers_vfork_child_registration;
         let completed_parents: Vec<_> = self
             .vfork_barriers
             .iter()
@@ -8146,13 +8616,13 @@ impl Scheduler {
                             matches!(resource, ResourceID::BlockedExternalContinue(_))
                         });
                         // A failed injected clone is an explicit deterministic outcome: no child
-                        // can ever register, so cancel the barrier on every backend. Successful
-                        // deferred spawns retain the ordinary continuation and keep waiting.
-                        // At parent continuation, drop a fulfilled barrier as normal cleanup. An
-                        // unfulfilled barrier is a failed clone only when the backend kept the
-                        // parent blocked until the child registered; when the backend defers child
-                        // registration the child is still coming, so keep waiting.
-                        vfork_failed || (at_continue && (child_registered || !defers_registration))
+                        // can ever register, so cancel the barrier. At the parent's continuation,
+                        // drop a fulfilled barrier as normal cleanup; an unfulfilled one waits for
+                        // its child unless the child was torn down before it could register.
+                        vfork_failed
+                            || (at_continue
+                                && (child_registered
+                                    || self.unregistered_vfork_child_exits.contains(parent)))
                     }
                     _ => false,
                 };
@@ -8329,6 +8799,114 @@ impl Scheduler {
             self.poll_deadlines.remove(&(deadline, dettid));
             self.poll_deadline_of.remove(&dettid);
         }
+    }
+
+    /// Run a poll upgrade once `poll_upgrade_period` of virtual time has
+    /// passed without one: restore every backed-off poller to its normal
+    /// priority (`RunQueue::upgrade_pollers`), and make every queued live
+    /// poller's filed retry runnable at its next selection
+    /// (`ready_filed_retries`).
+    ///
+    /// A backed-off poller retries only when it is selected, and any runnable
+    /// thread is selected ahead of it. The queueing-operation interval
+    /// (`POLLING_UPGRADE_INTERVAL`) bounds that wait in scheduler activity,
+    /// not in time. A thread that runs whole timeslices without taking a turn,
+    /// a spin loop, adds about two queueing operations per slice, so a socket
+    /// or pipe reader whose data had arrived waited about 100 of the
+    /// spinner's slices, 10 to 20 s of virtual time, for its next retry. Now, at the end of the
+    /// slice in which the period runs out, such a poller is runnable at its
+    /// normal priority. Without chaos it retries next. Under chaos it competes
+    /// by priority, and once passed over at two change points the starvation
+    /// bound puts the changing thread behind it (`bound_chaos_starvation`).
+    /// A program whose queueing operations already upgrade within the period
+    /// sees no extra upgrade. When one runs, each queued poller costs at most
+    /// a skipped and a committed turn.
+    ///
+    /// Nothing is upgraded here under a schedule replayer, whose trace sets
+    /// the run queue (as for `ready_channel`); under `hermit record` and
+    /// `hermit replay` (`recordreplay_modes`), whose recordings must keep
+    /// replaying (as for `note_poll_deadline`); or under a heuristic that
+    /// picks threads regardless of priority, where a poller cannot starve.
+    ///
+    /// Determinism: the inputs are committed time, the run queue, its upgrade
+    /// count and the filed requests at the first scheduler pass that sees a
+    /// new committed time, after all threads have quiesced, so every run
+    /// upgrades at the same pass. Later passes at the same committed time,
+    /// whose number can depend on host timing (a skipped pass, the KVM loop's
+    /// refreshes), do not look again: an operation-count upgrade one of them
+    /// runs is seen at the next committed time, in every run alike. A thread a
+    /// committed decision doomed (`poller_is_doomed`) may still be queued or
+    /// not, at host-timed moments: its retry is not readied and it is not
+    /// counted in the INFO line, and once a SIGKILL's victim could not be
+    /// named no retry is readied at all, as for `ready_channel`.
+    fn upgrade_pollers_on_time(&mut self) {
+        if self.has_schedule_replay()
+            || self.recordreplay_modes
+            || !self.run_queue.is_priority_ordered()
+            || self.timed_poll_upgrade_checked == Some(self.committed_time)
+        {
+            return;
+        }
+        self.timed_poll_upgrade_checked = Some(self.committed_time);
+        let upgrades = self.run_queue.poll_upgrade_count();
+        if let Some((due, seen)) = self.next_timed_poll_upgrade
+            && seen == upgrades
+        {
+            if self.committed_time < due {
+                return;
+            }
+            let restored = self
+                .run_queue
+                .upgrade_pollers()
+                .into_iter()
+                .filter(|tid| !self.unresolved_sigkill && !self.poller_is_doomed(*tid))
+                .count();
+            let readied = if self.unresolved_sigkill {
+                0
+            } else {
+                self.ready_filed_retries()
+            };
+            if restored + readied > 0 {
+                info!(
+                    "[scheduler] poll upgrade after {:?} of virtual time without one: {} backed-off \
+                     pollers restored to their normal priority, {} filed retries made runnable",
+                    self.poll_upgrade_period, restored, readied
+                );
+            }
+        }
+        self.next_timed_poll_upgrade = Some((
+            self.committed_time + self.poll_upgrade_period,
+            self.run_queue.poll_upgrade_count(),
+        ));
+    }
+
+    /// Make the filed retry of every queued live poller runnable at its next
+    /// selection, as `ready_channel` does: that selection would otherwise
+    /// only defer it once more in step 4 and back it off again, a slice
+    /// later. Nothing has readied its descriptor, so the retry may fail; it
+    /// then files the next one, as any retry does. Answers how many it made
+    /// runnable.
+    fn ready_filed_retries(&mut self) -> usize {
+        let queued: Vec<DetTid> = self.run_queue.tids().copied().collect();
+        let mut readied = 0;
+        for tid in queued {
+            if self.poller_is_doomed(tid) {
+                continue;
+            }
+            let Some(request) = self
+                .next_turns
+                .get(&tid)
+                .and_then(|turn| turn.req.try_read())
+                .and_then(|request| request.as_ref().ok().cloned())
+                .filter(|rs| rs.poll_attempt > 0 && Self::is_polling_turn(rs))
+            else {
+                continue;
+            };
+            self.note_sigalrm_polling_wait(tid, &request);
+            self.upgrade_polled_to_runnable(tid, &request);
+            readied += 1;
+        }
+        readied
     }
 
     /// Check whether it is time for the *earliest* time-based event to execute INSTEAD of
@@ -9248,18 +9826,8 @@ impl Scheduler {
                 }
             }
         }
-        // A thread whose exit waits for a sibling's delivery permit
-        // (`exits_awaiting_permit`) is still live, and so still among
-        // `process_signal_targets`, but it is exiting: the kernel passes it by
-        // (`wants_signal` skips an exiting thread), and a signal sent to it
-        // would never be delivered (`wake_signaled_guest`). So it is not chosen
-        // here; a live sibling is (the Codex review of
-        // https://github.com/rrnewton/hermit/issues/4367).
         match self.thread_status(detpid) {
-            ThreadStatus::Gone => self
-                .process_signal_targets(detpid)
-                .into_iter()
-                .find(|thread| !self.parked.exits_awaiting_permit.contains(thread)),
+            ThreadStatus::Gone => self.process_signal_targets(detpid).into_iter().next(),
             ThreadStatus::Running | ThreadStatus::NotRunning => Some(detpid),
         }
     }
@@ -9739,6 +10307,150 @@ impl Scheduler {
         }
     }
 
+    /// Record `comm` as the name of task `tid` (`ThreadTree::task_comms`),
+    /// in its own turn: after `PR_SET_NAME`, and after an exec, the name the
+    /// new image's `AT_EXECFN` gives it.
+    pub fn set_task_comm(&mut self, tid: DetTid, comm: crate::procfs::task_stat::TaskComm) {
+        self.thread_tree.task_comms.insert(tid, comm);
+    }
+
+    /// Record `parent`, the `getppid` answer of `process` when it first
+    /// opened or listed its rendered `stat`, as its guest-visible parent
+    /// (`ThreadTree::external_parents`), where Detcore's model knows no other
+    /// (`Self::guest_visible_parent` is `None`): its real parent is outside
+    /// the guest's process tree, as the run's root process's is, and a
+    /// `CLONE_PARENT` child's of such a process (Linux gives it its
+    /// creator's `real_parent`). Ignored for any other process.
+    pub fn record_external_parent(&mut self, process: DetPid, parent: i32) {
+        if self.guest_visible_parent(process).is_none() {
+            self.thread_tree.external_parents.insert(process, parent);
+        }
+    }
+
+    /// Record `limit`, `process`'s virtual soft `RLIMIT_RSS` after a
+    /// `setrlimit` or `prlimit64` changed it, in its own turn
+    /// (`ThreadTree::rss_limits`).
+    pub fn set_rss_limit(&mut self, process: DetPid, limit: u64) {
+        if limit == crate::procfs::task_stat::RLIM_INFINITY {
+            self.thread_tree.rss_limits.remove(&process);
+        } else {
+            self.thread_tree.rss_limits.insert(process, limit);
+        }
+    }
+
+    /// The parent of `process` as the guest sees it (`getppid`'s answer),
+    /// from Detcore's model: the process of its real parent
+    /// (`ThreadTree::parent_death_parents`, which follows a parent thread's
+    /// exit and a subreaper's adoption), the namespace's init, pid 1, for an
+    /// orphan given to it (`ThreadTree::init_orphans`), and for a process
+    /// whose real parent is outside the guest's tree the parent its own
+    /// `getppid` answered (`Self::record_external_parent`). `None` where
+    /// none is known.
+    pub fn guest_visible_parent(&self, process: DetPid) -> Option<i32> {
+        let tree = &self.thread_tree;
+        if let Some(parent) = tree
+            .parent_death_parents
+            .get(&process)
+            .and_then(|parent| tree.thread_to_leader.get(parent))
+        {
+            return Some(parent.as_raw());
+        }
+        if tree.init_orphans.contains(&process) {
+            return Some(1);
+        }
+        tree.external_parents.get(&process).copied()
+    }
+
+    /// The recorded name of task `tid` (`ThreadTree::task_comms`).
+    #[cfg(test)]
+    pub fn task_comm(&self, tid: DetTid) -> Option<crate::procfs::task_stat::TaskComm> {
+        self.thread_tree.task_comms.get(&tid).copied()
+    }
+
+    /// The CPUs task `tid` may run on and its home
+    /// (`ThreadTree::cpu_affinities`, `ThreadTree::cpu_homes`).
+    fn task_cpus(&self, tid: DetTid) -> TaskCpus {
+        let tree = &self.thread_tree;
+        TaskCpus {
+            mask: tree.cpu_affinities.get(&tid).copied(),
+            home: tree.cpu_homes.get(&tid).copied().unwrap_or(0),
+        }
+    }
+
+    /// Whether Linux's `find_process_by_pid` would find task `tid`: a live
+    /// task, from its clone's registration to its exit's, or the leader of
+    /// a process that has exited and is not reaped, which `/proc` still
+    /// lists (`procfs_listing`).
+    fn task_is_found(&self, tid: DetTid) -> bool {
+        self.next_turns.contains_key(&tid)
+            || (self.thread_tree.thread_group_leaders.contains(&tid) && self.process_exists(tid))
+    }
+
+    /// The CPUs of task `tid` under `--virtual-cpus`, or no such task where
+    /// Linux's `sched_getaffinity` answers ESRCH ([`Self::task_is_found`]).
+    pub fn cpu_affinity(&self, tid: DetTid) -> TaskAffinity {
+        match self.task_is_found(tid) {
+            true => TaskAffinity::Task(self.task_cpus(tid)),
+            false => TaskAffinity::NoSuchTask,
+        }
+    }
+
+    /// Record `cpus` as the CPU affinity of task `tid`
+    /// (`ThreadTree::cpu_affinities`): the mask of a `sched_setaffinity`
+    /// that Detcore checked against the virtual CPUs. Answers the task's
+    /// CPUs afterwards, or no such task as [`Self::cpu_affinity`] does.
+    pub fn set_cpu_affinity(&mut self, tid: DetTid, cpus: CpuSet) -> TaskAffinity {
+        if !self.task_is_found(tid) {
+            return TaskAffinity::NoSuchTask;
+        }
+        self.thread_tree.cpu_affinities.insert(tid, cpus);
+        self.cpu_affinity(tid)
+    }
+
+    /// What the process table says about the task a per-process `stat` file
+    /// names (`procfs::task_stat::TaskStatFacts`): the top-level
+    /// number `named` and the thread `thread` below its `task` directory, as
+    /// [`Self::procfs_task`] takes them. The task described is the thread,
+    /// else the task `named` is; its process is `named`'s.
+    pub fn task_stat_facts(
+        &self,
+        named: DetTid,
+        thread: Option<DetTid>,
+    ) -> crate::procfs::task_stat::TaskStatFacts {
+        let described = thread.unwrap_or(named);
+        let (_, exited) = self.procfs_task(named, thread);
+        let leader = self.signal_target_process(named);
+        let num_threads = self
+            .procfs_listing(leader)
+            .threads
+            .len()
+            .try_into()
+            .unwrap_or(i32::MAX);
+        let tree = &self.thread_tree;
+        let wait = leader.and_then(|leader| tree.process_wait.get(&leader));
+        let parent = leader.and_then(|leader| self.guest_visible_parent(leader));
+        crate::procfs::task_stat::TaskStatFacts {
+            comm: tree.task_comms.get(&described).copied(),
+            cpus: self.task_cpus(described),
+            exited,
+            leads: tree.thread_group_leaders.contains(&described),
+            process_exit_signal: wait.map_or(libc::SIGCHLD, |wait| wait.exit_signal),
+            forked_without_exec: wait.is_some_and(|wait| wait.forked_without_exec),
+            process_group: leader
+                .and_then(|leader| self.group_or_session_of(leader, false))
+                .map_or(0, |group| group.as_raw()),
+            session: leader
+                .and_then(|leader| self.group_or_session_of(leader, true))
+                .map_or(0, |session| session.as_raw()),
+            num_threads,
+            process: leader.map(|leader| leader.as_raw()),
+            parent,
+            rsslim: leader
+                .and_then(|leader| tree.rss_limits.get(&leader).copied())
+                .unwrap_or(crate::procfs::task_stat::RLIM_INFINITY),
+        }
+    }
+
     /// Linux's answer to `setsid()` by `process` (`ThreadTree::setsid_decision`),
     /// counting only processes Linux still has (`Self::process_exists`).
     pub fn setsid_decision(&self, process: DetPid) -> Result<(), Errno> {
@@ -9981,6 +10693,11 @@ impl Scheduler {
             if let Some(token) = token {
                 self.discard_note_fate(token, fate, record);
             }
+            self.note_committed_send_in_window(
+                dettid,
+                signal as libc::c_int,
+                matches!(queue, discarded_at_send::QueueId::Thread(_)),
+            );
             self.guest_send_landed = Some(true);
             if self.send_wakes(dettid) {
                 self.test_send_wakes.push(dettid);
@@ -10071,6 +10788,18 @@ impl Scheduler {
             && let Some(token) = token
         {
             self.discard_note_fate(token, fate, record);
+        }
+        // A5 step 3c.1e A: a successful send is committed here, before
+        // `note_group_send`'s and `send_wakes`'s early returns; while the
+        // target holds a temporary-mask publication it joins the committed-send
+        // window record, in the queue the send used. Nothing with the in-guest
+        // delivery gate off.
+        if result.is_ok() {
+            self.note_committed_send_in_window(
+                dettid,
+                signal as libc::c_int,
+                matches!(queue, discarded_at_send::QueueId::Thread(_)),
+            );
         }
         match result {
             Ok(()) if thread_of.is_none() => {
@@ -10283,21 +11012,6 @@ impl Scheduler {
         if self.in_guest_fatal_alarm_pending(dettid) {
             return;
         }
-        // A thread whose exit waits for a sibling's delivery permit
-        // (`exits_awaiting_permit`) has already made its exit call, and Linux
-        // runs an exit to completion: a signal sent to an exiting thread is
-        // never delivered to it, and process-directed signals pass it by
-        // (`thread_status` reports it gone, so no target selection picks it).
-        // Its retained `Exit` request is left as it is, and the permit's
-        // release re-admits it (https://github.com/rrnewton/hermit/issues/4367).
-        // Before, it was found in no pool, and the send panicked.
-        if self.parked.exits_awaiting_permit.contains(&dettid) {
-            debug!(
-                "[dtid {}] signal {} not woken: the thread is exiting.",
-                dettid, signal
-            );
-            return;
-        }
         // The physical send has already happened. Preserve its real kernel
         // pending/ignored semantics, but never invent an interrupted sleep
         // for an alarm this exact owner snapshot blocks or ignores. This
@@ -10322,22 +11036,67 @@ impl Scheduler {
         // scheduler and must await its own continuation.
         let has_external_blocker = self.blocked.external_io_blockers.contains_key(&dettid)
             || self.blocked.rt_sigsuspend_blockers.contains_key(&dettid);
+        // D44's arming assertion under the in-guest delivery gate (A5 step
+        // 3c.1c): a guest's send to a thread blocked in a kernel-run call that
+        // would interrupt the call is refused before it is made
+        // (`refuse_kernel_run_target_send`). What gets here is the scheduler's
+        // own sends (a timer, a child's exit) and the guest sends that check
+        // did not refuse (blocked by the call's mask, ignored, or a vfork
+        // parent's caught or core-dumping signal), which this block decides
+        // identically: the same record, the same dispositions, the pending set
+        // not read, so it does not refuse them either. One that would
+        // interrupt the call (`kernel_run_send_refused`) ends the run by name,
+        // fail closed, from committed state: the record of the thread's
+        // kernel-run request, not which pool holds it. Nothing is armed or
+        // waited for. One that would not stays pending, as Linux keeps it, and
+        // the call goes on.
+        if self.in_guest_signal_delivery
+            && let Some(block) = self.kernel_run_block(dettid)
+        {
+            let state = self.read_sleeper_signal_state(dettid);
+            let refused = match &state {
+                Ok(state) => crate::wait_signal_end::kernel_run_send_refused(
+                    state,
+                    block.mask.unwrap_or(state.blocked),
+                    signal.raw(),
+                    block.vfork,
+                    self.in_guest_reserved_signals,
+                ),
+                Err(_) => true,
+            };
+            if refused {
+                let reason = crate::refused_signal_controls::kernel_run_signal_refusal(
+                    "the scheduler",
+                    signal.raw(),
+                    None,
+                    dettid.as_raw(),
+                    block.vfork,
+                    state.is_err(),
+                );
+                tracing::error!("{}", reason);
+                self.kernel_run_signal_refusal.get_or_insert(reason);
+            } else {
+                debug!(
+                    "[dtid {}] signal {} would not interrupt its kernel-run call; it stays pending.",
+                    dettid, signal
+                );
+            }
+            return;
+        }
         if self.models_signal_targets && !has_external_blocker {
             self.note_signaled_sigsuspend_request(dettid, signal);
         }
-        let await_external_continuation =
-            self.backend.signal_interrupts_external_syscalls && has_external_blocker;
         // Where the scheduler models signal targets (`models_signal_targets`),
-        // such a thread awaits its own continuation too. Its request was
-        // consumed when it was backgrounded, so nothing may be counterfeited
-        // for it; the scheduler orders the continuation the signal provokes
-        // instead.
-        if self.models_signal_targets && has_external_blocker && !await_external_continuation {
+        // a thread running its call outside the scheduler awaits its own
+        // continuation. Its request was consumed when it was backgrounded, so
+        // nothing may be counterfeited for it; the scheduler orders the
+        // continuation the signal provokes instead.
+        if self.models_signal_targets && has_external_blocker {
             self.arm_signaled_background(dettid, signal);
             return;
         }
         // A scheduler that does not model signal targets (in-guest LiteInst,
-        // DBT, KVM) has nothing to arm, and the thread still runs its call
+        // SaBRe, DBT, KVM) has nothing to arm, and the thread still runs its call
         // outside the scheduler. Its request was consumed when it was
         // backgrounded, so nothing may be counterfeited for it either: it
         // rejoins through its own continuation (`BlockedExternalContinue`),
@@ -10351,7 +11110,7 @@ impl Scheduler {
         if has_external_blocker {
             return;
         }
-        if cfg!(debug_assertions) && !await_external_continuation {
+        if cfg!(debug_assertions) {
             let nxtturn = self
                 .next_turns
                 .get(&dettid)
@@ -10361,7 +11120,7 @@ impl Scheduler {
                 "signal_guest: thread should be parked in the scheduler"
             );
         }
-        if await_external_continuation || discarded {
+        if discarded {
             return;
         }
 
@@ -10384,6 +11143,15 @@ impl Scheduler {
             self.runqueue_push_front(dettid);
             return;
         }
+        // Under the in-guest delivery gate (A5 step 3c.1c, design 16.11), the
+        // send's commit ends an internal poll's wait only for a signal in the
+        // design's deliverable set, read now, at this committed point; a
+        // blocked or ignored one leaves the poll as it is. An unreadable state
+        // wakes it, and its own turn reads again. With the gate off, `true`.
+        let gated_wakes = !self.in_guest_signal_delivery
+            || self.gated_deliverable(dettid).map_or(true, |deliverable| {
+                deliverable & kernel_signal_bit(signal.raw()) != 0
+            });
         // Now that the thread is signaled, it needs to be runnable for the scheduler to continue it.
         match self.thread_status(dettid) {
             ThreadStatus::Gone => {
@@ -10424,7 +11192,12 @@ impl Scheduler {
                     }
                     None => false,
                 };
-                if is_internal_io_polling {
+                if is_internal_io_polling && !gated_wakes {
+                    debug!(
+                        "[dtid {}] signal {} is not deliverable to its internal poll; leaving it.",
+                        dettid, signal
+                    );
+                } else if is_internal_io_polling {
                     assert!(self.run_queue.remove_tid(dettid));
                     let mut rsrcs = Resources::new(dettid);
                     rsrcs.insert(ResourceID::InboundSignal(signal), Permission::W);
@@ -10434,6 +11207,11 @@ impl Scheduler {
                     // https://github.com/rrnewton/hermit/issues/4304).
                     let woken = self.force_unblock_thread_at(dettid, rsrcs, true);
                     self.mark_placed_delivery(dettid, signal, woken);
+                } else if is_queued_sleep && self.run_queue.contains_tid(dettid) && !gated_wakes {
+                    debug!(
+                        "[dtid {}] signal {} is not deliverable to its queued sleep; leaving it.",
+                        dettid, signal
+                    );
                 } else if is_queued_sleep && self.run_queue.contains_tid(dettid) {
                     // Read before the wake replaces the sleep request.
                     let ends = self.scheduler_sigchld_ends_sleep(dettid, signal);
@@ -10538,6 +11316,14 @@ impl Scheduler {
                 // found no signal for itself never returned
                 // (https://github.com/rrnewton/hermit/issues/4333).
                 let parked_sleep = self.signal_sleep(dettid).is_some();
+                if parked_sleep && !gated_wakes {
+                    // Under the gate, as a queued sleep above.
+                    debug!(
+                        "[dtid {}] signal {} is not deliverable to its parked sleep; leaving it.",
+                        dettid, signal
+                    );
+                    return;
+                }
                 let ends = parked_sleep && self.scheduler_sigchld_ends_sleep(dettid, signal);
                 let mut rsrcs = Resources::new(dettid);
                 rsrcs.insert(ResourceID::InboundSignal(signal), Permission::W);
@@ -10545,6 +11331,16 @@ impl Scheduler {
                     let woken = self.force_unblock_thread_at(dettid, rsrcs, true);
                     self.mark_woken_sleep_taker(dettid, signal, woken && ends);
                     self.blocked.woken_sleeps.insert(dettid);
+                } else if self.in_guest_signal_delivery
+                    && self.restartable_internal_io_signals(dettid).is_some()
+                    && !gated_wakes
+                {
+                    // A parked restartable poll (a pipe write waiting for room)
+                    // under the gate: as a queued one above.
+                    debug!(
+                        "[dtid {}] signal {} is not deliverable to its parked poll; leaving it.",
+                        dettid, signal
+                    );
                 } else {
                     self.force_unblock_thread(dettid, rsrcs);
                 }
@@ -10774,7 +11570,11 @@ impl Scheduler {
     }
 
     fn restartable_internal_io_signals(&self, dettid: DetTid) -> Option<Vec<SigWrapper>> {
-        if !self.backend.supports_parked_write_signal_interruption {
+        // D50 reader 1 (A5 step 3c.1c): the capability, or the in-guest
+        // delivery gate, whose drain decides from the published mask and
+        // `/proc` (`gated_deliverable`); the capability field is unchanged.
+        if !self.backend.supports_parked_write_signal_interruption && !self.in_guest_signal_delivery
+        {
             return None;
         }
         self.next_turns
@@ -10884,6 +11684,36 @@ impl Scheduler {
     /// `futex_wait_held_signals`, which restartable internal IO polls share.
     fn parked_futex_interrupting_signals(&self, dettid: DetTid, committed: u64) -> Option<u64> {
         let watch = self.parked_futex_waiter(dettid)?.signal_watch?;
+        // D50 reader 9 under the in-guest delivery gate (A5 step 3c.1c): the
+        // design's deliverable set, under the mask the wait published
+        // (`!watch.unblocked`), with nothing held: on in-guest a child's exit
+        // is published inside the every-turn hold and host-timed producers are
+        // refused unless ignored, so no pending bit is host-timed. An
+        // unreadable state wakes the waiter, whose own turn reads again.
+        if self.in_guest_signal_delivery {
+            let mask = !watch.unblocked;
+            #[cfg(test)]
+            if let Some(state) = self.test_kernel_signal_states.get(&dettid) {
+                return Some(crate::wait_signal_end::deliverable(
+                    state,
+                    mask,
+                    self.in_guest_reserved_signals,
+                ));
+            }
+            return Some(
+                match read_kernel_signal_state(
+                    reverie::Pid::from_raw(watch.pid),
+                    reverie::Pid::from_raw(watch.tid),
+                ) {
+                    Ok(state) => crate::wait_signal_end::deliverable(
+                        &state,
+                        mask,
+                        self.in_guest_reserved_signals,
+                    ),
+                    Err(_) => watch.unblocked,
+                },
+            );
+        }
         let held = self.futex_wait_held_signals(dettid)
             & !self.private_sigchld(dettid)
             & !(committed & !self.host_timed_signals(dettid));
@@ -10918,6 +11748,30 @@ impl Scheduler {
     /// (`record_request_guest_mask`), so the poll's signals are those that
     /// mask leaves unblocked rather than the in-guest runtime's; with nothing
     /// published, `state` is kept as read (`SigBlk`).
+    /// Under the in-guest delivery gate (A5 step 3c.1c, design 16.11 and
+    /// D50): the signals deliverable to `dettid` now
+    /// (`wait_signal_end::deliverable`), from its `/proc` status and the mask
+    /// it published at its latest request (`saved_guest_sigmasks`, step
+    /// 3c.1b), or `SigBlk` when it published none. Read only at a committed
+    /// point (a send's commit, the step-2 drain), where no guest thread holds
+    /// the turn, so the dispositions read are a function of the schedule.
+    fn gated_deliverable(
+        &self,
+        dettid: DetTid,
+    ) -> Result<u64, sleep_signal::SleeperStateUnreadable> {
+        let state = self.read_sleeper_signal_state(dettid)?;
+        let mask = self
+            .saved_guest_sigmasks
+            .get(&dettid)
+            .copied()
+            .unwrap_or(state.blocked);
+        Ok(crate::wait_signal_end::deliverable(
+            &state,
+            mask,
+            self.in_guest_reserved_signals,
+        ))
+    }
+
     fn under_published_mask(&self, dettid: DetTid, state: KernelSignalState) -> KernelSignalState {
         match self.saved_guest_sigmasks.get(&dettid) {
             Some(mask) => KernelSignalState {
@@ -11253,17 +12107,35 @@ impl Scheduler {
     /// replaced it, so it could name a stopped thread while the kernel woke an
     /// `rt_sigsuspend` sibling that nothing armed (the Codex review of
     /// https://github.com/rrnewton/hermit/commit/2f046e41b49d4b24b1bec605f269e3c3afde5895).
-    /// One chaos draw per send, as before.
+    /// One chaos draw per send, as before. With `thread_directed`
+    /// (`own_sigchld_thread_directed`), the send goes to that thread's own
+    /// queue instead, with no chaos draw: it is the process's one thread.
     pub(super) fn fire_child_exit_alarm(
         &mut self,
         parent: DetPid,
         creator: DetTid,
         info: Option<[u8; 128]>,
+        thread_directed: Option<DetTid>,
     ) -> Option<DetTid> {
         let sig = Signal::SIGCHLD;
         #[cfg(test)]
         {
             self.host_signal_attempts += 1;
+        }
+        if let Some(target) = thread_directed {
+            info!(
+                "[dtid {}] Alarm fired, delivering signal {} to guest.",
+                target, sig
+            );
+            self.send_guest_signal(
+                target,
+                sig,
+                Some(parent),
+                info,
+                target,
+                discarded_at_send::SendFate::Classify(None),
+            );
+            return Some(target);
         }
         if !self.models_signal_targets {
             let target = self.select_signal_target(parent, Some(creator));
@@ -11374,6 +12246,15 @@ impl Scheduler {
     /// call published, its temporary one, as design 18.16 holds for a thread
     /// readmitted before its continuation turn; `thread_signal_mask` still
     /// reads it as unknown (`continuation_masks`).
+    ///
+    /// IR-18 (A5 step 3c.1e A): a rejoin that returned under the guest's own
+    /// mask (`ContinuationMask::Restored`: neither a temporary mask nor an
+    /// unknown one) but publishes none no longer leaves the call's mask, which
+    /// may be its temporary mask that Linux took down before the call
+    /// returned (`restore_saved_sigmask_unless`, fs/select.c:301 at v6.12):
+    /// `restored_rejoin_published_nothing` marks it unknown where the backend
+    /// keeps the guest's mask apart, and otherwise leaves nothing published,
+    /// so readers take the kernel's `SigBlk`, which is then the guest's own.
     fn keep_mask_for_continuation(&mut self, dtid: DetTid) {
         let _ = self.blocked.out_of_scheduler_masks.remove(&dtid);
         let filed = self
@@ -11392,11 +12273,28 @@ impl Scheduler {
             self.blocked.continuation_masks.insert(dtid, mask);
         }
         if self.in_guest_signal_delivery
-            && let Some(published) = filed
-                .filter(Resources::is_rejoin)
-                .and_then(|req| req.guest_signal_mask)
+            && let Some(rejoin) = filed.filter(Resources::is_rejoin)
         {
-            self.saved_guest_sigmasks.insert(dtid, published);
+            match rejoin.guest_signal_mask {
+                Some(published) => {
+                    self.saved_guest_sigmasks.insert(dtid, published);
+                    self.unknown_guest_sigmasks.remove(&dtid);
+                    if Self::publishes_own_mask(&rejoin) {
+                        self.own_mask_publishers.insert(dtid);
+                    }
+                    if rejoin.blocked_signal_mask.is_some() {
+                        self.temporary_guest_sigmasks.insert(dtid);
+                    } else {
+                        self.temporary_guest_sigmasks.remove(&dtid);
+                    }
+                }
+                None if !rejoin.blocked_signal_mask_unknown
+                    && rejoin.blocked_signal_mask.is_none() =>
+                {
+                    self.restored_rejoin_published_nothing(dtid);
+                }
+                None => {}
+            }
         }
     }
 
@@ -11564,7 +12462,10 @@ impl Scheduler {
     /// discarded at send is not kept (`models_signal_targets`), or the mask
     /// cannot be read, every signal is admitted, as before.
     fn poll_mask_admits(&self, dettid: DetTid, signal: SigWrapper) -> bool {
-        if !self.models_signal_targets {
+        // Under the in-guest delivery gate (A5 step 3c.1c) the mask is the one
+        // the poll published at its request (`saved_guest_sigmasks`, step
+        // 3c.1b), or `SigBlk` when it published none.
+        if !self.models_signal_targets && !self.in_guest_signal_delivery {
             return true;
         }
         let mask = match self.saved_guest_sigmasks.get(&dettid) {
@@ -13137,6 +14038,21 @@ impl Scheduler {
         rs: &Resources,
         resp: &Ivar<SchedResponse>,
     ) -> Result<(), SkipTurn> {
+        if rs.priority_row.is_some() {
+            assert!(
+                rs.resources.len() == 1
+                    && matches!(
+                        rs.resources.keys().next(),
+                        Some(ResourceID::PriorityChangePoint(..))
+                    ),
+                "a priority row rides only a singleton priority-change request"
+            );
+            // Selected now, once: acknowledge the recorded row it ends.
+            if let Err(refusal) = self.acknowledge_priority_row(dettid, rs) {
+                self.callback_checkpoint_desyncs.push(refusal.clone());
+                exit_on_scheduler_refusal(&refusal);
+            }
+        }
         if let Some(origin) = rs.callback_checkpoint.as_deref() {
             assert_eq!(
                 rs.resources.len(),
@@ -13343,6 +14259,7 @@ impl Scheduler {
                 debug_assert!(rid.is_kernel_run_blocking());
                 if matches!(rid, ResourceID::BlockingVfork(_)) {
                     self.begin_vfork_barrier(dettid);
+                    self.vfork_barrier_ops.insert(dettid, *op_id);
                     if let Some(origin) = self.next_turns[&dettid].protocol.origin {
                         self.vfork_registration_origins.insert(dettid, origin.mm);
                     }
@@ -13482,6 +14399,9 @@ impl Scheduler {
                 // in, this resource request is immediately granted. From here
                 // the thread runs again, so its mask is the kernel's.
                 self.blocked.continuation_masks.remove(&dettid);
+                // Its continuation turn is granted: a send no longer finds it
+                // blocked in a kernel-run call (D44).
+                self.kernel_run_requests.remove(&dettid);
                 Ok(())
             }
 
@@ -13558,14 +14478,6 @@ impl Scheduler {
             ResourceID::Exit { group, process, mm } => {
                 if self.group_exit_decider == Some(dettid) {
                     self.group_exit_decider = None;
-                }
-                if self.exit_awaits_sibling_permit(dettid, *process) {
-                    info!(
-                        "[scheduler] NONCOMMIT turn {}, parking dettid {}'s exit behind a sibling's signal delivery",
-                        self.turn, dettid
-                    );
-                    self.parked.exits_awaiting_permit.insert(dettid);
-                    return self.skip_turn_blocked(dettid);
                 }
                 let reserve_mode = match self.reserve_exit_boundary(dettid, *process, *mm, *group) {
                     Ok(mode) => mode,
@@ -13813,6 +14725,30 @@ impl Scheduler {
         }
     }
 
+    /// `child`, created by the vfork whose `BlockingVfork` operation is
+    /// `origin`, is being torn down without having registered, so it never
+    /// will: record it, and that barrier ends at the parent's continuation
+    /// (`step2a`). Only the barrier `origin` began, while it is still pending
+    /// (its child has not registered, which would have fulfilled it), is
+    /// affected; a teardown naming an earlier vfork of the same parent, or
+    /// arriving after the child registered, changes nothing. Whether a thread
+    /// with `child`'s TID registered in an earlier lifetime does not matter.
+    /// The caller has authenticated `child` as the deregistration's sender.
+    pub(crate) fn record_unregistered_vfork_child_exit(
+        &mut self,
+        origin: ExternalOpId,
+        child: DetTid,
+    ) {
+        let parent = origin.tid;
+        if parent == child
+            || self.vfork_barrier_ops.get(&parent) != Some(&origin)
+            || self.vfork_barriers.get(&parent) != Some(&None)
+        {
+            return;
+        }
+        self.unregistered_vfork_child_exits.insert(parent);
+    }
+
     // TODO-HUMAN-REVIEW(PR-868): Review the vfork registration scheduler barrier.
     pub(crate) fn complete_vfork_registration(&mut self, parent: DetTid, child: DetTid) {
         if self.dead_vfork_parents.remove(&parent) {
@@ -13892,15 +14828,28 @@ impl Scheduler {
     /// threads, so a thread that never runs is not held back by a draw it made
     /// once.
     ///
-    /// Each runnable (non-polling) thread that `dettid`'s new priority still
-    /// beats counts one more pass. A thread passed over at
-    /// [`CHAOS_PASSOVER_BOUND`] such change points since its last committed
-    /// turn moves ahead: `dettid` takes the priority one below it (numerically
-    /// one greater, capped at `LAST_PRIORITY`), so the passed-over thread keeps
-    /// the lead for all its turns until it blocks, or until `dettid`'s next
-    /// change point draws again. A thread's count restarts at its committed
-    /// turn and goes when its blocking entries are removed (it retires, or a
-    /// forced wake requeues it).
+    /// Each runnable thread that `dettid`'s new priority still beats counts
+    /// one more pass. A thread passed over at [`CHAOS_PASSOVER_BOUND`] such
+    /// change points since its last committed turn moves ahead: `dettid` takes
+    /// the priority one below it (numerically one greater, capped at
+    /// `LAST_PRIORITY`), so the passed-over thread keeps the lead for all its
+    /// turns until it blocks, or until `dettid`'s next change point draws
+    /// again. A thread's count restarts at its committed turn and goes when
+    /// its blocking entries are removed (it retires, or a forced wake requeues
+    /// it).
+    ///
+    /// A poller counts once a poll upgrade has reached it
+    /// (`RunQueue::can_be_passed_over`), as it then competes as ordinary work;
+    /// one still backed off does not. That includes a poller whose normal
+    /// priority is the last band, which the upgrade reaches but cannot move:
+    /// before it counted, two threads sleeping in turns at better priorities
+    /// kept such a poller from its next retry forever, so it never saw a pipe
+    /// write it was polling for. In the last band the lead is by round-robin
+    /// turn alone, and a thread woken from a timed wait is pushed to the front
+    /// of its band (`wake_timed_event`). At the change point itself, though,
+    /// the changing thread is requeued behind the passed-over one, and every
+    /// other thread that keeps running ahead of it is demoted the same way at
+    /// its own next change point, so the passed-over thread runs eventually.
     ///
     /// Deterministic: it reads only the priority map and run-queue membership
     /// at this change point, in thread-ID order, and counts change only at
@@ -13914,18 +14863,19 @@ impl Scheduler {
         let queued: Vec<(DetTid, Priority)> = self
             .priorities
             .iter()
-            .filter(|(tid, _)| **tid != dettid && self.run_queue.contains_non_polling_tid(**tid))
+            .filter(|(tid, _)| **tid != dettid && self.run_queue.can_be_passed_over(**tid))
             .map(|(tid, prio)| (*tid, *prio))
             .collect();
-        let starving = queued
+        let starving_threads: Vec<(DetTid, Priority)> = queued
             .iter()
             .filter(|(tid, prio)| {
                 *prio > drawn
                     && self.chaos_passed_over.get(tid).copied().unwrap_or(0) + 1
                         >= CHAOS_PASSOVER_BOUND
             })
-            .map(|(_, prio)| *prio)
-            .max();
+            .copied()
+            .collect();
+        let starving = starving_threads.iter().map(|(_, prio)| *prio).max();
         let priority = starving.map_or(drawn, |prio| (prio + 1).min(runqueue::LAST_PRIORITY));
         for (tid, prio) in queued {
             if prio > priority {
@@ -13933,10 +14883,26 @@ impl Scheduler {
             }
         }
         if priority != drawn {
-            info!(
-                "[scheduler] chaos change point of dettid {}: priority {} drawn, {} taken, behind a thread passed over at {} change points",
-                dettid, drawn, priority, CHAOS_PASSOVER_BOUND
-            );
+            // A poller the bound counts only because a poll upgrade reached it
+            // in the last band (`RunQueue::can_be_passed_over`) is named, so
+            // that a log shows when the bound, and nothing else, retried it.
+            let last_band_poller = starving_threads
+                .iter()
+                .find(|(tid, prio)| {
+                    Some(*prio) == starving && !self.run_queue.contains_non_polling_tid(*tid)
+                })
+                .map(|(tid, _)| *tid);
+            if let Some(poller) = last_band_poller {
+                info!(
+                    "[scheduler] chaos change point of dettid {}: priority {} drawn, {} taken, behind poller dettid {}, passed over at {} change points after a poll upgrade reached it in the last band",
+                    dettid, drawn, priority, poller, CHAOS_PASSOVER_BOUND
+                );
+            } else {
+                info!(
+                    "[scheduler] chaos change point of dettid {}: priority {} drawn, {} taken, behind a thread passed over at {} change points",
+                    dettid, drawn, priority, CHAOS_PASSOVER_BOUND
+                );
+            }
         }
         priority
     }
@@ -13996,13 +14962,21 @@ impl Scheduler {
         );
 
         // Update request to be empty so the thread is unconditionally
-        // runnable when it next comes up in the queue.
-        let empty_req = Ivar::full(Ok(Resources::new(dettid)));
+        // runnable when it next comes up in the queue. It keeps the
+        // slice-expiry mark of the change point it replaces: the turn that
+        // commits it is the one charged for this preemption
+        // (`preemption_charge_cap`).
+        assert!(self.next_turns.contains_key(&dettid), "nextturn present");
+        let mut runnable = Resources::new(dettid);
+        runnable.slice_expired = self.next_turns[&dettid]
+            .req
+            .try_read_with(|request| request.as_ref().is_ok_and(|rs| rs.slice_expired))
+            .unwrap_or(false);
+        let empty_req = Ivar::full(Ok(runnable));
         trace!(
             "[dettid {}] Priority change point emplaced empty resource request at new {}",
             dettid, empty_req
         );
-        assert!(self.next_turns.contains_key(&dettid), "nextturn present");
         self.substitute_request_ivar(dettid, empty_req);
         info!(
             "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, dettid {} changed priority to {}",
@@ -14159,6 +15133,18 @@ impl Scheduler {
                 .all(|id| matches!(id, ResourceID::InboundSignal(_)))
     }
 
+    /// A sleep (`SleepUntil` with a deadline: not a yield's epoch, nor a
+    /// pause's indefinite deadline) whose deadline `now` has reached.
+    fn is_due_sleep(rsrcs: &Resources, now: LogicalTime) -> bool {
+        rsrcs.resources.len() == 1
+            && rsrcs.resources.keys().all(|id| {
+                matches!(id, ResourceID::SleepUntil(deadline)
+                    if *deadline > LogicalTime::from_nanos(0)
+                        && !deadline.is_indefinite()
+                        && *deadline <= now)
+            })
+    }
+
     fn is_x_turn(rsrcs: &Resources, x: &ResourceID) -> bool {
         if rsrcs.resources.contains_key(x) {
             if rsrcs.resources.len() > 1 {
@@ -14203,7 +15189,8 @@ impl Scheduler {
         // ran nothing but its handler
         // (https://github.com/rrnewton/hermit/issues/4139). The previous turn
         // is the last committed one other than a host-timed polling retry
-        // (`last_turn_was_polling`); skipped turns do not count. So the rule
+        // (`last_turn_was_polling`) or a schedule replay's own switch turn
+        // (`is_internal_turn`); skipped turns do not count. So the rule
         // also frees the signal wake of a thread asleep in pause, nanosleep or
         // a futex wait when that thread had the previous turn. Both inputs are
         // committed turns that both runs of --verify share, so they decide
@@ -14214,6 +15201,50 @@ impl Scheduler {
             && last_turn.as_ref().is_ok_and(|resources| {
                 self.previous_turn_tid == Some(resources.tid)
                     && Self::is_inbound_signal_turn(resources)
+            });
+
+        // A run of turns that each end an expired timed wait (`expired_wait_grant`: a
+        // futex wait answered `TimeOut`, or a sleep already due) is charged one
+        // scheduler turn, not one per turn, while another thread is queued to run. A
+        // timed wait shorter than one turn charge (`cv.wait_for(100us)` in a pool's idle
+        // loop, `usleep(100)`) otherwise never blocks: the charge of each turn carries
+        // the clock past the deadline the next waiter computed before it, so every wait
+        // ends at its grant, and a woken waiter goes to the head of its band
+        // (`wake_timed_event`). One futex poller then kept the CPU for its whole
+        // timeslice at a turn charge per iteration. Uncharged, the next wait sees only
+        // the time the waiters' own work took and blocks until its deadline, and the
+        // queued thread runs; that deadline then caps the queued thread's slice like any
+        // other (`deadline_remaining_from`). The first turn of a run, and every turn of
+        // a thread with nobody else queued, is charged as before, so a lone poller's
+        // time, and a wait of at least one turn charge beside other work, are unchanged;
+        // waiters that fall due together share one charge, and so do back-to-back waits
+        // whose deadline had already passed when they were made (a zero timeout). Time
+        // still advances by each waiter's own work, at least one syscall per turn, and
+        // by the empty-queue jump to the next deadline. Every input is a committed
+        // grant, the previous turn as above, or the run queue as step 1 finds it, so the
+        // rule adds no host-timed input and inherits those that already reach the queue
+        // (a readmitted background call); a host-timed polling retry neither ends nor
+        // continues a run (`previous_turn_expired_wait`), nor does a schedule replay's
+        // switch turn, which its recording lacks. Under race search (`--chaos`, a random
+        // heuristic) every such turn keeps its charge by default, as under `hermit
+        // record` and `hermit replay` (`recordreplay_modes`): the time each charge adds
+        // stretches short waits, which real races depend on. `--expired-wait-charge`
+        // sets the rule, and a replay follows its record
+        // (`expired_wait_runs_charged_once`).
+        let expired_wait_grant = self.expired_wait_grant.take();
+        let expired_wait = !self.recordreplay_modes
+            && self.expired_wait_runs_charged_once
+            && last_turn
+                .as_ref()
+                .is_ok_and(|resources| expired_wait_grant == Some(resources.tid));
+        let repeated_expired_wait = expired_wait
+            && self.previous_turn_expired_wait
+            && last_turn.as_ref().is_ok_and(|resources| {
+                // As `are_all_quiesced` does, not counting a thread whose old
+                // queue entry is pending removal.
+                self.run_queue.tids().any(|tid| {
+                    *tid != resources.tid && !self.pending_run_queue_removals.contains_key(tid)
+                })
             });
 
         // At this moment, when threads are parked, we know that the global_time is
@@ -14269,8 +15300,13 @@ impl Scheduler {
                 trace!(
                     "[scheduler] skipping scheduler time advance because just-finished turn delivered a signal to the thread already running"
                 );
+            } else if repeated_expired_wait {
+                trace!(
+                    "[scheduler] skipping scheduler time advance because just-finished turn ended an expired timed wait right after another"
+                );
             } else {
-                let newtime = match gtime.add_scheduler_time() {
+                let cap = self.preemption_charge_cap(last_turn);
+                let newtime = match gtime.add_capped_scheduler_time(cap) {
                     Ok(newtime) => newtime,
                     Err(exhausted) => {
                         // Keep the first report; the clock did not move.
@@ -14297,10 +15333,17 @@ impl Scheduler {
         // A host-timed retry is not a turn that both runs of --verify share:
         // letting it set the previous turn's thread would make whether the
         // next signal delivery is charged depend on how many retries ran.
+        // Nor is a schedule replay's own switch turn (`TraceReplay`, an
+        // internal turn): the recording has none, so letting it set the
+        // previous turn would end a run of expired waits, or make a signal
+        // delivery look like one to the running thread, where the recording
+        // decided otherwise, and charge the replay differently.
         if let Ok(resources) = last_turn
             && !last_turn_was_polling
+            && !Self::is_internal_turn(resources)
         {
             self.previous_turn_tid = Some(resources.tid);
+            self.previous_turn_expired_wait = expired_wait;
         }
 
         match snapshot.cmp(&self.committed_time) {
@@ -14329,6 +15372,65 @@ impl Scheduler {
         // O3: every turn of an observable process has quiesced, and no pop or
         // grant of the next pass has run yet.
         self.reconcile_inactive_alarms(self.committed_time);
+    }
+
+    /// Record a granted turn for `--cap-preemption-charge`: the thread's
+    /// clock now, while it is still stopped at the turn's request, becomes
+    /// its last turn's clock (`turn_clocks`), and when the request ends an
+    /// expired timeslice (`Resources::slice_expired`), the difference from
+    /// its previous turn's clock, the virtual time it ran in that slice,
+    /// caps the turn's charge (`preemption_cap`). Two kinds of turn are not
+    /// recorded: a host-timed polling retry, so how many retries ran cannot
+    /// change a cap, and a schedule replay's own switch turn (`TraceReplay`,
+    /// `is_internal_turn`), which its recording does not have: granted to a
+    /// thread stopped at a request it has not yet been granted, it would
+    /// restart that thread's measure, so a replayed preemption would be
+    /// charged about nothing where its recording charged the slice. Called
+    /// at the commit of every turn, so the cap always belongs to the turn
+    /// granted last.
+    fn note_granted_turn(&mut self, granted: &Resources, global_time: &Mutex<GlobalTime>) {
+        self.preemption_cap = None;
+        if !self.cap_preemption_charge
+            || Self::is_polling_turn(granted)
+            || Self::is_internal_turn(granted)
+        {
+            return;
+        }
+        let clock = {
+            let gtime = global_time.lock().unwrap();
+            if !gtime.contains_thread(granted.tid) {
+                return;
+            }
+            gtime.threads_duration(granted.tid)
+        };
+        let previous = self.turn_clocks.insert(granted.tid, clock);
+        if granted.slice_expired
+            && let Some(previous) = previous
+        {
+            let ran = clock.as_nanos().saturating_sub(previous.as_nanos());
+            self.preemption_cap = Some((granted.tid, ran));
+        }
+    }
+
+    /// The most the committed turn `last_turn` may be charged, in virtual
+    /// nanoseconds (`GlobalTime::add_capped_scheduler_time`): under
+    /// `--cap-preemption-charge`, a turn that ended an expired timeslice is
+    /// charged at most the virtual time its thread ran in that slice
+    /// (`note_granted_turn`). Every preemption otherwise costs a full turn
+    /// charge however short its slice, so slices far shorter than the charge
+    /// multiplied guest-visible time by about `1 + charge / slice`; capped,
+    /// a slice costs at most its own length again. A thread with no earlier
+    /// turn on record, every other turn, and the option off: no cap.
+    ///
+    /// Both clocks are read at grants of turns that both runs of `--verify`
+    /// share, and that a recording and its schedule replay share: a replay's
+    /// own switch turns are left out (`note_granted_turn`), and the turns
+    /// left are granted at the same per-thread clocks, so they charge alike.
+    fn preemption_charge_cap(&mut self, last_turn: &Result<Resources, SkipTurn>) -> u64 {
+        match (self.preemption_cap.take(), last_turn) {
+            (Some((tid, ran)), Ok(resources)) if tid == resources.tid => ran,
+            _ => u64::MAX,
+        }
     }
 
     /// Step 4: unblock enabled actions to actually, physically run.
@@ -14415,7 +15517,7 @@ impl Scheduler {
         }
         let fatal_alarm = self.in_guest_fatal_alarm_pending(dtid);
         let futex_timed_out = self.blocked.timed_out_futex_waiters.remove(&dtid);
-        let (guest_state_poll, fruitless, wants_alone) = match self
+        let (guest_state_poll, fruitless, wants_alone, sleep_due) = match self
             .next_turns
             .get(&dtid)
             .and_then(|turn| turn.req.try_read())
@@ -14424,9 +15526,14 @@ impl Scheduler {
                 Self::is_polling_turn(&rs) && rs.polls_guest_state_only,
                 Self::retries_its_call_without_progress(&rs),
                 rs.waits_until_nothing_else_can_run,
+                Self::is_due_sleep(&rs, self.committed_time),
             ),
-            _ => (false, false, false),
+            _ => (false, false, false, false),
         };
+        // Whether this grant ends a timed wait at its deadline
+        // (`expired_wait_grant`, read by `bump_global_time`).
+        self.expired_wait_grant =
+            ((futex_timed_out || sleep_due) && !signaled && !fatal_alarm).then_some(dtid);
         // The committed request, read before `clear_nextturn` empties it.
         let work_span_request = self
             .work_span
@@ -14519,12 +15626,17 @@ impl Scheduler {
     /// a request that is simply runnable or an entry kept past its time, and
     /// a thread pending removal or in a process a committed SIGKILL has
     /// doomed will never act on its deadline. A wait no longer than the time
-    /// the scheduler charges for a turn has therefore passed by the grant and
-    /// ends no slice: counting passed waits too would end the slice of every
-    /// thread granted while another thread's sleep is over, a contended
-    /// quantum this cap does not add (measured: 51% more virtual time for 8
-    /// threads sleeping 1 ms between bursts of work, against 11%). `None`
-    /// when nothing qualifies,
+    /// the scheduler charges for a turn has therefore usually passed by the
+    /// grant and ends no slice: counting passed waits too would end the slice
+    /// of every thread granted while another thread's sleep is over, a
+    /// contended quantum this cap does not add (measured: 51% more virtual
+    /// time for 8 threads sleeping 1 ms between bursts of work, against 11%).
+    /// The exception is the last wait of an uncharged run of expired waits
+    /// (`bump_global_time`): made after an uncharged turn, it is still ahead
+    /// and caps the next slice as a wait of one turn charge would. Like any
+    /// cap it ends the slice only at the thread's next check-in
+    /// (`cap_timeslice_at_deadline`), so a loop without syscalls still runs
+    /// to its PMU maximum. `None` when nothing qualifies,
     /// and always under record/replay, which records no hint (as it records
     /// no poll deadline, `note_poll_deadline`).
     ///
@@ -15175,7 +16287,12 @@ impl Scheduler {
                         .unwrap_or((None, false, false));
                     // A poll that checks the disposition itself after the
                     // wake (a parked pipe `writev`) keeps every signal.
-                    let interrupting = if decides_itself {
+                    // Under the in-guest delivery gate every poll is decided
+                    // here by the design's deliverable set (A5 step 3c.1c,
+                    // D50 reader 1), and decides again in its own turn.
+                    let interrupting = if self.in_guest_signal_delivery {
+                        self.gated_deliverable(dettid).unwrap_or(!0)
+                    } else if decides_itself {
                         !0
                     } else {
                         self.restartable_internal_io_interrupting_signals(dettid, task)
@@ -15411,8 +16528,14 @@ impl Scheduler {
             .merge(&stats);
     }
 
-    /// Record an exiting thread's final completed-syscall count.
-    pub fn record_syscall_count(&mut self, dettid: DetTid, count: u64) {
+    /// Record an exiting thread's final completed-syscall count and
+    /// histogram.
+    pub fn record_syscall_count(
+        &mut self,
+        dettid: DetTid,
+        count: u64,
+        histogram: SparseSyscallHistogram,
+    ) {
         let consumed = self
             .transferred_exec_syscall_offsets
             .get(&dettid)
@@ -15422,6 +16545,166 @@ impl Scheduler {
             .checked_add(count)
             .expect("transferred exec syscall count overflow");
         self.per_thread_syscalls.insert(dettid, total);
+        let mut merged = self
+            .transferred_exec_syscall_histograms
+            .get(&dettid)
+            .cloned()
+            .unwrap_or_default();
+        merged.merge(&histogram);
+        self.per_thread_syscall_histograms.insert(dettid, merged);
+    }
+
+    /// Take custody of the callback checkpoints of the priority history this
+    /// run replays (`Config::annotated_priority_replay`), from the same
+    /// validated record the threads' histories come from, before any thread
+    /// starts. Refuses a record whose checkpoints disagree with the launch
+    /// decision, in either direction: the configuration and the input are
+    /// one identity.
+    pub(crate) fn install_priority_checkpoints(
+        &mut self,
+        checkpoints: &BTreeMap<DetTid, Vec<crate::preemptions::callback_history::Checkpoint>>,
+    ) -> Result<(), String> {
+        let annotated = checkpoints.values().any(|points| !points.is_empty());
+        if annotated != self.annotated_priority_replay {
+            return Err(format!(
+                "HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE: the replayed preemption record {} \
+                 callback checkpoints, but the run was prepared as if it {}",
+                if annotated { "carries" } else { "carries no" },
+                if self.annotated_priority_replay {
+                    "carried them"
+                } else {
+                    "carried none"
+                },
+            ));
+        }
+        if annotated {
+            self.callback_checkpoints = checkpoints
+                .iter()
+                .map(|(tid, points)| (*tid, points.iter().cloned().collect()))
+                .collect();
+        }
+        Ok(())
+    }
+
+    /// Grant a thread's start under `annotated_priority_replay` only as its
+    /// birth: its history then replays from row 0 with every checkpoint
+    /// unconsumed. A second start of a thread ID (a reused ID, or a fresh
+    /// runtime after exec), or a start after rows or progress were consumed,
+    /// would restart a history a cursor has already consumed, and is refused.
+    pub(crate) fn authenticate_priority_birth(&mut self, dettid: DetTid) -> Result<(), String> {
+        if !self.annotated_priority_replay {
+            return Ok(());
+        }
+        let consumed_rows = self.priority_rows.get(&dettid).copied().unwrap_or(0);
+        let progressed = self.callback_progress.get(&dettid).is_some_and(|progress| {
+            *progress != crate::preemptions::callback_history::Progress::default()
+        });
+        if !self.priority_births.insert(dettid) || consumed_rows != 0 || progressed {
+            return Err(format!(
+                "HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_RESUME: dtid {dettid} starts again after \
+                 its priority history began replaying ({consumed_rows} rows acknowledged); a \
+                 callback-annotated history replays from its first row only at a thread's birth"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Acknowledge, at the selection of a priority-change request under
+    /// `annotated_priority_replay`, the recorded row it ends: exactly the
+    /// thread's next row, whose checkpoint, if it has one, must be the origin
+    /// the request carries. Rows count once each, here, for annotated and
+    /// unannotated rows alike. An attached origin for a row without a
+    /// checkpoint is the recorder's own annotation and consumes nothing.
+    pub(crate) fn acknowledge_priority_row(
+        &mut self,
+        dettid: DetTid,
+        rs: &Resources,
+    ) -> Result<(), String> {
+        use crate::preemptions::callback_history::Refusal;
+        if !self.annotated_priority_replay {
+            return Ok(());
+        }
+        let Some(row) = rs.priority_row else {
+            return Ok(());
+        };
+        let next = self.priority_rows.get(&dettid).copied().unwrap_or(0);
+        if row != next {
+            return Err(format!(
+                "{}: dtid {dettid} ends recorded row {row}, but its next unacknowledged row is \
+                 {next}",
+                Refusal::Skipped.name()
+            ));
+        }
+        let front = self
+            .callback_checkpoints
+            .get(&dettid)
+            .and_then(|points| points.front());
+        let index = usize::try_from(row).expect("row index fits in usize");
+        match front {
+            Some(front) if front.history_index < index => {
+                return Err(format!(
+                    "{}: dtid {dettid} ends row {row} with the checkpoint of row {} unconsumed",
+                    Refusal::Skipped.name(),
+                    front.history_index
+                ));
+            }
+            Some(front) if front.history_index == index => {
+                match rs.callback_checkpoint.as_deref() {
+                    Some(origin) if *origin == front.origin => {
+                        self.callback_checkpoints
+                            .get_mut(&dettid)
+                            .and_then(|points| points.pop_front());
+                    }
+                    Some(origin) => {
+                        return Err(format!(
+                            "{}: dtid {dettid} ends row {row} at {origin:?}, not at its recorded \
+                             endpoint {:?}",
+                            Refusal::Incompatible.name(),
+                            front.origin
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "{}: dtid {dettid} ends row {row} without reaching its recorded \
+                             endpoint {:?}",
+                            Refusal::Skipped.name(),
+                            front.origin
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.priority_rows.insert(dettid, next + 1);
+        Ok(())
+    }
+
+    /// Under `annotated_priority_replay`, the refusal of a run that ended
+    /// with recorded callback checkpoints unconsumed, naming each thread's
+    /// count; `None` when every checkpoint was consumed.
+    pub(crate) fn priority_history_incomplete(&self) -> Option<String> {
+        if !self.annotated_priority_replay {
+            return None;
+        }
+        let remaining: Vec<String> = self
+            .callback_checkpoints
+            .iter()
+            .filter(|(_, points)| !points.is_empty())
+            .map(|(tid, points)| {
+                format!(
+                    "dtid {tid}: {} unconsumed from row {}",
+                    points.len(),
+                    points.front().unwrap().history_index
+                )
+            })
+            .collect();
+        (!remaining.is_empty()).then(|| {
+            format!(
+                "{}: the run ended with recorded callback checkpoints unconsumed ({})",
+                crate::preemptions::callback_history::Refusal::Incomplete.name(),
+                remaining.join("; ")
+            )
+        })
     }
 
     /// Report a checkpoint mismatch without inserting an event or moving the
@@ -15437,6 +16720,23 @@ impl Scheduler {
             .callback_checkpoints
             .get_mut(&tid)
             .and_then(|points| points.pop_front());
+        // A thread past the checkpoint it reports is refused as overshot by
+        // name, even when this custody no longer holds that checkpoint first.
+        // Any other custody disagreement stays an internal error.
+        if expected.as_ref() != Some(checkpoint)
+            && (actual.progress > checkpoint.origin.progress
+                || actual.rcbs > checkpoint.origin.rcbs)
+        {
+            exit_on_scheduler_refusal(&format!(
+                "{}: {tid} went past callback checkpoint {} (expected {:?}, observed {:?}); the \
+                 scheduler's custody holds {:?} first",
+                crate::preemptions::callback_history::Refusal::Overshot.name(),
+                checkpoint.history_index,
+                checkpoint.origin,
+                actual,
+                expected,
+            ));
+        }
         assert_eq!(
             expected.as_ref(),
             Some(checkpoint),
@@ -15601,6 +16901,17 @@ impl Scheduler {
             timeslice_stats.merge(st);
         }
         let syscalls = self.per_thread_syscalls.values().copied().sum();
+        let mut syscall_histogram = SyscallHistogram::default();
+        for histogram in self.per_thread_syscall_histograms.values() {
+            histogram.add_to(&mut syscall_histogram);
+        }
+
+        // After the record is flushed and each thread's DESYNC line is
+        // logged above: the re-recorded history survives as evidence, and the
+        // run still ends as a refusal, not a summary.
+        if let Some(refusal) = self.priority_history_incomplete() {
+            return Err(crate::PriorityHistoryRefusal(refusal).into());
+        }
 
         Ok((
             RunSummary {
@@ -15624,6 +16935,11 @@ impl Scheduler {
                 dispatch_stats: None,
                 // GlobalState records the effective run configuration.
                 preemption: None,
+                // GlobalState knows what the accounting point could not see
+                // and replaces this scope (`run_summary_for_log`).
+                syscall_histogram: Some(
+                    syscall_histogram.summary(SyscallObservationScope::Complete),
+                ),
             },
             info_reprio_descrip,
         ))
@@ -18017,14 +19333,13 @@ mod test {
             .with_time(LogicalTime::from_nanos(10_000));
         let mut events = vec![prehook.clone()];
         if let Some(count) = branches {
-            let branch = SchedEvent::branches(next, count)
-                .with_time(LogicalTime::from_nanos(10_000) + LogicalTime::from_rcbs(count.into()));
-            let other = SchedEvent {
-                op: detcore_model::schedule::Op::OtherInstructions,
-                count: 1,
-                ..branch.clone()
-            };
-            events.extend([branch, other]);
+            // A timer preemption, as recordings write it: branches with no
+            // OtherInstructions after them, then the next thread's event.
+            events.push(
+                SchedEvent::branches(next, count).with_time(
+                    LogicalTime::from_nanos(10_000) + LogicalTime::from_rcbs(count.into()),
+                ),
+            );
         } else {
             events.push(SchedEvent::syscall(
                 next,
@@ -18242,6 +19557,16 @@ mod test {
         }
     }
 
+    /// A histogram of `n` getpid entries, as a thread with `syscall_count` n
+    /// reports it.
+    fn entries(n: u64) -> SparseSyscallHistogram {
+        let mut histogram = SyscallHistogram::default();
+        for _ in 0..n {
+            histogram.enter(reverie::syscalls::Sysno::getpid);
+        }
+        (&histogram).into()
+    }
+
     #[test]
     fn transferred_exec_reconnect_accumulates_consumed_leader_syscalls_once() {
         let config = Config::default().with_backend(|backend| {
@@ -18253,20 +19578,22 @@ mod test {
         let second_caller = DetTid::from_raw(19);
         let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
         assert!(sched.note_deregistration_accounted(leader));
-        sched.record_syscall_count(leader, 3);
+        sched.record_syscall_count(leader, 3, entries(3));
         sched.logically_kill_thread(&leader, &detpid, pre_exec_mm);
 
         reconnect_transferred_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
         sched.drain_pending_run_queue_removals();
         sched.drain_pending_run_queue_admissions();
         assert!(sched.note_deregistration_accounted(leader));
-        sched.record_syscall_count(leader, 7);
+        sched.record_syscall_count(leader, 7, entries(7));
         assert_eq!(sched.per_thread_syscalls[&leader], 10);
+        assert_eq!(sched.per_thread_syscall_histograms[&leader], entries(10));
         assert!(!sched.note_deregistration_accounted(leader));
         // The count itself is idempotent too; do not add the previous aggregate
         // each time the current incarnation reports its final count.
-        sched.record_syscall_count(leader, 7);
+        sched.record_syscall_count(leader, 7, entries(7));
         assert_eq!(sched.per_thread_syscalls[&leader], 10);
+        assert_eq!(sched.per_thread_syscall_histograms[&leader], entries(10));
 
         sched.thread_tree.add_child(leader, second_caller, false);
         register_known_thread(&mut sched, second_caller);
@@ -18275,11 +19602,13 @@ mod test {
         sched.logically_kill_thread(&leader, &detpid, second_mm);
         reconnect_transferred_exec(&mut sched, leader, second_caller, detpid, second_mm);
         assert!(sched.note_deregistration_accounted(leader));
-        sched.record_syscall_count(leader, 11);
+        sched.record_syscall_count(leader, 11, entries(11));
         assert_eq!(sched.per_thread_syscalls[&leader], 21);
+        assert_eq!(sched.per_thread_syscall_histograms[&leader], entries(21));
         assert!(!sched.note_deregistration_accounted(leader));
         assert!(!sched.per_thread_syscalls.contains_key(&caller));
         assert!(!sched.per_thread_syscalls.contains_key(&second_caller));
+        assert!(!sched.per_thread_syscall_histograms.contains_key(&caller));
     }
 
     #[test]
@@ -18292,16 +19621,18 @@ mod test {
             let leader = DetTid::from_raw(17);
             let caller = DetTid::from_raw(18);
             let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
-            sched.record_syscall_count(leader, 3);
+            sched.record_syscall_count(leader, 3, entries(3));
             if reload {
                 reconnect_nonleader_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
             }
 
             assert!(sched.note_deregistration_accounted(leader));
-            sched.record_syscall_count(leader, 7);
+            sched.record_syscall_count(leader, 7, entries(7));
             assert_eq!(sched.per_thread_syscalls[&leader], 7);
+            assert_eq!(sched.per_thread_syscall_histograms[&leader], entries(7));
             assert!(sched.note_deregistration_accounted(leader));
             assert!(sched.transferred_exec_syscall_offsets.is_empty());
+            assert!(sched.transferred_exec_syscall_histograms.is_empty());
         }
     }
 
@@ -19359,6 +20690,11 @@ mod test {
             request.insert(ResourceID::InternalIOPolling, Permission::W);
             request
         };
+        let switch = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::TraceReplay, Permission::RW);
+            request
+        };
         // The advance of the last of `turns`, committed in order.
         let advance = |record_replay: bool, turns: &[Resources]| {
             let mut sched = Scheduler::new(&config);
@@ -19395,6 +20731,22 @@ mod test {
             "a delivery that switches threads"
         );
         assert_eq!(
+            advance(
+                false,
+                &[Resources::new(other), switch(running), delivery(running)]
+            ),
+            charge,
+            "a schedule replay's switch turn is not the previous turn"
+        );
+        assert_eq!(
+            advance(
+                false,
+                &[Resources::new(running), switch(running), delivery(running)]
+            ),
+            Duration::ZERO,
+            "nor does it hide the running thread's own previous turn"
+        );
+        assert_eq!(
             advance(true, &[Resources::new(running), delivery(running)]),
             charge,
             "a delivery under record/replay"
@@ -19426,6 +20778,729 @@ mod test {
             ),
             Duration::ZERO,
             "a retry between the same thread's turn and the delivery"
+        );
+    }
+
+    /// Under a schedule replay, the thread the trace switches to is woken at
+    /// the switch if it is still in a timed wait whose deadline has passed: a
+    /// pass wakes one due waiter, and the replay runs fewer passes than its
+    /// recording did. A waiter whose deadline is ahead, and a thread already
+    /// queued, are left alone.
+    #[test]
+    fn a_replays_switch_target_wakes_at_its_passed_deadline() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        scheduler.committed_time = at(10_000);
+        let due = DetTid::from_raw(3);
+        let ahead = DetTid::from_raw(5);
+        let queued = DetTid::from_raw(7);
+        for (tid, deadline) in [(due, at(9_000)), (ahead, at(20_000)), (queued, at(8_000))] {
+            queue_request(&mut scheduler, tid, sleep_request(tid, deadline));
+            scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+            if tid != queued {
+                assert!(scheduler.run_queue.remove_tid(tid));
+                scheduler.blocked.timed_waiters.insert(deadline, tid);
+            }
+        }
+        for tid in [due, ahead, queued] {
+            scheduler.wake_due_replay_target(tid);
+        }
+        assert!(scheduler.run_queue.contains_tid(due));
+        assert_eq!(scheduler.blocked.timed_waiters.thread_deadline(due), None);
+        assert!(!scheduler.run_queue.contains_tid(ahead));
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(ahead),
+            Some(at(20_000))
+        );
+        assert!(scheduler.run_queue.contains_tid(queued));
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(queued),
+            None
+        );
+    }
+
+    /// A replay that leaves `--expired-wait-charge` unset charges runs of
+    /// expired timed waits as its record says, whatever its own options: a
+    /// record of a plain run (which stores the rule) makes even a `--chaos`
+    /// replay charge a run once, and a record that does not say (a chaos
+    /// recording, or one older than the rule) makes even a plain replay
+    /// charge every wait. An explicit value decides; a run that replays
+    /// nothing takes the default from `--chaos` and the heuristic; a
+    /// recording stores the rule.
+    #[test]
+    fn a_replay_charges_expired_waits_as_its_record_says() {
+        let dir = tempfile::tempdir().unwrap();
+        for (recorded_once, chaos) in [(true, true), (false, false), (true, false), (false, true)] {
+            let path = dir
+                .path()
+                .join(format!("record-{recorded_once}-{chaos}.json"));
+            let record = crate::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+                .with_expired_wait_runs_charged_once(recorded_once);
+            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+            for schedule in [true, false] {
+                let config = Config {
+                    chaos,
+                    replay_schedule_from: schedule.then(|| path.clone()),
+                    replay_preemptions_from: (!schedule).then(|| path.clone()),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    Scheduler::new(&config).expired_wait_runs_charged_once,
+                    recorded_once,
+                    "recorded {recorded_once}, --chaos {chaos}, schedule replay {schedule}"
+                );
+            }
+        }
+        // An explicit `--expired-wait-charge` decides, record or not (`hermit
+        // run` refuses one that disagrees with the record before this).
+        let path = dir.path().join("record-true-true.json");
+        use crate::config::ExpiredWaitCharge;
+        for (charge, once) in [
+            (ExpiredWaitCharge::Once, true),
+            (ExpiredWaitCharge::Each, false),
+        ] {
+            for replay in [None, Some(path.clone())] {
+                let config = Config {
+                    chaos: true,
+                    expired_wait_charge: Some(charge),
+                    replay_schedule_from: replay.clone(),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    Scheduler::new(&config).expired_wait_runs_charged_once,
+                    once,
+                    "{charge:?}, replaying {replay:?}"
+                );
+            }
+        }
+        // A replay that also records stores the rule it replayed under.
+        let replaying_recorder = Config {
+            chaos: true,
+            replay_schedule_from: Some(path.clone()),
+            record_preemptions: true,
+            ..Default::default()
+        };
+        let scheduler = Scheduler::new(&replaying_recorder);
+        assert!(scheduler.expired_wait_runs_charged_once);
+        assert!(
+            scheduler
+                .preemption_writer
+                .unwrap()
+                .into_string()
+                .contains("\"expired_wait_runs_charged_once\":true")
+        );
+        // A heuristic that does not select by priority is race search too.
+        let random = Config {
+            sched_heuristic: crate::config::SchedHeuristic::Random,
+            ..Default::default()
+        };
+        assert!(!Scheduler::new(&random).expired_wait_runs_charged_once);
+        for chaos in [false, true] {
+            let config = Config {
+                chaos,
+                record_preemptions: true,
+                ..Default::default()
+            };
+            let scheduler = Scheduler::new(&config);
+            assert_eq!(scheduler.expired_wait_runs_charged_once, !chaos);
+            let written = scheduler.preemption_writer.unwrap().into_string();
+            assert_eq!(
+                written.contains("\"expired_wait_runs_charged_once\":true"),
+                !chaos,
+                "{written}"
+            );
+        }
+    }
+
+    /// A run of turns that each end an expired timed wait is charged one
+    /// scheduler turn while another thread is queued: the first of the run
+    /// is charged, the next is not, whether its thread is the same or
+    /// another. With nobody else queued (the waiter itself does not count),
+    /// under record/replay, under `--chaos`, and after any other committed
+    /// turn, every such turn is charged as before. A host-timed polling retry
+    /// neither ends nor continues a run, so the charge cannot depend on how
+    /// many retries ran,
+    /// and neither does a skipped turn, which takes a pending mark with it,
+    /// nor a schedule replay's own switch turn, which its recording lacks.
+    #[test]
+    fn a_run_of_expired_timed_waits_is_charged_one_turn_while_another_thread_waits() {
+        let config = Config::default();
+        let first = DetTid::from_raw(13);
+        let second = DetTid::from_raw(14);
+        let worker = DetTid::from_raw(15);
+        // A committed turn of `tid`, and whether it ended an expired wait.
+        let wait = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::FutexWait, Permission::R);
+            (request, true)
+        };
+        let ordinary = |tid: DetTid| (Resources::new(tid), false);
+        let retry = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            (request, false)
+        };
+        let switch = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::TraceReplay, Permission::RW);
+            (request, false)
+        };
+        // The advance of the last of `turns`, committed in order with
+        // `queued` in the run queue, by a scheduler for `config`.
+        let advance_under = |config: &Config,
+                             record_replay: bool,
+                             queued: &[DetTid],
+                             turns: &[(Resources, bool)]| {
+            let mut sched = Scheduler::new(config);
+            sched.recordreplay_modes = record_replay;
+            for tid in queued {
+                sched.priorities.insert(*tid, DEFAULT_PRIORITY);
+                sched.runqueue_push_back(*tid);
+            }
+            let time = Mutex::new(GlobalTime::new(config));
+            let mut before = time.lock().unwrap().as_nanos();
+            for (turn, expired) in turns {
+                before = time.lock().unwrap().as_nanos();
+                sched.expired_wait_grant = expired.then_some(turn.tid);
+                sched.bump_global_time(&time, &Ok(turn.clone()));
+            }
+            time.lock().unwrap().as_nanos().duration_since(before)
+        };
+        let advance = |record_replay: bool, queued: &[DetTid], turns: &[(Resources, bool)]| {
+            advance_under(&config, record_replay, queued, turns)
+        };
+        let charge = advance(false, &[worker], &[ordinary(worker), ordinary(worker)]);
+        assert!(charge > Duration::ZERO, "an ordinary turn is charged");
+        assert_eq!(
+            advance(false, &[worker], &[ordinary(worker), wait(first)]),
+            charge,
+            "the first expired wait of a run"
+        );
+        assert_eq!(
+            advance(false, &[worker], &[wait(first), wait(second)]),
+            Duration::ZERO,
+            "another thread's expired wait right after it"
+        );
+        assert_eq!(
+            advance(false, &[worker], &[wait(first), wait(first), wait(first)]),
+            Duration::ZERO,
+            "the same thread's, again and again"
+        );
+        assert_eq!(
+            advance(false, &[], &[wait(first), wait(first)]),
+            charge,
+            "nobody else queued"
+        );
+        assert_eq!(
+            advance(false, &[first], &[wait(first), wait(first)]),
+            charge,
+            "only the waiter itself queued"
+        );
+        assert_eq!(
+            advance(true, &[worker], &[wait(first), wait(second)]),
+            charge,
+            "under record/replay"
+        );
+        assert_eq!(
+            advance(
+                false,
+                &[worker],
+                &[wait(first), ordinary(worker), wait(second)]
+            ),
+            charge,
+            "an ordinary turn ends the run"
+        );
+        assert_eq!(
+            advance(false, &[worker], &[wait(first), retry(first), wait(second)]),
+            Duration::ZERO,
+            "a retry does not end the run"
+        );
+        assert_eq!(
+            advance(
+                false,
+                &[worker],
+                &[wait(first), switch(second), wait(second)]
+            ),
+            Duration::ZERO,
+            "nor does a schedule replay's switch turn, which the recording lacks"
+        );
+        assert_eq!(
+            advance(
+                false,
+                &[worker],
+                &[ordinary(worker), retry(first), wait(second)]
+            ),
+            charge,
+            "nor start one"
+        );
+        assert_eq!(
+            advance(false, &[worker], &[wait(first), retry(first)]),
+            charge,
+            "and is charged itself"
+        );
+        // A skipped turn between two expired waits, and one that takes the
+        // mark a grant left for a turn that was not committed.
+        let skipped = |expired_before_skip: bool| {
+            let mut sched = Scheduler::new(&config);
+            sched.priorities.insert(worker, DEFAULT_PRIORITY);
+            sched.runqueue_push_back(worker);
+            let time = Mutex::new(GlobalTime::new(&config));
+            let (first_wait, _) = wait(first);
+            sched.expired_wait_grant = Some(first);
+            sched.bump_global_time(&time, &Ok(first_wait.clone()));
+            sched.expired_wait_grant = expired_before_skip.then_some(second);
+            sched.bump_global_time(&time, &Err(SkipTurn));
+            let (second_wait, _) = wait(second);
+            let before = time.lock().unwrap().as_nanos();
+            sched.expired_wait_grant = (!expired_before_skip).then_some(second);
+            sched.bump_global_time(&time, &Ok(second_wait));
+            time.lock().unwrap().as_nanos().duration_since(before)
+        };
+        assert_eq!(
+            skipped(false),
+            Duration::ZERO,
+            "a skipped turn does not end the run"
+        );
+        assert_eq!(
+            skipped(true),
+            charge,
+            "a skipped turn takes the mark with it"
+        );
+        // Under --chaos every expired wait keeps its turn charge.
+        let chaos = Config {
+            chaos: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            advance_under(&chaos, false, &[worker], &[wait(first), wait(second)]),
+            charge,
+            "under --chaos"
+        );
+        assert_eq!(
+            advance_under(&chaos, false, &[worker], &[wait(first), wait(first)]),
+            charge,
+            "the same thread's, under --chaos"
+        );
+    }
+
+    /// An expired timed wait is one that ends at its deadline: a futex wait
+    /// answered `TimeOut`, or a sleep already due, including a zero-length one
+    /// (its deadline is the time it was made). A futex wait a wake ended, a
+    /// timeout whose grant delivers a signal, a yield's epoch sleep and a
+    /// pause's indefinite deadline are not.
+    #[test]
+    fn an_expired_timed_wait_is_one_that_ends_at_its_deadline() {
+        let tid = DetTid::from_raw(13);
+        let grant = |request: Resources, timed_out: bool| {
+            let mut sched = Scheduler::new(&Config::default());
+            sched.committed_time = LogicalTime::from_nanos(5_000_000);
+            register_known_thread(&mut sched, tid);
+            sched.runqueue_push_back(tid);
+            if timed_out {
+                assert!(sched.blocked.timed_out_futex_waiters.insert(tid));
+            }
+            let next = sched.next_turns.get(&tid).unwrap();
+            next.req.put(Ok(request.clone()));
+            let response = next.resp.clone();
+            assert_eq!(sched.run_queue.tentative_pop_next(), Some(tid));
+            assert!(sched.step4_resource_block(tid, &request, &response).is_ok());
+            assert!(sched.step5_guest_unblock(tid, &request, &response).is_ok());
+            sched.expired_wait_grant
+        };
+        let futex = || {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::FutexWait, Permission::R);
+            request
+        };
+        let sleep = |deadline: LogicalTime| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::SleepUntil(deadline), Permission::W);
+            request
+        };
+        assert_eq!(grant(futex(), true), Some(tid), "a futex timeout");
+        assert_eq!(grant(futex(), false), None, "one a wake ended");
+        assert_eq!(
+            grant(sleep(LogicalTime::from_nanos(4_000_000)), false),
+            Some(tid),
+            "a due sleep"
+        );
+        assert_eq!(
+            grant(sleep(LogicalTime::from_nanos(5_000_000)), false),
+            Some(tid),
+            "a zero-length sleep"
+        );
+        assert_eq!(
+            grant(sleep(LogicalTime::from_nanos(0)), false),
+            None,
+            "a yield"
+        );
+        let mut delivery = Resources::new(tid);
+        delivery.insert(
+            ResourceID::InboundSignal(SigWrapper(libc::SIGALRM)),
+            Permission::W,
+        );
+        assert_eq!(
+            grant(delivery, true),
+            None,
+            "a timeout whose grant delivers a signal"
+        );
+        let now = LogicalTime::from_nanos(5_000_000);
+        assert!(!Scheduler::is_due_sleep(
+            &sleep(LogicalTime::INDEFINITE),
+            now
+        ));
+        assert!(!Scheduler::is_due_sleep(
+            &sleep(LogicalTime::from_nanos(6_000_000)),
+            now
+        ));
+    }
+
+    /// A backed-off poller is restored to its normal priority once a
+    /// poll-upgrade period of virtual time passes without a poll upgrade
+    /// (`upgrade_pollers_on_time`), and not before. An upgrade the
+    /// queueing-operation interval runs in the meantime restarts the period,
+    /// at the next committed time the scheduler looks at: a second look at
+    /// the same committed time changes nothing.
+    #[test]
+    fn a_backed_off_poller_is_upgraded_once_a_poll_upgrade_period_passes_without_one() {
+        let mut sched = Scheduler::new(&Config::default());
+        let period = sched.poll_upgrade_period;
+        assert_eq!(
+            period,
+            Duration::from_millis(200),
+            "the default maximum timeslice"
+        );
+        let poller = DetTid::from_raw(13);
+        let normal = 500;
+        sched.priorities.insert(poller, normal);
+        sched.run_queue.push_poller(poller, normal, 6);
+        let backed_off = Some(runqueue::LAST_PRIORITY);
+        assert_eq!(sched.run_queue.queued_priority(poller), backed_off);
+        let start = LogicalTime::from_nanos(1_000_000_000);
+        sched.committed_time = start;
+        sched.upgrade_pollers_on_time();
+        assert_eq!(
+            sched.run_queue.queued_priority(poller),
+            backed_off,
+            "the first pass only starts the period"
+        );
+        sched.committed_time = start + (period - Duration::from_nanos(1));
+        sched.upgrade_pollers_on_time();
+        assert_eq!(
+            sched.run_queue.queued_priority(poller),
+            backed_off,
+            "before the period runs out"
+        );
+        sched.committed_time = start + period;
+        sched.upgrade_pollers_on_time();
+        assert_eq!(
+            sched.run_queue.queued_priority(poller),
+            Some(normal),
+            "once it runs out"
+        );
+
+        // The poller retries and backs off again; an upgrade the interval
+        // runs then restarts the period, so the next timed one is due a whole
+        // period after the pass that saw it.
+        assert!(sched.run_queue.remove_tid(poller));
+        sched.run_queue.push_poller(poller, normal, 7);
+        let looked = start + period + Duration::from_millis(50);
+        sched.committed_time = looked;
+        sched.upgrade_pollers_on_time();
+        // An interval upgrade after the scheduler looked at this committed
+        // time is seen at the next one, however often it looks again here.
+        assert_eq!(sched.run_queue.upgrade_pollers(), vec![poller]);
+        assert!(sched.run_queue.remove_tid(poller));
+        sched.run_queue.push_poller(poller, normal, 8);
+        sched.upgrade_pollers_on_time();
+        let restart = looked + Duration::from_millis(10);
+        sched.committed_time = restart;
+        sched.upgrade_pollers_on_time();
+        sched.committed_time = looked + period;
+        sched.upgrade_pollers_on_time();
+        assert_eq!(
+            sched.run_queue.queued_priority(poller),
+            backed_off,
+            "the interval's upgrade restarted the period at the next committed time"
+        );
+        sched.committed_time = restart + period;
+        sched.upgrade_pollers_on_time();
+        assert_eq!(sched.run_queue.queued_priority(poller), Some(normal));
+    }
+
+    /// A timed poll upgrade also makes a queued live poller's filed retry
+    /// runnable at its next selection (`ready_filed_retries`), as readying a
+    /// pipe does. A poller whose process a committed fatal signal doomed and
+    /// a queued thread that is not polling are left alone. Under `hermit
+    /// record`/`hermit replay` and under a heuristic that picks threads
+    /// regardless of priority nothing happens at all. The period has a floor
+    /// of 200 ms whatever the maximum timeslice.
+    #[test]
+    fn a_timed_poll_upgrade_readies_a_live_pollers_filed_retry() {
+        let actor = DetTid::from_raw(1);
+        let live = DetTid::from_raw(3);
+        let doomed = DetTid::from_raw(5);
+        let worker = DetTid::from_raw(7);
+        let start = LogicalTime::from_nanos(1_000_000_000);
+        let run = |config: &Config, record_replay: bool| {
+            let mut sched = Scheduler::new(config);
+            sched.recordreplay_modes = record_replay;
+            for tid in [actor, live, doomed, worker] {
+                sched.thread_tree.add_child(actor, tid, true);
+                register_known_thread_for(&mut sched, tid);
+            }
+            sched.record_committed_fatal_signal(doomed);
+            for poller in [live, doomed] {
+                let mut request = Resources::new(poller);
+                request.insert(ResourceID::InternalIOPolling, Permission::W);
+                request.poll_attempt = 3;
+                sched.next_turns[&poller].req.put(Ok(request));
+                sched.runqueue_push_back(poller);
+            }
+            sched.next_turns[&worker]
+                .req
+                .put(Ok(Resources::new(worker)));
+            sched.runqueue_push_back(worker);
+            sched.committed_time = start;
+            sched.upgrade_pollers_on_time();
+            sched.committed_time = start + sched.poll_upgrade_period;
+            sched.upgrade_pollers_on_time();
+            sched
+        };
+        let request = |sched: &Scheduler, tid: DetTid| {
+            sched.next_turns[&tid]
+                .req
+                .try_read()
+                .unwrap()
+                .expect("a filed request")
+        };
+        let sched = run(&Config::default(), false);
+        let readied = request(&sched, live);
+        assert_eq!(
+            (readied.poll_attempt, readied.upgraded_from_attempt),
+            (0, 3),
+            "the live poller's retry is runnable, still counted as its third"
+        );
+        assert!(sched.in_polling_wait(live));
+        assert_eq!(request(&sched, doomed).poll_attempt, 3, "a doomed poller");
+        assert!(
+            request(&sched, worker).resources.is_empty(),
+            "a thread that is not polling"
+        );
+        assert_eq!(
+            request(&run(&Config::default(), true), live).poll_attempt,
+            3,
+            "under hermit record/replay"
+        );
+        let random = Config {
+            sched_heuristic: crate::config::SchedHeuristic::Random,
+            ..Config::default()
+        };
+        assert_eq!(
+            request(&run(&random, false), live).poll_attempt,
+            3,
+            "under the random heuristic"
+        );
+        let short = Config {
+            max_timeslice: std::num::NonZeroU64::new(400_000),
+            ..Config::default()
+        };
+        assert_eq!(
+            Scheduler::new(&short).poll_upgrade_period,
+            Duration::from_millis(200),
+            "a 400 us timeslice still waits 200 ms between timed upgrades"
+        );
+        let costly = Config {
+            scheduler_turn_cost: std::num::NonZeroU64::new(50_000_000),
+            ..Config::default()
+        };
+        assert_eq!(
+            Scheduler::new(&costly).poll_upgrade_period,
+            Duration::from_secs(10),
+            "200 turn charges of 50 ms"
+        );
+    }
+
+    /// Once a SIGKILL's victim could not be named, a doomed poller cannot be
+    /// told from a live one, so a timed poll upgrade readies no filed retry
+    /// (as `ready_channel` readies nothing). It still restores backed-off
+    /// pollers, as the queueing-operation interval does.
+    #[test]
+    fn a_timed_poll_upgrade_readies_nothing_after_an_unresolved_sigkill() {
+        let actor = DetTid::from_raw(1);
+        let poller = DetTid::from_raw(3);
+        let mut sched = Scheduler::new(&Config::default());
+        for tid in [actor, poller] {
+            sched.thread_tree.add_child(actor, tid, true);
+            register_known_thread_for(&mut sched, tid);
+        }
+        let mut request = Resources::new(poller);
+        request.insert(ResourceID::InternalIOPolling, Permission::W);
+        request.poll_attempt = 3;
+        sched.next_turns[&poller].req.put(Ok(request));
+        sched.run_queue.push_poller(poller, DEFAULT_PRIORITY, 3);
+        sched.unresolved_sigkill = true;
+        let start = LogicalTime::from_nanos(1_000_000_000);
+        sched.committed_time = start;
+        sched.upgrade_pollers_on_time();
+        sched.committed_time = start + sched.poll_upgrade_period;
+        sched.upgrade_pollers_on_time();
+        assert_eq!(
+            sched.run_queue.queued_priority(poller),
+            Some(DEFAULT_PRIORITY),
+            "restored"
+        );
+        let filed = sched.next_turns[&poller]
+            .req
+            .try_read()
+            .unwrap()
+            .expect("a filed request");
+        assert_eq!(filed.poll_attempt, 3, "not readied");
+    }
+
+    /// `--cap-preemption-charge`: a committed turn whose request ends an
+    /// expired timeslice is charged the virtual time its thread ran in that
+    /// slice, from its previous granted turn to this request, at most the
+    /// full charge and at least one nanosecond. As in production, the charge
+    /// is applied only after the granted thread has run on to its next
+    /// request, and that later run does not count. Another thread's work, an
+    /// unmarked turn, a thread with no earlier turn and the option off keep
+    /// the full charge, and neither a host-timed polling retry nor a schedule
+    /// replay's switch turn restarts the measure.
+    #[test]
+    fn a_preemption_is_charged_at_most_the_time_its_thread_ran() {
+        let full = Config::default().scheduler_turn_charge().unwrap();
+        let thread = DetTid::from_raw(13);
+        let other = DetTid::from_raw(14);
+        let expired = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.slice_expired = true;
+            request
+        };
+        let retry = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            request
+        };
+        let switch = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::TraceReplay, Permission::RW);
+            request
+        };
+        // The charge of the last of `turns`, in production order: each turn's
+        // thread runs `before` virtual nanoseconds and files the request,
+        // which is granted; it runs `after` more to its next request; then
+        // the next pass charges the turn.
+        let charge = |cap: bool, turns: &[(Resources, u64, u64)]| {
+            let config = Config {
+                cap_preemption_charge: cap,
+                ..Config::default()
+            };
+            let mut sched = Scheduler::new(&config);
+            for tid in [thread, other] {
+                sched.priorities.insert(tid, DEFAULT_PRIORITY);
+                sched.runqueue_push_back(tid);
+            }
+            let time = Mutex::new(GlobalTime::new(&config));
+            let start = time.lock().unwrap().as_nanos();
+            let mut clocks: BTreeMap<DetTid, u64> = BTreeMap::new();
+            let mut run = |tid: DetTid, ran: u64| {
+                let clock = clocks.entry(tid).or_default();
+                *clock += ran;
+                time.lock().unwrap().update_global_time(
+                    tid,
+                    start + LogicalTime::from_nanos(*clock),
+                    LogicalTime::ZERO,
+                );
+            };
+            let mut last = 0;
+            for (turn, before, after) in turns {
+                run(turn.tid, *before);
+                sched.note_granted_turn(turn, &time);
+                run(turn.tid, *after);
+                let before_charge = time.lock().unwrap().as_nanos();
+                sched.bump_global_time(&time, &Ok(turn.clone()));
+                last = time
+                    .lock()
+                    .unwrap()
+                    .as_nanos()
+                    .duration_since(before_charge)
+                    .as_nanos() as u64;
+            }
+            last
+        };
+        let plain = Resources::new;
+        assert_eq!(
+            charge(
+                true,
+                &[(plain(thread), 0, 0), (expired(thread), 1_000, 7_000)]
+            ),
+            1_000,
+            "the slice the turn ended, not the run after its grant"
+        );
+        assert_eq!(
+            charge(true, &[(plain(thread), 0, 0), (expired(thread), 0, 0)]),
+            1,
+            "a capped turn still advances the clock"
+        );
+        assert_eq!(
+            charge(
+                true,
+                &[(plain(thread), 0, 0), (expired(thread), 2 * full, 2_000)]
+            ),
+            full,
+            "a slice longer than one charge is charged as before"
+        );
+        assert_eq!(
+            charge(true, &[(expired(thread), 1_000, 0)]),
+            full,
+            "no earlier turn on record"
+        );
+        assert_eq!(
+            charge(true, &[(plain(thread), 0, 0), (plain(thread), 1_000, 0)]),
+            full,
+            "a turn that does not end an expired slice"
+        );
+        assert_eq!(
+            charge(false, &[(plain(thread), 0, 0), (expired(thread), 1_000, 0)]),
+            full,
+            "the option off"
+        );
+        assert_eq!(
+            charge(
+                true,
+                &[
+                    (plain(thread), 0, 0),
+                    (plain(other), 5_000, 0),
+                    (expired(thread), 1_000, 0)
+                ]
+            ),
+            1_000,
+            "another thread's work is not the preempted thread's"
+        );
+        assert_eq!(
+            charge(
+                true,
+                &[
+                    (plain(thread), 0, 0),
+                    (retry(thread), 500, 0),
+                    (expired(thread), 1_000, 0)
+                ]
+            ),
+            1_500,
+            "a host-timed retry does not restart the measure"
+        );
+        assert_eq!(
+            charge(
+                true,
+                &[
+                    (plain(thread), 0, 0),
+                    (switch(thread), 1_000, 0),
+                    (expired(thread), 0, 0)
+                ]
+            ),
+            1_000,
+            "nor does a schedule replay's switch turn, which the recording lacks"
         );
     }
 
@@ -19930,12 +22005,14 @@ mod test {
     }
 
     /// A failed clone has no child and no release edge: the barrier ends at
-    /// the continuation and the parent keeps the background readmission.
+    /// its `VforkFailed` and the parent keeps the background readmission.
     #[test]
     fn a_failed_vfork_keeps_the_background_readmission() {
         let (mut scheduler, op_id, parent, _) = backgrounded_vfork_pair();
         scheduler.vfork_barriers.insert(parent, None);
-        post_vfork_continuation(&mut scheduler, op_id);
+        let mut failure = Resources::new(parent);
+        failure.insert(ResourceID::VforkFailed(op_id), Permission::RW);
+        scheduler.next_turns[&parent].req.put(Ok(failure));
         assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
         assert!(scheduler.vfork_barriers.is_empty());
         assert!(scheduler.blocked.external_io_blockers.contains_key(&parent));
@@ -19943,15 +22020,12 @@ mod test {
     }
 
     /// A continuation that comes before the child's release edge (a backend
-    /// deferring the child's registration posts it before the child runs)
-    /// ends the barrier as before but readmits nothing: the parent cannot
-    /// resume ahead of the child it is waiting for.
+    /// that registers the child after the parent's call returns posts it
+    /// before the child runs) ends the barrier as before but readmits nothing:
+    /// the parent cannot resume ahead of the child it is waiting for.
     #[test]
     fn a_continuation_before_the_release_edge_keeps_the_background_readmission() {
-        let config = Config::default().with_backend(|backend| {
-            backend.defers_vfork_child_registration = true;
-        });
-        let mut scheduler = Scheduler::new(&config);
+        let mut scheduler = Scheduler::new(&Config::default());
         let parent = DetTid::from_raw(3);
         let child = DetTid::from_raw(5);
         let op_id = ExternalOpId::new(parent, 7);
@@ -20491,6 +22565,122 @@ mod test {
         ));
     }
 
+    /// A parent at its continuation whose child never registers, and was
+    /// never reported torn down, still waits: the barrier stays through the
+    /// valve and the run is refused by name, rather than the continuation
+    /// being read as a failed clone.
+    #[test]
+    fn a_continuation_without_a_child_past_its_valve_refuses_the_run_and_stays() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let parent = DetTid::from_raw(3);
+        let op_id = ExternalOpId::new(parent, 7);
+        let mut continuation = Resources::new(parent);
+        continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+        scheduler.vfork_barriers.insert(parent, None);
+        scheduler.next_turns.insert(
+            parent,
+            ThreadNextTurn {
+                dettid: parent,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(continuation)),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        assert!(scheduler.vfork_barrier_refusal.is_none());
+
+        expire_vfork_barrier_valve(&mut scheduler);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&None));
+        let refusal = scheduler
+            .vfork_barrier_refusal
+            .take()
+            .expect("an expired wait records a typed refusal");
+        assert_eq!(
+            refusal.waits,
+            vec![VforkBarrierWait {
+                parent,
+                child: None,
+                state: VforkBarrierState::Pending,
+            }]
+        );
+    }
+
+    /// A vfork child torn down before its registration completed (it died
+    /// before its first stop, or its registration was refused) ends its
+    /// parent's barrier at the parent's continuation, whichever of the two
+    /// events arrives first. A teardown that names another vfork operation of
+    /// the same parent (an earlier child's late teardown), or that arrives
+    /// for a parent without a pending barrier, changes nothing.
+    #[test]
+    fn a_vfork_child_torn_down_before_registering_ends_the_barrier_at_continuation() {
+        let parent = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        let op_id = ExternalOpId::new(parent, 7);
+        let earlier_op = ExternalOpId::new(parent, 4);
+        let continuation = || {
+            let mut continuation = Resources::new(parent);
+            continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+            continuation
+        };
+        let pending = |req: Ivar<Result<Resources, ThreadExited>>| {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.vfork_barriers.insert(parent, None);
+            scheduler.vfork_barrier_ops.insert(parent, op_id);
+            scheduler.next_turns.insert(
+                parent,
+                ThreadNextTurn {
+                    dettid: parent,
+                    child_tid_addr: 0,
+                    req,
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+            scheduler
+        };
+
+        // Continuation first, then the teardown.
+        let mut scheduler = pending(Ivar::full(Ok(continuation())));
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        // An earlier vfork's child, torn down late, is not this barrier's.
+        scheduler.record_unregistered_vfork_child_exit(earlier_op, DetTid::from_raw(9));
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&None));
+        scheduler.record_unregistered_vfork_child_exit(op_id, child);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+        assert!(scheduler.unregistered_vfork_child_exits.is_empty());
+        assert!(scheduler.vfork_barrier_ops.is_empty());
+
+        // Teardown first: the barrier still waits for the continuation.
+        let mut scheduler = pending(Ivar::new());
+        scheduler.record_unregistered_vfork_child_exit(op_id, child);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&None));
+        scheduler.next_turns[&parent].req.put(Ok(continuation()));
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+
+        // No pending barrier (the child registered): nothing is recorded.
+        let mut scheduler = pending(Ivar::new());
+        scheduler.complete_vfork_registration(parent, child);
+        scheduler.record_unregistered_vfork_child_exit(op_id, child);
+        assert!(scheduler.unregistered_vfork_child_exits.is_empty());
+
+        // The child's TID belonged to a thread that registered and exited in
+        // an earlier lifetime: the teardown of this never-registered child
+        // still ends the barrier.
+        let mut scheduler = pending(Ivar::full(Ok(continuation())));
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, child, true);
+        assert!(scheduler.thread_was_registered(child));
+        scheduler.record_unregistered_vfork_child_exit(op_id, child);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+    }
+
     /// A released barrier whose parent never posts its continuation, and is
     /// never retired, is refused by name once the valve expires, and the
     /// barrier stays released.
@@ -20600,13 +22790,15 @@ mod test {
         assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
     }
 
+    /// A failed clone's `VforkFailed` ends a barrier whose child never
+    /// registered.
     #[test]
     fn vfork_registration_barrier_releases_failed_clone() {
         let mut scheduler = Scheduler::new(&Config::default());
         let parent = DetTid::from_raw(3);
         let op_id = ExternalOpId::new(parent, 7);
-        let mut continuation = Resources::new(parent);
-        continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+        let mut failure = Resources::new(parent);
+        failure.insert(ResourceID::VforkFailed(op_id), Permission::RW);
 
         scheduler.vfork_barriers.insert(parent, None);
         scheduler.next_turns.insert(
@@ -20614,7 +22806,7 @@ mod test {
             ThreadNextTurn {
                 dettid: parent,
                 child_tid_addr: 0,
-                req: Ivar::full(Ok(continuation)),
+                req: Ivar::full(Ok(failure)),
                 resp: Ivar::new(),
                 protocol: Default::default(),
             },
@@ -20628,13 +22820,11 @@ mod test {
     // TODO-HUMAN-REVIEW(PR-1152): Review deferred vfork child registration.
     #[test]
     fn vfork_registration_barrier_waits_for_deferred_child_at_continuation() {
-        // On a backend that defers the child spawn (e.g. KVM), the parent posts its continuation
-        // BEFORE the child registers. An unfulfilled barrier at continuation must be kept, not
-        // torn down as a failed clone; otherwise the late child panics on registration.
-        let config = Config::default().with_backend(|backend| {
-            backend.defers_vfork_child_registration = true;
-        });
-        let mut scheduler = Scheduler::new(&config);
+        // A backend may start the child only after the parent's call returns (KVM does), so the
+        // parent posts its continuation BEFORE the child registers. An unfulfilled barrier at
+        // continuation must be kept, not torn down as a failed clone; otherwise the late child
+        // panics on registration.
+        let mut scheduler = Scheduler::new(&Config::default());
         let parent = DetTid::from_raw(3);
         let child = DetTid::from_raw(5);
         let op_id = ExternalOpId::new(parent, 7);
@@ -20654,7 +22844,7 @@ mod test {
         );
 
         // Parent is at its continuation but the child has not registered: keep waiting, keep the
-        // barrier (the failed-clone teardown must NOT fire on a deferring backend).
+        // barrier (only `VforkFailed` means the clone failed).
         assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
         assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&None));
 
@@ -20667,10 +22857,7 @@ mod test {
     // TODO-HUMAN-REVIEW(PR-1152): Review failed deferred-vfork cancellation.
     #[test]
     fn vfork_registration_barrier_releases_deferred_failed_clone() {
-        let config = Config::default().with_backend(|backend| {
-            backend.defers_vfork_child_registration = true;
-        });
-        let mut scheduler = Scheduler::new(&config);
+        let mut scheduler = Scheduler::new(&Config::default());
         let parent = DetTid::from_raw(3);
         let op_id = ExternalOpId::new(parent, 7);
         let mut failure = Resources::new(parent);
@@ -23506,6 +25693,45 @@ mod test {
         assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
     }
 
+    /// A chaos change point never commits; the empty request it leaves in its
+    /// place commits the thread's next turn, which is the one charged for
+    /// the preemption. So that request keeps the change point's slice-expiry
+    /// mark (`--cap-preemption-charge`), and a change point of an explicit
+    /// `sched_yield`, which has none, leaves none.
+    #[test]
+    fn a_change_point_hands_its_slice_expiry_to_the_request_it_leaves() {
+        for expired in [true, false] {
+            let (mut scheduler, spinner, _) = chaos_spinner_and_waiter(
+                Config {
+                    chaos: true,
+                    ..Config::default()
+                },
+                DEFAULT_PRIORITY,
+                DEFAULT_PRIORITY,
+            );
+            let mut request = Resources::new(spinner);
+            request.insert(
+                ResourceID::PriorityChangePoint(
+                    DEFAULT_PRIORITY,
+                    LogicalTime::from_nanos(1),
+                    1,
+                    Vec::new(),
+                ),
+                Permission::W,
+            );
+            request.slice_expired = expired;
+            scheduler.next_turns[&spinner].req.put(Ok(request));
+            spinner_changepoint(&mut scheduler, spinner, DEFAULT_PRIORITY, 1);
+            let left = scheduler.next_turns[&spinner]
+                .req
+                .try_read()
+                .unwrap()
+                .unwrap();
+            assert!(left.resources.is_empty());
+            assert_eq!(left.slice_expired, expired);
+        }
+    }
+
     /// Two threads, spinner and waiter, at the given priorities, both queued,
     /// on a chaos scheduler.
     fn chaos_spinner_and_waiter(
@@ -23622,6 +25848,42 @@ mod test {
         );
         spinner_changepoint(&mut scheduler, spinner, 136, 1);
         spinner_changepoint(&mut scheduler, spinner, 7043, 2);
+        assert_eq!(scheduler.priorities[&spinner], runqueue::LAST_PRIORITY);
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(waiter));
+    }
+
+    /// A poller whose normal priority is the last band is counted by the
+    /// bound once a poll upgrade has reached it, like every upgraded poller,
+    /// although the upgrade cannot move it: after two passes the spinner
+    /// shares its band, behind it, so its retry runs next. While it is backed
+    /// off, change points keep their draws. Before, such a poller was never
+    /// counted, so threads at better priorities kept it from its retry
+    /// forever; in `tests/c/chaos_poller_beside_sleepers.c` two sleepers did,
+    /// and it never saw the pipe write it polled for.
+    #[test]
+    fn a_chaos_change_point_yields_to_an_upgraded_last_band_poller() {
+        let (mut scheduler, spinner, waiter) = chaos_spinner_and_waiter(
+            Config {
+                chaos: true,
+                ..Config::default()
+            },
+            500,
+            runqueue::LAST_PRIORITY,
+        );
+        assert!(scheduler.run_queue.remove_tid(waiter));
+        scheduler
+            .run_queue
+            .push_poller(waiter, runqueue::LAST_PRIORITY, 5);
+        spinner_changepoint(&mut scheduler, spinner, 136, 1);
+        spinner_changepoint(&mut scheduler, spinner, 7043, 2);
+        assert_eq!(scheduler.priorities[&spinner], 7043, "backed off");
+        assert!(scheduler.chaos_passed_over.is_empty());
+
+        scheduler.run_queue.poll_upgrade_now();
+        spinner_changepoint(&mut scheduler, spinner, 136, 3);
+        assert_eq!(scheduler.priorities[&spinner], 136);
+        assert_eq!(scheduler.chaos_passed_over.get(&waiter), Some(&1));
+        spinner_changepoint(&mut scheduler, spinner, 4756, 4);
         assert_eq!(scheduler.priorities[&spinner], runqueue::LAST_PRIORITY);
         assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(waiter));
     }
@@ -26712,7 +28974,6 @@ mod test {
         for vfork in [false, true] {
             let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
             scheduler.models_signal_targets = false;
-            assert!(!scheduler.backend.signal_interrupts_external_syscalls);
             let op = ExternalOpId::new(creator, 1);
             let rid = if vfork {
                 ResourceID::BlockingVfork(op)
@@ -27239,14 +29500,13 @@ mod test {
 
     /// Only a backend whose blocked waits are interrupted by the kernel's
     /// signal state (`supports_blocked_wait_signal_interruption`)
-    /// arms an `rt_sigsuspend` waiter to await its report. On SaBRe, where a
-    /// signal interrupts an external syscall through its own continuation
-    /// RPC, the waiter stays in its pool, unarmed, with its request empty.
+    /// arms an `rt_sigsuspend` waiter to await its report. On SaBRe, where
+    /// the interrupted thread rejoins through its own continuation RPC, the
+    /// waiter stays in its pool, unarmed, with its request empty.
     #[test]
     fn signal_leaves_rt_sigsuspend_in_its_pool_on_a_backend_without_a_guaranteed_report() {
         let config = Config::default().with_backend(|backend| {
             backend.reports_physical_process_exits = true;
-            backend.signal_interrupts_external_syscalls = true;
         });
         let mut scheduler = Scheduler::new(&config);
         assert!(!scheduler.models_signal_targets);
@@ -29531,7 +31791,6 @@ mod test {
     fn physical_exit_barrier_precedes_empty_queue_timer_fast_forward() {
         let config = Config::default().with_backend(|backend| {
             backend.reports_physical_process_exits = true;
-            backend.signal_interrupts_external_syscalls = true;
         });
         let mut scheduler = Scheduler::new(&config);
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
@@ -29581,7 +31840,6 @@ mod test {
     fn physical_wait_handoff_queue(completion_before_wait: bool) -> Vec<DetTid> {
         let config = Config::default().with_backend(|backend| {
             backend.reports_physical_process_exits = true;
-            backend.signal_interrupts_external_syscalls = true;
         });
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         let mut scheduler = Scheduler::new(&config);
@@ -30421,7 +32679,6 @@ mod test {
     fn physical_exit_barrier_begins_when_last_process_thread_is_logically_dead() {
         let config = Config::default().with_backend(|backend| {
             backend.reports_physical_process_exits = true;
-            backend.signal_interrupts_external_syscalls = true;
         });
         let mut scheduler = Scheduler::new(&config);
         let leader = DetTid::from_raw(100);
@@ -30455,7 +32712,6 @@ mod test {
     fn final_root_and_orphan_exits_release_exact_pid_barriers() {
         let config = Config::default().with_backend(|backend| {
             backend.reports_physical_process_exits = true;
-            backend.signal_interrupts_external_syscalls = true;
         });
         let mut scheduler = Scheduler::new(&config);
         let root = DetPid::from_raw(100);
@@ -30842,6 +33098,220 @@ mod test {
         }
     }
 
+    /// Without publication reports or modelled signal targets (SaBRe), the
+    /// `ChildExit` timer sends the scheduler's copy to a one-thread parent's
+    /// own queue, marked, and that thread's take of the kernel's copy of the
+    /// exit is not delivered, in either order it takes the two: the
+    /// scheduler's copy stands for the exit. Before, the scheduler's copy went
+    /// to the shared queue, where a pending kernel copy of an earlier child's
+    /// exit could absorb it, and that kernel copy was then dropped as a
+    /// duplicate (<https://github.com/rrnewton/hermit/issues/4710>). Decided
+    /// as before: a parent with a second thread at the send (process-directed
+    /// send, kept kernel copy); another thread's take of the kernel copy (a
+    /// thread created after the send, which on Linux could have taken the
+    /// scheduler's copy from the shared queue); and the holder's take while a
+    /// process-directed scheduler copy is outstanding, which may have merged
+    /// into the kernel copy.
+    #[test]
+    fn a_thread_directed_child_exit_sigchld_stands_for_the_exit_without_publication() {
+        use crate::scheduler::child_exit_sigchld::ChildExitSend;
+        use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+        use crate::scheduler::child_exit_sigchld::ChildExitSigchldControl;
+        use crate::scheduler::child_exit_sigchld::ChildExitSiginfo;
+        use crate::scheduler::child_exit_sigchld::OWN_SIGCHLD_MARK;
+        use crate::scheduler::child_exit_sigchld::OwnCopy;
+        use crate::scheduler::child_exit_sigchld::marked_own_copy;
+        use crate::scheduler::child_exit_sigchld::siginfo_code_and_pid;
+        use crate::scheduler::child_exit_sigchld::taken_control;
+
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Case {
+            KernelFirst,
+            OwnFirst,
+            SecondThreadAtSend,
+            ThreadAddedAfterSend,
+            ProcessDirectedOutstanding,
+        }
+        fn add_thread(scheduler: &mut Scheduler, parent: DetPid, thread: DetTid) {
+            scheduler.thread_tree.add_child(parent, thread, false);
+            scheduler.next_turns.insert(
+                thread,
+                ThreadNextTurn {
+                    dettid: thread,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+            scheduler.priorities.insert(thread, DEFAULT_PRIORITY);
+        }
+        fn exit_child(scheduler: &mut Scheduler, child: DetPid, status: i32) {
+            let report = ChildExitSigchldControl::ExitStatus {
+                code: libc::CLD_EXITED,
+                status,
+                uid: 0,
+            };
+            assert_eq!(
+                scheduler.child_exit_sigchld_control(child, report),
+                ChildExitSigchldAnswer::Recorded
+            );
+            grant_group_exit(scheduler, child);
+            assert!(child_exit_timer_armed(scheduler, child));
+        }
+        let kernel = sigchld_info(libc::CLD_EXITED, 200);
+        let exited = ChildExitSiginfo {
+            code: libc::CLD_EXITED,
+            pid: 200,
+            uid: 0,
+            status: 7,
+        };
+        let own = marked_own_copy(0, nix::unistd::getuid().as_raw());
+        let worker = DetTid::from_raw(101);
+        for case in [
+            Case::KernelFirst,
+            Case::OwnFirst,
+            Case::SecondThreadAtSend,
+            Case::ThreadAddedAfterSend,
+            Case::ProcessDirectedOutstanding,
+        ] {
+            let (mut scheduler, parent, child) =
+                child_exit_fixture(false, libc::SIGCHLD, Some("read"), Option::None);
+            scheduler.backend.reports_kernel_child_exit_signals = true;
+            assert!(!scheduler.models_signal_targets, "{case:?}");
+            if case == Case::SecondThreadAtSend {
+                add_thread(&mut scheduler, parent, worker);
+            }
+            scheduler.test_sent_signals = Some(Vec::new());
+            exit_child(&mut scheduler, child, 7);
+            assert_eq!(
+                scheduler.send_child_exit_sigchld(parent, parent, child),
+                ChildExitSend::Sent(Some(parent)),
+                "{case:?}"
+            );
+            let sent = scheduler.test_sent_signals.take().unwrap();
+            let [(target, signal, info, thread_of)] = sent.as_slice() else {
+                panic!("{case:?}: one send expected, got {sent:?}");
+            };
+            assert_eq!((*target, *signal), (parent, libc::SIGCHLD), "{case:?}");
+            let take = |scheduler: &mut Scheduler, taker: DetTid, info: &[u8; 128]| {
+                scheduler.child_exit_sigchld_control_for_receiver(taker, taken_control(info, true))
+            };
+            if case == Case::SecondThreadAtSend {
+                assert_eq!(*thread_of, Option::None, "{case:?}");
+                assert_eq!(*info, Option::None, "{case:?}");
+                // The kept kernel copy is delivered with the ledger's siginfo,
+                // as before.
+                assert_eq!(
+                    take(&mut scheduler, parent, &kernel),
+                    ChildExitSigchldAnswer::ClaimedFor(exited),
+                    "{case:?}"
+                );
+                continue;
+            }
+            assert_eq!(*thread_of, Some(parent), "{case:?}");
+            let sent_own = (*info)
+                .expect("a thread-directed copy carries its mark")
+                .to_user();
+            assert_eq!(sent_own, own, "{case:?}");
+            assert_eq!(siginfo_code_and_pid(&own), (libc::SI_QUEUE, 0), "{case:?}");
+            assert_eq!(
+                i32::from_ne_bytes(own[24..28].try_into().unwrap()),
+                OWN_SIGCHLD_MARK,
+                "{case:?}"
+            );
+            let own_answer = ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(exited));
+            match case {
+                Case::KernelFirst => {
+                    assert_eq!(
+                        take(&mut scheduler, parent, &kernel),
+                        ChildExitSigchldAnswer::Claimed(true),
+                        "{case:?}"
+                    );
+                    assert_eq!(take(&mut scheduler, parent, &own), own_answer, "{case:?}");
+                    // The delivered exit stays for the parent's death.
+                    assert!(
+                        !scheduler.child_exit_sigchld.thread_directed.is_empty(),
+                        "{case:?}"
+                    );
+                }
+                Case::OwnFirst => {
+                    assert_eq!(take(&mut scheduler, parent, &own), own_answer, "{case:?}");
+                    assert_eq!(
+                        take(&mut scheduler, parent, &kernel),
+                        ChildExitSigchldAnswer::Claimed(true),
+                        "{case:?}"
+                    );
+                    // A kernel copy taken last forgets the exit, as `claim`
+                    // does.
+                    assert!(
+                        scheduler.child_exit_sigchld.thread_directed.is_empty(),
+                        "{case:?}"
+                    );
+                }
+                Case::ThreadAddedAfterSend => {
+                    // The holder blocks SIGCHLD; a thread created after the
+                    // send takes the kernel's copy, which is delivered, and
+                    // the holder's copy, taken later, is then a duplicate.
+                    add_thread(&mut scheduler, parent, worker);
+                    assert_eq!(
+                        take(&mut scheduler, worker, &kernel),
+                        ChildExitSigchldAnswer::ClaimedFor(exited),
+                        "{case:?}"
+                    );
+                    assert_eq!(
+                        take(&mut scheduler, parent, &own),
+                        ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate),
+                        "{case:?}"
+                    );
+                }
+                Case::ProcessDirectedOutstanding => {
+                    // Once the parent has a second thread, another child's
+                    // copy goes process-directed and may merge into the
+                    // kernel's copy of the first child's exit.
+                    add_thread(&mut scheduler, parent, worker);
+                    let second = DetPid::from_raw(201);
+                    scheduler.thread_tree.add_child_with_wait_metadata(
+                        parent,
+                        second,
+                        true,
+                        false,
+                        libc::SIGCHLD,
+                    );
+                    scheduler.next_turns.insert(
+                        second,
+                        ThreadNextTurn {
+                            dettid: second,
+                            child_tid_addr: 0,
+                            req: Ivar::new(),
+                            resp: Ivar::new(),
+                            protocol: Default::default(),
+                        },
+                    );
+                    scheduler.priorities.insert(second, DEFAULT_PRIORITY);
+                    exit_child(&mut scheduler, second, 8);
+                    scheduler.test_sent_signals = Some(Vec::new());
+                    assert_eq!(
+                        scheduler.send_child_exit_sigchld(parent, parent, second),
+                        ChildExitSend::Sent(Some(parent)),
+                        "{case:?}"
+                    );
+                    let sent = scheduler.test_sent_signals.take().unwrap();
+                    assert!(
+                        matches!(sent.as_slice(), [(_, _, Option::None, Option::None)]),
+                        "{case:?}: {sent:?}"
+                    );
+                    assert_eq!(
+                        take(&mut scheduler, parent, &kernel),
+                        ChildExitSigchldAnswer::ClaimedFor(exited),
+                        "{case:?}"
+                    );
+                }
+                Case::SecondThreadAtSend => unreachable!("handled above"),
+            }
+        }
+    }
+
     fn child_exit_timer_armed(scheduler: &Scheduler, child: DetPid) -> bool {
         scheduler.blocked.timed_waiters.iter().any(|(_, event)| {
             matches!(
@@ -31187,7 +33657,6 @@ mod test {
     fn final_child_exit_does_not_block_parent_timer() {
         let config = Config::default().with_backend(|backend| {
             backend.reports_physical_process_exits = true;
-            backend.signal_interrupts_external_syscalls = true;
         });
         let mut scheduler = Scheduler::new(&config);
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
@@ -31451,7 +33920,6 @@ mod test {
         }
         let config = Config::default().with_backend(|backend| {
             backend.reports_physical_process_exits = true;
-            backend.signal_interrupts_external_syscalls = true;
         });
         let root = DetTid::from_raw(3);
         let mut runs = Vec::new();
@@ -32616,6 +35084,206 @@ mod test {
         // A committed SIGKILL dooms it, so the wait will end.
         scheduler.record_committed_sigkill(child, Some(DetPid::from_raw(5)));
         assert!(!scheduler.child_waits_wait_only_on_stuck_children());
+    }
+
+    /// Detcore records each task's name (package K slice D4c-1): a new task
+    /// takes its creator's (`dup_task_struct`), a rename replaces only the
+    /// renamed task's, an exec by a thread carries the survivor's name to the
+    /// leader's tid until the exec's edge names the image, and the facts a
+    /// `stat` renders describe the task its file names, with the
+    /// guest-visible parent: the creator's process, the namespace init (1)
+    /// for an orphan given to it, and the recorded getppid answer of a
+    /// process whose parent is outside the tree (the root, its
+    /// `CLONE_PARENT` children); and with the process's own `RLIMIT_RSS`.
+    #[test]
+    fn task_comms_are_inherited_renamed_and_described_as_linux_keeps_them() {
+        use crate::procfs::task_stat::TaskComm;
+        let mut scheduler = Scheduler::new(&Config::default());
+        let (leader, worker, child) = (
+            DetTid::from_raw(3),
+            DetTid::from_raw(4),
+            DetTid::from_raw(5),
+        );
+        scheduler.thread_tree.add_child(leader, leader, true);
+        // The root has no name until its first image names it.
+        assert_eq!(scheduler.task_comm(leader), None);
+        let probe = TaskComm::new(b"probe");
+        scheduler.set_task_comm(leader, probe);
+        scheduler.thread_tree.add_child(leader, worker, false);
+        scheduler.thread_tree.add_child(worker, child, true);
+        for tid in [leader, worker, child] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        assert_eq!(scheduler.task_comm(worker), Some(probe));
+        assert_eq!(scheduler.task_comm(child), Some(probe));
+        let renamed = TaskComm::new(b"worker");
+        scheduler.set_task_comm(worker, renamed);
+        assert_eq!(scheduler.task_comm(leader), Some(probe));
+        assert_eq!(scheduler.task_comm(child), Some(probe));
+
+        let thread = scheduler.task_stat_facts(leader, Some(worker));
+        assert_eq!(thread.comm, Some(renamed));
+        assert!(!thread.leads);
+        assert!(!thread.exited);
+        assert_eq!(thread.process, Some(3));
+        assert_eq!(thread.num_threads, 2);
+        let process = scheduler.task_stat_facts(leader, None);
+        assert_eq!(process.comm, Some(probe));
+        assert!(process.leads);
+        assert_eq!(process.process_exit_signal, libc::SIGCHLD);
+        assert!(process.forked_without_exec);
+        assert_eq!((process.process_group, process.session), (0, 0));
+        assert_eq!(
+            process.parent, None,
+            "the root's parent is unknown until its first image records it"
+        );
+        // A getppid answer is recorded only for a process whose model knows
+        // no parent: the root's is; its child's, whose parent is the root,
+        // is ignored.
+        scheduler.record_external_parent(DetPid::from_raw(5), 9);
+        assert_eq!(scheduler.task_stat_facts(child, None).parent, Some(3));
+        scheduler.record_external_parent(DetPid::from_raw(3), 1);
+        assert_eq!(scheduler.task_stat_facts(leader, None).parent, Some(1));
+        // A CLONE_PARENT child of the root shares the root's outside parent:
+        // the model knows none, so its own getppid answer is recorded.
+        let sibling = DetTid::from_raw(6);
+        scheduler.thread_tree.add_child_with_wait_metadata(
+            leader,
+            sibling,
+            true,
+            true,
+            libc::SIGCHLD,
+        );
+        register_known_thread(&mut scheduler, sibling);
+        assert_eq!(scheduler.task_stat_facts(sibling, None).parent, None);
+        scheduler.record_external_parent(DetPid::from_raw(6), 1);
+        assert_eq!(scheduler.task_stat_facts(sibling, None).parent, Some(1));
+        // The virtual RLIMIT_RSS: each process's own, copied to a forked
+        // child, RLIM_INFINITY unless set.
+        let infinity = crate::procfs::task_stat::RLIM_INFINITY;
+        assert_eq!(scheduler.task_stat_facts(leader, None).rsslim, infinity);
+        scheduler.set_rss_limit(DetPid::from_raw(3), 123);
+        assert_eq!(scheduler.task_stat_facts(leader, None).rsslim, 123);
+        assert_eq!(
+            scheduler.task_stat_facts(leader, Some(worker)).rsslim,
+            123,
+            "a thread's file shows its process's limit"
+        );
+        assert_eq!(scheduler.task_stat_facts(child, None).rsslim, infinity);
+        let grandchild = DetTid::from_raw(7);
+        scheduler.thread_tree.add_child(leader, grandchild, true);
+        register_known_thread(&mut scheduler, grandchild);
+        assert_eq!(scheduler.task_stat_facts(grandchild, None).rsslim, 123);
+        scheduler.set_rss_limit(DetPid::from_raw(3), infinity);
+        assert_eq!(scheduler.task_stat_facts(leader, None).rsslim, infinity);
+        // A thread's file names its process's parent.
+        assert_eq!(
+            scheduler.task_stat_facts(leader, Some(worker)).parent,
+            Some(1)
+        );
+        let forked = scheduler.task_stat_facts(child, None);
+        assert_eq!(forked.process, Some(5));
+        assert_eq!(forked.parent, Some(3), "its creator's process");
+        assert_eq!(forked.num_threads, 1);
+        // An orphan given to the namespace's init has parent 1.
+        scheduler
+            .thread_tree
+            .parent_death_parents
+            .remove(&DetPid::from_raw(5));
+        scheduler
+            .thread_tree
+            .init_orphans
+            .insert(DetPid::from_raw(5));
+        assert_eq!(scheduler.task_stat_facts(child, None).parent, Some(1));
+        // A successful exec clears PF_FORKNOEXEC.
+        scheduler.record_successful_exec(DetPid::from_raw(3));
+        assert!(!scheduler.task_stat_facts(leader, None).forked_without_exec);
+        // An exec by the worker: it survives under the leader's tid with its
+        // own name, which the exec's edge then replaces.
+        scheduler
+            .thread_tree
+            .transfer_exec_parent_death(worker, leader);
+        assert_eq!(scheduler.task_comm(leader), Some(renamed));
+        assert_eq!(scheduler.task_comm(worker), None);
+        // A number given out again starts with its new creator's name.
+        scheduler.thread_tree.add_child(child, worker, false);
+        assert_eq!(scheduler.task_comm(worker), Some(probe));
+    }
+
+    /// A rendered `comm` (package K slice A+) reads the record the facts of
+    /// its task carry, so every spelling of the reader's own process's comm
+    /// shows the described task's name and a newline: a new task's is its
+    /// creator's, `PR_SET_NAME` changes only the renamed task's, and an exec
+    /// names the image by its `AT_EXECFN`, after a thread's exec under the
+    /// leader's tid. The source is the record only where the backend's
+    /// guest threads are not host tasks the tool can name (KVM); elsewhere
+    /// Detcore renders no `comm`, whatever the record holds.
+    #[test]
+    fn a_rendered_comm_reads_the_record_after_renames_clones_and_execs() {
+        use crate::procfs::task_stat::CommSource;
+        use crate::procfs::task_stat::TaskComm;
+        use crate::procfs::task_stat::render_comm;
+        use crate::procfs::task_stat::renders_task_comm;
+        let mut scheduler = Scheduler::new(&Config::default());
+        let (leader, worker, child) = (
+            DetTid::from_raw(3),
+            DetTid::from_raw(4),
+            DetTid::from_raw(5),
+        );
+        scheduler.thread_tree.add_child(leader, leader, true);
+        register_known_thread(&mut scheduler, leader);
+        // The root before its first image: nothing to render, so the
+        // kernel beneath answers (the executor's EACCES on KVM).
+        let unnamed = scheduler.task_stat_facts(leader, None);
+        assert!(!renders_task_comm(&unnamed, 3, CommSource::Record));
+        // The root's image, launched as /path/to/probe.
+        scheduler.set_task_comm(leader, TaskComm::of_exec_filename(b"/path/to/probe"));
+        let comm = |scheduler: &Scheduler, named: DetTid, thread: Option<DetTid>| {
+            let facts = scheduler.task_stat_facts(named, thread);
+            render_comm(&facts.comm.expect("a recorded name"))
+        };
+        // `self`, its pid and `thread-self` of the leader name one task.
+        assert_eq!(comm(&scheduler, leader, None), b"probe\n");
+        assert_eq!(comm(&scheduler, leader, Some(leader)), b"probe\n");
+        let own = scheduler.task_stat_facts(leader, None);
+        assert!(renders_task_comm(&own, 3, CommSource::Record));
+        assert!(
+            !renders_task_comm(&own, 3, CommSource::Kernel),
+            "ptrace, DBT, SaBRe and LiteInst leave every comm to the kernel"
+        );
+        assert!(
+            !renders_task_comm(&own, 9, CommSource::Record),
+            "another process's comm is the kernel beneath's"
+        );
+        // PR_SET_NAME (15 bytes kept) by the leader.
+        scheduler.set_task_comm(leader, TaskComm::new(b"0123456789abcdefghij"));
+        assert_eq!(comm(&scheduler, leader, None), b"0123456789abcde\n");
+        // A thread starts with its creator's name, then renames itself;
+        // `task/<tid>/comm` (and its own `thread-self/comm`) show its own.
+        scheduler.thread_tree.add_child(leader, worker, false);
+        register_known_thread(&mut scheduler, worker);
+        assert_eq!(comm(&scheduler, leader, Some(worker)), b"0123456789abcde\n");
+        scheduler.set_task_comm(worker, TaskComm::new(b"worker-thread"));
+        assert_eq!(comm(&scheduler, leader, Some(worker)), b"worker-thread\n");
+        assert_eq!(comm(&scheduler, leader, None), b"0123456789abcde\n");
+        // A forked child starts with its creator's name.
+        scheduler.thread_tree.add_child(leader, child, true);
+        register_known_thread(&mut scheduler, child);
+        assert_eq!(comm(&scheduler, child, None), b"0123456789abcde\n");
+        assert!(renders_task_comm(
+            &scheduler.task_stat_facts(child, None),
+            5,
+            CommSource::Record
+        ));
+        // An exec by the worker: it keeps its own name under the leader's
+        // tid, then the exec's edge names the image by its AT_EXECFN.
+        scheduler
+            .thread_tree
+            .transfer_exec_parent_death(worker, leader);
+        assert_eq!(comm(&scheduler, leader, None), b"worker-thread\n");
+        scheduler.set_task_comm(leader, TaskComm::of_exec_filename(b"/proc/self/exe"));
+        assert_eq!(comm(&scheduler, leader, None), b"exe\n");
+        assert_eq!(comm(&scheduler, child, None), b"0123456789abcde\n");
     }
 
     /// A parent-death signal follows Linux's `forget_original_parent`
@@ -35097,6 +37765,37 @@ mod test {
         assert!(scheduler.sigalrm_pending(target));
         assert!(!scheduler.in_guest_fatal_alarm_pending(target));
         assert_eq!(scheduler.host_signal_attempts, 0);
+    }
+
+    /// A recording scheduler stores the seed of the guest's randomness in its
+    /// preemption record, in the legacy and the slice-boundary format alike,
+    /// so a replay can hand the guest the values the recording read.
+    #[test]
+    fn a_recorded_schedule_stores_the_guest_rng_seed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("schedule.json");
+        for (strict_schedule_boundaries, rng_seed, stored) in [
+            (false, None, 3),
+            (false, Some(11), 11),
+            (true, Some(11), 11),
+        ] {
+            let config = Config {
+                sequentialize_threads: true,
+                record_preemptions: true,
+                strict_schedule_boundaries,
+                seed: 3,
+                rng_seed,
+                ..Config::default()
+            };
+            let mut scheduler = Scheduler::new(&config);
+            let record = scheduler.preemption_writer.take().unwrap().into_string();
+            std::fs::write(&path, record).unwrap();
+            assert_eq!(
+                crate::preemptions::read_recorded_rng_seed(&path),
+                Ok(Some(stored)),
+                "strict_schedule_boundaries={strict_schedule_boundaries}, rng_seed={rng_seed:?}"
+            );
+        }
     }
 }
 

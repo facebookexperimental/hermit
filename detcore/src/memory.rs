@@ -70,6 +70,13 @@ pub(crate) struct MemoryMetadata {
     /// (`Detcore::handle_brk` refuses a brk by this name).
     #[serde(default)]
     pub(crate) brk_unmodeled: Option<String>,
+    /// Whether the address space has allocated or applied a protection key
+    /// (`pkey_alloc`, `pkey_mprotect`). Hermit's copies of guest memory do
+    /// not check protection keys, so where one may be in force they cannot
+    /// tell which pages the guest can write (`crate::syscalls::inotify`).
+    /// A fork copies the address space, keys included; an exec replaces it.
+    #[serde(default)]
+    pub(crate) protection_keys: bool,
 }
 
 /// Detcore's model of a process's program break: where Linux starts it for
@@ -106,6 +113,7 @@ impl MemoryMetadata {
             && self.brk_current.is_none()
             && self.brk_model.is_none()
             && self.brk_unmodeled.is_none()
+            && !self.protection_keys
     }
 
     /// Record a program break reported by a `brk(2)` return.

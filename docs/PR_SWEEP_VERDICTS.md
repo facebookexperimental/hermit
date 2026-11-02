@@ -635,7 +635,7 @@ Two drafts have already failed this check:
 
 - [Hermit #2410](https://github.com/rrnewton/hermit/pull/2410) named four
   replacement paths in `dev-hermit` and said they had migrated first. All four
-  were absent from current `dev-hermit/main`. That independently invalidated
+  were absent from the current `main` of the dev-hermit repository. That independently invalidated
   the deletion even before the new Hermit workflow caller was considered.
 - [Hermit #2162](https://github.com/rrnewton/hermit/pull/2162) named coordinated
   Reverie and LiteInst heads as part of a five-repository warnings program.
@@ -2156,7 +2156,7 @@ guard will reject the safest inputs; this says the safest inputs belong to your
 neighbours, so go and run your neighbours.
 
 ⚠️ **And install enforcement where it can be withdrawn in one command.** Both
-guards live in a PATH shim installed as a *copy* at `/home/newton/orc-bin/tg`,
+guards live in a PATH shim installed as a *copy* at `~/orc-bin/tg`,
 removable with `rm`. A guard that cannot be pulled quickly turns a false refusal
 into an outage of unbounded length, and the deadlock above lasted only as long as
 it took to diagnose because pulling it was always available.

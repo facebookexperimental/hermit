@@ -1346,6 +1346,8 @@ mod ledger_tests {
                     Some(if failures == 0 { 3 } else { 2 })
                 },
                 filtered_tests: if outcomes.is_empty() { None } else { Some(2) },
+                selective_skipped_nodes: Vec::new(),
+                selective_scope: None,
             };
             let path = dir.path().join(format!("{name}.jsonl"));
             super::super::write_ledger(

@@ -12,6 +12,7 @@ mod hermit_test;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::process::Output;
 
 fn compile_guest(output: &Path) {
     if let Some(parent) = output.parent() {
@@ -35,7 +36,8 @@ fn compile_guest(output: &Path) {
     );
 }
 
-fn run_guest(guest: &Path, seed: u64) -> Vec<u8> {
+/// One `hermit run` of the guest with `options` before it.
+fn hermit_run(guest: &Path, options: &[String]) -> Output {
     let mut command = Command::new(hermit_test::hermit_binary());
     command
         .args([
@@ -44,16 +46,24 @@ fn run_guest(guest: &Path, seed: u64) -> Vec<u8> {
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
         ])
-        .arg(format!("--rng-seed={seed}"))
+        .args(options)
         .arg(guest);
     hermit_test::configure_guest_execution(&mut command);
-    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    hermit_test::hermit_output(&format!("{command:?}"), &mut command)
+}
+
+fn assert_success(output: &Output, label: &str) {
     assert!(
         output.status.success(),
-        "random guest failed for seed {seed}:\nstdout:\n{}\nstderr:\n{}",
+        "random guest failed for {label}:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn run_guest(guest: &Path, seed: u64) -> Vec<u8> {
+    let output = hermit_run(guest, &[format!("--rng-seed={seed}")]);
+    assert_success(&output, &format!("seed {seed}"));
     output.stdout
 }
 
@@ -106,6 +116,69 @@ fn random_sources_repeat_across_runs_and_change_with_seed() {
         assert_eq!(run_guest(&guest, 17), expected);
     }
     assert_ne!(run_guest(&guest, 18), expected);
+}
+
+/// A schedule replay hands the guest the random values its recording read.
+/// `--seed` seeds the guest's randomness as well as the scheduler, so a
+/// preemption record stores the run's `--rng-seed`. A replay that omits
+/// `--rng-seed` adopts it, under either replay flag, and a different explicit
+/// one is refused before the guest runs.
+#[test]
+fn a_schedule_replay_hands_the_guest_the_recorded_random_values() {
+    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "random-determinism/random-sources-replay-{}",
+        std::process::id()
+    ));
+    compile_guest(&guest);
+    let schedule = guest.with_extension("preemptions.json");
+    let recorded = hermit_run(
+        &guest,
+        &[
+            "--seed=17".to_owned(),
+            format!("--record-preemptions-to={}", schedule.display()),
+        ],
+    );
+    assert_success(&recorded, "the recording at --seed=17");
+    let unseeded = hermit_run(&guest, &[]);
+    assert_success(&unseeded, "the default seed");
+    assert_ne!(
+        recorded.stdout, unseeded.stdout,
+        "the premise: the default seed hands the guest other values"
+    );
+
+    for flag in ["--replay-preemptions-from", "--replay-schedule-from"] {
+        let replayed = hermit_run(&guest, &[format!("{flag}={}", schedule.display())]);
+        assert_success(&replayed, flag);
+        assert_eq!(
+            String::from_utf8_lossy(&replayed.stdout),
+            String::from_utf8_lossy(&recorded.stdout),
+            "{flag} handed the guest other random values than the recording"
+        );
+    }
+
+    let refused = hermit_run(
+        &guest,
+        &[
+            "--rng-seed=18".to_owned(),
+            format!("--replay-preemptions-from={}", schedule.display()),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    // EXIT-CLASS: hermit
+    assert_eq!(refused.status.code(), Some(122), "{stderr}");
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("--rng-seed=18 differs from the seed 17"),
+        "{stderr}"
+    );
+    assert!(
+        refused.stdout.is_empty(),
+        "the guest ran despite the refusal: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
 }
 
 #[test]

@@ -26,7 +26,7 @@ pub const REQUIRED_ENV: &str = "HERMIT_PREPARED_NEXTEST_REQUIRED";
 pub const PACKAGE: &str = "hermetic_infra_hermit_tests";
 pub const C_FLAGS: [&str; 3] = ["-O0", "-g", "-pthread"];
 
-pub const C_SOURCES: [(&str, &str); 47] = [
+pub const C_SOURCES: [(&str, &str); 48] = [
     ("c_getpid", "tests/c/getpid.c"),
     ("c_getsockopt_null", "tests/c/getsockopt_null.c"),
     ("c_setsockopt_replay", "tests/c/record_replay_setsockopt.c"),
@@ -161,6 +161,10 @@ pub const C_SOURCES: [(&str, &str); 47] = [
         "tests/c/record_replay_deep_fork_chain.c",
     ),
     ("c_mount_nscd_order", "tests/c/mount_nscd_order.c"),
+    (
+        "c_record_replay_chaos_race",
+        "tests/c/record_replay_chaos_race.c",
+    ),
 ];
 
 // Alias, Cargo target, repository-relative source. The clock now uses the

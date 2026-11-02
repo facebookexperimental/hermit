@@ -5,6 +5,7 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
 
+use reverie_inguest::launcher::exec_stop::physical::BootstrapEntryCoordinates;
 use reverie_loader::artifact::TOOL_REGION;
 use reverie_loader::handoff::Extent;
 use sha2::Digest;
@@ -143,7 +144,16 @@ pub(super) fn run(case: MappedCase) -> io::Result<()> {
     // Every FD/backing and genuine admission outlives actual retirement inside
     // that lexical root. A lost cleanup capability never returns here.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        mapped_packet_control(case, &bytes, &coordinates, &proposed)
+        mapped_packet_control(
+            case,
+            &bytes,
+            &coordinates,
+            &proposed,
+            BootstrapEntryCoordinates {
+                entry: 0x6000e179aba0,
+                terminal_int3: 0x6000e16688d4,
+            },
+        )
     }));
     // A normal Result failure must close this same retained file as well. A
     // caught root panic reaches here only after its actual confirmed cleanup.

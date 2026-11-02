@@ -672,7 +672,7 @@ pub(crate) mod tests {
         );
         let changed = encoded(&tool, &thread, &binding, &receipt);
         check_prepared_native_exec_bytes(&tool, &thread, &binding, &receipt, &changed).unwrap();
-        thread.stats.count_syscall();
+        thread.stats.count_syscall(reverie::syscalls::Sysno::getpid);
         assert!(
             check_prepared_native_exec_bytes(&tool, &thread, &binding, &receipt, &changed).is_err()
         );
@@ -705,8 +705,8 @@ pub(crate) mod tests {
             let _ = thread.chaos_prng.random::<u64>();
         }
         thread.pedigree = thread.pedigree.fork().1.fork().0;
-        thread.stats.count_syscall();
-        thread.stats.count_syscall();
+        thread.stats.count_syscall(reverie::syscalls::Sysno::getpid);
+        thread.stats.count_syscall(reverie::syscalls::Sysno::getpid);
         thread.stats.count_signal();
         thread.stats.timeslice_stats.record(173);
         thread.timer_slack_ns = 137;

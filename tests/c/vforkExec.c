@@ -7,9 +7,12 @@
  */
 
 #include <errno.h>
+#include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -19,6 +22,25 @@ int main(int argc, char* argv[], char* envp[]) {
     printf("exec pid: %u\n", getpid());
     _exit(0);
   }
+
+  /* A CLONE_VFORK call the kernel refuses (CLONE_THREAD requires
+   * CLONE_SIGHAND, kernel/fork.c copy_process): no child is created, and the
+   * parent goes on with EINVAL rather than waiting for a child. */
+  errno = 0;
+  long refused =
+      syscall(SYS_clone, CLONE_VFORK | CLONE_THREAD | SIGCHLD, 0, 0, 0, 0);
+  int refused_errno = errno;
+  if (refused == 0) {
+    _exit(2);
+  }
+  if (refused != -1 || refused_errno != EINVAL) {
+    printf(
+        "refused vfork: expected -1 EINVAL, got %ld %s\n",
+        refused,
+        strerror(refused_errno));
+    return 3;
+  }
+  printf("refused vfork: -1 %s\n", strerror(refused_errno));
 
   pid_t pid = vfork();
 

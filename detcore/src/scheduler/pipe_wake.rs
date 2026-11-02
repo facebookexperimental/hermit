@@ -45,7 +45,7 @@ impl Scheduler {
     /// or a delivered fatal signal. Such a thread leaves the scheduler at a
     /// host-timed moment, so the scan below must not depend on whether it
     /// already has.
-    fn poller_is_doomed(&self, tid: DetTid) -> bool {
+    pub(super) fn poller_is_doomed(&self, tid: DetTid) -> bool {
         let Some(process) = self.thread_tree.thread_to_leader.get(&tid).copied() else {
             return true;
         };

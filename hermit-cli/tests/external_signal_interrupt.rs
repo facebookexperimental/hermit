@@ -112,6 +112,9 @@
 #[path = "common/hermit_binary.rs"]
 mod hermit_binary;
 
+#[path = "common/process_tree.rs"]
+mod process_tree;
+
 use std::cell::Cell;
 use std::fs;
 use std::io::BufRead;
@@ -3384,6 +3387,13 @@ fn run_inherited_terminal_cell_attempt(
         }
     }
 
+    // Where a failed cell's processes were waiting, recorded before the kill
+    // (https://github.com/rrnewton/hermit/issues/4820). A leader that had
+    // already exited took its process tree with it.
+    let snapshot = failure.is_some().then(|| match status {
+        Some(status) => format!("(the session leader had already exited: {status})\n"),
+        None => process_tree::process_tree_snapshot(leader_pid as u32),
+    });
     if failure.is_some() {
         // The leader's process group holds Hermit and every guest process.
         // SAFETY: plain kill(2).
@@ -3409,7 +3419,11 @@ fn run_inherited_terminal_cell_attempt(
         ));
     }
     if let Some(reason) = failure {
-        panic!("{describe}: {reason}\nguest stdout:\n{stdout}\nhermit stderr:\n{stderr}");
+        panic!(
+            "{describe}: {reason}\nguest stdout:\n{stdout}\nhermit stderr:\n{stderr}\n\
+             process tree before the kill:\n{}",
+            snapshot.unwrap_or_default()
+        );
     }
     let ready_to_result = ready_at
         .zip(result_at)

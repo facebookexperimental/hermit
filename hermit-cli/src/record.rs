@@ -21,6 +21,7 @@ use crate::consts::METADATA_NAME;
 use crate::error::Context;
 use crate::error::Error;
 use crate::metadata::Metadata;
+use crate::metadata::RecordOptions;
 use crate::metadata::record_or_replay_config;
 use crate::ptrace_completion::Control;
 use crate::ptrace_completion::{self};
@@ -38,21 +39,25 @@ pub struct Record {
 impl Record {
     /// Spawns a recording with exact mountinfo provenance captured from the
     /// completed recording container namespace.
+    ///
+    /// `options` are what `record start` chose; `None` is a library caller
+    /// that chose nothing, whose recording names no network choice and takes
+    /// the default `/proc` level, CPU profile and schedule.
     pub async fn spawn_with_mountinfo(
         command: Command,
         dir: &Path,
         mountinfo: crate::MountProvenance,
         mountinfo_mount_ids: Option<Vec<u64>>,
-        local_networking: Option<bool>,
-        proc_level: Option<detcore_model::config::ProcLevel>,
-        cpu_profile: detcore_model::cpu_profile::CpuProfile,
+        options: Option<RecordOptions>,
     ) -> Result<Self, Error> {
+        let cpu_profile = options.unwrap_or_default().cpu_profile;
         crate::cpu_profile_admission::check_record_or_replay(cpu_profile)?;
         let mut metadata = Metadata::new(&command)?;
-        metadata.local_networking = local_networking;
+        metadata.local_networking = options.map(|options| options.local_networking);
         // A recording always names its level, so its replay does not depend
         // on the replaying Hermit's default.
-        metadata.proc_level = Some(proc_level.unwrap_or_default());
+        metadata.proc_level = Some(options.unwrap_or_default().proc_level);
+        metadata.schedule = options.unwrap_or_default().schedule;
         // Under x86-64-v3 the host must qualify, and the recording binds the
         // host facts the guest's answers come from
         // (https://github.com/rrnewton/hermit/issues/4243).
@@ -100,6 +105,7 @@ impl Record {
         config.mount_id_assignment_order = metadata.mount_id_assignment_order.clone();
         config.container_mount_table = metadata.container_mount_table.clone();
         config.proc_level = metadata.proc_level.unwrap_or_default();
+        metadata.schedule.apply(&mut config);
 
         crate::cpu_profile_admission::refuse_unadmitted_launch(&config, true)?;
         let tracer = hermit_record::spawn_tracer(command, config).await?;

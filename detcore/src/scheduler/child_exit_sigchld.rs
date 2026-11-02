@@ -434,6 +434,13 @@ pub(crate) struct ChildExitSigchldLedger {
     /// thread that is not the last never touches its process's
     /// `exit_status`, which a sibling's `exit_group` may have just reported.
     pub(super) raw_exit_status: BTreeMap<DetTid, ChildExitSiginfo>,
+    /// The owned children, by parent, whose `ChildExit` timer sent the
+    /// scheduler's copy to the parent's one thread's own queue
+    /// (`Scheduler::own_sigchld_thread_directed`), with that thread (the
+    /// holder), until the child is forgotten. The holder's take of the
+    /// kernel's copy of such a child's exit is not delivered
+    /// (`drop_kernel_copy_of_thread_directed`).
+    pub(super) thread_directed: BTreeMap<(DetPid, DetPid), DetTid>,
 }
 
 /// What the `ChildExit` timer of an owned child does.
@@ -452,6 +459,8 @@ impl ChildExitSigchldLedger {
         let Some(info) = self.exit_status.remove(&child) else {
             return false;
         };
+        // A pid reused since an earlier child's copy went thread-directed.
+        self.thread_directed.remove(&(parent, child));
         self.owned
             .entry(parent)
             .or_default()
@@ -470,6 +479,7 @@ impl ChildExitSigchldLedger {
 
     fn forget(&mut self, parent: DetPid, child: DetPid) {
         self.cohorts.remove(&child);
+        self.thread_directed.remove(&(parent, child));
         if let Some(children) = self.owned.get_mut(&parent) {
             children.remove(&child);
             if children.is_empty() {
@@ -775,6 +785,51 @@ impl ChildExitSigchldLedger {
             }
         }
         self.sent.remove(&parent);
+        self.thread_directed
+            .retain(|(receiver, _), _| *receiver != parent);
+    }
+
+    /// Whether `taker` taking the kernel's copy of owned `child`'s exit drops
+    /// it, because the scheduler's copy of that exit went to `taker`'s own
+    /// queue ([`Self::thread_directed`]) and so stands for it. Linux takes a
+    /// thread's own queue before the shared one (`dequeue_signal`), so the
+    /// holder has taken every scheduler copy sent to it before it takes any
+    /// kernel copy. A kernel copy can hold only kernel copies then, unless
+    /// a scheduler copy sent process-directed to `parent` is still
+    /// outstanding (sent once `parent` had a second thread): that one may
+    /// have merged into it, so the copy is decided as before. Another
+    /// thread's take is decided as before too: the holder may never take its
+    /// copy (it blocks `SIGCHLD`, or exits first), and on Linux that thread
+    /// could have taken the scheduler's copy from the shared queue. A dropped
+    /// copy forgets a child whose `SIGCHLD` was delivered, as `claim` does;
+    /// one whose copy is still pending stays `Sent`, for that copy.
+    fn drop_kernel_copy_of_thread_directed(
+        &mut self,
+        parent: DetPid,
+        child: DetPid,
+        taker: DetTid,
+    ) -> bool {
+        if self.thread_directed.get(&(parent, child)) != Some(&taker) {
+            return false;
+        }
+        let process_directed_outstanding = self.sent.get(&parent).is_some_and(|order| {
+            order.iter().any(|sent| {
+                !self.thread_directed.contains_key(&(parent, *sent))
+                    && matches!(
+                        self.owned
+                            .get(&parent)
+                            .and_then(|children| children.get(sent)),
+                        Some(Notification::Sent(_))
+                    )
+            })
+        });
+        if process_directed_outstanding {
+            return false;
+        }
+        if matches!(self.state(parent, child), Some(Notification::Delivered)) {
+            self.forget(parent, child);
+        }
+        true
     }
 
     /// At the `Exit` grant of `thread` of `process` (`group`: an
@@ -825,19 +880,73 @@ impl Scheduler {
                 ChildExitSend::Nothing
             }
             Some(TimerSend::Send) => {
-                // A receiver in a nested PID namespace sees the tracer as pid
-                // 0, as it sees any sender outside it: its copy is marked.
-                let marked = self
-                    .thread_tree
-                    .pid_namespaces
-                    .namespace_of(DetTid::from_raw(parent.as_raw()))
-                    .is_some()
-                    .then(|| marked_own_copy(std::process::id(), nix::unistd::getuid().as_raw()));
+                let uid = nix::unistd::getuid().as_raw();
+                let thread_directed = self.own_sigchld_thread_directed(parent);
+                let marked = match thread_directed {
+                    // A thread-directed copy is marked with no sender, the
+                    // way a receiver in a nested PID namespace sees the
+                    // tracer, so the scheduler tells it apart from a guest's
+                    // `rt_tgsigqueueinfo` whatever namespace the receiver
+                    // lives in (`is_own_sigchld_mark`).
+                    Some(_) => Some(marked_own_copy(0, uid)),
+                    // A receiver in a nested PID namespace sees the tracer as
+                    // pid 0, as it sees any sender outside it: its copy is
+                    // marked.
+                    None => self
+                        .thread_tree
+                        .pid_namespaces
+                        .namespace_of(DetTid::from_raw(parent.as_raw()))
+                        .is_some()
+                        .then(|| marked_own_copy(std::process::id(), uid)),
+                };
                 self.sending_child_exit = Some(child);
-                let receiver = self.fire_child_exit_alarm(parent, creator, marked);
+                let receiver = self.fire_child_exit_alarm(parent, creator, marked, thread_directed);
                 self.sending_child_exit = None;
+                if let Some(holder) = thread_directed
+                    && receiver.is_some()
+                {
+                    self.child_exit_sigchld
+                        .thread_directed
+                        .insert((parent, child), holder);
+                }
                 ChildExitSend::Sent(receiver)
             }
+        }
+    }
+
+    /// The thread a `ChildExit` timer's own copy for `parent` is sent to
+    /// thread-directed, into that thread's own queue, or `None` to send it
+    /// process-directed as before: on a backend where the kernel's copy of a
+    /// child's exit reaches the tool (`reports_kernel_child_exit_signals`)
+    /// but neither its publication is reported nor the scheduler models
+    /// signal targets, so the send window is not used (SaBRe), when `parent`
+    /// has exactly one live thread.
+    ///
+    /// There, the kernel posts its copy to the shared queue when the tracer
+    /// releases the child, at a moment host timing chooses. A process-directed
+    /// copy of the scheduler's that was sent while such a kernel copy was
+    /// pending merged into it, as Linux does not queue a standard signal
+    /// already pending, and was dropped with it when that kernel copy named a
+    /// child whose `SIGCHLD` had already been delivered: whether the parent got
+    /// a `SIGCHLD` for the exits sent in that window depended on host timing
+    /// (<https://github.com/rrnewton/hermit/issues/4710>). In its own queue
+    /// the scheduler's copy merges only with the scheduler's other copies,
+    /// sent at committed points, and the kernel's copy is dropped
+    /// (`claim_kernel_copy`). The kernel gives a process-directed signal to a
+    /// process's one thread whenever it does not block it, and a blocked one
+    /// stays pending there in either queue, so with one thread the guest sees
+    /// the same delivery; only `/proc/<pid>/status` lists it under `SigPnd`
+    /// rather than `ShdPnd`.
+    pub(super) fn own_sigchld_thread_directed(&self, parent: DetPid) -> Option<DetTid> {
+        if !self.backend.reports_kernel_child_exit_signals
+            || self.backend.reports_child_exit_publication
+            || self.models_signal_targets
+        {
+            return None;
+        }
+        match self.process_signal_targets(parent).as_slice() {
+            [only] => Some(*only),
+            _ => None,
         }
     }
 
@@ -1039,6 +1148,22 @@ impl Scheduler {
 
     fn claim_kernel_copy(&mut self, dtid: DetTid, child: DetPid) -> ChildExitSigchldAnswer {
         let parent = self.sigchld_process(dtid);
+        // The scheduler's copy for this exit went to this thread's own queue
+        // (`own_sigchld_thread_directed`), where it is taken at a point the
+        // schedule fixes: it stands for the exit, so this thread's take of
+        // the kernel's copy, posted to the shared queue at a moment host
+        // timing chooses, is not delivered, whichever of the two it takes
+        // first (`drop_kernel_copy_of_thread_directed`).
+        if self
+            .child_exit_sigchld
+            .drop_kernel_copy_of_thread_directed(parent, child, dtid)
+        {
+            debug!(
+                "[dtid {}] dropping the kernel's SIGCHLD for child {}: the scheduler's went to this thread's own queue",
+                dtid, child
+            );
+            return ChildExitSigchldAnswer::Claimed(true);
+        }
         // Without a publication report, a kept kernel copy of an owned child
         // is delivered with the ledger's siginfo: the kernel's carries the
         // host's CPU times, which the scheduler's copy does not, so which copy

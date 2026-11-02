@@ -17,6 +17,7 @@ use reverie_inguest::launcher::exec_stop::CleanupReceipt;
 use reverie_inguest::launcher::exec_stop::CopiedInputRequest;
 use reverie_inguest::launcher::exec_stop::ExecStop;
 use reverie_inguest::launcher::exec_stop::PreparedExec;
+use reverie_inguest::launcher::exec_stop::physical::BootstrapEntryCoordinates;
 use reverie_inguest::launcher::exec_stop::physical::Preparation;
 use reverie_inguest::launcher::exec_stop::register_words;
 use sha2::Digest;
@@ -80,6 +81,7 @@ unsafe fn mapped_packet_control(
     image_bytes: &[u8],
     observed: &ObservedImage,
     placement: &ProposedPlacement,
+    initializer: BootstrapEntryCoordinates,
 ) -> io::Result<()> {
     // All fallible pre-birth setup may use '?'. After birth every outcome reaches
     // same-owner cancellation before watch teardown or host assertion unwinds.
@@ -331,8 +333,9 @@ unsafe fn mapped_packet_control(
                                 .ok_or_else(|| rpc("actual admission absent"))?,
                             &directory_fd,
                         )?;
-                        // SAFETY: exact immutable V11 image and decoded PC list,
-                        // independent valid-path pre-TLS source audit, original
+                        // SAFETY: the same retained image, exact entry/terminal
+                        // coordinates and decoded PC list; independent valid-path
+                        // pre-TLS source audit, original
                         // ptracer/current-thread runtime, retained real leases,
                         // concurrent genuine RPC and outer bounded cancellation.
                         // This experiment stops at the real initializer INT3 and
@@ -344,6 +347,7 @@ unsafe fn mapped_packet_control(
                                         .as_mut()
                                         .ok_or_else(|| rpc("actual mapping absent"))?,
                                     &config,
+                                    initializer,
                                 )
                                 .await
                         }
@@ -737,5 +741,58 @@ mod retirement_unwind_tests {
 
 #[test]
 fn mapped_genuine_initializer_returns_before_guest() -> io::Result<()> {
-    measured_v11::run(MappedCase::Initialize)
+    use crate::mapped_first_admission::runtime_binding::RetainedImage;
+
+    // The maintained package gate supplies the actual paired resources for the
+    // current host/runtime sources. Missing input is a failure, never a skip or
+    // a fallback to the historical V11 initializer. Do not change global
+    // HERMIT_INSTALL_DIR: the other map/default controls keep their own inputs.
+    let install = std::env::var_os("HERMIT_RETAINED_PACKAGE_TEST_INSTALL")
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| rpc("HERMIT_RETAINED_PACKAGE_TEST_INSTALL is required"))?;
+    let retained = RetainedImage::open_test_install(std::path::Path::new(&install))?;
+    let outcome = catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
+        let placement = retained.placement()?;
+        let initializer = BootstrapEntryCoordinates {
+            entry: retained.entry(),
+            terminal_int3: retained.terminal_int3(),
+        };
+        // SAFETY: the package gate authenticates the same current source/image
+        // pair and the reviewed bounded valid-path entry/ABI contract, as for
+        // mapped_run. Stable CPUID/XState, signal/filter lineage, original
+        // ptracer thread, real RPC and whole-subtree containment remain required.
+        // The retained pair and coordinates are DATA, not execution authority
+        // or Ready. This control stops at initializer return and cancels before
+        // Guest; mapped_packet_control retains every lease until real cleanup.
+        unsafe {
+            mapped_packet_control(
+                MappedCase::Initialize,
+                retained.bytes(),
+                retained.observed(),
+                &placement,
+                initializer,
+            )
+        }
+    }));
+    // Close BOTH original OFDs after every Result and after confirmed-cleanup
+    // panic. Neither a successful close nor a later error hides the real control.
+    let close = retained.verify();
+    match outcome {
+        Err(payload) => {
+            if let Err(error) = close
+                && let Err(diagnostic) = catch_unwind(AssertUnwindSafe(|| {
+                    eprintln!("independent retained-package close failure: {error}")
+                }))
+            {
+                std::mem::forget(diagnostic);
+            }
+            resume_unwind(payload)
+        }
+        Ok(result) => match (result, close) {
+            (result, Ok(())) => result,
+            (result, Err(error)) => Err(rpc(format!(
+                "retained-package close: {error}; control: {result:?}"
+            ))),
+        },
+    }
 }

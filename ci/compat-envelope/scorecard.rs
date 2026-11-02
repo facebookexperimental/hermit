@@ -58,11 +58,12 @@ use hermit_manifest_plan::runner::ExpectedGuestExit;
 use hermit_manifest_plan::runner::ExpectedOutputFailureReason;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::ObservedResult;
+use hermit_manifest_plan::runner::invocation_admits_declared_guest_exit;
 use hermit_manifest_plan::runner::parse_expected_output_failure_reason;
 use hermit_manifest_plan::runner::records_stripped_comparator;
 use hermit_manifest_plan::runner::require_stripped_comparison;
 use hermit_manifest_plan::runner::terminal_diagnostic_reason;
-use hermit_manifest_plan::runner::validate_expected_guest_exit;
+use hermit_manifest_plan::runner::validate_result_expected_guest_exit;
 use hermit_manifest_plan::stress_series::HostCapability;
 use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
 use hermit_manifest_plan::stress_series::SeriesAttemptDisposition;
@@ -102,7 +103,7 @@ const TEST_LEDGER_REPOSITORY: &str = "https://github.com/rrnewton/hermit_test_le
 /// and the compatibility website read. See
 /// <https://github.com/rrnewton/hermit/issues/3301>. Version 2 adds each
 /// row's source tree state, and only a run from a clean source tree can be a
-/// headline (<https://github.com/rrnewton/dev-hermit/issues/463>). Version 3
+/// headline (part of <https://github.com/rrnewton/hermit/issues/3301>). Version 3
 /// floors dbt's cells like every other backend's, now that dbt is compared;
 /// the website still reads version 2, whose dbt cells are in no floor.
 /// Version 4 drops the rows a `parity.retraction` withdraws and counts them
@@ -198,6 +199,14 @@ Commands:
       supplied no rows: reading nothing is what an unpopulated series looks
       like, not a finding that a cell has no evidence. An unreachable root is
       refused outright rather than read as empty.
+  project-observations-snapshot --snapshot FILE --snapshot-sha256 HEX \
+      --refreshed-at STAMP
+      The same projection as project-observations, reading one immutable
+      scorecard-series-snapshot/v1 file instead of a series worktree. The
+      ledger publisher uses it once retention has moved original series files
+      to its archive: the snapshot then carries the authenticated rows while
+      its source commit and tree stay the real published ones. The file must
+      match the digest and name the hermit_test_ledger repository.
   project-and-observe-results --snapshot FILE --snapshot-sha256 HEX \
       --results DIR --expected-head SHA --refreshed-at STAMP
       In one locked transaction, project one immutable canonical series
@@ -563,9 +572,10 @@ fn default_measurement() -> MeasurementState {
 
 /// The part of a cell's evidence that outlives its capped observations.
 ///
-/// The document keeps only each provenance's LATEST observation (cap 1,
-/// <https://github.com/rrnewton/dev-hermit/issues/563>); the full history lives
-/// in the series and the validation history. Before older observations are
+/// The document keeps only each provenance's LATEST observation (cap 1: the
+/// document holds each cell's latest state; d4a43db3c31 measured 1.56 GB ->
+/// 40.7 MB on that day's ledger); the full history lives in the series and
+/// the validation history. Before older observations are
 /// dropped, what they said is folded in here, so [`derive_measurement`] keeps
 /// its meaning: a cell that ever diverged still reads `diverged`.
 ///
@@ -651,8 +661,8 @@ impl CellAggregate {
 }
 
 /// Keep each cell's latest observation per provenance and comparison domain,
-/// and fold the rest into its [`CellAggregate`] (cap 1,
-/// <https://github.com/rrnewton/dev-hermit/issues/563>).
+/// and fold the rest into its [`CellAggregate`] (cap 1: the document holds each
+/// cell's latest state, and the full history lives in the series).
 ///
 /// The two domains are an observation that carries canonical comparisons and
 /// one that carries none (a below-L2 stripped pass, or a projected series
@@ -880,8 +890,9 @@ impl ObservationProvenance {
 /// `measured-and-passed`, while `measurement_state` requires every row to be
 /// `passed` (series.py:730) and otherwise says `measured-no-verdict`. Until
 /// series.py changes, do not treat its state as a second copy of this one.
-/// Aligning the two definitions is tracked in
-/// <https://github.com/rrnewton/dev-hermit/issues/469>.
+/// The two definitions disagree for a cell with a pass beside a parity
+/// failure; aligning them is undecided, with two options: count a parity
+/// failure as a divergence here too, or stop counting it in series.py.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum MeasurementState {
@@ -2276,7 +2287,7 @@ impl ResultRow {
         // the identity: removing or changing it cannot keep the accepted row's
         // hash. Undeclared rows keep their historical identity.
         if let Some(declared) = &self.expected_guest_exit {
-            validate_expected_guest_exit("result row", &self.mode, Some(declared))?;
+            validate_result_expected_guest_exit("result row", &self.mode, Some(declared))?;
             evidence["expected_guest_exit"] = serde_json::json!({
                 "code": declared.code,
                 "reason": declared.reason,
@@ -2497,7 +2508,8 @@ impl ResultRow {
     ///
     /// `check_expected_stdout` and `check_expected_stdout_contains` in
     /// ci/manifest-plan/src/runner.rs fail a matched verify attempt whose two
-    /// runs agree on other bytes than the cell declares, and record why only
+    /// runs agree on other bytes than the cell declares (a replay cell
+    /// inherits the declaration), and record why only
     /// in the attempt's reason. `Ok(None)`: the reason is not one of those
     /// texts. `Ok(Some)`: it is, and the attempt's evidence bears it out, so
     /// the attempt is that red and the record says what it failed. `Err`: the
@@ -2528,9 +2540,12 @@ impl ResultRow {
                 index + 1
             )
         };
-        if self.mode != "verify" {
+        // A replay cell inherits its verify recipe's declarations
+        // (runner::expectation_recipe), so it declares expected stdout
+        // exactly as verify does.
+        if !matches!(self.mode.as_str(), "verify" | "replay") {
             return Err(contradiction(&format!(
-                "only a verify cell declares expected stdout, and this is a {} cell",
+                "only a verify or replay cell declares expected stdout, and this is a {} cell",
                 self.mode
             )));
         }
@@ -3412,11 +3427,13 @@ impl ResultRow {
                 ) => true,
                 Some(ObservedResult::Timeout) => timed_out,
                 Some(ObservedResult::Oom) => !retained_crash,
+                // A chaos-floor failure's attempts all passed and matched.
                 Some(
                     ObservedResult::Pass
                     | ObservedResult::DeterminismFailure
                     | ObservedResult::ParityFailure
-                    | ObservedResult::ReplayFailure,
+                    | ObservedResult::ReplayFailure
+                    | ObservedResult::ChaosFloorFailure,
                 ) => false,
             };
             if !consistent {
@@ -3708,6 +3725,53 @@ where
     Ok((summaries, retained))
 }
 
+#[derive(Debug)]
+struct ProjectObservationsSnapshotArgs {
+    snapshot: PathBuf,
+    snapshot_sha256: String,
+    refreshed_at: String,
+}
+
+fn parse_project_observations_snapshot_args<I>(
+    mut args: I,
+) -> Result<ProjectObservationsSnapshotArgs, String>
+where
+    I: Iterator<Item = String>,
+{
+    let mut snapshot = None;
+    let mut snapshot_sha256 = None;
+    let mut refreshed_at = None;
+    while let Some(arg) = args.next() {
+        let slot = match arg.as_str() {
+            "--snapshot" => &mut snapshot,
+            "--snapshot-sha256" => &mut snapshot_sha256,
+            "--refreshed-at" => &mut refreshed_at,
+            _ => {
+                return Err(format!(
+                    "unknown project-observations-snapshot option `{arg}`\n\n{USAGE}"
+                ));
+            }
+        };
+        if slot.is_some() {
+            return Err(format!(
+                "project-observations-snapshot accepts {arg} only once"
+            ));
+        }
+        *slot = Some(
+            args.next()
+                .ok_or_else(|| format!("project-observations-snapshot {arg} requires a value"))?,
+        );
+    }
+    let required = |value: Option<String>, option: &str| {
+        value.ok_or_else(|| format!("project-observations-snapshot requires {option}\n\n{USAGE}"))
+    };
+    Ok(ProjectObservationsSnapshotArgs {
+        snapshot: PathBuf::from(required(snapshot, "--snapshot FILE")?),
+        snapshot_sha256: required(snapshot_sha256, "--snapshot-sha256 HEX")?,
+        refreshed_at: required(refreshed_at, "--refreshed-at STAMP")?,
+    })
+}
+
 fn set_project_and_observe_arg(
     slot: &mut Option<String>,
     option: &str,
@@ -3830,6 +3894,7 @@ fn run() -> Result<(), String> {
             | "import-results"
             | "update-observations"
             | "project-observations"
+            | "project-observations-snapshot"
             | "project-and-observe-results"
             | "export-legacy"
     ) && env::var_os("DEV_HERMIT_TEST_LEDGER_PUBLISH_LOCK_FD").is_none()
@@ -3931,6 +3996,15 @@ fn run() -> Result<(), String> {
                 // produce the same file. A refresh timestamp the tool invents is
                 // a diff on every run that says nothing changed.
                 &refreshed_at.ok_or("project-observations requires --refreshed-at STAMP")?,
+            )?;
+        }
+        "project-observations-snapshot" => {
+            let options = parse_project_observations_snapshot_args(args)?;
+            project_observations_snapshot(
+                &root,
+                &options.snapshot,
+                &options.snapshot_sha256,
+                &options.refreshed_at,
             )?;
         }
         "project-and-observe-results" => {
@@ -4804,6 +4878,38 @@ fn derive(root: &Path) -> Result<Derived, String> {
     })
 }
 
+/// The archived execution paths ([`hermit_manifest_plan::archived::ARCHIVED`]),
+/// so the scorecard says why an archived backend has no cell selected by full.
+fn archived_paragraph() -> String {
+    use hermit_manifest_plan::archived::ARCHIVED;
+    use hermit_manifest_plan::archived::ARCHIVED_RUN_TYPE;
+    use hermit_manifest_plan::archived::ArchivedKind;
+    let entries: Vec<String> = ARCHIVED
+        .iter()
+        .map(|entry| {
+            let kind = match entry.kind {
+                ArchivedKind::Backend => "backend",
+                ArchivedKind::PreprocessingWithPtrace => "preprocessing with ptrace, not a backend",
+            };
+            format!(
+                "`{}` ({kind}, archived {}, {})",
+                entry.name, entry.since, entry.schedule
+            )
+        })
+        .collect();
+    if entries.is_empty() {
+        return String::new();
+    }
+    format!(
+        "**Archived:** {}. They get no feature work and their tests left per-commit validation. \
+An archived backend's cells that would be selected by full belong to the `{ARCHIVED_RUN_TYPE}` \
+run type instead, so the table counts them as not selected by full, and the nightly pressure \
+sweep runs them as red cells. `ci/manifest-plan/src/archived.rs` records what still runs per \
+commit.\n\n",
+        entries.join(" and ")
+    )
+}
+
 /// How many selected verify cells declare the stripped comparator, by
 /// category and backend: they are selected, but below L2 and never canonical.
 fn stripped_selected_sentence(derived: &Derived) -> String {
@@ -5112,8 +5218,10 @@ fn declared_guest_exit_matches(
 /// on a result row can be recomputed, so a declaration whose report says
 /// otherwise would otherwise still hash coherently.
 ///
-/// Hermit ran in verify mode with `--verify-allow=failure` before the guest
-/// separator; Hermit's status reports the declared disposition (a signal death
+/// Hermit ran an invocation the runner writes for a declared exit before the
+/// guest separator (`invocation_admits_declared_guest_exit`: verify mode with
+/// `--verify-allow=failure`, or a replay cell's `record start`, which inherits
+/// its verify recipe's declaration); Hermit's status reports the declared disposition (a signal death
 /// either as that signal or as `128 + signo`); and the report's guest
 /// disposition and both compared outputs name exactly the declared code or
 /// signal.
@@ -5138,7 +5246,7 @@ fn declared_failure_matches(
         .iter()
         .position(|arg| *arg == "--")
         .map_or(&argv[..], |separator| &argv[..separator]);
-    if mode != "verify" || !hermit_args.contains(&"--verify-allow=failure") {
+    if !invocation_admits_declared_guest_exit(mode, hermit_args) {
         return false;
     }
     let disposition = |name: &str| match attempt.get(name) {
@@ -5327,6 +5435,7 @@ cross-backend parity.\n\n\
         "| **Total** | **{selected_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
         total - selected_total - na_total
     ));
+    out.push_str(&archived_paragraph());
     // DENOMINATOR PROVENANCE. Emitted from the derived population, never
     // hand-written, so it cannot go stale and cannot be forgotten.
     //
@@ -7128,7 +7237,7 @@ fn attribute_refused_parity_row(
 
 /// A parity row's source tree state, by the rule of section 7 of the parity
 /// summary format, version 3
-/// (<https://github.com/rrnewton/dev-hermit/issues/463>).
+/// (part of <https://github.com/rrnewton/hermit/issues/3301>).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ParityRowTree {
     /// `"source_tree_dirty": false`.
@@ -7182,7 +7291,7 @@ fn with_source_tree_state_added(text: &str) -> Option<String> {
 }
 
 /// Classify one line of the store (section 7 of the parity summary format,
-/// version 3, <https://github.com/rrnewton/dev-hermit/issues/463>):
+/// version 3, part of <https://github.com/rrnewton/hermit/issues/3301>):
 ///
 /// - it passes [`parity_row_check`] with `"source_tree_dirty": false`: clean;
 /// - it passes with `true`: dirty;
@@ -7328,7 +7437,7 @@ impl ParityRunAccumulator {
 /// ([`classify_parity_row`]), by the rule of section 7 of the parity summary
 /// format, version 3 (sha256
 /// 2cf28f143ff8d4a45b8cfc4d69b6fcb35454a8a8f61501c0d9babf0bb8bfb6f8,
-/// <https://github.com/rrnewton/dev-hermit/issues/463>). The rule is stated
+/// part of <https://github.com/rrnewton/hermit/issues/3301>). The rule is stated
 /// per row, because the value is stored on each row and the summary reads
 /// only rows: `source_tree_dirty_rows` and `source_tree_unreported_rows`
 /// count every classified line, duplicates and rows a conflicting commit
@@ -7758,7 +7867,7 @@ Credit pools clean credit (inputs equalized) with unequalized credit only under 
     // Each producer with runs in the store leads with its headline, which is
     // always a run from a clean source tree, or says that it has none
     // (section 7 of the parity summary format, version 3,
-    // https://github.com/rrnewton/dev-hermit/issues/463).
+    // part of https://github.com/rrnewton/hermit/issues/3301).
     let producers_with_runs = summary
         .runs
         .iter()
@@ -9081,7 +9190,24 @@ fn wait_for_scorecard_write_lock(
     }
 }
 
-fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
+/// An absolute path that replaces the repository's scorecard write-back lock.
+/// Only tests set it: a worktree's lock is its Git common directory's, which
+/// every worktree of the primary checkout shares, so a test running `check`
+/// would otherwise wait the full timeout behind a live write-back elsewhere on
+/// the host.
+const WRITEBACK_LOCK_ENV: &str = "HERMIT_SCORECARD_WRITEBACK_LOCK";
+
+fn scorecard_write_lock_path(root: &Path) -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os(WRITEBACK_LOCK_ENV).filter(|path| !path.is_empty()) {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(format!(
+                "{WRITEBACK_LOCK_ENV} must be an absolute path: {}",
+                path.display()
+            ));
+        }
+        return Ok(path);
+    }
     let output = Command::new("git")
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(root)
@@ -9090,12 +9216,16 @@ fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
     if !output.status.success() {
         return Err("git rev-parse failed while locating the scorecard write-back lock".into());
     }
-    let path = PathBuf::from(
+    Ok(PathBuf::from(
         std::str::from_utf8(&output.stdout)
             .map_err(|e| format!("scorecard write-back lock path is not UTF-8: {e}"))?
             .trim(),
     )
-    .join("scorecard-writeback.lock");
+    .join("scorecard-writeback.lock"))
+}
+
+fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
+    let path = scorecard_write_lock_path(root)?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -9634,8 +9764,8 @@ fn render_provenance_disagreements(tracked: &TrackedCells) -> Result<String, Str
 /// prints it. A receipt (a canonical or backend-parity comparison) is one
 /// run. An invocation is one run unless it is the plain copy of a receipt
 /// ([`receipt_covers_plain_invocation`]): writers stored that copy beside
-/// every canonical pass until
-/// https://github.com/rrnewton/dev-hermit/issues/540, and still store it
+/// every canonical pass until the ledger slimming change dropped that copy,
+/// and still store it
 /// beside a canonical divergence and a parity row. So a canonical pass is
 /// one run in either storage form, and any other invocation counts once, as
 /// it did when the report printed the invocation count.
@@ -10507,7 +10637,7 @@ fn apply_validate_results_from(
             // skip a plain invocation that a receipt covers, and a pass has no
             // divergence position to sample. The plain copy cost about 8 MB of
             // cells.json per full run and nothing read it
-            // (https://github.com/rrnewton/dev-hermit/issues/540). Its argv,
+            // (so the ledger slimming change stopped writing it). Its argv,
             // environment and attempt records stay in the retained run named by
             // run_id. Divergences, stripped passes and no-verdict rows keep
             // their invocations.
@@ -11382,7 +11512,6 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
     let derived = check_tracked(root)?;
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
     reconcile_history_catalogue(root, &mut tracked)?;
-    let before = tracked.clone();
 
     // Resolve and verify the source once, then parse only the captured commit
     // bytes. A later worktree mutation cannot change the rows while leaving the
@@ -11395,25 +11524,150 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
         );
     }
     let rows = read_series_rows(&snapshot)?;
-    let attempts = validate_attempt_bindings(&tracked, Some(&rows))?;
-    let representation = direct_representation(&tracked, &rows, &attempts)?;
-    remove_replaceable_projected_observations(&mut tracked, &rows, Some(&snapshot.source))?;
+    project_observation_rows(
+        root,
+        &derived,
+        tracked,
+        &rows,
+        &ObservationRowSource {
+            source: &snapshot.source,
+            repository: snapshot.source_repository.as_deref(),
+            commit: &snapshot.source_commit,
+            tree: &snapshot.source_tree,
+        },
+        refreshed_at,
+        || Ok(()),
+    )
+}
+
+/// The same projection as `project_observations`, from one held
+/// scorecard-series-snapshot/v1 file rather than a series worktree.
+///
+/// The ledger publisher needs this once retention has moved original series
+/// files out of the published tree: the snapshot then holds the authenticated
+/// union of active and archived rows, and still names the real published
+/// commit and `series` tree. A series worktree cannot express that, because its
+/// committed-file guard requires every row to be in a committed shard. The
+/// snapshot must hold published rows only (no local sources), exactly the
+/// population `project_observations` reads; it is rechecked against its
+/// digest and identity immediately before the write.
+fn project_observations_snapshot(
+    root: &Path,
+    snapshot_path: &Path,
+    snapshot_sha256: &str,
+    refreshed_at: &str,
+) -> Result<(), String> {
+    project_observations_snapshot_with(
+        root,
+        snapshot_path,
+        snapshot_sha256,
+        refreshed_at,
+        || Ok(()),
+    )
+}
+
+/// `project_observations_snapshot` with a hook that runs after every guard and
+/// immediately before the held snapshot's final recheck; tests use it to
+/// change the file while it is held.
+fn project_observations_snapshot_with<BeforeVerify>(
+    root: &Path,
+    snapshot_path: &Path,
+    snapshot_sha256: &str,
+    refreshed_at: &str,
+    before_verify: BeforeVerify,
+) -> Result<(), String>
+where
+    BeforeVerify: FnOnce() -> Result<(), String>,
+{
+    if refreshed_at.trim().is_empty() {
+        return Err("--refreshed-at requires a nonempty deterministic stamp".into());
+    }
+    let _lock = acquire_history_write_lock(root)?;
+    // Validate and hold the caller's operand before unrelated catalogue work,
+    // as project-and-observe-results does.
+    let snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
+    let source = &snapshot.snapshot.source;
+    if source.repository.as_deref() != Some(TEST_LEDGER_REPOSITORY) {
+        return Err(
+            "new observation projections must read the existing hermit_test_ledger repository"
+                .into(),
+        );
+    }
+    if !source.local_sources.is_empty() || source.published_rows != snapshot.snapshot.rows_read {
+        return Err(format!(
+            "scorecard snapshot {} holds unpublished local rows; an observation projection \
+             reads published rows only",
+            snapshot_path.display()
+        ));
+    }
+    let derived = check_tracked(root)?;
+    let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
+    reconcile_history_catalogue(root, &mut tracked)?;
+    project_observation_rows(
+        root,
+        &derived,
+        tracked,
+        &snapshot.rows,
+        &ObservationRowSource {
+            source: &source.path,
+            repository: source.repository.as_deref(),
+            commit: &source.commit,
+            tree: &source.tree,
+        },
+        refreshed_at,
+        || {
+            before_verify()?;
+            snapshot.verify()
+        },
+    )
+}
+
+/// The identity a projection records for the rows it read.
+struct ObservationRowSource<'a> {
+    source: &'a str,
+    repository: Option<&'a str>,
+    commit: &'a str,
+    tree: &'a str,
+}
+
+/// Project canonical series rows onto the reconciled history and write it.
+///
+/// Both projection commands share this body, so the same rows and source
+/// identity produce the same files whichever way they were read.
+/// `verify_source` runs after every guard and immediately before the write.
+fn project_observation_rows<VerifySource>(
+    root: &Path,
+    derived: &Derived,
+    mut tracked: TrackedCells,
+    rows: &[SeriesRow],
+    row_source: &ObservationRowSource<'_>,
+    refreshed_at: &str,
+    verify_source: VerifySource,
+) -> Result<(), String>
+where
+    VerifySource: FnOnce() -> Result<(), String>,
+{
+    let before = tracked.clone();
+    let source = row_source.source.to_string();
+    let attempts = validate_attempt_bindings(&tracked, Some(rows))?;
+    let representation = direct_representation(&tracked, rows, &attempts)?;
+    remove_replaceable_projected_observations(&mut tracked, rows, Some(&source))?;
     let unrepresented = rows
         .iter()
         .filter(|row| !representation.represented_event_ids.contains(&row.event_id))
         .collect::<Vec<&SeriesRow>>();
     let mut projection =
-        apply_series_rows_in_place(root, &mut tracked, &unrepresented, Some(&snapshot.source))?;
+        apply_series_rows_in_place(root, &mut tracked, &unrepresented, Some(&source))?;
     projection.represented_rows += representation.represented_event_ids.len();
     let skipped = &projection.skipped;
 
     let rows_read = rows.len() as u64;
     tracked.schema = SCHEMA;
     tracked.projection = Some(ObservationProjection {
-        source: snapshot.source.clone(),
-        source_repository: snapshot.source_repository.clone(),
-        source_commit: Some(snapshot.source_commit.clone()),
-        source_tree: Some(snapshot.source_tree.clone()),
+        source: source.clone(),
+        source_repository: row_source.repository.map(str::to_string),
+        source_commit: Some(row_source.commit.to_string()),
+        source_tree: Some(row_source.tree.to_string()),
         refreshed_at: refreshed_at.to_string(),
         rows_read,
         pre_series_corpus: rows.is_empty() || representation.has_unrepresented_direct_evidence,
@@ -11427,7 +11681,8 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
     // hit the disk is a projection someone has to notice and revert.
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
-    write_observation_files(root, &derived, &tracked)?;
+    verify_source()?;
+    write_observation_files(root, derived, &tracked)?;
 
     println!(
         "compatibility scorecard: projected {} cell(s) from {} evidence row(s), including {} \
@@ -11437,9 +11692,9 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
         projection.rows,
         projection.no_verdict_rows,
         projection.runs,
-        snapshot.source,
-        snapshot.source_commit,
-        snapshot.source_tree
+        source,
+        row_source.commit,
+        row_source.tree
     );
     println!(
         "  {} row(s) were already represented by one exact recorded run/attempt; \
@@ -11475,9 +11730,10 @@ fn verify_combined_write_state(
     }
     // Compared in chunks, not by reading the files: cells.json is 1.27 GB, and
     // a whole copy of it per check, beside the original and the generated
-    // bytes, set the write-back's peak
-    // (https://github.com/rrnewton/dev-hermit/issues/554). The parity file is
-    // still read, as before, so an unreadable one still refuses.
+    // bytes, set the write-back's peak. With the rebuilt history below, this
+    // cut the write-back's peak RSS from 15,464 MB to 12,684 MB on real inputs
+    // (measured in 49fa9f99eb95). The parity file is still read, as before, so
+    // an unreadable one still refuses.
     let (scorecard, cells) = history_files(root, false)?;
     let parity = history_parity_file(root, false)?;
     if !file_holds_exactly(&scorecard, expected_scorecard)? {
@@ -12198,7 +12454,7 @@ where
 
     // The reconciled history as read, rebuilt from the held bytes whenever a
     // fresh copy of it is needed, instead of keeping a 2.7 GB clone (`before`)
-    // from here to the end (https://github.com/rrnewton/dev-hermit/issues/554).
+    // from here to the end (49fa9f99eb95 measured the pair of changes here).
     // Parsing and reconciling the same bytes against the same checkout gives
     // the same history; only the first reconciliation checks the committed
     // document and announces retirements.
@@ -12404,8 +12660,9 @@ where
     )?;
     // Each of the history's large copies is released as soon as nothing below
     // reads it, so they are not all held while the generated files are built
-    // and written (https://github.com/rrnewton/dev-hermit/issues/554). After
-    // here the snapshot is read only for its held identity (verify).
+    // and written (with the other cuts in 06142e8fb897, the write-back's peak
+    // RSS went from 23,850 MB to 15,464 MB on real inputs). After here the
+    // snapshot is read only for its held identity (verify).
     snapshot.rows = Vec::new();
     let before = reconciled_history(false)?;
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
@@ -13599,7 +13856,7 @@ fn binding_matches_event(binding: &ComparisonAttemptBinding, row: &SeriesRow) ->
 }
 
 /// Refuse a stored [`ExpectedOutputFailure`] the validate fold could not have
-/// written: one outside a validate observation of a verify cell, on an attempt
+/// written: one outside a validate observation of a verify or replay cell, on an attempt
 /// the runner did not FAIL without a timeout, under an invocation whose result
 /// is a pass or a divergence, or one the runner's reason could not state.
 fn validate_expected_output_failures(tracked: &TrackedCells) -> Result<(), String> {
@@ -13610,8 +13867,8 @@ fn validate_expected_output_failures(tracked: &TrackedCells) -> Result<(), Strin
                     let Some(failure) = &attempt.expected_output_failure else {
                         continue;
                     };
-                    let why = if cell.id.mode != "verify" {
-                        Some("only a verify cell declares expected output")
+                    let why = if !matches!(cell.id.mode.as_str(), "verify" | "replay") {
+                        Some("only a verify or replay cell declares expected output")
                     } else if observation.provenance != ObservationProvenance::Validate {
                         Some("only a validate observation verifies one")
                     } else if attempt.outcome != "FAIL" || attempt.timed_out {
@@ -15407,11 +15664,14 @@ fn series_evidence(row: &SeriesRow, id: &CellId) -> Option<SeriesEvidence> {
     }
     if row.schema == SeriesSchema::V3 {
         return match row.series.result {
+            // A chaos-floor failure is a product result over attempts that each
+            // matched: an observation of its cell, as a divergence is.
             Some(
                 result @ (ObservedResult::Pass
                 | ObservedResult::DeterminismFailure
                 | ObservedResult::ParityFailure
-                | ObservedResult::ReplayFailure),
+                | ObservedResult::ReplayFailure
+                | ObservedResult::ChaosFloorFailure),
             ) => Some(SeriesEvidence {
                 result: Some(result),
                 no_verdict: false,
@@ -16005,12 +16265,18 @@ struct SnapshotDirectoryIdentity {
 impl SnapshotDirectoryIdentity {
     fn from_path_identity(identity: SnapshotPathIdentity) -> Self {
         // Creating or renaming a sibling output changes directory timestamps
-        // and size without replacing the held directory. The snapshot file
-        // itself still uses the complete metadata identity and byte digest.
+        // and size without replacing the held directory. So does a chmod:
+        // the held directories include every ancestor of an evidence file,
+        // `/` among them, and other actors on a shared host change their
+        // permission bits (a host's `/` has been seen switching between 0555
+        // and 0755), which failed the check with "evidence directory changed:
+        // /". Only the file type stays in the identity, beside the device and
+        // inode that name the directory. The snapshot file itself still uses
+        // the complete metadata identity and byte digest.
         Self {
             device: identity.device,
             inode: identity.inode,
-            mode: identity.mode,
+            mode: identity.mode & libc::S_IFMT,
         }
     }
 }
@@ -16334,6 +16600,12 @@ fn validate_scorecard_snapshot(
         // refuses an unknown key inside it). The series writer copies it from
         // the cell's results row when the harness recorded one.
         "strictness",
+        // A verify cell's first divergence (`SeriesDivergence`, whose structs
+        // all deny unknown fields; `validate_for_read` checks it). dev-hermit's
+        // series writer has written it on verify rows since 2026-10-21. Every
+        // scorecard render from then on refused the snapshot here until this
+        // entry existed, so scorecard/parity.json stopped advancing.
+        "divergence",
     ];
     let allowed_series_fields = SERIES_FIELDS.iter().copied().collect::<BTreeSet<_>>();
     let mut rows = Vec::with_capacity(snapshot.rows.len());
@@ -25758,6 +26030,19 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                 "series has an unknown field",
             )?;
 
+            // `divergence` is a known series field: it passes the field check
+            // and is judged by the row's own validation, which writes it only on
+            // verify rows (this fixture's row is a replay cell).
+            let mut replay_divergence = row_snapshot_value.clone();
+            replay_divergence["rows"][0]["series"]["divergence"] =
+                serde_json::json!({"self": {"left_len": 3, "right_len": 3}});
+            recompute_snapshot_rows(&mut replay_divergence)?;
+            assert_snapshot_refused_unchanged(
+                "replay-row-divergence",
+                &replay_divergence,
+                "divergence is written only on verify rows",
+            )?;
+
             let mut duplicate_event_id = row_snapshot_value.clone();
             let mut duplicate_row = duplicate_event_id["rows"][0].clone();
             duplicate_row["emitted_at"] = serde_json::json!("2026-09-13T18:30:01Z");
@@ -26081,9 +26366,9 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                         .iter()
                         .any(|cell| cell.id.category == retired_import_id.category) =>
             {
-                // Every writer caps the document it writes back (cap 1,
-                // https://github.com/rrnewton/dev-hermit/issues/563), so the
-                // live cell holds only what the cap keeps of the resolved cell.
+                // Every writer caps the document it writes back (cap 1: each
+                // cell keeps only its latest state), so the live cell holds
+                // only what the cap keeps of the resolved cell.
                 let mut capped = TrackedCells {
                     schema: SCHEMA,
                     projection: None,
@@ -26158,7 +26443,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                         display_id(&import_id)
                     )
                 })?;
-            // Cap 1 (https://github.com/rrnewton/dev-hermit/issues/563) keeps
+            // Cap 1 (each cell keeps only its latest state) keeps
             // each provenance's latest observation and folds the rest into the
             // cell's aggregate; a folded observation is carried only if the
             // aggregate already says everything it said (cell_accounts_for).
@@ -27399,7 +27684,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
     let fold_fixture_row = |row: ResultRow| fold_fixture_rows(vec![row]);
 
     // A canonical PASS is stored once, as its receipt, with no plain
-    // invocation beside it (https://github.com/rrnewton/dev-hermit/issues/540).
+    // invocation beside it (since the ledger slimming change).
     // Its readers still get the run's result, pass count, measurement and
     // direct evidence key, through the stored form and a repeated import. A
     // canonical divergence keeps its plain invocation.
@@ -27502,8 +27787,8 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
     // Counting invocations made a receipt-only canonical pass read as zero
     // runs (post-facto review of d3c63548055e946eacf5c3fc1dd123ee1b5bfe94).
     // A canonical pass is one run whether it is stored as its receipt alone or
-    // beside the plain invocation copy that cells written before
-    // https://github.com/rrnewton/dev-hermit/issues/540 hold, and the legacy
+    // beside the plain invocation copy that cells written before the ledger
+    // slimming change hold, and the legacy
     // form prints what the invocation count printed.
     for runs in [1usize, 3] {
         let mut receipt_only = TrackedCells {
@@ -29887,7 +30172,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         // Their omitted outer-attempt and evidence identities collapse to the same
         // compact run/result key even though the invocation payloads differ.
         //
-        // Cells written before https://github.com/rrnewton/dev-hermit/issues/540
+        // Cells written before the ledger slimming change
         // hold that plain invocation beside each canonical receipt. The
         // fixture's replay row is a canonical pass, so the current writer
         // stores only its receipt; the legacy invocation is rebuilt from the
@@ -33697,7 +33982,7 @@ mod post_verdict_transaction_tests {
 
         // The supported current-only ingest route also emits authority. The
         // document keeps only the latest observation of each provenance and
-        // domain (cap 1, https://github.com/rrnewton/dev-hermit/issues/563),
+        // domain (cap 1: each cell keeps only its latest state),
         // so when the receiving head differs, the two previous heads'
         // observations are capped and their bindings leave with them: only
         // the current run's binding stays, and the writer boundary accepts
@@ -33712,6 +33997,238 @@ mod post_verdict_transaction_tests {
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].run_id, "direct-current-run");
         preserve_attempt_bindings(&successor, &current).unwrap();
+    }
+
+    /// One series row for the snapshot projection tests: real cell, tree and
+    /// depth of the fixture's measured source, distinct event and run ids.
+    fn snapshot_projection_row(
+        fixture: &Fixture,
+        event_id: &str,
+        run_id: &str,
+        emitted_at: &str,
+    ) -> SeriesRow {
+        let measured = fixture.options.results_head.clone().unwrap();
+        let row = SeriesRow {
+            source: String::new(),
+            schema: SeriesSchema::V3,
+            event_id: event_id.into(),
+            event_type: "series.observation".into(),
+            emitted_at: emitted_at.into(),
+            team: "hermit".into(),
+            host: "fixture-host".into(),
+            producer: SeriesProducer::Validate,
+            run_id: run_id.into(),
+            series: SeriesPayload {
+                cell: series_cell_key(&fixture.id),
+                tree: measured.clone(),
+                detcore_tree: Some(git(
+                    &fixture.root,
+                    &["rev-parse", &format!("{measured}:detcore")],
+                )),
+                outcome: SeriesOutcome::Passed,
+                result: Some(ObservedResult::Pass),
+                failure_class: None,
+                no_verdict_evidence: None,
+                pressure_evidence: None,
+                declared_guest_exit: None,
+                comparison: None,
+                run_index: 1,
+                attempt: Some(1),
+                num_runs: 1,
+                last_run_index: None,
+                main_ancestry: Some(true),
+                runtime: None,
+                source_tree_dirty: false,
+                depth: source_depths(&fixture.root, &measured).unwrap(),
+                coordinates: None,
+                first_divergent_messages: None,
+                machine_shortname: Some("fixture-host".into()),
+                kernel_version: Some("fixture-kernel".into()),
+                host_capabilities: Some(BTreeMap::from([
+                    (
+                        HostCapability::CpuidFaulting,
+                        HostCapabilityVerdict {
+                            present: true,
+                            evidence: "fixture cpuid probe".into(),
+                        },
+                    ),
+                    (
+                        HostCapability::Kvm,
+                        HostCapabilityVerdict {
+                            present: false,
+                            evidence: "fixture kvm probe".into(),
+                        },
+                    ),
+                ])),
+                strictness: None,
+                divergence: None,
+            },
+        };
+        row.validate_for_read().unwrap();
+        row
+    }
+
+    /// Ledger retention moves original series files to an archive, so the
+    /// publisher hands the authenticated rows over as a snapshot instead of a
+    /// series worktree. Reading the same rows at the same source commit and
+    /// tree must write byte-identical history either way.
+    #[test]
+    fn snapshot_projection_writes_what_the_series_worktree_projection_writes() {
+        let _fixture_lock = history_fixture_lock();
+        let fixture = Fixture::new();
+        fixture.publish().unwrap();
+        // Two rows whose emitted_at order is the reverse of their event_id
+        // order: the worktree reader and the snapshot list them differently.
+        let rows = [
+            snapshot_projection_row(
+                &fixture,
+                "fixture-snapshot-projection-a",
+                "snapshot-projection-run-a",
+                "2026-09-13T18:31:00Z",
+            ),
+            snapshot_projection_row(
+                &fixture,
+                "fixture-snapshot-projection-b",
+                "snapshot-projection-run-b",
+                "2026-09-13T18:30:00Z",
+            ),
+        ];
+        let shard = fixture.ledger.join("series/hermit/fixture/2026-09.jsonl");
+        fs::create_dir_all(shard.parent().unwrap()).unwrap();
+        let mut lines = Vec::new();
+        for row in &rows {
+            lines.extend(serde_json::to_vec(row).unwrap());
+            lines.push(b'\n');
+        }
+        fs::write(&shard, &lines).unwrap();
+        git(&fixture.ledger, &["add", "series", "scorecard"]);
+        let ledger_commit = commit(&fixture.ledger, "snapshot projection fixture");
+        let series_tree = git(&fixture.ledger, &["rev-parse", "HEAD:series"]);
+        let published = read_history_files(&fixture.root).unwrap();
+
+        project_observations(&fixture.root, &fixture.ledger.join("series"), "nightly").unwrap();
+        let from_worktree = read_history_files(&fixture.root).unwrap();
+        assert!(from_worktree != published);
+        let projection = fixture.cells().projection.unwrap();
+        assert_eq!(projection.rows_read, 2);
+        assert_eq!(
+            projection.source_commit.as_deref(),
+            Some(ledger_commit.as_str())
+        );
+        assert_eq!(
+            projection.source_tree.as_deref(),
+            Some(series_tree.as_str())
+        );
+        git(&fixture.ledger, &["checkout", "--quiet", "--", "scorecard"]);
+        assert!(read_history_files(&fixture.root).unwrap() == published);
+
+        // The archived form, committed: the ledger's HEAD no longer holds the
+        // shard, so neither its worktree nor HEAD:series has these rows. The
+        // snapshot names the earlier commit and tree that did, as the
+        // publisher's authenticated archive view does.
+        git(&fixture.ledger, &["rm", "--quiet", "-r", "series"]);
+        fs::create_dir_all(fixture.ledger.join("series")).unwrap();
+        fs::write(fixture.ledger.join("series/ARCHIVE.json"), b"{}\n").unwrap();
+        git(&fixture.ledger, &["add", "series"]);
+        commit(&fixture.ledger, "archive the series fixture");
+        let mut sorted = rows.to_vec();
+        sorted.sort_by(|left, right| {
+            (&left.emitted_at, &left.event_id).cmp(&(&right.emitted_at, &right.event_id))
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let value =
+            scorecard_snapshot_fixture_value(&ledger_commit, &series_tree, &sorted).unwrap();
+        let snapshot = directory.path().join("snapshot.json");
+        let snapshot_sha256 = write_scorecard_snapshot_fixture(&snapshot, &value).unwrap();
+        let write_variant = |name: &str, value: &JsonValue| {
+            let path = directory.path().join(name);
+            let sha256 = write_scorecard_snapshot_fixture(&path, value).unwrap();
+            (path, sha256)
+        };
+
+        // Refusals leave both history files byte-identical.
+        let error =
+            project_observations_snapshot(&fixture.root, &snapshot, &"0".repeat(64), "nightly")
+                .unwrap_err();
+        assert!(error.contains("digest mismatch"), "{error}");
+        let error = project_observations_snapshot(&fixture.root, &snapshot, &snapshot_sha256, " ")
+            .unwrap_err();
+        assert!(error.contains("--refreshed-at"), "{error}");
+        let mut no_repository = value.clone();
+        no_repository["source"]["repository"] = JsonValue::Null;
+        let (path, sha256) = write_variant("no-repository.json", &no_repository);
+        let error =
+            project_observations_snapshot(&fixture.root, &path, &sha256, "nightly").unwrap_err();
+        assert!(error.contains("hermit_test_ledger repository"), "{error}");
+        let mut unpublished = value.clone();
+        unpublished["source"]["published_rows"] = 1.into();
+        let (path, sha256) = write_variant("unpublished.json", &unpublished);
+        let error =
+            project_observations_snapshot(&fixture.root, &path, &sha256, "nightly").unwrap_err();
+        assert!(error.contains("published rows only"), "{error}");
+        // A local source with every row counted as published still names
+        // rows that are not in the ledger; the reader itself admits it.
+        let mut local = value.clone();
+        local["source"]["local_sources"] = serde_json::json!([{
+            "kind": "live", "path": "local.jsonl", "device": 1, "inode": 2,
+            "rows": 0, "size": 0, "sha256": "e".repeat(64),
+        }]);
+        let (path, sha256) = write_variant("local.json", &local);
+        HeldScorecardSeriesSnapshot::open(&path, &sha256).unwrap();
+        let error =
+            project_observations_snapshot(&fixture.root, &path, &sha256, "nightly").unwrap_err();
+        assert!(error.contains("published rows only"), "{error}");
+        // A snapshot changed after it was opened and checked is refused by
+        // the recheck immediately before the write.
+        let error = project_observations_snapshot_with(
+            &fixture.root,
+            &snapshot,
+            &snapshot_sha256,
+            "nightly",
+            || {
+                let mut changed = fs::read(&snapshot).unwrap();
+                changed.push(b'\n');
+                fs::write(&snapshot, &changed).map_err(|error| error.to_string())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("changed"), "{error}");
+        assert!(read_history_files(&fixture.root).unwrap() == published);
+
+        let snapshot_sha256 = write_scorecard_snapshot_fixture(&snapshot, &value).unwrap();
+        project_observations_snapshot(&fixture.root, &snapshot, &snapshot_sha256, "nightly")
+            .unwrap();
+        assert!(read_history_files(&fixture.root).unwrap() == from_worktree);
+    }
+
+    #[test]
+    fn snapshot_projection_arguments_are_exact() {
+        let parse = |args: &[&str]| {
+            parse_project_observations_snapshot_args(args.iter().map(|arg| arg.to_string()))
+        };
+        let parsed = parse(&[
+            "--snapshot",
+            "s.json",
+            "--snapshot-sha256",
+            "abc",
+            "--refreshed-at",
+            "stamp",
+        ])
+        .unwrap();
+        assert_eq!(parsed.snapshot, PathBuf::from("s.json"));
+        assert_eq!(parsed.snapshot_sha256, "abc");
+        assert_eq!(parsed.refreshed_at, "stamp");
+        let error = parse(&["--snapshot", "a", "--snapshot", "b"]).unwrap_err();
+        assert!(error.contains("only once"), "{error}");
+        let error = parse(&["--snapshot", "a", "--refreshed-at"]).unwrap_err();
+        assert!(error.contains("requires a value"), "{error}");
+        let error = parse(&["--series-root", "series"]).unwrap_err();
+        assert!(
+            error.contains("unknown project-observations-snapshot option"),
+            "{error}"
+        );
+        let error = parse(&["--snapshot", "a", "--refreshed-at", "stamp"]).unwrap_err();
+        assert!(error.contains("--snapshot-sha256 HEX"), "{error}");
     }
 
     #[test]
@@ -36545,7 +37062,7 @@ mod post_verdict_transaction_tests {
                 "{label}"
             );
             // A canonical pass stores its receipt and no invocation
-            // (https://github.com/rrnewton/dev-hermit/issues/540), so the green
+            // (since the ledger slimming change), so the green
             // sibling holds no attempt that could carry a failure record, and
             // its one receipt is the pass.
             assert_eq!(
@@ -36633,7 +37150,7 @@ mod post_verdict_transaction_tests {
     /// runner could not have failed that way.
     ///
     /// A canonical pass stores only its receipt
-    /// (https://github.com/rrnewton/dev-hermit/issues/540), so the record is
+    /// (since the ledger slimming change), so the record is
     /// also forged onto a stripped pass, which still stores its attempts.
     #[test]
     fn an_expected_output_failure_the_runner_could_not_have_found_is_not_published() {
@@ -36837,6 +37354,70 @@ mod post_verdict_transaction_tests {
                 declared_text: String::new(),
             });
         });
+    }
+
+    /// A replay cell inherits its verify recipe's declared stdout
+    /// (runner::expectation_recipe), so the runner's red for a failed
+    /// expectation on a replay attempt is retained exactly as on verify.
+    #[test]
+    fn a_replay_failed_stdout_expectation_is_retained_red() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (mut id, declared) = declared_exit_row(&measured);
+        id.mode = "replay".into();
+        let mut replay = with_matched_exit(&declared, 0);
+        replay
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_guest_exit");
+        replay["mode"] = "replay".into();
+        // A replay comparison leaves time real, and its declared exit is
+        // admitted by the record-start invocation compared with
+        // --verify-allow=both (runner::invocation_admits_declared_guest_exit).
+        let argv = vec![
+            "hermit-verify-pair",
+            "hermit",
+            "log-diff",
+            "--verify-allow=both",
+            "hermit",
+            "record",
+            "start",
+            "--",
+            "fixture",
+        ];
+        replay["argv"] = serde_json::json!(argv);
+        replay["attempts"][0]["argv"] = serde_json::json!(argv);
+        let shell_command = literal_shell_command(
+            "/repo",
+            &BTreeMap::from([("LC_ALL".into(), "C".into())]),
+            &argv.iter().map(|arg| (*arg).into()).collect::<Vec<_>>(),
+        );
+        replay["shell_command"] = shell_command.clone().into();
+        replay["attempts"][0]["shell_command"] = shell_command.into();
+        replay["effective_args"] = serde_json::json!(&argv[1..]);
+        let mut report: JsonValue =
+            serde_json::from_str(replay["attempts"][0]["verification_report"].as_str().unwrap())
+                .unwrap();
+        report["comparison"]["virtualize_time"] = false.into();
+        let report = serde_json::to_string(&report).unwrap();
+        replay["attempts"][0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(report.as_bytes())).into();
+        replay["attempts"][0]["verification_report"] = report.into();
+        let observed = "getrandom[0] 918fdb56\n";
+        let expected = "getrandom[0] a29a84d6\n";
+        let replay = with_captured_stdout(&replay, observed);
+        let exact = expected_stdout_reason("first", observed, expected);
+        let failed = expected_output_failure(&replay, &exact);
+        fixture.publish_rows(&[failed]);
+        let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+        match candidates[&id][0].evidence(&id, ResultInput::Current) {
+            Ok(ValidateRowEvidence::ExpectedOutputFailed { reason, result, .. }) => {
+                assert!(reason.contains("failed its declared expected output"), "{reason}");
+                assert_eq!(result, Some(ObservedResult::CrashError));
+            }
+            other => panic!("replay failed expectation was not retained: {other:?}"),
+        }
     }
 
     /// Only the runner's own expected-output red is retained. A FAIL whose
@@ -37317,6 +37898,62 @@ mod post_verdict_transaction_tests {
                 "{label} was accepted outside verify mode"
             );
         }
+        // A replay cell's row carries its verify recipe's declaration and is
+        // judged by the same exact match, from the replay's own invocation
+        // (`record start`, whose comparison takes --verify-allow=both).
+        const REPLAY: &[&str] = &[
+            "hermit-verify-pair",
+            "hermit",
+            "log-diff",
+            "--verify-allow=both",
+            "hermit",
+            "record",
+            "start",
+            "--",
+            "guest",
+        ];
+        for (label, declared, code, signal) in [
+            ("declared code", &code_3, Some(3), None),
+            ("signal death", &signal_11, None, Some(11)),
+        ] {
+            let expected = report(declared.code, declared.signal);
+            assert!(
+                declared_failure_matches(
+                    "replay",
+                    declared,
+                    &attempt(code, signal, REPLAY),
+                    &expected
+                ),
+                "replay {label} was refused"
+            );
+            assert!(
+                !declared_failure_matches(
+                    "replay",
+                    declared,
+                    &attempt(code, signal, ALLOW),
+                    &expected
+                ),
+                "replay {label} was accepted from a verify invocation"
+            );
+            assert!(
+                !declared_failure_matches(
+                    "verify",
+                    declared,
+                    &attempt(code, signal, REPLAY),
+                    &expected
+                ),
+                "verify {label} was accepted from a replay invocation"
+            );
+        }
+        assert!(
+            !declared_failure_matches(
+                "replay",
+                &code_3,
+                &attempt(Some(4), None, REPLAY),
+                &report(Some(4), None)
+            ),
+            "a replay that ended with another code was accepted"
+        );
         let mut one_output = report(Some(3), None);
         one_output
             .compared_outputs
@@ -37779,7 +38416,7 @@ mod post_verdict_transaction_tests {
         // A later invocation of an older measured tree preserves that newer
         // stamp. Its older observation is not the latest of its provenance, so
         // the cap folds it into the cell's aggregate rather than keeping it
-        // (https://github.com/rrnewton/dev-hermit/issues/563); the stamped
+        // (cap 1: each cell keeps only its latest state); the stamped
         // observation stays.
         fixture.row["hermit_sha"] = measured.clone().into();
         fixture.row["run_id"] = "later-old-source-run".into();
@@ -39292,6 +39929,32 @@ mod attempt_binding_tests {
             .comparison_attempt_bindings_v1 = comparison_attempt_bindings(&tracked).cloned();
         preserve_attempt_bindings(&tracked, &rewritten).unwrap();
         validate_attempt_bindings(&rewritten, Some(&events)).unwrap();
+    }
+
+    /// A permission change on a held directory, as another actor's chmod of
+    /// an ancestor such as `/`, does not replace it, so verification still
+    /// passes; a directory replaced at the same path still fails it.
+    #[test]
+    fn a_held_directory_survives_a_chmod_but_not_a_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let held_directory = directory.path().join("evidence");
+        fs::create_dir(&held_directory).unwrap();
+        let path = held_directory.join("results.jsonl");
+        fs::write(&path, b"{}\n").unwrap();
+        let held = HeldEvidenceFile::open(&path, None).unwrap();
+        for mode in [0o555, 0o755] {
+            fs::set_permissions(&held_directory, fs::Permissions::from_mode(mode)).unwrap();
+            held.verify().unwrap();
+        }
+        fs::rename(&held_directory, directory.path().join("moved")).unwrap();
+        fs::create_dir(&held_directory).unwrap();
+        fs::copy(directory.path().join("moved/results.jsonl"), &path).unwrap();
+        assert_eq!(
+            held.verify().unwrap_err(),
+            format!("evidence directory changed: {}", held_directory.display())
+        );
     }
 
     #[test]
@@ -44938,7 +45601,7 @@ mod parity_summary_tests {
 
 /// Series rows for a verify cell that declares `comparator: stripped` carry
 /// `series.comparison = {"strictness": "stripped", "bitwise_parity": false}`
-/// (<https://github.com/rrnewton/dev-hermit/issues/476>). The snapshot reader
+/// (a stripped pass is admitted, below bitwise parity). The snapshot reader
 /// must accept exactly that object, refuse anything else inside it, and count
 /// the row exactly as it counted the same row before the field existed.
 #[cfg(test)]

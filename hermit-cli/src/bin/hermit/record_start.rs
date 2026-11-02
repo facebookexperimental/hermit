@@ -192,8 +192,9 @@ pub struct StartOpts {
 
     /// The CPU the recorded guest sees: x86-64-v2 (the default) or x86-64-v3,
     /// offered only on qualified ptrace hosts. The long help states what the
-    /// qualification leaves uncovered.
-    #[clap(long, value_enum, default_value_t, long_help = detcore_model::cpu_profile::CPU_PROFILE_LONG_HELP)]
+    /// qualification leaves uncovered. HERMIT_CPU_PROFILE supplies it when the
+    /// flag is absent, as for `hermit run`; the flag wins.
+    #[clap(long, value_enum, default_value_t, env = "HERMIT_CPU_PROFILE", long_help = detcore_model::cpu_profile::CPU_PROFILE_LONG_HELP)]
     cpu_profile: detcore_model::cpu_profile::CpuProfile,
 
     /// Refuse to record (exit 122) on a host whose retired-conditional-branch counter
@@ -234,9 +235,9 @@ pub struct StartOpts {
     /// Select guest networking, with the same contract as `hermit run --network`. `local`
     /// (the default) gives the recording and its verify replay an isolated loopback
     /// interface; `host` exposes the host network to the recording. The choice is
-    /// stored in the recording, and `hermit replay --autopilot` replays in the same
-    /// network. `--verify-with-gdbex` defaults to, and requires, `host`: its replay's
-    /// gdbserver must be reachable from the gdb client outside the container.
+    /// stored in the recording, and `hermit replay` replays in the same network,
+    /// served to gdb or not, as does `--verify-with-gdbex`: a replay's gdbserver
+    /// port is bound in the host's network namespace, where the gdb client reaches it.
     #[clap(long, alias = "net", value_name = "local|host")]
     network: Option<NetworkingMode>,
 
@@ -249,6 +250,20 @@ pub struct StartOpts {
         value_name = "minimal|standard"
     )]
     proc: detcore_model::config::ProcLevel,
+
+    /// Schedule guest threads in chaos mode, as `hermit run --chaos` does. The
+    /// recording stores the schedule and its replays follow it, so a failure
+    /// that one seed provokes can be replayed under a debugger. Recording runs
+    /// under its own configuration (`--strict` describes how it differs from
+    /// `hermit run`), so a seed does not produce the interleaving it produces
+    /// under `hermit run --chaos`.
+    #[clap(long)]
+    chaos: bool,
+
+    /// Seed for `--chaos` scheduling (default 0). It seeds only the scheduler:
+    /// the guest's random numbers are recorded.
+    #[clap(long, alias = "sched-seed", value_name = "uint64", requires = "chaos")]
+    seed: Option<u64>,
 
     /// Set the working directory for both recording and replay after mounts apply.
     #[clap(long, value_name = "path")]
@@ -351,8 +366,8 @@ pub struct StartOpts {
     gdbex: Vec<String>,
 
     /// Why this host's retired-branch counter is inexact, if it is. Only the
-    /// `--strict` refusal consults it; tests replace it to reach that refusal
-    /// on a host whose counters pass.
+    /// `--strict` refusal and the warning without `--strict` consult it; tests
+    /// replace it to reach both on a host whose counters pass.
     #[clap(skip = crate::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
     inexact_branch_counter: fn() -> Option<String>,
 }
@@ -457,31 +472,25 @@ impl StartOpts {
         )
     }
 
-    /// Whether this invocation replays its recording under a gdbserver.
-    fn replays_under_gdb(&self) -> bool {
-        !self.verify && !self.gdbex.is_empty()
+    /// What the recording stores for its replays to honor.
+    fn record_options(&self) -> hermit::RecordOptions {
+        hermit::RecordOptions {
+            local_networking: self.network() == NetworkingMode::Local,
+            proc_level: self.proc,
+            cpu_profile: self.cpu_profile,
+            schedule: if self.chaos {
+                hermit::RecordedSchedule::Chaos {
+                    seed: self.seed.unwrap_or_default(),
+                }
+            } else {
+                hermit::RecordedSchedule::Default
+            },
+        }
     }
 
     /// The network the recording (and an immediate replay of it) runs in.
     fn network(&self) -> NetworkingMode {
-        self.network.unwrap_or(if self.replays_under_gdb() {
-            NetworkingMode::Host
-        } else {
-            NetworkingMode::Local
-        })
-    }
-
-    /// A replay served to gdb runs on the host network, where the gdb client
-    /// can reach its gdbserver port, so the recording it checks must too.
-    fn check_gdb_replay_network(&self) -> Result<(), Error> {
-        if self.replays_under_gdb() && self.network() == NetworkingMode::Local {
-            anyhow::bail!(
-                "--verify-with-gdbex replays under a gdbserver that the gdb client reaches \
-                 on the host network, so the recording must use the same network; \
-                 --network local is not supported with it"
-            );
-        }
-        Ok(())
+        self.network.unwrap_or(NetworkingMode::Local)
     }
 
     fn configured_container(
@@ -490,7 +499,7 @@ impl StartOpts {
     ) -> Result<(Container, IdentityGuard), Error> {
         let mut container = namespace_container(true);
         network.configure(&mut container, false);
-        let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts()?;
+        let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts(None)?;
         for mount in &self.mount {
             let user_target = mount.get_target();
             identity_guard.discard_mounts_shadowed_by(&mut identity_mounts, user_target);
@@ -554,6 +563,29 @@ impl StartOpts {
         )
     }
 
+    /// `main`'s branch-counter check before a recording, as
+    /// `RunOpts::admit_branch_counter` makes it before a run:
+    /// [`Self::refuse_strict_with_inexact_branch_counter`], and a recording
+    /// without `--strict` on such a counter goes on and passes
+    /// `run::warning_for_an_inexact_branch_counter` to `warn` (stderr in
+    /// `main`), because its replay need not follow it. Every path of `main`
+    /// that records makes this check first: the plain recording, `--verify`,
+    /// the first run of `--verify-run`, and `--gdbex`.
+    fn admit_branch_counter(
+        &self,
+        global: &GlobalOpts,
+        warn: &mut dyn FnMut(&str),
+    ) -> Result<(), Error> {
+        self.refuse_strict_with_inexact_branch_counter(global)?;
+        if let Some(warning) = crate::run::warning_for_an_inexact_branch_counter(
+            crate::run::CounterReader::Recording,
+            self.inexact_branch_counter,
+        ) {
+            warn(&warning);
+        }
+        Ok(())
+    }
+
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         hermit::cpu_profile_admission::check_record_or_replay(self.cpu_profile).map_err(
             |refusal| Error::new(crate::container::PolicyRefusal).context(refusal.to_string()),
@@ -575,14 +607,13 @@ impl StartOpts {
             validate_log_level(global)?;
             self.record_verify_run(directory, global)
         } else if !self.gdbex.is_empty() {
-            self.refuse_strict_with_inexact_branch_counter(global)?;
+            self.admit_branch_counter(global, &mut crate::tracing::write_stderr_diagnostic)?;
             self.record_verify_debug(global)
         } else {
-            self.refuse_strict_with_inexact_branch_counter(global)?;
+            self.admit_branch_counter(global, &mut crate::tracing::write_stderr_diagnostic)?;
             let hermit = HermitData::from(self.data_dir.as_ref());
             let record_timeout = self.record_timeout();
-            let local_networking = self.network() == NetworkingMode::Local;
-            let proc_level = self.proc;
+            let record_options = self.record_options();
 
             let (mut container, identity_guard) = self.recording_container(global)?;
 
@@ -614,18 +645,14 @@ impl StartOpts {
                                 command,
                                 data.path(),
                                 mountinfo,
-                                local_networking,
-                                proc_level,
-                                options.cpu_profile,
+                                record_options,
                             )
                         }),
                         None => hermit::record_to_with_mountinfo(
                             command,
                             data.path(),
                             mountinfo,
-                            local_networking,
-                            proc_level,
-                            options.cpu_profile,
+                            record_options,
                         ),
                     }
                 },
@@ -680,7 +707,7 @@ impl StartOpts {
         }
         // After the pending report carries the counter verdict, so that a
         // refused recording still says which counter it would have read.
-        self.refuse_strict_with_inexact_branch_counter(global)?;
+        self.admit_branch_counter(global, &mut crate::tracing::write_stderr_diagnostic)?;
         let strictness = self.verification_strictness();
         let ((global1, log1), (global2, log2)) =
             setup_double_run(global, "record", "replay", strictness)
@@ -696,8 +723,7 @@ impl StartOpts {
             temp_data_dir.path().display()
         );
         let record_timeout = self.record_timeout();
-        let local_networking = self.network() == NetworkingMode::Local;
-        let proc_level = self.proc;
+        let record_options = self.record_options();
         let options = self.clone();
         let record_global = global1.clone();
         let (recording, (temp_data_dir, _record_identity, log1, log2)) =
@@ -719,18 +745,14 @@ impl StartOpts {
                                 command,
                                 data.path(),
                                 mountinfo,
-                                local_networking,
-                                proc_level,
-                                options.cpu_profile,
+                                record_options,
                             )
                         }),
                         None => hermit::record_with_output_with_mountinfo(
                             command,
                             data.path(),
                             mountinfo,
-                            local_networking,
-                            proc_level,
-                            options.cpu_profile,
+                            record_options,
                         ),
                     }
                 },
@@ -800,7 +822,7 @@ impl StartOpts {
         let exact_branch_counter = crate::run::branch_counter_verdict();
         let result = match &first {
             None => self
-                .refuse_strict_with_inexact_branch_counter(global)
+                .admit_branch_counter(global, &mut crate::tracing::write_stderr_diagnostic)
                 .and_then(|()| self.record_into(&writer.path(verify_run::RECORDING), &run_global)),
             Some(first) => {
                 self.replay_from(&first.directory().join(verify_run::RECORDING), &run_global)
@@ -854,8 +876,7 @@ impl StartOpts {
         let (mut container, identity_guard) = self.recording_container(global)?;
         eprintln!(":: {}", "Recording...".yellow().bold());
         let record_timeout = self.record_timeout();
-        let local_networking = self.network() == NetworkingMode::Local;
-        let proc_level = self.proc;
+        let record_options = self.record_options();
         let options = self.clone();
         let record_global = global.clone();
         let data = data.to_owned();
@@ -881,18 +902,14 @@ impl StartOpts {
                             command,
                             &data,
                             mountinfo,
-                            local_networking,
-                            proc_level,
-                            options.cpu_profile,
+                            record_options,
                         )
                     }),
                     None => hermit::record_with_output_with_mountinfo(
                         command,
                         &data,
                         mountinfo,
-                        local_networking,
-                        proc_level,
-                        options.cpu_profile,
+                        record_options,
                     ),
                 }
             },
@@ -929,15 +946,13 @@ impl StartOpts {
 
     /// This is called when `--verify-with-gdbex` is passed to the command line.
     fn record_verify_debug(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        self.check_gdb_replay_network()?;
         let (mut container, identity_guard) = self.recording_container(global)?;
 
         eprintln!(":: {}", "Recording...".yellow().bold());
 
         let temp_data_dir = tempfile::tempdir()?;
         let record_timeout = self.record_timeout();
-        let local_networking = self.network() == NetworkingMode::Local;
-        let proc_level = self.proc;
+        let record_options = self.record_options();
         let options = self.clone();
         let record_global = global.clone();
         let resources = format!(
@@ -962,18 +977,14 @@ impl StartOpts {
                             command,
                             data.path(),
                             mountinfo,
-                            local_networking,
-                            proc_level,
-                            options.cpu_profile,
+                            record_options,
                         )
                     }),
                     None => hermit::record_to_with_mountinfo(
                         command,
                         data.path(),
                         mountinfo,
-                        local_networking,
-                        proc_level,
-                        options.cpu_profile,
+                        record_options,
                     ),
                 }
             },
@@ -987,10 +998,12 @@ impl StartOpts {
         let exe = data_dir.join("exe");
         let real_exe = Shebang::new(&exe).map_or(exe, |s| s.interpreter().into());
 
-        // Not using fixed port (such as 1234) here because this is mainly
-        // intended for tests, which could be running in parallel. This could
-        // be flakey when port is already in use.
-        let gdbserver_port = 16384 + nix::unistd::gettid().as_raw() as u16 % 1024;
+        // Any free port: this is mainly for tests, which can run in parallel.
+        // Bound here, in the host's network namespace, before the container
+        // exists, so the gdb client reaches it whatever network the replay
+        // has (`hermit::gdbserver`).
+        let bound_port = hermit::gdbserver::GdbPort::bind(0)?;
+        let gdbserver_port = bound_port.port();
 
         // Run the gdb client outside of the PID namespace. This cannot be done
         // inside of the PID namespace because it would perturb the
@@ -1023,11 +1036,13 @@ impl StartOpts {
         // on that container result, unreachable in exactly the case that needed
         // it. The watch owns the reap and releases the accept.
         let gdb_watch = GdbClientWatch::spawn(gdb_command, gdbserver_port)?;
-        // The gdb client runs outside the container, so the replay's gdbserver
-        // port must live in the host network namespace, which `network()`
-        // guarantees the recording also used.
         let (mut container, identity) = self.configured_container(self.network())?;
-        let guards = Rc::new(RefCell::new((temp_data_dir, identity, gdb_watch)));
+        let guards = Rc::new(RefCell::new((
+            temp_data_dir,
+            identity,
+            gdb_watch,
+            Some(bound_port),
+        )));
         let replay_global = global.clone();
         let mounts = self.mount.clone();
         let result = super::owned_container::run(
@@ -1039,6 +1054,9 @@ impl StartOpts {
             None,
             move |guards| {
                 let _guard = replay_global.init_tracing();
+                if let Some(port) = guards.borrow_mut().3.take() {
+                    port.serve_next_gdbserver();
+                }
                 hermit::replay_with_gdbserver_and_mounts(
                     guards.borrow().0.path(),
                     gdbserver_port,
@@ -1280,6 +1298,8 @@ mod tests {
             mount: Vec::new(),
             network: None,
             proc: Default::default(),
+            chaos: false,
+            seed: None,
             workdir: None,
             data_dir: None,
             record_timeout: None,
@@ -1339,6 +1359,118 @@ mod tests {
         );
     }
 
+    /// Set in the child process of
+    /// [`record_start_takes_hermit_cpu_profile_when_the_flag_is_absent`]:
+    /// the arguments after `start`, one per line.
+    const RECORD_CPU_PROFILE_ARGS_IN_CHILD: &str = "HERMIT_TEST_RECORD_CPU_PROFILE_ARGS";
+
+    /// `record start --cpu-profile` reads HERMIT_CPU_PROFILE exactly as `hermit
+    /// run` does: unset is x86-64-v2, the flag wins, and a value that names no
+    /// profile is refused. Each parse runs in a child process given exactly
+    /// the variable under test.
+    #[test]
+    fn record_start_takes_hermit_cpu_profile_when_the_flag_is_absent() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[clap(flatten)]
+            start: StartOpts,
+        }
+        if let Some(args) = std::env::var_os(RECORD_CPU_PROFILE_ARGS_IN_CHILD) {
+            let args = args.into_string().unwrap();
+            let argv = ["start"]
+                .into_iter()
+                .chain(args.lines().filter(|arg| !arg.is_empty()))
+                .chain(["/bin/true"]);
+            println!();
+            match <Cli as clap::Parser>::try_parse_from(argv) {
+                Ok(cli) => println!("cpu-profile={}", cli.start.cpu_profile.name()),
+                Err(error) => println!("refused: {:?}", error.kind()),
+            }
+            return;
+        }
+
+        let test = format!(
+            "{}::record_start_takes_hermit_cpu_profile_when_the_flag_is_absent",
+            module_path!().split_once("::").unwrap().1
+        );
+        let parse = |variable: Option<&str>, args: &[&str]| -> String {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", &test, "--nocapture"])
+                .env(RECORD_CPU_PROFILE_ARGS_IN_CHILD, args.join("\n"))
+                .env_remove("HERMIT_CPU_PROFILE")
+                .env_remove("HERMIT_DATA_DIR");
+            if let Some(value) = variable {
+                child.env("HERMIT_CPU_PROFILE", value);
+            }
+            let output = child.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+                "the child for {variable:?} {args:?} did not run exactly once: {}\n{stdout}",
+                output.status,
+            );
+            stdout
+                .lines()
+                .find(|line| line.starts_with("cpu-profile=") || line.starts_with("refused: "))
+                .unwrap_or_else(|| panic!("the child printed no verdict:\n{stdout}"))
+                .to_owned()
+        };
+
+        assert_eq!(parse(None, &[]), "cpu-profile=x86-64-v2");
+        assert_eq!(parse(Some("x86-64-v3"), &[]), "cpu-profile=x86-64-v3");
+        assert_eq!(
+            parse(Some("x86-64-v3"), &["--cpu-profile=x86-64-v2"]),
+            "cpu-profile=x86-64-v2"
+        );
+        assert_eq!(parse(Some("x86-64-v4"), &[]), "refused: InvalidValue");
+    }
+
+    /// Without `--strict`, a recording on a counter that fails Reverie's
+    /// validation goes on and writes the one warning line `hermit run` writes,
+    /// because its replay need not follow it. With `--strict` it is refused and
+    /// writes nothing, and a counter that passed writes nothing.
+    #[test]
+    fn a_recording_without_strict_warns_of_an_inexact_branch_counter() {
+        let ptrace = <GlobalOpts as clap::Parser>::parse_from(["hermit"]);
+        let admit = |options: &StartOpts| {
+            let mut lines = Vec::new();
+            let result = options
+                .admit_branch_counter(&ptrace, &mut |line: &str| lines.push(line.to_owned()));
+            (result, lines)
+        };
+        let inexact: fn() -> Option<String> = || Some("SpecLockMap is enabled".to_string());
+        let mut options = start_options(Vec::new());
+        options.inexact_branch_counter = inexact;
+        let (result, lines) = admit(&options);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            lines,
+            [crate::run::warning_for_an_inexact_branch_counter(
+                crate::run::CounterReader::Recording,
+                inexact
+            )
+            .unwrap()]
+        );
+
+        options.strict = true;
+        let (result, lines) = admit(&options);
+        assert!(
+            result.is_err_and(|error| {
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some()
+            }),
+            "--strict refuses"
+        );
+        assert!(lines.is_empty(), "{lines:?}");
+
+        options.strict = false;
+        options.inexact_branch_counter = || None;
+        let (result, lines) = admit(&options);
+        assert!(result.is_ok() && lines.is_empty(), "{lines:?}");
+    }
+
     /// The refusal needs `--strict` and an inexact counter, and covers e9patch
     /// preprocessing, which records on the same ptrace runtime and counter.
     #[test]
@@ -1375,7 +1507,7 @@ mod tests {
     }
 
     /// `record start` takes `run`'s networking contract, local by default,
-    /// except that a gdb-served replay needs the host network.
+    /// a gdb-served replay included.
     #[test]
     fn record_networking_defaults_to_local_like_run() {
         #[derive(clap::Parser)]
@@ -1396,6 +1528,17 @@ mod tests {
         );
         assert_eq!(
             parse(&["start", "--verify-with-gdbex", "continue", "/bin/true"]),
+            NetworkingMode::Local
+        );
+        assert_eq!(
+            parse(&[
+                "start",
+                "--network",
+                "host",
+                "--verify-with-gdbex",
+                "continue",
+                "/bin/true"
+            ]),
             NetworkingMode::Host
         );
         assert_eq!(
@@ -1421,45 +1564,37 @@ mod tests {
         );
     }
 
+    /// `--chaos` records a chaos schedule, seeded with 0 unless `--seed` (or
+    /// its `hermit run` spelling `--sched-seed`) names another; `--seed` alone
+    /// is refused, since it would record the default schedule.
     #[test]
-    fn a_gdb_checked_recording_refuses_local_networking() {
+    fn record_chaos_flags_choose_the_recorded_schedule() {
         #[derive(clap::Parser)]
         struct Cli {
             #[clap(flatten)]
             start: StartOpts,
         }
-        let check = |args: &[&str]| {
+        let parse = |args: &[&str]| {
             <Cli as clap::Parser>::try_parse_from(args)
-                .unwrap()
-                .start
-                .check_gdb_replay_network()
+                .map(|cli| cli.start.record_options().schedule)
         };
-        let refused = check(&[
-            "start",
-            "--network",
-            "local",
-            "--verify-with-gdbex",
-            "continue",
-            "/bin/true",
-        ])
-        .unwrap_err();
-        assert!(
-            refused
-                .to_string()
-                .contains("--network local is not supported"),
-            "{refused:#}"
+        assert_eq!(
+            parse(&["start", "/bin/true"]).unwrap(),
+            hermit::RecordedSchedule::Default
         );
-        check(&["start", "--verify-with-gdbex", "continue", "/bin/true"]).unwrap();
-        check(&[
-            "start",
-            "--network",
-            "host",
-            "--verify-with-gdbex",
-            "continue",
-            "/bin/true",
-        ])
-        .unwrap();
-        check(&["start", "--network", "local", "/bin/true"]).unwrap();
+        assert_eq!(
+            parse(&["start", "--chaos", "/bin/true"]).unwrap(),
+            hermit::RecordedSchedule::Chaos { seed: 0 }
+        );
+        assert_eq!(
+            parse(&["start", "--chaos", "--seed", "16", "/bin/true"]).unwrap(),
+            hermit::RecordedSchedule::Chaos { seed: 16 }
+        );
+        assert_eq!(
+            parse(&["start", "--chaos", "--sched-seed=3", "/bin/true"]).unwrap(),
+            hermit::RecordedSchedule::Chaos { seed: 3 }
+        );
+        assert!(parse(&["start", "--seed", "16", "/bin/true"]).is_err());
     }
 
     #[test]
@@ -1566,6 +1701,8 @@ mod tests {
             mount: Vec::new(),
             network: None,
             proc: Default::default(),
+            chaos: false,
+            seed: None,
             workdir: None,
             data_dir: None,
             record_timeout: None,

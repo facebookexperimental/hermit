@@ -12,8 +12,9 @@
 //! process of the namespace, so a parent waiting for the refusing child, and
 //! a grandchild that would write a file later, never run on.
 //!
-//! Nothing in Hermit files the request yet (its producers come with A5 steps
-//! 3c.1c and 3c.1e), so the run is played by plain processes: a forked
+//! Its producers (A5 step 3c.1c's restart checkpoint and kernel-run refusals,
+//! and step 3c.1e's) file it only under the in-guest delivery gate, which no
+//! run sets yet, so the run is played by plain processes: a forked
 //! process enters a new user and PID namespace, and its first child, PID 1
 //! there, stands for Hermit's container init, where the scheduler runs. It
 //! forks a guest parent, which forks the refusing child and waits for it; the
@@ -271,4 +272,47 @@ fn a_stopping_refusal_filed_by_a_child_ends_every_process_of_the_run() {
         !sentinel.exists(),
         "the sentinel grandchild ran on after the refusal"
     );
+}
+
+/// IR-16: with the gate off a filed `StoppingRefusal` is refused the run-wide
+/// exit. Through the real `GlobalState::receive_rpc`, from a registered
+/// thread (so the handler's bookkeeping after its `match` runs on the
+/// answer): the reply is `PolicyRefusal`, the reason is recorded as the
+/// run's policy refusal (which ends the run with `HERMIT_POLICY_REFUSAL_EXIT`
+/// once it completes), and the process goes on: this test returns. Mutation
+/// "the gate check removed": the coordinator exits inside the call, so the
+/// test process ends with `HERMIT_POLICY_REFUSAL_EXIT` and the test fails.
+#[tokio::test]
+async fn with_the_gate_off_a_stopping_refusal_is_recorded_and_answered_without_the_exit() {
+    let mut config = Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        in_guest_signal_delivery: false,
+        ..Config::default()
+    };
+    config.backend = reverie::BackendCapabilities::LITEINST_IN_GUEST;
+    let state = GlobalState::initialize(&config, false);
+    let detpid = DetPid::from_raw(CHILD.as_raw());
+    state
+        .sched
+        .lock()
+        .unwrap()
+        .thread_tree
+        .add_child(CHILD, CHILD, true);
+    install_test_registration(&state, CHILD, Ivar::new());
+    let reason = "hermit refused to continue the run (stopping-refusal-test): filed with the \
+                  gate off"
+        .to_owned();
+    let (_, reply) = state
+        .receive_rpc(
+            Tid::from_raw(CHILD.as_raw()),
+            (
+                DetTime::new(&config),
+                MmId::initial(detpid),
+                GlobalRequest::StoppingRefusal(reason.clone()),
+            ),
+        )
+        .await;
+    assert_eq!(reply, GlobalResponse::PolicyRefusal(()));
+    assert_eq!(state.policy_refusal(), Some(reason));
 }

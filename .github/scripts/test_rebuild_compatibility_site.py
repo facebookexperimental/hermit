@@ -548,8 +548,8 @@ class HostedAdapterTests(unittest.TestCase):
         with patch.dict(os.environ, env):
             self.assertEqual(ADAPTER.fetch_ledger(ledger, newest), 1)
 
-        # After a squash (https://github.com/rrnewton/dev-hermit/issues/562)
-        # main is a new root, and a summary written before it names a commit
+        # After a squash of the ledger's main to one snapshot commit, main is
+        # a new root, and a summary written before it names a commit
         # no deeper fetch reaches: the fetch stops once it has the whole
         # history instead of deepening to the limit.
         snapshot = sh(origin, "commit-tree", newest + "^{tree}", "-m", "ledger snapshot")

@@ -260,6 +260,12 @@ fn rcb_accounting_progresses_without_an_implicit_preemption_timer() {
                 );
                 let mut expected_cpu = initial_cpu.clone();
                 expected_cpu["snapshot"]["user"] = serde_json::to_value(nanos).unwrap();
+                if observes {
+                    // The accounting also records the thread's own time, for
+                    // another thread's CPU clock of it.
+                    expected_cpu["threads"][TID.as_raw().to_string()] =
+                        serde_json::to_value((nanos, LogicalTime::ZERO)).unwrap();
+                }
                 assert_eq!(
                     serde_json::to_value(&*cpu_owner.lock().unwrap()).unwrap(),
                     expected_cpu,
@@ -387,6 +393,8 @@ fn interleaved_clock_observations_preserve_deadlines_and_timer_capability() {
                 assert!(Arc::ptr_eq(&floor_owner, &guest.thread.guest_clock));
                 let mut expected_cpu = initial_cpu.clone();
                 expected_cpu["snapshot"]["user"] = serde_json::to_value(nanos).unwrap();
+                expected_cpu["threads"][TID.as_raw().to_string()] =
+                    serde_json::to_value((nanos, LogicalTime::ZERO)).unwrap();
                 assert_eq!(
                     serde_json::to_value(&*cpu_owner.lock().unwrap()).unwrap(),
                     expected_cpu
@@ -584,13 +592,11 @@ async fn replay_continue_installs_a_logical_deadline_without_requiring_a_timer()
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             file.path(),
+            // A timer preemption the thread runs on from, as recordings write
+            // it: branches, with no OtherInstructions after them, then more.
             crate::preemptions::PreemptionRecord::from_sched_events(vec![
                 event.clone(),
                 branch.clone(),
-                SchedEvent {
-                    end_time: branch.end_time,
-                    ..event.clone()
-                },
                 SchedEvent {
                     count: 1,
                     end_time: Some(sample_time + LogicalTime::from_nanos(1_240)),

@@ -209,6 +209,12 @@ Use the staged executable for these backends; a default `cargo install` does
 not enable them. KVM requires read-write `/dev/kvm` access plus its guest-kernel
 Linux ABI.
 
+SaBRe and e9patch preprocessing are **archived** since 2026-10-25: they still
+build and keep per-commit smoke checks, but they get no feature work. SaBRe's
+manifest cells run nightly, in the pressure sweep, rather than per commit;
+e9patch has no manifest cells, and its corpus runs nightly
+(`ci/manifest-plan/src/archived.rs`).
+
 SaBRe's measured post-0.2 `Stripped` envelope, build instructions, and explicit
 unsupported cases are documented in
 [SaBRe backend compatibility](docs/SABRE_COMPATIBILITY.md).

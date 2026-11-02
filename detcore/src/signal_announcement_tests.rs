@@ -81,6 +81,10 @@ struct AnnounceGuest {
     thread: ThreadState<()>,
     requests: Mutex<Vec<Vec<ResourceID>>>,
     continues: Mutex<Vec<bool>>,
+    /// What `GlobalRequest::InPidNamespaceInit` answers (A5 step 3c.1e A,
+    /// IR-15), and how many times it was asked.
+    pid_namespace_init: bool,
+    init_queries: Mutex<usize>,
 }
 
 struct UnusedStack;
@@ -124,6 +128,10 @@ impl GlobalRPC<GlobalState> for AnnounceGuest {
                     .unwrap()
                     .push(request.continues_sigreturn);
                 GlobalResponse::RequestResources(crate::tool_global::ResumeStatus::Normal)
+            }
+            GlobalRequest::InPidNamespaceInit(_) => {
+                *self.init_queries.lock().unwrap() += 1;
+                GlobalResponse::InPidNamespaceInit(self.pid_namespace_init)
             }
             request => panic!("a delivery of SIGUSR1 sent an unexpected RPC: {request:?}"),
         };
@@ -212,6 +220,8 @@ fn setup_with(adjust: impl FnOnce(&mut Config)) -> (Detcore, AnnounceGuest) {
             thread,
             requests: Mutex::new(Vec::new()),
             continues: Mutex::new(Vec::new()),
+            pid_namespace_init: false,
+            init_queries: Mutex::new(0),
         },
     )
 }
@@ -546,4 +556,97 @@ async fn boundary_signal_entries_survive_withdrawal_and_link_actual_commit_witho
         ));
     }
     assert_eq!(histories[0], histories[1]);
+}
+
+/// A5 step 3c.1e A, IR-15: under the in-guest delivery gate, an announcement
+/// of a signal that takes its default action, for a thread of a process that
+/// is the init of a PID namespace it created, is refused with
+/// `EPROTONOSUPPORT` before any turn. Linux ignores such a signal at send
+/// unless it is blocked (`sig_task_ignored`, kernel/signal.c:92-94 at v6.12,
+/// through `sig_ignored`, :104-120), and discards a blocked one at dequeue
+/// (`get_signal`, :2843-2845), so both rows refuse: SIGUSR1 unblocked, and
+/// SIGUSR2 blocked in the thread's mask. A caught signal (a handler for
+/// SIGRTMIN+8 in this test process) is announced as for any process; so is
+/// any signal of a thread that is not an init, and nothing is asked with the
+/// gate off. Mutations "guard removed" (the default rows take the delivery's
+/// turn) and "every announcement for an init refused" (the caught row is
+/// refused).
+#[tokio::test]
+async fn under_the_gate_an_announcement_for_a_pid_namespace_init_is_refused_before_any_turn() {
+    extern "C" fn ignore(_: libc::c_int) {}
+    /// Puts back the action the test replaced, however the test ends (IR-31
+    /// (b)): later tests in the same process see the action they started
+    /// with.
+    struct RestoreAction(libc::c_int, libc::sigaction);
+    impl Drop for RestoreAction {
+        fn drop(&mut self) {
+            // SAFETY: reinstalls the action this test found.
+            let restored = unsafe { libc::sigaction(self.0, &self.1, std::ptr::null_mut()) };
+            assert_eq!(restored, 0, "restore the action of signal {}", self.0);
+        }
+    }
+    let caught = libc::SIGRTMIN() + 8;
+    // SAFETY: installs a no-op handler for a signal nothing else in this test
+    // process uses, so the thread's /proc status reports it caught; the guard
+    // restores the previous action.
+    let restore = unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = ignore as *const () as usize;
+        let mut previous: libc::sigaction = std::mem::zeroed();
+        assert_eq!(libc::sigaction(caught, &action, &mut previous), 0);
+        RestoreAction(caught, previous)
+    };
+    for (gate, init, signal, blocked, refused) in [
+        (true, true, libc::SIGUSR1, false, true),
+        (true, true, libc::SIGUSR2, true, true),
+        (true, true, caught, false, false),
+        (true, false, libc::SIGUSR1, false, false),
+        (false, true, libc::SIGUSR1, false, false),
+    ] {
+        let case = format!("gate {gate}, init {init}, signal {signal}, blocked {blocked}");
+        // SAFETY: changes only this test thread's own mask, restored below.
+        let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
+        if blocked {
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, signal);
+                assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old), 0);
+            }
+        }
+        let (tool, mut guest) = setup_with(|config| config.in_guest_signal_delivery = gate);
+        guest.pid_namespace_init = init;
+        let result = tool.announce_signal_event(&mut guest, signal).await;
+        if blocked {
+            // SAFETY: restores this thread's mask from before the row.
+            unsafe {
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()),
+                    0
+                );
+            }
+        }
+        if refused {
+            assert_eq!(result.map(|_| ()), Err(Errno::EPROTONOSUPPORT), "{case}");
+            assert!(turns(&guest).is_empty(), "{case}: no turn");
+        } else {
+            assert!(result.is_ok(), "{case}: {result:?}");
+            assert_eq!(turns(&guest).len(), 1, "{case}: the delivery's turn");
+        }
+        let asked = usize::from(gate && signal != caught);
+        assert_eq!(
+            *guest.init_queries.lock().unwrap(),
+            asked,
+            "{case}: asked only under the gate, for a default action"
+        );
+    }
+    let previous = restore.1.sa_sigaction;
+    drop(restore);
+    // SAFETY: only reads the action.
+    let now = unsafe {
+        let mut now: libc::sigaction = std::mem::zeroed();
+        assert_eq!(libc::sigaction(caught, std::ptr::null(), &mut now), 0);
+        now.sa_sigaction
+    };
+    assert_eq!(now, previous, "the test leaves the action it found");
 }

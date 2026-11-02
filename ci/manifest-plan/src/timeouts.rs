@@ -329,6 +329,100 @@ pub const KVM_RATCHET_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [TimeoutCa
     configured_wall_seconds: 80,
 }];
 
+/// The DBT verify cell of the Python random example, from its 249 passing
+/// result rows in coordinator-launched full validations of 2026-10-11 to
+/// 2026-10-25 (row-level `cpu_usage_usec` and `duration_ms`), after the
+/// default CPU bound stopped the validation of f8adb23a at 22.0 CPU seconds.
+/// The configured CPU bound covers that stop (ceil(1.5 x 22.0) = 33).
+pub const DBT_2026_10_25_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [TimeoutCalibration {
+    test: "language-runtimes/example-python-random",
+    mode: "verify",
+    backend: "dbt",
+    samples: 249,
+    p90_cpu_usec: 17_274_987,
+    p90_wall_millis: 23_556,
+    required_cpu_seconds: 26,
+    required_wall_seconds: 95,
+    configured_cpu_seconds: 33,
+    configured_wall_seconds: 95,
+}];
+
+/// Five DBT verify cells the 288-cell flip made required and full validation
+/// stopped at the default 22 CPU s. The validation of 77635530182d stopped
+/// compat/git, compat/ld, compat/pkg-config and language-runtimes/node-v8-jit;
+/// the landed flip's validation of 330a8b849db3 then stopped compat/node on its
+/// local Buck route (22.093 CPU s recorded at the kill). Local single samples
+/// on the host named in docs/TESTING_ENVIRONMENTS.md under "Named measurement
+/// hosts", at the flip head (test-harness run, 4x timeout multiplier,
+/// 2026-10-27) measured the first four cells' CPU/wall below; five Buck-cell
+/// runs of compat/node at 25d8071f6aa measured 13.487-14.242 CPU s (max wall
+/// 24.838 s). The configured CPU bound is ceil(1.5 x 22.0) = 33, the same rule
+/// as DBT_2026_10_25 above, because the validate-context measurement is the
+/// 22.0 stop itself. Wall stays at the 57 s default: every measured wall sample
+/// is at most 31.5 s and the cells are CPU-bound.
+pub const DBT_FLIP_2026_10_27_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 5] = [
+    TimeoutCalibration {
+        test: "compat/git",
+        mode: "verify",
+        backend: "dbt",
+        samples: 1,
+        p90_cpu_usec: 12_464_774,
+        p90_wall_millis: 13_744,
+        required_cpu_seconds: 19,
+        required_wall_seconds: 21,
+        configured_cpu_seconds: 33,
+        configured_wall_seconds: 57,
+    },
+    TimeoutCalibration {
+        test: "compat/ld",
+        mode: "verify",
+        backend: "dbt",
+        samples: 1,
+        p90_cpu_usec: 14_867_876,
+        p90_wall_millis: 16_055,
+        required_cpu_seconds: 23,
+        required_wall_seconds: 25,
+        configured_cpu_seconds: 33,
+        configured_wall_seconds: 57,
+    },
+    TimeoutCalibration {
+        test: "compat/pkg-config",
+        mode: "verify",
+        backend: "dbt",
+        samples: 1,
+        p90_cpu_usec: 13_171_550,
+        p90_wall_millis: 14_464,
+        required_cpu_seconds: 20,
+        required_wall_seconds: 22,
+        configured_cpu_seconds: 33,
+        configured_wall_seconds: 57,
+    },
+    TimeoutCalibration {
+        test: "compat/node",
+        mode: "verify",
+        backend: "dbt",
+        samples: 5,
+        p90_cpu_usec: 14_242_037,
+        p90_wall_millis: 24_838,
+        required_cpu_seconds: 22,
+        required_wall_seconds: 38,
+        configured_cpu_seconds: 33,
+        configured_wall_seconds: 57,
+    },
+    TimeoutCalibration {
+        test: "language-runtimes/node-v8-jit",
+        mode: "verify",
+        backend: "dbt",
+        samples: 1,
+        p90_cpu_usec: 20_172_896,
+        p90_wall_millis: 31_470,
+        required_cpu_seconds: 31,
+        required_wall_seconds: 48,
+        configured_cpu_seconds: 33,
+        configured_wall_seconds: 57,
+    },
+];
+
 /// Per-cell nearest-rank p90 from ten schema-4 result rows, using row-level
 /// CPU microseconds and wall milliseconds, including reported preparation.
 /// See docs/LITEINST_QUALIFICATION_20260916.md for retained evidence and limits.
@@ -2068,6 +2162,7 @@ mod tests {
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)
+            .chain(&DBT_2026_10_25_TIMEOUT_CALIBRATIONS)
             .chain(&LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS)
             .chain(&LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS)
             .copied()

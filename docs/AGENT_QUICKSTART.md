@@ -39,7 +39,7 @@ when the Hermit binary is in a worktree or under `/tmp`:
 ```bash
 repo=$(git rev-parse --show-toplevel)
 hermit_bin="$repo/target/release/hermit"
-safehermit=/home/newton/work/dev-hermit/bin/safehermit
+safehermit=/path/to/safehermit   # a wrapper that bounds the run's output and disk use
 scratch=$(mktemp -d /tmp/hermit-agent.XXXXXX)
 epoch=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -147,7 +147,7 @@ input.
 
 Build products stay in the designated worktree. Put a curated experiment
 manifest, reproducer commands, small evidence files, and final report under
-`/home/newton/work/dev-hermit/experiments/<campaign>/` when they are intended
+the parent workspace's `experiments/<campaign>/` directory when they are intended
 project outputs. Put other scratch data in a uniquely named directory under
 `/tmp` or `~/temp`, then delete it after extracting the evidence. Do not create
 extra checkouts or dump logs directly under `~/work`.

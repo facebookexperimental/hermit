@@ -300,6 +300,25 @@ impl Scheduler {
         self.parked.control.is_some()
     }
 
+    /// Answers the backend's request for a delivery permit at a real
+    /// user-return boundary of `task`.
+    ///
+    /// A permit belongs to one thread. Linux delivers each thread's signals
+    /// on that thread's own return to user mode (`exit_to_user_mode_loop`
+    /// runs `arch_do_signal_or_restart` for the returning thread alone), and
+    /// `get_signal` holds the process's `siglock` only around the dequeue,
+    /// never across another thread's delivery. So a permit another thread of
+    /// the process holds is no reason to decline: its own boundary waiting
+    /// for its `InboundSignal` turn, an observed parked wait, or a committed
+    /// exit. Declining a boundary that has an eligible signal makes
+    /// reverie-kvm ask again until its bound and then fail the run
+    /// (https://github.com/rrnewton/hermit/issues/4899).
+    ///
+    /// It declines only where no delivery can be committed: without an
+    /// installed control, after a backend failure, for a logically killed
+    /// thread, and for a thread that does not hold the serial grant. A thread
+    /// that already holds a permit gets that same permit back; one thread
+    /// never holds two.
     pub(crate) fn authorize_signal_boundary(
         &mut self,
         task: SignalTaskIdentity,
@@ -332,14 +351,6 @@ impl Scheduler {
             .ok_or(reverie::syscalls::Errno::ESRCH)?;
         if expected != task || !self.rpc_incarnation_matches(tid, mm) {
             return Err(reverie::syscalls::Errno::EINVAL.into());
-        }
-        if self
-            .parked
-            .permits
-            .values()
-            .any(|p| p.task.process == task.process)
-        {
-            return Ok(None);
         }
         let sequence = self
             .parked
@@ -565,6 +576,10 @@ impl Scheduler {
             {
                 return Err(ProtocolFailure::Identity);
             }
+            // Any thread's outstanding permit is a leak here, not a policy:
+            // each thread's own receipt settles its permit before that
+            // thread's worker ends, and the backend reports retirement only
+            // after the leader has joined every worker.
             if self
                 .parked
                 .permits
@@ -588,6 +603,17 @@ impl Scheduler {
         };
         if terminal.process != event.process || terminal.status != event.status {
             return Err(ProtocolFailure::Identity);
+        }
+        // A group exit can retire siblings that held permits of their own.
+        // Each one's receipt has released its permit by now, for the reason
+        // above, so one still outstanding is a leak.
+        if self
+            .parked
+            .permits
+            .values()
+            .any(|permit| permit.task.process == event.process)
+        {
+            return Err(ProtocolFailure::Phase);
         }
         match terminal.class {
             FinalProcessClass::Root | FinalProcessClass::DirectParentTerminal { .. } => {
@@ -846,74 +872,21 @@ impl Scheduler {
         })
     }
 
-    /// The thread-group leader of `tid` (itself when it leads, or when it is
-    /// unknown), as `fail_parked` names a thread's process.
-    fn permit_leader(&self, tid: DetTid) -> DetTid {
-        self.thread_tree
-            .thread_to_leader
-            .get(&tid)
-            .copied()
-            .unwrap_or(tid)
-    }
-
-    /// Whether `tid`'s controlled exit must wait because another thread of its
-    /// process holds a delivery permit: that thread is at a signal boundary,
-    /// waiting for its `InboundSignal` turn, and the protocol allows one
-    /// boundary per process at a time, so `reserve_exit_boundary` would refuse
-    /// the exit as a protocol failure. The exit waits instead, and the
-    /// permit's release re-admits it (`admit_exits_released_by`), as Linux
-    /// lets a thread exit while a sibling handles a signal
-    /// (https://github.com/rrnewton/hermit/issues/4367).
-    pub(crate) fn exit_awaits_sibling_permit(&self, tid: DetTid, process: DetPid) -> bool {
-        if self.parked.control.is_none() {
-            return false;
-        }
-        let Some((_, task)) = self.real_timers.task_identity(process, tid) else {
-            return false;
-        };
-        self.parked
-            .permits
-            .iter()
-            .any(|(holder, permit)| *holder != tid && permit.task.process == task.process)
-    }
-
-    /// Admit, at the next drain and at the front of its band, every exit that
-    /// waited (`exit_awaits_sibling_permit`) for the permit `holder` just
-    /// released, once no other permit of `process` remains. Called at every
-    /// release of a permit, so no waiter outlives the permits it waits for.
-    /// Each release is ordered before the next selection, so the drain that
-    /// admits the exit is a deterministic one (`admit_to_run_queue`): the
-    /// delivery receipt arrives while `holder` holds its turn, before it files
-    /// its next request, and an observation's release runs in the scheduler's
-    /// own control drain, while the observed thread's empty request holds the
-    /// scheduler.
-    pub(super) fn admit_exits_released_by(&mut self, holder: DetTid, process: SignalProcessId) {
-        if self
-            .parked
-            .permits
-            .values()
-            .any(|permit| permit.task.process == process)
-        {
-            return;
-        }
-        let leader = self.permit_leader(holder);
-        let ready: Vec<DetTid> = self
-            .parked
-            .exits_awaiting_permit
-            .iter()
-            .copied()
-            .filter(|waiter| self.permit_leader(*waiter) == leader)
-            .collect();
-        for waiter in ready {
-            self.parked.exits_awaiting_permit.remove(&waiter);
-            self.admit_to_run_queue(waiter, super::AdmitIntent::Fixed(super::AdmitSide::Front));
-        }
-    }
-
     /// Fence one scheduler-committed exit until KVM reports the exact terminal
     /// boundary after committing its process-family snapshot. The selected
     /// `(tid, request, response)` transaction is the authority here: step 5
     /// has not yet made `parked.running` name this task.
+    ///
+    /// The exit's permit is the exiting thread's own, so a delivery permit
+    /// another thread of the process holds does not hold the exit back:
+    /// Linux lets a thread exit, or a group exit begin, while a sibling is
+    /// about to take a signal. A single thread's terminal receipt retires that
+    /// thread alone. A group's retires its live siblings, and each sibling's
+    /// own receipt then settles that sibling's permit before the backend
+    /// retires the process (`consume_signal_boundary`). One committed exit of
+    /// a process is still fenced at a time: the fence is a control barrier,
+    /// so no second exit of the process can be granted while it stands, and a
+    /// second fence would mean that the barrier failed.
     pub(crate) fn reserve_exit_boundary(
         &mut self,
         tid: DetTid,
@@ -937,11 +910,6 @@ impl Scheduler {
             .ok_or(ProtocolFailure::Identity)?;
         if expected_mm != mm
             || !self.rpc_incarnation_matches(tid, mm)
-            || self
-                .parked
-                .permits
-                .values()
-                .any(|permit| permit.task.process == task.process)
             || self
                 .parked
                 .exit_fences
@@ -1002,6 +970,15 @@ impl Scheduler {
         Ok(ExitReserveMode::Controlled)
     }
 
+    /// Whether `process`'s final transition is already recorded, with exit
+    /// status `status` (`record_final_process_transition`).
+    fn final_transition_recorded(&self, process: SignalProcessId, status: ExitStatus) -> bool {
+        self.parked
+            .terminal_processes
+            .get(&ProcessGeneration::from_backend(process))
+            .is_some_and(|terminal| terminal.process == process && terminal.status == status)
+    }
+
     pub(crate) fn consume_signal_boundary(
         &mut self,
         receipt: SignalBoundaryReceipt,
@@ -1042,42 +1019,55 @@ impl Scheduler {
                 None if !self.next_turns.contains_key(&tid) => {}
                 _ => return Err(reverie::syscalls::Errno::EINVAL.into()),
             }
-            let targets = if group {
-                self.thread_tree.my_thread_group(&pid)
-            } else {
-                vec![tid]
-            };
-            for target in targets {
-                if !self.next_turns.contains_key(&target) {
-                    continue;
-                }
-                let (mm, identity) = self
-                    .real_timers
-                    .task_identity(pid, target)
-                    .ok_or(reverie::syscalls::Errno::EINVAL)?;
-                if identity.process != receipt.permit.task.process
-                    || !self.rpc_incarnation_matches(target, mm)
-                {
-                    return Err(reverie::syscalls::Errno::EINVAL.into());
-                }
-                retire.push((target, pid, mm));
-            }
-            final_transition = self
-                .record_final_process_transition(
-                    tid,
-                    pid,
-                    group,
+            // Permits are per thread, so a sibling can hold one when another
+            // member's terminal receipt commits the group exit. That receipt
+            // retired the sibling and recorded the process's final transition;
+            // the sibling's own receipt for the same group exit (reverie-kvm's
+            // committed-group follower) only settles its permit below.
+            let settles_committed_group_exit = group
+                && exit_fence.is_none()
+                && current.is_none()
+                && self.final_transition_recorded(
                     receipt.permit.task.process,
                     ExitStatus::from_raw(wait_status),
-                )
-                .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
+                );
+            if !settles_committed_group_exit {
+                let targets = if group {
+                    self.thread_tree.my_thread_group(&pid)
+                } else {
+                    vec![tid]
+                };
+                for target in targets {
+                    if !self.next_turns.contains_key(&target) {
+                        continue;
+                    }
+                    let (mm, identity) = self
+                        .real_timers
+                        .task_identity(pid, target)
+                        .ok_or(reverie::syscalls::Errno::EINVAL)?;
+                    if identity.process != receipt.permit.task.process
+                        || !self.rpc_incarnation_matches(target, mm)
+                    {
+                        return Err(reverie::syscalls::Errno::EINVAL.into());
+                    }
+                    retire.push((target, pid, mm));
+                }
+                final_transition = self
+                    .record_final_process_transition(
+                        tid,
+                        pid,
+                        group,
+                        receipt.permit.task.process,
+                        ExitStatus::from_raw(wait_status),
+                    )
+                    .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
+            }
         }
         // Cleanup/failure may already have logically killed the task. Exact
         // duplicates remain recognizable after timer/task retirement. No turn
-        // or membership is created by this consuming notification.
-        if let Some(released) = self.parked.permits.remove(&tid) {
-            self.admit_exits_released_by(tid, released.task.process);
-        }
+        // or membership is created by this consuming notification. Releasing
+        // this thread's permit changes no other thread's: each holds its own.
+        self.parked.permits.remove(&tid);
         if exit_fence.is_some() {
             self.parked.exit_fences.remove(&tid);
         }

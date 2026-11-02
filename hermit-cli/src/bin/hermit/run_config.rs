@@ -997,11 +997,13 @@ mod tests {
         ),
         ("futex-wake-yields", &["--futex-wake-yields"]),
         ("pipe-wake-latency", &["--pipe-wake-latency=1000000"]),
+        ("expired-wait-charge", &["--expired-wait-charge=once"]),
         (
             "work-span-report",
             &["--work-span-report=/tmp/work-span.json"],
         ),
         ("scheduler-turn-cost", &["--scheduler-turn-cost=10000"]),
+        ("cap-preemption-charge", &["--cap-preemption-charge"]),
         ("sigint-instakill", &["--sigint-instakill"]),
         ("warn-non-zero-binds", &["--warn-non-zero-binds"]),
         ("sched-heuristic", &["--sched-heuristic=random"]),
@@ -1026,6 +1028,7 @@ mod tests {
         ("detlog-regs-cadence", &["--detlog-regs-cadence=2"]),
         ("sysinfo-uptime-offset", &["--sysinfo-uptime-offset=60"]),
         ("memory", &["--memory=2GB"]),
+        ("virtual-cpus", &["--virtual-cpus=4"]),
         ("proc", &["--proc=standard"]),
         (
             "interrupt-at",
@@ -1059,6 +1062,10 @@ mod tests {
         ("tmp", &["--tmp=/tmp/guest tmp"]),
         ("image", &["--image=docker.io/library/busybox@sha256:00"]),
         ("seed-from", &["--seed-from=Args"]),
+        (
+            "chaos-seeded-timeslice",
+            &["--chaos", "--chaos-seeded-timeslice"],
+        ),
         ("verify", &["--verify"]),
         ("verify-verbose", &["--verify", "--verify-verbose"]),
         ("verify-strict", &["--verify", "--verify-strict"]),

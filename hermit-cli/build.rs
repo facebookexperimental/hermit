@@ -29,6 +29,7 @@ use build_support::emit_git_revision;
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(fbcode_build)");
     println!("cargo:rustc-check-cfg=cfg(hermit_registry_build)");
+    println!("cargo:rustc-check-cfg=cfg(hermit_e9patch_sources_excluded)");
 
     // A manifest without a `dbt` feature is the crates.io projection, whose
     // DBT diagnostic points at a source build (see

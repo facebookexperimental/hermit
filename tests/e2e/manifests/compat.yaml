@@ -1474,6 +1474,9 @@ corpus:
     # cells run): 10 of 10 with four runs at once. mountpoint joined once
     # Detcore rendered /proc/<pid>/mountinfo from the container mount table
     # (K3a of https://github.com/rrnewton/hermit/issues/4213): 10 of 10.
+    # kill, lsirq, lsmod and sysctl-random-uuid joined after running clean,
+    # 3 of 3, on each of the five nightly pressure sweeps from 2026-10-21 to
+    # 2026-10-25 (Hermit 9b30cb9a to 7903351d).
     - backend: kvm
       rows:
         [
@@ -1486,8 +1489,8 @@ corpus:
           expr, factor, fallocate, fgrep, file, find, findmnt, flex,
           fmt, fold, free, "g++", gcc, gcov, getconf, getopt, git, gprof, grep,
           groups, gzip, gzip-roundtrip, head, hexdump, hostname, iconv, id,
-          install, ionice, iostat, ip, join, jq, ld, ln, logger, logname, ls,
-          lscpu, lua, lua-direct, m4, make, md5sum, mkdir, mkfifo, mktemp,
+          install, ionice, iostat, ip, join, jq, kill, ld, ln, logger, logname, ls,
+          lscpu, lsirq, lsmod, lua, lua-direct, m4, make, md5sum, mkdir, mkfifo, mktemp,
           mountpoint, mpstat-softirqs, msgfmt, msgunfmt, mv, namei, netlink-route,
           netlink-sock-diag, nice, nl, nm, node, nohup, nproc, numactl-hardware,
           numastat, numfmt, objcopy, objdump, od, openssl, paste, patch,
@@ -1496,7 +1499,7 @@ corpus:
           realpath, rev, rm, rmdir, ruby, sar-resource-tables, sed, seq,
           setfacl, setfattr, sha1sum, sha224sum, sha256sum, sha384sum,
           sha512sum, shell-build, shred, shuf, size, sleep, sort, split,
-          sqlite3, ss, stat, stdbuf, strings, strip, sum, sync, tac, tar,
+          sqlite3, ss, stat, stdbuf, strings, strip, sum, sync, sysctl-random-uuid, tac, tar,
           tar-roundtrip, taskset, tcl, tee, test, time, timeout, top, touch, tr,
           "true", truncate, tsort, tty, uname, unexpand, uniq, uptime, users,
           uuidgen, vmstat, wc, wc-lines, wget-localhost, whoami, xmllint, xxd,
@@ -1518,6 +1521,56 @@ corpus:
           lock's lifetime equal to the guest description's. This cell passed
           only because KVM flock used to be a silent no-op
           (https://github.com/rrnewton/reverie/issues/1069)
+    # DBT (batch-2 flip, sweep 2026-10-27 at Hermit 0948c8eb): rows CLEAN on
+    # DBT in both the 2026-10-26 and 2026-10-27 nightly sweeps get a required
+    # DBT verify cell; the other rows keep no DBT cell under the reason below.
+    - backend: dbt
+      slow:
+        - timeout_seconds: 57
+          cpu_timeout_seconds: 33
+          slow_reason: >-
+            The full validation of 77635530182d stopped git, ld and
+            pkg-config at the default 22 CPU s, and the landed flip's
+            validation of 330a8b849db3 stopped node the same way on its
+            local Buck route. Local single samples on the host named in
+            docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts",
+            at the flip head (2026-10-27), measured git 12.465, ld 14.868 and
+            pkg-config 13.172 CPU s; five Buck-cell runs of node at
+            25d8071f6aa measured 13.487-14.242 CPU s (max wall 24.838 s).
+            The configured bound is ceil(1.5 x 22.0) = 33, the rule of
+            DBT_2026_10_25_TIMEOUT_CALIBRATIONS, because the
+            validate-context measurement is the 22.0 stop itself. Wall
+            stays at the 57 s default (measured walls at most 24.9 s).
+          rows: [git, ld, node, pkg-config]
+      rows:
+        [
+          addr2line, ar, arch, as, awk, b2sum, base32, base64, basename, basenc,
+          bash, bc, bracket, bzip2, bzip2-roundtrip, "c++filt", cal, cargo, cat,
+          chmod, chown, chrt, cksum, cmake, cmp, col, colrm, column, comm, cp,
+          cpio-roundtrip, crc32, cscope, csplit, curl, curl-localhost, cut, date,
+          dc, dd, df, df-direct, diff, diff3, dirname, dos2unix, du, echo, egrep,
+          elfedit, env, envsubst, expand, expr, factor, fallocate, fgrep, file,
+          find, findmnt, flock, fmt, fold, free, gcov, getconf, getopt, git,
+          gprof, grep, groups, gzip, gzip-roundtrip, head, hexdump, hostname,
+          iconv, id, install, ionice, iostat, ip, join, jq, ld, ln, logger,
+          logname, ls, lscpu, lsirq, lsmod, lua, lua-direct, m4, md5sum, mkdir,
+          mkfifo, mktemp, mountpoint, mpstat-softirqs, msgfmt, msgunfmt, mv,
+          namei, netlink-route, nice, nl, nm, node, nohup, nproc,
+          numactl-hardware, numastat, numfmt, objcopy, objdump, od, openssl,
+          paste, patch, pathchk, perl, perl-direct, pgrep, pidstat-disk, pinky,
+          pkg-config, pkill, pr, printenv, printf, ps, ptx, pwd, python3, ranlib,
+          readelf, readlink, realpath, rev, rm, rmdir, ruby, sar-resource-tables,
+          sed, seq, setfacl, setfattr, sha1sum, sha224sum, sha256sum, sha384sum,
+          sha512sum, shred, shuf, size, sleep, sort, split, sqlite3, ss, stat,
+          stdbuf, strings, strip, sum, sync, sysctl-random-uuid, tac, tar,
+          tar-roundtrip, taskset, tcl, tee, test, time, top, touch, tr, "true",
+          truncate, tsort, tty, uname, unexpand, uniq, uptime, users, uuidgen,
+          vmstat, vmstat-disk, wc, wc-lines, wget-localhost, whoami, xargs,
+          xmllint, xxd, xz, xz-roundtrip, "yes", zip-unzip, zstd, zstd-roundtrip
+        ]
+      disabled_reason: >-
+        Not CLEAN on DBT in both the 2026-10-26 and 2026-10-27 nightly
+        sweeps (Hermit 0948c8eb), so this row has no DBT verify cell yet
   # Cells measured red on 2026-10-01 (release Hermit at 03bbb8358, through
   # this bucket): each stays enabled with ci: false and its failure class's
   # issue, so the SaBRe run type does not require it.
@@ -1597,19 +1650,7 @@ corpus:
         4 runs; ptrace passes 3 of 3
       rows:
         [
-          iostat, mpstat-softirqs
-        ]
-    - backend: ptrace
-      result: crash-error
-      evidence: https://github.com/rrnewton/hermit/issues/3789
-      reason: >-
-        Detcore panics with "signal_guest: thread should be parked in the
-        scheduler" while timeout waits in rt_sigsuspend for its child (1 of
-        1 in the validation of 57883eff8); locally 1 of 40 runs diverged at
-        the same rt_sigsuspend
-      rows:
-        [
-          timeout
+          iostat
         ]
   # The rr run type (scripts/validate.rs --rr-compat-only): every program
   # the rr lane listed as passing record/replay (its 139
