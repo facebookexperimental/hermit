@@ -372,14 +372,17 @@ fn source_guard(
             ],
         "current Hermit HEAD/tree/gitlink differs from qualified producer or compiled pin",
     )?;
+    let hermit_dirty = read(
+        root,
+        "hermit-clean",
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
     require(
-        read(
-            root,
-            "hermit-clean",
-            &["status", "--porcelain=v1", "--untracked-files=all"],
-        )?
-        .is_empty(),
-        "Hermit source must remain clean during actual fixture execution",
+        hermit_dirty.is_empty(),
+        &format!(
+            "Hermit source must remain clean during actual fixture execution; \
+             offending paths (git status --porcelain):\n{hermit_dirty}"
+        ),
     )?;
     let rv = root.join("reverie");
     let identity = read(&rv, "reverie", &["rev-parse", "HEAD", "HEAD^{tree}"])?;
@@ -389,14 +392,17 @@ fn source_guard(
             && values == [env!("HERMIT_REVERIE_PIN"), bundle.reverie_tree.as_str()],
         "initialized Reverie HEAD/tree differs from compiled pin or producer",
     )?;
+    let reverie_dirty = read(
+        &rv,
+        "reverie-clean",
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
     require(
-        read(
-            &rv,
-            "reverie-clean",
-            &["status", "--porcelain=v1", "--untracked-files=all"],
-        )?
-        .is_empty(),
-        "initialized Reverie source must remain clean during actual fixture execution",
+        reverie_dirty.is_empty(),
+        &format!(
+            "initialized Reverie source must remain clean during actual fixture execution; \
+             offending paths (git status --porcelain):\n{reverie_dirty}"
+        ),
     )
 }
 #[derive(Clone, Copy)]
