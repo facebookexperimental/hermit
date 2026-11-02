@@ -37,17 +37,24 @@
 set -euo pipefail
 
 ALLOWED_ACTORS=("hermit-bot3" "rrnewton")
-# Exact "Name <email>" author identities observed on origin/main:
-#   hermit-bot3 — the bot account (github-usage skill, 2026-10-18).
-#   Ryan Newton <rrnewton@gmail.com> — the owner's commits on main.
-#   rrnewton <rrnewton@users.noreply.github.com> — the owner's GitHub
-#     noreply identity, same person as the allow-listed actor `rrnewton`.
-ALLOWED_AUTHORS=(
-  "hermit-bot3 <344587749+hermit-bot3@users.noreply.github.com>"
-  "Ryan Newton <rrnewton@gmail.com>"
-  "rrnewton <rrnewton@users.noreply.github.com>"
-  "Ryan Newton <rrnewton@users.noreply.github.com>"
+# Author identities are matched by email, not display name: names are
+# free text and spoofable, while the email is the recorded identity.
+# Defaults are the author emails observed on origin/main: the bot
+# account (github-usage skill, 2026-10-18) and the repository owner's
+# direct and GitHub-noreply addresses. Operators can extend the list
+# without editing this file via $RUNNER_TRUST_ALLOWED_AUTHOR_EMAILS
+# (comma- or space-separated); workflow jobs may source it from a
+# repository variable so no personal address is hard-coded here.
+ALLOWED_AUTHOR_EMAILS=(
+  "344587749+hermit-bot3@users.noreply.github.com"
+  "rrnewton@gmail.com"
+  "rrnewton@users.noreply.github.com"
 )
+if [ -n "${RUNNER_TRUST_ALLOWED_AUTHOR_EMAILS:-}" ]; then
+  extra="${RUNNER_TRUST_ALLOWED_AUTHOR_EMAILS//,/ }"
+  # shellcheck disable=SC2206 # deliberate word splitting of the override list
+  ALLOWED_AUTHOR_EMAILS+=($extra)
+fi
 
 actor="${GITHUB_ACTOR:-}"
 base_arg="${RUNNER_TRUST_BASE:-}"
@@ -95,7 +102,8 @@ check_authors() {
     [ -n "$line" ] || continue
     count=$((count + 1))
     sha="${line%% *}"; author="${line#* }"; author="${author%%|*}"; committer="${line##*|}"
-    if in_list "$author" "${ALLOWED_AUTHORS[@]}"; then
+    author_email="${author##*<}"; author_email="${author_email%%>*}"
+    if in_list "$author_email" "${ALLOWED_AUTHOR_EMAILS[@]}"; then
       echo "runner-trust: ok $sha author=$author committer=$committer"
     else
       echo "::error::runner-trust: commit $sha authored by '$author' is not allow-listed (committer=$committer)" >&2
@@ -133,7 +141,7 @@ self_test() {
   (
     cd "$repo"
     # 1. allow-listed actor + allow-listed authors passes
-    commit_as "Ryan Newton" "rrnewton@gmail.com" "owner work"
+    commit_as "Repo Owner" "rrnewton@gmail.com" "owner work"
     guard hermit-bot3 >/dev/null 2>&1 && rc=0 || rc=$?; expect "allowlisted actor+authors passes" 0 "$rc"
     # 2. outside author in range refuses (even with trusted committer)
     commit_as "Outside Dev" "outside@example.com" "outside work" "hermit-bot3" "344587749+hermit-bot3@users.noreply.github.com"
