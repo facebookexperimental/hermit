@@ -1499,6 +1499,15 @@ corpus:
     # https://github.com/rrnewton/reverie/issues/1069): 21 of 21 canonical
     # strict verify pairs on the tree that enabled it. flock(1) takes its lock
     # before it forks the command, as rustup does.
+    # ps joined on 2026-11-01 once Detcore served the caller's own /proc
+    # directories on KVM (package K slice K10 of
+    # https://github.com/rrnewton/hermit/issues/5039; before, its open of
+    # /proc/self was EACCES): 21 of 21 canonical strict verify pairs in the
+    # pinned root on the tree that enabled it (bitwise parity, 502 INFO records
+    # each side). Its table lists ps alone: KVM's own /proc refuses /proc/1,
+    # Hermit's init, another process's directory, with EACCES
+    # (https://github.com/rrnewton/hermit/issues/4564), where ptrace also
+    # lists pid 1 with Hermit's own command line.
     - backend: kvm
       rows:
         [
@@ -1517,7 +1526,7 @@ corpus:
           netlink-sock-diag, nice, nl, nm, node, nohup, nproc, numactl-hardware,
           numastat, numfmt, objcopy, objdump, od, openssl, paste, patch,
           pathchk, perl, perl-direct, pidstat-disk, pinky, pkg-config, pr,
-          printenv, printf, ptx, pwd, python3, ranlib, readelf, readlink,
+          printenv, printf, ps, ptx, pwd, python3, ranlib, readelf, readlink,
           realpath, rev, rm, rmdir, ruby, rustc, sar-resource-tables, sed, seq,
           setfacl, setfattr, sha1sum, sha224sum, sha256sum, sha384sum,
           sha512sum, shell-build, shred, shuf, size, sleep, sort, split,
@@ -1564,12 +1573,6 @@ corpus:
           (https://github.com/rrnewton/hermit/issues/4564): the opens answer
           EACCES, so pkill matches nothing and exits 1 in 3 of 3 KVM verify
           runs at Hermit 26eb116d
-        ps: >-
-          ps opens /proc/self as an O_PATH directory, which KVM's /proc
-          answers with EACCES (https://github.com/rrnewton/hermit/issues/5039), so ps
-          exits 47 (`Error, do this: mount -t proc proc /proc`) in 3 of 3 KVM
-          verify runs at Hermit 26eb116d; listing other processes also needs
-          https://github.com/rrnewton/hermit/issues/4564
     # DBT (batch-2 flip, sweep 2026-10-27 at Hermit 0948c8eb): rows CLEAN on
     # DBT in both the 2026-10-26 and 2026-10-27 nightly sweeps get a required
     # DBT verify cell; the other rows keep no DBT cell under the reason below.

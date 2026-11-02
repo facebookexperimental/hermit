@@ -2919,6 +2919,23 @@ fn procfs_reached_task(reached: &Path) -> Option<crate::procfs::BoundTask> {
     Some(crate::procfs::BoundTask { process, thread })
 }
 
+/// The task whose own directory, or whose `task` directory, the procfs path
+/// `directory` is: `/proc/<pid>`, `/proc/<pid>/task`, or the thread of
+/// `/proc/<pid>/task/<tid>` (`procfs_reached_task`). `None` for any other
+/// path, a directory below a task's (`fd`, `ns`, ...) included.
+fn procfs_task_directory_task(directory: &Path) -> Option<crate::procfs::BoundTask> {
+    let names = directory
+        .strip_prefix("/proc")
+        .ok()?
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()?;
+    match names.as_slice() {
+        [_] | [_, "task"] | [_, "task", _] => procfs_reached_task(directory),
+        _ => None,
+    }
+}
+
 /// Whether `spelling` names a `/proc` selector link itself: `/proc/self` or
 /// `/proc/thread-self`, which are symbolic links to a task's directory.
 fn names_a_selector_link(spelling: &Path) -> bool {
@@ -5716,8 +5733,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .await
         {
+            let name_and_slash = descriptor_directory::ends_in_a_name_and_slash(
+                guest_spelled
+                    .as_ref()
+                    .map_or(&observed_path, |(observed, _)| observed),
+            );
             let result = match opened {
-                Ok(opened) => self.open_placeholder(guest, call.flags(), opened).await,
+                Ok(opened) => {
+                    self.open_placeholder(guest, call.flags(), opened, name_and_slash)
+                        .await
+                }
                 Err(errno) => Err(errno.into()),
             };
             resource_release_all(guest).await;
@@ -17121,6 +17146,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self.project_one_buffer(guest, call).await;
         }
         if !needs_snapshot {
+            if self.stream_task_gone(guest, call.fd).await {
+                return Err(Errno::ENOENT.into());
+            }
             return self.serve_next_batch(guest, call).await;
         }
         let mark = directory_snapshot_mark(guest).await;
@@ -17162,6 +17190,54 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Whether the directory stream of `fd` holds the snapshot of a procfs
+    /// task directory (`/proc/<pid>`, its `task`, or `/proc/<pid>/task/<tid>`)
+    /// whose task is gone now, as Detcore's process table says in the
+    /// caller's turn: Linux's readdir of such a directory looks the task up
+    /// first and fails with `ENOENT` once it is gone, at every call, so a
+    /// stream read while the task lived lists nothing more either
+    /// (`proc_pident_readdir`'s `get_proc_task`, `proc_task_readdir`'s
+    /// `proc_inode_is_dead`, fs/proc/base.c at v6.17; package K slice K10).
+    /// Only where guest thread IDs name host tasks (ptrace), for a snapshot
+    /// of the guest's own procfs (its device), which names the directory by
+    /// the numbers Detcore's table uses, and not under
+    /// record and replay, which serve the kernel's listing as recorded, nor
+    /// in a nested PID namespace or after a guest `chroot`, where Detcore
+    /// does not know which tasks the numbers name, nor for pid 1, the
+    /// namespace's init, whose threads the kernel lists and Detcore's table
+    /// does not unless a guest holds it.
+    async fn stream_task_gone<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) -> bool {
+        let state = guest.thread_state();
+        if self.cfg.recordreplay_modes
+            || state.nested_pid_namespace
+            || state.changed_root.load(Ordering::SeqCst)
+            || !procfs_inode::guest_tids_name_host_tasks(&self.cfg.backend, state.physical_tid)
+        {
+            return false;
+        }
+        let Ok(Ok(Some(inodes))) = state.with_detfd(fd, |detfd| {
+            detfd.with_directory_stream(|stream| stream.snapshot_inodes())
+        }) else {
+            return false;
+        };
+        // Only a listing of the guest's own procfs names its tasks by the
+        // numbers Detcore's table uses (as `modeled_directory_snapshot`
+        // requires): another procfs instance (a nested PID namespace's, which
+        // a guest mounted) numbers them otherwise.
+        if rendered_procfs::proc_device() != Some(inodes.device()) {
+            return false;
+        }
+        let Some(task) = inodes
+            .entry_procfs_path(b".")
+            .as_deref()
+            .and_then(procfs_task_directory_task)
+            .filter(|task| task.process != 1)
+        else {
+            return false;
+        };
+        !crate::tool_global::procfs_task(guest, task).await.exists
     }
 
     /// Answer a `getdents` whose count does not fit in an `int`. Linux keeps
@@ -17408,10 +17484,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             std::fs::read_link(format!("/proc/thread-self/fd/{fd}"))
                 .is_ok_and(|kernel| listing::classify(&kernel, 0, 0).is_some())
         };
-        if spelled
-            .as_deref()
-            .and_then(|spelled| listing::classify(spelled, 0, 0))
-            .is_none()
+        // A spelling with `..` names the directory Linux's walk reaches over
+        // procfs's own directories (`/proc/self/fd/..` is `/proc/self`), as
+        // the shared resolver resolves it (package K slice K10); which
+        // directory the descriptor is still comes from its inode below.
+        let names_a_modeled_directory = |spelled: &Path| {
+            listing::classify(spelled, 0, 0).is_some()
+                || descriptor_directory::resolved_procfs_dotdot(spelled)
+                    .is_some_and(|(resolved, _)| listing::classify(&resolved, 0, 0).is_some())
+        };
+        if !spelled.as_deref().is_some_and(names_a_modeled_directory)
             && !(Self::translates_procfs_numbers(guest)
                 && guest.config().backend.tool_shares_guest_descriptor_table
                 && kernel_named())
@@ -17588,6 +17670,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let order = match &directory {
             ModeledDirectory::System(names) if names.is_empty() => DirectoryOrder::ProcfsIds,
             ModeledDirectory::Tasks(_) => DirectoryOrder::ProcfsIds,
+            ModeledDirectory::Process(_) => DirectoryOrder::ProcessEntries { thread: false },
+            ModeledDirectory::Thread(..) => DirectoryOrder::ProcessEntries { thread: true },
             _ => DirectoryOrder::NameBytes,
         };
         Ok(Some((entries, inodes, order)))
@@ -19141,6 +19225,25 @@ mod test {
                 super::procfs_reached_task(Path::new(reached)),
                 expected,
                 "{reached}"
+            );
+        }
+        // The task whose own directory or `task` directory each is, whose
+        // listing ends with it: none below one (package K slice K10).
+        for (directory, expected) in [
+            ("/proc/3", Some(task(3, None))),
+            ("/proc/3/task", Some(task(3, None))),
+            ("/proc/3/task/5", Some(task(3, Some(5)))),
+            ("/proc/3/task/5/ns", None),
+            ("/proc/3/fd", None),
+            ("/proc/self", None),
+            ("/proc", None),
+            ("/proc/sys", None),
+            ("/proc/0", None),
+        ] {
+            assert_eq!(
+                super::procfs_task_directory_task(Path::new(directory)),
+                expected,
+                "{directory}"
             );
         }
     }

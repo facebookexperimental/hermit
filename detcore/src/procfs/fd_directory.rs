@@ -147,6 +147,11 @@ pub enum PlaceholderDirectory {
     Root,
     /// A task's descriptor directory, bound to that task at the open.
     Descriptors(DescriptorDirectoryBinding),
+    /// One of the caller's own task directories, its process's, its own
+    /// thread's or its process's `task`, bound to that task at the open
+    /// (package K slice K10). Last, so that the earlier variants keep their
+    /// numbers in the global RPC's positional encoding.
+    Task(TaskDirectoryBinding),
 }
 
 impl PlaceholderDirectory {
@@ -157,16 +162,19 @@ impl PlaceholderDirectory {
         match self {
             Self::Root => PathBuf::from("/proc"),
             Self::Descriptors(binding) => binding.canonical(),
+            Self::Task(binding) => binding.canonical(),
         }
     }
 
     /// The absolute spelling a name relative to the directory's descriptor is
     /// looked up below, for a caller whose pid and tid are `caller`
-    /// ([`DescriptorDirectoryBinding::lookup_base`]).
+    /// ([`DescriptorDirectoryBinding::lookup_base`],
+    /// [`TaskDirectoryBinding::lookup_base`]).
     pub(crate) fn lookup_base(&self, caller: (i32, i32)) -> PathBuf {
         match self {
             Self::Root => PathBuf::from("/proc"),
             Self::Descriptors(binding) => binding.lookup_base(caller),
+            Self::Task(binding) => binding.lookup_base(caller),
         }
     }
 
@@ -181,6 +189,13 @@ impl PlaceholderDirectory {
                 pid: binding.pid,
                 process_incarnation: binding.process_incarnation,
                 thread: (binding.table == DescriptorDirectoryTable::Thread)
+                    .then_some((binding.tid, binding.thread_incarnation)),
+            },
+            Self::Task(binding) => PlaceholderLockKey::Task {
+                kind: binding.kind,
+                pid: binding.pid,
+                process_incarnation: binding.process_incarnation,
+                thread: (binding.kind == TaskDirectoryKind::Thread)
                     .then_some((binding.tid, binding.thread_incarnation)),
             },
         }
@@ -210,6 +225,17 @@ pub enum PlaceholderLockKey {
     Descriptors {
         /// Whose table.
         table: DescriptorDirectoryTable,
+        /// The process.
+        pid: i32,
+        /// Its incarnation.
+        process_incarnation: u32,
+        /// For a thread's directory, the thread and its incarnation.
+        thread: Option<(i32, Option<u32>)>,
+    },
+    /// One of a task's own directories (package K slice K10).
+    Task {
+        /// Which directory.
+        kind: TaskDirectoryKind,
         /// The process.
         pid: i32,
         /// Its incarnation.
@@ -258,6 +284,188 @@ pub(crate) fn classify(path: &Path, own: (i32, i32)) -> Option<DescriptorDirecto
         }
         _ => None,
     }
+}
+
+/// Which of the caller's own task directories a task-directory placeholder
+/// stands for (package K slice K10, toward
+/// <https://github.com/rrnewton/hermit/issues/5039>).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize
+)]
+pub enum TaskDirectoryKind {
+    /// The process's directory, `/proc/<pid>` (`/proc/self`).
+    Process,
+    /// One of its threads' directories, `/proc/<pid>/task/<tid>`
+    /// (`/proc/thread-self`).
+    Thread,
+    /// The process's `task` directory, which lists its threads.
+    Tasks,
+}
+
+/// The task a task-directory placeholder is bound to, as Linux binds the
+/// directory's inode to a task at the lookup (`proc_pid_instantiate`,
+/// `proc_task_instantiate`, `proc_pident_instantiate` for `task`): every
+/// later listing and lookup below it reads that task, whoever holds the
+/// descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskDirectoryBinding {
+    /// Which directory.
+    pub kind: TaskDirectoryKind,
+    /// The process, as the guest numbers it.
+    pub pid: i32,
+    /// The thread, as the guest numbers it: the directory's thread for a
+    /// thread's directory, the opener otherwise.
+    pub tid: i32,
+    /// How many tasks of the run had held the process number at the open
+    /// (`InodePool::count_incarnation`), 0 where unknown.
+    pub process_incarnation: u32,
+    /// The same for the thread number of a thread's directory.
+    pub thread_incarnation: Option<u32>,
+    /// The device that keys the directory's inode number and its entries',
+    /// as for a descriptor directory ([`DescriptorDirectoryBinding::device`]).
+    pub device: u64,
+}
+
+impl TaskDirectoryBinding {
+    /// The directory's path within procfs, as the guest numbers its task:
+    /// `/<pid>`, `/<pid>/task/<tid>` or `/<pid>/task`.
+    pub(crate) fn within(&self) -> PathBuf {
+        match self.kind {
+            TaskDirectoryKind::Process => PathBuf::from(format!("/{}", self.pid)),
+            TaskDirectoryKind::Thread => PathBuf::from(format!("/{}/task/{}", self.pid, self.tid)),
+            TaskDirectoryKind::Tasks => PathBuf::from(format!("/{}/task", self.pid)),
+        }
+    }
+
+    /// The directory's absolute guest path, which is what Linux's
+    /// `/proc/self/fd/N` link to it reads (`/proc/<pid>`).
+    pub(crate) fn canonical(&self) -> PathBuf {
+        let within = self.within();
+        Path::new("/proc").join(within.strip_prefix("/").unwrap_or(&within))
+    }
+
+    /// The absolute spelling a name relative to the directory's descriptor is
+    /// looked up below, for a caller whose pid and tid are `caller`: through
+    /// `self` or `thread-self` where that is the bound task, which every
+    /// backend's `/proc` resolves for the caller, else by number.
+    pub(crate) fn lookup_base(&self, caller: (i32, i32)) -> PathBuf {
+        match self.kind {
+            TaskDirectoryKind::Process if caller.0 == self.pid => PathBuf::from("/proc/self"),
+            TaskDirectoryKind::Tasks if caller.0 == self.pid => PathBuf::from("/proc/self/task"),
+            TaskDirectoryKind::Thread if caller.1 == self.tid => PathBuf::from("/proc/thread-self"),
+            _ => self.canonical(),
+        }
+    }
+
+    /// The model's directory ([`super::listing::ModeledDirectory`]).
+    pub(crate) fn modeled(&self) -> super::listing::ModeledDirectory {
+        match self.kind {
+            TaskDirectoryKind::Process => super::listing::ModeledDirectory::Process(self.pid),
+            TaskDirectoryKind::Thread => {
+                super::listing::ModeledDirectory::Thread(self.pid, self.tid)
+            }
+            TaskDirectoryKind::Tasks => super::listing::ModeledDirectory::Tasks(self.pid),
+        }
+    }
+}
+
+/// Which of the caller's own task directories the absolute guest path
+/// `path` spells, for a caller whose pid and tid, as the guest numbers them,
+/// are `own`, and the thread for a thread's directory: `/proc/self` or
+/// `/proc/<pid>` its process's, `/proc/thread-self` its own thread's,
+/// `/proc/self/task/<tid>` or `/proc/<pid>/task/<tid>` that of a thread
+/// numbered `<tid>`, which the caller checks is one of its process's, and
+/// `/proc/self/task` or `/proc/<pid>/task` its process's `task`. Empty and
+/// `.` components name nothing, and a final `/` asks for the directory it
+/// is. `None` for any other path: another process's directory, a number
+/// with a leading zero (which names nothing on Linux), and a spelling with
+/// `..` (the caller resolves those first, `resolved_procfs_dotdot`).
+pub(crate) fn classify_task_directory(
+    path: &Path,
+    own: (i32, i32),
+) -> Option<(TaskDirectoryKind, i32)> {
+    let mut components = path.components().filter(|c| *c != Component::CurDir);
+    if components.next() != Some(Component::RootDir)
+        || components.next() != Some(Component::Normal(OsStr::new("proc")))
+    {
+        return None;
+    }
+    let mut names = Vec::new();
+    for component in components {
+        match component {
+            Component::Normal(name) => names.push(name.to_str()?),
+            _ => return None,
+        }
+    }
+    let number = |name: &str| -> Option<i32> {
+        if name.starts_with('0') || name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        name.parse().ok()
+    };
+    let own_process = |name: &str| name == "self" || number(name) == Some(own.0);
+    match names.as_slice() {
+        [process] if own_process(process) => Some((TaskDirectoryKind::Process, own.1)),
+        ["thread-self"] => Some((TaskDirectoryKind::Thread, own.1)),
+        [process, "task"] if own_process(process) => Some((TaskDirectoryKind::Tasks, own.1)),
+        [process, "task", thread] if own_process(process) => {
+            Some((TaskDirectoryKind::Thread, number(thread)?))
+        }
+        _ => None,
+    }
+}
+
+/// The process spelling, `/proc/self/<name>`, of the absolute guest path
+/// `path` where it names a file of the caller's process's thread group
+/// leader's own directory that is the file of the same name in the process's
+/// directory (`levels::leader_thread_file_is_process_file`), for a caller
+/// whose pid and tid are `own`: `/proc/self/task/<pid>/<name>` and
+/// `/proc/<pid>/task/<pid>/<name>` by any caller, and
+/// `/proc/thread-self/<name>` by the leader itself. Empty and `.` components
+/// name nothing, but a final `/` or `/.` asks for a directory (and follows a
+/// final link), so the respelling ends in `/` too: the backend's walk then
+/// fails at a file with `ENOTDIR`, as Linux's does (`path_lookupat`,
+/// `do_open`). `None` for any other path, one with `..`, and one that goes
+/// on past the name, which stays as it is spelled. A backend whose `/proc`
+/// renders a process's files and not its threads' (KVM's executor) then
+/// answers the leader's, as Linux does (package K slice K10).
+pub(crate) fn leader_process_spelling(path: &[u8], own: (i32, i32)) -> Option<Vec<u8>> {
+    if !path.starts_with(b"/") {
+        return None;
+    }
+    let names = path
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty() && *component != b".")
+        .collect::<Vec<_>>();
+    let pid = own.0.to_string();
+    let own_process = |name: &[u8]| name == b"self" || name == pid.as_bytes();
+    let name = match names.as_slice() {
+        [b"proc", b"thread-self", name] if own.0 == own.1 => name,
+        [b"proc", process, b"task", thread, name]
+            if own_process(process) && *thread == pid.as_bytes() =>
+        {
+            name
+        }
+        _ => return None,
+    };
+    if !super::levels::leader_thread_file_is_process_file(name) {
+        return None;
+    }
+    let mut spelled = b"/proc/self/".to_vec();
+    spelled.extend_from_slice(name);
+    if path.ends_with(b"/") || path.ends_with(b"/.") {
+        spelled.push(b'/');
+    }
+    Some(spelled)
 }
 
 /// One entry of a descriptor directory, at its Linux position.
@@ -645,5 +853,159 @@ mod tests {
             ..process
         });
         assert_eq!(reopened.lock_key(), keys[1], "the same task's directory");
+    }
+
+    /// The caller's own task directories, by every spelling that names one
+    /// without `..` (package K slice K10): a process's by `self` or its
+    /// number, its own thread's by `thread-self`, any thread's of its
+    /// process by number (which the caller then checks), and `task`.
+    #[test]
+    fn classifies_the_callers_own_task_directories() {
+        use TaskDirectoryKind::*;
+        let own = (7, 9);
+        let classified = |path: &str| classify_task_directory(Path::new(path), own);
+        assert_eq!(classified("/proc/self"), Some((Process, 9)));
+        assert_eq!(classified("/proc/7"), Some((Process, 9)));
+        assert_eq!(classified("/proc/7/"), Some((Process, 9)));
+        assert_eq!(classified("/proc/./self/."), Some((Process, 9)));
+        assert_eq!(classified("//proc//7"), Some((Process, 9)));
+        assert_eq!(classified("/proc/thread-self"), Some((Thread, 9)));
+        assert_eq!(classified("/proc/thread-self/"), Some((Thread, 9)));
+        assert_eq!(classified("/proc/self/task/9"), Some((Thread, 9)));
+        assert_eq!(classified("/proc/7/task/12/"), Some((Thread, 12)));
+        assert_eq!(classified("/proc/self/task"), Some((Tasks, 9)));
+        assert_eq!(classified("/proc/7/task/"), Some((Tasks, 9)));
+        for path in [
+            "/proc",
+            "/proc/8",
+            "/proc/07",
+            "/proc/8/task",
+            "/proc/8/task/9",
+            "/proc/self/task/09",
+            "/proc/self/task/x",
+            "/proc/self/fd",
+            "/proc/self/status",
+            "/proc/thread-self/task",
+            "/proc/self/../self",
+            "/proc/self/fd/..",
+            "proc/self",
+            "/tmp/self",
+        ] {
+            assert_eq!(classified(path), None, "{path}");
+        }
+    }
+
+    /// A task directory's path within procfs and its absolute spelling, and
+    /// what a name below its descriptor is looked up below: through `self`
+    /// or `thread-self` where that is its task, which every backend's
+    /// `/proc` resolves for the caller, else by number; each locks as its own
+    /// inode, apart from the descriptor directories.
+    #[test]
+    fn a_task_directory_names_its_path_its_lookup_base_and_its_lock() {
+        let process = TaskDirectoryBinding {
+            kind: TaskDirectoryKind::Process,
+            pid: 7,
+            tid: 9,
+            process_incarnation: 1,
+            thread_incarnation: None,
+            device: 0,
+        };
+        let thread = TaskDirectoryBinding {
+            kind: TaskDirectoryKind::Thread,
+            tid: 12,
+            thread_incarnation: Some(1),
+            ..process
+        };
+        let tasks = TaskDirectoryBinding {
+            kind: TaskDirectoryKind::Tasks,
+            ..process
+        };
+        assert_eq!(process.within(), Path::new("/7"));
+        assert_eq!(thread.within(), Path::new("/7/task/12"));
+        assert_eq!(tasks.within(), Path::new("/7/task"));
+        assert_eq!(process.canonical(), Path::new("/proc/7"));
+        assert_eq!(thread.canonical(), Path::new("/proc/7/task/12"));
+        assert_eq!(tasks.canonical(), Path::new("/proc/7/task"));
+        assert_eq!(process.lookup_base((7, 9)), Path::new("/proc/self"));
+        assert_eq!(process.lookup_base((8, 8)), Path::new("/proc/7"));
+        assert_eq!(tasks.lookup_base((7, 12)), Path::new("/proc/self/task"));
+        assert_eq!(thread.lookup_base((7, 12)), Path::new("/proc/thread-self"));
+        assert_eq!(thread.lookup_base((7, 9)), Path::new("/proc/7/task/12"));
+        let keys = [
+            PlaceholderDirectory::Task(process).lock_key(),
+            PlaceholderDirectory::Task(thread).lock_key(),
+            PlaceholderDirectory::Task(tasks).lock_key(),
+            PlaceholderDirectory::Descriptors(DescriptorDirectoryBinding {
+                table: DescriptorDirectoryTable::Process,
+                pid: 7,
+                tid: 9,
+                process_incarnation: 1,
+                thread_incarnation: None,
+                device: 0,
+                files: None,
+            })
+            .lock_key(),
+        ];
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(
+            PlaceholderDirectory::Task(TaskDirectoryBinding {
+                device: 5,
+                ..process
+            })
+            .lock_key(),
+            keys[0],
+            "the same task's directory"
+        );
+    }
+
+    /// A file of the thread group leader's own directory that is its
+    /// process's is spelled as the process's: by any caller through the
+    /// leader's number, by the leader alone through `thread-self`; never
+    /// `stat` or `io`, a directory, a name only one table has, a spelling
+    /// with `..`, or one that goes on past the name. A final `/` or `/.`
+    /// still asks for a directory after the respelling.
+    #[test]
+    fn a_leaders_thread_file_is_spelled_as_its_processs() {
+        let spelled =
+            |path: &str, own| leader_process_spelling(path.as_bytes(), own).map(String::from_utf8);
+        let leader = (7, 7);
+        let thread = (7, 9);
+        for (path, own, expected) in [
+            ("/proc/thread-self/status", leader, "/proc/self/status"),
+            ("/proc//thread-self/./maps", leader, "/proc/self/maps"),
+            ("/proc/self/task/7/status", thread, "/proc/self/status"),
+            ("/proc/7/task/7/environ", thread, "/proc/self/environ"),
+            ("/proc/thread-self/status/", leader, "/proc/self/status/"),
+            ("/proc/thread-self/status/.", leader, "/proc/self/status/"),
+            ("/proc/thread-self/maps/./", leader, "/proc/self/maps/"),
+            ("/proc/self/task/7/status/.", thread, "/proc/self/status/"),
+            ("/proc/7/task/7/maps//.", thread, "/proc/self/maps/"),
+            ("/proc/thread-self/cwd/.", leader, "/proc/self/cwd/"),
+        ] {
+            assert_eq!(spelled(path, own), Some(Ok(expected.into())), "{path}");
+        }
+        for (path, own) in [
+            ("/proc/thread-self/status", thread),
+            ("/proc/self/task/9/status", thread),
+            ("/proc/thread-self/stat", leader),
+            ("/proc/thread-self/io", leader),
+            ("/proc/thread-self/fd", leader),
+            ("/proc/thread-self/task", leader),
+            ("/proc/thread-self/children", leader),
+            ("/proc/thread-self/timerslack_ns", leader),
+            ("/proc/thread-self/status/x", leader),
+            ("/proc/thread-self/status/..", leader),
+            ("/proc/thread-self/status/.", thread),
+            ("/proc/thread-self/../status", leader),
+            ("/proc/8/task/8/status", leader),
+            ("/proc/self/status", leader),
+            ("thread-self/status", leader),
+        ] {
+            assert_eq!(spelled(path, own), None, "{path}");
+        }
     }
 }

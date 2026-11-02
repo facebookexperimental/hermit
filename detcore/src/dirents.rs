@@ -381,6 +381,13 @@ fn compare_dir_entries(a: &DirEntry, b: &DirEntry) -> std::cmp::Ordering {
 pub(crate) enum DirectoryOrder {
     NameBytes,
     ProcfsIds,
+    /// A process's directory, or a thread's (`thread`), which Detcore lists
+    /// from its model in Linux's order (`procfs::levels::process_entry_rank`,
+    /// package K slice K10): `.` and `..` first, then by the table's order, a
+    /// name it does not have last, by its bytes.
+    ProcessEntries {
+        thread: bool,
+    },
 }
 
 impl DirectoryOrder {
@@ -405,6 +412,19 @@ impl DirectoryOrder {
                         }
                     }
                 }
+                key(&a.name).cmp(&key(&b.name))
+            }
+            Self::ProcessEntries { thread } => {
+                let key = |name: &[u8]| -> (u8, usize, Vec<u8>) {
+                    match name {
+                        b"." => (0, 0, Vec::new()),
+                        b".." => (1, 0, Vec::new()),
+                        _ => match crate::procfs::levels::process_entry_rank(thread, name) {
+                            Some(rank) => (2, rank, Vec::new()),
+                            None => (3, 0, name.to_vec()),
+                        },
+                    }
+                };
                 key(&a.name).cmp(&key(&b.name))
             }
         }
@@ -1344,6 +1364,42 @@ mod test {
         assert_eq!(
             names(&stream.next_batch(DirentFormat::Dirent64, 1024).unwrap()),
             ["2", "10", "0", "03", "15x", "2147483648"]
+        );
+    }
+
+    /// A process's or a thread's directory lists in Linux's table order, not
+    /// by bytes: the dots first, then `tgid_base_stuff` or `tid_base_stuff`,
+    /// and a name the table does not have last (package K slice K10).
+    #[test]
+    fn process_entries_keep_the_tables_order() {
+        let listed = |thread| {
+            let mut stream = DirectoryStream::default();
+            stream.install(
+                [
+                    "status", "zz", "fd", "..", "task", "children", "cwd", ".", "aa",
+                ]
+                .into_iter()
+                .map(entry)
+                .collect(),
+                DirectoryOrder::ProcessEntries { thread },
+            );
+            let batch = stream.next_batch(DirentFormat::Dirent64, 1024).unwrap();
+            names(&batch)
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            listed(false),
+            [
+                ".", "..", "task", "fd", "status", "cwd", "aa", "children", "zz"
+            ]
+        );
+        assert_eq!(
+            listed(true),
+            [
+                ".", "..", "fd", "status", "children", "cwd", "aa", "task", "zz"
+            ]
         );
     }
 

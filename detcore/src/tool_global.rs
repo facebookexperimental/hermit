@@ -7749,9 +7749,20 @@ pub enum SignalScope {
 /// before either decodes the other's messages. A change to either enum
 /// appends a revision (`config::tests::the_global_rpc_revision_matches_its_definitions`
 /// fails until it does). That test digests the two enums' bodies and
-/// `Resources`: a change to another payload type defined elsewhere
-/// (`CommittedSendWindow`, ...) changes what is on the wire without changing
-/// the digest, and needs a revision appended by hand.
+/// `Resources`, and refuses a revision whose digests did not change, so no
+/// revision can be appended by hand. A change to another payload type defined
+/// elsewhere (`CommittedSendWindow`, `PlaceholderDirectory`, ...) changes what
+/// is on the wire without changing the digest, so it must either keep every
+/// encoding a peer built before it can send or receive (an enum variant
+/// appended at the end, which no such peer encodes), or bring the type into
+/// the digest, as `Resources` is, whose change then asks for a revision.
+/// Package K slice K10 appended `PlaceholderDirectory::Task` (carried by
+/// `RegisterPlaceholder` and `Placeholder`) and `PlaceholderLockKey::Task` (in
+/// `PlaceholderWriteHint` and `PlaceholderFlock`) under the first rule, so the
+/// revision did not move from 26: every earlier variant keeps its encoding, and only KVM
+/// encodes the new ones, where Detcore runs in the Hermit process beside its
+/// coordinator. The in-guest runtimes, the only peers built apart, never
+/// register a placeholder (`Detcore::serves_placeholders`).
 // 26 follows SP2's 25, whose variants come before this revision's
 // `ChildSubreaper` pair.
 pub(crate) const GLOBAL_RPC_REVISION: u32 = 26;

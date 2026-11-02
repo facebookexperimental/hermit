@@ -457,6 +457,28 @@ fn decided_procfs_link(path: &[u8], pid: i32, tid: i32) -> Option<DecidedLink> {
     decided_procfs_link_parts(&parts, pid, tid)
 }
 
+/// The absolute spelling `path` spelled from `/proc/` where empty or `.`
+/// components come before its first component, `proc` (`//proc/self`,
+/// `/./proc/thread-self`): those name nothing, as they name nothing after it.
+/// The rest is kept byte for byte, a final `/` or `.` included. `None` for
+/// any other spelling, and for one that begins `/proc/` already.
+fn procfs_leading_components_dropped(path: &[u8]) -> Option<Vec<u8>> {
+    let mut rest = path.strip_prefix(b"/")?;
+    let mut dropped = false;
+    loop {
+        if let Some(after) = rest.strip_prefix(b"/") {
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix(b"./") {
+            rest = after;
+        } else {
+            break;
+        }
+        dropped = true;
+    }
+    let rest = rest.strip_prefix(b"proc/")?;
+    dropped.then(|| [b"/proc/".as_slice(), rest].concat())
+}
+
 /// [`decided_procfs_link`] of the components below `/proc` of a spelling
 /// that does not follow its last one.
 fn decided_procfs_link_parts(parts: &[&[u8]], pid: i32, tid: i32) -> Option<DecidedLink> {
@@ -1893,13 +1915,56 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(None);
         }
+        let tid = state.dettid.as_raw();
+        // Where Detcore serves the caller's own task directories (KVM, where
+        // record and replay do not run), empty and `.` components before
+        // `proc` name nothing, as they name nothing after it (`//proc/self`),
+        // and each `..` within the caller's own task tree resolves as Linux's
+        // walk resolves it (`/proc/self/../self` is the link `/proc/self`),
+        // once the walk to the last component succeeds, which readlink does
+        // not follow (unless a final `/` or `/.` makes it); the backend's
+        // executor, which would answer the spelling otherwise, takes neither
+        // (package K slice K10).
+        let bytes = path.as_os_str().as_bytes();
+        let serves = Self::serves_task_directories(guest);
+        let unprefixed = serves
+            .then(|| procfs_leading_components_dropped(bytes))
+            .flatten();
+        let resolved = if serves {
+            let follows_last = bytes.ends_with(b"/") || bytes.ends_with(b"/.");
+            match Self::own_tree_resolved(guest, bytes, follows_last).await {
+                Ok(resolved) => resolved,
+                Err(errno) => {
+                    // Linux refuses a size that is not positive before it
+                    // looks up the path.
+                    readlink_size(buffer_len)?;
+                    return Err(errno.into());
+                }
+            }
+        } else {
+            None
+        };
         let decided = decided_procfs_link(
-            path.as_os_str().as_bytes(),
+            resolved
+                .as_deref()
+                .or(unprefixed.as_deref())
+                .unwrap_or(bytes),
             self.own_detpid(guest).as_raw(),
-            state.dettid.as_raw(),
+            tid,
         );
-        let Some(decided) = decided else {
-            return Ok(None);
+        let decided = match decided {
+            Some(decided) => decided,
+            // A directory Detcore serves there (`/proc`, the caller's own
+            // descriptor and task directories), by any spelling that reaches
+            // it, is no link: EINVAL, once the walk to it succeeds.
+            None => match self.served_directory_walk(guest, bytes).await {
+                Some(Ok(())) => DecidedLink::Followed(Errno::EINVAL),
+                Some(Err(errno)) => {
+                    readlink_size(buffer_len)?;
+                    return Err(errno.into());
+                }
+                None => return Ok(None),
+            },
         };
         // Linux takes the size as an int, and refuses one that is not
         // positive before it looks up the path.
@@ -2317,15 +2382,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         // itself, a directory, or one whose task or kernel path Detcore knows
         // (a selector's directory records its task only where the open
         // followed the selector, not for the link itself, an
-        // `O_PATH | O_NOFOLLOW` open of `/proc/self`). An empty pathname reads
-        // the descriptor's own link, which the kernel answers (an inherited
-        // one keeps its opener's binding).
+        // `O_PATH | O_NOFOLLOW` open of `/proc/self`), and, where Detcore
+        // serves the caller's own task directories (KVM, package K slice
+        // K10), below any directory it serves on a placeholder, which it
+        // resolves as Linux's walk does (`../self` below `/proc/self`). An
+        // empty pathname reads the descriptor's own link, which the kernel
+        // answers (an inherited one keeps its opener's binding).
         let decidable = path.is_absolute()
             || named_by_directory
             || (below_directory
                 && recorded
                     .as_deref()
-                    .is_some_and(|directory| directory == Path::new("/proc")));
+                    .is_some_and(|directory| directory == Path::new("/proc")))
+            || (below_directory
+                && Self::serves_task_directories(guest)
+                && Self::placeholder_of(guest, call.dirfd()).is_some());
         // The caller's own `exe`, `cwd` and `root` links, by a name below a
         // descriptor on `/proc` or one of its process directories.
         if decidable
@@ -2444,6 +2515,53 @@ mod tests {
         ] {
             assert_eq!(subject(path), None, "{path}");
         }
+    }
+
+    /// Empty and `.` components before `proc` name nothing: the spelling is
+    /// given from `/proc/`, the rest byte for byte (package K slice K10).
+    #[test]
+    fn a_procfs_spelling_loses_the_components_before_proc() {
+        let dropped = |path: &str| {
+            procfs_leading_components_dropped(path.as_bytes())
+                .map(|path| String::from_utf8(path).unwrap())
+        };
+        assert_eq!(dropped("//proc/self"), Some("/proc/self".into()));
+        assert_eq!(
+            dropped("/./proc/thread-self"),
+            Some("/proc/thread-self".into())
+        );
+        assert_eq!(dropped("/.//./proc//self/"), Some("/proc//self/".into()));
+        assert_eq!(
+            dropped("///proc/3/task/5/fd/7"),
+            Some("/proc/3/task/5/fd/7".into())
+        );
+        for path in [
+            "/proc/self",
+            "/proc/./self",
+            "//proc",
+            "//procx/self",
+            "//tmp/proc/self",
+            "/../proc/self",
+            "proc/self",
+            "",
+        ] {
+            assert_eq!(dropped(path), None, "{path}");
+        }
+        let decided = |path: &str| {
+            decided_procfs_link(
+                &procfs_leading_components_dropped(path.as_bytes()).unwrap(),
+                3,
+                5,
+            )
+        };
+        assert_eq!(
+            decided("//proc/self"),
+            Some(DecidedLink::Target(b"3".to_vec()))
+        );
+        assert_eq!(
+            decided("/./proc/thread-self/"),
+            Some(DecidedLink::Followed(Errno::EINVAL))
+        );
     }
 
     #[test]

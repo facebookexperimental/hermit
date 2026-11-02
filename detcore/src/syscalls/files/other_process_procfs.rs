@@ -600,6 +600,71 @@ fn linux_answer_before_the_walk<M: MemoryAccess>(
     }
 }
 
+/// Linux's answer to the call `sysno`, with argument `values`, from every
+/// check it makes of the call's own arguments before it walks any path:
+/// [`linux_answer_before_the_walk`]'s, and those the backend beneath makes
+/// first itself where it is given the call (see that function), each with
+/// EINVAL: open flags `build_open_flags` refuses (v6.17 fs/open.c:1281 and
+/// the rest of `build_open_flags`); an `access` mode or flags
+/// (`do_faccessat`, :475 and :478); a `readlink` size that is not a
+/// positive `int` (fs/stat.c:571); a negative `truncate` length
+/// (`do_sys_truncate`); an unknown flag of `unlinkat`, `fchmodat2`,
+/// `fchownat`, `linkat` or `newfstatat` (fs/namei.c, fs/open.c, and
+/// `vfs_statx`, fs/stat.c:348). `None` where the call goes on to its walk.
+/// For a call whose walk Detcore decides before the backend sees the call
+/// (package K slice K10), so that its walk's error does not come first.
+pub(super) fn arguments_refused_before_the_walk<M: MemoryAccess>(
+    memory: &M,
+    sysno: Sysno,
+    values: &[usize; 6],
+) -> Option<Result<i64, Errno>> {
+    if let Some(answer) = linux_answer_before_the_walk(memory, sysno, values) {
+        return Some(answer);
+    }
+    let flag = |index: usize| values[index] as i32;
+    let access = |mode: usize, flags: i32| {
+        mode as i32 & !(libc::S_IRWXO as i32) != 0
+            || flags & !(libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) != 0
+    };
+    let refused = match sysno {
+        #[cfg(target_arch = "x86_64")]
+        Sysno::open => {
+            return super::rendered_procfs::open_flags_refused(
+                nix::fcntl::OFlag::from_bits_retain(flag(1)),
+            )
+            .map(Err);
+        }
+        Sysno::openat => {
+            return super::rendered_procfs::open_flags_refused(
+                nix::fcntl::OFlag::from_bits_retain(flag(2)),
+            )
+            .map(Err);
+        }
+        #[cfg(target_arch = "x86_64")]
+        Sysno::access => access(values[1], 0),
+        Sysno::faccessat => access(values[2], 0),
+        Sysno::faccessat2 => access(values[2], flag(3)),
+        #[cfg(target_arch = "x86_64")]
+        Sysno::readlink => flag(2) <= 0,
+        Sysno::readlinkat => flag(3) <= 0,
+        Sysno::truncate => (values[1] as i64) < 0,
+        Sysno::unlinkat => flag(2) & !libc::AT_REMOVEDIR != 0,
+        Sysno::fchmodat2 => flag(3) & !(libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) != 0,
+        Sysno::fchownat => flag(4) & !(libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) != 0,
+        Sysno::linkat => flag(4) & !(libc::AT_SYMLINK_FOLLOW | libc::AT_EMPTY_PATH) != 0,
+        Sysno::newfstatat => {
+            flag(3)
+                & !(libc::AT_SYMLINK_NOFOLLOW
+                    | libc::AT_NO_AUTOMOUNT
+                    | libc::AT_EMPTY_PATH
+                    | libc::AT_STATX_SYNC_TYPE)
+                != 0
+        }
+        _ => false,
+    };
+    refused.then_some(Err(Errno::EINVAL))
+}
+
 /// The call the kernel beneath is given for the call `sysno`, with argument
 /// `values` and its path at argument `path` (which is then respelled): the
 /// call itself, but for `utime` and `utimes`, which a backend need not
@@ -1608,5 +1673,63 @@ mod tests {
                 "{sysno}"
             );
         }
+        // Where Detcore decides the walk itself (package K slice K10), it
+        // checks those arguments too, so that its walk's error does not come
+        // first: each refusal, then the same call with valid arguments.
+        let call = |sysno: Sysno, values: [usize; 6]| {
+            arguments_refused_before_the_walk(&memory, sysno, &values)
+        };
+        let creat_directory = (libc::O_CREAT | libc::O_DIRECTORY) as usize;
+        let refused = Some(Err(Errno::EINVAL));
+        for (sysno, bad, good) in [
+            (
+                Sysno::openat,
+                [0, 0, creat_directory, 0, 0, 0],
+                [0, 0, 0, 0, 0, 0],
+            ),
+            (
+                Sysno::openat,
+                [0, 0, libc::O_TMPFILE as usize, 0, 0, 0],
+                [0, 0, (libc::O_TMPFILE | libc::O_RDWR) as usize, 0, 0, 0],
+            ),
+            (Sysno::faccessat, [0, 0, 0o100, 0, 0, 0], [0, 0, 0, 0, 0, 0]),
+            (
+                Sysno::faccessat2,
+                [0, 0, 4, 0x4000_0000, 0, 0],
+                [0, 0, 4, libc::AT_EACCESS as usize, 0, 0],
+            ),
+            (
+                Sysno::newfstatat,
+                [0, 0, 0, 0x4000_0000, 0, 0],
+                [0, 0, 0, libc::AT_SYMLINK_NOFOLLOW as usize, 0, 0],
+            ),
+            (Sysno::readlinkat, [0, 0, 0, 0, 0, 0], [0, 0, 0, 1, 0, 0]),
+            (
+                Sysno::truncate,
+                [0, usize::MAX, 0, 0, 0, 0],
+                [0, 1, 0, 0, 0, 0],
+            ),
+            (
+                Sysno::unlinkat,
+                [0, 0, 1, 0, 0, 0],
+                [0, 0, libc::AT_REMOVEDIR as usize, 0, 0, 0],
+            ),
+            (Sysno::fchownat, [0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 0]),
+            (
+                Sysno::linkat,
+                [0, 0, 0, 0, 1, 0],
+                [0, 0, 0, 0, libc::AT_SYMLINK_FOLLOW as usize, 0],
+            ),
+            (Sysno::fchmodat2, [0, 0, 0, 1, 0, 0], [0, 0, 0, 0, 0, 0]),
+            (
+                Sysno::statx,
+                [0, 0, 0, 0x8000_0000, 0, 0],
+                [0, 0, 0, 0x7ff, 0, 0],
+            ),
+        ] {
+            assert_eq!(call(sysno, bad), refused, "{sysno} {bad:?}");
+            assert_eq!(call(sysno, good), None, "{sysno} {good:?}");
+        }
+        assert_eq!(call(Sysno::mkdirat, [usize::MAX; 6]), None);
     }
 }

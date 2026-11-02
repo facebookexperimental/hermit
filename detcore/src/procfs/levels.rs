@@ -157,6 +157,159 @@ const PROCESS_UNDECIDED_BELOW: &[&str] = &["cwd", "exe", "fd", "fdinfo", "net", 
 ///   yet (https://github.com/rrnewton/hermit/issues/4263).
 const PROCESS_KERNEL: &[&str] = &["gid_map", "mem", "setgroups", "uid_map"];
 
+/// The names of a process's directory in Linux's order, `tgid_base_stuff`
+/// (fs/proc/base.c:3314-3426 at v6.17), with every configuration's entries:
+/// `proc_pident_readdir` emits the table's entries in this order
+/// (fs/proc/base.c:2738-2760), so a listing of fewer names keeps it.
+const PROCESS_ORDER: &[&str] = &[
+    "task",
+    "fd",
+    "map_files",
+    "fdinfo",
+    "ns",
+    "net",
+    "environ",
+    "auxv",
+    "status",
+    "personality",
+    "limits",
+    "sched",
+    "autogroup",
+    "timens_offsets",
+    "comm",
+    "syscall",
+    "cmdline",
+    "stat",
+    "statm",
+    "maps",
+    "numa_maps",
+    "mem",
+    "cwd",
+    "root",
+    "exe",
+    "mounts",
+    "mountinfo",
+    "mountstats",
+    "clear_refs",
+    "smaps",
+    "smaps_rollup",
+    "pagemap",
+    "attr",
+    "wchan",
+    "stack",
+    "schedstat",
+    "latency",
+    "cpuset",
+    "cgroup",
+    "cpu_resctrl_groups",
+    "oom_score",
+    "oom_adj",
+    "oom_score_adj",
+    "loginuid",
+    "sessionid",
+    "make-it-fail",
+    "fail-nth",
+    "coredump_filter",
+    "io",
+    "uid_map",
+    "gid_map",
+    "projid_map",
+    "setgroups",
+    "timers",
+    "timerslack_ns",
+    "patch_state",
+    "stack_depth",
+    "arch_status",
+    "seccomp_cache",
+    "ksm_merging_pages",
+    "ksm_stat",
+];
+
+/// The same for a thread's directory, `tid_base_stuff` (fs/proc/base.c:
+/// 3664-3762 at v6.17), which has no `task`, `map_files`, `autogroup`,
+/// `timens_offsets`, `mountstats`, `coredump_filter`, `timers`,
+/// `timerslack_ns` or `stack_depth`, and has `children`.
+const THREAD_ORDER: &[&str] = &[
+    "fd",
+    "fdinfo",
+    "ns",
+    "net",
+    "environ",
+    "auxv",
+    "status",
+    "personality",
+    "limits",
+    "sched",
+    "comm",
+    "syscall",
+    "cmdline",
+    "stat",
+    "statm",
+    "maps",
+    "children",
+    "numa_maps",
+    "mem",
+    "cwd",
+    "root",
+    "exe",
+    "mounts",
+    "mountinfo",
+    "clear_refs",
+    "smaps",
+    "smaps_rollup",
+    "pagemap",
+    "attr",
+    "wchan",
+    "stack",
+    "schedstat",
+    "latency",
+    "cpuset",
+    "cgroup",
+    "cpu_resctrl_groups",
+    "oom_score",
+    "oom_adj",
+    "oom_score_adj",
+    "loginuid",
+    "sessionid",
+    "make-it-fail",
+    "fail-nth",
+    "io",
+    "uid_map",
+    "gid_map",
+    "projid_map",
+    "setgroups",
+    "patch_state",
+    "arch_status",
+    "seccomp_cache",
+    "ksm_merging_pages",
+    "ksm_stat",
+];
+
+/// Where Linux lists `name` in a process's directory, or a thread's
+/// (`thread`): its index in [`PROCESS_ORDER`] or [`THREAD_ORDER`], `None` for
+/// a name Linux's table does not have.
+pub(crate) fn process_entry_rank(thread: bool, name: &[u8]) -> Option<usize> {
+    let order = if thread { THREAD_ORDER } else { PROCESS_ORDER };
+    order.iter().position(|entry| entry.as_bytes() == name)
+}
+
+/// Whether the entry `name` of a thread's directory is, for its process's
+/// thread group leader, the file of that name in the process's directory: an
+/// entry of both tables ([`PROCESS_ORDER`], [`THREAD_ORDER`]) whose answer
+/// does not depend on the table it was reached through, which is every entry
+/// both tables have but `stat` and `io`, which add up the whole thread group
+/// in the process's directory (`proc_tgid_stat`, `proc_tgid_io_accounting`
+/// against `proc_tid_stat`, `proc_tid_io_accounting`, fs/proc/base.c at
+/// v6.17), and the directories (`fd`, `fdinfo`, `ns`, `net`, `attr`), whose
+/// entries are their own matter.
+pub(crate) fn leader_thread_file_is_process_file(name: &[u8]) -> bool {
+    !matches!(
+        name,
+        b"stat" | b"io" | b"fd" | b"fdinfo" | b"ns" | b"net" | b"attr"
+    ) && process_entry_rank(false, name).is_some()
+        && process_entry_rank(true, name).is_some()
+}
+
 /// What the table says about a path under `/proc`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProcfsName {
@@ -307,13 +460,15 @@ pub(crate) fn system_entries(names: &[&[u8]], level: ProcLevel) -> Option<Vec<(V
 /// `level`, each with its `d_type`: the level's names and the kernel's
 /// ([`PROCESS_KERNEL`]), less `task` and `timerslack_ns` in a thread's
 /// directory and `children` in a process's, as on Linux
-/// (`tgid_base_stuff`, `tid_base_stuff`).
+/// (`tgid_base_stuff`, `tid_base_stuff`), in Linux's order
+/// ([`process_entry_rank`]).
 pub(crate) fn process_entries(thread: bool, level: ProcLevel) -> Vec<(&'static str, u8)> {
     let mut names: Vec<&'static str> = PROCESS_MINIMAL.to_vec();
     if level >= ProcLevel::Standard {
         names.extend_from_slice(PROCESS_STANDARD);
     }
     names.extend_from_slice(PROCESS_KERNEL);
+    names.sort_by_key(|name| process_entry_rank(thread, name.as_bytes()).unwrap_or(usize::MAX));
     names
         .into_iter()
         .filter(|name| match *name {
@@ -495,5 +650,94 @@ mod tests {
         assert!(!absent_entry(Path::new("/proc/42/fd"), b"3", level));
         assert!(!absent_entry(Path::new("/tmp"), b"kallsyms", level));
         assert!(absent_entry(proc, b"\xff", level));
+    }
+
+    /// A process's and a thread's directory list their names in Linux's
+    /// order (`tgid_base_stuff`, `tid_base_stuff`; package K slice K10).
+    #[test]
+    fn process_entries_keep_linuxs_order() {
+        let names = |thread| {
+            process_entries(thread, ProcLevel::Minimal)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(false),
+            [
+                "task",
+                "fd",
+                "fdinfo",
+                "ns",
+                "net",
+                "environ",
+                "auxv",
+                "status",
+                "comm",
+                "cmdline",
+                "stat",
+                "statm",
+                "maps",
+                "mem",
+                "cwd",
+                "root",
+                "exe",
+                "mounts",
+                "mountinfo",
+                "smaps",
+                "cgroup",
+                "uid_map",
+                "gid_map",
+                "setgroups",
+            ]
+        );
+        assert_eq!(names(true)[..3], ["fd", "fdinfo", "ns"]);
+        assert!(!names(true).contains(&"task"));
+        for thread in [false, true] {
+            let ranks = process_entries(thread, ProcLevel::Standard)
+                .into_iter()
+                .map(|(name, _)| process_entry_rank(thread, name.as_bytes()))
+                .collect::<Vec<_>>();
+            assert!(ranks.iter().all(Option::is_some), "{ranks:?}");
+            assert!(ranks.windows(2).all(|pair| pair[0] < pair[1]), "{ranks:?}");
+        }
+        assert_eq!(process_entry_rank(false, b"task"), Some(0));
+        assert_eq!(process_entry_rank(true, b"task"), None);
+        assert_eq!(process_entry_rank(false, b"children"), None);
+        assert_eq!(process_entry_rank(true, b"children"), Some(16));
+    }
+
+    /// A leader's thread file is its process's file of that name, except
+    /// `stat` and `io` and the directories, and the names only one table
+    /// has.
+    #[test]
+    fn a_leaders_thread_files_are_its_processs_but_stat_and_io() {
+        for name in [
+            "status", "maps", "comm", "environ", "cmdline", "mounts", "cgroup",
+        ] {
+            assert!(
+                leader_thread_file_is_process_file(name.as_bytes()),
+                "{name}"
+            );
+        }
+        for name in [
+            "stat",
+            "io",
+            "fd",
+            "fdinfo",
+            "ns",
+            "net",
+            "attr",
+            "task",
+            "children",
+            "timerslack_ns",
+            "mountstats",
+            "nothing",
+        ] {
+            assert!(
+                !leader_thread_file_is_process_file(name.as_bytes()),
+                "{name}"
+            );
+        }
     }
 }

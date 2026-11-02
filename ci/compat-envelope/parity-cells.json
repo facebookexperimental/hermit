@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 3115,
-      "applicable": 2266,
-      "selectable": 1775,
+      "applicable": 2269,
+      "selectable": 1778,
       "population": 3050,
-      "population_candidate_selected": 1775,
+      "population_candidate_selected": 1778,
       "population_candidate_not_selected": 475,
-      "population_candidate_disabled": 800
+      "population_candidate_disabled": 797
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 623,
-        "applicable": 600,
-        "selectable": 591,
+        "applicable": 603,
+        "selectable": 594,
         "population": 610,
-        "population_candidate_selected": 591,
+        "population_candidate_selected": 594,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 16
+        "population_candidate_disabled": 13
       },
       "liteinst": {
         "cells": 623,
@@ -962,7 +962,7 @@
     {"test_id":"c-programs/proc-fd-directory","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: The backend runtime's own descriptors are in the guest's descriptor table and no provider fact names them, so the directory stays the kernel's listing on this backend (package K slice F1's capability-keyed residual)"},
     {"test_id":"c-programs/proc-fd-link-aliases","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/proc-fd-link-aliases","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/proc-fd-link-aliases","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM gap (https://github.com/rrnewton/hermit/issues/5039): KVM's own /proc answers EACCES for readlink of /proc/self/fd/../fd/3, which Linux resolves lexically, so the guest exits 1 (`lexical: Permission denied`) in 3 of 3 KVM verify runs at Hermit 26eb116d; the four preceding readlink calls succeed"},
+    {"test_id":"c-programs/proc-fd-link-aliases","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/proc-fd-link-aliases","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/proc-fd-link-aliases","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"c-programs/proc-fdinfo","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -1522,7 +1522,7 @@
     {"test_id":"c-programs/thp-disable","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"c-programs/thread-self-procfs-handoff","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/thread-self-procfs-handoff","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
-    {"test_id":"c-programs/thread-self-procfs-handoff","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM gap (https://github.com/rrnewton/hermit/issues/5039): KVM's own /proc answers EACCES for /proc/thread-self/status, which Linux and ptrace open, so the guest exits 1 in 3 of 3 KVM verify runs at Hermit 26eb116d"},
+    {"test_id":"c-programs/thread-self-procfs-handoff","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/thread-self-procfs-handoff","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
     {"test_id":"c-programs/thread-self-procfs-handoff","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
     {"test_id":"c-programs/thread-sync-determinism","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
@@ -2342,7 +2342,7 @@
     {"test_id":"compat/printf","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/ps","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/ps","backend":"in-guest-trap","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"compat/ps","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: ps opens /proc/self as an O_PATH directory, which KVM's /proc answers with EACCES (https://github.com/rrnewton/hermit/issues/5039), so ps exits 47 (`Error, do this: mount -t proc proc /proc`) in 3 of 3 KVM verify runs at Hermit 26eb116d; listing other processes also needs https://github.com/rrnewton/hermit/issues/4564"},
+    {"test_id":"compat/ps","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/ps","backend":"liteinst","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/ps","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/ptx","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

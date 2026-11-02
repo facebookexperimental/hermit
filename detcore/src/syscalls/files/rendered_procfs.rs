@@ -913,7 +913,7 @@ pub(super) fn walk_lock_or_fdinfo_alias(path: &Path) -> LockOrFdinfoAlias {
         {
             continue;
         }
-        if let Some(tasks) = past_the_link_limit(&components[..index]) {
+        if let Some(tasks) = past_the_link_limit(&components[..index], 0) {
             return LockOrFdinfoAlias::LinkLimit { file, tasks };
         }
         return if index + 1 == components.len() && !trailing {
@@ -929,14 +929,18 @@ pub(super) fn walk_lock_or_fdinfo_alias(path: &Path) -> LockOrFdinfoAlias {
 /// and `.` ones, whose `..` all resolve over procfs's own directories) follows
 /// the `self` or `thread-self` link more than `MAXSYMLINKS` times: each one it
 /// looks up in `/proc` is one link (`proc_self_get_link`,
-/// `proc_thread_self_get_link`), counted in lookup order. `Some` of the tasks
-/// named before the first link past the limit, which the walk looks up first
-/// (and fails with ENOENT at the first that does not exist); `None` within
-/// the limit.
-fn past_the_link_limit(
+/// `proc_thread_self_get_link`), counted in lookup order, after the
+/// `followed` links the same lookup followed to reach the first of
+/// `components` (a respelled path's descriptor link and the selector links
+/// before it, `Detcore::decided_path`), which count against the same limit
+/// (`pick_link`'s `total_link_count`). `Some` of the tasks named before the
+/// first link past the limit, which the walk looks up first (and fails with
+/// ENOENT at the first that does not exist); `None` within the limit.
+pub(super) fn past_the_link_limit(
     components: &[&[u8]],
+    followed: usize,
 ) -> Option<Vec<super::descriptor_directory::NamedTask>> {
-    let mut links = 0;
+    let mut links = followed;
     let mut prefix = Vec::new();
     let mut passed_dotdot = false;
     for component in components {
@@ -9571,5 +9575,28 @@ mod tests {
                 "{path}"
             );
         }
+        // The links the lookup followed before these components (a respelled
+        // path's descriptor link and the selector link before it,
+        // `Detcore::decided_path`) count against the same limit: after two,
+        // 38 `self` links resolve; after three, the 38th is the 41st link.
+        let walked = format!("/proc/{}self", repeated(37));
+        let components = walked
+            .split('/')
+            .filter(|name| !name.is_empty())
+            .map(str::as_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(past_the_link_limit(&components, 0), None);
+        assert_eq!(past_the_link_limit(&components, 2), None);
+        assert_eq!(past_the_link_limit(&components, 3), Some(vec![]));
+        let walked = format!("/proc/7/../{}self", repeated(37));
+        let components = walked
+            .split('/')
+            .filter(|name| !name.is_empty())
+            .map(str::as_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            past_the_link_limit(&components, 3),
+            Some(vec![named(Some(7), None)])
+        );
     }
 }

@@ -235,7 +235,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// false, that function answers `Ok(None)` at once, so a caller that asks
     /// first may skip it.
     pub(crate) fn may_translate_procfs_call<G: Guest<Self>>(guest: &G, call: &Syscall) -> bool {
-        (Self::translates_procfs_numbers(guest) && path_operands(call.number()).is_some())
+        ((Self::translates_procfs_numbers(guest) || Self::serves_task_directories(guest))
+            && path_operands(call.number()).is_some())
             || Self::may_respell_below_descriptor_directory(guest, call)
     }
 
@@ -266,6 +267,36 @@ impl<T: RecordOrReplay> Detcore<T> {
         Self::translated_call_with_scratch(guest, call, true).await
     }
 
+    /// [`Self::own_task_backend_spelling`] of a path operand `bytes` of the
+    /// call `sysno`, with argument `values`, where the walk it decides fails
+    /// (`ENOENT` at a task that does not exist, `ELOOP` past the link limit)
+    /// only after the checks Linux makes of the call's own arguments before
+    /// any walk (`other_process_procfs::arguments_refused_before_the_walk`):
+    /// their refusal comes first, as natively (v6.17: `build_open_flags`,
+    /// `do_faccessat`, `vfs_statx`, `do_statx`); and where those checks
+    /// answer the call without a walk (two `UTIME_OMIT` times), the operand
+    /// is left as it is spelled, for the backend to answer the call as
+    /// before (package K slice K10).
+    async fn own_task_operand_spelling<G: Guest<Self>>(
+        guest: &mut G,
+        sysno: reverie::syscalls::Sysno,
+        values: &[usize; 6],
+        bytes: &[u8],
+    ) -> Result<Option<Vec<u8>>, Errno> {
+        match Self::own_task_backend_spelling(guest, bytes).await {
+            Err(walk) => match super::other_process_procfs::arguments_refused_before_the_walk(
+                &guest.memory(),
+                sysno,
+                values,
+            ) {
+                Some(Err(refused)) => Err(refused),
+                Some(Ok(_)) => Ok(None),
+                None => Err(walk),
+            },
+            spelled => spelled,
+        }
+    }
+
     async fn translated_call_with_scratch<G: Guest<Self>>(
         guest: &mut G,
         call: &Syscall,
@@ -278,6 +309,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut values = [
             args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
         ];
+        // Where Detcore serves the caller's own task directories (KVM), each
+        // absolute path the backend is given is spelled as its executor's
+        // `/proc` answers it (`Detcore::own_task_backend_spelling`).
+        let own_tasks = Self::serves_task_directories(guest);
         if Self::may_respell_below_descriptor_directory(guest, call) {
             // Boxed: the respelling's future is large, and every handler that
             // injects a path call through this one would carry it inline,
@@ -285,18 +320,59 @@ impl<T: RecordOrReplay> Detcore<T> {
             let respelled =
                 Box::pin(Self::respelled_below_descriptor_directory(guest, call)).await?;
             if !respelled.is_empty() {
-                let staged = respelled
-                    .into_iter()
-                    .map(|operand| {
-                        if let Some(dirfd) = operand.dirfd {
-                            values[dirfd] = libc::AT_FDCWD as isize as usize;
-                        }
-                        let mut bytes = operand.bytes;
-                        bytes.push(0);
-                        (operand.path, bytes)
-                    })
-                    .collect();
+                let mut staged = Vec::with_capacity(respelled.len());
+                for operand in respelled {
+                    if let Some(dirfd) = operand.dirfd {
+                        values[dirfd] = libc::AT_FDCWD as isize as usize;
+                    }
+                    let mut bytes = operand.bytes;
+                    if own_tasks
+                        && bytes.starts_with(b"/")
+                        && let Some(spelled) = Box::pin(Self::own_task_operand_spelling(
+                            guest, sysno, &values, &bytes,
+                        ))
+                        .await?
+                    {
+                        bytes = spelled;
+                    }
+                    bytes.push(0);
+                    staged.push((operand.path, bytes));
+                }
                 return Self::stage_translated(guest, sysno, values, staged, allow_scratch)
+                    .await
+                    .map(Some);
+            }
+        }
+        if own_tasks && let Some(operands) = path_operands(sysno) {
+            let mut respelled = Vec::new();
+            for &(_, argument) in operands {
+                let Some(spelling) = PathPtr::from_ptr(values[argument] as *const libc::c_char)
+                    .and_then(|address| address.read(&guest.memory()).ok())
+                else {
+                    continue;
+                };
+                let spelling = spelling.into_os_string().into_vec();
+                // An absolute path whose first component is `proc`, however
+                // many empty or `.` components come before it.
+                if !spelling.starts_with(b"/")
+                    || spelling
+                        .split(|byte| *byte == b'/')
+                        .find(|component| !component.is_empty() && *component != b".")
+                        != Some(b"proc".as_slice())
+                {
+                    continue;
+                }
+                if let Some(mut spelled) = Box::pin(Self::own_task_operand_spelling(
+                    guest, sysno, &values, &spelling,
+                ))
+                .await?
+                {
+                    spelled.push(0);
+                    respelled.push((argument, spelled));
+                }
+            }
+            if !respelled.is_empty() {
+                return Self::stage_translated(guest, sysno, values, respelled, allow_scratch)
                     .await
                     .map(Some);
             }

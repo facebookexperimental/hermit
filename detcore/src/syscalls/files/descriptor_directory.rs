@@ -135,6 +135,8 @@ use crate::procfs::fd_directory;
 use crate::procfs::fd_directory::DescriptorDirectoryBinding;
 use crate::procfs::fd_directory::DescriptorDirectoryTable;
 use crate::procfs::fd_directory::PlaceholderDirectory;
+use crate::procfs::fd_directory::TaskDirectoryBinding;
+use crate::procfs::fd_directory::TaskDirectoryKind;
 use crate::procfs_inode;
 use crate::procfs_inode::DirectoryInodes;
 use crate::procfs_inode::ProcfsDirectory;
@@ -189,6 +191,16 @@ pub(super) enum OpenedDirectory {
     /// The directory a descriptor link of the caller's (`/proc/self/fd/N`)
     /// reaches: the placeholder directory `N` is.
     Reopened(PlaceholderDirectory),
+    /// One of the caller's own task directories, its process's, one of its
+    /// process's threads' (by its number) or its process's `task` (package K
+    /// slice K10), by any spelling that reaches it
+    /// ([`Detcore::own_task_directory`]).
+    Task(TaskDirectoryKind, i32),
+    /// `/proc/self`, or `/proc/thread-self` (`thread`), itself, opened
+    /// `O_PATH` without following it: Linux opens the symbolic link, which no
+    /// backend Detcore serves the task directories on has, so the open is
+    /// refused by name ([`Detcore::open_placeholder`]).
+    SelectorLink { thread: bool },
 }
 
 /// The calls whose path operands are each looked up relative to a directory
@@ -509,6 +521,131 @@ pub(super) fn resolved_procfs_dotdot(path: &Path) -> Option<(PathBuf, Vec<NamedT
     Some((PathBuf::from(std::ffi::OsString::from_vec(out)), tasks))
 }
 
+/// The absolute guest path `path`, with each `..` resolved as Linux's walk
+/// resolves it over procfs's own directories ([`resolved_procfs_dotdot`]),
+/// where what it reaches is in the caller's own task tree: `/proc/self`,
+/// `/proc/thread-self` or `/proc/<pid>` and below, for a caller whose pid is
+/// `pid`. `Some` of the resolved path, with a final `/` where `path` ends in
+/// one or in `/.` (Linux then requires a directory, and follows a last
+/// link), or in `..` (which reaches a directory, never a link: the resolved
+/// `/proc/self` of `/proc/self/fd/..` is the directory, not the link), and
+/// the tasks the walk names on the way ([`NamedTask`]), each of which must
+/// exist for the path to name what this resolves it to. `None` for a path
+/// without `..`, one that only the kernel's walk resolves, and one that
+/// leaves the caller's tree (package K slice K10).
+pub(super) fn own_tree_dotdot(path: &[u8], pid: i32) -> Option<(Vec<u8>, Vec<NamedTask>)> {
+    let (resolved, tasks) = resolved_procfs_dotdot(Path::new(OsStr::from_bytes(path)))?;
+    let mut bytes = resolved.into_os_string().into_vec();
+    let pid = pid.to_string();
+    let mut names = bytes
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty());
+    if names.next() != Some(b"proc".as_slice()) {
+        return None;
+    }
+    match names.next() {
+        Some(b"self" | b"thread-self") => {}
+        Some(name) if name == pid.as_bytes() => {}
+        _ => return None,
+    }
+    let last_dotdot = walked_components(path).last() == Some(&b"..".as_slice());
+    if (path.ends_with(b"/") || path.ends_with(b"/.") || last_dotdot) && !bytes.ends_with(b"/") {
+        bytes.push(b'/');
+    }
+    Some((bytes, tasks))
+}
+
+/// The absolute guest path `path` without its empty and `.` components,
+/// where it is in the caller's own task tree (`/proc/self`,
+/// `/proc/thread-self` or `/proc/<pid>` and below, for a caller whose pid is
+/// `pid`) and has any: such components name nothing on Linux. A final `/` or
+/// `/.` stays a final `/`, as Linux then requires a directory and follows a
+/// final link. `None` for any other path, and for one already without them
+/// (package K slice K10).
+pub(super) fn own_tree_normalized(path: &[u8], pid: i32) -> Option<Vec<u8>> {
+    if !path.starts_with(b"/") {
+        return None;
+    }
+    let names = path
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty() && *component != b".")
+        .collect::<Vec<_>>();
+    let pid = pid.to_string();
+    match names.as_slice() {
+        [b"proc", b"self" | b"thread-self", ..] => {}
+        [b"proc", process, ..] if *process == pid.as_bytes() => {}
+        _ => return None,
+    }
+    let mut normalized = Vec::with_capacity(path.len());
+    for name in names {
+        normalized.push(b'/');
+        normalized.extend_from_slice(name);
+    }
+    if path.ends_with(b"/") || path.ends_with(b"/.") {
+        normalized.push(b'/');
+    }
+    (normalized != path).then_some(normalized)
+}
+
+/// The `/proc/self` or `/proc/thread-self` link whose name is the last
+/// component of the absolute guest path `path`, with each `..` before it
+/// resolved as Linux's walk resolves it over procfs's own directories
+/// ([`resolved_procfs_dotdot`]: `/proc/self/../self` and
+/// `/proc/self/fd/../../self` end at `self`,
+/// `/proc/thread-self/../../../thread-self` at `thread-self`): `Some` of the
+/// link's own spelling and the tasks the walk names on the way, each of which
+/// must exist for the path to reach the link ([`NamedTask`]). Whether a call
+/// follows that last component (a final `/` or `/.` always does) is the
+/// caller's to tell (`files::opens_the_link_itself`). `None` for any other
+/// path (package K slice K10).
+fn selector_link_reached(path: &Path) -> Option<(PathBuf, Vec<NamedTask>)> {
+    // The last component must be the link's own name: a last `..` lands on
+    // a directory (`/proc/self/fd/..` is the process's directory), whatever
+    // spelling it resolves to.
+    let last = *walked_components(path.as_os_str().as_bytes()).last()?;
+    if last != b"self" && last != b"thread-self" {
+        return None;
+    }
+    let (resolved, tasks) =
+        resolved_procfs_dotdot(path).unwrap_or_else(|| (path.to_path_buf(), Vec::new()));
+    super::names_a_selector_link(&resolved)
+        .then(|| (Path::new("/proc").join(OsStr::from_bytes(last)), tasks))
+}
+
+/// Whether the absolute spelling `observed` ends in a name and a `/`: a last
+/// component that is no `.` or `..` (nor the root), followed by slashes. An
+/// open with `O_CREAT` of such a spelling fails with `EISDIR` before the
+/// name is looked up, where it names an existing directory that `O_EXCL`
+/// would refuse with `EEXIST` too (`lookup_fast_for_open`, v6.17
+/// fs/namei.c; a last `.` or `..` is no name, `open_last_lookups`).
+pub(super) fn ends_in_a_name_and_slash(observed: &Path) -> bool {
+    let bytes = observed.as_os_str().as_bytes();
+    bytes.ends_with(b"/")
+        && bytes
+            .split(|byte| *byte == b'/')
+            .rfind(|component| !component.is_empty())
+            .is_some_and(|last| last != b"." && last != b"..")
+}
+
+/// The absolute spelling `bytes` without its last component and the
+/// slashes around it: the directory the walk is in when it reaches that
+/// component (`/proc/self/task` of `/proc/self/task/9/`, `/` of `/proc/`).
+/// `None` for a spelling with no component.
+fn before_the_last_name(bytes: &[u8]) -> Option<&[u8]> {
+    let trimmed = &bytes[..bytes.iter().rposition(|byte| *byte != b'/')? + 1];
+    let parent = &trimmed[..trimmed.iter().rposition(|byte| *byte == b'/')?];
+    Some(if parent.is_empty() { b"/" } else { parent })
+}
+
+/// The components of the absolute path `bytes` that Linux's walk looks up,
+/// without the empty and `.` ones, which name nothing.
+fn walked_components(bytes: &[u8]) -> Vec<&[u8]> {
+    bytes
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty() && *component != b".")
+        .collect()
+}
+
 /// Whether the absolute guest path `path` names `/proc` itself: its
 /// components, with the empty and `.` ones left out, are `proc` alone, or
 /// reach it back through `..` from directories every procfs has
@@ -793,6 +930,419 @@ impl<T: RecordOrReplay> Detcore<T> {
         Self::descriptor_directory_caller(guest).is_some()
     }
 
+    /// Whether Detcore serves the caller's own task directories
+    /// ([`PlaceholderDirectory::Task`], package K slice K10) to the caller
+    /// now: where it serves it placeholder directories
+    /// ([`Self::descriptor_directory_caller`]) and the guest's procfs is not
+    /// the kernel's ([`PlaceholderObject::Placeholder`]: KVM, whose executor
+    /// serves no procfs directory). Where it is (ptrace), the kernel serves
+    /// them, and Detcore lists them from its model
+    /// (`Detcore::modeled_directory_snapshot`), as before.
+    pub(crate) fn serves_task_directories<G: Guest<Self>>(guest: &G) -> bool {
+        Self::descriptor_directory_caller(guest).is_some()
+            && Self::placeholder_object(guest) == PlaceholderObject::Placeholder
+    }
+
+    /// The spelling the backend is given, where Detcore serves the caller's
+    /// own task directories ([`Self::serves_task_directories`], package K
+    /// slice K10), for `bytes`, an absolute path an injection carries: `..`
+    /// resolved within the caller's own task tree ([`own_tree_dotdot`]), then
+    /// a file of its thread group leader's own directory spelled as its
+    /// process's ([`fd_directory::leader_process_spelling`]), which is the
+    /// only spelling of it the KVM executor's `/proc` answers, and otherwise
+    /// a spelling in that tree without its empty and `.` components
+    /// ([`own_tree_normalized`]), which name nothing on Linux and which the
+    /// executor does not take (`//proc/self`). `Ok(None)` where none of
+    /// these applies, and `Err` where Linux's walk of `bytes` fails first:
+    /// `ENOENT` at a task it names on the way that does not exist, `ELOOP`
+    /// once it follows more `self` and `thread-self` links than
+    /// `MAXSYMLINKS` (`rendered_procfs::past_the_link_limit`).
+    pub(crate) async fn own_task_backend_spelling<G: Guest<Self>>(
+        guest: &mut G,
+        bytes: &[u8],
+    ) -> Result<Option<Vec<u8>>, Errno> {
+        let Some(own) = Self::descriptor_directory_caller(guest) else {
+            return Ok(None);
+        };
+        let resolved = Self::own_tree_resolved(guest, bytes, true).await?;
+        let path = resolved.as_deref().unwrap_or(bytes);
+        Ok(fd_directory::leader_process_spelling(path, own)
+            .or(resolved)
+            .or_else(|| own_tree_normalized(bytes, own.0)))
+    }
+
+    /// The absolute guest path `bytes` with each `..` resolved within the
+    /// caller's own task tree ([`own_tree_dotdot`]), where Detcore serves
+    /// the caller's own task directories, after Linux's walk of it succeeds
+    /// ([`Self::procfs_walk`], the last component's link counted where the
+    /// call follows it, `follows_last`): `Ok(Some(resolved))`, `Ok(None)` for
+    /// a path `own_tree_dotdot` does not resolve, `Err` where the walk fails
+    /// first (package K slice K10).
+    pub(crate) async fn own_tree_resolved<G: Guest<Self>>(
+        guest: &mut G,
+        bytes: &[u8],
+        follows_last: bool,
+    ) -> Result<Option<Vec<u8>>, Errno> {
+        let Some(own) = Self::descriptor_directory_caller(guest) else {
+            return Ok(None);
+        };
+        let Some((resolved, tasks)) = own_tree_dotdot(bytes, own.0) else {
+            return Ok(None);
+        };
+        Self::procfs_walk(guest, bytes, &tasks, follows_last, 0).await?;
+        Ok(Some(resolved))
+    }
+
+    /// Whether Linux's walk of the absolute guest path `bytes`, whose `..`
+    /// all resolve over procfs's own directories, gets past its components
+    /// to the last: `ELOOP` once it would follow more `self` and
+    /// `thread-self` links than `MAXSYMLINKS`, after the `followed` links
+    /// the lookup followed before `bytes` (a respelled path's, from
+    /// [`Self::decided_path`]; 0 for the guest's own spelling), the last
+    /// component's counted only where the call follows it (`follows_last`;
+    /// `rendered_procfs::past_the_link_limit`), unless a task named before
+    /// the first link past the limit does not exist (`ENOENT` there, which
+    /// the walk meets first); then `ENOENT` at the first of `tasks`, the
+    /// tasks the path names on the way, that does not exist
+    /// ([`Self::named_tasks_exist`]).
+    async fn procfs_walk<G: Guest<Self>>(
+        guest: &mut G,
+        bytes: &[u8],
+        tasks: &[NamedTask],
+        follows_last: bool,
+        followed: usize,
+    ) -> Result<(), Errno> {
+        let components = walked_components(bytes);
+        let walked = if follows_last {
+            &components[..]
+        } else {
+            &components[..components.len().saturating_sub(1)]
+        };
+        if let Some(before) = super::rendered_procfs::past_the_link_limit(walked, followed) {
+            return Err(if Self::named_tasks_exist(guest, &before).await {
+                Errno::ELOOP
+            } else {
+                Errno::ENOENT
+            });
+        }
+        if !Self::named_tasks_exist(guest, tasks).await {
+            return Err(Errno::ENOENT);
+        }
+        Ok(())
+    }
+
+    /// The caller's `/proc/self` or `/proc/thread-self` link that the
+    /// absolute guest spelling `spelling` reaches as its last component
+    /// ([`selector_link_reached`], `..` resolved), where Detcore serves the
+    /// caller's own task directories and the call does not follow that
+    /// component (the caller tells, `files::opens_the_link_itself` on the
+    /// guest's own spelling): `Some(Ok(link))`, the link's own spelling, or
+    /// `Some(Err(errno))` where Linux's walk to it fails first
+    /// ([`Self::procfs_walk`], the link itself not followed, after the
+    /// `followed` links of a respelled path). `None` for any other spelling,
+    /// which is no link of these (package K slice K10).
+    async fn own_selector_link<G: Guest<Self>>(
+        guest: &mut G,
+        spelling: &Path,
+        followed: usize,
+    ) -> Option<Result<PathBuf, Errno>> {
+        if !Self::serves_task_directories(guest) {
+            return None;
+        }
+        let (link, tasks) = selector_link_reached(spelling)?;
+        Some(
+            Self::procfs_walk(
+                guest,
+                spelling.as_os_str().as_bytes(),
+                &tasks,
+                false,
+                followed,
+            )
+            .await
+            .map(|()| link),
+        )
+    }
+
+    /// The named refusal (ARCHITECTURE.md rule 6) of a call that looks up
+    /// the `status` of a thread of the caller's process other than its thread
+    /// group leader, through the caller's own task tree
+    /// (`/proc/thread-self/status` from such a thread,
+    /// `/proc/self/task/<tid>/status`), where Detcore serves the caller's own
+    /// task directories ([`Self::serves_task_directories`], package K slice
+    /// K10): Detcore renders no task's `status`, and the KVM executor's
+    /// `/proc` renders its process's alone, which on Linux is the leader's,
+    /// not the thread's (`Pid`, `Name`, its signal and context-switch lines,
+    /// `proc_pid_status`). The leader's own is its process's, which the
+    /// backend answers ([`Self::own_task_backend_spelling`]). The call's path
+    /// is classified as the backend would be given it, by that same
+    /// respelling (`..` resolved, empty and `.` components left out:
+    /// `/proc/thread-self/./status`, `/proc/self/./task/<tid>/status`), so
+    /// that no spelling of the file reaches the backend unrefused. Left to the
+    /// lookup: a path whose walk fails first (`ENOENT` at a thread that does
+    /// not exist, `ELOOP` past the link limit), and one with a final `/` or
+    /// `/.`, which asks for a directory and fails at the file with `ENOTDIR`
+    /// on Linux and on the backend alike.
+    pub(crate) async fn refuse_unrendered_thread_status<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+    ) -> Option<Result<i64, Error>> {
+        if !Self::serves_task_directories(guest) {
+            return None;
+        }
+        let own = Self::descriptor_directory_caller(guest)?;
+        let (sysno, args) = (*call).into_parts();
+        let operands = super::procfs_levels::path_operands(sysno)?;
+        let values = [
+            args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
+        ];
+        for &(dirfd, argument) in operands {
+            let Some(spelling): Option<PathBuf> =
+                PathPtr::from_ptr(values[argument] as *const libc::c_char)
+                    .and_then(|address| address.read(&guest.memory()).ok())
+            else {
+                continue;
+            };
+            if spelling.as_os_str().is_empty() {
+                continue;
+            }
+            let dirfd = dirfd.map_or(libc::AT_FDCWD, |position| values[position] as i32);
+            Self::prepare_guest_cwd(guest, dirfd, &spelling).await;
+            let Some(observed) = Self::observed_path(guest, dirfd, &spelling)
+                .ok()
+                .filter(|observed| observed.is_absolute())
+            else {
+                continue;
+            };
+            let observed = if Self::starts_at_a_recorded_link(guest, dirfd, &spelling) {
+                observed
+            } else {
+                Self::decided_path(guest, &observed).map_or(observed, |(decided, _)| decided)
+            };
+            // As the backend would be given it: a walk that fails first is
+            // the lookup's to answer.
+            let observed_bytes = observed.as_os_str().as_bytes();
+            let named = match Self::own_task_backend_spelling(guest, observed_bytes).await {
+                Ok(spelled) => spelled.unwrap_or_else(|| observed_bytes.to_vec()),
+                Err(_) => continue,
+            };
+            if named.ends_with(b"/") || named.ends_with(b"/.") {
+                continue;
+            }
+            let names = walked_components(&named)
+                .into_iter()
+                .map(<[u8]>::to_vec)
+                .collect::<Vec<_>>();
+            let pid = own.0.to_string().into_bytes();
+            let number = |name: &[u8]| -> Option<i32> {
+                (name.first().is_some_and(|byte| *byte != b'0')
+                    && name.iter().all(u8::is_ascii_digit))
+                .then(|| std::str::from_utf8(name).ok()?.parse().ok())
+                .flatten()
+            };
+            let thread = match names
+                .iter()
+                .map(Vec::as_slice)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [b"proc", b"thread-self", b"status"] if own.1 != own.0 => own.1,
+                [b"proc", process, b"task", thread, b"status"]
+                    if (*process == b"self" || *process == pid.as_slice())
+                        && number(thread).is_some_and(|thread| thread != own.0) =>
+                {
+                    number(thread).unwrap_or_default()
+                }
+                _ => continue,
+            };
+            // The tasks named on the way exist (the respelling checked them).
+            let status_thread = NamedTask {
+                process: None,
+                thread: Some(thread),
+            };
+            if !Self::named_tasks_exist(guest, &[status_thread]).await {
+                continue;
+            }
+            return Some(
+                self.refuse_placeholder_call(
+                    guest,
+                    sysno,
+                    Errno::EACCES,
+                    &format!(
+                        "{}, the status of thread {thread} of this process, which is not its \
+                         thread group leader, cannot be served: Detcore renders no task's status \
+                         on this backend, and its procfs renders the process's alone, which \
+                         Linux gives the leader (https://github.com/rrnewton/hermit/issues/5039)",
+                        observed.display()
+                    ),
+                )
+                .await,
+            );
+        }
+        None
+    }
+
+    /// The caller's own task directory the absolute guest spelling
+    /// `spelling` names ([`fd_directory::classify_task_directory`]), where
+    /// Detcore serves them ([`Self::serves_task_directories`]), with each `..`
+    /// resolved as Linux's walk resolves it over procfs's own directories
+    /// ([`resolved_procfs_dotdot`]): `Some(Ok(kind))`, or `Some(Err(errno))`
+    /// where Linux's walk of the spelling stops first: `ENOENT` at a task it
+    /// names on the way that does not exist ([`Self::named_tasks_exist`]),
+    /// and `ELOOP` once it would follow more `self` and `thread-self` links
+    /// than `MAXSYMLINKS`, the final one included, which an open or stat that
+    /// names the directory follows, after the `followed` links of a respelled
+    /// path ([`Self::decided_path`]; `rendered_procfs::past_the_link_limit`).
+    /// `None` for any other spelling, which the backend answers, as before.
+    pub(super) async fn own_task_directory<G: Guest<Self>>(
+        guest: &mut G,
+        spelling: &Path,
+        followed: usize,
+    ) -> Option<Result<(TaskDirectoryKind, i32), Errno>> {
+        if !Self::serves_task_directories(guest) {
+            return None;
+        }
+        let own = Self::descriptor_directory_caller(guest)?;
+        let (resolved, mut tasks) = resolved_procfs_dotdot(spelling)
+            .unwrap_or_else(|| (spelling.to_path_buf(), Vec::new()));
+        let (kind, thread) = fd_directory::classify_task_directory(&resolved, own)?;
+        // A thread's directory by its number names a thread of the process
+        // only while one holds that number (`proc_task_lookup`).
+        if kind == TaskDirectoryKind::Thread && thread != own.1 {
+            tasks.push(NamedTask {
+                process: None,
+                thread: Some(thread),
+            });
+        }
+        Some(
+            Self::procfs_walk(
+                guest,
+                spelling.as_os_str().as_bytes(),
+                &tasks,
+                true,
+                followed,
+            )
+            .await
+            .map(|()| (kind, thread)),
+        )
+    }
+
+    /// Whether the absolute guest spelling `bytes` names a directory Detcore
+    /// serves the caller on a placeholder, where it serves the caller's own
+    /// task directories (KVM): `/proc` itself, one of the caller's own
+    /// descriptor directories ([`fd_directory::classify`]) or task
+    /// directories ([`fd_directory::classify_task_directory`]), by the
+    /// spellings Detcore resolves: through the caller's descriptor links to
+    /// placeholder directories ([`Self::decided_path`], whose `..` can reach
+    /// the root directory, which is no link either, and whose links count
+    /// against the walk's limit), `/dev/fd` followed where it is the link to
+    /// `/proc/self/fd` it is on Linux, and with each `..` resolved over
+    /// procfs's own directories ([`resolved_procfs_dotdot`]). A spelling
+    /// that leaves `/proc` on the way (a symbolic link elsewhere,
+    /// `/proc/self/root`) is not one of them. For `readlink`, which fails with `EINVAL`
+    /// for anything that is no link (`do_readlinkat`): `Some(Ok(()))` for
+    /// such a directory, `Some(Err(errno))` where the walk to it fails first
+    /// ([`Self::procfs_walk`]: `ENOENT` at a task named on the way, a thread's
+    /// directory's own task included, that does not exist; `ELOOP` past the
+    /// link limit). `None` for any other spelling (package K slice K10).
+    pub(crate) async fn served_directory_walk<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        bytes: &[u8],
+    ) -> Option<Result<(), Errno>> {
+        if !Self::serves_task_directories(guest) {
+            return None;
+        }
+        let own = Self::descriptor_directory_caller(guest)?;
+        let path = Path::new(OsStr::from_bytes(bytes));
+        if (bytes.ends_with(b"/") || bytes.ends_with(b"/."))
+            && path.components().eq(Path::new("/dev/fd").components())
+            && self
+                .injected_link_target(guest, b"/dev/fd")
+                .await
+                .as_deref()
+                == Some(Path::new("/proc/self/fd"))
+        {
+            return Some(Ok(()));
+        }
+        let (decided, followed) = match Self::decided_path(guest, path) {
+            Ok(decided) => decided,
+            Err(errno) => return Some(Err(errno)),
+        };
+        let through_link = decided.as_path() != path;
+        let (resolved, mut tasks) =
+            resolved_procfs_dotdot(&decided).unwrap_or_else(|| (decided.clone(), Vec::new()));
+        let names = |directory: &str| {
+            resolved.as_os_str().as_bytes().starts_with(b"/")
+                && resolved
+                    .components()
+                    .filter(|component| *component != std::path::Component::CurDir)
+                    .eq(Path::new(directory).components())
+        };
+        let served = names("/proc")
+            || (through_link && names("/"))
+            || fd_directory::classify(&resolved, own).is_some()
+            || match fd_directory::classify_task_directory(&resolved, own) {
+                Some((TaskDirectoryKind::Thread, thread)) if thread != own.1 => {
+                    tasks.push(NamedTask {
+                        process: None,
+                        thread: Some(thread),
+                    });
+                    true
+                }
+                Some(_) => true,
+                None => false,
+            };
+        if !served {
+            return None;
+        }
+        Some(
+            Self::procfs_walk(
+                guest,
+                decided.as_os_str().as_bytes(),
+                &tasks,
+                true,
+                followed,
+            )
+            .await,
+        )
+    }
+
+    /// The answer to an `O_CREAT` open of the absolute guest spelling
+    /// `spelling` of one of the caller's own task directories
+    /// ([`Self::own_task_directory`]'s spellings, whether or not the task
+    /// exists), where it ends in a name and a `/`
+    /// ([`ends_in_a_name_and_slash`]): Linux's walk reaches that last name
+    /// and fails with `EISDIR` before it looks the name up
+    /// (`lookup_fast_for_open`, v6.17 fs/namei.c), so the only earlier
+    /// failure is the walk of the components before it
+    /// ([`Self::procfs_walk`]: `ENOENT` at a task they name that does not
+    /// exist, `ELOOP` past the link limit, after the `followed` links of a
+    /// respelled path). `None` for any other spelling, or where Detcore does
+    /// not serve those directories.
+    async fn own_task_creation_through_slash<G: Guest<Self>>(
+        guest: &mut G,
+        spelling: &Path,
+        followed: usize,
+    ) -> Option<Errno> {
+        if !Self::serves_task_directories(guest) {
+            return None;
+        }
+        let own = Self::descriptor_directory_caller(guest)?;
+        let (resolved, _) = resolved_procfs_dotdot(spelling)
+            .unwrap_or_else(|| (spelling.to_path_buf(), Vec::new()));
+        fd_directory::classify_task_directory(&resolved, own)?;
+        let parent = before_the_last_name(spelling.as_os_str().as_bytes())?;
+        let (_, tasks) = resolved_procfs_dotdot(Path::new(OsStr::from_bytes(parent)))
+            .unwrap_or_else(|| (PathBuf::new(), Vec::new()));
+        Some(
+            Self::procfs_walk(guest, parent, &tasks, true, followed)
+                .await
+                .err()
+                .unwrap_or(Errno::EISDIR),
+        )
+    }
+
     /// The caller's pid and tid as Detcore numbers its tasks, which a
     /// placeholder's binding names its task by, in every state of the caller
     /// (after a `chroot`, in a nested PID namespace): for telling whether a
@@ -865,8 +1415,30 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Linux, or a descriptor link of the caller's to a placeholder. The last
     /// two are symbolic links: an open with `O_NOFOLLOW` that does not follow
     /// them anyway (a trailing `/`) opens the link itself (`O_PATH`) or fails
-    /// with `ELOOP`, which the kernel answers.
+    /// with `ELOOP`, which the kernel answers. Linux refuses the flags
+    /// `build_open_flags` refuses before it looks any name up, so where
+    /// Detcore answers the open at all, those flags are its answer, before
+    /// any the walk would give (v6.17 fs/open.c, `do_sys_openat2`); an open
+    /// Detcore then serves checks the rest (`open_placeholder`).
     pub(super) async fn descriptor_directory_opened<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        observed: &Path,
+        spelling: &Path,
+        flags: OFlag,
+    ) -> Option<Result<OpenedDirectory, Errno>> {
+        let opened = self
+            .descriptor_directory_reached(guest, observed, spelling, flags)
+            .await?;
+        Some(match super::rendered_procfs::open_flags_refused(flags) {
+            Some(errno) => Err(errno),
+            None => opened,
+        })
+    }
+
+    /// [`Self::descriptor_directory_opened`], before the flags
+    /// `build_open_flags` refuses.
+    async fn descriptor_directory_reached<G: Guest<Self>>(
         &self,
         guest: &mut G,
         observed: &Path,
@@ -901,12 +1473,68 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Err(Errno::ENOENT)
             });
         }
+        // `/proc/self` and `/proc/thread-self` are links: where Detcore
+        // serves the directories they reach, an open that does not follow
+        // the last one (by any spelling that ends at it, `..` resolved:
+        // `/proc/self/../self`) is answered as Linux answers an open of a
+        // symbolic link (v6.17 fs/namei.c): the flags `build_open_flags`
+        // refuses (`EINVAL`), then the walk to the link (`ENOENT` at a task
+        // named on the way that does not exist, `ELOOP` past the link limit),
+        // then in `do_open` an existing name with `O_CREAT|O_EXCL` (`EEXIST`)
+        // and `O_DIRECTORY` (`ENOTDIR`), then `may_open`'s `ELOOP` for a
+        // link. With `O_PATH`, which skips all but the `O_DIRECTORY` check,
+        // Linux opens the link itself, which is refused by name. Whether the
+        // open follows the last component is told from the guest's own
+        // spelling (a final `/` or `/.` follows it).
+        if super::opens_the_link_itself(observed, flags)
+            && let Some(link) = Self::own_selector_link(guest, spelling, links).await
+        {
+            let path_only = flags.contains(OFlag::O_PATH);
+            return Some(
+                if let Some(errno) = super::rendered_procfs::open_flags_refused(flags) {
+                    Err(errno)
+                } else {
+                    link.and_then(|link| {
+                        if !path_only && flags.contains(OFlag::O_CREAT | OFlag::O_EXCL) {
+                            Err(Errno::EEXIST)
+                        } else if flags.contains(OFlag::O_DIRECTORY) {
+                            Err(Errno::ENOTDIR)
+                        } else if !path_only {
+                            Err(Errno::ELOOP)
+                        } else {
+                            Ok(OpenedDirectory::SelectorLink {
+                                thread: link.ends_with("thread-self"),
+                            })
+                        }
+                    })
+                },
+            );
+        }
+        // An `O_CREAT` open (not `O_PATH`, which drops `O_CREAT`) by a
+        // spelling that ends in a name and a `/` fails with `EISDIR` once the
+        // walk reaches that name, before the name is looked up
+        // (`lookup_fast_for_open`): of a task directory, only the walk of the
+        // components before it can fail first, whether or not the task the
+        // name gives exists.
+        let creates_through_slash = !flags.contains(OFlag::O_PATH)
+            && flags.contains(OFlag::O_CREAT)
+            && ends_in_a_name_and_slash(observed);
+        if creates_through_slash
+            && let Some(answer) =
+                Self::own_task_creation_through_slash(guest, spelling, links).await
+        {
+            return Some(Err(answer));
+        }
+        if let Some(directory) = Self::own_task_directory(guest, spelling, links).await {
+            return Some(directory.map(|(kind, thread)| OpenedDirectory::Task(kind, thread)));
+        }
         if super::opens_the_link_itself(observed, flags) {
             return None;
         }
         if let Some(directory) = Self::own_link_directory(guest, observed) {
-            // The open follows this last link too, within the one budget.
-            if links + selector_links(observed) + 1 > LINK_LIMIT {
+            // The open follows this last link too, within the one budget,
+            // unless it fails at the link's name first (`creates_through_slash`).
+            if links + selector_links(observed) + usize::from(!creates_through_slash) > LINK_LIMIT {
                 return Some(Err(Errno::ELOOP));
             }
             return Some(Ok(OpenedDirectory::Reopened(directory)));
@@ -1020,8 +1648,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Whether the placeholder directory `directory` still names a directory:
-    /// `/proc` always does; a descriptor directory while its task does
-    /// (`get_proc_task`, [`Self::bound_task`]).
+    /// `/proc` always does; a descriptor directory or a task directory while
+    /// its task does (`get_proc_task`, [`Self::bound_task`]).
     async fn placeholder_current<G: Guest<Self>>(
         guest: &mut G,
         directory: &PlaceholderDirectory,
@@ -1029,7 +1657,59 @@ impl<T: RecordOrReplay> Detcore<T> {
         match directory {
             PlaceholderDirectory::Root => true,
             PlaceholderDirectory::Descriptors(binding) => Self::bound_task(guest, binding).await.1,
+            PlaceholderDirectory::Task(binding) => Self::bound_own_task(guest, binding).await.1,
         }
+    }
+
+    /// The binding of the caller's own task directory `kind`, for a caller
+    /// whose pid and tid are `(pid, tid)`: its task, the caller's process,
+    /// or the caller itself for its thread's directory, with the incarnation
+    /// of each of its numbers now, as Linux binds the directory's inode to
+    /// the task at the lookup (`proc_pid_instantiate`, `proc_task_instantiate`).
+    async fn task_directory_binding<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        kind: TaskDirectoryKind,
+        (pid, tid): (i32, i32),
+    ) -> TaskDirectoryBinding {
+        let thread = (kind == TaskDirectoryKind::Thread).then_some(tid);
+        let answer = crate::tool_global::procfs_task(
+            guest,
+            crate::procfs::BoundTask {
+                process: pid,
+                thread,
+            },
+        )
+        .await;
+        TaskDirectoryBinding {
+            kind,
+            pid,
+            tid,
+            process_incarnation: answer.process_incarnation,
+            thread_incarnation: answer.thread_incarnation,
+            device: Self::procfs_key_device(guest),
+        }
+    }
+
+    /// What Detcore's process table says now of the task the task directory
+    /// `binding` names, and whether that is still the task it was bound to.
+    async fn bound_own_task<G: Guest<Self>>(
+        guest: &mut G,
+        binding: &TaskDirectoryBinding,
+    ) -> (crate::procfs::listing::ProcfsTaskAnswer, bool) {
+        let thread = (binding.kind == TaskDirectoryKind::Thread).then_some(binding.tid);
+        let answer = crate::tool_global::procfs_task(
+            guest,
+            crate::procfs::BoundTask {
+                process: binding.pid,
+                thread,
+            },
+        )
+        .await;
+        let current = answer.exists
+            && answer.process_incarnation == binding.process_incarnation
+            && answer.thread_incarnation == binding.thread_incarnation;
+        (answer, current)
     }
 
     /// Whether every task in `tasks` exists now, as Linux's walk finds it
@@ -1247,7 +1927,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Open the placeholder directory `opened` names, with the guest's open
-    /// `flags`: refuse what Linux refuses for a directory, then inject the
+    /// `flags`, by a spelling that ends in a name and a `/` where
+    /// `name_and_slash` says so ([`ends_in_a_name_and_slash`]): refuse what
+    /// Linux refuses for a directory, then inject the
     /// open of the object that stands for it ([`PlaceholderObject`]), record
     /// the descriptor and which directory it is, register it for its tag, and
     /// name its description to the lock ledger, which follows every table
@@ -1258,11 +1940,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         flags: OFlag,
         opened: OpenedDirectory,
+        name_and_slash: bool,
     ) -> Result<i64, Error> {
         // As Linux refuses an open of a directory: invalid combinations
-        // first (`build_open_flags`), then an existing name with
-        // `O_CREAT|O_EXCL` (EEXIST), an `O_TMPFILE` below a directory that has
-        // no `tmpfile` (EOPNOTSUPP), `O_CREAT` (`do_open`'s EISDIR), a write
+        // first (`build_open_flags`), then `O_CREAT` by a spelling that ends
+        // in a name and a `/` (`lookup_fast_for_open`'s EISDIR), an existing
+        // name with `O_CREAT|O_EXCL` (EEXIST), an `O_TMPFILE` below an
+        // immutable directory (EPERM) or one that has no `tmpfile`
+        // (EOPNOTSUPP), `O_CREAT` (`do_open`'s EISDIR), a write
         // or `O_TRUNC` (`may_open`'s EISDIR), `O_NOATIME` for a caller that
         // neither owns the directory nor may act as its owner (the end of
         // `may_open`, EPERM), and last `O_DIRECT`, which procfs cannot do
@@ -1297,13 +1982,55 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             OpenedDirectory::Root => PlaceholderDirectory::Root,
             OpenedDirectory::Reopened(directory) => directory,
+            OpenedDirectory::Task(kind, thread) => PlaceholderDirectory::Task(
+                self.task_directory_binding(guest, kind, (pid, thread))
+                    .await,
+            ),
+            OpenedDirectory::SelectorLink { thread } => {
+                return self
+                    .refuse_placeholder_call(
+                        guest,
+                        Sysno::openat,
+                        Errno::EACCES,
+                        &format!(
+                            "an O_PATH open of /proc/{} that does not follow it, which opens \
+                             the symbolic link itself on Linux, cannot be served: Detcore serves \
+                             the directory it leads to on this backend, and no object for the \
+                             link (https://github.com/rrnewton/hermit/issues/5039)",
+                            if thread { "thread-self" } else { "self" }
+                        ),
+                    )
+                    .await;
+            }
         };
         if !path_only {
+            if name_and_slash && flags.contains(OFlag::O_CREAT) {
+                return Err(Errno::EISDIR.into());
+            }
             if flags.contains(OFlag::O_CREAT | OFlag::O_EXCL) {
                 return Err(Errno::EEXIST.into());
             }
             if flags.contains(OFlag::O_TMPFILE) {
-                return Err(Errno::EOPNOTSUPP.into());
+                // `vfs_tmpfile` checks write permission on the directory
+                // before it asks for `tmpfile` (v6.17 fs/namei.c:3927-3931):
+                // a process's or a thread's directory is immutable
+                // (`proc_pid_instantiate`, `proc_task_instantiate`,
+                // fs/proc/base.c:3498 and :3800), which no one may write
+                // (EPERM); `/proc`, `task` and a descriptor directory have no
+                // `tmpfile` (EOPNOTSUPP).
+                let immutable = matches!(
+                    directory,
+                    PlaceholderDirectory::Task(TaskDirectoryBinding {
+                        kind: TaskDirectoryKind::Process | TaskDirectoryKind::Thread,
+                        ..
+                    })
+                );
+                return Err(if immutable {
+                    Errno::EPERM
+                } else {
+                    Errno::EOPNOTSUPP
+                }
+                .into());
             }
             if flags.contains(OFlag::O_CREAT)
                 || flags & OFlag::O_ACCMODE != OFlag::O_RDONLY
@@ -2368,14 +3095,101 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok((entries, inodes, DirectoryOrder::ProcfsIds))
     }
 
-    /// Answer a `getdents` or `getdents64` of the `/proc` placeholder open as
-    /// `fd` from its directory stream, shared by the description's aliases:
-    /// the stream's snapshot of [`Self::root_placeholder_snapshot`], taken at
-    /// the first read and at the first after a seek to 0, as for every
-    /// directory Detcore lists (`DirectoryStream`). The kernel position stays
-    /// at the tag (`Detcore::move_directory_kernel_position` moves no
-    /// placeholder). A count that does not fit an `int` fits nothing: `EINVAL`,
-    /// or 0 at the end.
+    /// The entries of the caller's own task directory `binding` as Detcore
+    /// lists it (package K slice K10), and how to key their inode numbers,
+    /// for its placeholder's directory stream: the model's names
+    /// (`procfs::listing`, at the run's `--proc` level, the threads as the
+    /// scheduler lists them), kept where every answer about the entry is
+    /// Detcore's own, which is what Linux lists there less what this backend
+    /// would answer otherwise than Linux:
+    /// - in a process's or a thread's directory, the per-process files
+    ///   Detcore renders in this session (`ProcfsFile::rendered_path`), the
+    ///   `fd` directory it serves (`descriptor_directory`: a process's to
+    ///   every thread of it, a thread's to that thread alone, which is the
+    ///   reader taking the listing), and a process's `task`, which it serves
+    ///   too;
+    /// - in `task`, every thread of the process.
+    ///
+    /// Every other name in Linux's table is left out, deliberately: on this
+    /// backend its open reaches the KVM provider's procfs, which answers
+    /// `status` and `maps` from its own minimal renderings, not Linux's, and
+    /// refuses the rest (`EACCES`), which no listing should advertise. An
+    /// open of such a name by its spelling is answered as before. Each entry
+    /// is numbered by its path's key, as the files Detcore renders are, and
+    /// the stream keeps Linux's order (`DirectoryOrder::ProcessEntries`, the
+    /// threads in `task` ascending).
+    async fn task_placeholder_snapshot<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        binding: &TaskDirectoryBinding,
+    ) -> Result<(Vec<DirEntry>, DirectoryInodes, DirectoryOrder), Error> {
+        use crate::procfs::listing;
+        let directory = binding.modeled();
+        let facts = crate::tool_global::procfs_listing(
+            guest,
+            Some(crate::types::DetPid::from_raw(binding.pid)),
+        )
+        .await;
+        let names = listing::entries(&directory, self.cfg.proc_level, &facts).unwrap_or_default();
+        let within = binding.within();
+        let proc = Path::new("/proc");
+        let session_files = self.rendered_files(guest);
+        // A thread's descriptor directory Detcore serves to that thread
+        // alone (`fd_directory::classify`).
+        let reader = guest.thread_state().dettid.as_raw();
+        let kept = |name: &[u8]| match name {
+            b"." | b".." => true,
+            _ if binding.kind == TaskDirectoryKind::Tasks => true,
+            b"fd" => binding.kind == TaskDirectoryKind::Process || binding.tid == reader,
+            b"task" => binding.kind == TaskDirectoryKind::Process,
+            name => {
+                let path = proc
+                    .join(within.strip_prefix("/").unwrap_or(&within))
+                    .join(OsStr::from_bytes(name));
+                crate::procfs::ProcfsFile::from_path(&path).is_some_and(|file| {
+                    file.per_process_name().is_some()
+                        && !self.kernel_serves_every_comm(&file)
+                        && file.rendered_path(session_files).is_some()
+                })
+            }
+        };
+        let entries = names
+            .into_iter()
+            .filter(|(name, _)| kept(name))
+            .map(|(name, ty)| {
+                let entry = match name.as_slice() {
+                    b"." => within.clone(),
+                    b".." => within.parent().unwrap_or(&within).to_path_buf(),
+                    name => within.join(OsStr::from_bytes(name)),
+                };
+                DirEntry {
+                    ino: procfs_inode::path_inode(binding.device, &entry).ino,
+                    off: 0,
+                    ty,
+                    name,
+                }
+            })
+            .collect::<Vec<_>>();
+        let inodes = DirectoryInodes::new(binding.device, Some(ProcfsDirectory::new(within)));
+        let order = match binding.kind {
+            TaskDirectoryKind::Process => DirectoryOrder::ProcessEntries { thread: false },
+            TaskDirectoryKind::Thread => DirectoryOrder::ProcessEntries { thread: true },
+            TaskDirectoryKind::Tasks => DirectoryOrder::ProcfsIds,
+        };
+        Ok((entries, inodes, order))
+    }
+
+    /// Answer a `getdents` or `getdents64` of the `/proc` placeholder, or of
+    /// one of the caller's own task directories (package K slice K10), open
+    /// as `fd` from its directory stream, shared by the description's
+    /// aliases: the stream's snapshot of [`Self::root_placeholder_snapshot`]
+    /// or [`Self::task_placeholder_snapshot`], taken at the first read and at
+    /// the first after a seek to 0, as for every directory Detcore lists
+    /// (`DirectoryStream`); a task directory whose task is gone answers
+    /// `ENOENT` at every call. The kernel position stays at the tag
+    /// (`Detcore::move_directory_kernel_position` moves no placeholder). A
+    /// count that does not fit an `int` fits nothing: `EINVAL`, or 0 at the
+    /// end.
     async fn serve_root_placeholder<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2403,12 +3217,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(fd, |detfd| detfd.directory_lock())?;
         let _serving = lock.lock().await;
+        // A task directory whose task is gone (or whose number another task
+        // holds now) lists nothing: Linux's readdir looks the task up first,
+        // at every call, a stream it began reading or rewound included
+        // (`proc_pident_readdir`'s `get_proc_task`, `proc_task_readdir`'s
+        // `proc_inode_is_dead`, fs/proc/base.c at v6.17).
+        if let PlaceholderDirectory::Task(binding) = &state.directory
+            && !Self::bound_own_task(guest, binding).await.1
+        {
+            return Err(Errno::ENOENT.into());
+        }
         if guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.directory_needs_snapshot())?
         {
             let mark = crate::tool_global::directory_snapshot_mark(guest).await;
-            let (entries, inodes, order) = self.root_placeholder_snapshot(guest, fd).await?;
+            let (entries, inodes, order) = match &state.directory {
+                PlaceholderDirectory::Task(binding) => {
+                    self.task_placeholder_snapshot(guest, binding).await?
+                }
+                _ => self.root_placeholder_snapshot(guest, fd).await?,
+            };
             let mut entries = Some(entries);
             guest.thread_state().with_detfd(fd, |detfd| {
                 detfd.install_directory_snapshot(
@@ -2579,7 +3408,131 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.descriptor_directory_metadata(guest, binding, object)
                     .await
             }
+            PlaceholderDirectory::Task(binding) => {
+                self.task_directory_metadata(guest, binding).await
+            }
         }
+    }
+
+    /// The metadata of the caller's own task directory `binding` (package K
+    /// slice K10), as Linux reports it (fs/proc/base.c at v6.17): a directory
+    /// of mode 0555 (`S_IFDIR|S_IRUGO|S_IXUGO`: `proc_pid_instantiate`,
+    /// `proc_task_instantiate`, the `task` entry of `tgid_base_stuff`); its
+    /// links, 2 and one per directory in its table (`pid_entry_nlink`, 9 for a
+    /// process: `task`, `fd`, `map_files`, `fdinfo`, `ns`, `net` and `attr`;
+    /// 7 for a thread, without `task` and `map_files`), and for `task` 2 and
+    /// one per thread (`proc_pident_instantiate`'s 2, `proc_task_getattr`);
+    /// the task's effective owner, whatever its dumpable state, as
+    /// `pid_getattr` takes it through `task_dump_owner` for exactly this mode
+    /// (Detcore's virtual root, which owns every task's files it renders,
+    /// `rendered_file_owner`); size 0; procfs's 1024-byte blocks and device;
+    /// the inode number Detcore's pool gives its path; and the epoch. Neither
+    /// getattr looks the task up to fail: a held directory whose task is gone
+    /// (or whose number another task holds now) still answers, with the
+    /// links its inode was instantiated with, `task` with 2 and no thread
+    /// (`proc_task_getattr`), and a process's or a thread's directory owned
+    /// by global root as the guest's user namespace sees it, which is the
+    /// owner of `/proc` itself (`pid_getattr`, `guest_procfs_root`); `task`
+    /// keeps its inode's owner.
+    async fn task_directory_metadata<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        binding: &TaskDirectoryBinding,
+    ) -> Result<DetStat, Error> {
+        let (_, current) = Self::bound_own_task(guest, binding).await;
+        let nlink = match binding.kind {
+            TaskDirectoryKind::Process => 9,
+            TaskDirectoryKind::Thread => 7,
+            TaskDirectoryKind::Tasks if !current => 2,
+            TaskDirectoryKind::Tasks => {
+                let facts = crate::tool_global::procfs_listing(
+                    guest,
+                    Some(crate::types::DetPid::from_raw(binding.pid)),
+                )
+                .await;
+                2 + facts.threads.len() as u64
+            }
+        };
+        let (uid, gid) = if current || binding.kind == TaskDirectoryKind::Tasks {
+            (0, 0)
+        } else {
+            let (_, uid, gid) = super::rendered_procfs::guest_procfs_root()?;
+            (uid, gid)
+        };
+        let mark = crate::tool_global::directory_snapshot_mark(guest).await;
+        let ino = self
+            .directory_inode(guest, binding.device, &binding.within(), mark)
+            .await;
+        let epoch = super::rendered_procfs::epoch_time(guest.config().epoch);
+        Ok(DetStat {
+            mask: StatxMask::STATX_BASIC_STATS | StatxMask::STATX_MNT_ID,
+            mode: libc::S_IFDIR | 0o555,
+            uid,
+            gid,
+            attributes: StatxAttributes::empty(),
+            attributes_mask: StatxAttributes::STATX_ATTR_AUTOMOUNT
+                | StatxAttributes::STATX_ATTR_MOUNT_ROOT
+                | StatxAttributes::STATX_ATTR_DAX,
+            dev: Self::reported_procfs_device(guest),
+            rdev: 0,
+            inode: ino,
+            nlink,
+            size: 0,
+            blksize: procfs_inode::PROC_BLOCK_SIZE,
+            blocks: 0,
+            atime: epoch,
+            btime: epoch,
+            ctime: epoch,
+            mtime: epoch,
+        })
+    }
+
+    /// The metadata of the caller's `/proc/self` or `/proc/thread-self` link
+    /// itself (`spelling`, not followed), as Linux reports it
+    /// (`proc_setup_self`, `proc_setup_thread_self`, fs/proc/self.c and
+    /// fs/proc/thread_self.c at v6.17): a symbolic link of mode 0777, one
+    /// link, global root's, as the guest's own stat of `/proc` shows that
+    /// owner (`guest_procfs_root`), size 0, procfs's device and blocks, the
+    /// inode number its path keys, and the epoch.
+    async fn selector_link_metadata<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        spelling: &Path,
+    ) -> Result<DetStat, Error> {
+        let (_, uid, gid) = super::rendered_procfs::guest_procfs_root()?;
+        let device = Self::procfs_key_device(guest);
+        let within = Path::new("/").join(spelling.file_name().unwrap_or_default());
+        let mark = crate::tool_global::directory_snapshot_mark(guest).await;
+        let inodes = DirectoryInodes::new(device, Some(ProcfsDirectory::new(PathBuf::from("/"))));
+        let name = within.file_name().unwrap_or_default().as_bytes().to_vec();
+        let (host, procfs_name) =
+            inodes.entry_inode(&name, procfs_inode::path_inode(device, &within).ino);
+        let ino = crate::tool_global::determinize_listed_inode(guest, host, procfs_name, mark)
+            .await
+            .0
+            .as_raw();
+        let epoch = super::rendered_procfs::epoch_time(guest.config().epoch);
+        Ok(DetStat {
+            mask: StatxMask::STATX_BASIC_STATS | StatxMask::STATX_MNT_ID,
+            mode: libc::S_IFLNK | 0o777,
+            uid,
+            gid,
+            attributes: StatxAttributes::empty(),
+            attributes_mask: StatxAttributes::STATX_ATTR_AUTOMOUNT
+                | StatxAttributes::STATX_ATTR_MOUNT_ROOT
+                | StatxAttributes::STATX_ATTR_DAX,
+            dev: Self::reported_procfs_device(guest),
+            rdev: 0,
+            inode: ino,
+            nlink: 1,
+            size: 0,
+            blksize: procfs_inode::PROC_BLOCK_SIZE,
+            blocks: 0,
+            atime: epoch,
+            btime: epoch,
+            ctime: epoch,
+            mtime: epoch,
+        })
     }
 
     /// The fdinfo Linux gives placeholder descriptor `fd`, as the kernel's
@@ -2598,7 +3551,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(None);
         };
         let position = match state.directory {
-            PlaceholderDirectory::Root => guest
+            PlaceholderDirectory::Root | PlaceholderDirectory::Task(_) => guest
                 .thread_state()
                 .with_detfd(fd, |detfd| detfd.directory_stream_position())?,
             PlaceholderDirectory::Descriptors(_) => state.position,
@@ -2651,6 +3604,33 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
                 let spelling = self.procfs_spelling_at(guest, dirfd, &path).await?;
                 let (spelling, links) = Self::decided_path(guest, &spelling)?;
+                // The caller's `/proc/self` or `/proc/thread-self` link
+                // itself, by any spelling that ends at it (`..` resolved:
+                // `/proc/self/../self`), where Detcore serves the directories
+                // it reaches, after the walk to it; a final `/` or `/.` of
+                // the guest's spelling follows it to the directory, as Linux
+                // follows a trailing slash (`LOOKUP_FOLLOW`).
+                if !follow
+                    && super::opens_the_link_itself(&path, OFlag::O_NOFOLLOW)
+                    && let Some(link) = Self::own_selector_link(guest, &spelling, links).await
+                {
+                    let link = link?;
+                    return Ok(Some(self.selector_link_metadata(guest, &link).await?));
+                }
+                if let Some(directory) = Self::own_task_directory(guest, &spelling, links).await {
+                    let (kind, thread) = directory?;
+                    let binding = self
+                        .task_directory_binding(guest, kind, (pid, thread))
+                        .await;
+                    return Ok(Some(
+                        self.placeholder_metadata(
+                            guest,
+                            &PlaceholderDirectory::Task(binding),
+                            None,
+                        )
+                        .await?,
+                    ));
+                }
                 let directory = match fd_directory::classify(&spelling, (pid, tid)) {
                     Some(table) => {
                         let thread = (table == DescriptorDirectoryTable::Thread).then_some(tid);
@@ -2861,7 +3841,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         Some(match call {
             Syscall::Getdents(_) | Syscall::Getdents64(_)
-                if state.directory == PlaceholderDirectory::Root =>
+                if matches!(
+                    state.directory,
+                    PlaceholderDirectory::Root | PlaceholderDirectory::Task(_)
+                ) =>
             {
                 self.serve_root_placeholder(guest, call, fd, state).await
             }
@@ -3104,7 +4087,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 })?;
                 Ok(position as i64)
             }
-            PlaceholderDirectory::Root => {
+            PlaceholderDirectory::Root | PlaceholderDirectory::Task(_) => {
                 let current = guest
                     .thread_state()
                     .with_detfd(fd, |detfd| detfd.directory_stream_position())?;
@@ -3780,6 +4763,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let owned = match state.directory {
             PlaceholderDirectory::Root => None,
             PlaceholderDirectory::Descriptors(binding) => Some(binding.pid),
+            PlaceholderDirectory::Task(binding) => Some(binding.pid),
         };
         if state.path_only {
             return Err(xattr_arguments_answer(&guest.memory(), call)
@@ -4048,7 +5032,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> i64 {
         match state.directory {
             PlaceholderDirectory::Descriptors(_) => state.position as i64,
-            PlaceholderDirectory::Root => guest
+            PlaceholderDirectory::Root | PlaceholderDirectory::Task(_) => guest
                 .thread_state()
                 .with_detfd(fd, |detfd| detfd.directory_stream_position())
                 .map_or(0, |position| position as i64),
@@ -4204,6 +5188,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let (within, logical) = match &directory {
                         PlaceholderDirectory::Root => (Vec::new(), PathBuf::from("/proc")),
                         PlaceholderDirectory::Descriptors(binding) => {
+                            let within = binding.within().into_os_string().into_encoded_bytes();
+                            (within[1..].to_vec(), binding.canonical())
+                        }
+                        // Served only where the guest's procfs is not the
+                        // kernel's ([`Self::serves_task_directories`]); spelled
+                        // as a descriptor directory is should one be received.
+                        PlaceholderDirectory::Task(binding) => {
                             let within = binding.within().into_os_string().into_encoded_bytes();
                             (within[1..].to_vec(), binding.canonical())
                         }
@@ -4374,6 +5365,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             match directory {
                 PlaceholderDirectory::Root => logical = b"/proc".to_vec(),
                 PlaceholderDirectory::Descriptors(binding) => {
+                    let within = binding.within().into_os_string().into_encoded_bytes();
+                    out.extend_from_slice(&within);
+                    logical = binding.canonical().into_os_string().into_encoded_bytes();
+                    changed = true;
+                }
+                PlaceholderDirectory::Task(binding) => {
                     let within = binding.within().into_os_string().into_encoded_bytes();
                     out.extend_from_slice(&within);
                     logical = binding.canonical().into_os_string().into_encoded_bytes();
@@ -4865,7 +5862,7 @@ const RWH_WRITE_LIFE_EXTREME: u64 = 5;
 fn placeholder_owner_or_capable(directory: &PlaceholderDirectory) -> Result<bool, Errno> {
     const OVERFLOW_ID: u32 = 65534;
     match directory {
-        PlaceholderDirectory::Descriptors(_) => Ok(true),
+        PlaceholderDirectory::Descriptors(_) | PlaceholderDirectory::Task(_) => Ok(true),
         PlaceholderDirectory::Root => {
             let (_, uid, gid) = super::rendered_procfs::guest_procfs_root()?;
             Ok(uid != OVERFLOW_ID && gid != OVERFLOW_ID)
@@ -4885,7 +5882,7 @@ fn placeholder_owner_or_capable(directory: &PlaceholderDirectory) -> Result<bool
 /// `vfs_setlease` does not.
 fn placeholder_lease_owner(directory: &PlaceholderDirectory) -> Result<bool, Errno> {
     match directory {
-        PlaceholderDirectory::Descriptors(_) => Ok(true),
+        PlaceholderDirectory::Descriptors(_) | PlaceholderDirectory::Task(_) => Ok(true),
         PlaceholderDirectory::Root => {
             let (_, uid, _) = super::rendered_procfs::guest_procfs_root()?;
             Ok(uid == 0)
@@ -5224,6 +6221,178 @@ mod tests {
         assert_eq!(resolved("/tmp/../proc/fs"), None);
         assert_eq!(resolved("/proc/self/fd/3/.."), None, "a descriptor link");
         assert_eq!(resolved("/proc/self/fdinfo/3/.."), None, "a file");
+    }
+
+    /// A `..` whose walk stays in the caller's own task tree is resolved for
+    /// the task-directory placeholders, with a final `/` kept where Linux then
+    /// requires a directory, and the tasks it names reported; one that leaves
+    /// the tree, or that only the kernel's walk resolves, is not (package K
+    /// slice K10).
+    #[test]
+    fn a_dotdot_within_the_callers_own_tree_is_resolved() {
+        let own = |path: &str| {
+            own_tree_dotdot(path.as_bytes(), 7)
+                .map(|(path, tasks)| (String::from_utf8(path).unwrap(), tasks))
+        };
+        let task = |process, thread| NamedTask { process, thread };
+        // A last `..` reaches a directory, spelled with a final `/`.
+        assert_eq!(
+            own("/proc/self/fd/.."),
+            Some(("/proc/self/".into(), vec![]))
+        );
+        assert_eq!(
+            own("/proc/self/fd/../"),
+            Some(("/proc/self/".into(), vec![]))
+        );
+        assert_eq!(
+            own("/proc/self/fd/../."),
+            Some(("/proc/self/".into(), vec![]))
+        );
+        assert_eq!(
+            own("/proc/self/fd/../fd"),
+            Some(("/proc/self/fd".into(), vec![]))
+        );
+        assert_eq!(
+            own("/proc/thread-self/fd/.."),
+            Some(("/proc/thread-self/".into(), vec![]))
+        );
+        assert_eq!(
+            own("/proc/thread-self/.."),
+            Some(("/proc/self/task/".into(), vec![]))
+        );
+        assert_eq!(
+            own("/proc/self/../self"),
+            Some(("/proc/self".into(), vec![]))
+        );
+        assert_eq!(
+            own("/proc/7/task/9/fdinfo/../.."),
+            Some((
+                "/proc/7/task/".into(),
+                vec![task(Some(7), None), task(Some(7), Some(9))]
+            ))
+        );
+        for path in [
+            "/proc/self/fd",
+            "/proc/self/..",
+            "/proc/8/fd/..",
+            "/proc/self/fd/../../8",
+            "/proc/self/status/..",
+            "/proc/self/fd/3/..",
+            "/proc/self/cwd/..",
+            "/tmp/../proc/self",
+        ] {
+            assert_eq!(own(path), None, "{path}");
+        }
+        // The selector link a spelling ends at, `..` resolved before it,
+        // with the tasks named on the way; whether the call follows it is
+        // the caller's to tell.
+        let link = |path: &str| {
+            selector_link_reached(Path::new(path))
+                .map(|(link, tasks)| (link.to_str().unwrap().to_owned(), tasks))
+        };
+        for (path, expected) in [
+            ("/proc/self", "/proc/self"),
+            ("/proc/thread-self", "/proc/thread-self"),
+            ("//proc/./self", "/proc/self"),
+            ("/proc/self/../self", "/proc/self"),
+            ("/proc/self/fd/../../self", "/proc/self"),
+            ("/proc/self/../thread-self", "/proc/thread-self"),
+            (
+                "/proc/thread-self/../../../thread-self",
+                "/proc/thread-self",
+            ),
+            ("/proc/self/../self/", "/proc/self"),
+        ] {
+            assert_eq!(link(path), Some((expected.into(), vec![])), "{path}");
+        }
+        assert_eq!(
+            link("/proc/7/task/9/../../../self"),
+            Some((
+                "/proc/self".into(),
+                vec![task(Some(7), None), task(Some(7), Some(9))]
+            ))
+        );
+        for path in [
+            "/proc/self/..",
+            "/proc/self/../self/fd",
+            "/proc/thread-self/../../self",
+            "/proc/self/status/../self",
+            "/proc/selfish",
+            "/proc/self/task",
+            // A last `..` lands on a directory, not on a link.
+            "/proc/self/fd/..",
+            "/proc/thread-self/../..",
+            "/proc/self/task/../../self/fd/..",
+        ] {
+            assert_eq!(link(path), None, "{path}");
+        }
+        assert_eq!(
+            walked_components(b"//proc/./self/../fd/"),
+            [b"proc".as_slice(), b"self", b"..", b"fd"]
+        );
+        // Which spellings end in a name and a `/`, which an `O_CREAT` open
+        // refuses with EISDIR before it looks the name up.
+        for (path, expected) in [
+            ("/proc/self/", true),
+            ("/proc/self/../self/", true),
+            ("/proc//", true),
+            ("/proc/self", false),
+            ("/proc/self/.", false),
+            ("/proc/self/./", false),
+            ("/proc/self/fd/../", false),
+            ("/", false),
+        ] {
+            assert_eq!(
+                ends_in_a_name_and_slash(Path::new(path)),
+                expected,
+                "{path}"
+            );
+        }
+        // The directory the walk is in when it reaches the last name.
+        for (path, expected) in [
+            ("/proc/self/task/9/", Some("/proc/self/task")),
+            ("/proc/self/task/./9//", Some("/proc/self/task/.")),
+            ("/proc/self/task/9/../7/", Some("/proc/self/task/9/..")),
+            ("/proc/", Some("/")),
+            ("/proc", Some("/")),
+            ("/", None),
+        ] {
+            assert_eq!(
+                before_the_last_name(path.as_bytes()),
+                expected.map(str::as_bytes),
+                "{path}"
+            );
+        }
+    }
+
+    /// A spelling in the caller's own task tree loses its empty and `.`
+    /// components, which name nothing, and keeps a final `/` where Linux
+    /// then follows the last link; any other spelling, or one already
+    /// without them, is left as it is (package K slice K10).
+    #[test]
+    fn an_own_tree_spelling_loses_the_components_that_name_nothing() {
+        let normalized = |path: &str| {
+            own_tree_normalized(path.as_bytes(), 7).map(|path| String::from_utf8(path).unwrap())
+        };
+        assert_eq!(normalized("//proc/self"), Some("/proc/self".into()));
+        assert_eq!(
+            normalized("/./proc/thread-self"),
+            Some("/proc/thread-self".into())
+        );
+        assert_eq!(normalized("/proc//7/./stat"), Some("/proc/7/stat".into()));
+        assert_eq!(normalized("//proc/self/."), Some("/proc/self/".into()));
+        assert_eq!(normalized("/proc/self//"), Some("/proc/self/".into()));
+        for path in [
+            "/proc/self",
+            "/proc/self/",
+            "/proc/7/task/7",
+            "//proc/8",
+            "//proc/meminfo",
+            "//tmp/self",
+            "proc//self",
+        ] {
+            assert_eq!(normalized(path), None, "{path}");
+        }
     }
 
     /// A directory descriptor is told to be on a placeholder's object from

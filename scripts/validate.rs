@@ -19751,7 +19751,10 @@ mod nextest_timeout_tests {
                 // CI cells: 371 added, 12 removed, 318 of the added replay).
                 // 2971 on the batch6 base fcd62385 (batch6's manifest cells:
                 // 13 added, measured by the full validate at e3e107cd).
-                assert_eq!(all.len(), 2971, "the original all-owner population is retained");
+                // 2974 with package K slice K10's three KVM verify cells
+                // (c-programs/thread-self-procfs-handoff,
+                // c-programs/proc-fd-link-aliases and compat/ps).
+                assert_eq!(all.len(), 2974, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
@@ -20735,8 +20738,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // test: 120. And the KVM default rustc link refusal, overlapping
         // SCM_RIGHTS receipt refusal, hugetlbfs view refusal and unexchangeable
         // robust word refusal tests, N4's smaps test and PRCTL phase 2's
-        // parent-death test: 126, matching the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 126usize),
+        // parent-death test: 126. And package K slice K10's
+        // run_kvm_the_callers_own_proc_directories_answer_as_linux: 127, matching
+        // the DAG pin in validation_dag_static.
+        ("privileged-only-test.cli_kvm", 127usize),
     ] {
         let step = privileged
             .steps

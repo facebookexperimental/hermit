@@ -6394,14 +6394,24 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // (`other_process_procfs`).
                     None => match self.other_process_procfs_answer(guest, &call).await {
                         Some(answer) => Some(answer),
-                        None => match self.answer_rendered_procfs_operation(guest, &call).await {
-                            Some(answer) => Some(answer),
-                            None => match self.answer_rendered_procfs_mapping(guest, &call).await {
+                        // A thread's `status` that no one renders here
+                        // (`descriptor_directory`, package K slice K10).
+                        None => match Box::pin(self.refuse_unrendered_thread_status(guest, &call))
+                            .await
+                        {
+                            Some(refusal) => Some(refusal),
+                            None => match self.answer_rendered_procfs_operation(guest, &call).await
+                            {
                                 Some(answer) => Some(answer),
-                                None => self
-                                    .answer_rendered_procfs_path_call(guest, &call)
-                                    .await
-                                    .transpose(),
+                                None => {
+                                    match self.answer_rendered_procfs_mapping(guest, &call).await {
+                                        Some(answer) => Some(answer),
+                                        None => self
+                                            .answer_rendered_procfs_path_call(guest, &call)
+                                            .await
+                                            .transpose(),
+                                    }
+                                }
                             },
                         },
                     },

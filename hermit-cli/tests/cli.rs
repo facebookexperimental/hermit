@@ -7586,9 +7586,10 @@ fn detcore_omits_the_procfs_names_outside_the_level_on(test: &str, among: &[&str
         "/proc/self/task",
     ];
     // KVM's own /proc refuses these level names: its directories (design
-    // note, slices B3 and B4). A process's `io` is Detcore's on every
-    // backend (slice N3 of the kvm lane's verify-100 plan).
-    let kvm_refuses = ["/proc/sys/fs", "/proc/self/task"];
+    // note, slices B3 and B4), but the caller's own task directories, which
+    // Detcore serves (package K slice K10). A process's `io` is Detcore's on
+    // every backend (slice N3 of the kvm lane's verify-100 plan).
+    let kvm_refuses = ["/proc/sys/fs"];
     // What KVM's own /proc (until slice B4 of
     // https://github.com/rrnewton/hermit/issues/4266 removes it) and its
     // missing inotify leave unchecked, which the guest names in its output.
@@ -7644,8 +7645,8 @@ fn detcore_omits_the_procfs_names_outside_the_level_on(test: &str, among: &[&str
              open, datagram sends, a thread with its own descriptor table, chroot (record \
              and replay)\n"
         } else if kvm {
-            "unchecked: listings, /proc as the working directory, process directory \
-             descriptors, renames and links (KVM's own /proc); stat sync flags (KVM's executor, \
+            "unchecked: listings, /proc as the working directory, renames and links (KVM's \
+             own /proc); stat sync flags (KVM's executor, \
              https://github.com/rrnewton/reverie/issues/1047); inotify, a thread with its \
              own descriptor table, chroot (no KVM support)\n"
         } else {
@@ -8112,9 +8113,11 @@ fn detcore_answers_its_procfs_links_on_every_backend() {
 /// reports. The guest checks the same relations natively first, in a fresh
 /// read-only procfs of its own. The ptrace
 /// and KVM runs reach bitwise parity and print the same listings, with pids
-/// shown by role (before this, KVM's root listed nothing); KVM's own /proc
-/// cannot open a process's directory yet, so its run checks the root only,
-/// named as not checked (slice B3a-4). DBT, whose kernel numbers processes
+/// shown by role (before this, KVM's root listed nothing); on KVM, Detcore
+/// serves the caller's own process directory (package K slice K10) but lists
+/// only the names it serves there, without `status`, which the guest requires,
+/// and KVM's own /proc cannot look up another process's directory, so its run
+/// checks the root only, named as not checked. DBT, whose kernel numbers processes
 /// otherwise than its guest, lists and looks up the guest's numbers too,
 /// translated to the kernel's (slice B3a-4; before it, DBT listed the
 /// kernel's numbers): its run prints the same listings, without the
@@ -8216,9 +8219,10 @@ fn detcore_lists_procfs_from_its_model_on_every_backend() {
             assert_eq!(output, first, "{backend} differs from {first_backend}");
         } else if *backend == "kvm" {
             eprintln!(
-                "{test}: kvm: NOT CHECKED: a process's directory, a thread's and `task`, and \
-                 the inodes of the root's directories and links (KVM's own /proc cannot open \
-                 or look them up yet)"
+                "{test}: kvm: NOT CHECKED: a process's directory, a thread's and `task` (Detcore \
+                 lists only the names it serves there, without status, package K slice K10), and \
+                 the inodes of the root's directories and links (KVM's own /proc cannot look \
+                 them up yet)"
             );
             let root_only = first
                 .lines()
@@ -11255,9 +11259,10 @@ fn detcore_renders_its_procfs_files_on(test: &str, among: &[&str]) -> Vec<&'stat
 /// tool's record of a descriptor, which the in-guest backends (SaBRe,
 /// LiteInst, in-guest-trap) keep as DBT does, by discovering descriptors as
 /// they are used; their own runs of the guest are not part of this test.
-/// KVM's own /proc cannot open a process's directory yet, and KVM gives no
-/// thread a descriptor table of its own, so its run skips those checks,
-/// each named as not checked. KVM also runs the guest once with
+/// KVM's own /proc cannot open a process's `ns` directory (Detcore serves the
+/// caller's own process directory and its `fd`, package K slice K10, but not
+/// `ns`), and KVM gives no thread a descriptor table of its own, so its run
+/// skips those checks, each named as not checked. KVM also runs the guest once with
 /// `--no-sequentialize-threads`, where Detcore names a received `/proc` the
 /// same way, and must print what its default run printed.
 #[test]
@@ -11348,7 +11353,8 @@ fn a_name_below_a_received_directory_is_looked_up_on_ptrace_dbt_and_kvm() {
     for (backend, output) in &outputs[1..] {
         if *backend == "kvm" {
             // The lines of checks KVM does not make: its own /proc cannot
-            // open a process's directory yet (package K,
+            // open a process's `ns` directory, which the guest's process
+            // directory checks open first (package K,
             // https://github.com/rrnewton/hermit/issues/4213), and it gives
             // no thread a descriptor table of its own (it refuses a clone
             // without CLONE_FILES).
@@ -11554,9 +11560,12 @@ fn detcore_renders_process_cgroup_on_every_backend() {
             // serves this one: its metadata must be the kernel's as well.
             "--chroot",
         ];
-        // KVM's own /proc cannot open a process's or a thread's directory
-        // yet (slice B3a-4 of https://github.com/rrnewton/hermit/issues/4266),
-        // so the names relative to one, the listing and the check after
+        // On KVM the guest's process directory checks open the /proc/self link
+        // itself (O_PATH|O_NOFOLLOW), which Detcore refuses by name there, as
+        // no object stands for the link (package K slice K10), and a child's
+        // directory, another process's, which KVM's own /proc cannot open
+        // (https://github.com/rrnewton/hermit/issues/4564), so the names
+        // relative to a process's directory, the listing and the check after
         // chroot are not made there.
         if backend == "kvm" {
             args.push("--no-process-directories");
@@ -11619,8 +11628,8 @@ fn detcore_renders_process_cgroup_on_every_backend() {
                     .find(|line| line.starts_with(prefix))
                     .unwrap_or_else(|| panic!("{first_backend} printed no {prefix:?} line"));
                 eprintln!(
-                    "{test}: kvm: NOT CHECKED ({} of {} lines; KVM's own /proc refuses \
-                     process and thread directories): {line}",
+                    "{test}: kvm: NOT CHECKED ({} of {} lines; KVM has no object for the \
+                     /proc/self link and cannot open another process's directory): {line}",
                     NOT_CHECKED_ON_KVM.len(),
                     first.lines().count()
                 );
@@ -11905,11 +11914,11 @@ fn a_tasks_io_asks_ptrace_may_access_at_every_show_on_every_backend() {
 /// classified only the process-level spellings, and the thread-level ones
 /// read the host's own counters (Claude review of the kvm lane's slice N3).
 /// Linux shows the thread's real counters, so the guest is not compared
-/// natively. KVM serves
-/// a task's directory only in a container
-/// (`run_kvm_procfs_directories_are_served_only_in_a_container`), so there
-/// the two names relative to one are not reached: the lines
-/// `IO_SPELLINGS_KVM_KNOWN_DIFFERENCES` names.
+/// natively. On KVM, the names relative to a task directory read zeros too:
+/// Detcore serves the caller's own task directories there (package K slice
+/// K10, https://github.com/rrnewton/hermit/issues/5039); before, KVM's
+/// provider refused the directory (EACCES), a known difference this test
+/// named.
 #[test]
 fn every_spelling_of_a_threads_io_reads_zeros_on_every_backend() {
     let test = "every_spelling_of_a_threads_io_reads_zeros_on_every_backend";
@@ -11948,14 +11957,7 @@ fn every_spelling_of_a_threads_io_reads_zeros_on_every_backend() {
         let output = hermit(&args);
         assert_success(&output, &args);
         assert_bitwise_report(backend, &report);
-        let mut want = expected.clone();
-        if backend == "kvm" {
-            for (linux, kvm) in IO_SPELLINGS_KVM_KNOWN_DIFFERENCES {
-                eprintln!("{test}: kvm: KNOWN DIFFERENCE: {kvm:?} where the others give {linux:?}");
-                want = want.replace(linux, kvm);
-            }
-        }
-        assert_eq!(stdout(&output), want, "{backend}");
+        assert_eq!(stdout(&output), expected, "{backend}");
     }
 }
 
@@ -11998,21 +12000,6 @@ fn a_second_threads_io_spellings_read_zeros_on_every_backend() {
         assert_eq!(stdout(&output), expected, "{backend}");
     }
 }
-
-/// The lines of `rendered_io_and_diskstats --io-spellings` KVM answers
-/// otherwise: outside a container its provider serves no task directory
-/// (`run_kvm_procfs_directories_are_served_only_in_a_container`), so the
-/// guest cannot open one to name `io` relative to it.
-const IO_SPELLINGS_KVM_KNOWN_DIFFERENCES: [(&str, &str); 2] = [
-    (
-        "io spellings: io relative to a task directory: zeros\n",
-        "io spellings: a task directory: open EACCES\n",
-    ),
-    (
-        "io spellings: io relative to an O_PATH task directory: zeros\n",
-        "io spellings: an O_PATH task directory: open EACCES\n",
-    ),
-];
 
 /// A `/proc/diskstats` descriptor received over SCM_RIGHTS by a process
 /// forked before the file was opened, whose descriptor table is then full,
@@ -13297,7 +13284,9 @@ fn detcore_renders_the_mount_table_on_every_backend() {
         // (https://github.com/rrnewton/hermit/issues/4282), and refuses statx
         // through a symbolic link to a descriptor link (ELOOP), so the guest
         // skips that one spelling there, says so on stderr, and prints no
-        // line for it. Removed by package K10 with --kvm-local-procfs.
+        // line for it. Package K slice K10 serves the caller's own task
+        // directories but does not resolve a symbolic link outside /proc that
+        // leads to a descriptor link, so the skip stays.
         if backend == "kvm" {
             args.push("--kvm-local-procfs");
         }
@@ -64909,4 +64898,435 @@ fn host_capabilities_never_touches_the_probe_cache() {
         !cache_home.path().join("hermit").exists(),
         "host-capabilities wrote the cache"
     );
+}
+
+static PROCFS_OWN_DIRECTORY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// How many lines the own-directory guest prints in its default mode.
+const OWN_DIRECTORY_LINES: usize = 445;
+
+/// `tests/c/procfs_own_directory.c`'s guest.
+fn procfs_own_directory_guest() -> &'static Path {
+    compiled_c_guest(&PROCFS_OWN_DIRECTORY_GUEST, "procfs_own_directory")
+}
+
+/// The own-directory guest's transcript under Hermit on `backend` at
+/// `--proc=level`, in the guest's `modes`, at L2: two runs at bitwise parity
+/// under `--verify-strict`, with the same nonzero number of INFO records
+/// compared.
+fn procfs_own_directory_at_l2(backend: &str, level: &str, modes: &[&str]) -> String {
+    let guest = procfs_own_directory_guest();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join(format!("{backend}.json"));
+    let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+    let level_arg = format!("--proc={level}");
+    let mut args = vec![
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        &level_arg,
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        &report_arg,
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        directory.path().to_str().expect("directory path is UTF-8"),
+    ];
+    args.extend_from_slice(modes);
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+            .expect("parse the verification report");
+    assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+    let compared = &verdict["compared_log_messages"];
+    assert!(
+        compared["left"].as_u64().is_some_and(|count| count > 0)
+            && compared["left"] == compared["right"],
+        "{backend} compared no INFO messages: {verdict}"
+    );
+    stdout(&output)
+}
+
+/// The own-directory guest's transcript under Hermit on `backend` at
+/// `--proc=standard`, in the guest's `modes`, by one `run --strict` (no
+/// verification).
+fn procfs_own_directory_strict(backend: &str, modes: &[&str]) -> String {
+    let guest = procfs_own_directory_guest();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut args = vec![
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--proc=standard",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        directory.path().to_str().expect("directory path is UTF-8"),
+    ];
+    args.extend_from_slice(modes);
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    stdout(&output)
+}
+
+/// The own-directory guest's held-thread mode run natively: descriptors of a
+/// second thread's directory held while it exits, whose fstat still
+/// describes the directory and whose getdents64 fails with ENOENT, after a
+/// read while it lived and after a rewind too.
+fn held_thread_native() -> String {
+    let native = procfs_own_directory_native(&["held-thread"]);
+    for line in [
+        "exited thread's directory stat: ENOENT",
+        "exited thread's directory getdents: ENOENT",
+        "exited thread's directory getdents after a read: ENOENT",
+        "exited thread's directory getdents after a rewind: ENOENT",
+    ] {
+        assert!(
+            native.lines().any(|native| native == line),
+            "{line}: {native}"
+        );
+    }
+    assert!(
+        native
+            .lines()
+            .any(|line| line.starts_with("exited thread's directory fstat: dir 0555 nlink 7 ")),
+        "{native}"
+    );
+    native
+}
+
+/// The own-directory guest's transcript run natively, in `modes`.
+fn procfs_own_directory_native(modes: &[&str]) -> String {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let output = Command::new(procfs_own_directory_guest())
+        .arg(directory.path())
+        .args(modes)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the own-directory guest natively");
+    assert!(output.status.success(), "native {modes:?}: {output:?}");
+    stdout(&output)
+}
+
+/// The own-directory guest's listings of a `task` directory, which list the
+/// process's threads and nothing a `--proc` level or a backend leaves out, so
+/// they equal the native listing exactly.
+const OWN_DIRECTORY_TASK_LISTINGS: [&str; 2] = ["/proc/self/task", "/proc/thread-self/.."];
+
+/// Whether `transcript`, the own-directory guest's under Hermit, answers as
+/// `native` does: line for line equal, except that each `list <label>:` line,
+/// a directory's entries in getdents order, may leave entries out, keeping
+/// the dots first and the others' names, types and order (an
+/// order-preserving subsequence of the native listing); a `task` listing
+/// ([`OWN_DIRECTORY_TASK_LISTINGS`]) leaves none out. Returns each listing's
+/// entries, by label, in order.
+fn assert_own_directory_transcript(
+    native: &str,
+    transcript: &str,
+    context: &str,
+) -> Vec<(String, Vec<String>)> {
+    let native_lines = native.lines().collect::<Vec<_>>();
+    let lines = transcript.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines.len(),
+        native_lines.len(),
+        "{context}: line counts\n{transcript}\nnative:\n{native}"
+    );
+    let mut listings = Vec::new();
+    for (line, native_line) in lines.iter().zip(&native_lines) {
+        let Some(native_listing) = native_line.strip_prefix("list ") else {
+            assert_eq!(line, native_line, "{context}");
+            continue;
+        };
+        let (native_label, native_entries) = native_listing
+            .split_once(':')
+            .expect("a listing line has a label");
+        let (label, entries) = line
+            .strip_prefix("list ")
+            .and_then(|listing| listing.split_once(':'))
+            .unwrap_or_else(|| panic!("{context}: not a listing: {line}"));
+        assert_eq!(label, native_label, "{context}");
+        let entries = entries
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut remaining = native_entries.split_whitespace();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| remaining.any(|native_entry| native_entry == entry)),
+            "{context}: {label} lists {entries:?}, which is no order-preserving part of the \
+             native {native_entries}"
+        );
+        assert_eq!(entries[..2], ["./d", "../d"], "{context}: {label}");
+        if OWN_DIRECTORY_TASK_LISTINGS.contains(&label) {
+            assert_eq!(
+                entries,
+                native_entries.split_whitespace().collect::<Vec<_>>(),
+                "{context}: the task listing {label} leaves out a thread"
+            );
+        }
+        listings.push((label.to_owned(), entries));
+    }
+    listings
+}
+
+/// Every spelling of the caller's own `/proc` directories
+/// (`tests/c/procfs_own_directory.c`: `/proc/self`, `/proc/<pid>`,
+/// `/proc/<pid>/`, `/proc/thread-self`, `/proc/<pid>/task/<tid>`, the `task`
+/// directory, and the `..` spellings that reach them, by the main thread and
+/// by a second one) answers on `backend` at L2 as natively, at
+/// `--proc=standard` and `--proc=minimal`: the opens, stat, lstat, fstat and
+/// fstatat (mode, link count, owner, size), the names below each directory,
+/// readlink of `/proc/self`, `/proc/thread-self` and a descriptor link
+/// reached through `..`, the opens of the links that do not follow them,
+/// lstat and readlink of the links with a final `/` or `/.` or with empty
+/// and `.` components, and the `Pid` of `/proc/thread-self/status`; the
+/// links reached through `..` (`/proc/self/../self`,
+/// `/proc/thread-self/../../../thread-self`), whose opens, lstat, stat and
+/// readlink answer as for the link spelled plainly, and readlink of a
+/// spelling whose last `..` reaches a directory (EINVAL); a file of the caller's
+/// own directories with a final `/` or `/.`, through `thread-self` and the
+/// leader's number (ENOTDIR); and the opens that create of the caller's own
+/// thread's directory and of one that does not exist, which Linux refuses by
+/// their flags (EINVAL) and, where a name ends the spelling with a `/`, at
+/// that name (EISDIR) before any lookup of it; readlinkat of names relative
+/// to descriptors of those directories (`../self` reads the link, `.` and
+/// `..` reach a directory: EINVAL), and readlink of `/proc` and of a
+/// descriptor directory (EINVAL); calls whose own arguments Linux refuses
+/// before any walk (EINVAL), by spellings whose walk fails (a `..` through
+/// a thread that does not exist, or past the link limit); `O_TMPFILE` opens
+/// of the caller's own process and thread directories, which are immutable
+/// (EPERM); readlink of a directory reached through a descriptor link to it
+/// or through `/dev/fd` (EINVAL); and readlink, an open and stat through a
+/// descriptor link to the caller's own process or thread directory that
+/// follow more links in all than the limit, the descriptor link and the
+/// selector link before it counted (ELOOP). Each listing may leave entries
+/// out, keeping the native order and types, except a `task` listing, which
+/// lists every thread. Where Detcore serves these
+/// directories (KVM, package K slice K10,
+/// https://github.com/rrnewton/hermit/issues/5039) it lists the files it
+/// renders, the `fd` directories it serves and `task`; before, the KVM
+/// provider refused them (EACCES). On ptrace the kernel serves them and
+/// Detcore lists them from its model, now in Linux's order by their
+/// spellings within `/proc`. Returns the listings at `--proc=standard`.
+fn read_the_callers_own_proc_directories(backend: &str) -> Vec<(String, Vec<String>)> {
+    let native = procfs_own_directory_native(&[]);
+    assert_eq!(native.lines().count(), OWN_DIRECTORY_LINES, "{native}");
+    assert!(native.ends_with("done\n"), "{native}");
+    for line in [
+        "/proc/self open O_RDONLY|O_NOFOLLOW: ELOOP",
+        "/proc/self open O_PATH|O_NOFOLLOW|O_DIRECTORY: ENOTDIR",
+        "/proc/self open O_RDONLY|O_CREAT|O_EXCL: EEXIST",
+        "/proc/self readlink: <pid>",
+        "/proc/self/ lstat: dir 0555",
+        "//proc/self readlink: <pid>",
+        "/proc/thread-self/status open: Pid <pid>",
+        "/proc/self/../self open O_RDONLY|O_NOFOLLOW: ELOOP",
+        "/proc/self/../self open O_PATH|O_NOFOLLOW|O_DIRECTORY: ENOTDIR",
+        "/proc/self/../self lstat: lnk 0777 nlink 1",
+        "/proc/self/../self readlink: <pid>",
+        "/proc/thread-self/../../../thread-self readlink: <pid>/task/<tid>",
+        "/proc/self/fd/.. readlink: EINVAL",
+        "/proc/thread-self/status/. open: ENOTDIR",
+        "/proc/self/task/<pid>/status/. stat: ENOTDIR",
+        "/proc/self/task/999999999/ open O_RDONLY|O_CREAT: EISDIR",
+        "/proc/self/task/999999999/ open O_RDONLY|O_CREAT|O_EXCL: EISDIR",
+        "/proc/self/task/999999999/ open O_RDONLY|O_CREAT|O_DIRECTORY: EINVAL",
+        "/proc/self/task/999999999 open O_RDONLY|O_CREAT|O_DIRECTORY: EINVAL",
+        "/proc/self/task/999999999/. open O_RDONLY|O_CREAT|O_DIRECTORY: EINVAL",
+        "/proc/self/task/999999999/. open O_RDONLY|O_CREAT: ENOENT",
+        "[self]../self readlinkat: <pid>",
+        "[self].. readlinkat: EINVAL",
+        "[thread-self]../../../thread-self readlinkat: <pid>/task/<pid>",
+        "/proc readlink: EINVAL",
+        "/proc/self/fd readlink: EINVAL",
+        "/proc/self/task/999999999/../../fd/ open O_RDONLY|O_CREAT|O_DIRECTORY: EINVAL",
+        "/proc/self/task/999999999/../../cmdline faccessat mode 0100: EINVAL",
+        "/proc/self/task/999999999/../../exe statx unknown flag: EINVAL",
+        "/proc/self/task/999999999/../../exe newfstatat: ENOENT",
+        "40 self/.. hops then self/cmdline open O_RDONLY|O_CREAT|O_DIRECTORY: EINVAL",
+        "40 self/.. hops then self/cmdline open O_RDONLY: ELOOP",
+        "/proc/self open O_TMPFILE|O_RDWR: EPERM",
+        "/proc/self/fd/<pfd>/.. readlink: EINVAL",
+        "/dev/fd/ readlink: EINVAL",
+        "/proc/self/fd/<process fd>/../ then 38 self/.. hops then self/ readlink: ELOOP",
+        "/proc/self/fd/<process fd>/../ then 39 self/.. hops then self/ open O_RDONLY|O_DIRECTORY: ELOOP",
+        "/proc/self/fd/<thread fd>/../../../ then 38 self/.. hops then self/ stat: ELOOP",
+        "/proc/self/fd/<thread fd>/../../../ then 39 self/.. hops then self/ readlink: ELOOP",
+    ] {
+        assert!(
+            native.lines().any(|native| native == line),
+            "{line}: {native}"
+        );
+    }
+    let standard = assert_own_directory_transcript(
+        &native,
+        &procfs_own_directory_at_l2(backend, "standard", &[]),
+        &format!("{backend} at --proc=standard"),
+    );
+    assert_own_directory_transcript(
+        &native,
+        &procfs_own_directory_at_l2(backend, "minimal", &[]),
+        &format!("{backend} at --proc=minimal"),
+    );
+    standard
+}
+
+/// The own-directory guest's modes besides the default and held-thread,
+/// each with a line its native run prints, each a run that, where a backend
+/// cannot answer it, stops with the policy's refusal: the opens of `/proc/self` and
+/// `/proc/thread-self` that open each link itself (`O_PATH|O_NOFOLLOW`;
+/// `link`), the same through `..` (`dotdot-link`), and a second thread's
+/// open of its own `status` by a spelling with a `.` component
+/// (`thread-status-dot`, `task-status-dot`).
+const OWN_DIRECTORY_MODES: [(&str, &str); 4] = [
+    ("link", "/proc/self open O_PATH|O_NOFOLLOW: lnk 0777, <pid>"),
+    (
+        "dotdot-link",
+        "/proc/self/../self open O_PATH|O_NOFOLLOW: lnk 0777, <pid>",
+    ),
+    (
+        "thread-status-dot",
+        "/proc/thread-self/./status open: Pid <tid>",
+    ),
+    (
+        "task-status-dot",
+        "/proc/self/./task/<tid>/status open: Pid <tid>",
+    ),
+];
+
+/// [`read_the_callers_own_proc_directories`] on ptrace, and the guest's
+/// other modes ([`OWN_DIRECTORY_MODES`]), which the kernel answers, as
+/// natively. Then a second thread's directory held while it exits (the
+/// guest's held-thread mode), which the kernel answers as natively, and
+/// where Detcore ends a listing it stored once the thread is gone; but the
+/// kernel's fstat of a reaped task's directory leaves Detcore no inode
+/// number to give, which it records as a determinism loss
+/// (`procfs_inode::refuse_deleted`), so that run is compared under
+/// `--strict` alone, not at L2.
+#[test]
+fn the_callers_own_proc_directories_answer_as_linux() {
+    read_the_callers_own_proc_directories("ptrace");
+    assert_eq!(
+        procfs_own_directory_strict("ptrace", &["held-thread"]),
+        held_thread_native(),
+        "ptrace held-thread"
+    );
+    for (mode, line) in OWN_DIRECTORY_MODES {
+        let native = procfs_own_directory_native(&[mode]);
+        assert!(
+            native.lines().any(|native| native == line) && native.ends_with("done\n"),
+            "native {mode}: {native}"
+        );
+        assert_eq!(
+            procfs_own_directory_at_l2("ptrace", "standard", &[mode]),
+            native,
+            "ptrace {mode}"
+        );
+    }
+}
+
+/// [`read_the_callers_own_proc_directories`] on KVM, where each process or
+/// thread directory lists exactly what Detcore serves in it (the files it
+/// renders, `fd`, and a process's `task`), in Linux's order; and a second
+/// thread's directory held while it exits (the guest's held-thread mode),
+/// which Detcore answers from the directory's binding, at L2, as natively.
+/// Then the guest's other modes ([`OWN_DIRECTORY_MODES`]), each of which stops with
+/// the policy's exit and names why: the open of `/proc/self` itself
+/// (`O_PATH|O_NOFOLLOW`), by its plain spelling and through `..`, which
+/// opens the link on Linux and for which this backend has no object; and a
+/// second thread's `status` by a spelling with a `.` component, which this
+/// backend's procfs would answer with its process's (or not at all), not the
+/// thread's.
+#[test]
+fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
+    let test = "run_kvm_the_callers_own_proc_directories_answer_as_linux";
+    if kvm_unavailable(test) {
+        return;
+    }
+    let process = [
+        "./d",
+        "../d",
+        "task/d",
+        "fd/d",
+        "auxv/r",
+        "comm/r",
+        "cmdline/r",
+        "stat/r",
+        "statm/r",
+        "numa_maps/r",
+        "mounts/r",
+        "mountinfo/r",
+        "smaps/r",
+        "smaps_rollup/r",
+        "cgroup/r",
+        "io/r",
+        "arch_status/r",
+    ];
+    for (label, entries) in read_the_callers_own_proc_directories("kvm") {
+        let expected: Vec<&str> = match label.as_str() {
+            // Equal to the native listing (`assert_own_directory_transcript`).
+            label if OWN_DIRECTORY_TASK_LISTINGS.contains(&label) => continue,
+            "/proc/thread-self" | "/proc/<pid>/task/<tid>" | "/proc/self/task/<tid>/" => process
+                .iter()
+                .copied()
+                .filter(|entry| *entry != "task/d")
+                .collect(),
+            _ => process.to_vec(),
+        };
+        assert_eq!(entries, expected, "kvm {label}");
+    }
+    assert_eq!(
+        procfs_own_directory_at_l2("kvm", "standard", &["held-thread"]),
+        held_thread_native(),
+        "kvm held-thread"
+    );
+    let guest = procfs_own_directory_guest();
+    let link_reason = ["an O_PATH open of /proc/self that does not follow it"; 2];
+    let status_reason = "which is not its thread group leader, cannot be served";
+    for ((mode, _), reasons) in OWN_DIRECTORY_MODES.into_iter().zip([
+        link_reason,
+        link_reason,
+        [
+            "/proc/thread-self/./status, the status of thread",
+            status_reason,
+        ],
+        ["/proc/self/./task/", status_reason],
+    ]) {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let args = [
+            "--backend",
+            "kvm",
+            "run",
+            "--strict",
+            "--proc=standard",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            directory.path().to_str().expect("directory path is UTF-8"),
+            mode,
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "kvm {mode} did not stop with the policy's exit: {log}"
+        );
+        for reason in reasons {
+            assert!(
+                log.contains(reason),
+                "kvm {mode}: the refusal does not name its reason ({reason}): {log}"
+            );
+        }
+    }
 }
