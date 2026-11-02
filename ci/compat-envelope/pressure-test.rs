@@ -16432,7 +16432,7 @@ fn focused_run_type_plan_selects_each_cell(
         repetitions: Some(1),
         probe_disabled: probe_backend.is_some(),
         backend: probe_backend.map(str::to_string),
-        run_timeout_seconds: Some(1_000_000),
+        run_timeout_seconds: Some(1_000_000_000),
         ..CellSelection::default()
     };
     let (_, dag) =
@@ -16542,7 +16542,7 @@ fn validate_run_state_plan_check(
     let selection = CellSelection {
         cells_file: Some(cells_file),
         repetitions: Some(1),
-        run_timeout_seconds: Some(1_000_000),
+        run_timeout_seconds: Some(1_000_000_000),
         ..CellSelection::default()
     };
     let (_, dag) =
@@ -16917,7 +16917,7 @@ fn run_state_exclusive_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         &CellSelection {
             cells_file: Some(cells_file),
             repetitions: Some(2),
-            run_timeout_seconds: Some(1_000_000),
+            run_timeout_seconds: Some(1_000_000_000),
             ..CellSelection::default()
         },
     )?;
@@ -17065,7 +17065,7 @@ fn parity_reference_sample_self_test(root: &Path, scratch: &Path) -> Result<(), 
     let selection = CellSelection {
         sample: Some(SAMPLE),
         seed: Some(seed),
-        run_timeout_seconds: Some(1_000_000),
+        run_timeout_seconds: Some(1_000_000_000),
         ..CellSelection::default()
     };
     let (_, dag) =
@@ -20800,7 +20800,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         backend: Some("kvm".into()),
         probe_disabled: true,
         repetitions: Some(1),
-        run_timeout_seconds: Some(1_000_000),
+        run_timeout_seconds: Some(1_000_000_000),
         ..CellSelection::default()
     };
     let disabled_batch = pressure_cells(root, &disabled_batch_selection)?;
@@ -22052,7 +22052,7 @@ fn self_test(root: &Path) -> Result<(), String> {
 
     let red_batch_selection = CellSelection {
         repetitions: Some(2),
-        run_timeout_seconds: Some(1_000_000),
+        run_timeout_seconds: Some(1_000_000_000),
         ..CellSelection::default()
     };
     let selected_red_batch = pressure_cells(root, &red_batch_selection)?;
@@ -22076,7 +22076,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     let green_batch_selection = CellSelection {
         green: true,
         repetitions: Some(2),
-        run_timeout_seconds: Some(1_000_000),
+        run_timeout_seconds: Some(1_000_000_000),
         ..CellSelection::default()
     };
     let expected_green_ids: BTreeSet<_> = tracked
@@ -28332,7 +28332,7 @@ mod pressure_sample_tests {
             backend: Some("ptrace".into()),
             repetitions: Some(PROMOTION_REPETITIONS),
             no_retry: true,
-            run_timeout_seconds: Some(1_000_000),
+            run_timeout_seconds: Some(1_000_000_000),
             run_id_prefix: Some("green-summary-divergence".into()),
             ..CellSelection::default()
         };
@@ -31317,7 +31317,7 @@ mod pressure_sample_tests {
         let selection = CellSelection {
             sample: Some(1),
             seed: Some(seed),
-            run_timeout_seconds: Some(1_000_000),
+            run_timeout_seconds: Some(1_000_000_000),
             ..CellSelection::default()
         };
         let (mut metadata, dag) = write_plan_after_scorecard_check(
@@ -31994,7 +31994,7 @@ mod pressure_sample_tests {
         let selection = CellSelection {
             sample: Some(1),
             seed: Some(seed),
-            run_timeout_seconds: Some(1_000_000),
+            run_timeout_seconds: Some(1_000_000_000),
             ..CellSelection::default()
         };
         let (metadata, dag) = write_plan_after_scorecard_check(
@@ -32122,7 +32122,7 @@ mod pressure_sample_tests {
                 sample: Some(1),
                 seed: Some(seed),
                 repetitions: Some(1),
-                run_timeout_seconds: Some(1_000_000),
+                run_timeout_seconds: Some(1_000_000_000),
                 ..CellSelection::default()
             },
             true,
@@ -32141,7 +32141,7 @@ mod pressure_sample_tests {
             CellSelection {
                 cells_file: Some(cells_file.clone()),
                 repetitions: Some(1),
-                run_timeout_seconds: Some(1_000_000),
+                run_timeout_seconds: Some(1_000_000_000),
                 ..CellSelection::default()
             },
             false,
@@ -32310,7 +32310,7 @@ mod pressure_sample_tests {
             &CellSelection {
                 sample: Some(1),
                 seed: Some(seed),
-                run_timeout_seconds: Some(1_000_000),
+                run_timeout_seconds: Some(1_000_000_000),
                 ..CellSelection::default()
             },
         )
@@ -32584,7 +32584,7 @@ mod pressure_sample_tests {
                 mode: Some(cell.mode.clone()),
                 backend: Some(cell.backend.clone()),
                 repetitions: Some(1),
-                run_timeout_seconds: Some(1_000_000),
+                run_timeout_seconds: Some(1_000_000_000),
                 ..CellSelection::default()
             },
         )
