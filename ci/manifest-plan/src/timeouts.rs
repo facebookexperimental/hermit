@@ -10,8 +10,10 @@ pub const MIN_TIMEOUT_SECONDS: u64 = 1;
 pub const MAX_TIMEOUT_SECONDS: u64 = 1800;
 /// Owner-approved ordinary-cell CPU bound: ceil(1.5 * 14.298 s) = 22 s.
 pub const DEFAULT_TEST_CPU_TIMEOUT_SECONDS: u64 = 22;
-/// Owner-approved ordinary-test wall bound: ceil(4 * 14.019 s) = 57 s.
-pub const DEFAULT_TEST_WALL_TIMEOUT_SECONDS: u64 = 57;
+/// Owner-approved ordinary-test wall bound (2026-11-01 policy): 8x the
+/// 22 s default CPU base, rounded up = 180 s. CPU caps stay the tight limit;
+/// this wall is only a backstop for a wedged process under -j16 contention.
+pub const DEFAULT_TEST_WALL_TIMEOUT_SECONDS: u64 = 180;
 pub const TEST_CPU_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER";
 pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER";
 
@@ -2046,7 +2048,7 @@ mod tests {
     #[test]
     fn owner_defaults_are_the_conservative_ceilings() {
         assert_eq!(DEFAULT_TEST_CPU_TIMEOUT_SECONDS, 22);
-        assert_eq!(DEFAULT_TEST_WALL_TIMEOUT_SECONDS, 57);
+        assert_eq!(DEFAULT_TEST_WALL_TIMEOUT_SECONDS, 180);
         assert_eq!(cpu_bound_from_p90_usec(14_298_000), 22);
         assert_eq!(wall_bound_from_p90_millis(14_019), 57);
     }
