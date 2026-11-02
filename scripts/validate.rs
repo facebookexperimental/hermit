@@ -13352,6 +13352,26 @@ mod case_selection_tests {
     }
 
     #[test]
+    fn fixture_conf_binds_each_declared_fixture_read_only() {
+        let conf = fixture_containers_conf(&[
+            (
+                "HERMIT_MAPPED_PACKET_V11_IMAGE".into(),
+                "/run/target/validate-fixtures/HERMIT_MAPPED_PACKET_V11_IMAGE".into(),
+            ),
+            (
+                "HERMIT_RETAINED_PACKAGE_TEST_INSTALL".into(),
+                "/run/target/validate-fixtures/HERMIT_RETAINED_PACKAGE_TEST_INSTALL".into(),
+            ),
+        ]);
+        assert!(conf.contains(
+            "\"HERMIT_MAPPED_PACKET_V11_IMAGE=/fixtures/HERMIT_MAPPED_PACKET_V11_IMAGE\""
+        ));
+        assert!(conf.contains(
+            "\"type=bind,source=/run/target/validate-fixtures/HERMIT_RETAINED_PACKAGE_TEST_INSTALL,destination=/fixtures/HERMIT_RETAINED_PACKAGE_TEST_INSTALL,ro\""
+        ));
+    }
+
+    #[test]
     fn only_plan_accepts_nodes_from_other_lanes_but_not_unknown_tags() {
         // A rerun of a finished run's failed set names nodes from every
         // lane that run executed. privileged-pmu.preemption is not in the
@@ -28635,6 +28655,75 @@ mod scope_reexec_ledger_history_tests {
     }
 }
 
+/// The containers.conf a fixture first hop installs: each declared
+/// fixture bound read-only at /fixtures/<NAME>, with NAME set to that
+/// container path for processes podman starts.
+fn fixture_containers_conf(fixtures: &[(String, String)]) -> String {
+    let escape = |value: &str| value.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut out = String::from("[containers]\n");
+    out.push_str("env = [");
+    for (index, (name, _)) in fixtures.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("\"{}=/fixtures/{}\"", escape(name), escape(name)));
+    }
+    out.push_str("]\nmounts = [");
+    for (index, (name, host)) in fixtures.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!(
+            "\"type=bind,source={},destination=/fixtures/{},ro\"",
+            escape(host),
+            escape(name)
+        ));
+    }
+    out.push_str("]\n");
+    out
+}
+
+/// Install the pinned-cell first hop for launcher-declared fixtures.
+/// No fixtures declared: no-op. A declared name without an existing
+/// host path refuses: a cell must never run with a fixture other than
+/// the one that was declared.
+fn install_fixture_first_hop(root: &Path) -> Result<(), String> {
+    let declared = std::env::var("HERMIT_VALIDATE_FIXTURES").unwrap_or_default();
+    let names: Vec<String> = declared
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    let mut fixtures = Vec::new();
+    for name in &names {
+        let host = std::env::var(name)
+            .map_err(|_| format!("fixture {name} is declared but its path env is unset"))?;
+        if !Path::new(&host).exists() {
+            return Err(format!(
+                "fixture {name} names {host}, which does not exist in this run"
+            ));
+        }
+        fixtures.push((name.clone(), host));
+    }
+    let dir = root.join("target/validation/podman-fixtures");
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    let conf = dir.join("containers.conf");
+    std::fs::write(&conf, fixture_containers_conf(&fixtures))
+        .map_err(|error| format!("cannot write {}: {error}", conf.display()))?;
+    std::env::set_var("CONTAINERS_CONF_OVERRIDE", &conf);
+    eprintln!(
+        "validate: fixture first hop: {} fixture(s) bound at /fixtures/ via {}",
+        fixtures.len(),
+        conf.display()
+    );
+    Ok(())
+}
+
 fn run(
     durable_slot: &mut Option<DurableLog>,
     service_result_path: Option<&Path>,
@@ -28759,6 +28848,18 @@ fn run(
 
     let level_name = args.level.name().to_string();
     let root = repo_root();
+    // Declared fixtures (HERMIT_VALIDATE_FIXTURES, set by the launcher's
+    // --fixture): give pinned-root cells a real first hop. The placed
+    // copies live under target/, which the pinned wrapper overmounts
+    // with the split target, and cell env forwarding is a fixed name
+    // list — so bind each fixture read-only at /fixtures/<NAME> and set
+    // NAME to that container path through a run-owned containers.conf
+    // (CONTAINERS_CONF_OVERRIDE reaches the wrapper's podman, and only
+    // podman invocations in this process tree see it). Host steps keep
+    // reading NAME as the host path from the launcher.
+    if let Err(error) = install_fixture_first_hop(&root) {
+        return RunSummary::refused(2, &level_name, "fixture first hop", vec![error]);
+    }
     if std::env::set_current_dir(&root).is_err() {
         return RunSummary::refused(
             2,
