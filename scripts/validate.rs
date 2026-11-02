@@ -13352,6 +13352,38 @@ mod case_selection_tests {
     }
 
     #[test]
+    fn only_plan_accepts_nodes_from_other_lanes_but_not_unknown_tags() {
+        // A rerun of a finished run's failed set names nodes from every
+        // lane that run executed. privileged-pmu.preemption is not in the
+        // portable lane subset; the plan must still build (committed-DAG
+        // fallback), while a tag no DAG knows still refuses by name.
+        let root = test_source_root();
+        let args = parse_argv(&[
+            "--only".to_string(),
+            "portable".to_string(),
+            "test.cli,privileged-pmu.preemption".to_string(),
+        ])
+        .unwrap();
+        let plan = build_plan(&root, &args, &std::env::temp_dir()).unwrap();
+        let tags: std::collections::BTreeSet<String> =
+            plan.cfg.steps.iter().map(|step| step.tag()).collect();
+        assert!(tags.contains("test.cli"), "{tags:?}");
+        assert!(tags.contains("privileged-pmu.preemption"), "{tags:?}");
+
+        let unknown = parse_argv(&[
+            "--only".to_string(),
+            "portable".to_string(),
+            "no.such_node".to_string(),
+        ])
+        .unwrap();
+        let error = match build_plan(&root, &unknown, &std::env::temp_dir()) {
+            Ok(_) => panic!("an unknown tag planned successfully"),
+            Err(error) => error,
+        };
+        assert!(error.contains("no.such_node"), "{error}");
+    }
+
+    #[test]
     fn injection_filters_nextest_nodes_and_refuses_others_by_name() {
         let cfg = validate_plan::validation_config(&test_source_root()).unwrap();
         let mut steps = cfg.steps.clone();
@@ -13890,6 +13922,24 @@ fn keep_ancestor_baseline(
     })
 }
 
+/// Select focused tags (with dependency closure) from the lane subset,
+/// falling back to the full committed DAG when the lane subset does not
+/// know a requested tag. A rerun of a finished run's failed set names
+/// nodes from every lane that run executed (portable, privileged,
+/// buck-e2e); refusing such a node because the focused lane subset omits
+/// it makes a one-command rerun impossible. Tags unknown to the
+/// committed DAG itself still refuse, naming them.
+fn select_focused_steps(
+    lane_cfg: &DagConfig,
+    committed: &DagConfig,
+    tags: &[String],
+) -> Result<DagConfig, String> {
+    match dagrun::select_steps_by_tags(lane_cfg, tags, true) {
+        Ok(cfg) => Ok(cfg),
+        Err(_) => dagrun::select_steps_by_tags(committed, tags, true),
+    }
+}
+
 /// Runtime plan boundary: every executable path is a selection from the one
 /// committed `ci/dag/validate.json`. The maintenance generator is separate and
 /// never reaches this function.
@@ -13920,8 +13970,11 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         };
         tags.extend(preflight.iter().map(|tag| (*tag).to_string()));
         retain_focused_manifest_producers(&lane_cfg, &mut tags);
-        let mut cfg =
-            dagrun::select_steps_by_tags(&lane_cfg, &tags.into_iter().collect::<Vec<_>>(), true)?;
+        let mut cfg = select_focused_steps(
+            &lane_cfg,
+            &committed,
+            &tags.into_iter().collect::<Vec<_>>(),
+        )?;
         inject_case_filters(&mut cfg.steps, cases)?;
         let plan = Plan {
             planned_test_nodes: test_nodes_of(&cfg),
@@ -13974,8 +14027,11 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             }
         }));
         retain_focused_manifest_producers(&lane_cfg, &mut tags);
-        let cfg =
-            dagrun::select_steps_by_tags(&lane_cfg, &tags.into_iter().collect::<Vec<_>>(), true)?;
+        let cfg = select_focused_steps(
+            &lane_cfg,
+            &committed,
+            &tags.into_iter().collect::<Vec<_>>(),
+        )?;
         let plan = Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
