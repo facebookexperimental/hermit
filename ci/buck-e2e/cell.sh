@@ -17,12 +17,12 @@
 #                                  (default: Tpx timeout - 30 s; Tpx returns no
 #                                  artifacts at all from an RE action it kills)
 #        CELL_BUNDLE_MODE          pinned-root bundle preparation: "shared"
-#                                  (default) hard-links the bundle as an overlay
-#                                  lower in the container, so per-cell writes
-#                                  copy up to a per-cell upper and never reach
-#                                  the shared bundle; "copy" is the previous
-#                                  per-cell reflink copy, kept so the two can
-#                                  be compared by CELL_BUNDLE_PREP_NS
+#                                  (default) binds the staged bundle read-only
+#                                  into the container as an overlay lower, so
+#                                  per-cell writes copy up to a per-cell upper
+#                                  and never reach the shared bundle; "copy" is
+#                                  the previous per-cell reflink copy, kept so
+#                                  the two can be compared by CELL_BUNDLE_PREP_NS
 #        HERMIT_E2E_KVM_SLOTS      how many local KVM cells may run at once on this host
 #                                  (default 16; see acquire_kvm_slot)
 #        HERMIT_E2E_KVM_SLOT_DIR   where their slot files live
@@ -272,17 +272,24 @@ PY
     # may sandbox it further), and the wrapper bind-mounts $R at /src with private
     # propagation, so a mount cell.sh could create would not reliably appear in the
     # container. The privileged container is the mount context that can hold an
-    # overlay, so in shared mode the host only hard-links the bundle (cp -al:
-    # directories are per-cell copies, files share inodes with the bundle) as the
-    # overlay's lower layer, and the container prologue below mounts a writable
-    # overlay over /src/bundle with its upper and work directories on the per-cell
-    # scratch under /src (.bundle-upper/.bundle-work, i.e. $R on the host). Every
-    # write then copies up into the upper and never reaches the shared bundle. If
-    # hard links are impossible (bundle and scratch on different filesystems) the
-    # lower layer is the old reflink copy instead, still overlay-isolated; if the
-    # overlay mount itself fails in the container, the prologue breaks the hard
-    # links with a reflink copy before the harness runs. In copy mode the host
-    # reflink copy (about 1 s on btrfs) is the bundle, exactly as before.
+    # overlay, so in shared mode the wrapper binds the staged bundle read-only at
+    # /bundle-lower (--bundle-lower) and the container prologue below mounts a
+    # writable overlay over /src/bundle with that as its lower layer and its upper
+    # and work directories on the per-cell scratch under /src
+    # (.bundle-upper/.bundle-work, i.e. $R on the host). Every write then copies up
+    # into the upper and never reaches the shared bundle. If the overlay mount fails
+    # in the container, the prologue reflink-copies /bundle-lower into /src/bundle
+    # before the harness runs. In copy mode the host reflink copy (about 1 s on
+    # btrfs) is the bundle, exactly as before.
+    #
+    # The lower layer must not be a hard-linked copy of the bundle (cp -al, as it
+    # was from 3febe765 to 2026-11-02): overlayfs reports a lower file's own link
+    # count (fs/overlayfs/inode.c ovl_getattr), Detcore passes a regular file's link
+    # count through as the guest-visible fact it is, and every live cell's copy was
+    # one more link to the same inodes. A guest's stat of a bundle file then said
+    # nlink=164 in run 1 and nlink=167 in run 2 of one cell, as other cells started;
+    # that was the first divergence of 810 of the 813 non-passing Buck observations
+    # in the full validate of cd856249.
     R=$W/root
     mkdir -p "$R/target" "$R/agent-utils/rs/target" "$R/agent-utils/rs/.agent-utils-locks" \
         "$R/agent-utils/rs/.agent-utils-snapshots" "$W/results/buck-cell-out" "$W/pinned" ||
@@ -292,13 +299,8 @@ PY
         cp -a --reflink=auto "$B" "$R/bundle" ||
             emit_fatal "cannot place the bundle in the pinned-root scratch tree"
     else
-        mkdir -p "$R/.bundle-upper" "$R/.bundle-work" ||
+        mkdir -p "$R/bundle" "$R/.bundle-upper" "$R/.bundle-work" ||
             emit_fatal "cannot create the pinned-root bundle overlay scratch"
-        if ! cp -al "$B" "$R/bundle" 2>"$W/bundle-prep.log"; then
-            rm -rf "$R/bundle"
-            cp -a --reflink=auto "$B" "$R/bundle" ||
-                emit_fatal "cannot place the bundle in the pinned-root scratch tree"
-        fi
     fi
     bundle_prep_end_ns=$(date +%s%N)
     bundle_prep_ns=$((bundle_prep_end_ns - bundle_prep_start_ns))
@@ -326,26 +328,21 @@ printf "%s\n" "$deps" | while read -r name arrow path rest; do
     esac
 done
 exec "$@"'
-    # Shared-mode container prologue: mount the writable overlay over the hard-linked
-    # bundle (upper/work are the per-cell scratch directories beside it under /src),
-    # then, for a DBT cell, the same library links link_dbt_runtime makes in the
-    # private copy, now in the overlay's upper. If the overlay mount fails (a
-    # container without overlay support), break the hard links with a reflink copy
-    # first, so a write still cannot reach the shared bundle. Ends by exec'ing the
-    # rest of the command, like link_dbt_runtime.
+    # Shared-mode container prologue: mount the writable overlay, lower the read-only
+    # bundle bind, over the empty /src/bundle (upper/work are the per-cell scratch
+    # directories beside it under /src), then, for a DBT cell, the same library links
+    # link_dbt_runtime makes in the private copy, now in the overlay's upper. If the
+    # overlay mount fails (a container without overlay support), reflink-copy the
+    # lower into /src/bundle instead, so the cell still has a private writable bundle.
+    # Ends by exec'ing the rest of the command, like link_dbt_runtime.
     bundle_setup='set -eu
-bundle=${1%/} backend=$2
-shift 2
+lower=${1%/} bundle=${2%/} backend=$3
+shift 3
 root=$(dirname "$bundle")
 upper=$root/.bundle-upper work=$root/.bundle-work
-mkdir -p "$upper" "$work"
-if ! mount -t overlay overlay -o "lowerdir=$bundle,upperdir=$upper,workdir=$work" "$bundle" 2>/dev/null; then
-    lower=$bundle.cell-lower
-    rm -rf "$lower"
-    mv "$bundle" "$lower"
-    mkdir -p "$bundle"
+mkdir -p "$bundle" "$upper" "$work"
+if ! mount -t overlay overlay -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$bundle" 2>/dev/null; then
     cp -a --reflink=auto "$lower/." "$bundle/"
-    rm -rf "$lower"
 fi
 if [ "$backend" = dbt ]; then
     r=$bundle/hermit/install/rsrcs
@@ -361,9 +358,10 @@ if [ "$backend" = dbt ]; then
     done
 fi
 exec "$@"'
-    prologue=()
+    prologue=() bundle_lower=()
     if [[ $bundle_mode == shared ]]; then
-        prologue=(sh -c "$bundle_setup" bundle-setup /src/bundle/ "$BACKEND")
+        bundle_lower=(--bundle-lower "$B")
+        prologue=(sh -c "$bundle_setup" bundle-setup /bundle-lower /src/bundle/ "$BACKEND")
     elif [[ $BACKEND == dbt ]]; then
         prologue=(sh -c "$link_dbt_runtime" link-dbt-runtime /src/bundle/hermit/install/rsrcs)
     fi
@@ -387,7 +385,7 @@ exec "$@"'
         E2E_RESULT_ROOT="$W/results" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
         timeout --kill-after=10 "$outer" \
-        "$wrapper" --src "$R" --out "$W/pinned" --src-rw \
+        "$wrapper" --src "$R" --out "$W/pinned" --src-rw "${bundle_lower[@]}" \
         --env HERMIT_E2E_EMPTY_WORKDIR --env VALIDATE_RUN_STATE --env E2E_RESULT_ROOT \
         --env E2E_RUN_ID --env E2E_KEEP_VERIFY_LOGS --env E2E_PARITY_POST_PASS \
         --env HERMIT_EPOCH -- \

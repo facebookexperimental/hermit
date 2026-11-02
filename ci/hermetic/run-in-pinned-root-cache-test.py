@@ -104,6 +104,7 @@ class CargoCacheMounts(unittest.TestCase):
         git_location=None,
         command=None,
         caller_affinity=None,
+        bundle_lower=None,
     ):
         # The wrapper gets this process's environment, as it does in
         # production, so an inherited Git location variable reaches it.
@@ -121,6 +122,8 @@ class CargoCacheMounts(unittest.TestCase):
         if run_state is not None:
             env["VALIDATE_RUN_STATE"] = str(run_state)
             forwarded += ["--env", "VALIDATE_RUN_STATE"]
+        if bundle_lower is not None:
+            forwarded += ["--bundle-lower", str(bundle_lower)]
         result = subprocess.run(
             [
                 "bash",
@@ -633,6 +636,42 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertIn("VALIDATE_RUN_STATE=/validate-run-state", argv)
         self.assertEqual((run_state / "fixture").read_bytes(), b"existing fixture")
         self.assertEqual(argv[-2:], ["/not-executed/command", "literal argument"])
+
+    def test_bundle_lower_is_a_read_only_bind_that_adds_no_link(self):
+        # ci/buck-e2e/cell.sh shares one staged bundle across concurrent cells as
+        # an overlay lower. A bind leaves its files' link counts alone; a guest
+        # stat reports them, so a hard-linked copy per cell diverged run 1 from
+        # run 2.
+        bundle = self.root / "staged bundle"
+        (bundle / "src").mkdir(parents=True)
+        (bundle / "src/test.sh").write_text("#!/bin/sh\n")
+        result, calls = self.invoke(bundle_lower=bundle)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = calls[-1]
+        self.assertEqual(argv[0], "run")
+        self.assertIn(
+            f"type=bind,source={bundle},destination=/bundle-lower,ro=true", argv
+        )
+        self.assertEqual((bundle / "src/test.sh").stat().st_nlink, 1)
+
+    def test_no_bundle_lower_mounts_nothing_there(self):
+        result, calls = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any("/bundle-lower" in arg for arg in calls[-1]))
+
+    def test_unusable_bundle_lower_refuses_before_container_launch(self):
+        comma = self.root / "a,b"
+        comma.mkdir()
+        for lower, message in (
+            (self.root / "missing", "is not a directory"),
+            (comma, "cannot contain a comma"),
+        ):
+            with self.subTest(lower=lower):
+                self.capture.write_text("")
+                result, calls = self.invoke(bundle_lower=lower)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(message, result.stderr)
+                self.assertFalse(any(call[0] == "run" for call in calls), calls)
 
     def test_relative_run_state_refuses_before_container_launch(self):
         result, calls = self.invoke(run_state="relative-state")

@@ -211,9 +211,12 @@ sys.exit(int(os.environ["FAKE_EXIT"]) if "FAKE_EXIT" in os.environ else 0 if out
 """
 
 # ci/hermetic/run-in-pinned-root.sh. `--check-image` exits FAKE_IMAGE_RC. A run records
-# its options, the --env values it was asked to forward, and the mountpoints present in
-# --src, then runs the command after `--` with /src, /results and /validate-run-state
-# mapped to --src, $E2E_RESULT_ROOT and $VALIDATE_RUN_STATE, the way podman would.
+# its options, the --env values it was asked to forward, the mountpoints present in
+# --src, and the largest link count of a file in the staged bundle ($HERMIT_E2E_BUNDLE)
+# while the container would run, then
+# runs the command after `--` with /src, /results, /validate-run-state and /bundle-lower
+# mapped to --src, $E2E_RESULT_ROOT, $VALIDATE_RUN_STATE and --bundle-lower, the way
+# podman would.
 FAKE_WRAPPER = r"""#!/usr/bin/env python3
 import json, os, subprocess, sys
 args = sys.argv[1:]
@@ -233,11 +236,16 @@ forwarded = {n: os.environ[n] for n in (opts[i + 1] for i, o in enumerate(opts) 
              if n in os.environ}
 mountpoints = sorted(p for p in ("target", "agent-utils/rs/target", "agent-utils/rs/.agent-utils-locks",
                                  "agent-utils/rs/.agent-utils-snapshots") if os.path.isdir(os.path.join(src, p)))
+lower = opts[opts.index("--bundle-lower") + 1] if "--bundle-lower" in opts else None
+bundle_max_nlink = max(os.lstat(os.path.join(d, n)).st_nlink
+                       for d, _, names in os.walk(os.environ["HERMIT_E2E_BUNDLE"]) for n in names)
 with open(calls, "a") as f:
     f.write(json.dumps({"who": "wrapper", "opts": opts, "command": command, "forwarded": forwarded,
-                        "mountpoints": mountpoints}) + "\n")
+                        "mountpoints": mountpoints, "bundle_max_nlink": bundle_max_nlink}) + "\n")
 mapping = {"/src": src, "/results": os.environ["E2E_RESULT_ROOT"],
            "/validate-run-state": os.environ["VALIDATE_RUN_STATE"]}
+if lower is not None:
+    mapping["/bundle-lower"] = lower
 env = {k: v for k, v in os.environ.items() if k not in forwarded}
 env.update({"E2E_RESULT_ROOT": "/results", "VALIDATE_RUN_STATE": "/validate-run-state",
             "HARNESS_ROOT_MAP": json.dumps(mapping)})
@@ -245,7 +253,8 @@ env.update({k: v for k, v in forwarded.items() if k not in ("E2E_RESULT_ROOT", "
 # The command is `sh -c SCRIPT NAME /src/bundle/.../rsrcs env NAME=VALUE... timeout ...
 # /src/bundle/bin/test-harness ...`: run it with the container paths among its arguments
 # mapped to the host.
-command = [mapping["/src"] + c[len("/src"):] if c.startswith("/src/bundle/") else c for c in command]
+command = [mapping["/src"] + c[len("/src"):] if c.startswith("/src/bundle/")
+           else mapping[c] if c == "/bundle-lower" else c for c in command]
 sys.exit(subprocess.run(command, env=env).returncode)
 """
 
@@ -400,7 +409,8 @@ class CellTest(unittest.TestCase):
                          "the wrapper would replace E2E_BUILD_ROOT with /src/target/e2e-build")
         self.assertNotIn("HERMIT_EPOCH", wrapper["forwarded"], "an unset HERMIT_EPOCH is not forwarded")
         self.assertEqual(command[:2], ["sh", "-c"])
-        self.assertEqual(command[3:6], ["bundle-setup", "/src/bundle/", BACKEND])
+        self.assertEqual(command[3:7], ["bundle-setup", "/bundle-lower", "/src/bundle/", BACKEND])
+        self.assertEqual(opts[opts.index("--bundle-lower") + 1], str(self.bundle))
         for assignment in ("E2E_BUILD_ROOT=/src/bundle/build", "HERMIT_BIN=/src/bundle/hermit/hermit",
                            "HERMIT_INSTALL_DIR=/src/bundle/hermit/install"):
             self.assertIn(assignment, command)
@@ -443,12 +453,28 @@ class CellTest(unittest.TestCase):
         self.assertIn("CELL_BUNDLE_PREP_NS=", stderr)
         self.assertEqual((self.bundle / "hermit" / "hermit").read_text(), "hermit\n")
 
+    def test_shared_bundle_adds_no_link_to_a_bundle_file(self) -> None:
+        # A guest's stat of a bundle file reports its link count, which Detcore passes
+        # through for a regular file. A hard-linked copy per cell made that count
+        # 1 + the cells alive at that moment, so run 1 and run 2 of one cell differed
+        # (nlink=164 vs 167) as other cells started. The bundle is bound read-only
+        # instead: while the container runs, every bundle file still has one link.
+        done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root")
+        self.assertEqual(done["status"], "passed", done)
+        [wrapper] = self.calls_by("wrapper")
+        self.assertEqual(wrapper["bundle_max_nlink"], 1, "a cell hard-linked the shared bundle")
+        for path in self.bundle.rglob("*"):
+            if path.is_file():
+                self.assertEqual(path.stat().st_nlink, 1, path)
+
     def test_copy_bundle_mode_keeps_the_reflink_copy_and_journals_it(self) -> None:
         done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", CELL_BUNDLE_MODE="copy")
         self.assertEqual(done["status"], "passed", done)
         [wrapper] = self.calls_by("wrapper")
         self.assertEqual(wrapper["command"][3:6],
                          ["link-dbt-runtime", "/src/bundle/hermit/install/rsrcs", "env"])
+        self.assertNotIn("--bundle-lower", wrapper["opts"])
+        self.assertEqual(wrapper["bundle_max_nlink"], 1)
         self.assertEqual(result["bundle_mode"], "copy")
         self.assertIsInstance(result["bundle_prep_ns"], int)
         stderr = (self.tmp / "tpx" / "artifacts" / "harness.stderr").read_text()
@@ -498,7 +524,7 @@ class CellTest(unittest.TestCase):
         self.assertEqual(done["status"], "passed", done)
         [wrapper] = self.calls_by("wrapper")
         self.assertEqual(wrapper["command"][:2], ["sh", "-c"], wrapper["command"])
-        self.assertEqual(wrapper["command"][3:6], ["bundle-setup", "/src/bundle/", "ptrace"])
+        self.assertEqual(wrapper["command"][3:7], ["bundle-setup", "/bundle-lower", "/src/bundle/", "ptrace"])
         [harness] = self.calls_by("harness")
         self.assertEqual(harness["rsrcs"], {"libshipped.so": None})
         self.assertEqual(result["harness_rc"], 0)

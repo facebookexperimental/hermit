@@ -16,7 +16,7 @@
 #
 #   usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA]
 #                                [--src-rw] [--cargo-home DIR] [--proc-locks-runtime] [--env NAME]... -- CMD...
-#                                [--nextest-calibration]
+#                                [--nextest-calibration] [--bundle-lower DIR]
 #          run-in-pinned-root.sh --check-image [--digest NAME@SHA]
 #
 # --check-image only reads the exact local image reference. It shares the late
@@ -28,6 +28,13 @@
 # status 2 before Podman runs. Production leaves it unset; the wrapper's own
 # tests shorten it. It is an environment supplement rather than a flag because
 # the late probe runs inside every pinned-root node's generated command line.
+#
+# --bundle-lower DIR mounts DIR READ-ONLY at /bundle-lower, for a command that
+# mounts its own overlay with DIR as the lower layer (ci/buck-e2e/cell.sh shares
+# one staged bundle across concurrent cells this way). A bind adds no link to
+# DIR's files, so a guest's stat of one reports the same st_nlink however many
+# cells share it; hard-linking DIR into --src did not (each live copy was one
+# more link).
 #
 # --src-rw mounts the source WRITABLE. The default is read-only and stays that
 # way, but a test phase legitimately writes into its own tree (target/ci,
@@ -53,7 +60,7 @@ set -euo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DIGEST_FILE="$HERE/image.digest"
 
-src=""; out=""; digest=""; src_mode="ro=true"; cargo_home=""
+src=""; out=""; digest=""; src_mode="ro=true"; cargo_home=""; bundle_lower=""
 proc_locks_runtime=false
 check_image=false
 nextest_calibration=false
@@ -61,7 +68,8 @@ pass_env=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h)
-            printf '%s\n' 'usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA] [--src-rw] [--cargo-home DIR] [--proc-locks-runtime] [--nextest-calibration] [--env NAME]... -- CMD...' \
+            printf '%s\n' 'usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA] [--src-rw] [--cargo-home DIR] [--proc-locks-runtime] [--nextest-calibration] [--bundle-lower DIR] [--env NAME]... -- CMD...' \
+                '--bundle-lower DIR mounts DIR read-only at /bundle-lower, as the lower layer of an overlay the command mounts itself.' \
                 '       run-in-pinned-root.sh --check-image [--digest NAME@SHA]' \
                 '--nextest-calibration captures the actual host envelope for the regular Nextest consumer using an existing prepared helper. Missing capture capability stays unqualified; bootstrap calls do not capture or compile.' \
                 'HERMIT_PINNED_IMAGE_PROBE_BOUND_S=SECONDS replaces the 120 s WALL bound on each of the two exact-image probe attempts (a positive integer; unset: 120). Production leaves it unset.'
@@ -74,6 +82,7 @@ while [[ $# -gt 0 ]]; do
         --cargo-home) cargo_home=$2; shift 2 ;;
         --proc-locks-runtime) proc_locks_runtime=true; shift ;;
         --nextest-calibration) nextest_calibration=true; shift ;;
+        --bundle-lower) bundle_lower=$2; shift 2 ;;
         --env) pass_env+=("$2"); shift 2 ;;
         --) shift; break ;;
         *) echo "run-in-pinned-root: unexpected argument '$1'" >&2; exit 2 ;;
@@ -171,6 +180,20 @@ src=$(realpath -m -- "$src")
 out=$(realpath -m -- "$out")
 if [[ -n "$cargo_home" ]]; then
     cargo_home=$(realpath -m -- "$cargo_home")
+fi
+bundle_mount=()
+if [[ -n "$bundle_lower" ]]; then
+    bundle_lower=$(realpath -m -- "$bundle_lower")
+    [[ -d "$bundle_lower" ]] || {
+        echo "run-in-pinned-root: --bundle-lower $bundle_lower is not a directory" >&2
+        exit 2
+    }
+    # Podman's --mount value is comma-framed.
+    [[ "$bundle_lower" != *,* ]] || {
+        echo "run-in-pinned-root: --bundle-lower path cannot contain a comma: $bundle_lower" >&2
+        exit 2
+    }
+    bundle_mount=(--mount "type=bind,source=$bundle_lower,destination=/bundle-lower,ro=true")
 fi
 
 # FAIL CLOSED ON A MISSING IMAGE. Falling back to a tag, or to the host, would
@@ -608,6 +631,7 @@ exec podman run --rm \
     "${cargo_mount[@]}" \
     "${git_mounts[@]}" \
     "${extra_mounts[@]}" \
+    "${bundle_mount[@]}" \
     "${calibration_mount[@]}" \
     "${env_args[@]}" \
     -e HOME=/build \
