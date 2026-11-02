@@ -101,6 +101,28 @@ pub fn selected_inventory(bytes: &[u8]) -> Result<Vec<AttemptIdentity>, String> 
     Ok(identities)
 }
 
+/// How many tests a run of this inventory will execute: every testcase whose
+/// filter-match status is `matches`. The `ignored` flag does not subtract:
+/// `nextest list` already flips an ignored testcase to `matches` exactly when
+/// the run's own arguments will run it (`--ignored`, `--include-ignored`, or
+/// `--run-ignored` in the shared selection), and to `mismatch` otherwise.
+pub fn listed_count(bytes: &[u8]) -> Result<u64, String> {
+    BinaryMap::from_nextest_inventory(bytes)?;
+    let inventory: NextestInventory =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let mut listed = 0u64;
+    for suite in inventory.rust_suites.into_values() {
+        for case in suite.testcases.into_values() {
+            match case.filter_match.status.as_str() {
+                "matches" => listed += 1,
+                "mismatch" => {}
+                status => return Err(format!("unknown Nextest filter status {status:?}")),
+            }
+        }
+    }
+    Ok(listed)
+}
+
 pub const BUDGET_SCHEMA: u64 = 1;
 pub const CALIBRATION_PATH: &str = ".config/nextest-budgets.json";
 

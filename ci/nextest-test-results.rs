@@ -24,6 +24,7 @@ use nextest_cpu::AttemptRecord;
 use nextest_cpu::BinaryMap;
 use nextest_cpu::CpuReport;
 use nextest_cpu::read_attempt_records;
+use nextest_cpu::listed_count;
 use nextest_cpu::read_binary_map;
 use nextest_cpu::write_binary_map_atomic;
 use nextest_cpu::write_report_atomic;
@@ -40,7 +41,7 @@ mod nextest_cpu;
 
 fn usage() {
     println!(
-        "usage: nextest-test-results.rs EVENTS_JSONL NEXTEST_STATUS OUTPUT_OR_DASH [ATTEMPT_RECORD_DIR BINARY_MAP CPU_REPORT_OR_DASH]\n       nextest-test-results.rs --write-binary-map NEXTEST_INVENTORY_JSON OUTPUT"
+        "usage: nextest-test-results.rs EVENTS_JSONL NEXTEST_STATUS OUTPUT_OR_DASH [ATTEMPT_RECORD_DIR BINARY_MAP CPU_REPORT_OR_DASH]\n       nextest-test-results.rs --write-binary-map NEXTEST_INVENTORY_JSON OUTPUT\n       nextest-test-results.rs --listed-count NEXTEST_INVENTORY_JSON"
     );
 }
 
@@ -609,6 +610,19 @@ fn run() -> Result<(), ProducerError> {
     };
     if first == "--help" || first == "-h" {
         usage();
+        return Ok(());
+    }
+    if first == "--listed-count" {
+        let inventory = args
+            .next()
+            .ok_or_else(|| "nextest-test-results missing NEXTEST_INVENTORY_JSON".to_string())?;
+        if args.next().is_some() {
+            return Err("nextest-test-results listed-count mode received too many arguments".into());
+        }
+        let bytes = fs::read(&inventory)
+            .map_err(|error| format!("cannot read nextest inventory {inventory}: {error}"))?;
+        let listed = listed_count(&bytes)?;
+        println!("{listed}");
         return Ok(());
     }
     if first == "--write-binary-map" {
@@ -1552,6 +1566,39 @@ mod tests {
                 "observed_cpu_usec": 12_345,
             })
         );
+    }
+
+    #[test]
+    fn listed_count_is_the_will_run_inventory() {
+        // Selected tests count by filter-match alone. This is the population
+        // a successful run must execute exactly (executed == listed).
+        let inventory = br#"{
+            "rust-suites": {
+                "suite": {
+                    "package-name": "suite",
+                    "binary-id": "suite",
+                    "binary-name": "suite",
+                    "kind": "lib",
+                    "binary-path": "/tmp/suite-binary",
+                    "testcases": {
+                        "runs": {"ignored": false, "filter-match": {"status": "matches"}},
+                        "also_runs": {"ignored": false, "filter-match": {"status": "matches"}},
+                        "ignored_one": {"ignored": true, "filter-match": {"status": "matches"}},
+                        "filtered_out": {"ignored": false, "filter-match": {"status": "mismatch"}}
+                    }
+                }
+            }
+        }"#;
+        // `matches` alone is the will-run population: the ignored testcase
+        // marked `matches` counts (the run's arguments run it), the
+        // mismatched one does not.
+        assert_eq!(listed_count(inventory).unwrap(), 3);
+        let unknown = String::from_utf8(inventory.to_vec())
+            .unwrap()
+            .replace("\"matches\"", "\"surprise\"");
+        assert!(listed_count(unknown.as_bytes())
+            .unwrap_err()
+            .contains("unknown Nextest filter status"));
     }
 
     #[test]

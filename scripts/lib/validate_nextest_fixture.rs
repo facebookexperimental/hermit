@@ -689,12 +689,21 @@ fn actual_nextest_results_and_publication_failures() {
         } else {
             ""
         };
+        // The counted runner derives its expected count from `nextest list`;
+        // the mismatch case alone manufactures a wrong expectation through
+        // the fixture-only override, so the count refusal still precedes
+        // the publish refusal it is ordered against.
+        let override_env = if mismatch {
+            format!("HERMIT_NEXTEST_EXPECTED_EXECUTED_OVERRIDE={expected} ")
+        } else {
+            String::new()
+        };
         let command = format!(
             "cd {} || exit $?; export PATH={}:\"$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT={}; \
              export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=1; \
              export CARGO_TARGET_DIR={} TMPDIR={}; unset HERMIT_PREPARED_NEXTEST_REQUIRED; \
              printf '%s\\n' \"$DAGRUN_TEST_COUNTS_PATH\" > {}; {lock}{fault}set +e; \
-             NEXTEST_EXPECTED_EXECUTED={expected} HERMIT_NEXTEST_CPU_REPORT_PATH={} \
+             {override_env}NEXTEST_EXPECTED_EXECUTED={expected} HERMIT_NEXTEST_CPU_REPORT_PATH={} \
              {} --manifest-path {} --locked --offline \
              --profile ci --lib -j 1 --retries 0 --no-tests fail -E {} >{} 2>{}; \
              fixture_status=$?; cat {}; cat {} >&2; exit \"$fixture_status\"",

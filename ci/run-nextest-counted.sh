@@ -232,6 +232,23 @@ function run_nextest {
         cleanup_nextest_config
         return 2
     fi
+    # The expected executed count is derived from this same inventory (the
+    # will-run testcases of `nextest list` for the identical
+    # selection), never from a hand-maintained pin: a successful run must
+    # execute exactly the listed population (executed == listed). Any
+    # NEXTEST_EXPECTED_EXECUTED inherited from the DAG is superseded below.
+    # HERMIT_NEXTEST_EXPECTED_EXECUTED_OVERRIDE exists only so the
+    # structured-results fixture can still manufacture a count mismatch
+    # (a listed test that never executes) against the derived population;
+    # no DAG node sets it.
+    local listed_count
+    if [[ -n ${HERMIT_NEXTEST_EXPECTED_EXECUTED_OVERRIDE:-} ]]; then
+        listed_count=$HERMIT_NEXTEST_EXPECTED_EXECUTED_OVERRIDE
+    elif ! listed_count=$(run_rust_script "$RESULT_WRITER" --listed-count "$inventory"); then
+        printf 'run-nextest-counted: cannot derive listed test count from nextest inventory\n' >&2
+        cleanup_nextest_config
+        return 2
+    fi
 
     # Prepared consumers can bind calibration to the exact checked build and
     # selected inventory. Standalone/unsupported populations keep the existing
@@ -278,8 +295,18 @@ function run_nextest {
     set -e
     cleanup_nextest_config
 
-    emit_libtest_count "$events_log" "$status" "$attempts" "$binary_map" \
-        "$cpu_report" || count_status=$?
+    # Gate only a successful run on executed == listed: a failed run already
+    # fails the node by its status, and its typed report must still publish
+    # for diagnosis. An inherited pin is never consulted on either path.
+    if ((status == 0)); then
+        NEXTEST_EXPECTED_EXECUTED="$listed_count" \
+            emit_libtest_count "$events_log" "$status" "$attempts" "$binary_map" \
+            "$cpu_report" || count_status=$?
+    else
+        (unset NEXTEST_EXPECTED_EXECUTED; \
+            emit_libtest_count "$events_log" "$status" "$attempts" "$binary_map" \
+            "$cpu_report") || count_status=$?
+    fi
     # Publication cannot erase a failure that the actual test runner observed.
     if ((status != 0)); then
         return "$status"
@@ -384,6 +411,27 @@ assert report["results"] == [
     {"id": "suite$fails", "result": "fail", "attempts": 1},
 ]
 PYEOF
+
+    # The listed count is derived from the inventory: filter-matched
+    # testcases only (executed == listed for a successful run).
+    jq -nc '{
+        "rust-suites": {
+            "suite": {
+                "package-name": "suite",
+                "binary-id": "suite",
+                "binary-name": "suite",
+                "kind": "lib",
+                "binary-path": "/tmp/suite-binary",
+                "testcases": {
+                    "runs": {"ignored": false, "filter-match": {"status": "matches"}},
+                    "also_runs": {"ignored": false, "filter-match": {"status": "matches"}},
+                    "ignored_one": {"ignored": true, "filter-match": {"status": "matches"}},
+                    "filtered_out": {"ignored": false, "filter-match": {"status": "mismatch"}}
+                }
+            }
+        }
+    }' >"$scratch/listed-inventory.json"
+    [[ $(run_rust_script "$RESULT_WRITER" --listed-count "$scratch/listed-inventory.json") == 3 ]] || return 1
 
     # Exercise the generated config, the real per-execution wrapper, and the
     # typed reconciliation path. A valid failed run must still return nextest's
