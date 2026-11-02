@@ -1268,6 +1268,11 @@ mod tests {
             &["-l", "debug", "--log-file=/nonexistent/hermit.log"],
         ),
         ("max-log-bytes", &["--max-log-bytes=8G"]),
+        (
+            "log-ring",
+            &["--log-ring=1M", "--log-ring-file=/nonexistent/ring.log"],
+        ),
+        ("log-ring-file", &["--log-ring-file=/nonexistent/ring.log", "--log-ring=1M"]),
         ("backend", &["--backend", "ptrace"]),
         (
             "unsafe-ignore-host-seccomp",
