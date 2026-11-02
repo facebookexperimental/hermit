@@ -7417,6 +7417,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// So EINVAL says the kernel has no keys, and ENOMEM (no mapping there)
     /// that it has them. KVM's LinuxEmu answers EINVAL, as Linux on its vCPU,
     /// whose CR4.PKE is clear, would. Any other answer is not a fact: `Err`.
+    ///
+    /// The inference presumes the process has not freed key 0, which Linux
+    /// allows: on a kernel with keys `pkey_free(0)` finds key 0 allocated and
+    /// clears it (`mm_pkey_free`, arch/x86/include/asm/pkeys.h, v6.17), and
+    /// the probe then answers EINVAL, which reads as a kernel without keys.
+    /// That cannot happen where the probe is asked today: only KVM renders
+    /// the files (`Detcore::renders_address_space_files`), and its LinuxEmu
+    /// answers `pkey_free`, as it answers the probe, with EINVAL, whatever
+    /// the key. A backend that renders them over a kernel with keys needs a
+    /// record of the process freeing key 0 first.
     pub(crate) async fn serving_kernel_enables_protection_keys<G: Guest<Self>>(
         &self,
         guest: &mut G,

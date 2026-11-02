@@ -79,6 +79,7 @@ use tracing::warn;
 
 use super::StatTarget;
 use crate::fd::FdType;
+use crate::procfs::AddressSpaceFile;
 use crate::procfs::FixedProcfsFile;
 use crate::procfs::ProcfsFile;
 use crate::procfs::RenderedFiles;
@@ -3955,7 +3956,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// spelling of every process's, its lookup, metadata and listing
     /// included, is the kernel's, unclassified, exactly as before Detcore
     /// rendered any (package K slice N4), decided before any request to the
-    /// global tool, so those backends pay nothing for the files.
+    /// global tool, so those backends pay nothing for the files. A path
+    /// call's spelling of one (`faccessat`, `getxattr`, `chmod`) is left to
+    /// the kernel earlier still, by the session's files
+    /// (`could_name_rendered`), without resolving the spelling.
     pub(super) fn kernel_serves_every_address_space_file(&self, file: &ProcfsFile) -> bool {
         file.lists_rendered_address_space() && !self.renders_address_space_files()
     }
@@ -7179,18 +7183,30 @@ const fn nofollow() -> u64 {
 /// Whether `path` could be a spelling Detcore resolves to a rendered file
 /// itself: its last component is a rendered file's name or a descriptor
 /// number. A task's `comm` is one only where Detcore may render it
-/// (`renders_comm`: its record is the name's source, package K slice A+);
-/// elsewhere the kernel serves every `comm` and its spelling goes to the
-/// kernel untouched, as before.
+/// (`renders_comm`: its record is the name's source, package K slice A+),
+/// and a process's `smaps`, `smaps_rollup` and `numa_maps` only where the
+/// session renders them (`files.address_space`, package K slice N4).
+/// Elsewhere the kernel serves every one of those, and a path call's
+/// spelling of one (`faccessat(dirfd, "smaps")`, `getxattr`, `chmod`) goes
+/// to the kernel untouched, as before, without the lookup that resolves a
+/// spelling (`Detcore::procfs_spelling_at`) or its request to the global
+/// tool.
 fn could_name_rendered(path: &Path, files: RenderedFiles, renders_comm: bool) -> bool {
     let Some(std::path::Component::Normal(last)) = path.components().next_back() else {
         return false;
     };
     let last = last.as_bytes();
+    let address_space_names = [
+        AddressSpaceFile::Smaps,
+        AddressSpaceFile::SmapsRollup,
+        AddressSpaceFile::NumaMaps,
+    ]
+    .map(AddressSpaceFile::name);
     rendered_paths(files).any(|rendered| rendered_name(rendered) == last)
         || ProcfsFile::PER_PROCESS_NAMES
             .iter()
             .filter(|name| renders_comm || **name != "comm")
+            .filter(|name| files.address_space || !address_space_names.contains(*name))
             .any(|name| name.as_bytes() == last)
         || (!last.is_empty() && last.iter().all(u8::is_ascii_digit))
 }
@@ -7429,9 +7445,10 @@ mod tests {
     /// Where the guest's procfs is the kernel's (ptrace's capabilities),
     /// every spelling of a process's `smaps`, `smaps_rollup` and `numa_maps`
     /// is the kernel's, decided from the configuration before any request to
-    /// the global tool, as before Detcore rendered them (package K slice N4);
-    /// where it is not (KVM's), Detcore classifies them. Other per-process
-    /// files are not affected.
+    /// the global tool, as before Detcore rendered them (package K slice N4):
+    /// an open's, and a path call's too (`faccessat(dirfd, "smaps")`), which
+    /// `could_name_rendered` leaves to the kernel. Where it is not (KVM's),
+    /// Detcore classifies them. Other per-process files are not affected.
     #[test]
     fn the_kernel_serves_every_address_space_file_where_procfs_is_its() {
         use crate::record_or_replay::NoopTool;
@@ -7444,6 +7461,14 @@ mod tests {
         ] {
             tool.cfg.backend = backend;
             assert_eq!(tool.renders_address_space_files(), !kernels);
+            // The session's files, as `Detcore::rendered_files` makes them.
+            let files = RenderedFiles::of(
+                true,
+                true,
+                false,
+                !procfs_inode::tool_can_name_guest_descriptors(&tool.cfg.backend),
+            );
+            assert_eq!(files.address_space, !kernels);
             for path in [
                 "/proc/self/smaps",
                 "/proc/3/smaps_rollup",
@@ -7455,10 +7480,34 @@ mod tests {
                     kernels,
                     "{path}"
                 );
+                let name = Path::new(path).file_name().expect(path);
+                for spelling in [Path::new(path), Path::new(name)] {
+                    assert_eq!(
+                        could_name_rendered(spelling, files, false),
+                        !kernels,
+                        "{spelling:?}"
+                    );
+                    assert_eq!(
+                        could_name_rendered(spelling, files, true),
+                        !kernels,
+                        "{spelling:?}"
+                    );
+                }
             }
             let statm = ProcfsFile::from_path(Path::new("/proc/self/statm")).unwrap();
             assert!(!tool.kernel_serves_every_address_space_file(&statm));
+            assert!(could_name_rendered(Path::new("statm"), files, false));
         }
+        assert!(!could_name_rendered(
+            Path::new("/proc/self/smaps"),
+            RenderedFiles::WITHOUT_CPUINFO,
+            false
+        ));
+        assert!(could_name_rendered(
+            Path::new("/proc/self/smaps"),
+            RenderedFiles::ALL,
+            false
+        ));
     }
 
     /// A guest for [`Detcore::bind_task_identity`]: its registers name the

@@ -1404,6 +1404,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// mappings a rendered `smaps` or `numa_maps` shows
     /// (`procfs::memory_map::smaps`). True where the backend gives no map,
     /// which cannot show that the call reached none.
+    ///
+    /// A zero length reaches no page, as for madvise, which returns before
+    /// any when `start + PAGE_ALIGN(len)` is `start` (`madvise_should_skip`,
+    /// mm/madvise.c, v6.17). Linux's mlock differs: `do_mlock` (mm/mlock.c,
+    /// v6.17) page-aligns `len + offset_in_page(start)`, so `mlock` or
+    /// `mlock2` of an unaligned start with length 0 locks the page that holds
+    /// it, where this answers false. That cannot happen where it is asked
+    /// today: only KVM renders the files, and its LinuxEmu answers mlock,
+    /// mlock2 and mlockall with ENOSYS, which `handle_memory_lock_call`
+    /// records nothing for. A backend that runs them and renders the files
+    /// needs that page counted first.
     pub(crate) fn range_reaches_listed_mapping<G: Guest<Self>>(
         guest: &G,
         start: u64,
