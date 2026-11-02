@@ -336,7 +336,9 @@ mod tests {
         // gate.manifest: 120 CPU-s since d7138e26e moved the five tool
         // self-tests into their own selftest.* nodes; the slimmed gate
         // measured 2.53-2.74 CPU-s at load average 215-233. Its 900 s wall
-        // is unchanged.
+        // is unchanged. CPU re-derived 2026-11-01: across 296 retained
+        // full-run step profiles its worst valid CPU was 577.1 s, so the
+        // cap is 900, the next 300 s bucket above 1.5 x that worst.
         let expected = vec![
             ("pre.submodules".to_string(), 900, 300, Some(2_147_483_648)),
             ("pre.reverie_pin".to_string(), 900, 300, Some(2_147_483_648)),
@@ -359,7 +361,7 @@ mod tests {
                 7200,
                 Some(4_294_967_296),
             ),
-            ("gate.manifest".to_string(), 900, 120, Some(5_368_709_120)),
+            ("gate.manifest".to_string(), 900, 900, Some(5_368_709_120)),
         ];
         let check = |candidate: &[Step]| {
             let observed = candidate
@@ -378,10 +380,10 @@ mod tests {
 
         assert_eq!(check(&nodes), Ok(()));
 
-        // The gate's earlier CPU caps (300, 600, then 900 until d7138e26e)
-        // were sized for the self-tests that used to run inside it. Restoring
-        // any of them would silently hand the slimmed gate that budget again.
-        for old_cpu_cap in [300, 600, 900] {
+        // The gate's earlier CPU caps (300, 600, then 900 until d7138e26e,
+        // then 120 for the slimmed gate) no longer match the measured cap.
+        // Restoring any of them would silently hand the gate that budget again.
+        for old_cpu_cap in [120, 300, 600] {
             let mut widened_gate = nodes.clone();
             widened_gate
                 .iter_mut()
@@ -390,7 +392,7 @@ mod tests {
                 .cpu_timeout = old_cpu_cap;
             assert!(
                 check(&widened_gate).is_err(),
-                "restoring gate.manifest's pre-d7138e26e {old_cpu_cap}-second CPU cap must fail"
+                "restoring gate.manifest's old {old_cpu_cap}-second CPU cap must fail"
             );
         }
 
@@ -402,7 +404,7 @@ mod tests {
             .cpu_timeout = 60;
         assert!(
             check(&lowered_gate).is_err(),
-            "lowering gate.manifest's measured 120-second CPU cap must fail"
+            "lowering gate.manifest's measured 900-second CPU cap must fail"
         );
 
         let mut old_plan_wall = nodes.clone();
