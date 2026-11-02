@@ -81,30 +81,70 @@ pub(crate) struct PodmanStore {
     graph_root: String,
 }
 
+/// Total WALL budget for waiting out a locked podman database, shared by
+/// every podman invocation in this binary. Concurrent validates share one
+/// containers/storage store; its database lock is held for milliseconds,
+/// so contention is transient — but an unbounded or silent retry would
+/// hide a wedged store, so the wait is bounded and counted.
+pub(crate) const PODMAN_LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Whether podman's stderr reports the shared storage database lock.
+pub(crate) fn podman_database_locked(stderr: &str) -> bool {
+    stderr.contains("database locked")
+}
+
+/// Wait once for the podman database lock, counting the attempt out loud.
+/// `attempt` is 1-based. Returns false when the budget is exhausted, in
+/// which case the caller surfaces the lock failure (never retries past
+/// the bound, never silently).
+pub(crate) fn wait_for_podman_lock(attempt: u32, started: std::time::Instant) -> bool {
+    let elapsed = started.elapsed();
+    if elapsed >= PODMAN_LOCK_WAIT_BUDGET {
+        return false;
+    }
+    let delay =
+        (std::time::Duration::from_millis(250) * attempt).min(std::time::Duration::from_secs(5));
+    eprintln!(
+        "hermit: podman database locked; lock wait attempt {attempt} \
+         (elapsed {:.1}s of {:.0}s budget)",
+        elapsed.as_secs_f64(),
+        PODMAN_LOCK_WAIT_BUDGET.as_secs_f64(),
+    );
+    std::thread::sleep(delay);
+    true
+}
+
 /// Run a podman command and capture stdout, mapping a nonzero exit to an error
 /// that includes podman's own stderr (which is where its diagnostics go).
 fn podman_output(args: &[&str]) -> Result<String, Error> {
-    let output = Command::new(PODMAN)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| {
-            format!(
-                "Failed to run `{PODMAN} {}`. `hermit oci` needs a rootless \
-                 `{PODMAN}` on PATH.",
-                args.join(" ")
-            )
-        })?;
-    if !output.status.success() {
+    let started = std::time::Instant::now();
+    let mut attempt = 0;
+    loop {
+        let output = Command::new(PODMAN)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .with_context(|| {
+                format!(
+                    "Failed to run `{PODMAN} {}`. `hermit oci` needs a rootless \
+                     `{PODMAN}` on PATH.",
+                    args.join(" ")
+                )
+            })?;
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::msg(format!(
-            "`{PODMAN} {}` failed ({}): {}",
-            args.join(" "),
-            output.status,
-            stderr.trim()
-        )));
+        attempt += 1;
+        if !podman_database_locked(&stderr) || !wait_for_podman_lock(attempt, started) {
+            return Err(Error::msg(format!(
+                "`{PODMAN} {}` failed ({}): {}",
+                args.join(" "),
+                output.status,
+                stderr.trim()
+            )));
+        }
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 impl PodmanStore {
@@ -390,5 +430,21 @@ mod tests {
             size: 1,
         };
         assert_eq!(named.display_name(), "localhost/example:1");
+    }
+
+    #[test]
+    fn database_locked_matches_only_the_lock_diagnostic() {
+        assert!(podman_database_locked(
+            "Error: database locked: timeout waiting for database lock"
+        ));
+        assert!(!podman_database_locked("Error: no such image"));
+        assert!(!podman_database_locked(""));
+    }
+
+    #[test]
+    fn lock_wait_refuses_once_the_budget_is_spent() {
+        let spent = std::time::Instant::now()
+            - (PODMAN_LOCK_WAIT_BUDGET + std::time::Duration::from_secs(1));
+        assert!(!wait_for_podman_lock(1, spent));
     }
 }

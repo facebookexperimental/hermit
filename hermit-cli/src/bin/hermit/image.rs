@@ -480,18 +480,31 @@ fn apply_overlay_layer(layer: &Path, rootfs: &Path) -> Result<(), Error> {
     // modes, symlinks, and hardlinks survive exactly as in the buildah path.
     // The copy runs under `podman unshare` because layer entries can be
     // owned by mapped sub-UIDs the plain invoking user cannot read.
-    let status = Command::new("podman")
-        .args(["unshare", "cp", "-a"])
-        .arg(format!("{}/.", layer.display()))
-        .arg(format!("{}/", rootfs.display()))
-        .stdin(Stdio::null())
-        .status()
-        .context("Failed to spawn `podman unshare cp` to apply an overlay layer")?;
-    if !status.success() {
-        return Err(Error::msg(format!(
-            "cp failed applying overlay layer {} (exit {status})",
-            layer.display()
-        )));
+    let started = std::time::Instant::now();
+    let mut attempt = 0;
+    loop {
+        let output = Command::new("podman")
+            .args(["unshare", "cp", "-a"])
+            .arg(format!("{}/.", layer.display()))
+            .arg(format!("{}/", rootfs.display()))
+            .stdin(Stdio::null())
+            .output()
+            .context("Failed to spawn `podman unshare cp` to apply an overlay layer")?;
+        if output.status.success() {
+            break;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        attempt += 1;
+        if !crate::podman_store::podman_database_locked(&stderr)
+            || !crate::podman_store::wait_for_podman_lock(attempt, started)
+        {
+            return Err(Error::msg(format!(
+                "cp failed applying overlay layer {} (exit {}): {}",
+                layer.display(),
+                output.status,
+                stderr.trim()
+            )));
+        }
     }
     // Drop any whiteout markers the copy carried over.
     let mut copied: Vec<PathBuf> = Vec::new();
