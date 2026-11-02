@@ -355,8 +355,8 @@ fn main() {
                     .run_ids
                     .insert(run.as_os_str().to_string_lossy().into_owned());
             }
-            let mut total = totals.entry(day).or_default();
-            count_results(&text, daily, &mut total);
+            let total = totals.entry(day).or_default();
+            count_results(&text, daily, total);
             continue;
         }
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
