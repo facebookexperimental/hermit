@@ -19753,8 +19753,9 @@ mod nextest_timeout_tests {
                 // 13 added, measured by the full validate at e3e107cd).
                 // 2974 with package K slice K10's three KVM verify cells
                 // (c-programs/thread-self-procfs-handoff,
-                // c-programs/proc-fd-link-aliases and compat/ps).
-                assert_eq!(all.len(), 2974, "the original all-owner population is retained");
+                // c-programs/proc-fd-link-aliases and compat/ps). 2976 with R1108's
+                // c-programs/shared-file-threads on ptrace and KVM.
+                assert_eq!(all.len(), 2976, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
@@ -20739,9 +20740,12 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // SCM_RIGHTS receipt refusal, hugetlbfs view refusal and unexchangeable
         // robust word refusal tests, N4's smaps test and PRCTL phase 2's
         // parent-death test: 126. And package K slice K10's
-        // run_kvm_the_callers_own_proc_directories_answer_as_linux: 127, matching
-        // the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 127usize),
+        // run_kvm_the_callers_own_proc_directories_answer_as_linux: 127. And R1108
+        // (https://github.com/rrnewton/reverie/issues/1108) retires the default
+        // rustc link refusal and lists the shared file view beside a second
+        // thread, the exited-threads fork test and the fork refusal beside a live
+        // thread: 129, matching the DAG pin in validation_dag_static.
+        ("privileged-only-test.cli_kvm", 129usize),
     ] {
         let step = privileged
             .steps

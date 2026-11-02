@@ -467,14 +467,26 @@ fn kvm_named_refusals_are_policy_refusals_and_other_errors_stay_failures() {
         scheduler: Ok(()),
         preemption_recording: Err("recording control".to_owned()),
     };
-    let refusals: [fn() -> reverie_kvm::Error; 2] = [
+    let refusals: [fn() -> reverie_kvm::Error; 3] = [
         || reverie_kvm::Error::PotentiallyBlockingZeroRead { fd: 3 },
         || reverie_kvm::Error::BlockingInotifyRead { fd: 4 },
+        // A shared-file operation the program asked for and the backend
+        // does not implement.
+        || reverie_kvm::Error::UnsupportedSharedFile {
+            operation: "shared-file fork snapshot",
+            reason: "another thread of the process is alive",
+        },
     ];
-    let failures: [fn() -> reverie_kvm::Error; 3] = [
+    let failures: [fn() -> reverie_kvm::Error; 4] = [
         || reverie_kvm::Error::UnexpectedVcpuExit("hlt".to_owned()),
         || reverie_kvm::Error::InvalidGuestPid(-17),
         || reverie_kvm::Error::HostIo(std::io::Error::from_raw_os_error(libc::EIO)),
+        // The shared-file path's own guards and its stop bound: the
+        // backend's failure, never a refusal by name.
+        || reverie_kvm::Error::SharedFileCapability {
+            operation: "mapping publication",
+            reason: "the address space's other vCPUs or host copies did not stop",
+        },
     ];
     let cases = refusals
         .iter()

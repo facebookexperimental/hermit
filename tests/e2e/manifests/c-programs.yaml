@@ -9548,6 +9548,78 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/shared-file-threads
+    description: Two worker threads store through and read MAP_SHARED file views that the main thread maps, unmaps, maps again and makes read-only while they live, the main thread maps its own executable read-only and MAP_SHARED beside them, and a third thread created while both views are held reads them, for tests/c/shared_file_threads.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/shared_file_threads.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -pthread
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: Not measured; the shared-file threads slice qualified ptrace and KVM (https://github.com/rrnewton/reverie/issues/1108)
+          sabre: Not measured; the shared-file threads slice qualified ptrace and KVM (https://github.com/rrnewton/reverie/issues/1108)
+          liteinst: Not measured; the shared-file threads slice qualified ptrace and KVM (https://github.com/rrnewton/reverie/issues/1108)
+          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+        expected_stdout:
+          ptrace: "mapped a shared view with 2 threads alive\nround 0: the file holds every thread's store, and every thread read them all\nunmapped the view and mapped it again with threads alive\nround 1: the file holds every thread's store, and every thread read them all\na thread's gettimeofday into the read-only view failed with EFAULT\nmapped the executable read-only beside the threads\na thread created while both views were held read them\nthreads joined\n"
+          kvm: "mapped a shared view with 2 threads alive\nround 0: the file holds every thread's store, and every thread read them all\nunmapped the view and mapped it again with threads alive\nround 1: the file holds every thread's store, and every thread read them all\na thread's gettimeofday into the read-only view failed with EFAULT\nmapped the executable read-only beside the threads\na thread created while both views were held read them\nthreads joined\n"
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: this guest asserts strict verification and native-equal output; it asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts strict verification and native-equal output; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification cell and has not been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this strict-verification cell
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/shared-file-vfork
     description: A process that holds MAP_SHARED file views creates vfork and posix_spawn children that exec, exit, fail to exec, take signals and vfork again, for tests/c/shared_file_vfork.c
     lane: portable

@@ -802,7 +802,7 @@ test:
           liteinst: No edge-case Hermit arguments are required
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: language-runtimes/rustc-hello
-    description: Compile a small Rust program with rustc and run it; rustc starts its linker through the standard library's fork path, whose exec-error channel is a SOCK_SEQPACKET socketpair, and links single-threaded with its bundled rust-lld, which maps its output MAP_SHARED | MAP_NORESERVE
+    description: Compile a small Rust program with rustc and run it; rustc starts its linker through the standard library's fork path, whose exec-error channel is a SOCK_SEQPACKET socketpair, and links with its bundled rust-lld, which maps its output MAP_SHARED | MAP_NORESERVE while its worker threads run
     lane: portable
     requires:
       - linux

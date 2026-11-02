@@ -1542,19 +1542,25 @@ corpus:
         on the compatibility ledger
       disabled:
         java: >-
-          The JVM publishes a shared file mapping while its other threads run,
-          which KVM's one-vCPU shared-file views cannot do
-          (https://github.com/rrnewton/hermit/issues/4598): the run fails with
-          `unsupported KVM shared-file operation mapping publication: requires
-          one stopped vCPU (or unattached memory)` (HERMIT_INTERNAL_FAILURE,
-          exit 125) in 3 of 3 KVM verify runs at Hermit 26eb116d
+          The JVM's shared file mappings beside its other threads now go ahead
+          on KVM (https://github.com/rrnewton/reverie/issues/1108). At Hermit
+          534dd831, before Detcore's flock model was in this base, the run
+          then stopped at flock: the pinned root's OpenJDK
+          (openjdk-headless-21.0.12+8) creates its perf-data file
+          /tmp/hsperfdata_root/<pid> and calls flock(LOCK_EX|LOCK_NB) on it,
+          which KVM refused by name (`KVM flock is unsupported`,
+          HERMIT_POLICY_REFUSAL, exit 122) in 10 of 10 KVM verify runs. What
+          stops it on this tree, which has the flock model, is unmeasured; it
+          stays off KVM until it is measured
         javac: >-
-          javac's JVM publishes a shared file mapping while its other threads
-          run, which KVM's one-vCPU shared-file views cannot do
-          (https://github.com/rrnewton/hermit/issues/4598): the run fails with
-          `unsupported KVM shared-file operation mapping publication: requires
-          one stopped vCPU (or unattached memory)` (HERMIT_INTERNAL_FAILURE,
-          exit 125) in 3 of 3 KVM verify runs at Hermit 26eb116d
+          javac's JVM gets past its shared file mappings beside its threads on
+          KVM too (https://github.com/rrnewton/reverie/issues/1108). At Hermit
+          534dd831, before Detcore's flock model was in this base, it stopped
+          at the same flock of its perf-data file /tmp/hsperfdata_root/<pid>,
+          which KVM refused by name (`KVM flock is unsupported`,
+          HERMIT_POLICY_REFUSAL, exit 122) in 10 of 10 KVM verify runs. What
+          stops it on this tree, which has the flock model, is unmeasured; it
+          stays off KVM until it is measured
         lsof: >-
           lsof stats every process's /proc/<pid> directory, which KVM's /proc
           does not serve (another process's:

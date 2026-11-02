@@ -22462,97 +22462,490 @@ fn run_kvm_flock_excludes_as_ptrace_does() {
     );
 }
 
-/// rustc's default link: on ptrace it links and the program runs; on KVM it is
-/// refused by name. rustc links with its bundled rust-lld, which starts its
-/// worker threads and then maps its output file with
-/// mmap(MAP_SHARED | MAP_NORESERVE), and a KVM shared file view still needs
-/// one vCPU in its address space ("mapping publication: requires one stopped
-/// vCPU", https://github.com/rrnewton/reverie/issues/1108). The E2E cell
-/// language-runtimes/rustc-hello links single-threaded for that reason. This
-/// test keeps that record current: once KVM runs the program here, #1108 has
-/// moved, the cell should take the default link and this test should go.
+/// https://github.com/rrnewton/reverie/issues/1108's reproducer: with a
+/// second thread alive, the process maps its own executable read-only and
+/// `MAP_SHARED`, as the fbcode Python interpreter does early in its startup.
+const SHARED_FILE_VIEW_WITH_A_SECOND_THREAD_GUEST: &str = r#"
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static void *idle(void *argument) {
+  (void)argument;
+  for (;;) {
+    pause();
+  }
+  return NULL;
+}
+
+int main(int argc, char **argv) {
+  (void)argc;
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, idle, NULL) != 0) {
+    return 2;
+  }
+  int fd = open(argv[0], O_RDONLY | O_CLOEXEC);
+  struct stat status;
+  if (fd < 0 || fstat(fd, &status) != 0) {
+    return 3;
+  }
+  void *view = mmap(NULL, status.st_size, PROT_READ, MAP_SHARED, fd, 0);
+  printf("threads=2 mmap=%s elf=%s\n", view == MAP_FAILED ? "failed" : "ok",
+         view != MAP_FAILED && memcmp(view, "\177ELF", 4) == 0 ? "yes" : "no");
+  return 0;
+}
+"#;
+
+fn shared_file_view_with_a_second_thread_guest() -> PathBuf {
+    let build_root = process_build_root("shared-file-view-with-a-second-thread");
+    fs::create_dir_all(&build_root).expect("failed to create the guest directory");
+    let source = build_root.join("shared_file_view_with_a_second_thread.c");
+    let guest = build_root.join("shared_file_view_with_a_second_thread");
+    if !guest.exists() {
+        fs::write(&source, SHARED_FILE_VIEW_WITH_A_SECOND_THREAD_GUEST)
+            .expect("failed to write the guest");
+        let compiled = Command::new("cc")
+            .args(["-O0", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the guest");
+        assert!(compiled.status.success(), "{compiled:?}");
+    }
+    guest
+}
+
+/// A shared file view mapped while a second thread is alive
+/// (`SHARED_FILE_VIEW_WITH_A_SECOND_THREAD_GUEST`) maps on KVM as natively
+/// and on ptrace. KVM used to stop such a run by name ("mapping publication:
+/// requires one stopped vCPU", https://github.com/rrnewton/reverie/issues/1108);
+/// a publication now closes admission for every vCPU of the address space.
+/// The E2E cells language-runtimes/rustc-hello (rust-lld's default worker
+/// threads map its output) and c-programs/shared-file-threads cover the
+/// writable cases.
 #[test]
-fn run_kvm_default_rustc_link_is_a_named_refusal_where_ptrace_links() {
-    if !Path::new("/dev/kvm").exists() {
-        eprintln!("skipping the KVM default rustc link case: /dev/kvm is unavailable");
+fn run_kvm_shared_file_view_with_a_second_thread_maps_as_natively() {
+    if kvm_unavailable("run_kvm_shared_file_view_with_a_second_thread_maps_as_natively") {
         return;
     }
+    let guest = shared_file_view_with_a_second_thread_guest();
+    let guest = guest.to_str().expect("guest path is UTF-8");
+    let linux = "threads=2 mmap=ok elf=yes\n";
+    assert_eq!(native_stdout(Path::new(guest)), linux);
     let _guard = hermit_run_guard();
-    // The toolchain's own rustc rather than a rustup proxy, which would need
-    // a HOME that Hermit's minimal guest environment does not give it.
-    let sysroot = Command::new("rustc")
-        .args(["--print", "sysroot"])
-        .output()
-        .expect("run rustc --print sysroot");
-    assert!(
-        sysroot.status.success(),
-        "rustc --print sysroot failed\nstderr:\n{}",
-        String::from_utf8_lossy(&sysroot.stderr)
-    );
-    let sysroot = String::from_utf8(sysroot.stdout).expect("the sysroot should be UTF-8");
-    let rustc = Path::new(sysroot.trim()).join("bin/rustc");
-    assert!(rustc.is_file(), "no rustc binary at {}", rustc.display());
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let source = directory.path().join("hello.rs");
-    fs::write(
-        &source,
-        "fn main() {\n    println!(\"hello from rustc\");\n}\n",
-    )
-    .unwrap();
-    // The program and rustc's intermediate files go to the guest's own /tmp.
-    let command = format!(
-        "{} {} -o /tmp/hello && /tmp/hello",
-        shell_words::quote(rustc.to_str().expect("the rustc path should be UTF-8")),
-        shell_words::quote(source.to_str().expect("the source path should be UTF-8")),
-    );
     for backend in ["ptrace", "kvm"] {
-        let backend_arg = format!("--backend={backend}");
         let args = [
-            backend_arg.as_str(),
+            "--backend",
+            backend,
             "run",
             "--strict",
             "--base-env=minimal",
             "--",
-            "/bin/sh",
-            "-c",
-            command.as_str(),
+            guest,
         ];
         let output = hermit(&args);
-        let stdout = stdout(&output);
-        let stderr = stderr(&output);
-        if backend == "ptrace" {
-            assert_success(&output, &args);
-            assert_eq!(stdout, "hello from rustc\n", "ptrace");
-            continue;
-        }
-        assert!(
-            !stdout.contains("hello from rustc"),
-            "KVM linked with a multi-threaded rust-lld and ran the program, so \
-             https://github.com/rrnewton/reverie/issues/1108 has moved: drop \
-             -C link-arg=-Wl,--threads=1 from tests/e2e/language-runtimes/rustc-hello.sh \
-             and retire this test\nstderr:\n{stderr}"
-        );
-        // KNOWN DEFECT (https://github.com/rrnewton/hermit/issues/5025): this
-        // refusal is a deliberate, named one (a SharedFileCapability), so the
-        // run should end as a policy refusal, HERMIT_POLICY_REFUSAL_EXIT (122).
-        // It exits 125 because is_policy_refusal does not yet recognize
-        // SharedFileCapability, which also backs internal guards. This
-        // assertion is meant to change to 122 when 5025 is fixed.
-        assert_eq!(
-            output.status.code(),
-            Some(HERMIT_INTERNAL_FAILURE_EXIT),
-            "KVM must end the default rustc link with its named shared-file refusal, \
-             exit 125 until https://github.com/rrnewton/hermit/issues/5025 makes it a \
-             policy refusal (122)\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        assert!(
-            stderr.contains(
-                "unsupported KVM shared-file operation mapping publication: requires one \
-                 stopped vCPU"
-            ),
-            "the KVM run did not name the shared-file refusal on stderr\nstderr:\n{stderr}"
-        );
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), linux, "{backend}");
     }
+}
+
+/// Threads that come and go beside shared file views
+/// (https://github.com/rrnewton/reverie/issues/1108), by its argument:
+/// - `join-fork`: five times, create a thread, join it and fork; each child
+///   reads the view. At each fork the process has one live thread.
+/// - `leader-exit-fork`: fork; the child creates a worker and its main thread
+///   exits with `pthread_exit`; the worker joins it, so that it is the child's
+///   only live thread, and forks a grandchild that reads the view.
+/// - `leader-cleartid`: fork; the child points its `clear_child_tid` at a
+///   marker in `MAP_SHARED | MAP_ANONYMOUS` memory, creates a thread, joins
+///   it, and exits its only thread with `SYS_exit`. Linux stores zero there
+///   and wakes it only while another task uses the address space, so the
+///   marker stays.
+/// - `fork-beside-thread`: fork while a second thread is alive (blocked in a
+///   pipe read until the fork returns).
+const SHARED_FILE_THREAD_LIFECYCLE_GUEST: &str = r#"
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+static unsigned char *view;
+static pthread_t main_thread;
+static int release[2];
+static volatile unsigned int *marker;
+static volatile int spinner_runs;
+
+#define REQUIRE(condition, step)                                                \
+  do {                                                                         \
+    if (!(condition)) {                                                        \
+      printf("%s failed\n", step);                                             \
+      fflush(stdout);                                                          \
+      _exit(1);                                                                \
+    }                                                                          \
+  } while (0)
+
+static void *brief(void *argument) { return argument; }
+
+static void reap(pid_t child, const char *step) {
+  int status = 0;
+  REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+              WEXITSTATUS(status) == 0,
+          step);
+}
+
+static void *fork_after_leader_exit(void *argument) {
+  (void)argument;
+  REQUIRE(pthread_join(main_thread, NULL) == 0, "joining the child's main thread");
+  pid_t grandchild = fork();
+  REQUIRE(grandchild >= 0, "fork by the last thread");
+  if (grandchild == 0) {
+    _exit(view[0] == 'v' ? 0 : 3);
+  }
+  reap(grandchild, "the grandchild");
+  printf("the child's last thread forked after its main thread exited\n");
+  fflush(stdout);
+  exit(0);
+}
+
+static void *last_worker(void *argument) {
+  (void)argument;
+  REQUIRE(pthread_join(main_thread, NULL) == 0, "joining the child's main thread");
+  struct timespec delay = {0, 10 * 1000 * 1000};
+  while (nanosleep(&delay, &delay) != 0) {
+  }
+  syscall(SYS_set_tid_address, (unsigned int *)&marker[16]);
+  syscall(SYS_exit, 0);
+  _exit(6);
+}
+
+static void *spin(void *argument) {
+  (void)argument;
+  __atomic_store_n(&spinner_runs, 1, __ATOMIC_SEQ_CST);
+  for (;;) {
+    sched_yield();
+  }
+  return NULL;
+}
+
+static void *blocked(void *argument) {
+  (void)argument;
+  char byte;
+  REQUIRE(read(release[0], &byte, 1) == 1, "the release");
+  return NULL;
+}
+
+int main(int argc, char **argv) {
+  REQUIRE(argc == 2, "usage");
+  char path[] = "/tmp/shared-file-thread-lifecycle-XXXXXX";
+  int fd = mkstemp(path);
+  REQUIRE(fd >= 0 && unlink(path) == 0 && ftruncate(fd, 4096) == 0, "the file");
+  view = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  REQUIRE(view != MAP_FAILED, "mmap");
+  view[0] = 'v';
+  if (strcmp(argv[1], "join-fork") == 0) {
+    for (int round = 0; round < 5; round++) {
+      pthread_t thread;
+      REQUIRE(pthread_create(&thread, NULL, brief, NULL) == 0, "pthread_create");
+      REQUIRE(pthread_join(thread, NULL) == 0, "pthread_join");
+      pid_t child = fork();
+      REQUIRE(child >= 0, "fork after a join");
+      if (child == 0) {
+        _exit(view[0] == 'v' ? 0 : 3);
+      }
+      reap(child, "the child");
+    }
+    printf("forked five times, each after joining the only other thread\n");
+  } else if (strcmp(argv[1], "leader-exit-fork") == 0) {
+    fflush(stdout);
+    pid_t child = fork();
+    REQUIRE(child >= 0, "fork");
+    if (child == 0) {
+      main_thread = pthread_self();
+      pthread_t thread;
+      REQUIRE(pthread_create(&thread, NULL, fork_after_leader_exit, NULL) == 0,
+              "pthread_create in the child");
+      pthread_exit(NULL);
+    }
+    reap(child, "the child");
+    printf("the child exited 0\n");
+  } else if (strcmp(argv[1], "leader-cleartid") == 0) {
+    volatile unsigned int *marker = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    REQUIRE(marker != MAP_FAILED, "the marker's page");
+    marker[16] = 0x5eedf00d;
+    pid_t child = fork();
+    REQUIRE(child >= 0, "fork");
+    if (child == 0) {
+      syscall(SYS_set_tid_address, (unsigned int *)&marker[16]);
+      pthread_t thread;
+      if (pthread_create(&thread, NULL, brief, NULL) != 0 ||
+          pthread_join(thread, NULL) != 0) {
+        _exit(5);
+      }
+      syscall(SYS_exit, 0);
+      _exit(6);
+    }
+    reap(child, "the child");
+    printf("the child's clear_child_tid word holds %#x\n", marker[16]);
+  } else if (strcmp(argv[1], "worker-cleartid") == 0 ||
+             strcmp(argv[1], "group-cleartid") == 0) {
+    int group = strcmp(argv[1], "group-cleartid") == 0;
+    marker = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    REQUIRE(marker != MAP_FAILED, "the marker's page");
+    marker[16] = 0x5eedf00d;
+    pid_t child = fork();
+    REQUIRE(child >= 0, "fork");
+    if (child == 0) {
+      main_thread = pthread_self();
+      pthread_t thread;
+      if (group) {
+        /* The main thread, whose word is the marker, ends the group while a
+           worker runs. */
+        syscall(SYS_set_tid_address, (unsigned int *)&marker[16]);
+        if (pthread_create(&thread, NULL, spin, NULL) != 0) {
+          _exit(5);
+        }
+        while (!__atomic_load_n(&spinner_runs, __ATOMIC_SEQ_CST)) {
+          sched_yield();
+        }
+        syscall(SYS_exit_group, 0);
+        _exit(6);
+      }
+      /* The last thread is a worker: it joins the main thread and exits
+         with its own word at the marker. */
+      if (pthread_create(&thread, NULL, last_worker, NULL) != 0) {
+        _exit(5);
+      }
+      pthread_exit(NULL);
+    }
+    reap(child, "the child");
+    printf("the child's clear_child_tid word holds %#x\n", marker[16]);
+  } else if (strcmp(argv[1], "fork-beside-thread") == 0) {
+    REQUIRE(pipe(release) == 0, "pipe");
+    pthread_t thread;
+    REQUIRE(pthread_create(&thread, NULL, blocked, NULL) == 0, "pthread_create");
+    pid_t child = fork();
+    REQUIRE(child >= 0, "fork beside a live thread");
+    if (child == 0) {
+      _exit(view[0] == 'v' ? 0 : 3);
+    }
+    reap(child, "the child");
+    REQUIRE(write(release[1], "r", 1) == 1, "releasing the thread");
+    REQUIRE(pthread_join(thread, NULL) == 0, "pthread_join");
+    printf("forked beside a live thread\n");
+  } else {
+    REQUIRE(0, "the mode");
+  }
+  return 0;
+}
+"#;
+
+fn shared_file_thread_lifecycle_guest() -> PathBuf {
+    let build_root = process_build_root("shared-file-thread-lifecycle");
+    fs::create_dir_all(&build_root).expect("failed to create the guest directory");
+    let source = build_root.join("shared_file_thread_lifecycle.c");
+    let guest = build_root.join("shared_file_thread_lifecycle");
+    if !guest.exists() {
+        fs::write(&source, SHARED_FILE_THREAD_LIFECYCLE_GUEST).expect("failed to write the guest");
+        let compiled = Command::new("cc")
+            .args(["-O0", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the guest");
+        assert!(compiled.status.success(), "{compiled:?}");
+    }
+    guest
+}
+
+/// The lifecycle guest's standard output natively for `mode`, without
+/// address randomization, as Hermit runs every guest.
+fn shared_file_thread_lifecycle_natively(guest: &str, mode: &str) -> String {
+    let output = Command::new("setarch")
+        .args(["-R", guest, mode])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(output.status.success(), "{mode} natively: {output:?}");
+    String::from_utf8(output.stdout).expect("the guest's stdout should be UTF-8")
+}
+
+/// A process that holds a shared file view forks once its other threads
+/// have exited, on KVM as natively and on ptrace (`SHARED_FILE_THREAD_LIFECYCLE_GUEST`,
+/// modes `join-fork` and `leader-exit-fork`), and a forked child's last
+/// thread leaves its `clear_child_tid` marker unwritten as Linux does, whether
+/// it is the main thread (mode `leader-cleartid`) or a worker
+/// (`worker-cleartid`), on every run: on KVM a thread stops counting as a user
+/// of the address space at its exit, in the program's order, not when its
+/// host side finishes tearing down, and a leader's `clear_child_tid` word is
+/// cleared before its exit is observable, so its joiner does not wait a
+/// host-timed number of times. In mode `group-cleartid` the child's main
+/// thread ends the group while a worker runs; Linux stores zero or not by
+/// when the worker drops its mm, and so does ptrace, so only KVM runs it, and
+/// it stores zero every time, the outcome the exit's start decides. Each KVM
+/// run is a strict verify pair, at bitwise parity with nonzero compared INFO
+/// records, three times, and a plain strict run five times (a verify pair
+/// once hid a host-timed answer here that plain runs showed).
+#[test]
+fn run_kvm_shared_file_threads_that_exited_do_not_hold_back_a_fork() {
+    if kvm_unavailable("run_kvm_shared_file_threads_that_exited_do_not_hold_back_a_fork") {
+        return;
+    }
+    let guest = shared_file_thread_lifecycle_guest();
+    let guest = guest.to_str().expect("guest path is UTF-8");
+    let directory = tempfile::tempdir().expect("failed to create report directory");
+    let _guard = hermit_run_guard();
+    let marker = "the child's clear_child_tid word holds 0x5eedf00d\n";
+    for (mode, linux, backends) in [
+        (
+            "join-fork",
+            "forked five times, each after joining the only other thread\n",
+            &[("ptrace", 1), ("kvm", 3)][..],
+        ),
+        (
+            "leader-exit-fork",
+            "the child's last thread forked after its main thread exited\nthe child exited 0\n",
+            &[("ptrace", 1), ("kvm", 3)][..],
+        ),
+        ("leader-cleartid", marker, &[("ptrace", 1), ("kvm", 3)][..]),
+        ("worker-cleartid", marker, &[("ptrace", 1), ("kvm", 3)][..]),
+        (
+            "group-cleartid",
+            "the child's clear_child_tid word holds 0\n",
+            &[("kvm", 3)][..],
+        ),
+    ] {
+        let native = shared_file_thread_lifecycle_natively(guest, mode);
+        if mode == "group-cleartid" {
+            assert!(native == linux || native == marker, "{mode}: {native:?}");
+        } else {
+            assert_eq!(native, linux, "{mode}");
+        }
+        for &(backend, runs) in backends {
+            // Plain strict runs, each a single run whose answer is not
+            // compared with another's.
+            for run in 0..if backend == "kvm" { 5 } else { 1 } {
+                let args = [
+                    "--backend",
+                    backend,
+                    "run",
+                    "--strict",
+                    "--base-env=minimal",
+                    "--",
+                    guest,
+                    mode,
+                ];
+                let output = hermit(&args);
+                assert_success(&output, &args);
+                assert_eq!(stdout(&output), linux, "{mode} {backend} plain run {run}");
+            }
+            for run in 0..runs {
+                let report = directory
+                    .path()
+                    .join(format!("{mode}-{backend}-{run}.json"));
+                let report_arg = report.to_str().expect("report path is UTF-8");
+                let args = [
+                    "--backend",
+                    backend,
+                    "run",
+                    "--strict",
+                    "--verify",
+                    "--verify-strict",
+                    "--verify-json",
+                    report_arg,
+                    "--base-env=minimal",
+                    "--",
+                    guest,
+                    mode,
+                ];
+                let output = hermit(&args);
+                assert_success(&output, &args);
+                assert_eq!(stdout(&output), linux, "{mode} {backend} run {run}");
+                let verdict: serde_json::Value = serde_json::from_slice(
+                    &fs::read(&report).expect("read the verification report"),
+                )
+                .expect("parse the verification report");
+                assert_eq!(
+                    verdict["bitwise_parity"], true,
+                    "{mode} {backend} run {run}: {verdict}"
+                );
+                assert!(
+                    verdict["compared_log_messages"]["left"]
+                        .as_u64()
+                        .is_some_and(|count| count > 0),
+                    "{mode} {backend} run {run}: {verdict}"
+                );
+            }
+        }
+    }
+}
+
+/// A fork of a process that holds a shared file view while another of its
+/// threads lives is refused by name on KVM, exit 122, before the fork takes
+/// effect: the child's copy of the address space would be taken while that
+/// thread's vCPU runs in it (`SHARED_FILE_THREAD_LIFECYCLE_GUEST`, mode
+/// `fork-beside-thread`). ptrace forks as natively.
+#[test]
+fn run_kvm_shared_file_fork_beside_a_live_thread_is_refused_by_name() {
+    if kvm_unavailable("run_kvm_shared_file_fork_beside_a_live_thread_is_refused_by_name") {
+        return;
+    }
+    let guest = shared_file_thread_lifecycle_guest();
+    let guest = guest.to_str().expect("guest path is UTF-8");
+    let linux = "forked beside a live thread\n";
+    assert_eq!(
+        shared_file_thread_lifecycle_natively(guest, "fork-beside-thread"),
+        linux
+    );
+    let _guard = hermit_run_guard();
+    let run = |backend| {
+        let args = vec![
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            guest,
+            "fork-beside-thread",
+        ];
+        (hermit(&args), args)
+    };
+    let (output, args) = run("ptrace");
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), linux);
+    let (output, args) = run("kvm");
+    let stderr = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: {stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "{args:?}: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "unsupported KVM shared-file operation shared-file fork snapshot: another thread of \
+             the process is alive"
+        ),
+        "{args:?}: {stderr}"
+    );
+    assert_eq!(stdout(&output), "", "{args:?}");
 }
 
 /// A one-page `MAP_SHARED | MAP_NORESERVE` view of a hugetlbfs file, one huge

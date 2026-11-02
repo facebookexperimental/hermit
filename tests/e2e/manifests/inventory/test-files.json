@@ -2714,6 +2714,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/shared_file_threads.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and KVM; ci=true)",
+      "why": "tests/c/shared_file_threads.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: with two worker threads alive the main thread maps a MAP_SHARED file view that every thread stores through and reads, unmaps it and maps it again, makes it read-only so a worker's gettimeofday into it fails with EFAULT, and maps its own executable read-only and MAP_SHARED, so standard output equals native output on every backend (https://github.com/rrnewton/reverie/issues/1108)"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/shared_file_vfork.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and KVM; ci=true)",
       "why": "tests/c/shared_file_vfork.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: a process that holds MAP_SHARED views of an ordinary file must be able to create vfork and posix_spawn children that exec, exit, fail to exec, handle a signal and vfork again, with every store through a view reaching the parent and the parent's views showing exactly the file's bytes afterwards, as the gcc driver does after glibc maps its iconv module cache (https://github.com/rrnewton/reverie/issues/1108)"
@@ -4066,7 +4072,7 @@
       "disposition": "manifest-test",
       "path": "tests/e2e/language-runtimes/rustc-hello.sh",
       "runner": "target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml",
-      "why": "tests/e2e/language-runtimes/rustc-hello.sh is owned by target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml: compiles and runs a small Rust program with rustc under Hermit; rustc starts its linker through the standard library's fork path, whose exec-error channel is a SOCK_SEQPACKET socketpair, and links single-threaded with its bundled rust-lld, which maps its output MAP_SHARED | MAP_NORESERVE (https://github.com/rrnewton/reverie/issues/1108)"
+      "why": "tests/e2e/language-runtimes/rustc-hello.sh is owned by target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml: compiles and runs a small Rust program with rustc under Hermit; rustc starts its linker through the standard library's fork path, whose exec-error channel is a SOCK_SEQPACKET socketpair, and links with its bundled rust-lld, which maps its output MAP_SHARED | MAP_NORESERVE while its worker threads run (https://github.com/rrnewton/reverie/issues/1108)"
     },
     {
       "disposition": "manifest-test",

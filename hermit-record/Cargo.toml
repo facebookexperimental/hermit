@@ -12,8 +12,8 @@ hermit-record-format = { version = "0.5.4", path = "../hermit-record-format" }
 bincode = { version = "2", features = ["serde"] }
 detcore = { package = "hermit-detcore", version = "0.5.4", path = "../detcore" }
 libc = "0.2.186"
-reverie = { package = "reverie-core", version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "940ac8d7e6d6744b1b50a29c326a490d71982219" }
-reverie-ptrace = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "940ac8d7e6d6744b1b50a29c326a490d71982219" }
+reverie = { package = "reverie-core", version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "42b59ad872680b7e7815fc7a88ed76ca3a233832" }
+reverie-ptrace = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "42b59ad872680b7e7815fc7a88ed76ca3a233832" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 tempfile = "3.27.0"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }

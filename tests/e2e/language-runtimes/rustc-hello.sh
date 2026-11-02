@@ -16,13 +16,10 @@
 # KVM refused both until Reverie admitted SOCK_SEQPACKET socketpairs and
 # MAP_NORESERVE file views.
 #
-# The link is single-threaded (lld --threads=1) on every backend. rust-lld
-# maps its output after it starts its worker threads, and on KVM a shared
-# file view still needs one vCPU in its address space
-# (https://github.com/rrnewton/reverie/issues/1108). The CLI test
-# run_kvm_default_rustc_link_is_a_named_refusal_where_ptrace_links in
-# hermit-cli/tests/cli.rs requires KVM's refusal of the default link by name,
-# and fails once KVM runs it, which is when this flag should go.
+# The link is rust-lld's default: it starts its worker threads, then maps its
+# output, and the workers write into it. KVM refused that view while the
+# workers lived, until a publication closed admission for every vCPU of the
+# address space (https://github.com/rrnewton/reverie/issues/1108).
 #
 # The guest's PATH is Hermit's minimal one, so --prepare records the
 # toolchain's own rustc binary for --run: a rustup proxy on PATH would need
@@ -54,7 +51,7 @@ fn main() {
     println!("hello from rustc");
 }
 EOF
-        "$rustc" -C link-arg=-Wl,--threads=1 "$work/hello.rs" -o "$work/hello"
+        "$rustc" "$work/hello.rs" -o "$work/hello"
         "$work/hello"
         ;;
     *)

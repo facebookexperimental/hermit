@@ -6312,7 +6312,10 @@ mod tests {
         // adds one row per candidate backend: 3110.
         // system-utils/flock-shared-exclusive (Detcore's flock model, the kvm
         // lane's slice SP2) adds one row per candidate backend: 3115.
-        assert_eq!(parsed.cells.len(), 3115);
+        // c-programs/shared-file-threads (shared file views beside live
+        // threads, https://github.com/rrnewton/reverie/issues/1108) adds one row
+        // per candidate backend: 3120.
+        assert_eq!(parsed.cells.len(), 3120);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448
