@@ -22,6 +22,13 @@
 # --check-image only reads the exact local image reference. It shares the late
 # execution guard, uses the caller's Podman store, and creates no output paths.
 #
+# HERMIT_PINNED_IMAGE_PROBE_BOUND_S, when set, replaces the 120 s WALL bound on
+# each of the exact-image probe's two attempts. It must be a positive integer
+# number of seconds; any other value, an empty one included, is refused with
+# status 2 before Podman runs. Production leaves it unset; the wrapper's own
+# tests shorten it. It is an environment supplement rather than a flag because
+# the late probe runs inside every pinned-root node's generated command line.
+#
 # --src-rw mounts the source WRITABLE. The default is read-only and stays that
 # way, but a test phase legitimately writes into its own tree (target/ci,
 # ignored/e2e/build), exactly as a GitHub shard job writes into its checkout.
@@ -56,7 +63,8 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             printf '%s\n' 'usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA] [--src-rw] [--cargo-home DIR] [--proc-locks-runtime] [--nextest-calibration] [--env NAME]... -- CMD...' \
                 '       run-in-pinned-root.sh --check-image [--digest NAME@SHA]' \
-                '--nextest-calibration captures the actual host envelope for the regular Nextest consumer using an existing prepared helper. Missing capture capability stays unqualified; bootstrap calls do not capture or compile.'
+                '--nextest-calibration captures the actual host envelope for the regular Nextest consumer using an existing prepared helper. Missing capture capability stays unqualified; bootstrap calls do not capture or compile.' \
+                'HERMIT_PINNED_IMAGE_PROBE_BOUND_S=SECONDS replaces the 120 s WALL bound on each of the two exact-image probe attempts (a positive integer; unset: 120). Production leaves it unset.'
             exit 0 ;;
         --src) src=$2; shift 2 ;;
         --out) out=$2; shift 2 ;;
@@ -99,7 +107,17 @@ check_pinned_image() {
     # timeout/tool failure) instead of converting every nonzero result into
     # 'image missing'. GNU timeout also signals its command group; the
     # forced-stop grace is finite.
-    local bound=120 status attempt
+    #
+    # HERMIT_PINNED_IMAGE_PROBE_BOUND_S replaces the 120 s per-attempt bound, so
+    # the wrapper's tests can time a hung and a TERM-ignoring probe through both
+    # attempts in seconds. The default applies only when it is unset: an empty
+    # value is refused, not read as 120.
+    local bound=${HERMIT_PINNED_IMAGE_PROBE_BOUND_S-120} status attempt
+    if [[ ! "$bound" =~ ^[1-9][0-9]*$ ]]; then
+        echo "run-in-pinned-root: HERMIT_PINNED_IMAGE_PROBE_BOUND_S must be a positive integer number of seconds, got '$bound'." >&2
+        echo "  Unset it for the default 120 s probe bound, or set a whole number of seconds such as 30." >&2
+        return 2
+    fi
     for attempt in 1 2; do
         if timeout --verbose --signal=TERM --kill-after=2s "${bound}s" podman image exists "$digest"; then
             return 0
