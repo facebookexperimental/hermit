@@ -960,8 +960,12 @@ struct DataEdges {
 /// through it.
 fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
     let (steps, mut untracked) = channel_steps(syscalls);
+    // The ends a pipe or socketpair call returned. An Open note alone is not
+    // a creation: Detcore also notes one when a descriptor joins an existing
+    // description (received over SCM_RIGHTS, or taken with pidfd_getfd).
     let opened: BTreeSet<OpenFileId> = syscalls
         .iter()
+        .filter(|sys| creates_a_channel_pair(sys.sysno) && sys.result == Some(0))
         .flat_map(|sys| &sys.accesses)
         .filter_map(|access| match access {
             Access::Fd {
@@ -984,6 +988,17 @@ fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
     }
     let edges = replay_channels(&steps, &mut untracked);
     DataEdges { edges, untracked }
+}
+
+/// Whether `sysno` returns two connected descriptors, the calls Detcore names
+/// a channel's pair for: pipe2, socketpair, and x86_64's legacy pipe.
+fn creates_a_channel_pair(sysno: Sysno) -> bool {
+    match sysno {
+        Sysno::pipe2 | Sysno::socketpair => true,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::pipe => true,
+        _ => false,
+    }
 }
 
 /// One write or read that moved data through a channel.
@@ -4248,6 +4263,69 @@ mod tests {
             data_edges(&calls.iter().collect::<Vec<_>>()).edges,
             Vec::<HbEdge>::new()
         );
+
+        // An end that joins the pipe's description in the trace, received
+        // over SCM_RIGHTS or taken with pidfd_getfd, does not create it:
+        // Detcore notes such an install as an Open of the existing
+        // description, and the pipe still predates the trace.
+        for (sysno, args) in [
+            (Sysno::recvmsg, [5, 0x4000, 0]),
+            (Sysno::pidfd_getfd, [9, 4, 0]),
+        ] {
+            let joined = call(
+                95,
+                9,
+                38,
+                sysno,
+                &args,
+                Some(if sysno == Sysno::recvmsg { 1 } else { 3 }),
+                vec![fd(3, Some(file(7, 1)), opened("pipe"))],
+            );
+            let calls = [joined, write(101), read(103, 4)];
+            let data = data_edges(&calls.iter().collect::<Vec<_>>());
+            assert_eq!(data.edges, Vec::<HbEdge>::new(), "{sysno:?}");
+            assert_eq!(
+                data.untracked.get(&shared).map(|u| (u.since, u.why)),
+                Some((0, PREDATES_TRACE)),
+                "{sysno:?}"
+            );
+        }
+
+        // Created in the trace, the pipe keeps its edges through the ends a
+        // forked child inherited: the child's write orders the read of its
+        // bytes.
+        let mut inherited = write(101);
+        inherited.tid = t(11);
+        inherited.pid = DetPid::from_raw(11);
+        let created = call(
+            90,
+            7,
+            29,
+            Sysno::pipe2,
+            &[0x3000, 0],
+            Some(0),
+            vec![
+                fd(3, Some(file(7, 1)), opened("pipe")),
+                fd(4, Some(file(7, 2)), opened("pipe")),
+            ],
+        );
+        let calls = [created, inherited, read(103, 4)];
+        let data = data_edges(&calls.iter().collect::<Vec<_>>());
+        assert_eq!(
+            data.edges,
+            vec![HbEdge {
+                from: EventRef {
+                    tid: t(11),
+                    event: 101,
+                },
+                to: EventRef {
+                    tid: t(9),
+                    event: 104,
+                },
+                kind: HbEdgeKind::ChannelBytes,
+            }]
+        );
+        assert!(data.untracked.is_empty(), "{:?}", data.untracked);
 
         // The finder still finds the pair, now unordered in both runs, and
         // names the pipe as giving no edge.
