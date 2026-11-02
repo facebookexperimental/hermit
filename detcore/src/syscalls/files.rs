@@ -14268,33 +14268,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (result, backgrounded) = self
             .run_binder_call(guest, call, fd, request, argument)
             .await?;
-        // Recorded only where the call ran in this thread's turn: on the
-        // background path another task may have closed or replaced the
-        // numbers before this one resumed, as for a receive.
-        // TODO-HUMAN-REVIEW(PR-4736)
-        if binder_read && !backgrounded && result >= 0 {
-            let delivered =
-                crate::syscalls::binder::delivered(&guest.memory(), argument, already_consumed);
-            let recorded = self
-                .record_received_descriptors(
-                    guest,
-                    &delivered,
-                    crate::syscalls::scm_rights::Channel::Binder,
-                    true,
-                    // Binder installs every descriptor it delivers
-                    // close-on-exec (`binder_apply_fd_fixups`).
-                    true,
-                    crate::syscalls::scm_rights::ReceivedFrom {
-                        socket: fd,
-                        peek: false,
-                        // No `SCM_RIGHTS` message is queued to a binder
-                        // descriptor, so no count of messages taken matters.
-                        messages: 1,
-                        call: Sysno::ioctl,
-                    },
-                )
-                .await?;
-            self.refresh_received_locks(guest, &recorded, LockCall::BinderWriteRead)
+        if binder_read && result >= 0 {
+            self.take_binder_receipts(guest, fd, argument, already_consumed, backgrounded)
                 .await?;
         }
         // A descriptor Detcore lists without modelling keeps its
@@ -14318,10 +14293,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// a half that waits for another process hold the caller's turn. Returns
     /// its result and whether any half ran on the background path.
     ///
-    /// The call is issued whole, as the guest made it. Before it goes to the
-    /// background, a zero-timeout `ppoll` asks whether this thread already
-    /// has work: a read that would not wait keeps its turn, which is what
-    /// lets the descriptors it delivers be recorded. A call that would wait
+    /// The call is issued whole, as the guest made it, along the route
+    /// `binder::route` gives it. A read with nothing before it first asks a
+    /// zero-timeout `ppoll` whether this thread already has work: a read
+    /// that would not wait keeps its turn, which is what lets the
+    /// descriptors it delivers be recorded. A call that waits and has an
+    /// effect besides waiting (a write half, or a freeze) never polls, since
+    /// its caller's readiness does not say whether it waits, and goes to the
+    /// background path only where the run allows that effect to run off the
+    /// turn ([`Self::admit_host_timed_binder_call`]). There a call that would wait
     /// runs on the background path with its write half, which the schedule
     /// therefore does not order against sibling threads. Splitting the two
     /// halves was measured with the rejoin order recorded and lost most of
@@ -14330,6 +14310,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Under `--strict` (`Config::strict_binder`) a call is first checked
     /// against `binder::strict_refusal`, and a refused one ends the run with
     /// the policy-refusal exit.
+    ///
+    /// A split must also answer for the thread's `looper_need_return`, which
+    /// Linux clears at the end of every binder `ioctl` (`binder_ioctl`,
+    /// drivers/android/binder.c:5536 at v6.4): a read issued as a second call
+    /// would wait where the guest's single call returns at once.
     // TODO-HUMAN-REVIEW(PR-4742)
     async fn run_binder_call<G: Guest<Self>>(
         &self,
@@ -14357,7 +14342,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(fd, |detfd| detfd.is_nonblocking())
             .unwrap_or(false);
-        let waits = binder::blocking(
+        let route = binder::route(
             request,
             written.as_ref(),
             binder::freeze_info(&guest.memory(), argument).as_ref(),
@@ -14368,21 +14353,161 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `binder_write_read`, so binder is unsupported there, and neither the
         // poll below, which is not in the recording, nor the background path
         // may add to what is recorded or replayed.
-        let Some(waits) = waits.filter(|_| !self.cfg.recordreplay_modes) else {
-            return Ok((self.record_or_replay(guest, call).await?, false));
-        };
-        // A call whose read half has work waiting does not wait at all, so it
-        // keeps the caller's turn, and the descriptors it delivers are
-        // recorded.
-        if self.binder_has_work(guest, fd).await? {
+        if self.cfg.recordreplay_modes {
             return Ok((self.record_or_replay(guest, call).await?, false));
         }
+        let waits = match route {
+            binder::Route::InTurn => {
+                return Ok((self.record_or_replay(guest, call).await?, false));
+            }
+            binder::Route::PollFirst => {
+                // A read whose thread has work waiting does not wait at all,
+                // so it keeps the caller's turn, and the descriptors it
+                // delivers are recorded.
+                if self.binder_has_work(guest, fd).await? {
+                    return Ok((self.record_or_replay(guest, call).await?, false));
+                }
+                binder::Blocking::Read
+            }
+            binder::Route::HostTimed(waits, effect) => {
+                if let Some(refused) = self.admit_host_timed_binder_call(guest, fd, effect).await? {
+                    return Ok((refused, false));
+                }
+                waits
+            }
+        };
         let _warned = binder::note_blocking(waits, guest.pid().as_raw());
         Ok((
             self.record_or_replay_blocking(guest, Syscall::Ioctl(call))
                 .await?,
             true,
         ))
+    }
+
+    /// Whether this run lets a binder call on `fd` that waits run its
+    /// `effect` off the turn, on the background path
+    /// (`binder::Route::HostTimed`): when the effect lands is then the
+    /// host's, so the run is no longer one the schedule repeats. That is the
+    /// unsupported-operation boundary. A fail-closed run (the default, and
+    /// always under `--strict`) ends here with a named policy refusal
+    /// ([`Self::refuse_unserviceable_operation_because`]), and the guest's
+    /// call never runs. A run that allows unsupported operations
+    /// (`--allow-unsupported-syscalls`) lets the call go to the background,
+    /// warns once per process, and records a determinism loss, so
+    /// verification refuses to compare the run. Returns `None` to go on, or
+    /// the result the refusal policy chose instead.
+    async fn admit_host_timed_binder_call<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        effect: crate::syscalls::binder::Effect,
+    ) -> Result<Option<i64>, Error> {
+        let reason = crate::syscalls::binder::host_timed_reason(effect, fd);
+        if self.cfg.panic_on_unsupported_syscalls {
+            let reason = format!(
+                "{reason}. Hermit cannot run it deterministically; \
+                 --allow-unsupported-syscalls runs it anyway and records the run as \
+                 nondeterministic"
+            );
+            crate::syscalls::helpers::report_refusal_reason(
+                true,
+                &format!(
+                    "[dtid {}] ioctl refused: {reason}",
+                    guest.thread_state().dettid
+                ),
+            );
+            // The fallback errno is never the guest's: a fail-closed run
+            // ends inside this call.
+            return self
+                .refuse_unserviceable_operation_because(
+                    guest,
+                    reverie::syscalls::Sysno::ioctl,
+                    Errno::EOPNOTSUPP,
+                    &reason,
+                )
+                .await
+                .map(Some);
+        }
+        static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            warn!(
+                "[detcore] HERMIT_HOST_TIMED_BINDER: {reason}; --allow-unsupported-syscalls lets it \
+                 run, and this run is recorded as nondeterministic"
+            );
+            crate::tool_global::report_determinism_loss(
+                guest,
+                format!("HERMIT_HOST_TIMED_BINDER: {reason}"),
+            )
+            .await;
+        }
+        Ok(None)
+    }
+
+    /// After a successful `BINDER_WRITE_READ` on `fd`, whose
+    /// `struct binder_write_read` is at `argument` and whose `read_consumed`
+    /// was `already_consumed` before it: record the descriptors its read
+    /// delivered, where the call completed in this thread's turn. One that
+    /// ran on the background path (`backgrounded`) and delivered descriptors
+    /// is refused by name in a fail-closed run
+    /// (`binder::background_receipt_refusal`), before the guest sees the
+    /// transaction: the descriptors cannot be recorded there, and the guest's
+    /// first use of one would otherwise fail with `EBADF`, an answer Linux
+    /// never gives. A run that allows unsupported operations goes on with
+    /// them unrecorded, warned, as for a receive on the background path.
+    async fn take_binder_receipts<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        argument: usize,
+        already_consumed: u64,
+        backgrounded: bool,
+    ) -> Result<(), Error> {
+        use crate::syscalls::binder;
+        let delivered = binder::delivered(&guest.memory(), argument, already_consumed);
+        if backgrounded
+            && self.cfg.panic_on_unsupported_syscalls
+            && self.records_received_descriptors(guest)
+            && let Some(reason) = binder::background_receipt_refusal(fd, &delivered)
+        {
+            crate::syscalls::helpers::report_refusal_reason(
+                true,
+                &format!(
+                    "[dtid {}] ioctl refused: {reason}",
+                    guest.thread_state().dettid
+                ),
+            );
+            self.refuse_unserviceable_operation_because(
+                guest,
+                reverie::syscalls::Sysno::ioctl,
+                Errno::EOPNOTSUPP,
+                &reason,
+            )
+            .await?;
+        }
+        // TODO-HUMAN-REVIEW(PR-4736)
+        let recorded = self
+            .record_received_descriptors(
+                guest,
+                &delivered,
+                crate::syscalls::scm_rights::Channel::Binder,
+                // On the background path another task may have closed or
+                // replaced the numbers before this one resumed, as for a
+                // receive: they are named in a warning, never recorded.
+                !backgrounded,
+                // Binder installs every descriptor it delivers
+                // close-on-exec (`binder_apply_fd_fixups`).
+                true,
+                crate::syscalls::scm_rights::ReceivedFrom {
+                    socket: fd,
+                    peek: false,
+                    // No `SCM_RIGHTS` message is queued to a binder
+                    // descriptor, so no count of messages taken matters.
+                    messages: 1,
+                },
+            )
+            .await?;
+        self.refresh_received_locks(guest, &recorded, LockCall::BinderWriteRead)
+            .await
     }
 
     /// Whether this thread already has binder work waiting, from a
@@ -21156,6 +21281,11 @@ mod inject_fstat_scratch {
         maps_reads: std::collections::VecDeque<Vec<u8>>,
         /// A successful Binder read publishes this many command bytes.
         binder_read_consumed: Option<u64>,
+        /// What an injected `ppoll` returns: the number of ready
+        /// descriptors (`binder_has_work`'s poll).
+        ppoll_ready: Option<i64>,
+        /// The determinism losses the guest reported to the global state.
+        determinism_losses: std::sync::Mutex<Vec<String>>,
     }
 
     impl ScriptedGuest {
@@ -21204,6 +21334,8 @@ mod inject_fstat_scratch {
                 private_validations: std::sync::atomic::AtomicUsize::new(0),
                 maps_reads: Default::default(),
                 binder_read_consumed: None,
+                ppoll_ready: None,
+                determinism_losses: Default::default(),
             };
             (tool, guest)
         }
@@ -21265,6 +21397,10 @@ mod inject_fstat_scratch {
                     })
                     .collect();
                 return (None, GlobalResponse::ProcfsIds(resolved));
+            }
+            if let GlobalRequest::RecordDeterminismLoss(reason) = &message.2 {
+                self.determinism_losses.lock().unwrap().push(reason.clone());
+                return (None, GlobalResponse::RecordDeterminismLoss(()));
             }
             panic!("fd registration must not send an RPC: {:?}", message.2)
         }
@@ -21400,6 +21536,10 @@ mod inject_fstat_scratch {
             // SAFETY: each arm runs the syscall Detcore asked for against this
             // process, on addresses Detcore obtained from this guest.
             let raw = match Syscall::from_raw(number, args) {
+                Syscall::Ioctl(_) if args.arg1 as u64 == crate::syscalls::binder::BINDER_FREEZE => {
+                    0
+                }
+                Syscall::Ppoll(_) if let Some(ready) = self.ppoll_ready => ready,
                 Syscall::Ioctl(_) if self.binder_read_consumed.is_some() => {
                     assert_eq!(args.arg1 as u64, crate::syscalls::binder::BINDER_WRITE_READ);
                     let address = AddrMut::<[u64; 6]>::from_raw(args.arg2).unwrap();
@@ -21573,6 +21713,248 @@ mod inject_fstat_scratch {
                 vec![123]
             );
         }
+    }
+
+    /// A `BINDER_WRITE_READ` call on descriptor 99 whose
+    /// `struct binder_write_read` is `words`.
+    fn binder_write_read_call(words: &mut [u64; 6]) -> syscalls::Ioctl {
+        syscalls::Ioctl::new()
+            .with_fd(99)
+            .with_request(syscalls::ioctl::Request::Other(
+                crate::syscalls::binder::BINDER_WRITE_READ as usize,
+                words.as_mut_ptr() as usize,
+            ))
+    }
+
+    /// A read whose buffer is already full waits for work in Linux, so
+    /// Detcore asks the poll and, with no work queued, runs it on the
+    /// background path, where a sibling can send that work; with work queued
+    /// it keeps the turn. Before, the read was classified as returning on its
+    /// own and ran in the caller's turn without a poll, holding the guest's
+    /// only turn while the sibling that would send it work never ran.
+    #[tokio::test]
+    async fn an_exhausted_binder_read_waits_off_the_turn_when_no_work_is_queued() {
+        for (ready, backgrounded) in [(0, true), (1, false)] {
+            let (_, mut guest) = ScriptedGuest::new(true, false);
+            guest.binder_read_consumed = Some(256);
+            guest.ppoll_ready = Some(ready);
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+            let mut buffer = [0u8; 256];
+            let mut words = [0, 0, 0, 256, 256, buffer.as_mut_ptr() as u64];
+            let call = binder_write_read_call(&mut words);
+            let request = crate::syscalls::binder::BINDER_WRITE_READ;
+            let argument = words.as_ptr() as usize;
+            let routed = tool
+                .run_binder_call(&mut guest, call, 99, request, argument)
+                .await
+                .unwrap();
+            assert_eq!(routed, (0, backgrounded), "ppoll ready: {ready}");
+            assert_eq!(guest.injected, vec![Sysno::ppoll, Sysno::ioctl]);
+            assert!(guest.determinism_losses.lock().unwrap().is_empty());
+        }
+    }
+
+    /// A freeze, and a write+read, are never kept in the caller's turn by
+    /// the poll: a ready caller says nothing about whether the freeze's target
+    /// drains or whether the write half leaves the read anything to take.
+    /// Where the run allows unsupported operations they run on the background
+    /// path without a poll, and the run records a determinism loss for their
+    /// off-turn effect. Before, each polled first and, with its caller ready,
+    /// ran in the caller's turn, holding the guest's only turn until the
+    /// freeze timed out or the read's reply came, which nothing could send.
+    #[tokio::test]
+    async fn a_ready_caller_does_not_keep_a_freeze_or_a_write_and_read_in_its_turn() {
+        let mut freeze = [7u32, 1, 100];
+        let mut command = [0u8; 8];
+        let mut buffer = [0u8; 256];
+        let mut write_read = [
+            8,
+            0,
+            command.as_mut_ptr() as u64,
+            256,
+            0,
+            buffer.as_mut_ptr() as u64,
+        ];
+        let calls = [
+            (
+                crate::syscalls::binder::BINDER_FREEZE,
+                freeze.as_mut_ptr() as usize,
+                "ioctl(BINDER_FREEZE) on descriptor 99",
+            ),
+            (
+                crate::syscalls::binder::BINDER_WRITE_READ,
+                write_read.as_mut_ptr() as usize,
+                "ioctl(BINDER_WRITE_READ) on descriptor 99 both writes and waits",
+            ),
+        ];
+        let mut losses = Vec::new();
+        for (request, argument, named) in calls {
+            let (_, mut guest) = ScriptedGuest::new(true, false);
+            guest.config.panic_on_unsupported_syscalls = false;
+            guest.binder_read_consumed = Some(0);
+            guest.ppoll_ready = Some(1);
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+            let call = syscalls::Ioctl::new()
+                .with_fd(99)
+                .with_request(syscalls::ioctl::Request::Other(request as usize, argument));
+            let routed = tool
+                .run_binder_call(&mut guest, call, 99, request, argument)
+                .await
+                .unwrap();
+            assert_eq!(routed, (0, true), "{named}");
+            assert_eq!(guest.injected, vec![Sysno::ioctl], "{named}");
+            losses.extend(guest.determinism_losses.lock().unwrap().drain(..));
+        }
+        // The loss is reported once per tool process, by the first of these
+        // calls (no other test takes this path); each is host-timed all the
+        // same.
+        assert_eq!(losses.len(), 1, "{losses:?}");
+        assert!(
+            losses[0]
+                .starts_with("HERMIT_HOST_TIMED_BINDER: ioctl(BINDER_FREEZE) on descriptor 99"),
+            "{losses:?}"
+        );
+    }
+
+    /// Where the run fails closed (the default, and always under `--strict`),
+    /// a binder call that would run its write half or its freeze off the turn
+    /// is refused by name before it runs: here through the typed refusal an
+    /// embedder that sets `exit_on_unsupported_syscall` gets, since the
+    /// default ends the process. Before, it went to the background path with
+    /// one warning and the run went on as though nothing were host-timed.
+    #[tokio::test]
+    async fn a_host_timed_binder_call_is_refused_where_the_run_fails_closed() {
+        let mut freeze = [7u32, 1, 100];
+        let mut command = [0u8; 8];
+        let mut buffer = [0u8; 256];
+        let mut write_read = [
+            8,
+            0,
+            command.as_mut_ptr() as u64,
+            256,
+            0,
+            buffer.as_mut_ptr() as u64,
+        ];
+        for (request, argument) in [
+            (
+                crate::syscalls::binder::BINDER_FREEZE,
+                freeze.as_mut_ptr() as usize,
+            ),
+            (
+                crate::syscalls::binder::BINDER_WRITE_READ,
+                write_read.as_mut_ptr() as usize,
+            ),
+        ] {
+            let (_, mut guest) = ScriptedGuest::new(true, false);
+            guest.config.panic_on_unsupported_syscalls = true;
+            guest.config.exit_on_unsupported_syscall = true;
+            guest.binder_read_consumed = Some(0);
+            guest.ppoll_ready = Some(1);
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+            let call = syscalls::Ioctl::new()
+                .with_fd(99)
+                .with_request(syscalls::ioctl::Request::Other(request as usize, argument));
+            let refused = tool
+                .run_binder_call(&mut guest, call, 99, request, argument)
+                .await;
+            match refused {
+                Err(Error::Tool(error)) => assert!(
+                    error
+                        .downcast_ref::<crate::UnsupportedSyscallError>()
+                        .is_some(),
+                    "{error:?}"
+                ),
+                other => panic!("{request:#x}: not refused: {other:?}"),
+            }
+            assert!(guest.injected.is_empty(), "{:?}", guest.injected);
+            assert!(guest.determinism_losses.lock().unwrap().is_empty());
+        }
+        // A read with nothing before it is not host-timed: it goes to the
+        // background path where no work is queued, fail-closed or not.
+        let (_, mut guest) = ScriptedGuest::new(true, false);
+        guest.config.panic_on_unsupported_syscalls = true;
+        guest.config.exit_on_unsupported_syscall = true;
+        guest.binder_read_consumed = Some(0);
+        guest.ppoll_ready = Some(0);
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+        let mut words = [0, 0, 0, 256, 0, buffer.as_mut_ptr() as u64];
+        let call = binder_write_read_call(&mut words);
+        let argument = words.as_ptr() as usize;
+        let routed = tool
+            .run_binder_call(
+                &mut guest,
+                call,
+                99,
+                crate::syscalls::binder::BINDER_WRITE_READ,
+                argument,
+            )
+            .await
+            .unwrap();
+        assert_eq!(routed, (0, true));
+    }
+
+    /// A read that ran on the background path and delivered a descriptor is
+    /// refused by name where the run fails closed, before the guest sees the
+    /// transaction, rather than leaving the descriptor unrecorded so that the
+    /// guest's first use of it fails with `EBADF`, which Linux never answers.
+    /// A run that allows unsupported operations goes on, the descriptor
+    /// unrecorded, as for a receive on the background path. A background read
+    /// that delivered nothing is not refused.
+    #[tokio::test]
+    async fn a_descriptor_a_backgrounded_binder_read_delivers_is_refused_by_name() {
+        let mut object = [0u8; 24];
+        object[..4].copy_from_slice(&0x6664_2a85u32.to_ne_bytes()); // BINDER_TYPE_FD
+        object[8..12].copy_from_slice(&123u32.to_ne_bytes());
+        let offsets = [0u64];
+        let mut transaction = [0u8; 64];
+        transaction[40..48].copy_from_slice(&8u64.to_ne_bytes());
+        transaction[48..56].copy_from_slice(&(object.as_ptr() as u64).to_ne_bytes());
+        transaction[56..64].copy_from_slice(&(offsets.as_ptr() as u64).to_ne_bytes());
+        let mut commands = 0x8040_7202u32.to_ne_bytes().to_vec(); // BR_TRANSACTION
+        commands.extend_from_slice(&transaction);
+        let noop = 0x0000_720cu32.to_ne_bytes(); // BR_NOOP
+        let words = [
+            0,
+            0,
+            0,
+            commands.len() as u64,
+            commands.len() as u64,
+            commands.as_ptr() as u64,
+        ];
+        let empty = [0, 0, 0, 4, 4, noop.as_ptr() as u64];
+        let argument = words.as_ptr() as usize;
+        for fail_closed in [true, false] {
+            let (_, mut guest) = ScriptedGuest::new(true, false);
+            guest.config.sequentialize_threads = true;
+            guest.config.panic_on_unsupported_syscalls = fail_closed;
+            guest.config.exit_on_unsupported_syscall = true;
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+            assert!(tool.records_received_descriptors(&guest));
+            let taken = tool
+                .take_binder_receipts(&mut guest, 99, argument, 0, true)
+                .await;
+            match (fail_closed, taken) {
+                (true, Err(Error::Tool(error))) => assert!(
+                    error
+                        .downcast_ref::<crate::UnsupportedSyscallError>()
+                        .is_some(),
+                    "{error:?}"
+                ),
+                (false, Ok(())) => {}
+                (_, other) => panic!("fail-closed {fail_closed}: {other:?}"),
+            }
+            assert!(guest.thread.with_detfd(123, |_| ()).is_err());
+            assert!(guest.injected.is_empty(), "{:?}", guest.injected);
+            // A background read that delivered no descriptor goes on.
+            tool.take_binder_receipts(&mut guest, 99, empty.as_ptr() as usize, 0, true)
+                .await
+                .unwrap();
+        }
+        // Positive payload control: the buffer names descriptor 123.
+        assert_eq!(
+            crate::syscalls::binder::delivered(&LocalMemory::new(), argument, 0).fds,
+            vec![123]
+        );
     }
 
     mod runtime_readlink_tests {

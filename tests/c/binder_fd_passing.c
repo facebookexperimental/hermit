@@ -9,18 +9,24 @@
 // Pass a file descriptor over binder from one process to another, then use
 // it in the receiver.
 //
-// Usage: binder_fd_passing <binderfs mount> [poll|block|ping]. The guest adds a
-// device of its own to that binderfs instance through its binder-control
-// file (BINDER_CTL_ADD; an existing one is reused), so it needs no default
-// device and no servicemanager.
+// Usage: binder_fd_passing <binderfs mount> [poll|block|ping|exhausted|writeread].
+// The guest adds a device of its own to that binderfs instance through its
+// binder-control file (BINDER_CTL_ADD; an existing one is reused), so it needs
+// no default device and no servicemanager.
 //
 // In "poll" mode, the default, both processes open the device nonblocking
 // and wait in poll() before each read, so no binder ioctl waits in the
-// kernel. In "block" and "ping" mode they open it blocking, so each read
-// waits inside ioctl(BINDER_WRITE_READ) until the other process sends it
-// work: the mode every real binder thread pool uses. "ping" sends an empty
-// transaction instead of one carrying a descriptor, so it needs nothing of
-// the receiver but the round trip.
+// kernel. In every other mode they open it blocking, so each read waits
+// inside ioctl(BINDER_WRITE_READ) until the other process sends it work: the
+// mode every real binder thread pool uses. "ping" sends an empty transaction
+// instead of one carrying a descriptor, so it needs nothing of the receiver
+// but the round trip. "exhausted" is "ping" whose receiver first makes a
+// read whose buffer is already full (read_consumed == read_size), which
+// Linux makes wait for work like any other read and then return with nothing
+// added. "writeread" is "ping" whose sender sends the transaction and waits
+// for the reply in one BINDER_WRITE_READ, as libbinder's talkWithDriver does.
+// In "block" and "exhausted" mode the sender sleeps 100 ms first, so the
+// receiver's read is the one that waits.
 //
 // The parent becomes the device's context manager, with a node that accepts
 // descriptors, and the child sends it a
@@ -56,6 +62,15 @@ static int nonblocking = 1;
 
 // Whether the transaction carries a file descriptor.
 static int pass_fd = 1;
+
+// Whether the receiver first reads into a buffer that is already full.
+static int exhausted = 0;
+
+// Whether the sender writes its transaction and reads the reply in one call.
+static int write_and_read = 0;
+
+// Whether the sender sleeps before it sends, so the receiver waits first.
+static int sender_waits = 0;
 
 static void die(const char* what) {
   fprintf(stderr, "binder_fd_passing: %s: %s\n", what, strerror(errno));
@@ -165,7 +180,29 @@ static int client(const char* path) {
               .data.ptr.offsets = (binder_uintptr_t)offsets,
           },
   };
-  write_commands(fd, &command, sizeof(command));
+  if (sender_waits) {
+    usleep(100 * 1000);
+  }
+  if (write_and_read) {
+    // The transaction and the wait for its reply in one call. Linux runs the
+    // write half first, then the read half (binder_ioctl_write_read).
+    uint8_t buffer[512];
+    struct binder_write_read bwr = {
+        .write_size = sizeof(command),
+        .write_buffer = (binder_uintptr_t)&command,
+        .read_size = sizeof(buffer),
+        .read_buffer = (binder_uintptr_t)buffer,
+    };
+    if (ioctl(fd, BINDER_WRITE_READ, &bwr) < 0) {
+      die("BINDER_WRITE_READ (write and read)");
+    }
+    if (bwr.write_consumed != sizeof(command)) {
+      fprintf(stderr, "binder_fd_passing: the write half was not consumed\n");
+      return 1;
+    }
+  } else {
+    write_commands(fd, &command, sizeof(command));
+  }
   struct binder_transaction_data reply;
   wait_for(fd, BR_REPLY, &reply);
   return 0;
@@ -192,18 +229,29 @@ static char* add_device(const char* mount, const char* name) {
 }
 
 int main(int argc, char** argv) {
+  const char* usage = "usage: %s <binderfs mount> [poll|block|ping|exhausted|writeread]\n";
   if (argc < 2 || argc > 3) {
-    fprintf(stderr, "usage: %s <binderfs mount> [poll|block|ping]\n", argv[0]);
+    fprintf(stderr, usage, argv[0]);
     return 2;
   }
   if (argc == 3) {
     if (strcmp(argv[2], "block") == 0) {
       nonblocking = 0;
+      sender_waits = 1;
     } else if (strcmp(argv[2], "ping") == 0) {
       nonblocking = 0;
       pass_fd = 0;
+    } else if (strcmp(argv[2], "exhausted") == 0) {
+      nonblocking = 0;
+      pass_fd = 0;
+      exhausted = 1;
+      sender_waits = 1;
+    } else if (strcmp(argv[2], "writeread") == 0) {
+      nonblocking = 0;
+      pass_fd = 0;
+      write_and_read = 1;
     } else if (strcmp(argv[2], "poll") != 0) {
-      fprintf(stderr, "usage: %s <binderfs mount> [poll|block|ping]\n", argv[0]);
+      fprintf(stderr, usage, argv[0]);
       return 2;
     }
   }
@@ -227,6 +275,26 @@ int main(int argc, char** argv) {
   }
   if (child == 0) {
     _exit(client(path));
+  }
+
+  if (exhausted) {
+    // A read whose buffer is already full: Linux waits for work, then finds
+    // no room for it and returns with nothing added (binder_thread_read).
+    uint32_t full;
+    struct binder_write_read bwr = {
+        .read_size = sizeof(full),
+        .read_consumed = sizeof(full),
+        .read_buffer = (binder_uintptr_t)&full,
+    };
+    if (ioctl(fd, BINDER_WRITE_READ, &bwr) < 0) {
+      die("BINDER_WRITE_READ (exhausted read)");
+    }
+    if (bwr.read_consumed != sizeof(full)) {
+      fprintf(stderr, "binder_fd_passing: the exhausted read added commands\n");
+      return 1;
+    }
+    printf("exhausted read returned\n");
+    fflush(stdout);
   }
 
   struct binder_transaction_data data;

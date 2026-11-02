@@ -63626,10 +63626,25 @@ fn a_recording_whose_stream_cannot_be_written_in_full_is_refused() {
     );
 }
 
+/// Set where the binder tests must run: a host without a binder filesystem
+/// then fails them instead of skipping, as `HERMIT_REQUIRE_KVM` does for KVM.
+const HERMIT_REQUIRE_BINDERFS: &str = "HERMIT_REQUIRE_BINDERFS";
+
+/// Before a binder test skips because `reason`: fail instead where
+/// [`HERMIT_REQUIRE_BINDERFS`] is set, so a job that means to cover binder
+/// cannot silently stop.
+fn binderfs_skip_allowed(reason: &str) {
+    assert!(
+        std::env::var_os(HERMIT_REQUIRE_BINDERFS).is_none(),
+        "{HERMIT_REQUIRE_BINDERFS} is set, but {reason}, so the binder test cannot run"
+    );
+}
+
 /// Run the binder guest in `mode` on a private binderfs instance this test
 /// mounts in a user and mount namespace of its own, and return its output,
 /// or `None` where the kernel has no binder filesystem or will not mount one
-/// here. The run is bounded: the failures these tests pin are hangs.
+/// here: the test then skips, loudly, unless [`HERMIT_REQUIRE_BINDERFS`] is
+/// set. The run is bounded: the failures these tests pin are hangs.
 fn binder_guest_output(mode: &str) -> Option<Output> {
     binder_guest_output_with(mode, &[])
 }
@@ -63641,6 +63656,7 @@ fn binder_guest_output_with(mode: &str, hermit_args: &[&str]) -> Option<Output> 
         .lines()
         .any(|line| line.split_whitespace().last() == Some("binder"))
     {
+        binderfs_skip_allowed("this kernel has no binder filesystem");
         eprintln!("skipping: this kernel has no binder filesystem (CONFIG_ANDROID_BINDERFS)");
         return None;
     }
@@ -63663,6 +63679,7 @@ fn binder_guest_output_with(mode: &str, hermit_args: &[&str]) -> Option<Output> 
     let label = format!("{command:?}");
     let output = hermit_test::hermit_output(&label, &mut command);
     if stdout(&output).contains("NO-BINDERFS") {
+        binderfs_skip_allowed("binderfs cannot be mounted in a user namespace here");
         eprintln!(
             "skipping: binderfs cannot be mounted in a user namespace here: {}",
             String::from_utf8_lossy(&output.stderr)
@@ -63688,6 +63705,81 @@ fn a_descriptor_received_in_a_binder_transaction_is_usable() {
     assert!(
         stdout.starts_with("received fd ") && stdout.trim_end().ends_with(": hello"),
         "{stdout}"
+    );
+}
+
+/// A binder read whose buffer is already full (`read_consumed ==
+/// read_size`) waits for work as any read does (`binder_thread_read`), so it
+/// must not hold the guest's only turn either. The receiver makes one before
+/// its sender, which sleeps first, has sent anything; it returns once the
+/// transaction is queued, with nothing added, and the receiver then reads the
+/// transaction. Before, Detcore classified it as returning on its own and ran
+/// it in the receiver's turn, so the sender never ran.
+#[test]
+fn an_exhausted_binder_read_does_not_hold_the_guests_turn() {
+    let Some(output) = binder_guest_output("exhausted") else {
+        return;
+    };
+    assert_success(&output, &["binder_fd_passing", "exhausted"]);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.starts_with("exhausted read returned\nreceived transaction from pid "),
+        "{stdout}"
+    );
+}
+
+/// A blocking binder read that waits for its transaction runs on the
+/// background path, where the descriptors it delivers cannot be recorded, so
+/// the run is refused by name before the receiver sees the transaction. Its
+/// sender sleeps first, so the receiver's read is the one that waits. Before,
+/// the run went on and the receiver's first use of the descriptor failed with
+/// EBADF, an answer Linux never gives.
+#[test]
+fn a_descriptor_a_backgrounded_binder_read_delivers_is_refused_by_name() {
+    let Some(output) = binder_guest_output("block") else {
+        return;
+    };
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{}",
+        stderr(&output)
+    );
+    let log = stderr(&output);
+    assert!(
+        log.contains("ran on the background path and delivered descriptors"),
+        "{log}"
+    );
+    assert!(
+        !stdout(&output).contains("received fd"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(!log.contains("Bad file descriptor"), "{log}");
+}
+
+/// A binder call that sends a transaction and waits for its reply in one
+/// `BINDER_WRITE_READ`, as libbinder's `talkWithDriver` does, would run its
+/// write half off the turn on the background path, at a moment the host
+/// chooses. A run that fails closed, the default, refuses it by name. Before,
+/// it ran with one warning, and nothing marked the run as host-timed.
+#[test]
+fn a_binder_write_and_read_that_waits_is_refused_by_name() {
+    let Some(output) = binder_guest_output("writeread") else {
+        return;
+    };
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{}",
+        stderr(&output)
+    );
+    let log = stderr(&output);
+    assert!(
+        log.contains("ioctl(BINDER_WRITE_READ) on descriptor")
+            && log.contains("both writes and waits to read")
+            && log.contains("--allow-unsupported-syscalls"),
+        "{log}"
     );
 }
 

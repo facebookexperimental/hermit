@@ -1782,6 +1782,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             && self.completes_in_turn(guest, call)
     }
 
+    /// Whether this run records each received descriptor as the receive
+    /// returns (`ReceiptMode::Recorded`): neither discovered by the tool
+    /// nor left unrecorded for want of sequentialized threads.
+    pub(crate) fn records_received_descriptors<G: Guest<Self>>(&self, guest: &G) -> bool {
+        self.receipt_mode(guest) == ReceiptMode::Recorded
+    }
+
     /// Whether the tool discovers received descriptors itself (it shares the
     /// guest's descriptor table), so that a receive records none.
     pub(crate) fn discovers_received_descriptors<G: Guest<Self>>(&self, guest: &G) -> bool {

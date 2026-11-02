@@ -100,7 +100,7 @@ const fn binder_request(dir: u64, nr: u64, size: usize) -> u64 {
 
 /// `_IOW('b', 14, struct binder_freeze_info)`, its size from the structure
 /// rather than written out, so a test cannot share a wrong number.
-const BINDER_FREEZE: u64 = binder_request(1, 14, size_of::<FreezeInfo>());
+pub(crate) const BINDER_FREEZE: u64 = binder_request(1, 14, size_of::<FreezeInfo>());
 
 /// `_IOW('b', 7, __s32)`: become the context manager, handle 0.
 const BINDER_SET_CONTEXT_MGR: u64 = binder_request(1, 7, size_of::<i32>());
@@ -277,17 +277,33 @@ pub(crate) fn write_read<M: MemoryAccess>(memory: &M, argument: usize) -> Option
 
 impl WriteRead {
     /// Whether this call has a read half, which is the half that waits.
+    /// Linux runs `binder_thread_read` whenever `read_size` is nonzero
+    /// (`binder_ioctl_write_read`, drivers/android/binder.c:5073 at v6.4,
+    /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/android/binder.c?h=v6.4#n5073>),
+    /// and that read waits for work (`binder_wait_for_work`, :4412) before it
+    /// looks at how much of the buffer is left (:4445). A buffer the caller
+    /// has already filled (`read_consumed == read_size`) therefore waits as
+    /// long as an empty one, and then returns with nothing added.
     pub(crate) fn reads(&self) -> bool {
-        self.read_size > self.read_consumed
+        self.read_size > 0
+    }
+
+    /// Whether this call has a write half left to run: `binder_thread_write`
+    /// runs the commands of `write_buffer[write_consumed..write_size]`
+    /// (drivers/android/binder.c:3804-3807 at v6.4), before the read half and
+    /// in the same call (:5060-5071).
+    pub(crate) fn writes(&self) -> bool {
+        self.write_size > self.write_consumed
     }
 }
 
 /// Why `request` waits in the kernel, from the call's argument already read
 /// from guest memory: `None` when it returns on its own. `nonblocking` is the
 /// descriptor's `O_NONBLOCK`, which makes a read return `EAGAIN` instead of
-/// waiting (`binder_thread_read`). A read is classified as waiting whenever
-/// it asks for bytes; the caller may then find work already queued and run
-/// it in the caller's turn anyway.
+/// waiting (`binder_thread_read`, drivers/android/binder.c:4408-4410 at
+/// v6.4). A read is classified as waiting whenever it has a read half
+/// ([`WriteRead::reads`]); the caller may then find work already queued and
+/// run it in the caller's turn anyway ([`route`]).
 pub(crate) fn blocking(
     request: u64,
     write_read: Option<&WriteRead>,
@@ -303,6 +319,114 @@ pub(crate) fn blocking(
             .map(|_| Blocking::Freeze),
         _ => None,
     }
+}
+
+/// What a binder call that waits does besides waiting, which the background
+/// path would run at a moment the host chooses rather than one the schedule
+/// orders against the guest's other threads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Effect {
+    /// The write half of a `BINDER_WRITE_READ` that also reads: the
+    /// transactions, replies and commands it sends, which Linux runs first,
+    /// in the same call (`binder_ioctl_write_read`).
+    Write,
+    /// A `BINDER_FREEZE`: Linux marks the target frozen as the call starts
+    /// and then waits for its transactions to drain (`binder_ioctl_freeze`,
+    /// drivers/android/binder.c:5249-5256 at v6.4).
+    Freeze,
+}
+
+/// How Detcore issues a binder `ioctl` (`Detcore::run_binder_call`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// It returns on its own, so it runs in the caller's turn.
+    InTurn,
+    /// A read and nothing else, which waits only when no work is queued for
+    /// its thread. A zero-timeout poll in the caller's turn asks first
+    /// (`binder_poll` asks what this read's own wait asks, whether the thread
+    /// has work it may take: drivers/android/binder.c:5017-5040 against
+    /// :4387-4412 at v6.4): with work the read keeps the turn, otherwise it
+    /// runs on the background path. No half of the call runs before the
+    /// read, so the answer holds for it, with one host-timed exception: work
+    /// queued for the whole process (not for this thread) that a sibling
+    /// thread, whose own read entered the kernel late on the background path,
+    /// takes first. Work that arrives while a sibling already waits goes to
+    /// that sibling's own queue (`binder_proc_transaction`, :2785), so this needs the
+    /// sibling's entry to trail its turn.
+    PollFirst,
+    /// It waits and has an effect besides waiting. The caller's readiness
+    /// says nothing about whether it waits: a write half can make the thread
+    /// unavailable for the process work the poll saw (a synchronous
+    /// `BC_TRANSACTION` pushes its transaction stack and defers its own
+    /// completion, drivers/android/binder.c:3616-3619 and :559-564 at v6.4),
+    /// and a freeze waits on another process's transactions, not on this
+    /// thread's work. It never polls, and its effect would run off the turn
+    /// on the background path, so the run must allow that
+    /// (`Detcore::admit_host_timed_binder_call`).
+    HostTimed(Blocking, Effect),
+}
+
+/// How Detcore issues `request` ([`Route`]), from the call's argument already
+/// read from guest memory, as [`blocking`] reads it.
+pub(crate) fn route(
+    request: u64,
+    write_read: Option<&WriteRead>,
+    freeze: Option<&[u32; 3]>,
+    nonblocking: bool,
+) -> Route {
+    match blocking(request, write_read, freeze, nonblocking) {
+        None => Route::InTurn,
+        Some(Blocking::Freeze) => Route::HostTimed(Blocking::Freeze, Effect::Freeze),
+        Some(Blocking::Read) if write_read.is_some_and(WriteRead::writes) => {
+            Route::HostTimed(Blocking::Read, Effect::Write)
+        }
+        Some(Blocking::Read) => Route::PollFirst,
+    }
+}
+
+/// Why a binder call on descriptor `fd` that waits and has `effect` cannot be
+/// ordered by the schedule: the policy's reason, for a refusal or a recorded
+/// determinism loss (`Detcore::admit_host_timed_binder_call`).
+pub(crate) fn host_timed_reason(effect: Effect, fd: RawFd) -> String {
+    let (call, what) = match effect {
+        Effect::Write => (
+            "ioctl(BINDER_WRITE_READ)",
+            "both writes and waits to read, so its write half (the transactions, replies and \
+             commands it sends) would run",
+        ),
+        Effect::Freeze => (
+            "ioctl(BINDER_FREEZE)",
+            "waits for its target's transactions to drain, so the freeze would take effect",
+        ),
+    };
+    format!(
+        "{call} on descriptor {fd} {what} on the background path, at a moment this host chooses \
+         rather than one the schedule orders against the guest's other threads"
+    )
+}
+
+/// The refusal of a binder read on descriptor `fd` that ran on the
+/// background path and delivered descriptors (`delivered`), or `None` when
+/// it delivered none. Linux installs them as the read returns
+/// (`binder_apply_fd_fixups`, drivers/android/binder.c:4666 and :4357 at
+/// v6.4), and other threads run between that and the caller's continuation,
+/// where they could close or replace those numbers, so Detcore cannot record
+/// them, as for a receive on the background path
+/// (`Detcore::record_received_descriptors`). A read whose descriptors cannot
+/// be told is refused too: it may have delivered some.
+pub(crate) fn background_receipt_refusal(fd: RawFd, delivered: &Delivered) -> Option<String> {
+    let what = match delivered.refused {
+        Some(why) => format!("may have delivered descriptors Detcore cannot name ({why})"),
+        None if delivered.fds.is_empty() => return None,
+        None => format!("delivered descriptors {:?}", delivered.fds),
+    };
+    Some(format!(
+        "ioctl(BINDER_WRITE_READ) on descriptor {fd} ran on the background path and {what}, \
+         which Detcore cannot record there: other threads ran between the kernel installing \
+         them and this thread's return, and could have closed or replaced those numbers. A \
+         binder read that delivers descriptors is served where it completes in the caller's \
+         turn: with work already queued for its thread, or on a nonblocking descriptor"
+    ))
 }
 
 /// `struct binder_freeze_info` at `argument`, read from guest memory.
@@ -593,7 +717,9 @@ mod tests {
             blocking(BINDER_WRITE_READ, Some(&writing), None, false),
             None
         );
-        // A read whose buffer the caller has already filled wants nothing.
+        // A read whose buffer the caller has already filled still waits for
+        // work before Linux finds no room for it
+        // (`an_exhausted_read_buffer_still_waits_for_work`).
         let consumed = WriteRead {
             read_size: 256,
             read_consumed: 256,
@@ -601,7 +727,7 @@ mod tests {
         };
         assert_eq!(
             blocking(BINDER_WRITE_READ, Some(&consumed), None, false),
-            None
+            Some(Blocking::Read)
         );
         assert_eq!(
             blocking(BINDER_FREEZE, None, Some(&[7, 1, 100]), false),
@@ -733,6 +859,175 @@ mod tests {
         assert!(!note_blocking(Blocking::Read, 1_000_001));
         assert!(note_blocking(Blocking::Freeze, 1_000_002));
         assert!(external_calls() >= before + 3);
+    }
+
+    /// A read whose buffer is already full (`read_consumed == read_size`)
+    /// waits for work like any other: Linux runs the read half whenever
+    /// `read_size` is nonzero and waits in `binder_wait_for_work` before it
+    /// checks the room left (drivers/android/binder.c:5073, :4412, :4445 at
+    /// v6.4). Classified as returning on its own, it ran in the caller's turn
+    /// and held the guest's only turn while the sibling that would send it
+    /// work never ran. It polls first, as any read without a write half does,
+    /// and so goes to the background path when no work is queued.
+    #[test]
+    fn an_exhausted_read_buffer_still_waits_for_work() {
+        for read_consumed in [1, 255, 256, 4096] {
+            let exhausted = WriteRead {
+                read_size: 256,
+                read_consumed,
+                read_buffer: 0x1000,
+                ..WriteRead::default()
+            };
+            assert!(exhausted.reads(), "{exhausted:?}");
+            assert_eq!(
+                blocking(BINDER_WRITE_READ, Some(&exhausted), None, false),
+                Some(Blocking::Read),
+                "{exhausted:?}"
+            );
+            assert_eq!(
+                route(BINDER_WRITE_READ, Some(&exhausted), None, false),
+                Route::PollFirst,
+                "{exhausted:?}"
+            );
+            // On a nonblocking descriptor the same read returns EAGAIN
+            // instead of waiting (:4408-4410).
+            assert_eq!(
+                route(BINDER_WRITE_READ, Some(&exhausted), None, true),
+                Route::InTurn
+            );
+        }
+        // No read half at all: nothing waits.
+        let none = WriteRead {
+            read_consumed: 8,
+            ..WriteRead::default()
+        };
+        assert!(!none.reads());
+        assert_eq!(
+            route(BINDER_WRITE_READ, Some(&none), None, false),
+            Route::InTurn
+        );
+    }
+
+    /// The zero-timeout poll that keeps a read with queued work in the
+    /// caller's turn asks only about this thread's work, so it is asked only
+    /// of a read with nothing before it. A freeze waits for another process's
+    /// transactions to drain, and a write+read's write half can leave the
+    /// thread unable to take the process work the poll saw (a synchronous
+    /// transaction pushes its stack: drivers/android/binder.c:3616-3619 and
+    /// :559-564 at v6.4); a ready caller with a blocked target would hold the
+    /// guest's only turn until the freeze timed out, or for good. Neither ever
+    /// polls: each is host-timed, whether or not its caller has work.
+    #[test]
+    fn only_a_read_with_nothing_before_it_asks_the_poll() {
+        let read = WriteRead {
+            read_size: 256,
+            ..WriteRead::default()
+        };
+        assert_eq!(
+            route(BINDER_WRITE_READ, Some(&read), None, false),
+            Route::PollFirst
+        );
+        // A write half the caller already ran in full is no write half.
+        let written = WriteRead {
+            write_size: 8,
+            write_consumed: 8,
+            ..read
+        };
+        assert!(!written.writes());
+        assert_eq!(
+            route(BINDER_WRITE_READ, Some(&written), None, false),
+            Route::PollFirst
+        );
+        // A write+read, whole or partly written, and with an exhausted read
+        // buffer too.
+        for (write_consumed, read_consumed) in [(0, 0), (4, 0), (0, 256)] {
+            let write_read = WriteRead {
+                write_size: 8,
+                write_consumed,
+                read_consumed,
+                ..read
+            };
+            assert!(write_read.writes());
+            assert_eq!(
+                route(BINDER_WRITE_READ, Some(&write_read), None, false),
+                Route::HostTimed(Blocking::Read, Effect::Write),
+                "{write_read:?}"
+            );
+            // On a nonblocking descriptor the read half returns EAGAIN, and
+            // the write half runs in the caller's turn with it.
+            assert_eq!(
+                route(BINDER_WRITE_READ, Some(&write_read), None, true),
+                Route::InTurn
+            );
+        }
+        // A write-only call returns on its own.
+        let write_only = WriteRead {
+            write_size: 8,
+            ..WriteRead::default()
+        };
+        assert_eq!(
+            route(BINDER_WRITE_READ, Some(&write_only), None, false),
+            Route::InTurn
+        );
+        // A freeze with a timeout, on any descriptor; one without a timeout,
+        // or a thaw, returns on its own.
+        for nonblocking in [false, true] {
+            assert_eq!(
+                route(BINDER_FREEZE, None, Some(&[7, 1, 100]), nonblocking),
+                Route::HostTimed(Blocking::Freeze, Effect::Freeze)
+            );
+            assert_eq!(
+                route(BINDER_FREEZE, None, Some(&[7, 1, 0]), nonblocking),
+                Route::InTurn
+            );
+            assert_eq!(
+                route(BINDER_FREEZE, None, Some(&[7, 0, 100]), nonblocking),
+                Route::InTurn
+            );
+        }
+        let reason = host_timed_reason(Effect::Write, 5);
+        assert!(
+            reason.starts_with("ioctl(BINDER_WRITE_READ) on descriptor 5 "),
+            "{reason}"
+        );
+        assert!(reason.contains("write half"), "{reason}");
+        let reason = host_timed_reason(Effect::Freeze, 6);
+        assert!(
+            reason.starts_with("ioctl(BINDER_FREEZE) on descriptor 6 "),
+            "{reason}"
+        );
+    }
+
+    /// A read on the background path that delivered descriptors, or whose
+    /// descriptors cannot be told, is refused by name; one that delivered
+    /// none is not.
+    #[test]
+    fn a_background_read_that_delivered_descriptors_is_refused_by_name() {
+        let delivered = Delivered {
+            fds: vec![7, 9],
+            messages: Vec::new(),
+            refused: None,
+        };
+        let refusal = background_receipt_refusal(4, &delivered).unwrap();
+        assert!(
+            refusal.starts_with("ioctl(BINDER_WRITE_READ) on descriptor 4 ran on the background"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("delivered descriptors [7, 9]"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("cannot record"), "{refusal}");
+        let unknown = Delivered {
+            refused: Some("its return commands cannot be read"),
+            ..Delivered::default()
+        };
+        let refusal = background_receipt_refusal(4, &unknown).unwrap();
+        assert!(
+            refusal.contains("may have delivered descriptors Detcore cannot name (its return commands cannot be read)"),
+            "{refusal}"
+        );
+        assert_eq!(background_receipt_refusal(4, &Delivered::default()), None);
     }
 
     /// The command codes are the uapi header's, from their `_IOR` parts.
