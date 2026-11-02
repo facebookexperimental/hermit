@@ -1833,6 +1833,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/concurrent-piped-spawns",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/concurrent-piped-spawns",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/copy-file-range-refusal-probe",
           "mode": "replay",
           "backend": "ptrace"
@@ -3823,12 +3837,54 @@
           "category": "c-programs",
           "test": "c-programs/inotify-blocking-faults",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-faults",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/inotify-blocking-faults",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-read",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-read",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-read",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-signal",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-signal",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9963,6 +10019,13 @@
           "test": "c-programs/sigreturn-preemption",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigreturn-preemption",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -17058,6 +17121,13 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/rustc",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/sar-resource-tables",
           "mode": "replay",
           "backend": "ptrace"
@@ -23210,6 +23280,13 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/rustc",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/sar-resource-tables",
           "mode": "replay",
           "backend": "ptrace"
@@ -28026,6 +28103,13 @@
           "category": "determinism-stress",
           "test": "determinism-stress/thread-interleaving",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress",
+          "test": "determinism-stress/thread-interleaving",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -28557,6 +28641,20 @@
           "lane": "portable",
           "category": "language-runtimes",
           "test": "language-runtimes/python-random",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-subprocess-capture",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-subprocess-capture",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -33682,6 +33780,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/concurrent-piped-spawns",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/copy-file-range-refusal-probe",
           "mode": "verify",
           "backend": "ptrace"
@@ -34047,6 +34152,20 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/inotify-blocking-faults",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-read",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-signal",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -35916,6 +36035,13 @@
           "lane": "portable",
           "category": "language-runtimes",
           "test": "language-runtimes/python-random",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-subprocess-capture",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -39318,6 +39444,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/concurrent-piped-spawns",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/copy-file-range-refusal-probe",
           "mode": "replay",
           "backend": "ptrace"
@@ -40397,6 +40530,27 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/inotify-blocking-faults",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-read",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-read",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-signal",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -50415,6 +50569,13 @@
           "lane": "portable",
           "category": "language-runtimes",
           "test": "language-runtimes/python-random",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-subprocess-capture",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -60523,6 +60684,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/concurrent-piped-spawns",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/concurrent-piped-spawns",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/copy-file-range-refusal-probe",
           "mode": "replay",
           "backend": "ptrace"
@@ -62513,12 +62688,54 @@
           "category": "c-programs",
           "test": "c-programs/inotify-blocking-faults",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-faults",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/inotify-blocking-faults",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-read",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-read",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-read",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-signal",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-blocking-signal",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -68653,6 +68870,13 @@
           "test": "c-programs/sigreturn-preemption",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigreturn-preemption",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -75730,6 +75954,13 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/rustc",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/sar-resource-tables",
           "mode": "replay",
           "backend": "ptrace"
@@ -78615,6 +78846,13 @@
           "category": "determinism-stress",
           "test": "determinism-stress/thread-interleaving",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress",
+          "test": "determinism-stress/thread-interleaving",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -79137,6 +79375,20 @@
           "lane": "portable",
           "category": "language-runtimes",
           "test": "language-runtimes/python-random",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-subprocess-capture",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-subprocess-capture",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -81239,7 +81491,7 @@
       "group": "build",
       "job": "workspace_compile_in_pinned_root",
       "desc": "Build every workspace target, the backend plugins and the one Hermit binary in the validate profile, beside the rust-script build",
-      "description": "The Cargo half of the pinned-root workspace build and the one Cargo compilation of Hermit in the full and portable validations, in the [profile.validate] profile: release optimisation with debug assertions and overflow checks on, so cells run an optimised Hermit with detcore's debug_assert invariants and the determinism-log hash lines --verify compares. It first builds exactly the nextest preparation's guest build, `-p hermetic_infra_hermit_tests --bins`, in the same profile, so that build finds every unit it links already fresh. The workspace build cannot serve it: it resolves 14 shared dependencies with wider features (parking_lot gains send_guard, bytes serde, syn fold), which gives every reverie and hermit-detcore unit a new hash, and building hermit-install alone instead (def08d743) made the guest build compile them inside build.workspace_in_pinned_root, 46 s, so it was reverted. Until 2026-10-18 this first build was `-p detcore-dbt`, a superset of the guest build's units plus reverie-dbt's DynamoRIO build script (25.8 s) and detcore-dbt itself (24.4 s), both rebuilt by the workspace build anyway, which also builds reverie-dbt before hermit-install's build script reads its DynamoRIO cache (the cache publishes by atomic rename, so concurrent builders are safe). In the 32-job timings of 601df499 the first build took 55.9 s and the guest build's own units end at about 47 s; the workspace build's critical chain (163.4 s replayed) does not move when the DynamoRIO build script joins it, since it finishes before detcore-dbt can start, then builds the whole workspace, all targets, with the union of the features every prepared Nextest selection names. Nothing in it runs a rust-script (run-with-reverie-dbt-budget.sh compiles its pin checks with rustc, and no build script calls one), so it does not wait for build.rust_scripts_in_pinned_root and the two compile side by side in the same pinned root, writing different target directories; it keeps the rust-script environment, with HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1, so a rust-script added here later fails at once instead of compiling or running unprepared. Its only consumer is build.workspace_in_pinned_root, which lists the executables this build produced. Until 2026-10-06 the two halves were one node that waited for the rust-script tools, about 183 seconds, before this 175-to-182-second Cargo phase began. preferred_inner_jobs=32 is kept from the cold measurement at hermit@846baeca.",
+      "description": "The Cargo half of the pinned-root workspace build and the one Cargo compilation of Hermit in the full and portable validations, in the [profile.validate] profile: release optimisation with debug assertions and overflow checks on, so cells run an optimised Hermit with detcore's debug_assert invariants and the determinism-log hash lines --verify compares. It first builds exactly the nextest preparation's guest build, `-p hermetic_infra_hermit_tests --bins`, in the same profile, so that build finds every unit it links already fresh. The workspace build cannot serve it: it resolves 14 shared dependencies with wider features (parking_lot gains send_guard, bytes serde, syn fold), which gives every reverie and hermit-detcore unit a new hash, and building hermit-install alone instead (def08d743) made the guest build compile them inside build.workspace_in_pinned_root, 46 s, so it was reverted. Until 2026-10-18 this first build was `-p detcore-dbt`, a superset of the guest build's units plus reverie-dbt's DynamoRIO build script (25.8 s) and detcore-dbt itself (24.4 s), both rebuilt by the workspace build anyway, which also builds reverie-dbt before hermit-install's build script reads its DynamoRIO cache (the cache publishes by atomic rename, so concurrent builders are safe). In the 32-job timings of 601df499 the first build took 55.9 s and the guest build's own units end at about 47 s; the workspace build's critical chain (163.4 s replayed) does not move when the DynamoRIO build script joins it, since it finishes before detcore-dbt can start, then builds the whole workspace, all targets, with the union of the features every prepared Nextest selection names. Nothing in it runs a rust-script (run-with-reverie-dbt-budget.sh compiles its pin checks with rustc, and no build script calls one), so it does not wait for build.rust_scripts_in_pinned_root and the two compile side by side in the same pinned root, writing different target directories; it keeps the rust-script environment, with HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1, so a rust-script added here later fails at once instead of compiling or running unprepared. Its only consumer is build.workspace_in_pinned_root, which lists the executables this build produced. Until 2026-10-06 the two halves were one node that waited for the rust-script tools, about 183 seconds, before this 175-to-182-second Cargo phase began. preferred_inner_jobs=32 is kept from the cold measurement at hermit@846baeca. CPU RE-DERIVATION 2026-11-01: across 265 retained full-run step profiles (ci-hub history node-cpu-budgets, kill samples excluded) this node's worst valid CPU was 7336.6 seconds (p99 7316.1), and a composite rerun was killed at the former 7200-second cap at about 7330 CPU-seconds while the same node at the same commit passed at about 6090; the shared workspace CPU budget is now 11100, the next 300-second bucket above 1.5 times that worst (11004.8).",
       "labels": [
         "full",
         "portable"
@@ -81275,7 +81527,7 @@
       "group": "build",
       "job": "workspace_in_pinned_root",
       "desc": "List every prepared Nextest executable from the one validate-profile build and record each selection's subset",
-      "description": "The preparation half of the pinned-root workspace build. Once build.workspace_compile_in_pinned_root has built every workspace target and build.rust_scripts_in_pinned_root has published the prebuilt rust-script tools, `nextest-binaries.rs prepare full` runs in the same pinned root, target directory and Cargo home: one `cargo nextest list` over the unified validate-profile build, the hermit_modes guests and record workloads from that build, and a dev-profile build of the nextest-cpu-wrapper. It hashes every listed executable and publishes all selections in one record, so no selection recompiles anything or relinks target/validate/hermit. After the final preparation Cargo invocation, `target/validate/stage-detcore-liteinst --git target` builds the ordinary preload in the existing liteinst-runtime profile, applies the unchanged source/constructor proof and atomically stages its receipt and bytes. Every consumer of the workspace build names this node, so none starts before both preparation and finalization complete. COLD ORDINARY FINALIZATION 2026-10-17: at Hermit 9b0e652d, eight admitted CPUs, with only target/liteinst-runtime removed before the run, the complete preparation plus ordinary finalizer took 294.965 wall seconds and 1383.852 CPU-seconds (1327.116 user, 56.736 system), with a 4.9-GiB peak and no OOM. This includes preparation rebuilding the stamped CLI and install staging; it is not just a warm artifact check. The former 1200-CPU-second cap interrupted the added dedicated-profile build. 2100 CPU-seconds is the next 300-second bucket above 1.5 times the complete measured cost (2075.778); the 600-second wall and 8-GiB memory bounds remain. The constructor/source proof and every prepared selection are unchanged. The budget is measured: in eight full validations on 2026-10-06 the unsplit node took 235 to 241 seconds, of which Cargo reported 45 to 46 for detcore-dbt and 130 to 136 for the workspace, leaving 58 to 60 seconds for container start and preparation. The CPU-wrapper build is the largest part, 27 to 28 seconds at 32 workers in those runs; a cold 16-worker build of it outside the root took 28 seconds, 135 CPU-seconds and a 2.4 GB memory peak. The 32-worker preference is the width preparation ran at inside the unsplit node.",
+      "description": "The preparation half of the pinned-root workspace build. Once build.workspace_compile_in_pinned_root has built every workspace target and build.rust_scripts_in_pinned_root has published the prebuilt rust-script tools, `nextest-binaries.rs prepare full` runs in the same pinned root, target directory and Cargo home: one `cargo nextest list` over the unified validate-profile build, the hermit_modes guests and record workloads from that build, and a dev-profile build of the nextest-cpu-wrapper. It hashes every listed executable and publishes all selections in one record, so no selection recompiles anything or relinks target/validate/hermit. After the final preparation Cargo invocation, `target/validate/stage-detcore-liteinst --git target` builds the ordinary preload in the existing liteinst-runtime profile, applies the unchanged source/constructor proof and atomically stages its receipt and bytes. Every consumer of the workspace build names this node, so none starts before both preparation and finalization complete. COLD ORDINARY FINALIZATION 2026-10-17: at Hermit 9b0e652d, eight admitted CPUs, with only target/liteinst-runtime removed before the run, the complete preparation plus ordinary finalizer took 294.965 wall seconds and 1383.852 CPU-seconds (1327.116 user, 56.736 system), with a 4.9-GiB peak and no OOM. This includes preparation rebuilding the stamped CLI and install staging; it is not just a warm artifact check. The former 1200-CPU-second cap interrupted the added dedicated-profile build. 2100 CPU-seconds is the next 300-second bucket above 1.5 times the complete measured cost (2075.778); the 600-second wall and 8-GiB memory bounds remain. CPU RE-DERIVATION 2026-11-01: across 274 retained full-run step profiles (ci-hub history node-cpu-budgets, kill samples excluded) the preparation's worst valid CPU was 3618.0 seconds (p99 3562.4), so the cap is now 5700, the next 300-second bucket above 1.5 times that worst (5427.0). The constructor/source proof and every prepared selection are unchanged. The budget is measured: in eight full validations on 2026-10-06 the unsplit node took 235 to 241 seconds, of which Cargo reported 45 to 46 for detcore-dbt and 130 to 136 for the workspace, leaving 58 to 60 seconds for container start and preparation. The CPU-wrapper build is the largest part, 27 to 28 seconds at 32 workers in those runs; a cold 16-worker build of it outside the root took 28 seconds, 135 CPU-seconds and a 2.4 GB memory peak. The 32-worker preference is the width preparation ran at inside the unsplit node.",
       "labels": [
         "full",
         "portable"
@@ -81295,7 +81547,7 @@
       "networkonly": false,
       "engine_only": false,
       "timeout": 600,
-      "cpu_timeout": 2100,
+      "cpu_timeout": 5700,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
