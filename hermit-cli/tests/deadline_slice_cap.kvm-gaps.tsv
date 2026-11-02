@@ -31,13 +31,15 @@
 # file or to the suite (validation runs it in check.lint_checks): a version the check cannot read
 # blocks it until the checker itself changes.
 #
-# Gaps: D, E, E+F' and G = the gaps of that letter in
-# https://github.com/rrnewton/hermit/issues/4929. D fails as the named refusal the KVM backend
-# gives for it: a thread with a descriptor table of its own. C (a KVM rt_sigsuspend that waits)
-# and F' (a KVM masked ppoll that waits) left with SIGSHARE S2b, which KVM now requires. The T2 rows of
+# Gaps: D and E+F' = the gaps of that letter in
+# https://github.com/rrnewton/hermit/issues/4929, whose slice 2 fixed E and G and promoted
+# their rows. D fails as the named refusal the KVM backend gives for it: a thread with a
+# descriptor table of its own. C (a KVM rt_sigsuspend that waits) and F' (a KVM masked ppoll
+# that waits) left with SIGSHARE S2b, which KVM now requires. The T2 rows of
 # https://github.com/rrnewton/hermit/issues/4954 left with KVM's preemption timer.
 #
-# SKIPPED ON KVM SINCE 2026-11-01: all rows below, by the owner's directive of 2026-11-01,
+# SKIPPED ON KVM SINCE 2026-11-01: the rows below (six then; S2b promoted C and F', and slice 2
+# of 4929 promoted E and G since), by the owner's directive of 2026-11-01,
 # 7:20 PM EST: "Just disable known-failing tests, but make sure a high-priority task is filed to
 # fix them." Until then the node ran them as diagnostics. They still run on ptrace, the suite's
 # other backend, where they pass. The fix is tracked at priority 1 in minibeads dh-j7ocf,
@@ -47,9 +49,5 @@
 id	gap	issue	outcome	signature	approval
 # D: KVM refuses a thread clone without CLONE_FS|CLONE_FILES, a named refusal. Skipped on KVM; the fix is tracked in minibeads dh-j7ocf, https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-j7ocf.md
 hermit-run::deadline_slice_cap$itimer_a_private_descriptor_table_consumer_re_arms	D	https://github.com/rrnewton/hermit/issues/4485	skipped	-	https://github.com/rrnewton/dev-hermit-beads/commit/81d9a9e92e752b9ad45be0799cec1557ebdeb3b8
-# E: an ignored expiry is queued instead of discarded. Skipped on KVM; the fix is tracked in minibeads dh-j7ocf, https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-j7ocf.md
-hermit-run::deadline_slice_cap$itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue	E	https://github.com/rrnewton/hermit/issues/4929	skipped	-	https://github.com/rrnewton/dev-hermit-beads/commit/81d9a9e92e752b9ad45be0799cec1557ebdeb3b8
 # E+F': needs the ignored-expiry fix and a masked ppoll that waits. Skipped on KVM; the fix is tracked in minibeads dh-j7ocf, https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-j7ocf.md
 hermit-run::deadline_slice_cap$itimer_generation_discard_follows_the_wait_mask	E+F'	https://github.com/rrnewton/hermit/issues/4995	skipped	-	https://github.com/rrnewton/dev-hermit-beads/commit/81d9a9e92e752b9ad45be0799cec1557ebdeb3b8
-# G: the scheduler does not schedule the alarm's eligible recipient. Skipped on KVM; the fix is tracked in minibeads dh-j7ocf, https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-j7ocf.md
-hermit-run::deadline_slice_cap$itimer_mixed_masks_keep_the_timer_running	G	https://github.com/rrnewton/hermit/issues/4929	skipped	-	https://github.com/rrnewton/dev-hermit-beads/commit/81d9a9e92e752b9ad45be0799cec1557ebdeb3b8

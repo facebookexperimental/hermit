@@ -14,25 +14,9 @@
           "status": "skipped"
         },
         {
-          "gap": "E",
-          "id": "hermit-run::deadline_slice_cap$itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue",
-          "issue": "https://github.com/rrnewton/hermit/issues/4929",
-          "outcome": "skipped",
-          "signature": null,
-          "status": "skipped"
-        },
-        {
           "gap": "E+F'",
           "id": "hermit-run::deadline_slice_cap$itimer_generation_discard_follows_the_wait_mask",
           "issue": "https://github.com/rrnewton/hermit/issues/4995",
-          "outcome": "skipped",
-          "signature": null,
-          "status": "skipped"
-        },
-        {
-          "gap": "G",
-          "id": "hermit-run::deadline_slice_cap$itimer_mixed_masks_keep_the_timer_running",
-          "issue": "https://github.com/rrnewton/hermit/issues/4929",
           "outcome": "skipped",
           "signature": null,
           "status": "skipped"
@@ -40,7 +24,7 @@
       ],
       "ledger": "hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv",
       "node": "privileged-test.deadline_slice_cap_kvm",
-      "required_tests": 41
+      "required_tests": 43
     }
   ],
   "schema": 1

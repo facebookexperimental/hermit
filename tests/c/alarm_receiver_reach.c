@@ -249,6 +249,17 @@
  *       Linux ends the process at the 10 ms expiry, whatever the main thread
  *       waits in. Killed by SIGALRM after a few lines; "joined: not killed"
  *       would mean it was not.
+ *   busypause
+ *       A recurring 2 ms ITIMER_REAL with a handler; the leader loops in
+ *       pause(), and a worker sleeps 3 ms, sends the leader SIGUSR1 with
+ *       pthread_kill, then sleeps 5 ms 20 times. Linux wakes the leader for
+ *       its SIGUSR1, and the expiries, which name the leader, all go to it:
+ *       the worker's sleeps are never interrupted. Prints "mode=busypause
+ *       usr1=1 alarm_worker=0 worker_eintr=0 alarm_leader_nonzero=1".
+ *   busypausealone
+ *       No timer: the leader loops in pause() until a worker's SIGUSR1,
+ *       sent after 3 ms, has run its handler. Linux wakes the leader for it.
+ *       Prints "mode=busypausealone usr1=1".
  */
 
 #define _GNU_SOURCE
@@ -1267,8 +1278,89 @@ static int poll_retry(const char* mode) {
   return 0;
 }
 
+/* busypause, busypausealone: a thread-directed SIGUSR1 to a leader parked
+ * in pause(), which Linux wakes for it whatever a SIGALRM does
+ * (https://github.com/rrnewton/hermit/issues/4929). */
+static pid_t busy_leader_tid;
+static pthread_t busy_leader;
+static volatile sig_atomic_t busy_done;
+static volatile sig_atomic_t busy_usr1;
+static volatile sig_atomic_t busy_alarm_leader;
+static volatile sig_atomic_t busy_alarm_worker;
+static int busy_worker_eintr;
+static int busy_with_timer;
+
+static void busy_on_alarm(int signal) {
+  (void)signal;
+  if ((pid_t)syscall(SYS_gettid) == busy_leader_tid) {
+    busy_alarm_leader++;
+  } else {
+    busy_alarm_worker++;
+  }
+}
+
+static void busy_on_usr1(int signal) {
+  (void)signal;
+  busy_usr1 = 1;
+}
+
+static void* busy_worker(void* arg) {
+  (void)arg;
+  struct timespec start = {0, 3 * 1000 * 1000};
+  nanosleep(&start, NULL);
+  pthread_kill(busy_leader, SIGUSR1);
+  if (busy_with_timer) {
+    for (int i = 0; i < 20; i++) {
+      struct timespec nap = {0, 5 * 1000 * 1000};
+      if (nanosleep(&nap, NULL) != 0 && errno == EINTR) {
+        busy_worker_eintr++;
+      }
+    }
+  }
+  busy_done = 1;
+  return NULL;
+}
+
+static int busy_pause(const char* mode) {
+  busy_with_timer = strcmp(mode, "busypause") == 0;
+  busy_leader_tid = (pid_t)syscall(SYS_gettid);
+  busy_leader = pthread_self();
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = busy_on_alarm;
+  sigaction(SIGALRM, &sa, NULL);
+  sa.sa_handler = busy_on_usr1;
+  sigaction(SIGUSR1, &sa, NULL);
+  if (busy_with_timer) {
+    struct itimerval every = {{0, 2000}, {0, 2000}};
+    setitimer(ITIMER_REAL, &every, NULL);
+  }
+  pthread_t worker;
+  pthread_create(&worker, NULL, busy_worker, NULL);
+  int pauses = 0;
+  while (busy_with_timer ? !busy_done && pauses < 1000 : !busy_usr1) {
+    pause();
+    pauses++;
+  }
+  if (busy_with_timer) {
+    struct itimerval off = {{0, 0}, {0, 0}};
+    setitimer(ITIMER_REAL, &off, NULL);
+  }
+  pthread_join(worker, NULL);
+  if (busy_with_timer) {
+    printf("mode=busypause usr1=%d alarm_worker=%d worker_eintr=%d alarm_leader_nonzero=%d\n",
+           (int)busy_usr1, (int)busy_alarm_worker, busy_worker_eintr, busy_alarm_leader > 0);
+  } else {
+    printf("mode=busypausealone usr1=%d\n", (int)busy_usr1);
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "poll";
+  if (strncmp(mode, "busypause", 9) == 0) {
+    return busy_pause(mode);
+  }
   if (strcmp(mode, "twotimers") == 0) {
     return two_timers();
   }

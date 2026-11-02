@@ -25712,28 +25712,36 @@ const WOKEN_POLL_BEHIND_CASES: [(&str, &str); 3] = [
     ),
 ];
 
-/// tests/c/alarm_receiver_reach.c's `mixedignterm` and the line it must print
-/// on KVM: `mixedignlate` with a POSIX timer's caught SIGTERM due at the same
-/// 10 ms, which only the waiter leaves unblocked. Where SIGALRM is ignored by
-/// the time it is delivered, SIGTERM's handler takes the EINTR. Natively the
-/// poll fails with EINTR in 10 of 10 runs, with both handlers run (8) or
-/// SIGTERM's alone (2), this line. Ptrace prints the other native line
-/// ([`MIXED_IGNORE_TERM_PTRACE`]).
-const MIXED_IGNORE_TERM: (&str, &str) = (
+/// tests/c/alarm_receiver_reach.c's `mixedignterm` and the two lines native
+/// Linux prints for it: `mixedignlate` with a POSIX timer's caught SIGTERM due
+/// at the same 10 ms, which only the waiter leaves unblocked. Where SIGALRM is
+/// ignored by the time it is delivered, SIGTERM's handler takes the EINTR.
+/// Natively the poll fails with EINTR in every run, with both handlers run (8
+/// of 10 runs in the review, 15 and 17 of 20 in two later sets of 20) or
+/// SIGTERM's alone (2, 5 and 3). Either line is Linux's, so a backend may
+/// print either, the same one in both runs of its strict verification, and no
+/// other line passes. Which one follows the backend's schedule: KVM prints
+/// SIGTERM's alone; ptrace printed it too until main began moving global time
+/// ahead while only idle pollers remain
+/// (`Scheduler::fast_forward_to_next_finite_deadline`), and both handlers
+/// since, as the waiter takes SIGTERM and SIGALRM at the jump's end, before the
+/// leader's sleep ends and it ignores SIGALRM.
+const MIXED_IGNORE_TERM: (&str, [&str; 2]) = (
     "mixedignterm",
-    "mode=mixedignterm first=-1 errno=EINTR eintr=1 usr1=0 on_waiter=0 term=1\n",
+    [
+        "mode=mixedignterm first=-1 errno=EINTR eintr=1 usr1=1 on_waiter=1 term=1\n",
+        "mode=mixedignterm first=-1 errno=EINTR eintr=1 usr1=0 on_waiter=0 term=1\n",
+    ],
 );
 
-/// The line ptrace prints for `mixedignterm` ([`MIXED_IGNORE_TERM`]): both
-/// handlers run, the native outcome of 8 in 10 runs. While only the waiter's
-/// poll and the leader's 10 ms sleep remain, ptrace's schedule moves global
-/// time ahead to the two expiries (`Scheduler::fast_forward_to_next_finite_deadline`),
-/// and the waiter takes SIGTERM and SIGALRM there, before the leader's sleep
-/// ends and it ignores SIGALRM.
-const MIXED_IGNORE_TERM_PTRACE: (&str, &str) = (
-    "mixedignterm",
-    "mode=mixedignterm first=-1 errno=EINTR eintr=1 usr1=1 on_waiter=1 term=1\n",
-);
+/// Requires that `printed`, what `mode` printed, is one of `lines`, the lines
+/// native Linux prints for it.
+fn assert_one_native_line(mode: &str, printed: &str, lines: &[&str]) {
+    assert!(
+        lines.contains(&printed),
+        "{mode}: {printed:?} is none of Linux's lines {lines:?}"
+    );
+}
 
 /// The modes of tests/c/alarm_receiver_reach.c in which a 50 ms alarm's
 /// handler, which only counts, interrupts a 100 ms `poll` that the program then
@@ -25799,7 +25807,7 @@ fn run_kvm_a_woken_poll_fails_with_eintr_when_any_handler_runs() {
     }
     for (mode, expected) in MIXED_PENDING_CASES
         .into_iter()
-        .chain([WOKEN_POLL_BEHIND_CASES[1], MIXED_IGNORE_TERM])
+        .chain([WOKEN_POLL_BEHIND_CASES[1]])
     {
         assert_eq!(
             alarm_receiver_reach_at_l2(&["--backend=kvm"], mode),
@@ -25807,9 +25815,15 @@ fn run_kvm_a_woken_poll_fails_with_eintr_when_any_handler_runs() {
             "{mode}"
         );
     }
+    let (mode, lines) = MIXED_IGNORE_TERM;
+    assert_one_native_line(
+        mode,
+        &alarm_receiver_reach_at_l2(&["--backend=kvm"], mode),
+        &lines,
+    );
 }
 
-/// A known parity failure, pinned until
+/// A KNOWN DIVERGENCE, pinned until
 /// https://github.com/rrnewton/hermit/issues/4995 is fixed: KVM never wakes a
 /// polling thread for a POSIX timer's signal other than SIGALRM. In
 /// tests/c/alarm_receiver_reach.c's `mixedlate` the timer's SIGUSR1 falls due
@@ -25909,20 +25923,21 @@ fn run_kvm_a_woken_poll_linux_would_end_otherwise_is_refused_by_name() {
 /// The ptrace half of `run_kvm_a_woken_poll_fails_with_eintr_when_any_handler_runs`,
 /// and of the refused and pinned KVM cases: `mixedpoll`, `mixedusr2`,
 /// `mixedshared`, `mixedlate`, `mixedbehind`, `mixedbehindnors`,
-/// `mixedtgkill` and `mixedignterm` (with both handlers run,
-/// [`MIXED_IGNORE_TERM_PTRACE`]), which ptrace runs as Linux does,
+/// `mixedtgkill` and `mixedignterm` (either of its two native lines,
+/// [`MIXED_IGNORE_TERM`]), which ptrace runs as Linux does,
 /// `mixedignlate`, which ptrace prints as Linux does in 2 or 3 of 10 native
 /// runs (the leader's ignore discards the copy before the waiter takes it, and
 /// the poll restarts), and `mixedtgkillusr2`, whose poll fails with EINTR once,
 /// as in 2 of 10 native runs (in the other 8 the waiter's next poll gets
 /// SIGUSR2's EINTR too). Not
-/// `mixedtaken`: ptrace gives that POSIX timer's SIGUSR1 to the waiting
-/// thread, not to the running leader, which Linux's `complete_signal` chooses
-/// (kernel/signal.c:973-974 at v6.17), so the waiter's poll fails with EINTR
-/// there. That is ptrace's own, older, difference: ptrace leaves the choice of
-/// thread for a timer's process-directed signal to the host kernel, which
-/// finds every guest thread stopped
-/// (https://github.com/rrnewton/hermit/issues/4991).
+/// `mixedtaken`, a KNOWN DIVERGENCE on ptrace
+/// (https://github.com/rrnewton/hermit/issues/4991): ptrace gives that POSIX
+/// timer's SIGUSR1 to the waiting thread, not to the running leader, which
+/// Linux's `complete_signal` chooses (kernel/signal.c:973-974 at v6.17), so
+/// the waiter's poll fails with EINTR there. That is ptrace's own, older,
+/// difference: ptrace leaves the choice of thread for a timer's
+/// process-directed signal to the host kernel, which finds every guest thread
+/// stopped.
 #[test]
 fn a_woken_poll_fails_with_eintr_when_any_handler_runs() {
     for (mode, expected) in [
@@ -25938,7 +25953,6 @@ fn a_woken_poll_fails_with_eintr_when_any_handler_runs() {
             "mixedignlate",
             "mode=mixedignlate first=1 errno=0 eintr=0 usr1=0 on_waiter=0\n",
         ),
-        MIXED_IGNORE_TERM_PTRACE,
         (
             "mixedtgkillusr2",
             "mode=mixedtgkillusr2 first=-1 errno=EINTR eintr=1 usr1=1 on_waiter=1 usr2=1\n",
@@ -25946,6 +25960,8 @@ fn a_woken_poll_fails_with_eintr_when_any_handler_runs() {
     ]) {
         assert_eq!(alarm_receiver_reach_at_l2(&[], mode), expected, "{mode}");
     }
+    let (mode, lines) = MIXED_IGNORE_TERM;
+    assert_one_native_line(mode, &alarm_receiver_reach_at_l2(&[], mode), &lines);
 }
 
 /// <https://github.com/rrnewton/hermit/issues/4929> (the Claude review of
@@ -26130,28 +26146,157 @@ fn restarted_poll_under_network_recording(backend: &[&str], mode: &str, port: Op
 /// dropped copy too, moved `curr_target` to B, and ran that handler on B. In
 /// `ignmoveblocked` the leader blocks SIGALRM, so the first copy is queued and
 /// its walk does move `curr_target` to B: the handler runs on B natively (10 of
-/// 10) and on KVM. Each must print the native line at bitwise parity. ptrace's
-/// choice of thread for these copies differs from Linux's
-/// (https://github.com/rrnewton/hermit/issues/4991): it prints the native
-/// line for one of the two modes, and which one has changed with the schedule.
+/// 10) and on KVM. Each must print Linux's line at bitwise parity
+/// ([`IGNORED_MOVE_CASES`]); the native and ptrace halves are
+/// `an_ignored_posix_timer_signal_moves_no_receiver_walk_natively_and_on_ptrace`.
 #[test]
 fn run_kvm_an_ignored_posix_timer_signal_moves_no_receiver_walk() {
     if !Path::new("/dev/kvm").exists() {
         eprintln!("skipping the KVM ignored POSIX-timer walk cases: /dev/kvm is unavailable");
         return;
     }
-    for (mode, expected) in [
-        ("ignmove", "mode=ignmove handler_on=A eintr_a=1 eintr_b=0\n"),
-        (
-            "ignmoveblocked",
-            "mode=ignmoveblocked handler_on=B eintr_a=0 eintr_b=1\n",
-        ),
-    ] {
+    for (mode, linux, _) in IGNORED_MOVE_CASES {
         assert_eq!(
             alarm_receiver_reach_at_l2(&["--backend=kvm"], mode),
-            expected,
+            linux,
             "{mode}"
         );
+    }
+}
+
+/// tests/c/alarm_receiver_reach.c's `busypause` and `busypausealone`, and the
+/// line Linux prints for each (5 of 5 native runs each on Linux 7.1.3).
+const BUSY_PAUSE_CASES: [(&str, &str); 2] = [
+    (
+        "busypause",
+        "mode=busypause usr1=1 alarm_worker=0 worker_eintr=0 alarm_leader_nonzero=1\n",
+    ),
+    ("busypausealone", "mode=busypausealone usr1=1\n"),
+];
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (the Claude review of the
+/// slice's rebase onto C2, P2 and P3): a leader parked in `pause` that a
+/// worker's `pthread_kill(SIGUSR1)` reaches is woken for it, as Linux's
+/// thread-directed send wakes it (`complete_signal` -> `signal_wake_up`,
+/// kernel/signal.c:946-961 and 1033 at v6.17), whether or not a SIGALRM is
+/// pending. In `busypause` a recurring 2 ms ITIMER_REAL runs and the worker
+/// then sleeps 5 ms 20 times: the expiries, which name the leader, all go to
+/// it, and no sleep of the worker's is interrupted. Before the busy-thread
+/// observation ran ahead of the receiver walk, KVM left the leader asleep with
+/// its SIGUSR1 pending and gave every expiry to the worker (alarm_worker=20
+/// worker_eintr=20). In `busypausealone`, with no timer, KVM left the leader
+/// asleep for ever (a deadlock under Hermit's model). Each mode must print
+/// Linux's line natively first, then on KVM at bitwise parity.
+#[test]
+fn run_kvm_a_paused_leader_takes_its_own_signal_as_linux_wakes_it() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM paused-leader signal cases: /dev/kvm is unavailable");
+        return;
+    }
+    for (mode, linux) in BUSY_PAUSE_CASES {
+        assert_eq!(
+            native_alarm_receiver_reach(mode, linux),
+            linux,
+            "{mode}: natively"
+        );
+        assert_eq!(
+            alarm_receiver_reach_at_l2(&["--backend=kvm"], mode),
+            linux,
+            "{mode}: KVM"
+        );
+    }
+}
+
+/// A line a backend prints where Linux prints another, recorded with the
+/// issue that tracks the difference.
+struct KnownDivergence {
+    issue: &'static str,
+    line: &'static str,
+}
+
+/// tests/c/alarm_receiver_reach.c's `ignmove` and `ignmoveblocked`, the line
+/// Linux prints for each (20 of 20 native runs each), and ptrace's line where
+/// it differs. `ignmoveblocked` on ptrace is a KNOWN DIVERGENCE
+/// (https://github.com/rrnewton/hermit/issues/5014): the POSIX timer's copy,
+/// queued and ignored, is not taken by B, which Linux wakes for it and which
+/// drops it, so `curr_target` stays put; the copy waits in the shared queue
+/// until A unblocks SIGALRM after the handler is installed, and
+/// the handler runs on A, outside any poll. ptrace leaves the choice of thread
+/// to the host kernel, which finds every guest thread stopped, as in
+/// https://github.com/rrnewton/hermit/issues/4991. ptrace printed Linux's
+/// line here until main began moving global time ahead while only idle
+/// pollers remain, which leaves B no polling attempt between the expiry and
+/// the handler's installation, and printed `handler_on=B` for `ignmove`
+/// before then.
+const IGNORED_MOVE_CASES: [(&str, &str, Option<KnownDivergence>); 2] = [
+    (
+        "ignmove",
+        "mode=ignmove handler_on=A eintr_a=1 eintr_b=0\n",
+        None,
+    ),
+    (
+        "ignmoveblocked",
+        "mode=ignmoveblocked handler_on=B eintr_a=0 eintr_b=1\n",
+        Some(KnownDivergence {
+            issue: "https://github.com/rrnewton/hermit/issues/5014",
+            line: "mode=ignmoveblocked handler_on=A eintr_a=0 eintr_b=0\n",
+        }),
+    ),
+];
+
+/// What tests/c/alarm_receiver_reach.c prints for `mode`, run natively: the
+/// first of up to three runs that prints `expected`, or else the last. A
+/// native run's thread timing is the host's, so one run on a loaded host can
+/// miss a window the mode relies on.
+fn native_alarm_receiver_reach(mode: &str, expected: &str) -> String {
+    let mut printed = String::new();
+    for _ in 0..3 {
+        let output = Command::new(alarm_receiver_reach_guest())
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run the alarm-receiver-reach guest natively");
+        assert!(output.status.success(), "{mode}: natively: {output:?}");
+        printed = String::from_utf8(output.stdout).expect("guest stdout should be UTF-8");
+        if printed == expected {
+            break;
+        }
+    }
+    printed
+}
+
+/// The native and ptrace halves of
+/// `run_kvm_an_ignored_posix_timer_signal_moves_no_receiver_walk`: each mode of
+/// [`IGNORED_MOVE_CASES`] must print Linux's line natively, and on ptrace, at
+/// bitwise parity, Linux's line or, where a KNOWN DIVERGENCE is recorded, the
+/// line it records, which this prints. A recorded divergence that has closed,
+/// where ptrace prints Linux's line, fails, so its record is dropped rather
+/// than left stale.
+#[test]
+fn an_ignored_posix_timer_signal_moves_no_receiver_walk_natively_and_on_ptrace() {
+    for (mode, linux, divergence) in IGNORED_MOVE_CASES {
+        assert_eq!(
+            native_alarm_receiver_reach(mode, linux),
+            linux,
+            "{mode}: natively"
+        );
+        let ptrace = alarm_receiver_reach_at_l2(&[], mode);
+        match divergence {
+            None => assert_eq!(ptrace, linux, "{mode}: ptrace"),
+            Some(KnownDivergence { issue, line }) => {
+                eprintln!(
+                    "{mode}: KNOWN DIVERGENCE on ptrace ({issue}): it prints {line:?} where Linux prints {linux:?}"
+                );
+                assert_ne!(
+                    ptrace, linux,
+                    "{mode}: the KNOWN DIVERGENCE {issue} has closed: ptrace prints Linux's line; drop its record and require Linux's line"
+                );
+                assert_eq!(
+                    ptrace, line,
+                    "{mode}: ptrace prints neither Linux's line nor the line the KNOWN DIVERGENCE {issue} records"
+                );
+            }
+        }
     }
 }
 
@@ -26593,16 +26738,17 @@ fn a_fatal_alarm_ends_a_joining_process_at_the_expiry() {
     }
 }
 
-/// D1 (<https://github.com/rrnewton/hermit/issues/4929>; accepted as a named
-/// KVM gap until N8a): tests/c/alarm_receiver_reach.c's `join` mode, in which
-/// the main thread waits in `pthread_join` (a futex wait) for a worker that
-/// makes system calls until the SIGALRM handler sets a flag. Linux wakes the
-/// main thread, which the expiry names and which wants the signal, so the
-/// handler runs there and the run prints `on_leader=1` (`complete_signal`,
-/// kernel/signal.c:963-997 at v6.17). KVM cannot interrupt a futex wait for a
-/// signal until N8a (`supports_blocked_wait_signal_interruption`), so its
-/// receiver choice passes the main thread over and the handler runs on the
-/// worker: `on_leader=0`. This pins that behaviour at bitwise parity, so that
+/// D1, a KNOWN DIVERGENCE (<https://github.com/rrnewton/hermit/issues/4929>;
+/// accepted as a named KVM gap until N8a): tests/c/alarm_receiver_reach.c's
+/// `join` mode, in which the main thread waits in `pthread_join` (a futex
+/// wait) for a worker that makes system calls until the SIGALRM handler sets a
+/// flag. Linux wakes the main thread, which the expiry names and which wants
+/// the signal, so the handler runs there and the run prints `on_leader=1`
+/// (`complete_signal`, kernel/signal.c:963-997 at v6.17). KVM cannot interrupt
+/// a futex wait for a signal until N8a
+/// (`supports_blocked_wait_signal_interruption`), so its receiver choice
+/// passes the main thread over and the handler runs on the worker:
+/// `on_leader=0`. This pins that behaviour at bitwise parity, so that
 /// N8a changes it deliberately, here and in
 /// `kvm_alarm_reaches_a_futex_waiting_main_thread_after_n8a`
 /// (docs/ARCHITECTURE.md, pending the owner's approval). The difference is never

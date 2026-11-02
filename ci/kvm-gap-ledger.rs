@@ -1508,7 +1508,8 @@ mod tests {
     /// The deadline_slice_cap ledger's rows name their gaps' issues. Its rows, the lettered gaps
     /// of https://github.com/rrnewton/hermit/issues/4929, are skipped on KVM since the owner's
     /// directive of 2026-11-01 (minibeads dh-j7ocf tracks the fix), each citing the issue of its
-    /// own gap. C and F' left with SIGSHARE S2b, which KVM now requires.
+    /// own gap. C and F' left with SIGSHARE S2b, which KVM now requires; E and G left with slice 2
+    /// of https://github.com/rrnewton/hermit/issues/4929, which KVM now requires too.
     #[test]
     fn the_deadline_slice_cap_rows_name_their_issues() {
         let declaration =
@@ -1521,16 +1522,10 @@ mod tests {
                 4485,
             ),
             (
-                "itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue",
-                "E",
-                4929,
-            ),
-            (
                 "itimer_generation_discard_follows_the_wait_mask",
                 "E+F'",
                 4995,
             ),
-            ("itimer_mixed_masks_keep_the_timer_running", "G", 4929),
         ];
         assert_eq!(rows.len(), expected.len());
         for (row, (test, gap, issue)) in rows.iter().zip(expected) {
