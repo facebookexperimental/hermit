@@ -6947,12 +6947,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         // go, and a read through the stale number would read another file's
         // locks, or find none and hide every lock
         // (`procfs::locks::LockLedger::alias_inode`): there is nothing to
-        // refresh. Nor after a call that failed with EBADF, which changed no
-        // lock: `fd` named no open file description, or one opened without
-        // read or write access asked for a lock (`SYSCALL_DEFINE2(flock)`,
-        // lines 2158-2162 of fs/locks.c in Linux v6.17).
+        // refresh. Nor after an answer Linux gives before it reaches a lock
+        // list, which changed no lock: `LOCK_MAND`'s 0, an invalid command's
+        // EINVAL and EBADF (`flock_model::flock_changed_no_lock`).
         let current = match taken {
-            _ if matches!(result, Err(Error::Errno(Errno::EBADF))) => None,
+            _ if flock_model::flock_changed_no_lock(operation, &result) => None,
             Some(open_file) => guest.thread_state().slot_naming(open_file, fd),
             None => Some(fd),
         };

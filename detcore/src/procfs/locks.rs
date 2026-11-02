@@ -2278,9 +2278,12 @@ impl LockLedger {
     /// them (`Detcore::flock_mirror_after_teardown`), so no later grant waits
     /// for them again: once the mirror succeeded, the host held no lock of
     /// theirs that conflicts with `mode`, and a mirror that failed after the
-    /// wait's backstop was refused by name. So on a backend that reports no
-    /// teardown (DBT), only the first such grant after an exit waits, and a
-    /// later grant meeting a lock from outside the run is refused at once.
+    /// wait's backstop was refused by name. Only a grant whose description a
+    /// descriptor of the caller's table names takes them, which is where its
+    /// mirror follows on a backend that mirrors ([`Self::flock_poll`]). So on
+    /// a backend that reports no teardown (DBT), only the first such grant
+    /// after an exit waits, and a later grant meeting a lock from outside the
+    /// run is refused at once.
     fn flock_take_lagging(&mut self, key: FlockInodeKey, mode: FlockMode) -> Vec<DetPid> {
         let torn_down = &self.flock_torn_down;
         let Some(inode) = self.flock_inodes.get_mut(&key) else {
@@ -2376,12 +2379,36 @@ impl LockLedger {
                     self.flock_drop_waiters(|waiter| waiter.thread == thread);
                     return FlockPoll::Refused(WAITER_DESCRIPTOR_GONE_REFUSAL.to_owned());
                 }
-                self.flock_take_lagging(key, mode)
+                // The exited holders go to a grant whose description a
+                // descriptor of the caller's table names, which is where its
+                // mirror follows on a backend that mirrors
+                // (`Detcore::flock_mirror_waited`). Where none does, no mirror
+                // is made, as the lock goes with the call's own last reference
+                // or the call is refused by name, so the holders stay for the
+                // next conflicting grant, whose mirror waits for them (the
+                // Claude review of slice SP2's third round: that mirror was
+                // made at once, and a host still tearing a holder down refused
+                // it where Linux grants).
+                if self.flock_table_names(process, open_file) {
+                    self.flock_take_lagging(key, mode)
+                } else {
+                    Vec::new()
+                }
             }
             _ => Vec::new(),
         };
         self.flock_drop_waiters(|waiter| waiter.thread == thread);
         FlockPoll::Granted { lagging }
+    }
+
+    /// Whether a descriptor of `process`'s table names `open_file` (a table
+    /// that names it none has no entry, [`Self::set_references`]).
+    fn flock_table_names(&self, process: DetPid, open_file: OpenFileId) -> bool {
+        self.process_table.get(&process).is_some_and(|table| {
+            self.references
+                .get(&open_file)
+                .is_some_and(|tables| tables.contains_key(table))
+        })
     }
 
     /// Whether, once `thread`'s waiting call lets go of its own reference on
@@ -5282,6 +5309,57 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
             ledger.flock(taker, taker, flock_request(description(3), EX, false)),
             granted()
         );
+    }
+
+    /// A waited grant that no mirror follows hands over no exited holder. The
+    /// waiting call's descriptor was the last of its table to name the
+    /// description, and a sibling closed it: the call's own reference was the
+    /// description's last, so the lock goes with the call, or another
+    /// process's table keeps the description and the call is refused by name,
+    /// after which the model lets the grant go (`Detcore::flock_revoke`).
+    /// Either way nothing is mirrored, and the next conflicting grant, whose
+    /// mirror is made, must still wait for the holder's teardown (the Claude
+    /// review of slice SP2's third round: it mirrored at once, so a host still
+    /// tearing the holder down refused a call Linux grants).
+    #[test]
+    fn a_waited_grant_that_no_mirror_follows_leaves_the_exited_holders() {
+        let [holder, process, child, later] = [3, 4, 5, 6].map(DetPid::from_raw);
+        let waiter = DetTid::from_raw(40);
+        for kept_by_a_child in [false, true] {
+            let mut ledger = LockLedger::default();
+            ledger.flock(holder, holder, flock_request(description(0), EX, false));
+            assert_eq!(
+                ledger.flock(process, waiter, flock_request(description(1), EX, false)),
+                FlockOutcome::Queued { dropped: false }
+            );
+            if kept_by_a_child {
+                ledger.fork(process, child, false);
+            }
+            ledger.release(process, description(1), 0);
+            ledger.prune(|exited| exited != holder);
+            assert_eq!(
+                ledger.flock_poll(waiter),
+                granted_poll(&[]),
+                "kept by a child: {kept_by_a_child}"
+            );
+            if kept_by_a_child {
+                let revoke = FlockRequest {
+                    slots: 0,
+                    ..flock_request(description(1), UN, false)
+                };
+                assert_eq!(
+                    ledger.flock(process, waiter, revoke),
+                    FlockOutcome::Released
+                );
+            }
+            assert_eq!(
+                ledger.flock(later, later, flock_request(description(2), EX, false)),
+                FlockOutcome::Granted {
+                    lagging: vec![holder]
+                },
+                "kept by a child: {kept_by_a_child}"
+            );
+        }
     }
 
     /// A retry that blocks again wakes the requests that were blocked under

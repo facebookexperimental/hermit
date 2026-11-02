@@ -92,6 +92,24 @@ use crate::types::OpenFileId;
 /// else (`sys_flock`).
 const LOCK_MAND: i32 = 32;
 
+/// Whether a `flock` call with `operation` that answered `result` changed no
+/// lock, Linux having answered before it reached a lock list: `LOCK_MAND`
+/// with 0 before anything else, an invalid command with EINVAL before the
+/// descriptor, and EBADF where the descriptor names no open file, or names
+/// one opened without read or write access and asked for a lock
+/// (`SYSCALL_DEFINE2(flock)`, lines 2148-2162 of fs/locks.c in Linux v6.17).
+/// Its description's locks are then as they were, and a descriptor that
+/// names nothing has no fdinfo to read them through
+/// (`Detcore::handle_flock`).
+pub(crate) fn flock_changed_no_lock(operation: i32, result: &Result<i64, Error>) -> bool {
+    operation & LOCK_MAND != 0
+        || !matches!(
+            operation & !libc::LOCK_NB,
+            libc::LOCK_SH | libc::LOCK_EX | libc::LOCK_UN
+        )
+        || matches!(result, Err(Error::Errno(Errno::EBADF)))
+}
+
 /// How long a grant's mirror after a release by an exit waits at most for the
 /// host teardown of the process that held the lock: then it mirrors anyway
 /// where the backend reports teardowns, and refuses the call by name on DBT,
@@ -727,8 +745,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// again while it answers `EWOULDBLOCK`, at most for
     /// [`TEARDOWN_BACKSTOP`], after which the answer is `EWOULDBLOCK`. A
     /// mirror that fails is refused by name. The model hands each exited
-    /// process to one grant's mirror only, the first whose lock conflicts
-    /// with the one it released
+    /// process to one grant only: the first whose lock conflicts with the one
+    /// it released and whose description a descriptor of the caller's table
+    /// names, which is where its mirror follows on a backend that mirrors
     /// (`procfs::locks::LockLedger::flock_take_lagging`), so on DBT at most
     /// that grant waits, and a later one that meets a lock from outside the
     /// run is refused at once.
@@ -1121,6 +1140,46 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The answers Linux gives before it reaches a lock list change no lock,
+    /// whatever the descriptor: `LOCK_MAND` (0), an invalid command (EINVAL)
+    /// and EBADF. Any other answer to a valid command may have (the Claude
+    /// review of slice SP2's third round: after the first two, through a
+    /// descriptor that names nothing, a refresh hid every `/proc/locks` row).
+    #[test]
+    fn only_linuxs_early_answers_change_no_lock() {
+        let ok: Result<i64, Error> = Ok(0);
+        let errno = |errno: Errno| -> Result<i64, Error> { Err(Error::Errno(errno)) };
+        assert!(flock_changed_no_lock(LOCK_MAND, &ok));
+        assert!(flock_changed_no_lock(LOCK_MAND | libc::LOCK_EX, &ok));
+        assert!(flock_changed_no_lock(
+            libc::LOCK_SH | libc::LOCK_EX,
+            &errno(Errno::EINVAL)
+        ));
+        assert!(flock_changed_no_lock(0, &errno(Errno::EINVAL)));
+        assert!(flock_changed_no_lock(
+            libc::LOCK_EX | 128,
+            &errno(Errno::EINVAL)
+        ));
+        assert!(flock_changed_no_lock(libc::LOCK_EX, &errno(Errno::EBADF)));
+        for operation in [
+            libc::LOCK_SH,
+            libc::LOCK_EX,
+            libc::LOCK_UN,
+            libc::LOCK_EX | libc::LOCK_NB,
+            libc::LOCK_UN | libc::LOCK_NB,
+        ] {
+            assert!(!flock_changed_no_lock(operation, &ok), "{operation:#x}");
+            assert!(
+                !flock_changed_no_lock(operation, &errno(Errno::EWOULDBLOCK)),
+                "{operation:#x}"
+            );
+            assert!(
+                !flock_changed_no_lock(operation, &errno(Errno::EINVAL)),
+                "a filesystem's own EINVAL to {operation:#x}"
+            );
+        }
+    }
 
     #[test]
     fn own_flock_filesystems_are_named_by_their_magic() {

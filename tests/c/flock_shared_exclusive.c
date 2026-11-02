@@ -1022,13 +1022,17 @@ static void scenario_waiter_replaced(void) {
   scenario_waiter_descriptor_gone(1);
 }
 
-/* A flock through a descriptor number that names nothing fails with EBADF
-   before it looks at any lock (`SYSCALL_DEFINE2(flock)`): an OFD lock the
+/* Linux answers a flock before it reaches any lock list where the command
+   is LOCK_MAND (0, before anything else), where the command is invalid
+   (EINVAL, before the descriptor), and, through a descriptor number that
+   names nothing, with EBADF (`SYSCALL_DEFINE2(flock)`). Through descriptor
+   250, which names nothing, each changes no lock, and an OFD lock the
    process holds on an unrelated file keeps its /proc/locks row (found in
-   slice SP2's third round, on main too: the call's completion read the
-   number's fdinfo, found none, and hid every lock's row). Not in `all`:
-   replay refuses a flock through a descriptor outside its root, an EBADF
-   one included; hermit-cli/tests/flock_exclusion.rs runs it. */
+   slice SP2's third round, the EBADF case on main too: the call's completion
+   read the number's fdinfo, found none, and hid every lock's row; the other
+   two in the Claude review of that round). Not in `all`: replay refuses a
+   flock through a descriptor outside its root, an EBADF one included;
+   hermit-cli/tests/flock_exclusion.rs runs it. */
 static void scenario_ebadf(void) {
   const char* s = "ebadf";
   char count[16];
@@ -1040,6 +1044,13 @@ static void scenario_ebadf(void) {
          attempt(250, LOCK_EX | LOCK_NB), "errno=9");
   unrelated_ofd_rows(count, sizeof(count));
   expect(s, "the unrelated OFD lock's rows after that EBADF", count, "1");
+  expect(s, "LOCK_SH|LOCK_EX through descriptor 250", attempt(250, LOCK_SH | LOCK_EX),
+         "errno=22");
+  unrelated_ofd_rows(count, sizeof(count));
+  expect(s, "the unrelated OFD lock's rows after that EINVAL", count, "1");
+  expect(s, "LOCK_MAND through descriptor 250", attempt(250, LOCK_MAND), "ok");
+  unrelated_ofd_rows(count, sizeof(count));
+  expect(s, "the unrelated OFD lock's rows after that LOCK_MAND", count, "1");
   close(unrelated);
   unlink(unrelated_path);
 }
