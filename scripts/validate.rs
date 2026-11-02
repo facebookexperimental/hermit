@@ -2791,7 +2791,16 @@ struct SubmoduleFixtureChild {
 }
 
 /// The wall bound, in seconds, that `timeout` puts on one fixture child.
-const SUBMODULE_FIXTURE_CHILD_SECONDS: u64 = 300;
+///
+/// It is a hang backstop, not the work bound. In `selftest.validate_rs` the
+/// child runs inside the node's dagrun cgroup, whose CPU bound covers the
+/// child's whole process tree and does not fire on host load. This was 300
+/// until 2026-11-02, when four concurrent full validations failed the node at
+/// least five times with "the fixture child was killed at its 300-second
+/// bound after 300.1 s" (hermit 1a99b1a4, c041f6de, 848fda04 among them):
+/// a starved child, not a hung one. 780 leaves 120 seconds of the node's
+/// 900-second wall for the brackets after it (ci/manifest-plan/src/step_limits.rs).
+const SUBMODULE_FIXTURE_CHILD_SECONDS: u64 = 780;
 
 /// The rust-script cache of the no-submodules child, private to its fixture.
 ///

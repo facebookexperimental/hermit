@@ -229,7 +229,7 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
 ];
 pub const HOSTED_PORTABLE_LABEL: &str = "hosted-portable";
 const HOSTED_PRIVILEGED_LABEL: &str = "hosted-privileged";
-const HOSTED_VARIANT_SUFFIX: &str = "_on_host";
+pub(crate) const HOSTED_VARIANT_SUFFIX: &str = "_on_host";
 /// Hermit backends the GitHub-hosted portable profile omits.
 ///
 /// GitHub-hosted runners expose `/dev/kvm` through nested virtualization but
@@ -2298,8 +2298,16 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
     // about 10 times the measurement; it also encloses the stage's lock wait,
     // whose default (HERMIT_BUCK_STAGE_LOCK_TIMEOUT, 1200 s) leaves room for one
     // stage after it.
-    stage.timeout = 1800;
-    stage.cpu_timeout = 6000;
+    // 2026-11-02 (step_limits.rs): under concurrent full validations two stages
+    // were killed at that 1800-second WALL bound with 4039 and 3248 CPU-s used,
+    // and 499 passing stages to that date peaked at 4419 CPU-s. The CPU bound is
+    // the next 300-s bucket above 1.5 x 4419 (6628), 6900; the wall is 1.5 x
+    // the 1800-s kill bound, 2700, so a full lock wait still leaves 1500 s for
+    // the stage itself. It cannot be 3000: no node's wall may leave less than
+    // PREPARATION_RESERVE_S of the 4200-s run budget
+    // (committed_selections_survive_a_slow_preparation).
+    stage.timeout = 2700;
+    stage.cpu_timeout = 6900;
     stage.hint.est_duration_s = 177.0;
     // The baseline cloned from build.buck_release_artifact (8.39 GiB) is below
     // what ci/buck-e2e/stage peaks at with its builds running side by side:
@@ -4476,6 +4484,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     assert_m1_allocator_gate(cfg)?;
     assert_m2_stack_gate(cfg)?;
     assert_declared_caps(cfg)?;
+    crate::step_limits::assert_cpu_bounded_step_limits(cfg)?;
     assert_structured_result_producers(cfg)?;
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
     crate::nextest_build_selections::assert_producers_build_the_unified_selection(cfg)?;
@@ -5055,10 +5064,16 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         // build.rust_scripts_in_pinned_root (1200),
         // setup.manifest_plan_in_pinned_root (300),
         // privileged-build.manifest_guests_in_pinned_root (120), then
-        // privileged-only-e2e.manifest_applications and its scorecard.
-        if profile.label == "privileged" && critical_path_wall_seconds(&selected)? != 4740 {
+        // privileged-only-e2e.manifest_applications and its scorecard. 5160
+        // since 2026-11-02, when the step-limit recalibration (step_limits.rs)
+        // gave setup.manifest_plan, whose bounds its pinned-root twin copies,
+        // a 600-second wall (300 before; 210 s measured, 2100 CPU-seconds) and
+        // privileged-build.manifest_guests a 240-second one (120 before: 8
+        // times its 30-CPU-second floor; 21.6 s measured); the path's nodes are
+        // unchanged.
+        if profile.label == "privileged" && critical_path_wall_seconds(&selected)? != 5160 {
             return Err(format!(
-                "local privileged selected critical path differs from 4740 seconds with the measured rust-script wall bound and setup.manifest_plan beside it: {}",
+                "local privileged selected critical path differs from 5160 seconds with the measured rust-script wall bound and setup.manifest_plan beside it: {}",
                 critical_path_wall_seconds(&selected)?
             ));
         }
@@ -7226,8 +7241,10 @@ sys.exit(37)
             .unwrap();
         // 900 s covers the 104 folded backend-parity-c tests (slice S6 of
         // https://github.com/rrnewton/hermit/issues/3301); the two buckets
-        // measured 128.62 s and 75.76 s of wall time in one run.
-        assert_eq!(local.timeout, 900);
+        // measured 128.62 s and 75.76 s of wall time in one run. 1080 since
+        // 2026-11-02: 61 runs under concurrent validations peaked at 707 s
+        // (step_limits.rs).
+        assert_eq!(local.timeout, 1080);
         assert_eq!(hosted.timeout, local.timeout);
     }
 
@@ -8407,7 +8424,7 @@ sys.exit(37)
         };
         let local = find(&committed, SCRIPT_UNIT_TESTS_TAG);
         let hosted = find(&committed, HOSTED_SCRIPT_UNIT_TESTS_TAG);
-        assert_eq!(local.timeout, 900);
+        assert_eq!(local.timeout, 1500);
         assert_eq!(hosted.timeout, 1500);
         assert_eq!(hosted.cpu_timeout, local.cpu_timeout);
         assert_eq!(hosted.cmd, local.cmd);
@@ -8485,9 +8502,9 @@ sys.exit(37)
             .iter_mut()
             .find(|step| step.tag() == SCRIPT_UNIT_TESTS_TAG)
             .unwrap()
-            .timeout = 1500;
+            .timeout = 900;
         let error = materialize_hosted_script_unit_tests(&mut rewalled).unwrap_err();
-        assert!(error.contains("not its authored 900s"), "{error}");
+        assert!(error.contains("not its authored 1500s"), "{error}");
 
         // The assertion refuses each way of undoing the twin's contract.
         let mutated = |tag: &str, edit: &dyn Fn(&mut Step)| {
@@ -8506,8 +8523,11 @@ sys.exit(37)
             hosted_wall.contains("not the hosted 1500s"),
             "{hosted_wall}"
         );
-        let local_wall = mutated(SCRIPT_UNIT_TESTS_TAG, &|step| step.timeout = 1500);
-        assert!(local_wall.contains("not its authored 900s"), "{local_wall}");
+        let local_wall = mutated(SCRIPT_UNIT_TESTS_TAG, &|step| step.timeout = 900);
+        assert!(
+            local_wall.contains("not its authored 1500s"),
+            "{local_wall}"
+        );
         for (what, edit) in [
             (
                 "command",

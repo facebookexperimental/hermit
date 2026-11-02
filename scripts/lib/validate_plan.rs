@@ -354,11 +354,13 @@ mod tests {
                 Some(10_737_418_240),
             ),
             // 4 GiB since its width went from one core to 8 on 2026-09-30:
-            // a cold 8-core build peaked at 2.53 GiB.
+            // a cold 8-core build peaked at 2.53 GiB. 600 s wall and 2100
+            // CPU-s since 2026-11-02 (ci/manifest-plan/src/step_limits.rs):
+            // 679 runs peaked at 625.7 CPU-s and 210.3 s of wall.
             (
                 "setup.manifest_plan".to_string(),
-                300,
-                7200,
+                600,
+                2100,
                 Some(4_294_967_296),
             ),
             ("gate.manifest".to_string(), 900, 900, Some(5_368_709_120)),
