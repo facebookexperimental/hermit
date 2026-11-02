@@ -137,7 +137,9 @@ const INCARNATION_BITS: u32 = 8;
 const PID_BITS: u32 = 22;
 
 /// Bits of a per-process inode number for the file's index among the
-/// per-process files Detcore renders, from 1.
+/// per-process files Detcore renders, from 1. Full since `comm` took index 7
+/// (package K slice A+): the next per-process file needs a new layout, which
+/// renumbers every per-process inode.
 const INDEX_BITS: u32 = 3;
 
 const _: () = assert!(
@@ -229,29 +231,15 @@ pub(crate) fn may_be_procfs(device: u64, block_size: i64) -> bool {
     libc::major(device) == 0 && block_size == PROC_BLOCK_SIZE
 }
 
-/// The device of the procfs files the KVM backend synthesizes (`/proc` and
-/// its allowlisted files): reverie-kvm's `synthetic_dev(SYNTHETIC_PROC_DEV_MINOR)`
-/// in `reverie-kvm/src/executor.rs`, which reports them with 4096-byte blocks.
-/// `run_kvm_a_procfs_directory_keeps_its_size` fails if the two drift apart.
+/// The device of the regular procfs files the KVM backend's executor still
+/// synthesizes (`/proc/locks`, `/proc/self/status` and `/proc/self/maps`):
+/// reverie-linuxemu's `synthetic_dev(SYNTHETIC_PROC_DEV_MINOR)`, which it
+/// reports with 4096-byte blocks. It keys the inode numbers of the `/proc`
+/// directories Detcore serves on KVM
+/// (`Detcore::procfs_key_device`), so that they are the numbers they were
+/// when the executor's own `/proc` directory reported this device; the
+/// executor serves no procfs directory since package K slice P2.
 pub(crate) const KVM_SYNTHETIC_PROC_DEVICE: u64 = libc::makedev(0, 0xff01);
-
-/// Whether a stat result is the procfs of a backend whose `/proc` is its
-/// own: where the tool cannot name guest descriptors through host procfs
-/// ([`tool_can_name_guest_descriptors`], KVM), the backend serves `/proc`
-/// itself, on [`KVM_SYNTHETIC_PROC_DEVICE`] with 4096-byte blocks, and that
-/// device is the proof. Elsewhere the kernel's procfs is proved by naming the
-/// entry (`ProcfsEntry`), not by its stat fields: an anonymous device with
-/// 1024-byte blocks is also devpts, autofs or a FUSE mount that reports those
-/// blocks (Codex re-check of https://github.com/rrnewton/hermit/pull/4369).
-pub(crate) fn is_backend_procfs_device(
-    backend: &BackendCapabilities,
-    device: u64,
-    block_size: i64,
-) -> bool {
-    !tool_can_name_guest_descriptors(backend)
-        && device == KVM_SYNTHETIC_PROC_DEVICE
-        && block_size == 4096
-}
 
 /// Whether a stat result must be taken as procfs although Detcore cannot
 /// prove it: where guest thread IDs do not name host tasks
@@ -302,6 +290,21 @@ pub(crate) fn guest_tids_name_host_tasks(
 /// started without its configuration leaves at ptrace's values.
 pub(crate) fn tool_can_name_guest_descriptors(backend: &BackendCapabilities) -> bool {
     !backend.provides_process_signal_control
+}
+
+/// Whether the tool can read a guest process's working directory and root
+/// from host procfs, as `/proc/<pid>/cwd` and `/proc/<pid>/root` by the
+/// guest's process ID: the fact [`tool_can_name_guest_descriptors`] keys on,
+/// wherever guest threads are host tasks. Where the backend owns signal
+/// delivery because they are not (`provides_process_signal_control`, KVM),
+/// the guest's process ID names whatever host task holds it in the run's PID
+/// namespace, one of the supervisor's own threads
+/// (<https://github.com/rrnewton/hermit/issues/4541>), so Detcore reads the
+/// working directory from the guest instead, with an injected `getcwd`
+/// (`Detcore::read_guest_cwd_for_syscall`). A helper of its own over the
+/// same fact, so that each decision names what it reads from procfs.
+pub(crate) fn tool_can_read_guest_cwd(backend: &BackendCapabilities) -> bool {
+    tool_can_name_guest_descriptors(backend)
 }
 
 /// The key for the procfs entry at `path` within procfs on `device`: the
@@ -1109,7 +1112,13 @@ mod tests {
         const SENTINEL: i32 = 4242;
         nix::errno::Errno::set_raw(SENTINEL);
         let inside = futures::executor::block_on(preserving_errno(async {
-            assert!(std::fs::symlink_metadata("/proc/self/fd/-1").is_err());
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: the path is NUL-terminated and stat is writable output
+            // storage. The failed call's output is never read.
+            assert_eq!(
+                unsafe { libc::lstat(c"/proc/self/fd/-1".as_ptr(), stat.as_mut_ptr()) },
+                -1
+            );
             nix::errno::Errno::last_raw()
         }));
         assert_eq!(inside, libc::ENOENT, "the failed call set errno");
@@ -1379,41 +1388,6 @@ mod tests {
     }
 
     #[test]
-    fn only_kvms_synthetic_procfs_device_is_proved_by_its_stat_fields() {
-        let synthetic = libc::makedev(0, 0xff01);
-        assert!(is_backend_procfs_device(
-            &BackendCapabilities::KVM,
-            synthetic,
-            4096
-        ));
-        assert!(!is_backend_procfs_device(
-            &BackendCapabilities::KVM,
-            synthetic,
-            1024
-        ));
-        assert!(!is_backend_procfs_device(
-            &BackendCapabilities::KVM,
-            PROC_DEVICE,
-            1024
-        ));
-        assert!(!is_backend_procfs_device(
-            &BackendCapabilities::PTRACE,
-            synthetic,
-            4096
-        ));
-        assert!(!is_backend_procfs_device(
-            &BackendCapabilities::PTRACE,
-            PROC_DEVICE,
-            1024
-        ));
-        assert!(!is_backend_procfs_device(
-            &BackendCapabilities::DBT,
-            PROC_DEVICE,
-            1024
-        ));
-    }
-
-    #[test]
     fn only_a_backend_that_names_no_entries_but_shares_procfs_keeps_its_signature() {
         // DBT: guest thread IDs are its scheduler's virtual IDs.
         assert!(unprovable_procfs_signature(
@@ -1507,6 +1481,34 @@ mod tests {
             assert!(tool_can_name_guest_descriptors(&backend));
         }
         assert!(!tool_can_name_guest_descriptors(&BackendCapabilities::KVM));
+    }
+
+    /// The working directory is read from host procfs wherever descriptors
+    /// are, and from the guest (an injected `getcwd`) under KVM, whose guest
+    /// process IDs name the supervisor's own threads
+    /// (<https://github.com/rrnewton/hermit/issues/4541>): one fact keys both,
+    /// never the backend's name.
+    #[test]
+    fn the_working_directory_is_read_from_procfs_where_descriptors_are() {
+        for backend in [
+            BackendCapabilities::PTRACE,
+            BackendCapabilities::LITEINST_IN_GUEST,
+            BackendCapabilities::SABRE,
+            BackendCapabilities::DBT,
+            BackendCapabilities::KVM,
+        ] {
+            assert_eq!(
+                tool_can_read_guest_cwd(&backend),
+                tool_can_name_guest_descriptors(&backend)
+            );
+            assert_eq!(
+                tool_can_read_guest_cwd(&backend),
+                !backend.provides_process_signal_control
+            );
+        }
+        assert!(tool_can_read_guest_cwd(&BackendCapabilities::PTRACE));
+        assert!(tool_can_read_guest_cwd(&BackendCapabilities::DBT));
+        assert!(!tool_can_read_guest_cwd(&BackendCapabilities::KVM));
     }
 
     /// Once its task has exited, an entry is not named: following the link

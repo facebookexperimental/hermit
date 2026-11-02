@@ -83,10 +83,11 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
         backends_enabled:
           - ptrace
+          - dbt
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Robust-futex owner-death wakeup exercises core Detcore scheduling and currently times out under SaBRe; owner review is required
           liteinst: The LiteInst host-hybrid backend refuses clone3 with ENOTSUPP before the guest creates its first thread, so this multi-threaded guest cannot run there yet; unrelated to robust-futex owner death

@@ -212,10 +212,17 @@ pub struct AnalyzeOpts {
     pub log_budget: Option<crate::tracing::LogBudget>,
 
     /// Why this host's retired-branch counter is inexact, if it is; handed to
-    /// every trial's `RunOpts` for the `--strict` refusal. Tests replace it to
-    /// reach that refusal on a host whose counters pass.
+    /// every trial's `RunOpts` for the `--strict` refusal and the warning
+    /// without `--strict`. Tests replace it to reach both on a host whose
+    /// counters pass.
     #[clap(skip = crate::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
     pub inexact_branch_counter: fn() -> Option<String>,
+
+    /// The branch-counter warning `admit_branch_counter` printed before the
+    /// first trial, without its newline, for the final report to repeat
+    /// (`Report::branch_counter_warning`); `None` when it printed none.
+    #[clap(skip)]
+    pub branch_counter_warning: Option<String>,
 }
 
 // TODO: introduce a new type to encapsulate the state of the search, and make it immutable.
@@ -279,6 +286,15 @@ pub struct Report {
     pub critical_event1: ReportCriticalEvent,
     /// The runtime context for the other identified critical event.
     pub critical_event2: ReportCriticalEvent,
+
+    /// The warning line, without its newline, that `hermit analyze` or `hermit bisect` printed
+    /// before its first trial because those trials read a retired-branch counter that failed
+    /// Reverie's validation (`AnalyzeOpts::admit_branch_counter`): the seeds, preemption records
+    /// and schedules behind this report are then not guaranteed to reproduce it. Absent where the
+    /// counter passed or the trials do not read it, as in every report written before the field
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_counter_warning: Option<String>,
 }
 
 /// Runtime context for a critical event included in the analyze report.

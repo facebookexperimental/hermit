@@ -1,0 +1,57 @@
+--- a/convert/main.c
++++ b/convert/main.c
+@@ -128,6 +128,17 @@
+ #include "convert/common.h"
+ #include "convert/source-fs.h"
+ 
++/* DEMO08: bake ASAN options into the binary so they apply under hermit.
++ * disable_coredump=0 avoids the setrlimit(RLIMIT_CORE) that hermit rejects;
++ * leak detection is off so only the use-after-free aborts. */
++#if defined(__SANITIZE_ADDRESS__) || defined(__has_feature)
++const char *__asan_default_options(void);
++const char *__asan_default_options(void)
++{
++	return "detect_leaks=0:disable_coredump=0:abort_on_error=1:handle_segv=1:allocator_may_return_null=1";
++}
++#endif
++
+ extern const struct btrfs_convert_operations ext2_convert_ops;
+ extern const struct btrfs_convert_operations reiserfs_convert_ops;
+ 
+@@ -146,7 +157,7 @@
+ 	const char work_indicator[] = { '.', 'o', 'O', 'o' };
+ 	u64 count = 0;
+ 
+-	task_period_start(priv->info, 1000 /* 1s */);
++	task_period_start(priv->info, 1 /* period is irrelevant; pipe wakeup */);
+ 	while (1) {
+ 		count++;
+ 		pthread_mutex_lock(&priv->mutex);
+@@ -156,6 +167,11 @@
+ 		pthread_mutex_unlock(&priv->mutex);
+ 		fflush(stdout);
+ 		task_period_wait(priv->info);
++		/* In the buggy variant task_stop() frees info without joining the
++		 * detached thread, so this load races free(); the fixed variant joins
++		 * before task_deinit(). */
++		if (priv->info->periodic.stop)
++			break;
+ 	}
+ 
+ 	return NULL;
+@@ -2070,7 +2086,14 @@
+ 	}
+ 
+ 	file = argv[optind];
+-	ret = check_mounted(file);
++	/* DEMO08: skip the check that the image is not mounted. It reads the
++	 * host's mount table (/proc/self/mounts, then one stat() per entry and
++	 * /sys/block/loop* for loop devices), which Hermit passes through
++	 * unchanged. On a host whose mounts change, a longer or shorter table
++	 * changes how many system calls run before the conversion, and that
++	 * moves the chaos schedule that follows. The demo converts a private
++	 * copy of its image that is never mounted. */
++	ret = 0;
+ 	if (ret < 0) {
+ 		errno = -ret;
+ 		error("could not check mount status: %m");

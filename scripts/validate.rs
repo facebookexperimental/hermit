@@ -43,7 +43,7 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "bfd648864b74d14b96cd3af9e36f04186aca7075" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "d0c2867be75b495eb64239e664c6306af9747783" }
 //! hermit-manifest-plan = { path = "../ci/manifest-plan" }
 //! serde_json = "1"
 //! toml = "0.8.23"
@@ -1268,7 +1268,7 @@ fn usage() -> &'static str {
      \x20 quick            Core ptrace run/verify/record smoke tests; no alternate backends.\n\
      \x20 portable-only    Portable build, test, lint, format, and doc gates matching\n\
      \x20                  GitHub-managed portable CI; no PMU or namespace requirements.\n\
-     \x20 full             quick plus the complete suite and DBI/KVM gates (default).\n\
+     \x20 full             quick plus the complete suite and DBI/KVM gates.\n\
      \x20 super            Repeat stress probes under moderate oversubscription.\n\
      \x20 --quick          Alias for the quick level.\n\
      \x20 --portable       Alias for the portable-only level.\n\
@@ -1276,7 +1276,8 @@ fn usage() -> &'static str {
      Focused gates (run one matrix/lane and exit):\n\
      \x20 --portable-strict-compat-only Only the strict compatibility bucket (compat.yaml), release Hermit.\n\
      \x20 --rr-compat-only              Only the compat bucket's record/replay cells (label rr-compat-only).\n\
-     \x20 --sabre-compat-only           Only the compat bucket's SaBRe cells (label sabre-compat-only).\n\
+     \x20 --sabre-compat-only           Only the SaBRe run type (label sabre-compat-only): the compat\n\
+     \x20                               bucket's SaBRe cells and the archived sabre_examples tests.\n\
      \x20 --e9patch-compat-only         Gate core + installed e9patch legacy stripped apps.\n\
      \x20 --qemu-l2-only                Run the heavyweight QEMU L2 boot.\n\
      \x20 --portable-only               No PMU/CPUID hardware required.\n\
@@ -1289,11 +1290,18 @@ fn usage() -> &'static str {
      \x20                  declared caps; outside deps are dropped; preflight tags\n\
      \x20                  reuse validate's canonical preflight nodes.\n\
      \x20 --selective, --since-green    Only nodes affected since the last green baseline.\n\
+     \x20                               This is the DEFAULT when no level, focused mode,\n\
+     \x20                               --all, or --selected is named: a bare invocation\n\
+     \x20                               runs selective, failing safe to the full label\n\
+     \x20                               when no trustworthy green baseline exists. A\n\
+     \x20                               baseline that is not an ancestor of HEAD is\n\
+     \x20                               not trustworthy and is treated as no baseline.\n\
      \x20 --shallow-select              Like --selective but pin the baseline to HEAD~1.\n\
      \x20 --baseline <sha>              Known-green baseline commit for --selective.\n\
      \x20 --envelope-only               Measure and emit the working-envelope vector (JSON + human).\n\
      \x20 --envelope-compare FILE       Measure, then fail if any count regressed below FILE.\n\
-     \x20 --all, --full-run             Assert the COMPLETE suite explicitly.\n\
+     \x20 --all, --full-run             Assert the COMPLETE suite explicitly (overrides\n\
+     \x20                               the selective default; the landing form).\n\
      \n\
      Other options:\n\
      \x20 --allow-local-off-the-record-run\n\
@@ -1470,6 +1478,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         buck2: None,
     };
     let mut e2e_runner_explicit = false;
+    let mut label_pr_explicit = false;
     let mut shallow = false;
     let mut selective = false;
     let mut show_plan = false;
@@ -1650,6 +1659,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             "--label-pr" => {
                 args.label_pr = true;
                 args.no_label_pr_explicit = false;
+                label_pr_explicit = true;
             }
             "--no-label-pr" => {
                 args.label_pr = false;
@@ -1730,6 +1740,42 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             }
         }
         i += 1;
+    }
+    // An explicit `--label-pr` with no level or focused mode implies
+    // `--all`: publishing a receipt requires the complete full run, so a
+    // bare `--label-pr` must not silently resolve to selective and then
+    // publish nothing.
+    if label_pr_explicit
+        && focused.is_empty()
+        && !selective
+        && !envelope
+        && !args.level_explicit
+        && !args.force_full
+        && args.selected.is_none()
+    {
+        args.force_full = true;
+    }
+    // Landing default: a bare invocation (no level, focused mode, --all,
+    // --selected, self-test, Buck/full-only runner, or frozen ci-hub run)
+    // defaults to selective instead of the full suite. Display flags
+    // (--show-plan/--show-plan-json/--write-constructed-dag) do NOT change
+    // the mode: they preview the same mode a bare run executes, and a
+    // full-plan export is explicit (`--all` or the `full` level).
+    // Selective resolution fails safe itself: with no trustworthy green
+    // baseline it runs the full label (the Selective branch of
+    // `build_plan`), so the default never under-runs silently.
+    if focused.is_empty()
+        && !selective
+        && !envelope
+        && !args.level_explicit
+        && !args.force_full
+        && args.selected.is_none()
+        && !args.self_test
+        && !e2e_runner_explicit
+        && args.buck_release_dotslash.is_none()
+        && !args.frozen_run
+    {
+        selective = true;
     }
     if selective {
         focused.push(Focused::Selective { shallow });
@@ -3814,7 +3860,7 @@ fn self_test() -> Result<(), String> {
     // bracket accepts the real prefix, rejects deletion, and rejects the subtle
     // goalpost move of putting the same spelling in guest argv.
     for mode in LEGACY_BELOW_L2_STRICT_MODES {
-        let rendered = mode.run_args("whoami", "/tmp/nsswitch.conf");
+        let rendered = mode.run_args("whoami", "/tmp/nsswitch.conf", None);
         let guest_separator = rendered
             .iter()
             .position(|arg| arg == "--")
@@ -4820,7 +4866,9 @@ fn self_test() -> Result<(), String> {
     validate_series_writer_bracket()?;
     no_result_propagation_bracket()?;
     possible_missing_artifact_bracket()?;
+    default_mode_bracket()?;
     selective_subset_bracket(&root)?;
+    selective_terminal_cells_bracket()?;
     only_plan_bracket(&root)?;
     self_output_bracket()?;
     checkout_attribution_bracket()?;
@@ -6118,6 +6166,137 @@ fn checkout_attribution_bracket() -> Result<(), String> {
     Ok(())
 }
 
+/// Bracket the landing default (bare invocation -> selective), the `--all`
+/// override, and the hermit-side ledger invariant that a selective pass is
+/// not green evidence for anything it did not select.
+///
+/// The ledger half proves, at the lowest useful layer, that a synthetic
+/// selective pass row (exactly the shape the real writer emits:
+/// profile=selective, selection_mode=selective) cannot be reused as a full
+/// cache hit and cannot mint a receipt, and that a not-selected test node
+/// lands in `absent_nodes`, never in the executed count. The baseline half
+/// lives in `validate_history::self_test`, which refuses
+/// selective-profile and selective-selection rows as baselines.
+fn default_mode_bracket() -> Result<(), String> {
+    let parse = |argv: &[&str]| -> Result<Args, String> {
+        parse_argv(&argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+            .map_err(|code| format!("default mode: {argv:?} refused with exit {code}"))
+    };
+    // Bare and non-mode-only invocations default to selective, non-shallow.
+    for argv in [
+        Vec::new(),
+        vec!["--no-label-pr"],
+        vec!["--verbose"],
+        vec!["--ignore-cache"],
+        vec!["--baseline", "abc123"],
+    ] {
+        match parse(&argv)?.focused {
+            Some(Focused::Selective { shallow: false }) => {}
+            other => {
+                return Err(format!(
+                    "default mode: {argv:?} must default to selective (non-shallow), got {other:?}"
+                ));
+            }
+        }
+    }
+    // `--all`/`--full-run` override the default to the complete full level.
+    for argv in [vec!["--all"], vec!["--full-run"]] {
+        let args = parse(&argv)?;
+        if !args.force_full || args.focused.is_some() || args.level != Level::Full {
+            return Err(format!(
+                "default mode: {argv:?} must force the full level with no focused mode"
+            ));
+        }
+    }
+    // Explicit selective spellings are unchanged.
+    match parse(&["--selective"])?.focused {
+        Some(Focused::Selective { shallow: false }) => {}
+        other => return Err(format!("default mode: --selective changed: {other:?}")),
+    }
+    match parse(&["--shallow-select"])?.focused {
+        Some(Focused::Selective { shallow: true }) => {}
+        other => return Err(format!("default mode: --shallow-select changed: {other:?}")),
+    }
+    // Explicit levels and focused modes are unchanged.
+    for (argv, level) in [
+        (vec!["full"], Level::Full),
+        (vec!["quick"], Level::Quick),
+        (vec!["portable-only"], Level::PortableOnly),
+        (vec!["super"], Level::Super),
+    ] {
+        let args = parse(&argv)?;
+        if args.focused.is_some() || args.level != level {
+            return Err(format!("default mode: explicit level {argv:?} changed"));
+        }
+    }
+    match parse(&["--only", "portable", "test.cli"])?.focused {
+        Some(Focused::Only { .. }) => {}
+        other => return Err(format!("default mode: --only changed: {other:?}")),
+    }
+    // Display flags preview the SAME mode a bare run executes.
+    for argv in [
+        vec!["--show-plan"],
+        vec!["--show-plan-json"],
+        vec!["--write-constructed-dag", "/tmp/musesel-plan.json"],
+    ] {
+        match parse(&argv)?.focused {
+            Some(Focused::Selective { shallow: false }) => {}
+            other => {
+                return Err(format!(
+                    "default mode: display {argv:?} must preview the bare selective mode, got {other:?}"
+                ));
+            }
+        }
+    }
+    // A bare `--label-pr` implies `--all` so receipts stay possible.
+    {
+        let args = parse(&["--label-pr"])?;
+        if !args.force_full || args.focused.is_some() || args.level != Level::Full {
+            return Err("default mode: bare --label-pr must imply --all (full)".into());
+        }
+    }
+    if !usage().contains("This is the DEFAULT") {
+        return Err("default mode: --help does not state the selective default".into());
+    }
+
+    // A selective pass is not a full green for unselected work.
+    let selective_row = serde_json::json!({
+        "tree": "T", "profile": "selective", "host": "h1", "toolchain": "rustc 1.0",
+        "selection_mode": "selective", "result": "pass", "commit_anchored": true,
+        "tree_dirty": false, "failures": 0, "commit": "c0ffee",
+        "finished_at": "2026-08-07T00:00:00Z", "real_seconds": 100,
+        "schema_version": 5, "producer": "validate.rs",
+        "executed_tests": 873, "executed_nodes": 1,
+        "coverage": {"planned_test_nodes": 1, "executed_test_nodes": 1, "absent_nodes": []},
+    });
+    let key = validate_history::CacheKey {
+        tree: "T",
+        profile: "full",
+        host: "h1",
+        toolchain: "rustc 1.0",
+        release_builder: RELEASE_BUILDER_CARGO,
+    };
+    if validate_history::cache_lookup(std::slice::from_ref(&selective_row), "pass", &key).is_some()
+    {
+        return Err("default mode: a selective pass answered a full cache lookup".into());
+    }
+    if validate_receipt::eligible(0, 0, true, true, false, "selective", RELEASE_BUILDER_CARGO)
+        .is_ok()
+    {
+        return Err("default mode: a selective pass could mint a full receipt".into());
+    }
+    // The not-selected ⇒ absent/SKIPPED property is exercised through the
+    // REAL planner in `selective_subset_bracket` (full-population coverage
+    // from an actual Nodes decision), not by manual injection here.
+    println!(
+        "  default mode: bare/non-mode invocations resolve to selective (non-shallow); \
+         --all/--full-run force full; display flags preview the bare mode; bare \
+         --label-pr implies --all; explicit levels/focused modes unchanged; a selective \
+         pass is neither a full cache hit nor a receipt"
+    );
+    Ok(())
+}
+
 /// Bracket the `--selective` subset builder against the REAL portable lane.
 ///
 /// The dangerous failure here is silent under-running: a subset that drops a
@@ -6148,7 +6327,8 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
     let selected = select_from_committed_decision(
         &portable,
         portable.steps.len(),
-        SelectDecision::Nodes(requested),
+        SelectDecision::Nodes(requested, SelectiveScope::default()),
+        &BTreeSet::new(),
     )?;
     let expected = dagrun::select_steps_by_tags(&portable, std::slice::from_ref(&child), false)?;
     if dag_to_json(&selected) != dag_to_json(&expected) {
@@ -6177,7 +6357,11 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
     let mapped_plan = select_from_committed_decision(
         &portable,
         portable.steps.len(),
-        SelectDecision::Nodes([mapped_e2e.clone()].into_iter().collect()),
+        SelectDecision::Nodes(
+            [mapped_e2e.clone()].into_iter().collect(),
+            SelectiveScope::default(),
+        ),
+        &BTreeSet::new(),
     )?;
     let mapped_tags = mapped_plan
         .steps
@@ -6198,7 +6382,8 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
     let error = select_from_committed_decision(
         &portable,
         portable.steps.len(),
-        SelectDecision::Nodes(unknown),
+        SelectDecision::Nodes(unknown, SelectiveScope::default()),
+        &BTreeSet::new(),
     )
     .err()
     .ok_or("selective bracket: an unknown selected ID was accepted")?;
@@ -6208,14 +6393,28 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         ));
     }
 
-    let skip =
-        select_from_committed_decision(&portable, portable.steps.len(), SelectDecision::Skip)?;
+    let skip = select_from_committed_decision(
+        &portable,
+        portable.steps.len(),
+        SelectDecision::Skip(SelectiveScope::default()),
+        &BTreeSet::new(),
+    )?;
+    // v3 counterexample (inert-without-preflight): the no-change (Skip)
+    // selection must retain the PREFLIGHT check nodes plus both lint
+    // nodes, not only the five setup/gate nodes.
     let expected_skip = [
         "pre.submodules",
         PIN_GATE_TAG,
         RUST_SCRIPT_PRODUCER_TAG,
         validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
         "gate.manifest",
+        "check.skill_discovery",
+        "check.backend_abstraction",
+        "check.portability_paths",
+        "check.check_outcome_consumers",
+        "check.script_sigpipe",
+        "lint.rustfmt",
+        "lint.clippy",
     ]
     .into_iter()
     .map(str::to_string)
@@ -6227,6 +6426,216 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         ));
     }
 
+    // --- execution-layer backend assertions through the REAL planner ---
+    let full_base = dagrun::select_steps_by_labels(&committed, &["full".into()])?;
+    let full_tags: BTreeSet<String> = full_base.steps.iter().map(Step::tag).collect();
+    // (c) bare-default Full decision == Level::Full node set (the full label).
+    let full_decision = select_from_committed_decision(
+        &full_base,
+        full_base.steps.len(),
+        SelectDecision::Full("bracket".into()),
+        &BTreeSet::new(),
+    )?;
+    let full_decision_tags: BTreeSet<String> =
+        full_decision.steps.iter().map(Step::tag).collect();
+    if full_decision_tags != full_tags
+        || !full_decision_tags.contains("privileged-test.cli_kvm")
+        || !full_decision_tags.contains("full-scorecard.compatibility")
+    {
+        return Err(
+            "selective bracket: Full decision is not the Level::Full (full label) node set".into(),
+        );
+    }
+    // Load the generated footprints for rule/footprint node sets.
+    let footprints: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("ci/test-footprints.json"))
+            .map_err(|e| format!("selective bracket: footprints: {e}"))?,
+    )
+    .map_err(|e| format!("selective bracket: footprints JSON: {e}"))?;
+    let str_list = |value: &serde_json::Value, key: &str| -> Vec<String> {
+        value[key]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let local_nodes = |nodes: &[String]| -> BTreeSet<String> {
+        nodes.iter().map(|node| local_validation_step_tag(node)).collect()
+    };
+    let plan_tags = |plan: &DagConfig| -> BTreeSet<String> {
+        plan.steps.iter().map(Step::tag).collect()
+    };
+    // (a) DBT route through the REAL planner: buckets == buckets that
+    // contain a DBT cell (derived from the expected plan, not hard-coded),
+    // plus the privileged DBT buckets, all hermit_integration shards and
+    // check.dbt_runtime_abi.
+    let dbt_rule = footprints["backend_rules"]
+        .as_array()
+        .and_then(|rules| rules.iter().find(|rule| rule["id"].as_str() == Some("dbt")))
+        .ok_or("selective bracket: dbt backend rule missing")?;
+    if footprints["backend_rules"]
+        .as_array()
+        .is_some_and(|rules| rules.iter().any(|r| matches!(r["id"].as_str(), Some("kvm" | "ptrace" | "liteinst" | "sabre" | "e9patch"))))
+    {
+        return Err("selective bracket: a dropped v1 backend route reappeared".into());
+    }
+    let expected_plan_for_buckets: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("ci/expected-e2e-plan.json"))
+            .map_err(|e| format!("selective bracket: expected plan: {e}"))?,
+    )
+    .map_err(|e| format!("selective bracket: expected plan JSON: {e}"))?;
+    let derived_privileged_dbt_buckets = privileged_dbt_buckets_from_cells(
+        expected_plan_for_buckets["cells"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .as_slice(),
+    );
+    let dbt_plan = select_from_committed_decision(
+        &full_base,
+        full_base.steps.len(),
+        SelectDecision::Nodes(
+            local_nodes(&str_list(dbt_rule, "extra_nodes")),
+            SelectiveScope {
+                backends: vec!["dbt".into()],
+                backend_lanes: vec!["portable".into(), "privileged".into()],
+                backend_rules: vec!["dbt".into()],
+                ..Default::default()
+            },
+        ),
+        &derived_privileged_dbt_buckets,
+    )?;
+    let dbt_tags = plan_tags(&dbt_plan);
+    let expected_plan: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("ci/expected-e2e-plan.json"))
+            .map_err(|e| format!("selective bracket: expected plan: {e}"))?,
+    )
+    .map_err(|e| format!("selective bracket: expected plan JSON: {e}"))?;
+    let mut expected_buckets: BTreeSet<String> = BTreeSet::new();
+    for cell in expected_plan["cells"].as_array().cloned().unwrap_or_default() {
+        if cell["backend"].as_str() == Some("dbt") {
+            let category = cell["category"].as_str().unwrap_or_default().replace('-', "_");
+            expected_buckets.insert(match cell["lane"].as_str() {
+                Some("privileged") => format!("privileged-e2e.manifest_{category}"),
+                _ => format!("e2e.manifest_{category}"),
+            });
+        }
+    }
+    if expected_buckets.is_empty()
+        || !expected_buckets.iter().all(|b| dbt_tags.contains(b))
+        || !dbt_tags.contains("check.dbt_runtime_abi")
+        || !dbt_tags.contains("test.hermit_integration_2")
+        || !dbt_tags.contains("test.hermit_integration_3")
+    {
+        return Err(format!(
+            "selective bracket: DBT plan misses derived buckets/ABI/shards: missing={:?}",
+            expected_buckets.difference(&dbt_tags).collect::<Vec<_>>()
+        ));
+    }
+    // v3 counterexample (privileged bucket set mismatch): production must
+    // select EXACTLY the buckets derived from cells (privileged lane cells
+    // with backend=dbt included), with no extra privileged buckets.
+    {
+        let actual_buckets: BTreeSet<String> = dbt_tags
+            .iter()
+            .filter(|tag| {
+                tag.starts_with("e2e.manifest_") || tag.starts_with("privileged-e2e.manifest_")
+            })
+            .cloned()
+            .collect();
+        if actual_buckets != expected_buckets {
+            return Err(format!(
+                "selective bracket: v3 DBT bucket set must equal the cell-derived set exactly: extra={:?} missing={:?}",
+                actual_buckets
+                    .difference(&expected_buckets)
+                    .collect::<Vec<_>>(),
+                expected_buckets
+                    .difference(&actual_buckets)
+                    .collect::<Vec<_>>()
+            ));
+        }
+        let derived_privileged: BTreeSet<String> = expected_buckets
+            .iter()
+            .filter(|tag| tag.starts_with("privileged-"))
+            .cloned()
+            .collect();
+        let actual_privileged: BTreeSet<String> = actual_buckets
+            .iter()
+            .filter(|tag| tag.starts_with("privileged-"))
+            .cloned()
+            .collect();
+        if actual_privileged != derived_privileged {
+            return Err(format!(
+                "selective bracket: v3 privileged DBT buckets must equal the privileged-cell-derived set exactly: derived={derived_privileged:?} actual={actual_privileged:?}"
+            ));
+        }
+    }
+    // (i) Everything path: every full-label node is reachable.
+    if full_decision_tags != full_tags {
+        return Err("selective bracket: everything path misses full-label nodes".into());
+    }
+    // (iii) Baseline ancestor rule.
+    if keep_ancestor_baseline(Some("anc".into()), |_| true).as_deref() != Some("anc")
+        || keep_ancestor_baseline(Some("side".into()), |_| false).is_some()
+        || keep_ancestor_baseline(None, |_| true).is_some()
+    {
+        return Err("selective bracket: baseline ancestor rule broken".into());
+    }
+    // (f) unselected node is SKIPPED/absent from the FULL population via
+    // the real planner: one selected test node, coverage over population.
+    let population = test_nodes_of(&full_base);
+    let one_test = population
+        .iter()
+        .next()
+        .cloned()
+        .ok_or("selective bracket: full population has no test node")?;
+    let one_plan = select_from_committed_decision(
+        &full_base,
+        full_base.steps.len(),
+        SelectDecision::Nodes(
+            [one_test.clone()].into_iter().collect(),
+            SelectiveScope::default(),
+        ),
+        &BTreeSet::new(),
+    )?;
+    if !plan_tags(&one_plan).contains(&one_test) {
+        return Err("selective bracket: real planner lost the selected test node".into());
+    }
+    let outcome = StepOutcome {
+        tag: one_test.clone(),
+        ok: true,
+        duration_s: 0.0,
+        summary: String::new(),
+        executed_tests: Some(3),
+        filtered_tests: Some(0),
+        test_results: None,
+        test_results_error: None,
+        test_results_error_kind: None,
+        returncode: Some(0),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
+        reason: String::new(),
+        aborted: false,
+    };
+    let coverage = typed_test_node_coverage(&population, &[outcome]);
+    let absent = coverage["absent_nodes"]
+        .as_array()
+        .ok_or("selective bracket: coverage absent_nodes is not an array")?;
+    if coverage["executed_test_nodes"] != 1
+        || absent.len() + 1 != population.len()
+        || absent.iter().any(|node| node.as_str() == Some(one_test.as_str()))
+    {
+        return Err(format!(
+            "selective bracket: unselected nodes not SKIPPED/absent from full population: {coverage}"
+        ));
+    }
+
     let source_after = std::fs::read(&source_path)
         .map_err(|error| format!("selective bracket: cannot re-read source DAG: {error}"))?;
     if source_after != source_before {
@@ -6234,6 +6643,133 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
     }
     println!(
         "  selective subset: typed ID selection retained {child} and dependency {parent}; unknown IDs refused; no-change retained exact preflight; source bytes unchanged"
+    );
+    println!(
+        "  selective execution: DBT route buckets == buckets containing DBT cells exactly (derived, privileged included) + all integration shards; everything path == full label ({} nodes); baseline ancestor rule holds; unselected nodes absent/SKIPPED from full population",
+        full_decision_tags.len()
+    );
+    Ok(())
+}
+
+/// v3 counterexample (executed-cells claimed without terminal
+/// evidence): planned buckets must never be recorded as executed.
+/// Only terminal per-cell rows with a COMPLETE identity and an
+/// executed attempt count; preparation-error / no-attempt rows are
+/// recorded as not executed with their reason instead.
+fn selective_terminal_cells_bracket() -> Result<(), String> {
+    // Planned scope: two cells that will execute, one preparation-error
+    // cell, one no-attempt cell, and one cell whose bucket never launches.
+    // `scope.cells` is this planned list; production serialization must
+    // copy it only into `planned_cells`, never into `cells`.
+    let planned = vec![
+        "portable__c-programs__some/test__verify__dbt".to_string(),
+        "privileged__c-programs__other/test__run__dbt".to_string(),
+        "portable__c-programs__prep/test__verify__dbt".to_string(),
+        "portable__c-programs__noattempt/test__verify__dbt".to_string(),
+        "portable__c-programs__never/test__verify__dbt".to_string(),
+    ];
+    let scope = SelectiveScope {
+        backends: vec!["dbt".to_string()],
+        cells: planned.clone(),
+        cells_source: "planned: selected buckets at plan time; not terminal evidence".to_string(),
+        e2e_all: false,
+        backend_rules: vec!["dbt".to_string()],
+        backend_lanes: vec!["portable".to_string()],
+    };
+    // A bucket was planned but never launches: no terminal rows. Exercise
+    // the PRODUCTION ledger serializer (`ledger_selective_scope_json`,
+    // the function the ledger site calls), not only its helpers, and
+    // assert on the serialized output.
+    let (cells, not_executed, reason) = ledger_scope_cells(&planned, &[]);
+    let serialized = ledger_selective_scope_json(&scope, &cells, &not_executed, &reason);
+    if serialized["cells"] != serde_json::json!([])
+        || serialized["not_executed_cells"] != serde_json::json!([])
+        || serialized["planned_cells"] != serde_json::json!(planned)
+        || serialized["cells_source"] != "none: no executed terminal per-cell evidence"
+        || !serialized["cells_unknown_reason"]
+            .as_str()
+            .is_some_and(|text| text.contains("no terminal per-cell evidence"))
+    {
+        return Err(format!(
+            "selective terminal cells: v3 planned bucket without terminal evidence claimed cells in serialized ledger scope: {serialized}"
+        ));
+    }
+    // Terminal rows with a complete identity are recorded exactly.
+    let rows = vec![
+        serde_json::json!({"lane": "portable", "category": "c-programs", "test": "some/test", "mode": "verify", "backend": "dbt", "outcome": "PASS", "attempts": [{"index": "1", "outcome": "PASS"}]}),
+        serde_json::json!({"lane": "privileged", "category": "c-programs", "test": "other/test", "mode": "run", "backend": "dbt", "outcome": "PASS", "attempts": [{"index": "1", "outcome": "PASS"}]}),
+        // Complete identity but preparation failed before any attempt:
+        // `infrastructure_error_result` shape (runner.rs) — outcome ERROR,
+        // infrastructure failure class, empty `attempts`. Not executed.
+        serde_json::json!({"lane": "portable", "category": "c-programs", "test": "prep/test", "mode": "verify", "backend": "dbt", "outcome": "ERROR", "failure_class": "understood_infrastructure_failure", "error_kind": "infrastructure", "attempt": 1, "attempts": [], "reason": "fixture preparation failed"}),
+        // Complete identity but no attempt ran (host-inapplicable shape):
+        // empty `attempts`. Not executed.
+        serde_json::json!({"lane": "portable", "category": "c-programs", "test": "noattempt/test", "mode": "verify", "backend": "dbt", "outcome": "HOST-INAPPLICABLE", "failure_class": "understood_prerequisite_failure", "attempt": 1, "attempts": [], "reason": "host inapplicable"}),
+        // Incomplete identity (no test): must never be claimed.
+        serde_json::json!({"lane": "portable", "category": "c-programs", "mode": "verify", "backend": "dbt"}),
+    ];
+    let (cells, not_executed, reason) = ledger_scope_cells(&planned, &rows);
+    let expected = vec![
+        "portable__c-programs__some/test__verify__dbt".to_string(),
+        "privileged__c-programs__other/test__run__dbt".to_string(),
+    ];
+    let expected_not_executed = vec![
+        NotExecutedCell {
+            cell: "portable__c-programs__noattempt/test__verify__dbt".to_string(),
+            reason: "no_attempt: host inapplicable".to_string(),
+        },
+        NotExecutedCell {
+            cell: "portable__c-programs__prep/test__verify__dbt".to_string(),
+            reason: "preparation_error: fixture preparation failed".to_string(),
+        },
+    ];
+    if cells != expected || not_executed != expected_not_executed || reason.is_some() {
+        return Err(format!(
+            "selective terminal cells: terminal rows not split into executed (complete identity + executed attempt) vs not-executed (preparation error / no attempt): cells={cells:?} not_executed={not_executed:?} reason={reason:?}"
+        ));
+    }
+    // Same rows through the production serializer: assert on the
+    // serialized ledger fields. Restoring `"cells": scope.cells`
+    // (planned cells) in `ledger_selective_scope_json` must fail here,
+    // because planned includes prep/no-attempt/never-launched cells.
+    let serialized = ledger_selective_scope_json(&scope, &cells, &not_executed, &reason);
+    let expected_not_executed_json = serde_json::json!([
+        {"cell": "portable__c-programs__noattempt/test__verify__dbt", "reason": "no_attempt: host inapplicable"},
+        {"cell": "portable__c-programs__prep/test__verify__dbt", "reason": "preparation_error: fixture preparation failed"},
+    ]);
+    if serialized["cells"] != serde_json::json!(expected)
+        || serialized["cells"] == serde_json::json!(planned)
+        || serialized["not_executed_cells"] != expected_not_executed_json
+        || serialized["planned_cells"] != serde_json::json!(planned)
+        || serialized["cells_source"] != "terminal per-cell result rows"
+        || serialized["cells_unknown_reason"] != serde_json::Value::Null
+    {
+        return Err(format!(
+            "selective terminal cells: serialized ledger scope does not carry terminal-evidence cells only: {serialized}"
+        ));
+    }
+    // Skipped-node labels: selected prep/no-attempt cells are not
+    // executed, unselected entries remain not selected.
+    if selective_skipped_reason(
+        "cell:portable__c-programs__prep/test__verify__dbt",
+        Some(&serialized),
+    ) != "not executed (preparation_error: fixture preparation failed)"
+        || selective_skipped_reason(
+            "cell:portable__c-programs__noattempt/test__verify__dbt",
+            Some(&serialized),
+        ) != "not executed (no_attempt: host inapplicable)"
+        || selective_skipped_reason("some.unselected.node", Some(&serialized)) != "not selected"
+        || selective_skipped_reason(
+            "cell:portable__c-programs__never/test__verify__dbt",
+            Some(&serialized),
+        ) != "not selected"
+    {
+        return Err(format!(
+            "selective terminal cells: skipped label mislabels selected prep/no-attempt cells: {serialized}"
+        ));
+    }
+    println!(
+        "  selective terminal cells: production ledger serialization claims no executed cells without terminal evidence (unknown with reason); serialized cells are only complete-identity rows with an executed attempt; preparation-error and no-attempt rows are serialized as not executed with their reasons"
     );
     Ok(())
 }
@@ -10766,6 +11302,11 @@ struct Plan {
     /// `test.*` nodes the profile PLANNED to run, for the coverage record.
     #[allow(dead_code)]
     planned_test_nodes: BTreeSet<String>,
+    /// Full-plan test-node population a selective plan was drawn from.
+    /// Coverage is computed against this population, so unselected nodes
+    /// land in `absent_nodes` / SKIPPED records instead of vanishing.
+    /// Empty for non-selective plans (population == planned).
+    population_test_nodes: BTreeSet<String>,
     /// Set when this profile is a compatibility matrix, so the ratchet and the
     /// per-program summary are evaluated afterwards.
     compat: Option<CompatMode>,
@@ -10815,6 +11356,16 @@ struct Plan {
     /// deliberately separate from `suite_complete`: it may satisfy one open
     /// cell obligation but can never authorize a whole-run landing receipt.
     cell_evidence_expected: Option<Vec<serde_json::Value>>,
+    /// Selector scope of a selective plan (backends/cells/rules/lanes).
+    /// Applied at bucket granularity by `select_from_committed_decision`
+    /// (selected buckets run unfiltered; privileged lane adds nodes);
+    /// plan-time `cells` is a planned audit record, not a per-cell
+    /// filter and not evidence of execution.
+    selective_scope: Option<SelectiveScope>,
+    /// Full-label population (every step tag) for SKIPPED accounting.
+    population_nodes: BTreeSet<String>,
+    /// Cells of the full plan that this plan does not execute.
+    selective_skipped_cells: Vec<String>,
 }
 
 /// Selected package runs still need the exact constructed population: an empty
@@ -10849,6 +11400,7 @@ impl Default for Plan {
             profile: String::new(),
             selection_mode: "full",
             planned_test_nodes: BTreeSet::new(),
+            population_test_nodes: BTreeSet::new(),
             compat: None,
             compat_prefix: None,
             suite_complete: false,
@@ -10860,6 +11412,9 @@ impl Default for Plan {
             frozen_run_withheld: Vec::new(),
             cacheable: true,
             cell_evidence_expected: None,
+            selective_scope: None,
+            population_nodes: BTreeSet::new(),
+            selective_skipped_cells: Vec::new(),
         }
     }
 }
@@ -12529,17 +13084,93 @@ fn exact_manifest_value(manifest: &DagManifest) -> Result<serde_json::Value, Str
     }))
 }
 
+/// Privileged/full-lane nodes that exercise a backend, added (over-run,
+/// unfiltered) when a backend rule declaring the `privileged` lane matched.
+/// Buckets run all their backends' cells; this is the privileged analogue.
+/// Privileged E2E buckets that contain a DBT cell, derived from the
+/// expected plan's cells (privileged lane, backend=dbt) — never enumerated
+/// from the available privileged tags.
+fn privileged_dbt_buckets_from_cells(cells: &[serde_json::Value]) -> BTreeSet<String> {
+    cells
+        .iter()
+        .filter(|cell| {
+            cell["lane"].as_str() == Some("privileged")
+                && cell["backend"].as_str() == Some("dbt")
+        })
+        .map(|cell| {
+            format!(
+                "privileged-e2e.manifest_{}",
+                cell["category"].as_str().unwrap_or_default().replace('-', "_")
+            )
+        })
+        .collect()
+}
+
+fn privileged_nodes_for_scope(
+    scope: &SelectiveScope,
+    base: &DagConfig,
+    privileged_dbt_buckets: &BTreeSet<String>,
+) -> Vec<String> {
+    if !scope.backend_lanes.iter().any(|lane| lane == "privileged") {
+        return Vec::new();
+    }
+    let available: BTreeSet<String> = base.steps.iter().map(Step::tag).collect();
+    let mut wanted: Vec<&str> = Vec::new();
+    for backend in &scope.backends {
+        match backend.as_str() {
+            "kvm" => wanted.extend([
+                "privileged-test.cli_kvm",
+                "privileged-test.isolation_matrix_kvm",
+                "privileged-e2e.manifest_applications",
+                "privileged-e2e.manifest_c_programs",
+                "privileged-e2e.manifest_system_utils",
+                "privileged-build.manifest_guests",
+            ]),
+            "ptrace" => wanted.extend([
+                "privileged-test.pmu_ptrace_completion_cases",
+                "privileged-test.pmu_detcore_time_cases",
+                "privileged-test.pmu_cli_cases",
+                "privileged-pmu.preemption",
+                "privileged-cpuid.cpu_profile_v3",
+                "privileged-cpuid.faulting",
+            ]),
+            "dbt" => {
+                wanted.extend(["test.isolation_matrix_dbt_in_guest"]);
+                // Derived from cells, not enumerated from available tags:
+                // only privileged buckets that contain a DBT cell (today
+                // c-programs) are added.
+                wanted.extend(
+                    privileged_dbt_buckets
+                        .iter()
+                        .map(String::as_str),
+                );
+            }
+            "liteinst" | "in-guest-trap" => {
+                wanted.extend(["test.liteinst_allocator", "test.liteinst_stacks"])
+            }
+            _ => {}
+        }
+    }
+    wanted
+        .into_iter()
+        .filter(|tag| available.contains(*tag))
+        .map(str::to_string)
+        .collect()
+}
+
 fn select_from_committed_decision(
     base: &DagConfig,
     total: usize,
     decision: SelectDecision,
+    privileged_dbt_buckets: &BTreeSet<String>,
 ) -> Result<DagConfig, String> {
     match decision {
-        SelectDecision::Skip => {
+        SelectDecision::Skip(_) => {
             println!(
-                "Selective validation: no CI-relevant changes since baseline — nothing beyond \
-                 committed preflight runs (0/{total} lane nodes). The ledger's coverage record \
-                 will show zero planned test nodes, so this cannot be misread as a full pass."
+                "Selective validation: no CI-relevant changes since baseline — preflight \
+                 only (setup/gate plus PREFLIGHT checks and lint; 0/{total} lane nodes beyond \
+                 preflight). Unselected nodes and cells are recorded SKIPPED, so this cannot \
+                 be misread as a full pass."
             );
             let tags = [
                 "pre.submodules",
@@ -12547,19 +13178,65 @@ fn select_from_committed_decision(
                 RUST_SCRIPT_PRODUCER_TAG,
                 validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
                 "gate.manifest",
+                "check.skill_discovery",
+                "check.backend_abstraction",
+                "check.portability_paths",
+                "check.check_outcome_consumers",
+                "check.script_sigpipe",
+                "lint.rustfmt",
+                "lint.clippy",
             ]
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>();
             dagrun::select_steps_by_tags(base, &tags, true)
         }
-        SelectDecision::Nodes(keep) => {
-            let requested = keep.into_iter().collect::<Vec<_>>();
+        SelectDecision::Nodes(keep, scope) => {
+            // Backend selection changes execution: buckets selected for a
+            // backend run unfiltered (over-run, no per-cell filtering),
+            // and a rule declaring the privileged lane adds the privileged
+            // nodes that exercise that backend.
+            let privileged =
+                privileged_nodes_for_scope(&scope, base, privileged_dbt_buckets);
+            // Hosted selectors (e.g. build.workspace from
+            // build.workspace_on_host) name the pinned-root producer in
+            // the local full/portable graph; resolve that twin here so a
+            // selected build node actually executes instead of refusing.
+            let available: BTreeSet<String> = base.steps.iter().map(Step::tag).collect();
+            let mut requested: Vec<String> = keep
+                .into_iter()
+                .map(|tag| {
+                    let pinned = format!("{tag}_in_pinned_root");
+                    if !available.contains(&tag) && available.contains(&pinned) {
+                        pinned
+                    } else {
+                        tag
+                    }
+                })
+                .collect();
+            for tag in &privileged {
+                if !requested.contains(tag) {
+                    requested.push(tag.clone());
+                }
+            }
+            // The hosted integration node is the whole suite; locally it is
+            // split into shards, so selecting it selects every shard.
+            if requested.iter().any(|tag| tag == "test.hermit_integration") {
+                for shard in ["test.hermit_integration_2", "test.hermit_integration_3"] {
+                    if available.contains(shard) && !requested.iter().any(|tag| tag == shard) {
+                        requested.push(shard.to_string());
+                    }
+                }
+            }
             let selected = dagrun::select_steps_by_tags(base, &requested, false)?;
             println!(
-                "Selective validation: selected {} requested portable DAG node(s); committed \
+                "Selective validation: selected {} requested DAG node(s) ({} privileged \
+                 backend node(s) from scope backends={:?} lanes={:?}); committed \
                  dependency closure contains {}/{} node(s):\n  {}",
                 requested.len(),
+                privileged.len(),
+                scope.backends,
+                scope.backend_lanes,
                 selected.steps.len(),
                 total,
                 requested.join(" ")
@@ -12567,7 +13244,7 @@ fn select_from_committed_decision(
             Ok(selected)
         }
         SelectDecision::Full(why) => {
-            println!("Selective validation: {why} — running the FULL portable label.");
+            println!("Selective validation: {why} — running the FULL label.");
             Ok(base.clone())
         }
     }
@@ -12631,6 +13308,24 @@ fn retain_focused_manifest_producers(cfg: &DagConfig, tags: &mut BTreeSet<String
         }
         tags.extend(additions);
     }
+}
+
+/// Keep a selective baseline only when it is an ancestor of HEAD.
+/// Pure over the ancestry predicate so the rule is self-testable.
+fn keep_ancestor_baseline(
+    baseline: Option<String>,
+    is_ancestor: impl Fn(&str) -> bool,
+) -> Option<String> {
+    baseline.filter(|value| {
+        let ancestor = is_ancestor(value);
+        if !ancestor {
+            println!(
+                "Selective validation: baseline {value} is not an ancestor of HEAD; \
+                 ignoring it (no trustworthy baseline) and running everything."
+            );
+        }
+        ancestor
+    })
 }
 
 /// Runtime plan boundary: every executable path is a selection from the one
@@ -12746,7 +13441,10 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
     }
 
     if let Some(Focused::Selective { shallow }) = &args.focused {
-        let base = dagrun::select_steps_by_labels(&committed, &["portable".into()])?;
+        // Everything means the `full` label: a selective Full decision
+        // builds exactly the Level::Full node set, privileged nodes
+        // included. Nodes decisions select from that same population.
+        let base = dagrun::select_steps_by_labels(&committed, &["full".into()])?;
         let commit_exists = |sha: &str| {
             sh("git", &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_some()
                 || Command::new("git")
@@ -12768,10 +13466,21 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
                 &commit_exists,
             )
         };
+        // A baseline must be an ancestor of HEAD: selection diffs
+        // baseline...HEAD, so a non-ancestor baseline's green does not
+        // vouch for the merge-base either. Non-ancestor ⇒ no baseline
+        // ⇒ everything (the full label).
+        let baseline = keep_ancestor_baseline(baseline, |value| {
+            Command::new("git")
+                .args(["merge-base", "--is-ancestor", value, "HEAD"])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        });
         match &baseline {
             Some(value) => println!("Selective validation: last-known-green baseline = {value}"),
             None => println!(
-                "Selective validation: no trustworthy green baseline; running the FULL portable label."
+                "Selective validation: no trustworthy green baseline; running the FULL label."
             ),
         }
         let decision = baseline
@@ -12779,15 +13488,105 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             .map(|value| ask_selector(root, Some(value)))
             .unwrap_or_else(|| SelectDecision::Full("no trustworthy green baseline".into()));
         let total = base.steps.len();
-        let cfg = select_from_committed_decision(&base, total, decision)?;
+        // Nodes are consumed by `select_from_committed_decision`; the
+        // selector's backends/cells/rules/lanes are recorded on the plan.
+        // Buckets run unfiltered (see `SelectiveScope`); scope.cells is
+        // recomputed below to the PLANNED cells of the selected buckets.
+        // Executed cells are recorded later, from terminal evidence.
+        let selective_scope = match &decision {
+            SelectDecision::Skip(scope) | SelectDecision::Nodes(_, scope) => Some(scope.clone()),
+            SelectDecision::Full(_) => None,
+        };
+        let population_test_nodes = test_nodes_of(&base);
+        let population_nodes: BTreeSet<String> = base.steps.iter().map(Step::tag).collect();
+        let all_cells_for_scope = validate_cell_results::expected_plan(root).unwrap_or_default();
+        let privileged_dbt_buckets = privileged_dbt_buckets_from_cells(&all_cells_for_scope);
+        let cfg = select_from_committed_decision(&base, total, decision, &privileged_dbt_buckets)?;
+        // PLANNED cells: buckets run unfiltered, so every cell whose
+        // bucket node is in the planned cfg is planned to run; all other
+        // cells of the full population are planned SKIPPED. This is a
+        // plan, not execution evidence: the ledger recomputes executed
+        // cells from terminal per-cell rows.
+        let executed_tags: BTreeSet<String> = cfg.steps.iter().map(Step::tag).collect();
+        let all_cells = validate_cell_results::expected_plan(root).unwrap_or_default();
+        let cell_slug = |cell: &serde_json::Value| {
+            complete_cell_id(cell).unwrap_or_default()
+        };
+        let cell_bucket = |cell: &serde_json::Value| {
+            let category = cell["category"].as_str().unwrap_or_default().replace('-', "_");
+            match cell["lane"].as_str().unwrap_or_default() {
+                "privileged" => format!("privileged-e2e.manifest_{category}"),
+                _ => format!("e2e.manifest_{category}"),
+            }
+        };
+        let planned_cells: Vec<String> = all_cells
+            .iter()
+            .filter(|cell| executed_tags.contains(&cell_bucket(cell)))
+            .map(&cell_slug)
+            .filter(|id| !id.is_empty())
+            .collect();
+        let selective_skipped_cells: Vec<String> = all_cells
+            .iter()
+            .filter(|cell| !executed_tags.contains(&cell_bucket(cell)))
+            .map(&cell_slug)
+            .filter(|id| !id.is_empty())
+            .collect();
+        let selective_scope = selective_scope.map(|mut scope| {
+            scope.cells = planned_cells;
+            scope.cells_source =
+                "planned: selected buckets at plan time; not terminal evidence".into();
+            scope
+        });
         let plan = Plan {
             planned_test_nodes: test_nodes_of(&cfg),
+            population_test_nodes,
+            population_nodes,
+            selective_skipped_cells,
             cfg,
             profile: "selective".into(),
             selection_mode: "selective",
             cacheable: false,
+            selective_scope,
             ..Default::default()
         };
+        if let Some(scope) = &plan.selective_scope {
+            println!(
+                "Selective validation: selector scope backends={:?} e2e_all={} planned_cells={} \
+                 backend_rules={:?} backend_lanes={:?} (selected buckets run unfiltered \
+                 over their backends; privileged lane nodes added by scope \u{2014} see SelectiveScope)",
+                scope.backends,
+                scope.e2e_all,
+                scope.cells.len(),
+                scope.backend_rules,
+                scope.backend_lanes,
+            );
+            if !scope.e2e_all && !scope.cells.is_empty() {
+                let unfiltered = plan
+                    .cfg
+                    .steps
+                    .iter()
+                    .filter(|step| {
+                        step.manifest.as_ref().is_some_and(|manifest| {
+                            manifest.lane == "portable"
+                                && !scope.cells.iter().any(|cell| {
+                                    cell.split("__").nth(1)
+                                        == Some(manifest.category.as_str())
+                                })
+                        })
+                    })
+                    .map(Step::tag)
+                    .collect::<Vec<_>>();
+                if !unfiltered.is_empty() {
+                    println!(
+                        "Selective validation: NOTE selected E2E bucket(s) {} have no \
+                         selector-chosen cells; they run unfiltered (all backends) until \
+                         cell plumbing lands, and their unselected cells are not-selected, \
+                         never a pass.",
+                        unfiltered.join(" ")
+                    );
+                }
+            }
+        }
         return finish_selection_for(args, plan, source_path, source_bytes);
     }
 
@@ -12908,13 +13707,230 @@ fn local_validation_step_tag(tag: &str) -> String {
         .to_string()
 }
 
+/// What `ci/select-tests.rs` scoped a selective run to, beyond node tags:
+/// the E2E backends/cells and the backend rules/lanes it matched. Recorded
+/// on the plan and printed, so a selective run's scope is auditable from
+/// its own log.
+///
+/// Backend scope IS applied at bucket granularity: the DBT rule selects
+/// real bucket/build/test nodes (see `ci/test-footprints-policy.json`),
+/// selected buckets run unfiltered over all their backends (over-run,
+/// never under-run), unselected buckets do not run, and a rule declaring
+/// the `privileged` lane adds its privileged nodes via
+/// `privileged_nodes_for_scope`. Per-cell filtering inside a bucket is
+/// deliberately out of scope. At plan time `cells` lists the planned
+/// cells of the selected buckets (complete identities); the ledger
+/// replaces it with cells proven by terminal per-cell evidence and
+/// records unknown when no such evidence exists.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SelectiveScope {
+    backends: Vec<String>,
+    /// At plan time: cells of the selected buckets (planned, complete
+    /// identities). In the ledger: only cells proven by terminal
+    /// per-cell evidence (see `ledger_scope_cells`).
+    cells: Vec<String>,
+    /// Provenance of `cells`: planned vs terminal evidence vs unknown.
+    cells_source: String,
+    e2e_all: bool,
+    backend_rules: Vec<String>,
+    backend_lanes: Vec<String>,
+}
+
+/// Complete cell identity (lane, category, test, mode, backend) — the
+/// same five fields as `CellIdentity`. Returns `None` when any field is
+/// missing or empty, so an incomplete row can never be claimed.
+fn complete_cell_id(cell: &serde_json::Value) -> Option<String> {
+    let field = |key: &str| {
+        cell[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    Some(format!(
+        "{}__{}__{}__{}__{}",
+        field("lane")?,
+        field("category")?,
+        field("test")?,
+        field("mode")?,
+        field("backend")?
+    ))
+}
+
+/// A complete-identity terminal row that did NOT execute, with why.
+/// Recorded in the ledger's not-executed accounting, never as executed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NotExecutedCell {
+    cell: String,
+    reason: String,
+}
+
+/// Whether a terminal row shows an executed attempt. The executed marker
+/// is the row's `attempts` array (`CellResult.attempts` in
+/// `ci/manifest-plan/src/runner.rs`): a row that reached execution carries
+/// at least one `AttemptResult`, while
+/// `infrastructure_error_result` (preparation/spawn failure) and
+/// `host_inapplicable_result` carry `attempts: Vec::new()`. The scalar
+/// `attempt` ordinal is NOT this marker: it is `1` even on those
+/// no-attempt rows.
+fn terminal_row_has_executed_attempt(row: &serde_json::Value) -> bool {
+    row.get("attempts")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|attempts| !attempts.is_empty())
+}
+
+/// Why a complete-identity terminal row did not execute. A preparation
+/// error is the `infrastructure_error_result` shape: `outcome="ERROR"`
+/// with `failure_class="understood_infrastructure_failure"` (or
+/// `error_kind="infrastructure"`) and no attempts. Every other
+/// no-attempt row (for example `HOST-INAPPLICABLE`) is `no_attempt`.
+fn not_executed_reason(row: &serde_json::Value) -> String {
+    let text = |key: &str| {
+        row.get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let detail = text("reason").trim();
+    let preparation_error = text("outcome") == "ERROR"
+        && (text("failure_class") == "understood_infrastructure_failure"
+            || text("error_kind") == "infrastructure");
+    let kind = if preparation_error {
+        "preparation_error"
+    } else {
+        "no_attempt"
+    };
+    if detail.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{kind}: {detail}")
+    }
+}
+
+/// Split terminal rows into executed and not-executed cells. Bucket
+/// membership is never used here: a planned bucket that never launches
+/// produces no rows and therefore claims no cells. Only rows with a
+/// complete identity are considered at all; a cell with any executed
+/// attempt is executed even if another row for it did not execute.
+fn terminal_cell_accounting(rows: &[serde_json::Value]) -> (Vec<String>, Vec<NotExecutedCell>) {
+    let mut executed: BTreeSet<String> = BTreeSet::new();
+    let mut not_executed: BTreeMap<String, String> = BTreeMap::new();
+    for row in rows {
+        let Some(cell) = complete_cell_id(row) else {
+            continue;
+        };
+        if terminal_row_has_executed_attempt(row) {
+            executed.insert(cell);
+        } else {
+            not_executed
+                .entry(cell)
+                .or_insert_with(|| not_executed_reason(row));
+        }
+    }
+    for cell in &executed {
+        not_executed.remove(cell);
+    }
+    (
+        executed.into_iter().collect(),
+        not_executed
+            .into_iter()
+            .map(|(cell, reason)| NotExecutedCell { cell, reason })
+            .collect(),
+    )
+}
+
+/// Ledger form of the planned scope cells: terminal evidence only.
+/// Without terminal rows the executed set is honestly unknown (empty
+/// plus a reason), never inferred from planned buckets.
+fn ledger_scope_cells(
+    _planned: &[String],
+    terminal_rows: &[serde_json::Value],
+) -> (Vec<String>, Vec<NotExecutedCell>, Option<String>) {
+    let (executed, not_executed) = terminal_cell_accounting(terminal_rows);
+    if executed.is_empty() && not_executed.is_empty() {
+        (
+            Vec::new(),
+            Vec::new(),
+            Some(
+                "no terminal per-cell evidence; executed cells unknown (not inferred from planned buckets)"
+                    .into(),
+            ),
+        )
+    } else if executed.is_empty() {
+        (
+            Vec::new(),
+            not_executed,
+            Some(
+                "terminal per-cell rows present but none show an executed attempt; no executed cells proven"
+                    .into(),
+            ),
+        )
+    } else {
+        (executed, not_executed, None)
+    }
+}
+
+/// Production ledger serialization of a selective scope. This is the
+/// exact function the ledger site uses to write `cells`,
+/// `not_executed_cells`, `cells_source`, `cells_unknown_reason`, and
+/// `planned_cells`. Executed cells come from terminal evidence only;
+/// `scope.cells` is copied only into `planned_cells`, never into `cells`.
+fn ledger_selective_scope_json(
+    scope: &SelectiveScope,
+    executed_cells: &[String],
+    not_executed_cells: &[NotExecutedCell],
+    cells_unknown_reason: &Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "backends": scope.backends,
+        "cells": executed_cells,
+        "not_executed_cells": not_executed_cells
+            .iter()
+            .map(|cell| serde_json::json!({"cell": cell.cell, "reason": cell.reason}))
+            .collect::<Vec<_>>(),
+        "cells_source": if cells_unknown_reason.is_some() {
+            "none: no executed terminal per-cell evidence"
+        } else {
+            "terminal per-cell result rows"
+        },
+        "cells_unknown_reason": cells_unknown_reason,
+        "planned_cells": scope.cells,
+        "e2e_all": scope.e2e_all,
+        "backend_rules": scope.backend_rules,
+        "backend_lanes": scope.backend_lanes,
+        "unselected_policy": "SKIPPED (not selected); selected buckets run unfiltered",
+    })
+}
+
+/// Reason label for one `selective_skipped_nodes` entry. Unselected
+/// nodes/cells are `not selected`; a selected cell with a terminal
+/// not-executed row keeps its preparation-error / no-attempt reason.
+fn selective_skipped_reason(name: &str, selective_scope: Option<&serde_json::Value>) -> String {
+    if let Some(cell_id) = name.strip_prefix("cell:") {
+        if let Some(not_executed) = selective_scope
+            .and_then(|scope| scope.get("not_executed_cells"))
+            .and_then(serde_json::Value::as_array)
+        {
+            if let Some(entry) = not_executed
+                .iter()
+                .find(|entry| entry.get("cell").and_then(serde_json::Value::as_str) == Some(cell_id))
+            {
+                let reason = entry
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("no_attempt");
+                return format!("not executed ({reason})");
+            }
+        }
+    }
+    "not selected".to_string()
+}
+
 /// What `ci/select-tests.rs` decided, and what that means for the plan.
 enum SelectDecision {
     /// No CI-relevant change: run nothing beyond preflight.
-    Skip,
+    Skip(SelectiveScope),
     /// Run exactly this dependency-closed node set.
-    Nodes(BTreeSet<String>),
-    /// Fail-safe: run the complete portable lane, for the stated reason.
+    Nodes(BTreeSet<String>, SelectiveScope),
+    /// Fail-safe: run the full label (everything), for the stated reason.
     Full(String),
 }
 
@@ -12950,12 +13966,34 @@ fn ask_selector(root: &Path, baseline: Option<&str>) -> SelectDecision {
     println!("----- selective coverage report (skipped nodes/shards/e2e cells + reasons) -----");
     println!("{}", report.trim_end());
     println!("-------------------------------------------------------------------------------");
+    let str_list = |key: &str| -> Vec<String> {
+        sel.get(key)
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let scope = SelectiveScope {
+        backends: str_list("backends"),
+        cells_source: "planned: selector affinity at plan time; not terminal evidence".into(),
+        cells: str_list("cells"),
+        e2e_all: sel
+            .get("e2e_all")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        backend_rules: str_list("backend_rules"),
+        backend_lanes: str_list("backend_lanes"),
+    };
     match sel
         .get("decision")
         .and_then(|d| d.as_str())
         .unwrap_or("full")
     {
-        "skip" => SelectDecision::Skip,
+        "skip" => SelectDecision::Skip(scope),
         "selective" => {
             let nodes: BTreeSet<String> = sel
                 .get("nodes")
@@ -12970,7 +14008,7 @@ fn ask_selector(root: &Path, baseline: Option<&str>) -> SelectDecision {
             if nodes.is_empty() {
                 SelectDecision::Full("empty selected node set".into())
             } else {
-                SelectDecision::Nodes(nodes)
+                SelectDecision::Nodes(nodes, scope)
             }
         }
         other => SelectDecision::Full(format!("decision={other}")),
@@ -17650,7 +18688,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "91");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "102");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -17725,16 +18763,31 @@ mod nextest_timeout_tests {
         // run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec (Detcore's
         // empty-signal-boundary opt-in): 90. And
         // run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec
-        // (replaced-request parked ownership): 91. The spinner is retained
-        // but ignored and excluded because its explicit maximum requests an
-        // unavailable timer: 90 selected CLI tests remain.
+        // (replaced-request parked ownership): 91. And package K slice P1's
+        // run_kvm_procfs_directories_are_served_only_in_a_container,
+        // run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name and
+        // run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none
+        // (https://github.com/rrnewton/hermit/issues/4604): 94. And
+        // run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing
+        // and run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity
+        // (https://github.com/rrnewton/hermit/issues/4798): 96. And
+        // run_kvm_relative_names_are_decided_by_the_guests_working_directory,
+        // run_kvm_dotdot_names_are_decided_by_where_they_lead,
+        // run_kvm_the_virtual_cpus_are_listed_by_every_spelling,
+        // run_kvm_descriptor_directory_links_are_read_relative_to_the_working_directory
+        // and run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files
+        // (https://github.com/rrnewton/hermit/issues/4541): 101. And
+        // run_kvm_signal_permits_are_per_thread
+        // (https://github.com/rrnewton/hermit/issues/4899): 102. The spinner is
+        // retained but ignored and excluded because its explicit maximum
+        // requests an unavailable timer: 101 selected CLI tests remain.
         assert_eq!(
             names.len(),
-            91,
+            102,
             "update the exact CI inventory with new KVM tests"
         );
         names.retain(|name| name != excluded);
-        assert_eq!(names.len(), 90);
+        assert_eq!(names.len(), 101);
         let required_cases = [
             "run_kvm_self_sigkill_from_nonleader_is_group_fatal",
             "run_kvm_synchronous_root_segv_preserves_guest_exit",
@@ -17758,6 +18811,17 @@ mod nextest_timeout_tests {
             "run_kvm_cpuid_rows_match_ptrace",
             "run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec",
             "run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec",
+            "run_kvm_procfs_directories_are_served_only_in_a_container",
+            "run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name",
+            "run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none",
+            "run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing",
+            "run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity",
+            "run_kvm_relative_names_are_decided_by_the_guests_working_directory",
+            "run_kvm_dotdot_names_are_decided_by_where_they_lead",
+            "run_kvm_the_virtual_cpus_are_listed_by_every_spelling",
+            "run_kvm_descriptor_directory_links_are_read_relative_to_the_working_directory",
+            "run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files",
+            "run_kvm_signal_permits_are_per_thread",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -18843,7 +19907,23 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // empty-signal-boundary opt-in): 90 selected.
         // run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec
         // (replaced-request parked ownership): 91 selected.
-        ("privileged-only-test.cli_kvm", 91usize),
+        // Package K slice P1's
+        // run_kvm_procfs_directories_are_served_only_in_a_container,
+        // run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name and
+        // run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none
+        // (https://github.com/rrnewton/hermit/issues/4604): 94 selected.
+        // run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing
+        // and run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity
+        // (https://github.com/rrnewton/hermit/issues/4798): 96 selected.
+        // run_kvm_relative_names_are_decided_by_the_guests_working_directory,
+        // run_kvm_dotdot_names_are_decided_by_where_they_lead,
+        // run_kvm_the_virtual_cpus_are_listed_by_every_spelling,
+        // run_kvm_descriptor_directory_links_are_read_relative_to_the_working_directory
+        // and run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files
+        // (https://github.com/rrnewton/hermit/issues/4541): 101 selected. And
+        // run_kvm_signal_permits_are_per_thread
+        // (https://github.com/rrnewton/hermit/issues/4899): 102 selected.
+        ("privileged-only-test.cli_kvm", 102usize),
     ] {
         let step = privileged
             .steps
@@ -20990,6 +22070,11 @@ struct LedgerCtx {
     /// A failed retained count-only result cannot supply this value.
     passed_tests: Option<i64>,
     filtered_tests: Option<i64>,
+    /// Selective runs: full-population test nodes that were NOT selected.
+    /// Written to the row as SKIPPED (not selected), never as a pass.
+    selective_skipped_nodes: Vec<String>,
+    /// Selective runs: the selector scope (backends/cells/rules/lanes).
+    selective_scope: Option<serde_json::Value>,
 }
 
 struct ReceiptEvidence {
@@ -22749,7 +23834,7 @@ fn implied_single_ledger_attempt(gate: &serde_json::Value) -> Option<serde_json:
 ///
 /// Most gates run once, so the list repeated the gate's own fields in about
 /// 36 KB of every validate ledger event
-/// (https://github.com/rrnewton/dev-hermit/issues/540). A retried gate, an
+/// (cut by the ledger slimming change). A retried gate, an
 /// environmental or infrastructure attempt, or any attempt that differs from
 /// the rebuild in one field keeps its list unchanged.
 /// [`ledger_gate_attempts`] reads either form.
@@ -24587,6 +25672,13 @@ fn write_ledger_with_snapshot(
         // instead of asking readers to infer a set from the profile label.
         "planned_node_count": planned_tags.len(),
         "planned_nodes": planned_tags,
+        // Selective runs: every full-population node not in the plan and
+        // every cell whose bucket did not execute is SKIPPED, never a
+        // pass; cells appear as `cell:<slug>` entries. Unselected entries
+        // are `not selected`; selected preparation-error / no-attempt
+        // cells are `not executed (<reason>)`, not `not selected`.
+        "selective_skipped_nodes": ctx.selective_skipped_nodes.iter().map(|name| serde_json::json!({"name": name, "status": "SKIPPED", "reason": selective_skipped_reason(name, ctx.selective_scope.as_ref())})).collect::<Vec<_>>(),
+        "selective_scope": ctx.selective_scope,
         "real_seconds": wall_s,
         "log_file": log_file,
         "coverage": coverage,
@@ -26256,8 +27348,8 @@ fn run_owned_cache_bracket() -> Result<(), String> {
         .map_err(|error| format!("run-owned cache: cannot write probe: {error}"))?;
     // create_safe_cache's fallback is the directory above the OUTERMOST Cargo workspace, so a
     // fixture under a TMPDIR inside a checkout would select a cache beside that checkout:
-    // for a checkout at worktrees/slots/<slot>, worktrees/slots/ignored/validate/cache, shared by
-    // every slot. The self-test must only ever write inside its own fixture.
+    // an ignored/validate/cache directory in the directory that holds the checkout, shared by
+    // every sibling checkout there. The self-test must only ever write inside its own fixture.
     let boundary = cargo_manifest_boundary(&workspace);
     if boundary != workspace {
         return Err(format!(
@@ -28544,7 +29636,15 @@ fn run(
         .and_then(|d| d.retained.as_ref())
         .map(|log| log.locator.clone());
     let admission_floor_evidence = retained_admission.as_ref().map(|r| r.evidence.clone());
-    let coverage = typed_test_node_coverage(&plan.planned_test_nodes, &outcomes);
+    // Coverage is computed from the FULL plan population, not the reduced
+    // selective graph: unselected test nodes land in `absent_nodes` and
+    // are recorded SKIPPED (not selected), never as executed.
+    let coverage_planned = if plan.population_test_nodes.is_empty() {
+        &plan.planned_test_nodes
+    } else {
+        &plan.population_test_nodes
+    };
+    let coverage = typed_test_node_coverage(coverage_planned, &outcomes);
 
     // Later local-ref observations are not admission proof. Unknown remains
     // explicit instead of a failed Git command inventing a measured zero.
@@ -28589,6 +29689,14 @@ fn run(
     );
     let commit_anchored = attribution.commit_anchored;
     let attribution_tree_dirty = attribution.tree_dirty;
+    // Terminal per-cell accounting for the ledger, computed once so the
+    // executed list, the not-executed list, and the skipped accounting
+    // cannot disagree. Planned buckets are never executed evidence.
+    let (ledger_executed_cells, ledger_not_executed_cells, ledger_cells_unknown_reason) =
+        plan.selective_scope.as_ref().map_or_else(
+            || (Vec::new(), Vec::new(), None),
+            |scope| ledger_scope_cells(&scope.cells, &raw_snapshot.all_rows().unwrap_or_default()),
+        );
     if admitted_disposable_checkout && !dirty_at_admission && dirty_after_run {
         eprintln!(
             "validate: disposable checkout became dirty during execution; attribution remains \
@@ -28649,6 +29757,39 @@ fn run(
         executed_tests,
         passed_tests,
         filtered_tests,
+        // Every unselected node (all full-label tags, not only test
+        // groups) and every unexecuted cell is SKIPPED, never a pass.
+        selective_skipped_nodes: {
+            let planned: BTreeSet<String> = plan.cfg.steps.iter().map(Step::tag).collect();
+            let mut skipped: Vec<String> = plan
+                .population_nodes
+                .difference(&planned)
+                .cloned()
+                .collect();
+            skipped.extend(
+                plan.selective_skipped_cells
+                    .iter()
+                    .map(|cell| format!("cell:{cell}")),
+            );
+            // Terminal rows with no executed attempt (preparation error
+            // or no attempt) are not executed: SKIPPED accounting, with
+            // the reason carried in `not_executed_cells` below.
+            skipped.extend(
+                ledger_not_executed_cells
+                    .iter()
+                    .filter(|cell| !plan.selective_skipped_cells.contains(&cell.cell))
+                    .map(|cell| format!("cell:{}", cell.cell)),
+            );
+            skipped
+        },
+        selective_scope: plan.selective_scope.as_ref().map(|scope| {
+            ledger_selective_scope_json(
+                scope,
+                &ledger_executed_cells,
+                &ledger_not_executed_cells,
+                &ledger_cells_unknown_reason,
+            )
+        }),
     };
     if let (Some(a), Some(l)) = (peak_active, peak_live) {
         println!(
@@ -29507,6 +30648,8 @@ fn stop_test_seam(
         executed_tests: None,
         passed_tests: None,
         filtered_tests: None,
+        selective_skipped_nodes: Vec::new(),
+        selective_scope: None,
     };
     // `execution_complete: false` keeps this synthetic fixture incomplete. Its
     // selected denominator is retained without claiming a completed full profile.
@@ -33227,7 +34370,8 @@ mod refusal_detail_tests {
 
     /// The real refusal that stranded seven hours of validation on 2026-09-17,
     /// taken verbatim from run 1838's log rather than invented, so the bound
-    /// and the shape are sized against the thing they exist for.
+    /// and the shape are sized against the thing they exist for. Only the
+    /// private workspace prefix of its path is replaced by `<dev-hermit>/`.
     const REAL: &str = include_str!("../tests/fixtures/scorecard-writeback/refusal.txt");
 
     #[test]
@@ -33948,6 +35092,8 @@ with (root/'calls.jsonl').open('a') as out:
             executed_tests: Some(1),
             passed_tests: Some(1),
             filtered_tests: Some(0),
+            selective_skipped_nodes: Vec::new(),
+            selective_scope: None,
         }
     }
 

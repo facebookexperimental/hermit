@@ -760,6 +760,28 @@ impl RawFd {
         Ok(stat)
     }
 
+    /// The type of the file system the open file is on (`statfs::f_type`),
+    /// by a raw `fstatfs`.
+    pub fn fs_type(&self) -> std::io::Result<u64> {
+        // SAFETY: an all-zero `statfs` is a valid value, and the kernel
+        // writes at most its size.
+        let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
+        raw_zero_result(unsafe {
+            raw_syscall(
+                libc::SYS_fstatfs,
+                [
+                    self.0,
+                    &mut filesystem as *mut libc::statfs as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        })?;
+        Ok(filesystem.f_type as u64)
+    }
+
     /// Up to `buffer.len()` bytes at `offset`, by a raw `pread64`.
     pub fn read_at(&self, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
         // SAFETY: the buffer is writable for its length.
@@ -795,6 +817,17 @@ fn raw_path(path: &std::path::Path) -> std::io::Result<std::ffi::CString> {
 
 /// The status of the file at `path`, following links, by a raw `newfstatat`.
 pub fn raw_stat(path: &std::path::Path) -> std::io::Result<libc::stat> {
+    raw_stat_with(path, 0)
+}
+
+/// The status of the file at `path`, not following a link in its last
+/// component, by a raw `newfstatat`.
+pub fn raw_lstat(path: &std::path::Path) -> std::io::Result<libc::stat> {
+    raw_stat_with(path, libc::AT_SYMLINK_NOFOLLOW)
+}
+
+/// The status of the file at `path` by a raw `newfstatat` with `flags`.
+fn raw_stat_with(path: &std::path::Path, flags: libc::c_int) -> std::io::Result<libc::stat> {
     let path = raw_path(path)?;
     // SAFETY: a NUL-terminated path; an all-zero `stat` is a valid value.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -805,7 +838,7 @@ pub fn raw_stat(path: &std::path::Path) -> std::io::Result<libc::stat> {
                 libc::AT_FDCWD as u64,
                 path.as_ptr() as u64,
                 &mut stat as *mut libc::stat as u64,
-                0,
+                flags as u64,
                 0,
                 0,
             ],
@@ -902,6 +935,33 @@ pub fn raw_read_listing(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
         }
         capacity *= 2;
     }
+}
+
+/// The descriptor numbers the `linux_dirent64` records in `records` name: each
+/// entry whose name is a decimal number (a descriptor directory's), in
+/// order, leaving out `.` and `..`.
+pub fn descriptor_names(records: &[u8]) -> Vec<i32> {
+    let mut numbers = Vec::new();
+    let mut at = 0;
+    while at + 19 <= records.len() {
+        let length = usize::from(u16::from_ne_bytes([records[at + 16], records[at + 17]]));
+        if length < 19 || at + length > records.len() {
+            break;
+        }
+        let name = &records[at + 19..at + length];
+        let name = &name[..name
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(name.len())];
+        if !name.is_empty()
+            && name.iter().all(u8::is_ascii_digit)
+            && let Some(number) = std::str::from_utf8(name).ok().and_then(|n| n.parse().ok())
+        {
+            numbers.push(number);
+        }
+        at += length;
+    }
+    numbers
 }
 
 /// `path` with every symbolic link followed and every `.` and `..` resolved,

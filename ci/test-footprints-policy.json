@@ -139,9 +139,9 @@
       "e2e_all": true
     },
     {
-      "_why": "The DBT plugin has a runtime-callback ABI check and DBT cells. The retired test.dbt_parity matrix's 28 cases are DBT cells of the c-programs and system-utils manifests since slice S13 of https://github.com/rrnewton/hermit/issues/3301, and check.dbt_runtime_abi lost the test.dbt_parity dependent that used to pull it in.",
+      "_why": "The DBT plugin has a runtime-callback ABI check and DBT cells. The retired test.dbt_parity matrix's 28 cases are DBT cells of the c-programs and system-utils manifests since slice S13 of https://github.com/rrnewton/hermit/issues/3301, and check.dbt_runtime_abi lost the test.dbt_parity dependent that used to pull it in. The E2E bucket nodes are not listed here: the generator derives every bucket containing a DBT cell from ci/expected-e2e-plan.json.",
       "packages": ["detcore-dbt", "detcore-dbt-cdylib"],
-      "nodes": ["check.dbt_runtime_abi", "e2e.manifest_c_programs_on_host", "e2e.manifest_system_utils_on_host"],
+      "nodes": ["check.dbt_runtime_abi"],
       "e2e_backends": ["dbt"]
     },
     {
@@ -251,6 +251,45 @@
       "_why": "Standalone checks map to their own portable DAG node.",
       "paths": ["scripts/check-dagrun-naming.sh"],
       "nodes": ["check.dagrun_naming"]
+    }
+  ],
+  "backend_rules": [
+    {
+      "_why": "v1 selective scope: DBT is the only backend with a scoped route. A change confined to the DBT crates runs the common-core nodes in its generated footprint plus every E2E bucket that contains a DBT cell; the generator derives those bucket nodes from ci/expected-e2e-plan.json (cells with backend=dbt), so this list carries only the non-bucket DBT nodes. Reverie paths are relative to the reverie submodule root and apply when a reverie pin bump is expanded to its inner changed files. Residual future work (not v1 routes): scoped kvm, ptrace, liteinst/in-guest-trap, sabre and e9patch-preprocessing routes; any path for those backends, and any mixed, shared or unknown change, selects the full label instead.",
+      "id": "dbt",
+      "paths": ["detcore-dbt/**", "detcore-dbt-cdylib/**"],
+      "reverie_paths": ["reverie-dbt/**"],
+      "backends": ["dbt"],
+      "lanes": ["portable", "privileged"],
+      "extra_nodes": [
+        "build.workspace",
+        "check.dbt_runtime_abi",
+        "test.cli",
+        "test.hermit_integration"
+      ],
+      "tier": "backend"
+    },
+    {
+      "_why": "Shared Reverie crates every backend builds on, plus crates whose reverse-dependency closure spans multiple backends (safeptrace, reverie-inguest; enforced by the generator closure check): a pin bump touching any of these (or the reverie workspace manifests) can affect every backend, so selection falls back to the full suite.",
+      "id": "reverie-core",
+      "paths": [],
+      "reverie_paths": [
+        "reverie/**",
+        "reverie-syscalls/**",
+        "reverie-process/**",
+        "reverie-util/**",
+        "reverie-rpc-transport/**",
+        "reverie-memory/**",
+        "reverie-loader/**",
+        "safeptrace/**",
+        "reverie-inguest/**",
+        "Cargo.toml",
+        "Cargo.lock"
+      ],
+      "backends": ["*"],
+      "lanes": ["portable", "privileged"],
+      "extra_nodes": [],
+      "tier": "core"
     }
   ]
 }

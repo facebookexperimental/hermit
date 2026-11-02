@@ -58,8 +58,10 @@ fn deregistration(tid: DetTid, mm: MmId, count: u64) -> ThreadDeregistration {
         detpid: LEADER,
         mm,
         thread_start_entered: true,
+        vfork_origin: None,
         timeslice_stats: stats,
         syscall_count: count,
+        syscall_histogram: Default::default(),
         chaos_epochs: Vec::new(),
     }
 }

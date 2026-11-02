@@ -19,6 +19,7 @@ use reverie::syscalls;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Displayable;
+use reverie::syscalls::FcntlCmd;
 use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::ProtFlags;
@@ -271,6 +272,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         blocked_signal_mask_unknown: bool,
         after_grant: impl FnOnce(&mut G),
     ) -> Result<i64, Error> {
+        // D41 (A5 step 3c.1c): the first statement of every background
+        // external call and `rt_sigsuspend`, the two kernel-run families
+        // filed here, before anything below refuses, files or runs it.
+        if let Some(refused) = kernel_run_entry_refusal(guest)? {
+            return Err(refused);
+        }
         // A host wait on descriptors that may include a timerfd on virtual
         // time would never see it readable (`crate::syscalls::timerfd`).
         crate::syscalls::timerfd::refuse_host_wait_for(guest, call);
@@ -359,6 +366,29 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, rsrcs).await;
         }
         res
+    }
+
+    /// Whether [`Self::execute_nonblockable_fd_syscall`] runs `call` as a
+    /// blocking call outside this thread's turn
+    /// ([`Self::record_or_replay_blocking`]), where other threads may run
+    /// before the kernel reads the call's arguments: without sequentialized
+    /// threads, for an external descriptor under record and replay, for a
+    /// descriptor that is blocking in the kernel as well, and where the
+    /// descriptor cannot be classified. Decided as that function decides it.
+    pub(crate) fn nonblockable_call_runs_outside_turn<G, C>(&self, guest: &mut G, call: C) -> bool
+    where
+        G: Guest<Self>,
+        C: SyscallInfo + Into<Syscall> + Copy,
+    {
+        let wrapped: Syscall = call.into();
+        match ioaction_based_on_fd_status(guest, call) {
+            Err(_) => true,
+            Ok(action) => {
+                !self.cfg.sequentialize_threads
+                    || (self.cfg.recordreplay_modes && !syscall_targets_internal_fd(guest, wrapped))
+                    || action == IOAction::Blocking
+            }
+        }
     }
 
     /// Executes a nonblockable syscall according to the following strategy:
@@ -547,7 +577,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let turn_mask_cell = stack.reserve::<KernelSigset>();
         let action_addr = stack.reserve::<KernelSigaction>();
         let _mask_guard = stack.commit()?;
-        let checks_at_turn = decides_interruption_at_turn(guest, guest_signal_state_task(guest));
+        // A parked pipe write under the in-guest delivery gate (A5 step 3c.1c,
+        // D50 reader 1) installs no private mask: once an attempt would wait
+        // for room, the design's deliverable set under the thread's published
+        // mask decides (`gated_wait_ends`).
+        let gated = guest.config().in_guest_signal_delivery;
+        let checks_at_turn =
+            !gated && decides_interruption_at_turn(guest, guest_signal_state_task(guest));
         // Where the turn decides (`read_turn_signals`), the state is read, and
         // the first attempt made, in the slice of the call's own entry, as the
         // scalar writer's first attempt is, under the guest's own mask: that
@@ -580,7 +616,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut turn_wait = checks_at_turn
             .then(|| KernelSignalWait::new(guest, 0, false, call.signal_interrupt_errno()));
         let mut turn_mask: Option<KernelSigset> = None;
-        let guest_signal_mask = if checks_at_turn {
+        let guest_signal_mask = if checks_at_turn || gated {
             0
         } else {
             block_signals_for_disposition(guest, blocked_mask_addr, old_mask_addr).await?
@@ -630,7 +666,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     (status, turn)
                 }
             };
-            if turn.is_none() {
+            if turn.is_none() && !gated {
                 let disposition = match wait_signal_disposition(
                     guest,
                     status.clone(),
@@ -709,6 +745,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if turn.is_some_and(|turn| turn.ends(true)) {
                         break Ok(written_total as i64);
                     }
+                    if gated {
+                        match gated_wait_ends(guest, None) {
+                            Ok(true) => break Ok(written_total as i64),
+                            Ok(false) => {}
+                            Err(error) => break Err(error),
+                        }
+                    }
                     current = match remaining_writev_segment(
                         call.fd(),
                         &iovecs,
@@ -731,6 +774,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                     };
                 }
                 Err(Error::Errno(Errno::EAGAIN)) => {
+                    if gated {
+                        match gated_wait_ends(guest, None) {
+                            Ok(true) => {
+                                break if written_total > 0 {
+                                    Ok(written_total as i64)
+                                } else {
+                                    Err(call.signal_interrupt_errno().into())
+                                };
+                            }
+                            Ok(false) => {}
+                            Err(error) => break Err(error),
+                        }
+                    }
                     if !atomic_pipe_write && matches!(current, Syscall::Writev(_)) {
                         current = match remaining_writev_segment(call.fd(), &iovecs, 0, target) {
                             Ok(Some(write)) => Syscall::Write(write),
@@ -773,6 +829,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Err(error) => Err(error),
                 }
             }
+            None if gated => result,
             None => {
                 restore_signals_after_disposition(guest, old_mask_addr).await?;
                 result
@@ -849,7 +906,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let subtool = self.cfg.recordreplay_modes.then_some(self);
         let mut current = call;
         let mut written_total = 0usize;
-        let checks_at_turn = decides_interruption_at_turn(guest, resources.signal_state_task);
+        // Under the in-guest delivery gate (A5 step 3c.1c, D50 reader 1), as
+        // for a pipe `writev`: no private mask, and the design's deliverable
+        // set decides once an attempt would wait for room.
+        let gated = guest.config().in_guest_signal_delivery;
+        let checks_at_turn =
+            !gated && decides_interruption_at_turn(guest, resources.signal_state_task);
         // The write owns the guest's mask while it blocks every blockable
         // signal, as the generic poll does (`retry_nonblocking_syscall_helper`):
         // an attempt after the first is a private injection of the
@@ -901,7 +963,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else {
                 None
             };
-            let signaled = if turn.is_some() {
+            let signaled = if turn.is_some() || gated {
                 false
             } else {
                 match (&status, &disposition_scratch) {
@@ -972,6 +1034,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if written_total == target || turn.map_or(signaled, |turn| turn.ends(true)) {
                         break Ok(written_total as i64);
                     }
+                    if gated {
+                        match gated_wait_ends(guest, None) {
+                            Ok(true) => break Ok(written_total as i64),
+                            Ok(false) => {}
+                            Err(error) => break Err(error),
+                        }
+                    }
                     let Some(buffer) = call.buf() else {
                         break Err(Errno::EFAULT.into());
                     };
@@ -999,7 +1068,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                         Err(call.signal_interrupt_errno().into())
                     };
                 }
-                Err(Error::Errno(Errno::EAGAIN)) => {}
+                Err(Error::Errno(Errno::EAGAIN)) => {
+                    if gated {
+                        match gated_wait_ends(guest, None) {
+                            Ok(true) => {
+                                break if written_total > 0 {
+                                    Ok(written_total as i64)
+                                } else {
+                                    Err(call.signal_interrupt_errno().into())
+                                };
+                            }
+                            Ok(false) => {}
+                            Err(error) => break Err(error),
+                        }
+                    }
+                }
                 Err(error) => {
                     break finish_partial_record_or_replay_write(written_total as i64, error);
                 }
@@ -1241,10 +1324,12 @@ pub fn ioaction_based_on_fd_status<
 /// class -- but neither claim is airtight.
 ///
 /// The converse gap: a socketpair endpoint or pipe that a guest RECEIVES over
-/// `SCM_RIGHTS` is untracked by Detcore, so it is not recognized here and keeps the
-/// kernel-authoritative external path. Its open file description is still physically
-/// nonblocking, so a blocking read through the received descriptor can return EAGAIN
-/// under record, as it already could for a received pipe.
+/// `SCM_RIGHTS` is recorded (`Detcore::record_received_descriptors`) or discovered
+/// from the kernel's facts, which do not say that a guest made it, or not recorded
+/// at all (record and replay), so it is not recognized as internal here. Its open
+/// file description is still physically nonblocking, and the kernel's `O_NONBLOCK`
+/// is all the receiver's record knows, so a blocking read through the received
+/// descriptor can return EAGAIN where Linux would wait.
 ///
 /// Syscalls whose fd is not directly extractable (e.g. poll/ppoll, which carry a
 /// pointer to an fd array) return false and keep their existing handling.
@@ -1569,6 +1654,12 @@ pub trait NonblockableSyscall: SyscallInfo {
     /// guest memory. Only `rt_sigtimedwait` has any.
     fn signals_consumed_by_wait<M: MemoryAccess>(&self, _memory: &M) -> KernelSigset {
         0
+    }
+
+    /// Whether this call is a receive that Linux ends without waiting once
+    /// its socket's read side is shut down (`finish_after_read_shutdown`).
+    fn ends_at_read_shutdown(&self) -> bool {
+        false
     }
 
     /// Convert a physical nonblocking completion into the result expected by the guest.
@@ -1913,6 +2004,10 @@ impl NonblockableSyscall for reverie::syscalls::Read {
         // Note that we've ruled out 0-count reads before this point.
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
     }
+
+    fn ends_at_read_shutdown(&self) -> bool {
+        true
+    }
 }
 
 /// While the read syscall is quite general, this nonblocking capacity is used
@@ -1947,6 +2042,10 @@ impl NonblockableSyscall for reverie::syscalls::Readv {
 
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+
+    fn ends_at_read_shutdown(&self) -> bool {
+        true
     }
 }
 
@@ -2025,6 +2124,10 @@ impl NonblockableSyscall for reverie::syscalls::Recvfrom {
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
     }
+
+    fn ends_at_read_shutdown(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait]
@@ -2038,6 +2141,10 @@ impl NonblockableSyscall for reverie::syscalls::Recvmsg {
 
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+
+    fn ends_at_read_shutdown(&self) -> bool {
+        true
     }
 }
 
@@ -2054,6 +2161,10 @@ impl NonblockableSyscall for reverie::syscalls::Recvmmsg {
 
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+
+    fn ends_at_read_shutdown(&self) -> bool {
+        true
     }
 }
 
@@ -2290,10 +2401,14 @@ where
     G: Guest<Detcore<T>>,
 {
     let maybe_tup = maybe_timeout.map(|t| (t, call.timeout_return_val()));
+    // Under the in-guest delivery gate the private-mask machinery is never
+    // taken (A5 step 3c.1c, D50): the helper below decides by the published
+    // mask instead (`gated_wait_ends`).
     if guest
         .config()
         .backend
         .supports_blocked_wait_signal_interruption
+        && !guest.config().in_guest_signal_delivery
     {
         return retry_blocking_wait_with_kernel_signal_state(guest, call, rsrc, maybe_tup).await;
     }
@@ -2386,7 +2501,13 @@ where
         // deliver is pending, so a blocked or ignored signal leaves it waiting.
         rsrc.signal_state_task = guest_signal_state_task(guest);
     }
-    let checks_at_turn = rsrc.signal_interrupt_errno() == Some(Errno::ERESTARTSYS.into_raw())
+    // D50 reader 2 under the in-guest delivery gate (A5 step 3c.1c): no
+    // private kernel mask; once an attempt would block, the design's
+    // deliverable set under the thread's published mask decides
+    // (`gated_wait_ends`), at each turn, the first included.
+    let gated = guest.config().in_guest_signal_delivery;
+    let checks_at_turn = !gated
+        && rsrc.signal_interrupt_errno() == Some(Errno::ERESTARTSYS.into_raw())
         && decides_interruption_at_turn(guest, rsrc.signal_state_task);
     // Where the turn decides, the call owns the guest's mask while it blocks
     // every blockable signal (`KernelSignalWait::block_in_place`), from the
@@ -2465,12 +2586,42 @@ where
         // pending ends it (`TurnSignals::ends`).
         let signaled = match turn {
             Some(turn) => turn.ends(false),
-            None => matches!(resumed, ResumeStatus::Signaled(_)),
+            None => !gated && matches!(resumed, ResumeStatus::Signaled(_)),
         };
         // A pending real-time timer expiration in the set this wait takes
         // (https://github.com/rrnewton/hermit/issues/4089).
         let pending = pending_real_time_among(guest, consumed).await;
         act_on_pending_real_time(guest, pending, consumed, 0).await;
+        // A receive whose descriptors Detcore names reads its geometry again
+        // right before each attempt: a sibling may have changed it while an
+        // earlier attempt waited (`ThreadState::receive_geometry`).
+        if guest.thread_state().receive_geometry.is_some() {
+            let geometry =
+                crate::syscalls::scm_rights::ReceiveGeometry::before(&guest.memory(), &call.into());
+            guest.thread_state_mut().receive_geometry = Some(geometry);
+        }
+        // A send whose `SCM_RIGHTS` descriptors Detcore inspected reads them
+        // again right before each attempt: a sibling may have rewritten its
+        // messages, or replaced what their descriptor numbers name, since the
+        // inspection or while an earlier attempt waited
+        // (`ThreadState::send_inspection`). An attempt that would pass other
+        // placeholders than those whose copies Detcore counted is refused by
+        // name. Boxed: only a send that may pass a placeholder carries it.
+        if let Some(inspection) = guest.thread_state().send_inspection.clone()
+            && let Some(reason) =
+                Box::pin(Detcore::<T>::changed_placeholder_send(guest, &inspection)).await
+        {
+            tracing::error!("Detcore refuses {}: {reason}", inspection.sysno);
+            let panic_on_unsupported_syscalls = guest.config().panic_on_unsupported_syscalls;
+            break refuse_unserviceable_operation_with(
+                guest,
+                panic_on_unsupported_syscalls,
+                inspection.sysno,
+                Errno::EOPNOTSUPP,
+                Some(&reason),
+            )
+            .await;
+        }
         // Route through the record/replay subtool for internal pipes so each poll (an
         // EAGAIN, or the final data-bearing read) becomes one recorded event that replay
         // reproduces deterministically; otherwise execute the syscall directly.
@@ -2494,6 +2645,17 @@ where
             Err(Error::Errno(error)) => Err(error),
             Err(error) => break Err(error),
         };
+        // Before the signal check: Linux looks for a pending signal only when
+        // the call must wait, and a receive on a socket shut down for reading
+        // does not. Record and replay poll a receive here only on a
+        // socketpair, through `subtool`; finishing it there would add
+        // recorded calls, a new recording format, so they keep polling.
+        if subtool.is_none()
+            && call.syscall_would_have_blocked(syscall_result)
+            && let Some(result) = finish_after_read_shutdown(guest, call).await
+        {
+            break result;
+        }
         if signaled && call.syscall_would_have_blocked(syscall_result) {
             let errno = call.signal_interrupt_errno();
             tracing::trace!(
@@ -2502,6 +2664,16 @@ where
                 errno
             );
             break Err(errno.into());
+        }
+        // Under the gate the wait ends here, where it would block (as
+        // Linux checks for a pending signal only then), for a signal sent
+        // before it parked or one whose commit woke it.
+        if gated && call.syscall_would_have_blocked(syscall_result) {
+            match gated_wait_ends(guest, None) {
+                Ok(true) => break Err(call.signal_interrupt_errno().into()),
+                Ok(false) => {}
+                Err(error) => break Err(error),
+            }
         }
         if call.syscall_would_have_blocked(syscall_result) {
             rsrc.poll_attempt += 1;
@@ -2563,6 +2735,101 @@ where
         }
         _ => result,
     }
+}
+
+/// Ends a polled blocking receive as Linux does once its socket's read side is
+/// shut down.
+///
+/// Detcore polls a blocking receive on a physically nonblocking socket with
+/// nonblocking attempts (`retry_nonblocking_syscall`). On a datagram socket
+/// whose read side is shut down, Linux's blocking receive does not wait: with
+/// nothing queued it returns 0 at once (`__skb_wait_for_more_packets`). The
+/// nonblocking attempt fails with `EAGAIN` instead, every time, so the polled
+/// receive never ended, and a thread that shut a reader's socket down and then
+/// joined the reader waited forever.
+///
+/// After an attempt that would block on a socket whose read side a guest shut
+/// down (`DetFd::read_shutdown_requested`), this asks the kernel whether it is
+/// still shut (`read_side_shut_down`): a TCP disconnect opens it again. If it
+/// is, the blocking call cannot wait, so this runs the guest's call once with
+/// `O_NONBLOCK` cleared, then sets the flag back, and returns what Linux
+/// returned, with the address lengths it wrote. `None` for any other call or
+/// socket, or while the read side is open: the attempt's `EAGAIN` stands and
+/// the poll goes on, with no extra call.
+async fn finish_after_read_shutdown<T, G, C>(guest: &mut G, call: C) -> Option<Result<i64, Error>>
+where
+    C: NonblockableSyscall + Into<Syscall>,
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let fd = get_fd(call.into()).filter(|_| call.ends_at_read_shutdown())?;
+    let shut_down_by_guest = guest.thread_state().with_detfd(fd, |detfd| {
+        matches!(detfd.ty(), FdType::Socket) && detfd.read_shutdown_requested()
+    });
+    if shut_down_by_guest != Ok(true) || !read_side_shut_down(guest, fd).await {
+        return None;
+    }
+    let fcntl = |cmd| syscalls::Fcntl::new().with_fd(fd).with_cmd(cmd);
+    // Nothing has changed if either of these fails: the attempt's EAGAIN stands.
+    let flags = match guest.inject_with_retry(fcntl(FcntlCmd::F_GETFL)).await {
+        Ok(flags) => flags as libc::c_int,
+        Err(errno) => {
+            tracing::warn!("socket {fd}: F_GETFL before a read-shutdown receive failed: {errno}");
+            return None;
+        }
+    };
+    let blocking = fcntl(FcntlCmd::F_SETFL(flags & !libc::O_NONBLOCK));
+    if let Err(errno) = guest.inject_with_retry(blocking).await {
+        tracing::warn!(
+            "socket {fd}: clearing O_NONBLOCK for a read-shutdown receive failed: {errno}"
+        );
+        return None;
+    }
+    let result = guest.inject_with_retry(call).await.map_err(Error::from);
+    // Every later attempt on this description assumes it is nonblocking; one
+    // that blocked would hold the turn forever.
+    if let Err(errno) = guest
+        .inject_with_retry(fcntl(FcntlCmd::F_SETFL(flags)))
+        .await
+    {
+        panic!("socket {fd}: restoring O_NONBLOCK after a read-shutdown receive failed: {errno}");
+    }
+    tracing::trace!(
+        "retry_nonblocking_syscall: {} ran blocking after a read shutdown: {:?}",
+        call.display(&guest.memory()),
+        result
+    );
+    Some(result)
+}
+
+/// Whether the kernel reports `fd`'s read side shut down: `POLLRDHUP` from a
+/// `poll` with a zero timeout, which Linux sets exactly when the socket's
+/// `RCV_SHUTDOWN` is set (`datagram_poll`, `unix_dgram_poll`, `tcp_poll`).
+async fn read_side_shut_down<T, G>(guest: &mut G, fd: i32) -> bool
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut stack = guest.stack().await;
+    let pollfd: AddrMut<libc::pollfd> = stack.reserve();
+    let Ok(_guard) = stack.commit() else {
+        return false;
+    };
+    let probe = syscalls::Poll::new()
+        .with_fds(Some(pollfd.cast()))
+        .with_nfds(1)
+        .with_timeout(0);
+    let request = libc::pollfd {
+        fd,
+        events: libc::POLLRDHUP,
+        revents: 0,
+    };
+    guest.memory().write_value(pollfd, &request).is_ok()
+        && guest.inject_with_retry(probe).await == Ok(1)
+        && guest
+            .memory()
+            .read_value(pollfd)
+            .is_ok_and(|polled| polled.revents & libc::POLLRDHUP != 0)
 }
 
 /// Retry a blocking wait on a backend that decides signal interruption from the
@@ -2880,6 +3147,515 @@ where
     };
     crate::tool_global::set_saved_guest_sigmask(guest, Some(mask)).await;
     Ok(mask)
+}
+
+/// A5 step 3c.1c (design 16.11, D50): under the in-guest delivery gate, the
+/// guest mask a wait under the thread's own mask decides by, in the thread's
+/// own turn: the mask it publishes at its requests
+/// (`tool_global::publish_request_guest_mask`), or, when it publishes none,
+/// `fallback`, which is the kernel's `SigBlk` unless the caller knows the
+/// guest's mask better. No backend records the guest's mask apart from the
+/// kernel's before step 3c.1e, and step 3c.1b's readers take `SigBlk` then
+/// too.
+pub(crate) fn gated_own_mask<T, G>(guest: &G, fallback: KernelSigset) -> KernelSigset
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let own = Resources::new(guest.thread_state().dettid);
+    crate::tool_global::publish_request_guest_mask(guest, &own).unwrap_or(fallback)
+}
+
+/// A5 step 3c.1c (design 16.11, D50): under the in-guest delivery gate, what
+/// ends this thread's wait now, read in its own turn from its `/proc` status
+/// and its own published mask ([`gated_own_mask`], with `fallback` for
+/// `SigBlk` when the caller knows the guest's own mask better). `None` when no
+/// signal is deliverable, and always with the gate off. A state that cannot be
+/// read is handled as a wait's first read is (`read_thread_wait_signal_state`):
+/// a thread that no longer exists ends the call with `ERESTARTNOINTR`, and
+/// otherwise the run ends with a diagnostic.
+pub(crate) fn gated_wait_end<T, G>(
+    guest: &G,
+    fallback: Option<KernelSigset>,
+) -> Result<Option<crate::wait_signal_end::WaitSignalEnd>, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    gated_wait_end_with_virtual(guest, fallback, 0)
+}
+
+/// [`gated_wait_end`] with `virtual_caught`, caught signals the scheduler
+/// knows are pending on the process's shared queue with no physical copy
+/// (signal phase 1's virtual SIGALRM;
+/// `wait_signal_end::wait_end_with_virtual`).
+pub(crate) fn gated_wait_end_with_virtual<T, G>(
+    guest: &G,
+    fallback: Option<KernelSigset>,
+    virtual_caught: KernelSigset,
+) -> Result<Option<crate::wait_signal_end::WaitSignalEnd>, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if !guest.config().in_guest_signal_delivery {
+        return Ok(None);
+    }
+    let state = crate::syscalls::threads::read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+    let mask = gated_own_mask(guest, fallback.unwrap_or(state.blocked));
+    Ok(crate::wait_signal_end::wait_end_with_virtual(
+        &state,
+        mask,
+        guest.config().in_guest_reserved_signals,
+        virtual_caught,
+    ))
+}
+
+/// [`gated_wait_end`], recording a found end as the current call's D40 flag
+/// (`ThreadState::wait_signal_end`) for the restart checkpoint. Returns
+/// whether a signal ends the wait.
+pub(crate) fn gated_wait_ends<T, G>(
+    guest: &mut G,
+    fallback: Option<KernelSigset>,
+) -> Result<bool, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let end = gated_wait_end(guest, fallback)?;
+    if let Some(end) = end {
+        tracing::info!(
+            "[dtid {}] under the in-guest delivery gate, {:?} ends the wait",
+            guest.thread_state().dettid,
+            end
+        );
+        guest.thread_state_mut().wait_signal_end = Some(end);
+    }
+    Ok(end.is_some())
+}
+
+/// A5 step 3c.1c, design D41 (amending 16.26), with IR-5 and IR-14: under the
+/// in-guest delivery gate, a default-fatal signal already deliverable when a
+/// kernel-run call begins (`ResourceID::is_kernel_run_blocking`: a background
+/// external call, `rt_sigsuspend`, `vfork`) is one Linux would have delivered
+/// before the call, ending the process. So the call is not run: its handler
+/// calls this as its first statement, before any guest-visible effect, and
+/// returns the error this gives, `ERESTARTNOINTR` with the D40 flag `Fatal`
+/// recorded, which the restart checkpoint turns into `-EINTR` (the death path
+/// of step 3c.1e follows at the return). A `BehindCaught` end (a caught
+/// signal first, and a later delivery in the same loop that could end the
+/// process) means the call is not run either: the flag is recorded as it is,
+/// and the checkpoint resolves it. `Fatal` gives `-EINTR`. `Caught` (the
+/// handlers' masks hold the default-fatal signal, or no reset instance is
+/// reached) would need the handler run and then the call restarted, which
+/// 3c.1 cannot do, so the checkpoint refuses it by name
+/// (HERMIT_RESTART_AFTER_HANDLER, fail closed); in that schedule Linux runs
+/// the handler and, unless it changes the default-fatal signal's disposition
+/// or mask, ends the process at its `rt_sigreturn`, before the call is made
+/// again. Only a single caught signal at entry, or none, keeps today's path
+/// (`None`): the call runs. With the gate off, `None`.
+pub(crate) fn kernel_run_entry_refusal<T, G>(guest: &mut G) -> Result<Option<Error>, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    match gated_wait_end(guest, None)? {
+        Some(
+            end @ (crate::wait_signal_end::WaitSignalEnd::Fatal(_)
+            | crate::wait_signal_end::WaitSignalEnd::BehindCaught(_)),
+        ) => {
+            tracing::info!(
+                "[dtid {}] under the in-guest delivery gate, {:?} is deliverable at a kernel-run \
+                 call's entry: the call is not run",
+                guest.thread_state().dettid,
+                end
+            );
+            guest.thread_state_mut().wait_signal_end = Some(end);
+            Ok(Some(Errno::ERESTARTNOINTR.into()))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The most instances [`remove_ignored_signals`] dequeues in one call before
+/// it gives up: far more than a thread's queues can hold, which
+/// `RLIMIT_SIGPENDING` bounds for real-time signals and one per queue bounds
+/// for standard ones; reached, the removal fails closed.
+const MAX_IGNORED_REMOVALS: usize = 1 << 16;
+
+/// A5 step 3c.1d, design D37: remove the pending instances of `set` (ignored
+/// signals Linux would not hold, `ignored_signals::removable`) from the
+/// calling thread's queues, in its own turn, by repeated trusted zero-timeout
+/// `rt_sigtimedwait` calls until `EAGAIN`. Each call dequeues one instance,
+/// the thread's private queue first and then the shared one
+/// (`dequeue_signal`, kernel/signal.c:626-639 at v6.12), and with a zero
+/// timeout it never sleeps: no instance left gives `-EAGAIN`
+/// (`do_sigtimedwait`, :3629-3676). SIGKILL and SIGSTOP are never in `set`
+/// (they are never ignored), and the kernel drops them from it anyway
+/// (:3648). Nothing is injected for an empty set. An error other than
+/// `EAGAIN`, more instances than any queue can hold, or no scratch stack for
+/// the call's two cells is Hermit's own failure (`Error::Tool`), never an
+/// errno the guest's call could see.
+pub(crate) async fn remove_ignored_signals<T, G>(guest: &mut G, set: u64) -> Result<(), Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if set == 0 {
+        return Ok(());
+    }
+    let mut stack = guest.stack().await;
+    let set_cell = stack.push(set);
+    let timeout = stack.push(Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    });
+    // A stack with no room for the two cells is Hermit's own failure too, never
+    // an EFAULT of the guest's call (round-3 ruling 4).
+    let _stack_guard = stack.commit().map_err(|errno| {
+        Error::Tool(anyhow::anyhow!(
+            "removing ignored signals {set:#x}: no scratch stack for the trusted \
+             rt_sigtimedwait ({errno})"
+        ))
+    })?;
+    // SAFETY: the kernel only reads the set; Reverie types the argument as
+    // mutable.
+    let set_cell = unsafe { set_cell.cast::<libc::sigset_t>().into_mut() };
+    for _ in 0..MAX_IGNORED_REMOVALS {
+        let taken = guest
+            .inject(
+                syscalls::RtSigtimedwait::new()
+                    .with_set(Some(set_cell))
+                    .with_info(None)
+                    .with_timeout(Some(timeout))
+                    .with_sigsetsize(KERNEL_SIGSET_SIZE),
+            )
+            .await;
+        match taken {
+            Ok(signal) => tracing::info!(
+                "[dtid {}] under the in-guest delivery gate, removed ignored signal {} that Linux \
+                 would not hold (D37)",
+                guest.thread_state().dettid,
+                signal
+            ),
+            Err(Errno::EAGAIN) => return Ok(()),
+            // Hermit's own failure, never the guest's result: the guest's call
+            // (rt_sigaction, rt_sigsuspend, a masked wait) cannot return it.
+            Err(errno) => {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "removing ignored signals {set:#x}: the trusted rt_sigtimedwait failed with \
+                     {errno}"
+                )));
+            }
+        }
+    }
+    Err(Error::Tool(anyhow::anyhow!(
+        "removing ignored signals {set:#x} dequeued {MAX_IGNORED_REMOVALS} instances without \
+         emptying the queues"
+    )))
+}
+
+/// Which of a thread's two queues [`remove_ignored_from_queue`] empties of a
+/// signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OneQueue {
+    /// The thread's private queue (`SigPnd`).
+    Private,
+    /// Its thread group's shared queue (`ShdPnd`).
+    Shared,
+}
+
+/// A5 step 3c.1e A, D37's R2 per queue: remove every pending instance of the
+/// ignored signal `signal` from `queue` only, leaving the other queue's
+/// instances as they are, in the thread's own turn. `rt_sigtimedwait`
+/// dequeues the private queue first (`dequeue_signal`, kernel/signal.c:
+/// 626-639 at v6.12), so:
+///
+/// - `Private`: one trusted zero-timeout `rt_sigtimedwait` per instance, for
+///   as long as the thread's `/proc` status shows `signal` in `SigPnd`.
+/// - `Shared`: the private instances are dequeued first, each with its
+///   siginfo, then the shared ones until `EAGAIN`, then the private ones are
+///   queued again, in their order, with their own siginfo, by
+///   `rt_tgsigqueueinfo` to the thread itself (`do_rt_tgsigqueueinfo` lets a
+///   thread queue any siginfo to itself, kernel/signal.c:4112-4114; the
+///   signal is blocked by the kernel's mask then, the guest's own mask, which
+///   blocks it since Linux kept it, or the in-guest runtime's, so it is
+///   queued and not discarded, `sig_ignored`, :104-120).
+///
+/// Nothing is injected when `signal` is not pending in `queue`. A failed
+/// injection, more instances than any queue holds, or no scratch stack is
+/// Hermit's own failure (`Error::Tool`), never an errno of the guest's call.
+pub(crate) async fn remove_ignored_from_queue<T, G>(
+    guest: &mut G,
+    signal: i32,
+    queue: OneQueue,
+) -> Result<(), Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let bit = crate::syscalls::kernel_sigset_bit(signal);
+    let failed = |what: &str| {
+        Error::Tool(anyhow::anyhow!(
+            "removing ignored signal {signal} from the {queue:?} queue: {what}"
+        ))
+    };
+    let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+    let in_queue = match queue {
+        OneQueue::Private => state.thread_pending,
+        OneQueue::Shared => state.shared_pending,
+    };
+    if in_queue & bit == 0 {
+        return Ok(());
+    }
+    let mut stack = guest.stack().await;
+    let set_cell = stack.push(bit);
+    let timeout = stack.push(Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    });
+    // A siginfo cell, kept as bytes: `siginfo_t` holds raw pointers, so an
+    // address typed by it could not live across an await.
+    let info = stack.reserve::<[u8; 128]>();
+    let _stack_guard = stack
+        .commit()
+        .map_err(|errno| failed(&format!("no scratch stack ({errno})")))?;
+    // SAFETY: the kernel only reads the set; Reverie types it as mutable.
+    let set_cell = unsafe { set_cell.cast::<libc::sigset_t>().into_mut() };
+    let dequeue = move |with_info: bool| {
+        syscalls::RtSigtimedwait::new()
+            .with_set(Some(set_cell))
+            .with_info(with_info.then(|| info.cast()))
+            .with_timeout(Some(timeout))
+            .with_sigsetsize(KERNEL_SIGSET_SIZE)
+    };
+    // The private instances, dequeued one at a time while `SigPnd` shows
+    // them; their siginfo is kept to queue them again for `Shared`.
+    let mut kept: Vec<[u8; 128]> = Vec::new();
+    let mut removals = 0;
+    while read_thread_wait_signal_state(guest.pid(), guest.tid())?.thread_pending & bit != 0 {
+        removals += 1;
+        if removals > MAX_IGNORED_REMOVALS {
+            return Err(failed("too many instances"));
+        }
+        match guest.inject(dequeue(queue == OneQueue::Shared)).await {
+            Ok(_) => {
+                if queue == OneQueue::Shared {
+                    kept.push(guest.memory().read_value(info)?);
+                }
+            }
+            Err(errno) => return Err(failed(&format!("rt_sigtimedwait failed with {errno}"))),
+        }
+    }
+    if queue == OneQueue::Private {
+        tracing::info!(
+            "[dtid {}] under the in-guest delivery gate, removed ignored signal {} from the \
+             private queue, which Linux discarded at send (D37)",
+            guest.thread_state().dettid,
+            signal
+        );
+        return Ok(());
+    }
+    loop {
+        removals += 1;
+        if removals > MAX_IGNORED_REMOVALS {
+            return Err(failed("too many instances"));
+        }
+        match guest.inject(dequeue(false)).await {
+            Ok(_) => {}
+            Err(Errno::EAGAIN) => break,
+            Err(errno) => return Err(failed(&format!("rt_sigtimedwait failed with {errno}"))),
+        }
+    }
+    for siginfo in kept {
+        guest.memory().write_value(info, &siginfo)?;
+        let requeue = syscalls::RtTgsigqueueinfo::new()
+            .with_tgid(guest.pid().as_raw())
+            .with_tid(guest.tid().as_raw())
+            .with_sig(signal)
+            .with_siginfo(Some(info.cast()));
+        if let Err(errno) = guest.inject(requeue).await {
+            return Err(failed(&format!(
+                "queueing a kept private instance again failed with {errno}"
+            )));
+        }
+    }
+    tracing::info!(
+        "[dtid {}] under the in-guest delivery gate, removed ignored signal {} from the shared \
+         queue, which Linux discarded at send, keeping its private instances (D37)",
+        guest.thread_state().dettid,
+        signal
+    );
+    Ok(())
+}
+
+/// What a temporary-mask wait's check finds under the in-guest delivery gate
+/// ([`temporary_mask_check`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TemporaryMaskCheck {
+    /// Nothing ends the wait; the ignored signals Linux would not hold were
+    /// removed (D37 rule (ii)).
+    Waits,
+    /// A default-fatal signal the temporary mask lets in ends it: the D40
+    /// flag `Fatal` is recorded, and the call returns its restart code
+    /// (`-ERESTARTNOHAND`; `-EINTR` for the `epoll` forms), which the restart
+    /// checkpoint turns into `-EINTR` for the death path of step 3c.1e.
+    Fatal,
+    /// A masked `epoll_pwait` or `epoll_pwait2` at its park: an ignored signal
+    /// pending at entry that only the temporary mask lets in, removed, and
+    /// the call returns `EINTR` (D37's exception, IR-3).
+    EpollInterrupted,
+    /// A caught signal would end the wait (or be delivered first): its
+    /// handler would run under the temporary mask, which step 3c.w owns and
+    /// which 3c.1 never reaches (phase 1 refuses every temporary-mask call in
+    /// a process that handles SIGALRM, F8). The stopping refusal
+    /// HERMIT_TEMPORARY_MASK_CAUGHT_END was filed (D49); were the run to go
+    /// on, the call returns `EINTR`.
+    Refused,
+}
+
+/// A5 step 3c.1d (design D37, D39, D50, IR-7): the check of a wait under a
+/// temporary mask `m_temp` (`rt_sigsuspend`, a masked `pselect6`, `ppoll`,
+/// `epoll_pwait` or `epoll_pwait2`), at the point where Linux tests for a
+/// pending signal: the call would wait (nothing ready), in the thread's own
+/// turn, from its `/proc` status (one read).
+///
+/// 1. The design's deliverable set under `m_temp` (`wait_signal_end`): a
+///    default-fatal signal ends the wait (`Fatal`, the D40 flag recorded). A
+///    caught one would run its handler under the temporary mask (step 3c.w,
+///    unreachable in 3c.1): a named stopping refusal (`Refused`).
+/// 2. D37 rule (ii) with IR-7's per-instance masks: the ignored signals `I`
+///    pending now, less `I ∩ M_req ∩ M_next`, are removed, where `M_next` is
+///    `m_temp` and `M_req` is the mask in force when the instance was
+///    queued. `entry` is `Some(!0)` at the wait's first check, which every
+///    form makes in the call's own turn, before any scheduler request, so
+///    every instance pending then was pending at entry and was queued under
+///    the guest's own mask ([`gated_own_mask`]); `None` at any later check,
+///    where every instance kept from entry is in both masks, so `M_req` =
+///    `m_temp` for all of them. (A narrower `entry` set limits the at-entry
+///    rule to those bits.)
+/// 3. `epoll` (a masked `epoll_pwait` or `epoll_pwait2`) at the first check:
+///    an instance pending at entry in `I ∩ M_own ∖ M_temp` makes the call
+///    return `EINTR` (`EpollInterrupted`), as `ep_poll` does
+///    (`ignored_signals::epoll_interrupting`).
+///
+/// With the gate off it is never called.
+pub(crate) async fn temporary_mask_check<T, G>(
+    guest: &mut G,
+    m_temp: KernelSigset,
+    entry: Option<KernelSigset>,
+    epoll: bool,
+) -> Result<TemporaryMaskCheck, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    use crate::wait_signal_end::WaitSignalEnd;
+    let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+    let reserved = guest.config().in_guest_reserved_signals;
+    match crate::wait_signal_end::wait_end(&state, m_temp, reserved) {
+        None => {}
+        Some(end @ WaitSignalEnd::Fatal(_)) => {
+            tracing::info!(
+                "[dtid {}] under the in-guest delivery gate, {:?} ends the wait under its \
+                 temporary mask {:#x}",
+                guest.thread_state().dettid,
+                end,
+                m_temp
+            );
+            guest.thread_state_mut().wait_signal_end = Some(end);
+            return Ok(TemporaryMaskCheck::Fatal);
+        }
+        Some(end) => {
+            let signal = match end {
+                WaitSignalEnd::Caught(signal) => signal,
+                _ => {
+                    (state.pending & !m_temp & state.caught & !reserved).trailing_zeros() as i32 + 1
+                }
+            };
+            let reason = crate::refused_signal_controls::temporary_mask_caught_end_refusal(
+                guest.thread_state().dettid.as_raw(),
+                signal,
+            );
+            tracing::error!("{}", reason);
+            crate::tool_global::stopping_refusal(guest, reason).await;
+            return Ok(TemporaryMaskCheck::Refused);
+        }
+    }
+    let own = gated_own_mask(guest, state.blocked);
+    let now = crate::ignored_signals::pending_ignored(&state, reserved);
+    let (removed, interrupted) = match entry {
+        Some(entry) => {
+            let at_entry = KernelSignalState {
+                pending: state.pending & entry,
+                ..state
+            };
+            let since = KernelSignalState {
+                pending: state.pending & !entry,
+                ..state
+            };
+            let interrupted = epoll
+                && crate::ignored_signals::epoll_interrupting(&at_entry, own, m_temp, reserved)
+                    != 0;
+            (
+                crate::ignored_signals::removable(&at_entry, own, m_temp, reserved)
+                    | crate::ignored_signals::removable(&since, m_temp, m_temp, reserved),
+                interrupted,
+            )
+        }
+        None => (now & !m_temp, false),
+    };
+    remove_ignored_signals(guest, removed).await?;
+    Ok(if interrupted {
+        TemporaryMaskCheck::EpollInterrupted
+    } else {
+        TemporaryMaskCheck::Waits
+    })
+}
+
+/// The `sa_flags` of `signal`'s current action, as the guest set it, read in
+/// this thread's turn with a query `rt_sigaction` (the in-guest runtime
+/// answers it from the guest's action, phase 1's virtual SIGALRM included):
+/// for the restart checkpoint's caught row (A5 design D40).
+pub(crate) async fn caught_action_flags<T, G>(guest: &mut G, signal: i32) -> Result<u64, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    Ok(caught_action(guest, signal).await?.flags)
+}
+
+/// The `sa_mask` and `sa_flags` of `signal`'s current action, as the guest set
+/// it, read in this thread's turn with a query `rt_sigaction` (the in-guest
+/// runtime answers it from the guest's action, phase 1's virtual SIGALRM
+/// included): for the restart checkpoint's resolution of a
+/// `WaitSignalEnd::BehindCaught` (A5 design D40) and its caught row. Called
+/// only where the thread holds no committed scratch stack.
+pub(crate) async fn caught_action<T, G>(
+    guest: &mut G,
+    signal: i32,
+) -> Result<crate::wait_signal_end::CaughtAction, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut stack = guest.stack().await;
+    let action = stack.reserve::<KernelSigaction>();
+    let _stack_guard = stack.commit()?;
+    guest
+        .inject_with_retry(
+            syscalls::RtSigaction::new()
+                .with_signum(signal)
+                .with_action(None)
+                .with_old_action(Some(action.cast()))
+                .with_sigsetsize(KERNEL_SIGSET_SIZE),
+        )
+        .await?;
+    let action: KernelSigaction = guest.memory().read_value(action)?;
+    Ok(crate::wait_signal_end::CaughtAction {
+        mask: action.mask,
+        flags: action.flags,
+    })
 }
 
 /// Whether the scheduler keeps a guest mask that differs from the kernel's
@@ -3233,15 +4009,32 @@ pub(crate) fn tool_decided_injection_failure(
 /// - `tail_inject`, whose result goes straight to the guest.
 ///
 /// A general guard needs a Reverie API hook and is not part of this change.
+///
+/// Any other refusal it takes counts the call as refused in the syscall
+/// histogram (`crate::syscall_histogram`). A signalfd operation the backend
+/// does not model (`UnsupportedOperation::Signalfd`: a read that would wait,
+/// an epoll registration, a process created while one is open) is named in a
+/// warning as well: no handler takes that refusal, and its ENOSYS reaches the
+/// guest as the backend answered.
 pub(crate) fn fail_on_tool_decided_injection<T, G>(guest: &mut G, sysno: Sysno)
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
     let dettid = guest.thread_state().dettid;
-    if let Some(failure) =
-        tool_decided_injection_failure(guest.take_unsupported_refusal(), dettid, sysno)
+    let refusal = guest.take_unsupported_refusal();
+    if refusal.is_some() {
+        crate::syscall_histogram::mark_refused::<T, G>(guest);
+    }
+    if let Some(refusal) =
+        refusal.filter(|refusal| refusal.operation == reverie::UnsupportedOperation::Signalfd)
     {
+        tracing::warn!(
+            "[dtid {dettid}] {sysno} refused by the backend: {}",
+            refusal.diagnostic
+        );
+    }
+    if let Some(failure) = tool_decided_injection_failure(refusal, dettid, sysno) {
         tracing::error!("{failure}");
         panic!("{failure}");
     }
@@ -3262,6 +4055,7 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
+    crate::syscall_histogram::mark_refused::<T, G>(guest);
     if !panic_on_unsupported_syscalls {
         return Err(fallback.into());
     }
@@ -4843,7 +5637,7 @@ where
 {
     let dettid = guest.thread_state().dettid;
     let cfg = &guest.config();
-    if cfg.sequentialize_threads && cfg.should_trace_schedevent() {
+    if cfg.sequentialize_threads && cfg.observes_schedevents() {
         trace_schedevent(
             guest,
             with_guest_time(

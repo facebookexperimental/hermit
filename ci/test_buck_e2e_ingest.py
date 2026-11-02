@@ -71,6 +71,10 @@ def claim(cell):
     return {key: row(cell, None, None)[key] for key in ("test", "mode", "backend")}
 
 
+# What cell.sh adds to result.json once it accepts the harness output.
+VALID = {"version": 1, "status": "valid", "reason": None}
+
+
 def execution(cell, end, outcome, run_id, complete=True, **changes):
     """One execution of CELL that ended at END, as cell.sh uploads it: the row
     the harness wrote (OUTCOME None: it wrote none), summary.json, result.json
@@ -80,7 +84,7 @@ def execution(cell, end, outcome, run_id, complete=True, **changes):
         "end": end,
         "rows": [row(cell, outcome, run_id)] if outcome else None,
         "summary": {"schema": 1, "passed": int(outcome == "PASS")} if outcome else None,
-        "result": {"cell": cell, "run_id": run_id, "evidence_complete": complete},
+        "result": {"cell": cell, "run_id": run_id, "evidence_complete": complete, "producer_completion": VALID},
         "markers": [run_id],
         "uploaded": True,
     }
@@ -163,7 +167,7 @@ def withheld_on(route, cell, end, run_id):
     """An execution of CELL that withheld it (no row, a host-inapplicable claim)
     on ROUTE, as cell.sh records it in result.json."""
     summary = {"schema": 1, "host_inapplicable_cells": [claim(cell)]}
-    result = {"cell": cell, "run_id": run_id, "evidence_complete": True, "route": route}
+    result = {"cell": cell, "run_id": run_id, "evidence_complete": True, "producer_completion": VALID, "route": route}
     return execution(cell, end, None, run_id, summary=summary, result=result)
 
 
@@ -555,7 +559,7 @@ class IngestTest(unittest.TestCase):
                 )
 
     def test_a_result_json_for_another_cell_is_refused(self):
-        result = {"cell": Y, "run_id": "rx1", "evidence_complete": True}
+        result = {"cell": Y, "run_id": "rx1", "evidence_complete": True, "producer_completion": VALID}
         self.refused(
             {"RUN": [execution(X, 100, "PASS", "rx1", result=result), Y_PASSES]},
             f"the execution of {X} that ended at 100 has a result.json for {Y}",
@@ -564,13 +568,13 @@ class IngestTest(unittest.TestCase):
     def test_rows_result_json_and_marker_name_one_run(self):
         cases = [
             ("a row", {"rows": [row(X, "PASS", "rx-other")]}),
-            ("result.json", {"result": {"cell": X, "run_id": "rx-other", "evidence_complete": True}}),
+            ("result.json", {"result": {"cell": X, "run_id": "rx-other", "evidence_complete": True, "producer_completion": VALID}}),
             ("the marker", {"markers": ["rx-other"]}),
             (
                 "no run id at all",
                 {
                     "rows": [row(X, "PASS", None)],
-                    "result": {"cell": X, "run_id": None, "evidence_complete": True},
+                    "result": {"cell": X, "run_id": None, "evidence_complete": True, "producer_completion": VALID},
                     "markers": [],
                 },
             ),
@@ -719,7 +723,7 @@ class IngestTest(unittest.TestCase):
             ("a log without its recorded sha256", with_logs(execution(Y, 150, "FAIL", "ry1"), DIVERGED_LOGS, {run2: "0" * 64}),
              ["ry1/verify-logs/verify-1/run1_log_detlog"], None, "it does not have the sha256 its cell recorded"),
             ("no artifact_sha256 at all", dict(with_logs(execution(Y, 150, "FAIL", "ry1"), DIVERGED_LOGS),
-                                              result={"cell": Y, "run_id": "ry1", "evidence_complete": True}),
+                                              result={"cell": Y, "run_id": "ry1", "evidence_complete": True, "producer_completion": VALID}),
              [], "records no artifact_sha256", None),
             ("no log among the artifacts", execution(Y, 150, "ERROR", "ry1"), [], "hold no run1_log_* or run2_log_* log", None),
         ]

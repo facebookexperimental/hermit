@@ -1603,7 +1603,7 @@ int main(int argc, char **argv) {
 /// diverges in about 1 run in 10. The program-break assertions themselves
 /// pass; `sabre_program_break_of_a_pie_starts_at_linuxs_rule` keeps running.
 #[test]
-#[ignore = "known failure: https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/issue-drafts/2026-10-17-sabre-brk-exec-verify-flake.md (SaBRe delivers both Detcore's SI_USER SIGCHLD and the kernel's CLD_EXITED copy; strict verify diverged in 2 of 20 runs on SaBRe, 0 of 20 on ptrace)"]
+#[ignore = "known failure: a forked child's exit and the parent's wait4 can commit in different orders in the two runs (SaBRe delivers both Detcore's SI_USER SIGCHLD and the kernel's CLD_EXITED copy; strict verify diverged in 2 of 20 runs on SaBRe, 0 of 20 on ptrace)"]
 fn sabre_program_break_is_the_guests_as_natively() {
     const GUEST: &str = include_str!("fixtures/program_break.c");
     let Some(loader) = sabre_loader() else {

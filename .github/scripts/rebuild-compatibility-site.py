@@ -227,8 +227,8 @@ def require_sources(parent, config):
 # https://github.com/rrnewton/hermit/actions/runs/38256949845. The fetch moves
 # about 711 MiB at a GitHub serving rate near 1 MB/s; its bytes shrink by the
 # scorecard history parts (265.9 MiB of the pack at ledger f8361f72) once
-# those leave the ledger's main branch (dev-hermit option (a),
-# https://github.com/rrnewton/dev-hermit/issues/558). The rebuild step's own
+# those leave the ledger's main branch (the planned move of the scorecard
+# history to a branch of its own, replaced on each regeneration). The rebuild step's own
 # 180-minute bound holds the fetch, the 36-42 minute build and the upload.
 LEDGER_FETCH_TIMEOUT = 2700
 LEDGER_DEEPEN_STEP = 50
@@ -264,7 +264,7 @@ def _history_complete(ledger, ledger_commit, depth):
     """Whether the fetch at DEPTH already reached ledger_commit's root commit.
 
     After the ledger's main is squashed to one snapshot commit
-    (https://github.com/rrnewton/dev-hermit/issues/562), a parity summary
+    (done from time to time, to drop history no reader needs), a parity summary
     written before the squash names a commit that is in no history this fetch
     can reach, and deepening further only repeats the fetch.
     """

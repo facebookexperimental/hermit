@@ -1,7 +1,7 @@
 #!/usr/bin/env -S rust-script --force
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "bfd648864b74d14b96cd3af9e36f04186aca7075" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "d0c2867be75b495eb64239e664c6306af9747783" }
 //! detcore-model = { path = "../detcore-model" }
 //! hermit-manifest-plan = { path = "../ci/manifest-plan" }
 //! flate2 = "=1.1.10"
@@ -300,7 +300,7 @@ where
                 .to_owned()
         })?,
         safehermit: safehermit.ok_or_else(|| {
-            "missing --safehermit; provide dev-hermit/bin/safehermit explicitly".to_owned()
+            "missing --safehermit; provide the path to a safehermit wrapper explicitly".to_owned()
         })?,
     }))
 }
@@ -1444,7 +1444,7 @@ fn verify_generated_buck(text: &str) -> Result<(), String> {
     let mapped_files = text
         .lines()
         .filter(|line| {
-            line.trim_start().starts_with('"') && line.contains(": \"vendor/reverie-dbt-0.5.3/")
+            line.trim_start().starts_with('"') && line.contains(": \"vendor/reverie-dbt-0.5.4/")
         })
         .count();
     if mapped_files != reverie_dbt_inventory::REVERIE_DBT_FILES {
@@ -3570,7 +3570,12 @@ fn verify_closed_report_shape(value: &Value) -> Result<(), String> {
                     stats,
                     &format!("runtime.{run}"),
                     &["scheduler_turns", "virtual_nanoseconds"],
-                    &["scheduler_turns", "virtual_nanoseconds", "syscalls", "dispatch"],
+                    &[
+                        "scheduler_turns",
+                        "virtual_nanoseconds",
+                        "syscalls",
+                        "dispatch",
+                    ],
                 )?;
             }
         }
@@ -6325,7 +6330,7 @@ mod tests {
             let mut text = GENERATED_MARKERS.join("\n");
             for index in 0..files {
                 text.push_str(&format!(
-                    "\n    \"f{index}\": \"vendor/reverie-dbt-0.5.3/f{index}\","
+                    "\n    \"f{index}\": \"vendor/reverie-dbt-0.5.4/f{index}\","
                 ));
             }
             text

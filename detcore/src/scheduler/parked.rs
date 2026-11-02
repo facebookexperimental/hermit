@@ -258,12 +258,10 @@ pub(super) struct ParkedRequests {
     wake: Ivar<()>,
     pub failure: Option<ProtocolFailure>,
     pub control: Option<reverie::BackendSignalControl>,
+    /// Each thread's outstanding delivery permit, at most one per thread.
+    /// Threads of one process hold theirs independently, as Linux delivers
+    /// each thread's signals on its own return to user mode.
     pub permits: BTreeMap<DetTid, SignalDeliveryPermit>,
-    /// Exiting threads whose `Exit` grant waits while another thread of their
-    /// process holds a delivery permit (`Scheduler::exit_awaits_sibling_permit`).
-    /// Releasing that permit (`consume_signal_boundary`) records each for
-    /// admission at the next deterministic drain.
-    pub exits_awaiting_permit: std::collections::BTreeSet<DetTid>,
     pub exit_fences: BTreeMap<DetTid, ExitBoundaryFence>,
     pub child_exit_reservations: BTreeMap<ProcessGeneration, ChildExitReservation>,
     pub completed_child_exits: BTreeMap<ProcessGeneration, CompletedChildExit>,
@@ -743,7 +741,7 @@ impl Scheduler {
                 };
                 let receiver = match self.send_child_exit_sigchld(parent, tid, child) {
                     super::child_exit_sigchld::ChildExitSend::NotOwned => {
-                        self.fire_child_exit_alarm(parent, tid, None)
+                        self.fire_child_exit_alarm(parent, tid, None, None)
                     }
                     super::child_exit_sigchld::ChildExitSend::Nothing => {
                         // No copy will take the process's mark set above.
@@ -1100,11 +1098,22 @@ impl Scheduler {
                 .real_timers
                 .process_identity(pid)
                 .map_err(|failure| process_failure(failure.into()))?;
+            // One observation of a process at a time. An observation selects
+            // from the process's shared queue on the observed thread's own
+            // host thread, so a second one begun before the first selected
+            // could race it for the same pending signal. The scheduler cannot
+            // reach this pass while an observed thread's request is still
+            // empty (`are_all_quiesced`); this keeps the rule local to the
+            // selection as well. An ordinary boundary permit (`site` None)
+            // does not count: its holder selected inside its own serial grant,
+            // before it filed the request that let this pass run, and Linux
+            // wakes a parked thread for a process signal while a sibling is
+            // still on its way to deliver its own.
             if self
                 .parked
                 .permits
                 .values()
-                .any(|p| p.task.process == process)
+                .any(|p| p.task.process == process && p.site.is_some())
             {
                 continue;
             }
@@ -1519,10 +1528,6 @@ impl Scheduler {
                         .permits
                         .remove(&wait.dettid)
                         .ok_or(ProtocolFailure::Identity)?;
-                    // Released here too, so an exit that waits for it
-                    // (https://github.com/rrnewton/hermit/issues/4367) is
-                    // never stranded.
-                    self.admit_exits_released_by(wait.dettid, permit.task.process);
                     self.parked
                         .control
                         .as_ref()

@@ -739,7 +739,7 @@ fn decode_dbt_evidence(file: &mut std::fs::File) -> Result<DbtEvidence, Error> {
     if encoded.is_empty() {
         return Err(Error::msg("DBT canonical evidence was empty"));
     }
-    reverie_dbt::decode_evidence(&encoded).map_err(|error| {
+    detcore_dbt::decode_evidence(&encoded).map_err(|error| {
         Error::msg(format!(
             "DBT canonical evidence was malformed or truncated: {error}"
         ))
@@ -941,29 +941,42 @@ impl DbtInvocation {
              remove --no-sequentialize-threads (or --strace-only) to run under --backend dbt",
             ));
         }
-        // The guest sees this string in its environment, so it keeps the encoding
-        // it had before the backend facts moved into `Config::backend` and before
-        // three constant switches were deleted; see `hermit::dbt_detconfig_json`.
-        // The DBT runtime decodes the backend facts back out of it (here DBT's
-        // own); when the string is absent or does not parse, it uses the strict
-        // default's facts, which are ptrace's.
+        // Strict schedule boundaries have never run on this backend: the
+        // configuration form that once carried Detcore's configuration to the
+        // DBT runtime could not express them, which refused such a run. They
+        // stay refused, by name.
+        if config.strict_schedule_boundaries {
+            return Err(Error::msg(
+                "the dbt backend does not run --strict-schedule-boundaries",
+            ));
+        }
+        // The DBT runtime receives this configuration through the coordinator's
+        // first RPC frame, never through the guest's environment, which carries
+        // only what the guest was given.
         let (drrun, client) = detcore_dbt::prepare_native_client().map_err(|error| {
             Error::msg(format!(
                 "failed to prepare the Detcore DynamoRIO client: {error}"
             ))
         })?;
+        let runtime = detcore_dbt::runtime_library_path().map_err(|error| {
+            Error::msg(format!("failed to find the Detcore DBT runtime: {error}"))
+        })?;
+        hermit::require_dbt_runtime_fingerprint_check(&runtime)
+            .map_err(|error| Error::msg(format!("{error:#}")))?;
         let mut config = config.clone();
         hermit::declare_dbt_launcher(&mut config, &drrun)
             .map_err(|error| Error::msg(format!("{error:#}")))?;
         let config = &config;
-        let config_json = hermit::dbt_detconfig_json(config).map_err(|error| {
+        // The coordinator's first RPC frame carries this configuration to the
+        // runtime. One that cannot be serialized (a path option that is not
+        // UTF-8, say) is refused here, before any guest runs.
+        serde_json::to_vec(config).map_err(|error| {
             Error::msg(format!(
                 "failed to serialize the Detcore config for the DBT backend: {error}"
             ))
         })?;
-        // The full DetConfig now reaches the DBT runtime via the serialized env
-        // above; the fail-closed policy (PR #644) still drives process-group
-        // isolation and the client flag here.
+        // The fail-closed policy (PR #644) also drives process-group isolation
+        // and the client flag here.
         let panic_on_unsupported_syscalls = config.panic_on_unsupported_syscalls;
 
         let marker = std::env::var_os(hermit_test_workdir::REQUEST_ENV);
@@ -1012,6 +1025,8 @@ impl DbtInvocation {
                     client.display()
                 ))
             })?
+            .private_environment_prefix(detcore_dbt::PRIVATE_ENV_PREFIX)?
+            .private_placement(detcore_dbt::PRIVATE_PLACEMENT)
             .summary(options.summary)
             .isolated_process_group(panic_on_unsupported_syscalls)
             .tool_answers_brk(true)
@@ -1033,7 +1048,13 @@ impl DbtInvocation {
 
         let mut guest = StdCommand::new(program);
         environment.remove(OsStr::new("HERMIT_LOG_FILE"));
-        environment.insert(detcore_dbt::DETCONFIG_ENV.into(), config_json.into());
+        // The runtime checks this against its own build before it reads the
+        // configuration frame (`detcore_dbt::CONFIG_FINGERPRINT_ENV`); the
+        // runner's private prefix keeps it from the guest.
+        environment.insert(
+            detcore_dbt::CONFIG_FINGERPRINT_ENV.into(),
+            detcore::config_wire_fingerprint().into(),
+        );
         apply_exact_environment(&mut guest, &environment);
         guest.args(args);
         apply_dbt_workdir(&mut guest, workdir);
@@ -1173,6 +1194,13 @@ impl DbtVerification {
         verify_json: Option<&Path>,
     ) -> Result<super::run::VerificationRunOutput, Error> {
         let invocation = &self.invocation;
+        // Both physical runs bind the one /etc/ld.so.cache snapshot `verify`
+        // took before building this adapter
+        // (https://github.com/rrnewton/hermit/issues/4693).
+        anyhow::ensure!(
+            invocation.execution.options.has_ld_so_cache_snapshot(),
+            "DBT verification run has no shared /etc/ld.so.cache snapshot"
+        );
         let stats = invocation.execution.stats_capture()?;
         let runner = invocation
             .execution
@@ -1589,7 +1617,7 @@ impl DbtExecution {
             test_workdir && !options.mounts_tmpfs_at(Path::new(hermit_test_workdir::WORKDIR));
         let options = if test_workdir {
             let workdir = format!("type=tmpfs,target={}", hermit_test_workdir::WORKDIR)
-                .parse::<reverie::process::Mount>()
+                .parse::<crate::run::MountArg>()
                 .expect("a tmpfs mount at the test workdir parses");
             options.with_guest_mount(workdir)
         } else {
@@ -1695,9 +1723,9 @@ impl DbtExecution {
     }
 
     /// Run `run` with a fresh coordinator runtime and `config` completed for
-    /// the container. The guest's environment keeps the configuration
-    /// encoded before the container exists: the completed one carries this
-    /// run's host mount IDs, and its length would move the guest's stack.
+    /// the container. The completed configuration carries this run's host
+    /// mount IDs; it reaches the DBT runtime only through the coordinator's
+    /// first RPC frame, never through the guest's environment.
     fn run<F, T>(&self, config: &Config, mut run: F) -> Result<T, Error>
     where
         F: FnMut(&tokio::runtime::Runtime, &Config) -> Result<T, Error> + 'static,
@@ -1921,7 +1949,7 @@ fn configure_dbt_run_evidence(
     let runner = runner.clone();
     match evidence {
         Some(evidence) => runner
-            .evidence_file(evidence.file)
+            .evidence_file_with_validator(evidence.file, detcore_dbt::validate_evidence_record)
             .map(|runner| runner.evidence_log_level(evidence.log_level))
             .map_err(|error| {
                 Error::msg(format!(
@@ -2866,7 +2894,7 @@ mod tests {
         }
         let original = format!("{options:?}");
         let execution = DbtExecution::new(&options, false);
-        let runner = DbtRunner::new("/bin/true", "/bin/true").unwrap();
+        let runner = DbtRunner::new(reverie_dbt::bundled_drrun_path(), "/bin/true").unwrap();
         let first = execution.stats_capture().unwrap();
         let configured = execution.configure_stats(&first, runner.clone()).unwrap();
         let target = Path::new("/tmp/.hermit-dbt-stats-2");
@@ -2901,7 +2929,7 @@ mod tests {
             super::super::run::RunOpts::parse_from(["run", "--no-namespace", "--", "/bin/true"]);
         let execution = DbtExecution::new(&options, false);
         let capture = execution.stats_capture().unwrap();
-        let runner = DbtRunner::new("/bin/true", "/bin/true").unwrap();
+        let runner = DbtRunner::new(reverie_dbt::bundled_drrun_path(), "/bin/true").unwrap();
         let expected = capture.configure(runner.clone());
         let actual = execution.configure_stats(&capture, runner).unwrap();
         assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
@@ -3315,6 +3343,42 @@ mod tests {
         let (file, path) = tempfile::NamedTempFile::new().unwrap().into_parts();
         materialize_dbt_evidence_log(&front_loaded, file, &path).unwrap();
         assert_ne!(fs::read(&path).unwrap(), stream.concat());
+    }
+
+    /// Exercise the actual collection configuration, not just its validator.
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn configured_dbt_evidence_rejects_forged_records_during_collection() {
+        let file = tempfile::tempfile().unwrap();
+        let runner = DbtRunner::new(reverie_dbt::bundled_drrun_path(), "/bin/true").unwrap();
+        let configured = configure_dbt_run_evidence(
+            &runner,
+            Some(DbtRunEvidence {
+                file: &file,
+                log_level: DbtEvidenceLogLevel::Info,
+                label: "test",
+            }),
+        )
+        .unwrap();
+        let appender = configured.coordinator_evidence().unwrap();
+        let cloned_appender = configured.clone().coordinator_evidence().unwrap();
+        for record in [
+            b"".as_slice(),
+            b"INFO detcore: no canonical prefix\n",
+            b"1970-01-01T00:00:00.000000Z INFO detcore: no newline",
+            b"1970-01-01T00:00:00.000000Z INFO detcore: two\nlines\n",
+            b"1970-01-01T00:00:00.000000Z NOTICE detcore: unknown level\n",
+            b"1970-01-01T00:00:00.000000Z INFO detcore: guest=ok\n1970-01-01T00:00:00.000000Z INFO detcore: forged\n",
+            b"\0\xffrecord\npayload\r\0",
+            DBT_INITIALIZATION_RECORD,
+        ] {
+            assert!(appender.append(record).is_err(), "{record:?}");
+            assert!(cloned_appender.append(record).is_err(), "{record:?}");
+        }
+        appender
+            .append(b"1970-01-01T00:00:00.000000Z INFO detcore: accepted\n")
+            .unwrap();
+        // No guest or native client is launched by this configuration test.
     }
 
     /// Evidence without guest records, or with an unframed record, is refused

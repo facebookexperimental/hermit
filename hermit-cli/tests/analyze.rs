@@ -194,6 +194,27 @@ fn run_analyze(label: &str, guest: &Path, analyze_opts: &[&str], expected_output
             "{label}: expected {expected_output:?} in hermit analyze output\n{combined}"
         );
     }
+
+    // Analyze writes the branch-counter warning to stderr at most once, before
+    // its first trial, and the report repeats exactly that line, without its
+    // newline; it carries none where analyze wrote none.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("WARNING: this host's retired-branch counter"))
+        .collect();
+    assert!(warnings.len() <= 1, "{label}: {warnings:?}\n{combined}");
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&report_file).expect("hermit analyze should write its report file"),
+    )
+    .expect("the analyze report is JSON");
+    assert_eq!(
+        report
+            .get("branch_counter_warning")
+            .map(|value| value.as_str().expect("branch_counter_warning is a string")),
+        warnings.first().copied(),
+        "{label}: {report}\n{combined}"
+    );
 }
 
 /// Exercises analyze's fail-closed endpoint check for a workload whose target

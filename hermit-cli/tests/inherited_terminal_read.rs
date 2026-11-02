@@ -7,8 +7,6 @@
 //! Native Linux controls and real Detcore DBT progress regressions for a root
 //! inherited terminal. These one-run tests do not establish canonical parity.
 
-#![cfg(feature = "dbt")]
-
 use std::fs;
 use std::io::Read;
 use std::io::Write;
@@ -329,11 +327,19 @@ fn native_terminal_alias_survives_failed_and_successful_exec() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "dbt"),
+    ignore = "needs the dbt Cargo feature (DBT backend)"
+)]
 fn dbt_inherited_terminal_short_read_allows_parent_progress() {
     run(Backend::Dbt, false);
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "dbt"),
+    ignore = "needs the dbt Cargo feature (DBT backend)"
+)]
 fn dbt_terminal_alias_survives_failed_and_successful_exec() {
     run(Backend::Dbt, true);
 }
@@ -349,6 +355,10 @@ fn native_terminal_read_observes_peer_cleared_nonblocking_after_exec() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "dbt"),
+    ignore = "needs the dbt Cargo feature (DBT backend)"
+)]
 fn dbt_terminal_read_observes_peer_cleared_nonblocking_after_exec() {
     run_guest(
         Backend::Dbt,

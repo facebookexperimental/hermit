@@ -2033,6 +2033,14 @@ pub fn self_test() -> Result<String, String> {
             serde_json::json!({"profile": "envelope-only"}),
         ),
         (
+            "a selective-profile pass",
+            serde_json::json!({"profile": "selective"}),
+        ),
+        (
+            "a selective-selection pass",
+            serde_json::json!({"selection_mode": "selective"}),
+        ),
+        (
             "an --only pass",
             serde_json::json!({"selection_mode": "only"}),
         ),

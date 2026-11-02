@@ -74,15 +74,17 @@ fn assert_no_single_step_dumps(log: &str, path: &Path) {
 
 /// The host CPU that Hermit runs started here must never be pinned to.
 ///
-/// Hermit pins the tracer and every guest thread of a run to one core, chosen
-/// uniformly from the mask it inherits (`choose_affinity_core` in
-/// `hermit-cli/src/bin/hermit/container.rs`). On the development hosts, ptrace
-/// stops on CPU 0 cost about ten times as much CPU as elsewhere:
+/// Hermit pins the tracer and every guest thread of a run to one core of the
+/// mask it inherits: one that was idle over a short sample, passing over the
+/// cores a PMU is bound to while another idle core remains (`pinned_cpu.rs` in
+/// `hermit-cli/src/bin/hermit/`). On the development hosts, ptrace stops on
+/// CPU 0 cost about ten times as much CPU as elsewhere:
 /// https://github.com/rrnewton/hermit/issues/3265 measured 1.6 s per execution
-/// on CPU 5 and 17.1 s on CPU 0. CPU 0 was in the mask, so each Hermit run had
-/// about a 1 in 316 chance of landing there. A single-step-heavy case that
-/// landed there exceeded its 22 CPU-second budget. Validation launches already
-/// leave CPU 0 out of their cpuset when they can, but a standalone
+/// on CPU 5 and 17.1 s on CPU 0. A single-step-heavy case that landed there
+/// exceeded its 22 CPU-second budget. Hermit still lands a run on CPU 0 when
+/// the sample finds no other idle core, or when sysfs names no PMU-bound
+/// core, so this keeps CPU 0 out of the mask outright. Validation launches
+/// already leave CPU 0 out of their cpuset when they can, but a standalone
 /// `cargo nextest` run and other runners do not.
 const AVOIDED_HOST_CPU: usize = 0;
 

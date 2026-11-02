@@ -3,7 +3,8 @@
   "asymmetric_manifest_tests": [
     "applications/kvm-python-examples",
     "applications/kvm-shell-environment",
-    "c-programs/child-subreaper-refusal"
+    "c-programs/child-subreaper-refusal",
+    "determinism-stress/thread-interleaving"
   ],
   "backend_private_guest_files": [
     "tests/c/kvm_exact_child_waits.c",

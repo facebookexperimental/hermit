@@ -127,18 +127,23 @@ fn run_with_containment(
     hermit::declare_dbt_launcher(&mut config, &drrun).expect("declare actual DBT launcher");
     hermit::record_dbt_launched_image(&mut config, Path::new(program), Some(Path::new("/")), None);
     config.validate();
-    let environment = BTreeMap::<OsString, OsString>::from([
+    let mut environment = BTreeMap::<OsString, OsString>::from([
         ("PATH".into(), "/usr/bin:/bin".into()),
         ("LANG".into(), "C".into()),
         ("LC_ALL".into(), "C".into()),
         ("HERMIT_LOG".into(), "error".into()),
+        // As every Hermit DBT launch announces it: the runtime refuses a
+        // coordinator that does not.
         (
-            detcore_dbt::DETCONFIG_ENV.into(),
-            hermit::dbt_detconfig_json(&config)
-                .expect("encode the declared DBT config")
-                .into(),
+            detcore_dbt::CONFIG_FINGERPRINT_ENV.into(),
+            detcore::config_wire_fingerprint().into(),
         ),
     ]);
+    if std::env::var_os("HERMIT_TEST_DBT_PLACEMENT_MAPPING_CHILD").is_some() {
+        let observer = std::env::var_os(super::dbt_placement_probe::OBSERVER_ENV)
+            .expect("isolated placement observer path");
+        environment.insert("LD_PRELOAD".into(), observer);
+    }
     // Pending-completion errors can be returned after captured guest output
     // was collected. Keep native records in the runner's separate real channel.
     static NEXT_RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -162,6 +167,9 @@ fn run_with_containment(
     eprintln!("mapping capture native diagnostics: {}", path.display());
     let mut runner = DbtRunner::new(&drrun, &client)
         .expect("normal DBT runner")
+        .private_environment_prefix(detcore_dbt::PRIVATE_ENV_PREFIX)
+        .expect("valid Hermit environment prefix")
+        .private_placement(detcore_dbt::PRIVATE_PLACEMENT)
         .isolated_process_group(isolated)
         .terminate_process_group_on_exit(terminate)
         .tool_answers_brk(true)
@@ -553,6 +561,27 @@ fn dbt_mapping_capture_extra_helper_exit_does_not_restore_eligibility() {
 
 #[test]
 fn dbt_mapping_capture_preserves_legitimate_nonzero_guest_exits() {
+    const CHILD: &str = "HERMIT_TEST_DBT_PLACEMENT_MAPPING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let probe = super::dbt_placement_probe::Probe::new(false);
+        let (install, bind) = probe.launch();
+        assert!(bind.is_none());
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "mapping_capture_live::dbt_mapping_capture_preserves_legitimate_nonzero_guest_exits",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env(super::dbt_placement_probe::OBSERVER_ENV, probe.observer())
+            .env("HERMIT_INSTALL_DIR", install)
+            .output()
+            .expect("run isolated mapping placement controls");
+        assert!(output.status.success(), "{output:?}");
+        probe.assert_zero(6, false);
+        return;
+    }
     for (isolated, terminate) in [(true, false), (false, false), (false, true)] {
         for status in [101, 125] {
             let script = format!("exit {status}");

@@ -206,7 +206,7 @@ struct CapturedValue {
 
 /// Extensions large enough to keep as compact text when decoded from history.
 /// On the 2026-10-10 ledger `raw_result_input_census_v1` held 134 MB of JSON as
-/// 1.58 GB of `Value` (<https://github.com/rrnewton/dev-hermit/issues/552>).
+/// 1.58 GB of `Value`, held for every row validate-status reads.
 const RETAINED_EXTENSIONS: &[&str] = &["raw_result_input_census_v1"];
 
 /// The historical extension map plus private original-input metadata. The

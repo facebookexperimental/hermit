@@ -42,14 +42,12 @@ run_strict() {
 }
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# The checkout may be git-backed (CI) or a Sapling/Eden checkout (local
-# fbsource). Try git first so git checkouts behave exactly as before.
-if ! repo_root=$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null); then
-  if ! repo_root=$(sl --cwd "$script_dir" root 2>/dev/null); then
-    fail "could not determine repository root from $script_dir (not a git or Sapling checkout)"
-  fi
-fi
-hermit_bin=${HERMIT_BIN:-$repo_root/target/release/hermit}
+# Staged sources need not include Git metadata or a Cargo toolchain.
+repo_root=${COMPRESSION_REPO_ROOT:-$script_dir/../../../..}
+repo_root=$(cd "$repo_root" && pwd) || fail "invalid compression repository root"
+[[ $repo_root/hermit-cli/tests/fixtures/compression/run.sh -ef ${BASH_SOURCE[0]} ]] ||
+  fail "COMPRESSION_REPO_ROOT does not contain this compression runner: $repo_root"
+hermit_bin=${HERMIT_BIN-$repo_root/target/release/hermit}
 artifact_root=${COMPRESSION_ARTIFACT_ROOT:-$repo_root/target/compression}
 runs=${COMPRESSION_RUNS:-3}
 input_lines=${COMPRESSION_INPUT_LINES:-24000}
@@ -58,15 +56,51 @@ require_positive_integer COMPRESSION_RUNS "$runs"
 require_positive_integer COMPRESSION_INPUT_LINES "$input_lines"
 ((runs == 3)) || fail "COMPRESSION_RUNS must be 3 for the determinism check"
 
-for tool in awk basename bzip2 bzip2recover cargo cat cmp cp date git gzip mkdir seq sha256sum uname wc; do
+for tool in awk basename bzip2 bzip2recover cat cmp cp date gzip mkdir seq sha256sum uname wc; do
   command -v "$tool" >/dev/null || fail "required command not found: $tool"
 done
+
+# Prefer Git, then Sapling/Eden; other staged sources supply their own revision.
+if [[ ${COMPRESSION_SOURCE_REVISION+x} ]]; then
+  [[ -n $COMPRESSION_SOURCE_REVISION ]] || fail "COMPRESSION_SOURCE_REVISION must not be empty"
+  repository_commit=$COMPRESSION_SOURCE_REVISION
+  repository_commit_source=explicit
+elif git_root=$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null); then
+  [[ $git_root -ef $repo_root ]] ||
+    fail "source root is not a Git checkout; set COMPRESSION_SOURCE_REVISION for staged sources"
+  repository_commit=$(git -C "$repo_root" rev-parse HEAD) ||
+    fail "cannot determine source revision; set COMPRESSION_SOURCE_REVISION for staged sources"
+  repository_commit_source=git
+elif sapling_root=$(sl --cwd "$repo_root" root 2>/dev/null); then
+  # Native Hermit is nested inside fbsource; reject unrelated enclosing checkouts.
+  if [[ $sapling_root -ef $repo_root ||
+        $sapling_root/fbcode/hermetic_infra/hermit -ef $repo_root ]]; then
+    repository_commit_source=sapling
+  else
+    sapling_root=$(cd "$sapling_root" && pwd -P) || fail "invalid Sapling checkout root"
+    physical_repo_root=$(cd "$repo_root" && pwd -P) || fail "invalid compression repository root"
+    [[ $physical_repo_root == "$sapling_root"/buck-out/* ]] ||
+      fail "source root is not this Sapling checkout or its Buck output; set COMPRESSION_SOURCE_REVISION for staged sources"
+    cmp -s -- "${BASH_SOURCE[0]}" \
+      "$sapling_root/fbcode/hermetic_infra/hermit/hermit-cli/tests/fixtures/compression/run.sh" ||
+      fail "staged compression runner does not match this Sapling checkout; set COMPRESSION_SOURCE_REVISION for staged sources"
+    # Runner identity and the checkout revision do not certify the staged tree or binary.
+    repository_commit_source=sapling-staged
+  fi
+  repository_commit=$(sl --cwd "$sapling_root" log -r . -T '{node}' 2>/dev/null) ||
+    fail "cannot determine source revision; set COMPRESSION_SOURCE_REVISION for staged sources"
+else
+  fail "cannot determine source revision; set COMPRESSION_SOURCE_REVISION for staged sources"
+fi
+[[ -n $repository_commit ]] || fail "source revision must not be empty"
 
 bzip2_bin=$(command -v bzip2)
 bzip2recover_bin=$(command -v bzip2recover)
 gzip_bin=$(command -v gzip)
 
 if [[ ! -x $hermit_bin ]]; then
+  [[ ! ${HERMIT_BIN+x} ]] || fail "Hermit binary is not executable: $hermit_bin"
+  command -v cargo >/dev/null || fail "required command not found: cargo"
   cargo build --manifest-path "$repo_root/Cargo.toml" --release -p hermit-run --bin hermit
 fi
 [[ -x $hermit_bin ]] || fail "Hermit binary is not executable: $hermit_bin"
@@ -92,7 +126,8 @@ metadata=$evidence_dir/metadata.txt
 {
   printf 'schema_version=1\n'
   printf 'started_at_utc=%s\n' "$timestamp"
-  printf 'repository_commit=%s\n' "$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || sl --cwd "$repo_root" log -r . -T '{node}' 2>/dev/null || printf 'unknown')"
+  printf 'repository_commit=%s\n' "$repository_commit"
+  printf 'repository_commit_source=%s\n' "$repository_commit_source"
   printf 'host_kernel=%s\n' "$(uname -srmo)"
   printf 'runs=%s\n' "$runs"
   printf 'input_lines=%s\n' "$input_lines"

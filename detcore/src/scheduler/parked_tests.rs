@@ -622,8 +622,8 @@ fn return_permit_requires_real_grant_and_receipt_is_exactly_once() {
 /// Every input a later scheduling decision reads from the signal protocol,
 /// with permit and continuation numbering left out: the run queue, each
 /// thread's turn owner and transports, which threads own a parked request,
-/// the permits by holder and task, exits waiting for a permit, exit fences,
-/// pending admissions, timed waits, and failure.
+/// the permits by holder and task, exit fences, pending admissions, timed
+/// waits, and failure.
 fn scheduling_inputs(s: &Scheduler) -> String {
     let owners: Vec<_> = s
         .next_turns
@@ -657,7 +657,6 @@ fn scheduling_inputs(s: &Scheduler) -> String {
             owners,
             requests,
             permits,
-            &s.parked.exits_awaiting_permit,
             s.parked.exit_fences.keys().collect::<Vec<_>>(),
             &s.pending_run_queue_admissions,
             s.parked.failure,
@@ -672,7 +671,7 @@ fn scheduling_inputs(s: &Scheduler) -> String {
 /// receipt. Run in one of two identical schedulers and skipped in the other,
 /// it publishes nothing and leaves every scheduling input the same. Only the
 /// permit counter and the stored receipt differ, and the next alarm selection
-/// and a sibling's exit admission decide the same way in both.
+/// and a sibling's exit reservation decide the same way in both.
 #[test]
 fn an_empty_boundary_round_trip_changes_only_the_nonce_and_the_receipt() {
     let world = || {
@@ -723,7 +722,6 @@ fn an_empty_boundary_round_trip_changes_only_the_nonce_and_the_receipt() {
     assert!(asked_backend.permits.lock().unwrap().is_empty());
     assert!(skipped_backend.permits.lock().unwrap().is_empty());
     for s in [&asked, &skipped] {
-        assert!(!s.exit_awaits_sibling_permit(exiting, DetPid::from_raw(100)));
         assert!(s.holds_serial_grant(holder));
     }
 
@@ -739,9 +737,134 @@ fn an_empty_boundary_round_trip_changes_only_the_nonce_and_the_receipt() {
     assert_eq!(a.continuation.dettid, k.continuation.dettid);
     assert_eq!(a.permit.sequence, k.permit.sequence + 1);
     assert_eq!(scheduling_inputs(&asked), scheduling_inputs(&skipped));
-    for s in [&asked, &skipped] {
-        assert!(s.exit_awaits_sibling_permit(exiting, DetPid::from_raw(100)));
+    // A sibling's exit is reserved the same way in both, beside the observed
+    // wait's permit.
+    let process = DetPid::from_raw(100);
+    let mm = MmId::initial(process);
+    assert_eq!(
+        asked.reserve_exit_boundary(exiting, process, mm, false),
+        Ok(super::signal_control::ExitReserveMode::Controlled)
+    );
+    assert_eq!(
+        skipped.reserve_exit_boundary(exiting, process, mm, false),
+        Ok(super::signal_control::ExitReserveMode::Controlled)
+    );
+    assert_eq!(scheduling_inputs(&asked), scheduling_inputs(&skipped));
+}
+
+/// The skipped round trip of an empty boundary while siblings hold permits
+/// of their own: one waits for its `InboundSignal` turn after its boundary,
+/// and one is an observed parked wait returning into a caught handler. With
+/// permits per thread the round trip is authorized beside them, and run in
+/// one of two identical schedulers and skipped in the other, it leaves every
+/// scheduling input the same. The siblings' receipts, the observed thread's
+/// return boundary and another sibling's exit reservation then decide the
+/// same way in both.
+#[test]
+fn an_empty_boundary_round_trip_beside_sibling_permits_changes_only_the_nonce_and_the_receipt() {
+    let world = || {
+        let (mut s, b) = fixture();
+        let (holder, _, _) = add(&mut s, 100, 100);
+        let (sibling, _, _) = add(&mut s, 100, 101);
+        let (sleeper, mm, site) = add(&mut s, 100, 102);
+        let (exiting, _, _) = add(&mut s, 100, 103);
+        add(&mut s, 200, 200);
+        // The sibling's boundary, waiting for its InboundSignal turn.
+        s.parked.running = Some(sibling);
+        let sibling_permit = s
+            .authorize_signal_boundary(task(100, 101))
+            .unwrap()
+            .unwrap();
+        s.next_turns[&sibling]
+            .req
+            .put(Ok(inbound_request(sibling, libc::SIGUSR1)));
+        s.run_queue.push_back(sibling, DEFAULT_PRIORITY);
+        // The sleeper's observed wait, interrupted for a caught alarm.
+        let response = sleep(&mut s, sleeper, mm, site, 100);
+        b.recipients.lock().unwrap().push(SignalRecipient {
+            task: task(100, 102),
+        });
+        s.committed_time = at(10);
+        s.select_parked_alarm().unwrap();
+        let observed = selected(&response);
+        let ack = Ivar::new();
+        s.post_control(
+            sleeper,
+            mm,
+            ControlIntent::Finish {
+                wait: observed.continuation,
+                lease: observed.lease,
+                site,
+                finish: ObservationFinish::InterruptForCaught {
+                    selection: reverie::PreparedSignalToken {
+                        site,
+                        selection_nonce: 1,
+                    },
+                },
+                ack: ack.clone(),
+            },
+        )
+        .unwrap();
+        s.drain_control_intents();
+        assert_eq!(ack.try_read(), Some(Ok(FinishAck::Interrupted)));
+        // The holder was granted its turn and has not filed its next request.
+        s.runqueue_push_back(holder);
+        s.parked.running = Some(holder);
+        assert!(s.holds_serial_grant(holder));
+        (s, b, holder, sibling_permit, observed.permit, exiting, mm)
+    };
+    let (mut asked, asked_backend, holder, sibling_permit, observed_permit, exiting, mm) = world();
+    let (mut skipped, skipped_backend, ..) = world();
+    assert_eq!(scheduling_inputs(&asked), scheduling_inputs(&skipped));
+
+    let nonce = asked.parked.nonce;
+    let permit = asked
+        .authorize_signal_boundary(task(100, 100))
+        .unwrap()
+        .expect("the holder is authorized beside its siblings' permits");
+    let receipt = SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::NoHandler,
+    };
+    asked.consume_signal_boundary(receipt).unwrap();
+    asked_backend.release_delivery(permit).unwrap();
+    assert_eq!(asked.parked.nonce, nonce + 1);
+    assert_eq!(skipped.parked.nonce, nonce);
+    assert_eq!(asked.parked.completed.get(&holder), Some(&receipt));
+    assert_eq!(scheduling_inputs(&asked), scheduling_inputs(&skipped));
+    assert_eq!(
+        asked_backend.permits.lock().unwrap().as_slice(),
+        skipped_backend.permits.lock().unwrap().as_slice()
+    );
+    assert_eq!(
+        asked_backend.permits.lock().unwrap().as_slice(),
+        &[sibling_permit, observed_permit]
+    );
+
+    let process = DetPid::from_raw(100);
+    for s in [&mut asked, &mut skipped] {
+        assert!(s.holds_serial_grant(holder));
+        s.consume_signal_boundary(SignalBoundaryReceipt {
+            permit: sibling_permit,
+            outcome: SignalBoundaryOutcome::Caught,
+        })
+        .unwrap();
+        assert_eq!(
+            s.authorize_signal_boundary(task(100, 102)).unwrap(),
+            Some(observed_permit)
+        );
+        s.consume_signal_boundary(SignalBoundaryReceipt {
+            permit: observed_permit,
+            outcome: SignalBoundaryOutcome::Caught,
+        })
+        .unwrap();
+        assert_eq!(
+            s.reserve_exit_boundary(exiting, process, mm, false),
+            Ok(super::signal_control::ExitReserveMode::Controlled)
+        );
+        assert!(!s.backend_failed());
     }
+    assert_eq!(scheduling_inputs(&asked), scheduling_inputs(&skipped));
 }
 
 /// Why the receipt's cleanup (`parked.requests` and the turn owner) has
@@ -1199,166 +1322,553 @@ fn a_replaced_request_retires_only_plain_waiting_ownership() {
     }
 }
 
-/// A sibling's exit waits while a thread of its process holds a delivery
-/// permit, rather than failing the protocol (`reserve_exit_boundary` refuses a
-/// second boundary of the process), and the permit's release records the
-/// waiting exit for admission at the next drain, once no permit of the
-/// process remains (https://github.com/rrnewton/hermit/issues/4367). The
-/// permit holder's own exit, and a thread of another process, do not wait.
+/// An `InboundSignal` request for `signal`, as Detcore's delivery files it
+/// once its thread holds a delivery permit.
+fn inbound_request(tid: DetTid, signal: libc::c_int) -> Resources {
+    let mut request = Resources::new(tid);
+    request.insert(
+        ResourceID::InboundSignal(crate::types::SigWrapper(signal)),
+        Permission::RW,
+    );
+    request
+}
+
+/// Delivery permits belong to threads, not processes
+/// (https://github.com/rrnewton/hermit/issues/4899). While one thread holds a
+/// permit and waits for its `InboundSignal` turn, the scheduler grants a
+/// sibling, and that sibling's boundary is authorized too; the backend
+/// registers both permits, and each receipt releases only its own thread's
+/// permit, in either order. A permit of another process changes nothing.
 #[test]
-fn an_exit_waits_for_a_sibling_permit_and_is_admitted_at_its_release() {
-    let (mut s, _b) = fixture();
-    let (tid, _, _) = add(&mut s, 100, 100);
-    let (peer, peer_mm, _) = add(&mut s, 100, 101);
-    let (stranger, _, _) = add(&mut s, 200, 200);
-    s.parked.running = Some(tid);
-    assert!(!s.exit_awaits_sibling_permit(peer, DetPid::from_raw(100)));
-    let permit = s
-        .authorize_signal_boundary(task(100, 100))
-        .unwrap()
+fn two_threads_of_one_process_hold_delivery_permits_at_once() {
+    for first_released in [100, 101] {
+        let (mut s, b) = fixture();
+        let (a, _, _) = add(&mut s, 100, 100);
+        let (c, _, _) = add(&mut s, 100, 101);
+        let (stranger, _, _) = add(&mut s, 200, 200);
+        s.parked.running = Some(a);
+        let pa = s
+            .authorize_signal_boundary(task(100, 100))
+            .unwrap()
+            .expect("the thread holding the serial grant is authorized");
+        // a files its InboundSignal request and waits; c is granted next.
+        s.next_turns[&a]
+            .req
+            .put(Ok(inbound_request(a, libc::SIGUSR2)));
+        s.parked.running = Some(c);
+        let pc = s
+            .authorize_signal_boundary(task(100, 101))
+            .unwrap()
+            .expect("a sibling's permit is no reason to decline");
+        s.parked.running = Some(stranger);
+        let ps = s
+            .authorize_signal_boundary(task(200, 200))
+            .unwrap()
+            .expect("another process");
+        assert!(pa.sequence < pc.sequence && pc.sequence < ps.sequence);
+        assert_eq!(
+            s.parked.permits.values().copied().collect::<Vec<_>>(),
+            vec![pa, pc, ps]
+        );
+        assert_eq!(b.permits.lock().unwrap().as_slice(), &[pa, pc, ps]);
+        let (first, second) = if first_released == 100 {
+            (pa, pc)
+        } else {
+            (pc, pa)
+        };
+        s.consume_signal_boundary(SignalBoundaryReceipt {
+            permit: first,
+            outcome: SignalBoundaryOutcome::Caught,
+        })
         .unwrap();
-    assert!(s.exit_awaits_sibling_permit(peer, DetPid::from_raw(100)));
-    assert!(
-        !s.exit_awaits_sibling_permit(tid, DetPid::from_raw(100)),
-        "the holder's own exit"
-    );
-    assert!(
-        !s.exit_awaits_sibling_permit(stranger, DetPid::from_raw(200)),
-        "another process"
-    );
+        // Ordered by thread: whichever of a and c remains comes before ps.
+        assert_eq!(
+            s.parked.permits.values().copied().collect::<Vec<_>>(),
+            vec![second, ps]
+        );
+        s.consume_signal_boundary(SignalBoundaryReceipt {
+            permit: second,
+            outcome: SignalBoundaryOutcome::Caught,
+        })
+        .unwrap();
+        assert_eq!(
+            s.parked.permits.values().copied().collect::<Vec<_>>(),
+            vec![ps]
+        );
+        assert!(!s.backend_failed());
+        assert_eq!(s.parked.failure, None);
+    }
+}
 
-    // The sibling's exit, through the complete `Exit` resource arm: it waits,
-    // out of the run queue, with no exit boundary reserved and nothing failed.
-    s.runqueue_push_back(peer);
-    assert_eq!(s.run_queue.tentative_pop_next(), Some(peer));
-    let exit = ResourceID::Exit {
-        group: false,
-        process: DetPid::from_raw(100),
-        mm: peer_mm,
-    };
-    assert!(
-        s.block_for_one_resource(peer, &exit, &Permission::RW, None, None, &Ivar::new())
-            .is_err(),
-        "the waiting exit skips its turn"
-    );
-    assert!(!s.backend_failed());
-    assert!(s.parked.exits_awaiting_permit.contains(&peer));
-    assert!(!s.parked.exit_fences.contains_key(&peer));
-    assert!(!s.run_queue.contains_tid(peer));
-    assert!(!s.run_queue.tentative_pop_in_progress());
+/// A parked wait observed for a process alarm holds its observation permit
+/// until its return-boundary receipt, across its `InboundSignal` turn, during
+/// which siblings run. A sibling granted then is authorized at its own
+/// boundary, its receipt releases only its own permit, and the observed
+/// thread's return boundary still gets its own permit back.
+#[test]
+fn a_sibling_boundary_is_authorized_beside_an_observed_parked_wait() {
+    let (mut s, b) = fixture();
+    let (sleeper, mm, site) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    let response = sleep(&mut s, sleeper, mm, site, 100);
+    b.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 100),
+    });
+    s.committed_time = at(10);
+    s.select_parked_alarm().unwrap();
+    let c = selected(&response);
+    assert_eq!(c.permit.site, Some(site));
+    let ack = Ivar::new();
+    s.post_control(
+        sleeper,
+        mm,
+        ControlIntent::Finish {
+            wait: c.continuation,
+            lease: c.lease,
+            site,
+            finish: ObservationFinish::InterruptForCaught {
+                selection: reverie::PreparedSignalToken {
+                    site,
+                    selection_nonce: 1,
+                },
+            },
+            ack: ack.clone(),
+        },
+    )
+    .unwrap();
+    s.drain_control_intents();
+    assert_eq!(ack.try_read(), Some(Ok(FinishAck::Interrupted)));
+    assert_eq!(s.parked.permits.get(&sleeper), Some(&c.permit));
 
-    // A signal the scheduler sends it meanwhile neither panics nor wakes it:
-    // the thread is exiting (the Codex review of
-    // https://github.com/rrnewton/hermit/issues/4367).
-    s.wake_signaled_guest(peer, Signal::SIGUSR1);
-    assert!(s.parked.exits_awaiting_permit.contains(&peer));
-    assert!(!s.run_queue.contains_tid(peer));
-    assert!(!s.pending_run_queue_admissions.contains_key(&peer));
-
-    // The permit's receipt re-admits it at the next drain, front of its band.
+    s.parked.running = Some(sibling);
+    let permit = s
+        .authorize_signal_boundary(task(100, 101))
+        .unwrap()
+        .expect("an observed wait's permit is no reason to decline");
+    assert_eq!(permit.site, None);
+    assert_eq!(b.permits.lock().unwrap().as_slice(), &[c.permit, permit]);
     s.consume_signal_boundary(SignalBoundaryReceipt {
         permit,
         outcome: SignalBoundaryOutcome::Caught,
     })
     .unwrap();
-    assert!(s.parked.exits_awaiting_permit.is_empty());
     assert_eq!(
-        s.pending_run_queue_admissions.get(&peer),
-        Some(&super::AdmitIntent::Fixed(super::AdmitSide::Front))
+        s.parked.permits.values().copied().collect::<Vec<_>>(),
+        vec![c.permit]
     );
-    assert!(!s.exit_awaits_sibling_permit(peer, DetPid::from_raw(100)));
-}
+    assert!(matches!(
+        s.next_turns[&sleeper].protocol.owner,
+        NextTurnOwner::ReturningCaught { .. }
+    ));
 
-/// Each process's waiting exit is admitted only by its own process's permit,
-/// and a waiter retired while it waits leaves the wait set.
-#[test]
-fn a_waiting_exit_is_admitted_only_by_its_own_process_permit() {
-    let (mut s, _b) = fixture();
-    let (a, _, _) = add(&mut s, 100, 100);
-    let (a_peer, a_mm, _) = add(&mut s, 100, 101);
-    let (b, _, _) = add(&mut s, 200, 200);
-    let (b_peer, b_mm, _) = add(&mut s, 200, 201);
-    s.parked.running = Some(a);
-    let a_permit = s
-        .authorize_signal_boundary(task(100, 100))
-        .unwrap()
-        .unwrap();
-    s.parked.running = Some(b);
-    let _b_permit = s
-        .authorize_signal_boundary(task(200, 200))
-        .unwrap()
-        .unwrap();
-    for (peer, pid, mm) in [(a_peer, 100, a_mm), (b_peer, 200, b_mm)] {
-        s.runqueue_push_back(peer);
-        assert_eq!(s.run_queue.tentative_pop_tid(peer), Some(peer));
-        let exit = ResourceID::Exit {
-            group: true,
-            process: DetPid::from_raw(pid),
-            mm,
-        };
-        assert!(
-            s.block_for_one_resource(peer, &exit, &Permission::RW, None, None, &Ivar::new())
-                .is_err()
-        );
-    }
     assert_eq!(
-        s.parked.exits_awaiting_permit,
-        [a_peer, b_peer].into_iter().collect()
+        s.authorize_signal_boundary(task(100, 100)).unwrap(),
+        Some(c.permit)
     );
-    s.parked.running = Some(a);
     s.consume_signal_boundary(SignalBoundaryReceipt {
-        permit: a_permit,
+        permit: c.permit,
         outcome: SignalBoundaryOutcome::Caught,
     })
     .unwrap();
-    assert!(s.pending_run_queue_admissions.contains_key(&a_peer));
-    assert!(
-        !s.pending_run_queue_admissions.contains_key(&b_peer),
-        "another process's permit is still held"
-    );
+    assert!(s.parked.permits.is_empty());
     assert_eq!(
-        s.parked.exits_awaiting_permit,
-        [b_peer].into_iter().collect()
+        s.next_turns[&sleeper].protocol.owner,
+        NextTurnOwner::Ordinary
     );
-    s.remove_blocking_entries(&b_peer);
-    assert!(s.parked.exits_awaiting_permit.is_empty());
+    assert!(!s.backend_failed());
 }
 
-/// A leader whose exit waits for a sibling's permit is exiting: a
-/// process-directed signal goes to a live sibling instead, as the kernel
-/// passes an exiting thread by (the Codex review of
-/// https://github.com/rrnewton/hermit/issues/4367).
+/// Alarm selection skips a process only while one of its parked waits is
+/// observed. A sibling's ordinary boundary permit does not hold back the
+/// observation of a parked recipient: Linux wakes a parked thread for a
+/// process signal while a sibling is still on its way to deliver its own.
+/// A second observation of the process waits for the first one's permit,
+/// whatever else is released meanwhile.
 #[test]
-fn a_process_signal_passes_by_an_exiting_leader() {
-    let (mut s, _b) = fixture();
-    let (leader, leader_mm, _) = add(&mut s, 100, 100);
-    let (holder, _, _) = add(&mut s, 100, 101);
-    let (other, _, _) = add(&mut s, 100, 102);
-    let process = DetPid::from_raw(100);
-    assert_eq!(s.live_signal_target(process, None), Some(leader));
-    s.runqueue_push_back(other);
+fn an_observation_begins_beside_a_boundary_permit_but_not_beside_another_observation() {
+    let (mut s, b) = fixture();
+    let (holder, _, _) = add(&mut s, 100, 100);
+    let (first, mm, first_site) = add(&mut s, 100, 101);
+    let (second, _, second_site) = add(&mut s, 100, 102);
     s.parked.running = Some(holder);
-    let _permit = s
+    let held = s
+        .authorize_signal_boundary(task(100, 100))
+        .unwrap()
+        .unwrap();
+    s.next_turns[&holder]
+        .req
+        .put(Ok(inbound_request(holder, libc::SIGUSR2)));
+    let first_response = sleep(&mut s, first, mm, first_site, 100);
+    let second_response = sleep(&mut s, second, mm, second_site, 100);
+    b.recipients.lock().unwrap().extend([
+        SignalRecipient {
+            task: task(100, 101),
+        },
+        SignalRecipient {
+            task: task(100, 102),
+        },
+    ]);
+    s.committed_time = at(10);
+    s.select_parked_alarm().unwrap();
+    let c = selected(&first_response);
+    assert_eq!(c.permit.task, task(100, 101));
+    assert!(second_response.try_read().is_none());
+    assert_eq!(b.permits.lock().unwrap().as_slice(), &[held, c.permit]);
+
+    s.select_parked_alarm().unwrap();
+    assert!(
+        second_response.try_read().is_none(),
+        "one observation of a process at a time"
+    );
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit: held,
+        outcome: SignalBoundaryOutcome::Caught,
+    })
+    .unwrap();
+    s.select_parked_alarm().unwrap();
+    assert!(second_response.try_read().is_none());
+    assert_eq!(b.permits.lock().unwrap().as_slice(), &[held, c.permit]);
+    assert_eq!(
+        s.parked.permits.values().copied().collect::<Vec<_>>(),
+        vec![c.permit]
+    );
+}
+
+/// A thread's own exit does not wait for a sibling's delivery permit: the
+/// complete `Exit` arm reserves the exiting thread's fence and permit beside
+/// the sibling's, the terminal receipt retires only the exiting thread, and
+/// the sibling's own receipt then releases its permit. Linux lets a thread
+/// exit while a sibling is about to take a signal.
+#[test]
+fn a_thread_exit_proceeds_while_a_sibling_holds_a_permit() {
+    let (mut s, b) = fixture();
+    let (holder, _, _) = add(&mut s, 100, 100);
+    let (exiting, exiting_mm, _) = add(&mut s, 100, 101);
+    s.parked.running = Some(holder);
+    let held = s
+        .authorize_signal_boundary(task(100, 100))
+        .unwrap()
+        .unwrap();
+    s.next_turns[&holder]
+        .req
+        .put(Ok(inbound_request(holder, libc::SIGUSR1)));
+    // The exiting thread is selected next, as the scheduler does once the
+    // holder has filed its request.
+    s.runqueue_push_back(exiting);
+    assert_eq!(s.run_queue.tentative_pop_tid(exiting), Some(exiting));
+    let exit = ResourceID::Exit {
+        group: false,
+        process: DetPid::from_raw(100),
+        mm: exiting_mm,
+    };
+    assert!(
+        s.block_for_one_resource(exiting, &exit, &Permission::RW, None, None, &Ivar::new())
+            .is_ok(),
+        "the exit is granted, not parked behind the sibling"
+    );
+    let fence = s.parked.exit_fences[&exiting];
+    assert!(!fence.group);
+    assert_eq!(s.parked.permits.get(&holder), Some(&held));
+    assert_eq!(s.parked.permits.get(&exiting), Some(&fence.permit));
+    assert_eq!(b.permits.lock().unwrap().as_slice(), &[held, fence.permit]);
+    assert!(s.control_barrier());
+
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit: fence.permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: false,
+            wait_status: 0,
+        },
+    })
+    .unwrap();
+    assert!(!s.control_barrier());
+    assert!(!s.next_turns.contains_key(&exiting));
+    assert!(s.next_turns.contains_key(&holder));
+    assert!(!s.thread_is_logically_killed(holder));
+    assert_eq!(
+        s.parked.permits.values().copied().collect::<Vec<_>>(),
+        vec![held]
+    );
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit: held,
+        outcome: SignalBoundaryOutcome::Caught,
+    })
+    .unwrap();
+    assert!(s.parked.permits.is_empty());
+    assert!(!s.backend_failed());
+}
+
+/// A group exit while siblings hold permits of their own, through the
+/// `exit_group` fence or a fatal signal at the issuer's own boundary. The
+/// terminal receipt retires every sibling and cancels its pending request.
+/// Each sibling's permit stays until that sibling's own receipt settles it,
+/// as reverie-kvm sends one for every permit before the sibling's worker
+/// ends: `Cancelled`, or the committed group exit itself, which records no
+/// second final transition. Only then does the process retire, with no
+/// permit, fence or reservation left.
+#[test]
+fn a_group_exit_retires_permit_holding_siblings_whose_receipts_settle_them() {
+    for fatal in [false, true] {
+        for follower_terminated in [false, true] {
+            let (mut s, b) = fixture();
+            let (issuer, mm, _) = add(&mut s, 100, 100);
+            let (holder, _, _) = add(&mut s, 100, 101);
+            let (sleeper, _, site) = add(&mut s, 100, 102);
+
+            // The holder's boundary: permit, then its InboundSignal request.
+            s.parked.running = Some(holder);
+            let held = s
+                .authorize_signal_boundary(task(100, 101))
+                .unwrap()
+                .unwrap();
+            s.next_turns[&holder]
+                .req
+                .put(Ok(inbound_request(holder, libc::SIGUSR2)));
+            let holder_response = s.next_turns[&holder].resp.clone();
+            s.run_queue.push_back(holder, DEFAULT_PRIORITY);
+
+            // The sleeper's parked wait, observed and interrupted for a
+            // caught alarm, waiting in its own InboundSignal request.
+            let sleep_response = sleep(&mut s, sleeper, mm, site, 1000);
+            b.recipients.lock().unwrap().push(SignalRecipient {
+                task: task(100, 102),
+            });
+            s.committed_time = at(10);
+            s.select_parked_alarm().unwrap();
+            let observed = selected(&sleep_response);
+            let ack = Ivar::new();
+            s.post_control(
+                sleeper,
+                mm,
+                ControlIntent::Finish {
+                    wait: observed.continuation,
+                    lease: observed.lease,
+                    site,
+                    finish: ObservationFinish::InterruptForCaught {
+                        selection: reverie::PreparedSignalToken {
+                            site,
+                            selection_nonce: 1,
+                        },
+                    },
+                    ack: ack.clone(),
+                },
+            )
+            .unwrap();
+            s.drain_control_intents();
+            assert_eq!(ack.try_read(), Some(Ok(FinishAck::Interrupted)));
+            s.next_turns[&sleeper]
+                .req
+                .put(Ok(inbound_request(sleeper, libc::SIGALRM)));
+            let sleeper_response = s.next_turns[&sleeper].resp.clone();
+
+            let (permit, status, wait_status) = if fatal {
+                s.parked.running = Some(issuer);
+                let permit = s
+                    .authorize_signal_boundary(task(100, 100))
+                    .unwrap()
+                    .expect("the issuer's boundary beside two sibling permits");
+                (permit, ExitStatus::from_raw(libc::SIGTERM), libc::SIGTERM)
+            } else {
+                s.reserve_exit_boundary(issuer, issuer, mm, true)
+                    .expect("the exit beside two sibling permits");
+                (
+                    s.parked.exit_fences[&issuer].permit,
+                    ExitStatus::Exited(7),
+                    7 << 8,
+                )
+            };
+            s.consume_signal_boundary(SignalBoundaryReceipt {
+                permit,
+                outcome: SignalBoundaryOutcome::Terminated {
+                    group: true,
+                    wait_status,
+                },
+            })
+            .unwrap();
+            for (sibling, response) in [(holder, &holder_response), (sleeper, &sleeper_response)] {
+                assert!(s.thread_is_logically_killed(sibling));
+                assert!(!s.next_turns.contains_key(&sibling));
+                assert!(
+                    matches!(response.try_read(), Some(SchedResponse::Signaled(None))),
+                    "the sibling's pending request is cancelled"
+                );
+            }
+            assert_eq!(
+                s.parked.permits.values().copied().collect::<Vec<_>>(),
+                vec![held, observed.permit],
+                "a retired sibling's permit waits for its own receipt"
+            );
+            assert!(s.parked.exit_fences.is_empty());
+            assert!(s.control_barrier());
+            let key = ProcessGeneration::from_backend(task(100, 100).process);
+            let terminal = s.parked.terminal_processes[&key];
+
+            let follower = |permit: SignalDeliveryPermit| SignalBoundaryReceipt {
+                permit,
+                outcome: if follower_terminated {
+                    SignalBoundaryOutcome::Terminated {
+                        group: true,
+                        wait_status,
+                    }
+                } else {
+                    SignalBoundaryOutcome::Cancelled
+                },
+            };
+            for permit in [held, observed.permit] {
+                s.consume_signal_boundary(follower(permit)).unwrap();
+                // An exact duplicate is acknowledged, never applied again.
+                s.consume_signal_boundary(follower(permit)).unwrap();
+            }
+            assert!(s.parked.permits.is_empty());
+            assert_eq!(s.parked.terminal_processes.len(), 1);
+            assert_eq!(s.parked.terminal_processes[&key], terminal);
+            assert!(s.parked.child_exit_reservations.is_empty());
+            assert!(s.parked.requests.is_empty());
+            assert!(!s.backend_failed());
+
+            s.consume_process_retirement(reverie::BackendProcessRetirement {
+                process: task(100, 100).process,
+                status,
+            })
+            .unwrap();
+            assert!(!s.control_barrier());
+            assert!(!s.backend_failed());
+            assert_eq!(s.parked.failure, None);
+        }
+    }
+}
+
+/// The process retires only once every thread's permit is settled. After a
+/// group exit retired a sibling that held a permit, a retirement report that
+/// arrived before that sibling's receipt would leak the permit, so it is
+/// refused, and the run fails rather than lose it.
+#[test]
+fn process_retirement_refuses_a_sibling_permit_still_outstanding() {
+    let (mut s, _) = fixture();
+    let (leader, mm, _) = add(&mut s, 100, 100);
+    let (holder, _, _) = add(&mut s, 100, 101);
+    s.parked.running = Some(holder);
+    let held = s
         .authorize_signal_boundary(task(100, 101))
         .unwrap()
         .unwrap();
-    s.runqueue_push_back(leader);
-    assert_eq!(s.run_queue.tentative_pop_tid(leader), Some(leader));
-    let exit = ResourceID::Exit {
-        group: false,
-        process,
-        mm: leader_mm,
-    };
+    s.reserve_exit_boundary(leader, leader, mm, true)
+        .expect("the exit beside a sibling permit");
+    let permit = s.parked.exit_fences[&leader].permit;
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: 7 << 8,
+        },
+    })
+    .unwrap();
+    assert_eq!(s.parked.permits.get(&holder), Some(&held));
     assert!(
-        s.block_for_one_resource(leader, &exit, &Permission::RW, None, None, &Ivar::new())
-            .is_err()
+        s.consume_process_retirement(reverie::BackendProcessRetirement {
+            process: task(100, 100).process,
+            status: ExitStatus::Exited(7),
+        })
+        .is_err()
     );
-    assert!(s.parked.exits_awaiting_permit.contains(&leader));
-    // Still a live thread of the process, but never the delivery target.
-    assert!(s.process_signal_targets(process).contains(&leader));
-    assert_eq!(s.live_signal_target(process, None), Some(holder));
-    assert_eq!(s.live_signal_target(process, Some(leader)), Some(holder));
-    assert_eq!(s.live_signal_target(process, Some(other)), Some(other));
+    assert!(s.backend_failed());
+    assert!(s.control_barrier());
+}
+
+/// What still declines, or reuses, with per-thread permits, while siblings
+/// hold permits of their own: a thread that already holds a permit gets that
+/// same permit back and never a second reservation, and another incarnation
+/// of it is refused; a logically killed thread and a thread without the
+/// serial grant are declined.
+#[test]
+fn per_thread_permits_reuse_a_held_permit_and_decline_killed_or_ungranted_threads() {
+    let (mut s, b) = fixture();
+    let (holder, _, _) = add(&mut s, 100, 100);
+    let (granted, _, _) = add(&mut s, 100, 101);
+    let (killed, killed_mm, _) = add(&mut s, 100, 102);
+    let (_ungranted, _, _) = add(&mut s, 100, 103);
+    s.parked.running = Some(holder);
+    let held = s
+        .authorize_signal_boundary(task(100, 100))
+        .unwrap()
+        .unwrap();
+    s.parked.running = Some(granted);
+    let permit = s
+        .authorize_signal_boundary(task(100, 101))
+        .unwrap()
+        .expect("per-thread permit");
+    assert_eq!(
+        s.authorize_signal_boundary(task(100, 101)).unwrap(),
+        Some(permit),
+        "the same thread gets its own permit back"
+    );
+    let mut stale = task(100, 101);
+    stale.task_generation += 1;
+    assert!(s.authorize_signal_boundary(stale).is_err());
+    assert_eq!(b.permits.lock().unwrap().as_slice(), &[held, permit]);
+
+    s.logically_kill_thread(&killed, &DetPid::from_raw(100), killed_mm);
+    s.parked.running = Some(killed);
+    assert_eq!(s.authorize_signal_boundary(task(100, 102)).unwrap(), None);
+    s.parked.running = Some(granted);
+    assert_eq!(s.authorize_signal_boundary(task(100, 103)).unwrap(), None);
+    assert_eq!(
+        s.parked.permits.values().copied().collect::<Vec<_>>(),
+        vec![held, permit]
+    );
+    assert_eq!(b.permits.lock().unwrap().len(), 2);
+    assert!(!s.backend_failed());
+}
+
+/// A sibling's boundary at each point of a permit holder's delivery: before
+/// the holder files its `InboundSignal` request, after it filed it, after
+/// that request is granted, and after the holder's receipt. The sibling's
+/// authorization depends only on whether the sibling holds the serial grant,
+/// never on the holder's permit. In a real run the sibling can be granted
+/// only at the second and fourth points (the holder holds the grant at the
+/// first and third), and the second is the one
+/// https://github.com/rrnewton/hermit/issues/4899 refused.
+#[test]
+fn a_sibling_boundary_depends_only_on_its_own_grant_through_a_holders_delivery() {
+    for point in ["authorized", "filed", "granted", "released"] {
+        for sibling_granted in [false, true] {
+            let (mut s, _) = fixture();
+            let (a, _, _) = add(&mut s, 100, 100);
+            let (c, _, _) = add(&mut s, 100, 101);
+            s.runqueue_push_back(a);
+            s.parked.running = Some(a);
+            let held = s
+                .authorize_signal_boundary(task(100, 100))
+                .unwrap()
+                .unwrap();
+            if point != "authorized" {
+                s.next_turns[&a]
+                    .req
+                    .put(Ok(inbound_request(a, libc::SIGUSR2)));
+            }
+            if point == "granted" || point == "released" {
+                let response = s.next_turns[&a].resp.clone();
+                s.unblock_guest(a, &response).unwrap();
+                assert!(s.holds_serial_grant(a));
+            }
+            if point == "released" {
+                s.consume_signal_boundary(SignalBoundaryReceipt {
+                    permit: held,
+                    outcome: SignalBoundaryOutcome::Caught,
+                })
+                .unwrap();
+            }
+            s.parked.running = Some(if sibling_granted { c } else { a });
+            let answer = s.authorize_signal_boundary(task(100, 101)).unwrap();
+            assert_eq!(answer.is_some(), sibling_granted, "{point}");
+            assert_eq!(
+                s.parked.permits.contains_key(&a),
+                point != "released",
+                "{point}"
+            );
+            assert!(!s.backend_failed(), "{point}");
+        }
+    }
 }
 
 #[test]

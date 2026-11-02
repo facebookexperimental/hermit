@@ -100,8 +100,10 @@
 //! - an OFD lock the guest's descriptions held before Detcore read it is not
 //!   shown until a call through a modelled descriptor of it: a description
 //!   inherited already locked at the start; one received over `SCM_RIGHTS`
-//!   where Detcore keeps no model of the receiver's descriptor (ptrace), once
-//!   the sender's tables let go of it; one received through `recvmmsg`; one an
+//!   where Detcore keeps no model of the receiver's descriptor (not recorded
+//!   under record and replay, or without sequentialized threads on ptrace
+//!   and KVM), once the sender's tables let go of it; one received through
+//!   `recvmmsg`; one an
 //!   in-guest backend's exec rebuilds under a new identity;
 //! - a flock whose taker is not a guest process, while a guest description
 //!   holds it: a taker that has exited (its descriptor was inherited), or one
@@ -128,8 +130,9 @@
 //!   `CLONE_FILES`), whose calls the ledger cannot tell from the leader's;
 //! - once a lock or unlock goes through a descriptor whose description the
 //!   ledger may know under another identity (one Detcore keeps no model of,
-//!   such as a descriptor received over `SCM_RIGHTS` on ptrace, or one an
-//!   in-guest backend registered on reception), no lock on that inode number,
+//!   such as a descriptor received over `SCM_RIGHTS` and not recorded, or one
+//!   registered on reception, a second model of the sender's description), no
+//!   lock on that inode number,
 //!   on any device, is shown again; if that descriptor's fdinfo cannot be
 //!   read, no OFD or flock lock is shown again;
 //! - a lease set by a process that was then reaped, under `--no-namespace`,
@@ -392,11 +395,15 @@ type Table = u64;
 ///   name it ([`LockLedger::release`]);
 /// - a fork copies the parent's table, and `CLONE_FILES` shares it
 ///   ([`LockLedger::fork`]);
-/// - a successful exec leaves the process's table ([`LockLedger::exec`]) and
-///   then names the descriptions that survived it ([`LockLedger::exec_kept`]);
-///   a failed exec changes nothing;
-/// - a table any of whose processes has exited, reaped or not, is dropped
-///   ([`LockLedger::prune`]).
+/// - a successful exec leaves the process's table ([`LockLedger::exec`]) for
+///   a new one, which holds the descriptions the exec names as survivors
+///   next ([`LockLedger::exec_kept`]) and, until then, every description of
+///   the old table that holds a `flock` on a placeholder directory, so that
+///   no such lock a survivor holds is let go on the way; a failed exec
+///   changes nothing;
+/// - a table any of whose processes has exited, reaped or not, counts no
+///   longer for `/proc/locks`, and goes once every process that holds it has
+///   exited ([`LockLedger::prune`]).
 ///
 /// A description whose fdinfo could not be read is followed the same way,
 /// with its locks unknown ([`LockLedger::note_unknown`]) until a later read
@@ -412,7 +419,15 @@ pub(crate) struct LockLedger {
     owners: BTreeMap<Table, BTreeSet<DetPid>>,
     references: BTreeMap<OpenFileId, BTreeMap<Table, u32>>,
     locks: BTreeMap<OpenFileId, DescriptionLocks>,
+    /// The locks the descriptions of a process's table held when it
+    /// completed an exec ([`LockLedger::exec`]), for those its new table names
+    /// as survivors ([`LockLedger::exec_kept`]).
     after_exec: BTreeMap<DetPid, BTreeMap<OpenFileId, DescriptionLocks>>,
+    /// Processes whose new table, after an exec ([`LockLedger::exec`]),
+    /// still references the descriptions of the old one that hold a `flock`
+    /// on a placeholder directory, until the exec names its survivors
+    /// ([`LockLedger::exec_kept`]), which releases the others then.
+    exec_pending: BTreeSet<DetPid>,
     /// Processes whose descriptor table the ledger cannot follow
     /// ([`LockLedger::mark_opaque`]): a description any of their tables
     /// references contributes no lock.
@@ -425,6 +440,106 @@ pub(crate) struct LockLedger {
     /// Why no `/proc/locks` snapshot can be decided for the rest of the run
     /// ([`LockLedger::refuse`]): set once, never cleared.
     refused: Option<String>,
+    /// Tables one of whose processes has exited while another still holds
+    /// them (`CLONE_FILES` without `CLONE_THREAD`): they count no longer for
+    /// `/proc/locks` ([`LockLedger::held`], [`LockLedger::unknown`]), which
+    /// can only hide a row the survivors hold, and their references still
+    /// hold the descriptions' `flock` locks on placeholder directories, as
+    /// the survivors' table holds them on Linux, until they exit too
+    /// ([`LockLedger::prune`]).
+    departed: BTreeSet<Table>,
+    /// The `flock` locks held on the `/proc` directories Detcore serves on
+    /// placeholder descriptors ([`LockLedger::placeholder_flock`]), by
+    /// directory, each held by an open file description some table
+    /// references, followed as the ledger follows every description's
+    /// references: a description no table references any more holds none,
+    /// as Linux's last `fput` of it releases its locks (`locks_remove_file`).
+    placeholder_flocks:
+        BTreeMap<crate::procfs::fd_directory::PlaceholderLockKey, BTreeMap<OpenFileId, FlockMode>>,
+    /// Processes whose descriptor tables the ledger cannot tell apart, for
+    /// their whole life: one of their threads got a table of its own
+    /// (`CLONE_THREAD` without `CLONE_FILES`, [`LockLedger::mark_private_tables`]),
+    /// whose calls the ledger counts against the process's one table, or they
+    /// were forked from such a process, whose copied table may be either's.
+    /// Their placeholder `flock` requests are refused by name, their releases
+    /// of a description's last reference are not taken (a slot of another of
+    /// their tables may still hold it), and a lock that conflicts with one a
+    /// description their tables reference holds is refused by name rather
+    /// than answered ([`PlaceholderFlockOutcome::Unfollowable`]).
+    tainted: BTreeSet<DetPid>,
+    /// Copies of placeholder descriptions in flight: sent over `SCM_RIGHTS`
+    /// and not received yet, by description ([`LockLedger::placeholder_copies`]).
+    /// Linux keeps a description, and its `flock` locks, while a message
+    /// that holds it is queued; the ledger lets no description hold a
+    /// placeholder `flock` while a copy of it is in flight (a send of a
+    /// locked one, and a lock of one in flight, are refused by name), so no
+    /// lock rests on a reference only a queued message holds.
+    in_flight: BTreeMap<OpenFileId, u32>,
+    /// The write hint of each placeholder directory's inode whose hint a
+    /// guest set (`F_SET_RW_HINT`, [`LockLedger::placeholder_write_hint`]).
+    placeholder_write_hints: BTreeMap<crate::procfs::fd_directory::PlaceholderLockKey, u64>,
+}
+
+/// A change to the copies of placeholder descriptions in flight over
+/// `SCM_RIGHTS` ([`LockLedger::placeholder_copies`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlaceholderCopies {
+    /// A send of these descriptions is about to be made (one per copy).
+    Sending(Vec<OpenFileId>),
+    /// That send failed: its copies are not in flight.
+    Unsent(Vec<OpenFileId>),
+    /// A receive delivered a copy of this description.
+    Received(OpenFileId),
+}
+
+/// The mode of a `flock` lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FlockMode {
+    /// `LOCK_SH`.
+    Shared,
+    /// `LOCK_EX`.
+    Exclusive,
+}
+
+/// A `flock` through a placeholder descriptor
+/// ([`LockLedger::placeholder_flock`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaceholderFlock {
+    /// The directory the descriptor stands for.
+    pub key: crate::procfs::fd_directory::PlaceholderLockKey,
+    /// The descriptor's open file description, which owns the lock.
+    pub open_file: OpenFileId,
+    /// How many slots of the caller's table name the description.
+    pub slots: u32,
+    /// The lock asked for, or `None` for `LOCK_UN`.
+    pub mode: Option<FlockMode>,
+    /// `LOCK_NB`.
+    pub nonblocking: bool,
+}
+
+/// What [`LockLedger::placeholder_flock`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlaceholderFlockOutcome {
+    /// Granted, released, or already held in that mode.
+    Done,
+    /// Another description holds a conflicting lock and the caller asked not
+    /// to wait: `EWOULDBLOCK`. A lock of another mode the description held
+    /// is gone, as Linux's conversion deletes it before it looks for a
+    /// conflict (`flock_lock_inode`).
+    WouldBlock,
+    /// Another description holds a conflicting lock and the caller asked to
+    /// wait, which Detcore does not model: refused, with the description's
+    /// earlier lock kept, as `Detcore::handle_flock` refuses a contended
+    /// blocking `flock`.
+    Contended,
+    /// The caller's process holds descriptor tables the ledger cannot tell
+    /// apart, or the lock conflicts with one held by a description such a
+    /// process's tables reference ([`LockLedger::tainted`]), whose last
+    /// reference the ledger could not place: refused by name.
+    Unfollowable,
+    /// A copy of the description is in flight over `SCM_RIGHTS`
+    /// ([`LockLedger::in_flight`]): refused by name.
+    InFlight,
 }
 
 /// The locks a description holds, as its fdinfo last showed them, or why
@@ -454,7 +569,164 @@ impl LockLedger {
         if references.is_empty() {
             self.references.remove(&open_file);
             self.locks.remove(&open_file);
+            // Linux releases a description's `flock` locks with its last
+            // reference (`locks_remove_file`, from `__fput`).
+            self.placeholder_flocks.retain(|_, holders| {
+                holders.remove(&open_file);
+                !holders.is_empty()
+            });
         }
+    }
+
+    /// A `flock` through a descriptor of `process`'s table that Detcore
+    /// serves as a `/proc` directory on a placeholder
+    /// (`procfs::fd_directory::PlaceholderDirectory`). Every placeholder
+    /// descriptor is on the one inode of the placeholder directory, where
+    /// Linux gives procfs's root and each task's descriptor directory an
+    /// inode of its own, so the locks are kept here, by directory, as Linux's
+    /// `flock_lock_inode` keeps them on each inode: a description holds at
+    /// most one lock per directory; asking again for the mode it holds
+    /// changes nothing; another mode deletes the one it holds first; a lock
+    /// conflicts with another description's exclusive lock, and an exclusive
+    /// one with any. The description is followed as every description whose
+    /// locks the ledger knows (it holds no `/proc/locks` row), so its locks go
+    /// with its last reference, and survive an exec its descriptor survives.
+    pub(crate) fn placeholder_flock(
+        &mut self,
+        process: DetPid,
+        request: PlaceholderFlock,
+    ) -> PlaceholderFlockOutcome {
+        if request.mode.is_some() && self.tainted.contains(&process) {
+            return PlaceholderFlockOutcome::Unfollowable;
+        }
+        if request.mode.is_some() && self.in_flight.contains_key(&request.open_file) {
+            return PlaceholderFlockOutcome::InFlight;
+        }
+        self.note(process, request.open_file, Ok(Vec::new()), request.slots);
+        let held = self
+            .placeholder_flocks
+            .get(&request.key)
+            .and_then(|holders| holders.get(&request.open_file))
+            .copied();
+        let outcome = match request.mode {
+            None => {
+                if let Some(holders) = self.placeholder_flocks.get_mut(&request.key) {
+                    holders.remove(&request.open_file);
+                }
+                PlaceholderFlockOutcome::Done
+            }
+            Some(mode) if held == Some(mode) => PlaceholderFlockOutcome::Done,
+            Some(mode) => {
+                let conflicting = self
+                    .placeholder_flocks
+                    .get(&request.key)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(open_file, other)| {
+                        **open_file != request.open_file
+                            && (mode == FlockMode::Exclusive || **other == FlockMode::Exclusive)
+                    })
+                    .map(|(open_file, _)| *open_file)
+                    .collect::<Vec<_>>();
+                if conflicting
+                    .iter()
+                    .any(|open_file| self.referenced_by_tainted(*open_file))
+                {
+                    // Whether that description still holds its lock is
+                    // unknown: its last reference may have gone with a table
+                    // the ledger cannot follow. Nothing changes.
+                    return PlaceholderFlockOutcome::Unfollowable;
+                }
+                let holders = self.placeholder_flocks.entry(request.key).or_default();
+                holders.remove(&request.open_file);
+                if conflicting.is_empty() {
+                    holders.insert(request.open_file, mode);
+                    PlaceholderFlockOutcome::Done
+                } else if request.nonblocking {
+                    PlaceholderFlockOutcome::WouldBlock
+                } else {
+                    if let Some(held) = held {
+                        holders.insert(request.open_file, held);
+                    }
+                    PlaceholderFlockOutcome::Contended
+                }
+            }
+        };
+        self.placeholder_flocks
+            .retain(|_, holders| !holders.is_empty());
+        outcome
+    }
+
+    /// Whether a table of a process the ledger cannot follow
+    /// ([`Self::tainted`]) references `open_file`.
+    fn referenced_by_tainted(&self, open_file: OpenFileId) -> bool {
+        self.references.get(&open_file).is_some_and(|tables| {
+            tables.keys().any(|table| {
+                self.owners
+                    .get(table)
+                    .is_some_and(|owners| owners.iter().any(|owner| self.tainted.contains(owner)))
+            })
+        })
+    }
+
+    /// A change to the copies of placeholder descriptions in flight over
+    /// `SCM_RIGHTS` ([`Self::in_flight`]): a send counts its copies, unless a
+    /// description it sends holds a placeholder `flock`, which it names
+    /// (`Err`) for the sender to refuse by name; a failed send uncounts them,
+    /// and a receive its copy. A copy that is never received stays counted,
+    /// so that its description takes no placeholder lock for the rest of the
+    /// run (refused by name).
+    pub(crate) fn placeholder_copies(
+        &mut self,
+        change: PlaceholderCopies,
+    ) -> Result<(), OpenFileId> {
+        match change {
+            PlaceholderCopies::Sending(open_files) => {
+                if let Some(locked) = open_files
+                    .iter()
+                    .find(|open_file| self.holds_placeholder_flock(**open_file))
+                {
+                    return Err(*locked);
+                }
+                for open_file in open_files {
+                    *self.in_flight.entry(open_file).or_default() += 1;
+                }
+            }
+            PlaceholderCopies::Unsent(open_files) => {
+                for open_file in open_files {
+                    self.uncount_copy(open_file);
+                }
+            }
+            PlaceholderCopies::Received(open_file) => self.uncount_copy(open_file),
+        }
+        Ok(())
+    }
+
+    fn uncount_copy(&mut self, open_file: OpenFileId) {
+        if let Some(count) = self.in_flight.get_mut(&open_file) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.in_flight.remove(&open_file);
+            }
+        }
+    }
+
+    /// Set the write hint of the inode of the placeholder directory `key` to
+    /// `hint`, or read it with `None`; the hint after the request. Linux keeps
+    /// a write hint on the inode (`inode->i_write_hint`, `fcntl_rw_hint`),
+    /// shared by every open of the directory, 0 (`RWH_WRITE_LIFE_NOT_SET`) on
+    /// a new one; Detcore keeps it for the directory's task incarnation (its
+    /// key), where Linux keeps it while the inode is cached (named
+    /// approximation).
+    pub(crate) fn placeholder_write_hint(
+        &mut self,
+        key: crate::procfs::fd_directory::PlaceholderLockKey,
+        hint: Option<u64>,
+    ) -> u64 {
+        if let Some(hint) = hint {
+            self.placeholder_write_hints.insert(key, hint);
+        }
+        self.placeholder_write_hints.get(&key).copied().unwrap_or(0)
     }
 
     /// `open_file` holds `locks` (perhaps none), as its fdinfo showed them
@@ -500,9 +772,25 @@ impl LockLedger {
     /// or replacement there. A table the ledger has no record of has no
     /// reference to drop.
     pub(crate) fn release(&mut self, process: DetPid, open_file: OpenFileId, remaining: u32) {
+        // A process whose tables the ledger cannot tell apart may hold the
+        // description in another of its tables: its last-reference releases
+        // are not taken, and the description stays referenced until the
+        // process exits ([`Self::tainted`]; a conflict with a lock it holds is
+        // then refused by name, never answered from a reference that may be
+        // gone).
+        if remaining == 0 && self.tainted.contains(&process) {
+            return;
+        }
         if let Some(table) = self.process_table.get(&process).copied() {
             self.set_references(open_file, table, remaining);
         }
+    }
+
+    /// Whether `open_file` holds a `flock` on a placeholder directory.
+    fn holds_placeholder_flock(&self, open_file: OpenFileId) -> bool {
+        self.placeholder_flocks
+            .values()
+            .any(|holders| holders.contains_key(&open_file))
     }
 
     /// A new process `child` starts with a copy of `parent`'s table, or,
@@ -516,7 +804,12 @@ impl LockLedger {
     pub(crate) fn fork(&mut self, parent: DetPid, child: DetPid, shares_table: bool) {
         self.forget_process(child);
         self.after_exec.remove(&child);
+        self.exec_pending.remove(&child);
         self.opaque.remove(&child);
+        self.tainted.remove(&child);
+        if self.tainted.contains(&parent) {
+            self.tainted.insert(child);
+        }
         if shares_table {
             self.opaque.insert(parent);
         }
@@ -540,27 +833,74 @@ impl LockLedger {
     }
 
     /// `process` completed an exec: it leaves its table (Linux unshares it
-    /// and closes its close-on-exec slots), and only the descriptions
-    /// [`Self::exec_kept`] names next remain referenced through it.
+    /// and closes its close-on-exec slots) for a new one, through which only
+    /// the descriptions [`Self::exec_kept`] names next stay referenced. A
+    /// description of the old table that holds a `flock` on a placeholder
+    /// directory is referenced through the new one until then, with its slot
+    /// count, so that a survivor's lock is never let go between the two and
+    /// another process cannot take a conflicting one (on KVM, without
+    /// sequentialized threads, two exclusive locks); `exec_kept` releases the
+    /// ones the exec closed. Any other description's locks are kept aside for
+    /// `exec_kept`: a backend that rediscovers its descriptor table after an
+    /// exec (the in-guest backends, where no placeholder is served) names no
+    /// survivor, and the exec then leaves none of them referenced.
     pub(crate) fn exec(&mut self, process: DetPid) {
         let mut kept = BTreeMap::new();
+        let mut held = Vec::new();
         if let Some(table) = self.process_table.get(&process).copied() {
             for (open_file, references) in &self.references {
-                if references.contains_key(&table)
-                    && let Some(locks) = self.locks.get(open_file)
-                {
+                let Some(slots) = references.get(&table) else {
+                    continue;
+                };
+                if self.holds_placeholder_flock(*open_file) {
+                    held.push((*open_file, *slots));
+                } else if let Some(locks) = self.locks.get(open_file) {
                     kept.insert(*open_file, locks.clone());
                 }
             }
         }
+        let table = self.next_table;
+        self.next_table += 1;
+        for (open_file, slots) in &held {
+            if let Some(references) = self.references.get_mut(open_file) {
+                references.insert(table, *slots);
+            }
+        }
         self.forget_process(process);
+        self.process_table.insert(process, table);
+        self.owners.entry(table).or_default().insert(process);
         self.after_exec.insert(process, kept);
+        if held.is_empty() {
+            self.exec_pending.remove(&process);
+        } else {
+            self.exec_pending.insert(process);
+        }
     }
 
-    /// The descriptions whose locks Detcore read that `process`'s table names
-    /// after the exec [`Self::exec`] recorded, with their slot counts.
+    /// The descriptions whose locks Detcore follows that `process`'s table
+    /// names after the exec [`Self::exec`] recorded, with their slot counts:
+    /// each is referenced through the new table with its locks, and a
+    /// description that held a placeholder `flock` and is not among them,
+    /// one the exec closed, is released.
     pub(crate) fn exec_kept(&mut self, process: DetPid, surviving: &[(OpenFileId, u32)]) {
         let kept = self.after_exec.remove(&process).unwrap_or_default();
+        let table = self.table_of(process);
+        if self.exec_pending.remove(&process) {
+            let closed = self
+                .references
+                .iter()
+                .filter(|(open_file, references)| {
+                    references.contains_key(&table)
+                        && !surviving
+                            .iter()
+                            .any(|(survivor, slots)| survivor == *open_file && *slots > 0)
+                })
+                .map(|(open_file, _)| *open_file)
+                .collect::<Vec<_>>();
+            for open_file in closed {
+                self.set_references(open_file, table, 0);
+            }
+        }
         for (open_file, slots) in surviving {
             let Some(locks) = self
                 .locks
@@ -570,7 +910,6 @@ impl LockLedger {
             else {
                 continue;
             };
-            let table = self.table_of(process);
             self.set_references(*open_file, table, *slots);
             if self.references.contains_key(open_file) {
                 self.locks.insert(*open_file, locks);
@@ -584,20 +923,31 @@ impl LockLedger {
     /// exits, which can only hide a row the survivors still hold.
     pub(crate) fn prune(&mut self, mut alive: impl FnMut(DetPid) -> bool) {
         self.opaque.retain(|process| alive(*process));
-        let gone = self
-            .owners
-            .iter()
-            .filter(|(_, owners)| owners.iter().any(|process| !alive(*process)))
-            .map(|(table, _)| *table)
-            .collect::<Vec<_>>();
+        self.tainted.retain(|process| alive(*process));
+        self.after_exec.retain(|process, _| alive(*process));
+        self.exec_pending.retain(|process| alive(*process));
+        let mut gone = Vec::new();
+        for (table, owners) in &self.owners {
+            let living = owners.iter().filter(|process| alive(**process)).count();
+            if living == 0 {
+                gone.push(*table);
+            } else if living < owners.len() {
+                self.departed.insert(*table);
+            }
+        }
         for table in gone {
             self.drop_table(table);
         }
-        let processes = self.after_exec.keys().copied().collect::<Vec<_>>();
-        for process in processes {
-            if !alive(process) {
-                self.after_exec.remove(&process);
-            }
+        // A process that exited holds its table no longer; a later process
+        // with its number starts with a table of its own.
+        let exited = self
+            .process_table
+            .keys()
+            .copied()
+            .filter(|process| !alive(*process))
+            .collect::<Vec<_>>();
+        for process in exited {
+            self.forget_process(process);
         }
     }
 
@@ -615,6 +965,7 @@ impl LockLedger {
     }
 
     fn drop_table(&mut self, table: Table) {
+        self.departed.remove(&table);
         if let Some(owners) = self.owners.remove(&table) {
             for process in owners {
                 if self.process_table.get(&process) == Some(&table) {
@@ -635,6 +986,16 @@ impl LockLedger {
     /// guest's row but never admits a host's.
     pub(crate) fn mark_opaque(&mut self, process: DetPid) {
         self.opaque.insert(process);
+    }
+
+    /// `process` has a thread with a descriptor table of its own
+    /// (`CLONE_THREAD` without `CLONE_FILES`): its tables cannot be told
+    /// apart for the rest of its life, for `/proc/locks`
+    /// ([`Self::mark_opaque`]) and for the placeholder `flock` locks its
+    /// descriptions hold ([`Self::tainted`]).
+    pub(crate) fn mark_private_tables(&mut self, process: DetPid) {
+        self.mark_opaque(process);
+        self.tainted.insert(process);
     }
 
     /// A lock or unlock went through a descriptor whose description the
@@ -670,9 +1031,12 @@ impl LockLedger {
             .iter()
             .filter(|(open_file, _)| {
                 self.references.get(*open_file).is_some_and(|references| {
-                    references
+                    let counted = references
                         .keys()
-                        .all(|table| !opaque_tables.contains(table))
+                        .filter(|table| !self.departed.contains(table))
+                        .collect::<Vec<_>>();
+                    !counted.is_empty()
+                        && counted.iter().all(|table| !opaque_tables.contains(table))
                 })
             })
             .filter_map(|(_, locks)| locks.as_ref().ok())
@@ -705,7 +1069,13 @@ impl LockLedger {
         }
         self.locks
             .iter()
-            .filter(|(open_file, _)| self.references.contains_key(open_file))
+            .filter(|(open_file, _)| {
+                self.references.get(*open_file).is_some_and(|references| {
+                    references
+                        .keys()
+                        .any(|table| !self.departed.contains(table))
+                })
+            })
             .find_map(|(_, locks)| locks.as_ref().err())
             .map(String::as_str)
     }
@@ -1154,6 +1524,93 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         assert!(ledger.held().is_empty());
     }
 
+    /// `flock` through placeholder descriptors locks each directory apart,
+    /// as Linux's separate inodes do: two descriptions conflict only on the
+    /// same directory, a description re-asking for its mode keeps it, a
+    /// refused blocking conversion keeps the earlier lock, a refused
+    /// nonblocking one loses it, and the last close releases the lock.
+    #[test]
+    fn placeholder_flocks_lock_each_directory_apart() {
+        use crate::procfs::fd_directory::DescriptorDirectoryTable;
+        use crate::procfs::fd_directory::PlaceholderLockKey;
+        let process = DetPid::from_raw(3);
+        let fd_directory = PlaceholderLockKey::Descriptors {
+            table: DescriptorDirectoryTable::Process,
+            pid: 3,
+            process_incarnation: 1,
+            thread: None,
+        };
+        let flock = |key, open_file, slots, mode, nonblocking| PlaceholderFlock {
+            key,
+            open_file,
+            slots,
+            mode,
+            nonblocking,
+        };
+        let (shared, exclusive) = (Some(FlockMode::Shared), Some(FlockMode::Exclusive));
+        let mut ledger = LockLedger::default();
+        let root = PlaceholderLockKey::Root;
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(0), 1, exclusive, true)),
+            PlaceholderFlockOutcome::Done
+        );
+        // Another directory is another inode: no conflict.
+        assert_eq!(
+            ledger.placeholder_flock(
+                process,
+                flock(fd_directory, description(1), 1, exclusive, true)
+            ),
+            PlaceholderFlockOutcome::Done
+        );
+        // The same directory through another description conflicts.
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(2), 1, shared, true)),
+            PlaceholderFlockOutcome::WouldBlock
+        );
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(2), 1, shared, false)),
+            PlaceholderFlockOutcome::Contended
+        );
+        // The holder asking again changes nothing.
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(0), 2, exclusive, true)),
+            PlaceholderFlockOutcome::Done
+        );
+        // Shared locks share.
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(0), 2, shared, true)),
+            PlaceholderFlockOutcome::Done
+        );
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(2), 1, shared, true)),
+            PlaceholderFlockOutcome::Done
+        );
+        // A refused blocking conversion keeps the shared lock...
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(2), 1, exclusive, false)),
+            PlaceholderFlockOutcome::Contended
+        );
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(0), 2, exclusive, true)),
+            PlaceholderFlockOutcome::WouldBlock,
+            "description 2 still holds its shared lock"
+        );
+        // ...and description 0 lost its own by asking without waiting. Once
+        // description 2's last slot closes, nothing holds the root.
+        ledger.release(process, description(2), 0);
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(3), 1, exclusive, true)),
+            PlaceholderFlockOutcome::Done
+        );
+        // An unlock releases; the placeholder flocks add no /proc/locks row.
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(3), 1, None, true)),
+            PlaceholderFlockOutcome::Done
+        );
+        assert!(ledger.held().is_empty());
+        assert_eq!(ledger.unknown(), None);
+    }
+
     #[test]
     fn a_shared_table_closes_for_every_process_that_shares_it() {
         let [parent, sibling] = [3, 4].map(DetPid::from_raw);
@@ -1162,10 +1619,281 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         ledger.fork(parent, sibling, true);
         ledger.release(sibling, description(0), 0);
         assert!(ledger.held().is_empty());
-        // A shared table goes when the first process sharing it exits.
+        // A shared table counts no longer for /proc/locks once the first
+        // process sharing it exits.
         ledger.note_locks(parent, description(1), vec![lock("1")], 1);
         ledger.prune(|process| process != sibling);
         assert!(ledger.held().is_empty());
+    }
+
+    /// A placeholder `flock` is the description's, and goes with its last
+    /// reference, as Linux's last `fput` releases it: not when the taker
+    /// closes a description a child forked before the lock still holds, not
+    /// at an exec its descriptor survives, but at the exit of the last
+    /// process whose table holds it, also without a close, and with the last
+    /// process sharing a table. A process whose tables the ledger cannot tell
+    /// apart is refused a lock for the rest of its life, keeps every
+    /// description it holds until it exits, and a lock that conflicts with
+    /// one such a description holds is refused by name, not answered.
+    #[test]
+    fn a_placeholder_flock_follows_its_descriptions_references() {
+        use crate::procfs::fd_directory::PlaceholderLockKey;
+        let [parent, child, other, sibling] = [3, 4, 5, 6].map(DetPid::from_raw);
+        let lock = |ledger: &mut LockLedger, process, open_file, mode| {
+            ledger.placeholder_flock(
+                process,
+                PlaceholderFlock {
+                    key: PlaceholderLockKey::Root,
+                    open_file,
+                    slots: 1,
+                    mode,
+                    nonblocking: true,
+                },
+            )
+        };
+        let exclusive = Some(FlockMode::Exclusive);
+        let mut ledger = LockLedger::default();
+        // The parent opens the directory (its description noted with no
+        // lock) and forks before it locks; then it locks and closes.
+        ledger.note_locks(parent, description(0), Vec::new(), 1);
+        ledger.fork(parent, child, false);
+        assert_eq!(
+            lock(&mut ledger, parent, description(0), exclusive),
+            PlaceholderFlockOutcome::Done
+        );
+        ledger.release(parent, description(0), 0);
+        assert_eq!(
+            lock(&mut ledger, other, description(1), exclusive),
+            PlaceholderFlockOutcome::WouldBlock,
+            "the child's copy still holds the lock"
+        );
+        // An exec the child's descriptor survives keeps it.
+        ledger.exec(child);
+        ledger.exec_kept(child, &[(description(0), 1)]);
+        assert_eq!(
+            lock(&mut ledger, other, description(1), exclusive),
+            PlaceholderFlockOutcome::WouldBlock,
+            "the descriptor survived the exec"
+        );
+        // The child exits without closing it: its last reference goes.
+        ledger.prune(|process| process != child);
+        assert_eq!(
+            lock(&mut ledger, other, description(1), exclusive),
+            PlaceholderFlockOutcome::Done
+        );
+        assert_eq!(
+            lock(&mut ledger, other, description(1), None),
+            PlaceholderFlockOutcome::Done
+        );
+        // An exec the descriptor does not survive lets the lock go.
+        ledger.note_locks(sibling, description(2), Vec::new(), 1);
+        assert_eq!(
+            lock(&mut ledger, sibling, description(2), exclusive),
+            PlaceholderFlockOutcome::Done
+        );
+        ledger.exec(sibling);
+        ledger.exec_kept(sibling, &[]);
+        assert_eq!(
+            lock(&mut ledger, other, description(1), exclusive),
+            PlaceholderFlockOutcome::Done
+        );
+        assert_eq!(
+            lock(&mut ledger, other, description(1), None),
+            PlaceholderFlockOutcome::Done
+        );
+        // A table two processes share holds the lock until both exit.
+        let mut ledger = LockLedger::default();
+        ledger.note_locks(parent, description(0), Vec::new(), 1);
+        ledger.fork(parent, sibling, true);
+        assert_eq!(
+            lock(&mut ledger, parent, description(0), exclusive),
+            PlaceholderFlockOutcome::Done
+        );
+        ledger.prune(|process| process != parent);
+        assert_eq!(
+            lock(&mut ledger, other, description(1), exclusive),
+            PlaceholderFlockOutcome::WouldBlock,
+            "the sibling still holds the shared table"
+        );
+        ledger.prune(|process| process != parent && process != sibling);
+        assert_eq!(
+            lock(&mut ledger, other, description(1), exclusive),
+            PlaceholderFlockOutcome::Done
+        );
+        // A process that got a thread with a table of its own: its tables
+        // cannot be told apart for the rest of its life. It is refused a new
+        // lock; its close of the lock's description is not taken (the
+        // thread's copy may still hold it, and Linux releases the lock only
+        // at the last reference, which may go with that thread unseen); and
+        // another process's lock that conflicts with it is refused by name,
+        // as is a lock in a process forked from it, until both have exited.
+        let mut ledger = LockLedger::default();
+        ledger.note_locks(parent, description(0), Vec::new(), 1);
+        assert_eq!(
+            lock(&mut ledger, parent, description(0), exclusive),
+            PlaceholderFlockOutcome::Done
+        );
+        ledger.mark_private_tables(parent);
+        let request = PlaceholderFlock {
+            key: PlaceholderLockKey::Root,
+            open_file: description(3),
+            slots: 1,
+            mode: Some(FlockMode::Shared),
+            nonblocking: true,
+        };
+        assert_eq!(
+            ledger.placeholder_flock(parent, request),
+            PlaceholderFlockOutcome::Unfollowable
+        );
+        ledger.release(parent, description(0), 0);
+        assert_eq!(
+            lock(&mut ledger, other, description(1), exclusive),
+            PlaceholderFlockOutcome::Unfollowable,
+            "the conflicting lock's last reference may be gone unseen"
+        );
+        ledger.fork(parent, child, false);
+        assert_eq!(
+            ledger.placeholder_flock(child, request),
+            PlaceholderFlockOutcome::Unfollowable,
+            "a process forked from it cannot be followed either"
+        );
+        assert_eq!(
+            lock(&mut ledger, other, description(1), None),
+            PlaceholderFlockOutcome::Done,
+            "an unlock is answered"
+        );
+        ledger.prune(|process| process != parent && process != child);
+        assert_eq!(
+            lock(&mut ledger, other, description(1), exclusive),
+            PlaceholderFlockOutcome::Done
+        );
+    }
+
+    /// No placeholder `flock` rests on a reference only a message queued
+    /// over `SCM_RIGHTS` holds: a send of a locked description is refused
+    /// (it names the description), a lock of one with a copy in flight is
+    /// refused, and the receive (or the send's failure) lets the description
+    /// lock again.
+    #[test]
+    fn a_placeholder_lock_never_rests_on_a_copy_in_flight() {
+        use crate::procfs::fd_directory::PlaceholderLockKey;
+        let [sender, receiver] = [3, 4].map(DetPid::from_raw);
+        let lock = |ledger: &mut LockLedger, process, open_file, mode| {
+            ledger.placeholder_flock(
+                process,
+                PlaceholderFlock {
+                    key: PlaceholderLockKey::Root,
+                    open_file,
+                    slots: 1,
+                    mode,
+                    nonblocking: true,
+                },
+            )
+        };
+        let exclusive = Some(FlockMode::Exclusive);
+        let mut ledger = LockLedger::default();
+        ledger.note_locks(sender, description(0), Vec::new(), 1);
+        assert_eq!(
+            lock(&mut ledger, sender, description(0), exclusive),
+            PlaceholderFlockOutcome::Done
+        );
+        assert_eq!(
+            ledger.placeholder_copies(PlaceholderCopies::Sending(vec![description(0)])),
+            Err(description(0))
+        );
+        assert_eq!(
+            lock(&mut ledger, sender, description(0), None),
+            PlaceholderFlockOutcome::Done
+        );
+        assert_eq!(
+            ledger.placeholder_copies(PlaceholderCopies::Sending(vec![description(0)])),
+            Ok(())
+        );
+        assert_eq!(
+            lock(&mut ledger, sender, description(0), exclusive),
+            PlaceholderFlockOutcome::InFlight
+        );
+        // The receiver's copy is the same description: once it is received,
+        // a lock through either is the description's one lock.
+        assert_eq!(
+            ledger.placeholder_copies(PlaceholderCopies::Received(description(0))),
+            Ok(())
+        );
+        assert_eq!(
+            lock(&mut ledger, receiver, description(0), exclusive),
+            PlaceholderFlockOutcome::Done
+        );
+        assert_eq!(
+            lock(&mut ledger, sender, description(0), exclusive),
+            PlaceholderFlockOutcome::Done,
+            "the same description holds it already"
+        );
+        // A failed send uncounts its copies.
+        assert_eq!(
+            lock(&mut ledger, receiver, description(0), None),
+            PlaceholderFlockOutcome::Done
+        );
+        assert_eq!(
+            ledger.placeholder_copies(PlaceholderCopies::Sending(vec![description(0)])),
+            Ok(())
+        );
+        assert_eq!(
+            ledger.placeholder_copies(PlaceholderCopies::Unsent(vec![description(0)])),
+            Ok(())
+        );
+        assert_eq!(
+            lock(&mut ledger, sender, description(0), exclusive),
+            PlaceholderFlockOutcome::Done
+        );
+    }
+
+    /// An exec never lets a placeholder `flock` a survivor holds go: the new
+    /// table references every description of the old one that holds such a
+    /// lock until the exec names what survived, so another process never
+    /// finds a surviving description's lock gone in between, and then a
+    /// close-on-exec one is released.
+    #[test]
+    fn an_exec_never_lets_a_surviving_lock_go() {
+        use crate::procfs::fd_directory::PlaceholderLockKey;
+        let [process, other] = [3, 4].map(DetPid::from_raw);
+        let lock = |ledger: &mut LockLedger, process, open_file, mode| {
+            ledger.placeholder_flock(
+                process,
+                PlaceholderFlock {
+                    key: PlaceholderLockKey::Root,
+                    open_file,
+                    slots: 1,
+                    mode,
+                    nonblocking: true,
+                },
+            )
+        };
+        let exclusive = Some(FlockMode::Exclusive);
+        let mut ledger = LockLedger::default();
+        ledger.note_locks(process, description(0), Vec::new(), 1);
+        assert_eq!(
+            lock(&mut ledger, process, description(0), exclusive),
+            PlaceholderFlockOutcome::Done
+        );
+        ledger.exec(process);
+        assert_eq!(
+            lock(&mut ledger, other, description(1), exclusive),
+            PlaceholderFlockOutcome::WouldBlock,
+            "the survivor's lock holds between the exec and its survivors"
+        );
+        ledger.exec_kept(process, &[(description(0), 1)]);
+        assert_eq!(
+            lock(&mut ledger, other, description(1), exclusive),
+            PlaceholderFlockOutcome::WouldBlock,
+            "and after"
+        );
+        // A close-on-exec description's lock goes with the old table.
+        ledger.exec(process);
+        ledger.exec_kept(process, &[]);
+        assert_eq!(
+            lock(&mut ledger, other, description(1), exclusive),
+            PlaceholderFlockOutcome::Done
+        );
     }
 
     #[test]
@@ -1182,6 +1910,11 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         // An exec that names nothing surviving leaves nothing.
         ledger.exec(process);
         ledger.exec_kept(process, &[]);
+        assert!(ledger.held().is_empty());
+        // Nor does one that names nothing at all (a backend that rediscovers
+        // its table after the exec), whatever it held.
+        ledger.note_locks(process, description(2), vec![lock("2")], 1);
+        ledger.exec(process);
         assert!(ledger.held().is_empty());
     }
 
@@ -1287,12 +2020,16 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         ledger.note_locks(parent, description(1), vec![lock("0")], 1);
         assert_eq!(ledger.unknown(), None);
         assert_eq!(ledger.held(), [lock("0")]);
-        // An exec keeps an unknown description its table still names.
+        // An exec keeps an unknown description its table still names, and
+        // drops one it does not.
         ledger.note_unknown(parent, description(1), "ENFILE".to_string(), 1);
         ledger.exec(parent);
         assert_eq!(ledger.unknown(), None);
         ledger.exec_kept(parent, &[(description(1), 1)]);
         assert_eq!(ledger.unknown(), Some("ENFILE"));
+        ledger.exec(parent);
+        ledger.exec_kept(parent, &[]);
+        assert_eq!(ledger.unknown(), None);
     }
 
     #[test]

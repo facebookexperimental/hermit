@@ -239,6 +239,28 @@ fn models_child_subreapers(sequentialize_threads: bool, backend: &BackendCapabil
         && !backend.reports_physical_process_exits
 }
 
+/// The name `PR_SET_NAME` stores from the caller's string at `address`
+/// (`strncpy_from_user(comm, arg2, sizeof(me->comm) - 1)`): its bytes through
+/// the first NUL, at most 15. The bytes are read with the vectored,
+/// protection-respecting copy (`files::read_guest_prefix`, never
+/// `PTRACE_PEEKDATA`, which reads whole words and could fault on the page
+/// after a string that ends before it), so a string that ends just before an
+/// unreadable page is read whole, as the kernel reads it. `None` where a byte
+/// before the string's end or its 15th byte cannot be read.
+fn prctl_task_name<M: reverie::syscalls::MemoryAccess>(
+    memory: &M,
+    address: libc::c_ulong,
+) -> Option<crate::procfs::task_stat::TaskComm> {
+    let mut bytes = [0_u8; crate::procfs::task_stat::TASK_COMM_LEN - 1];
+    let address = AddrMut::<u8>::from_raw(usize::try_from(address).ok()?)?;
+    let read = crate::syscalls::files::read_guest_prefix(memory, address, &mut bytes).ok()?;
+    let readable = &bytes[..read];
+    if read < bytes.len() && !readable.contains(&0) {
+        return None;
+    }
+    Some(crate::procfs::task_stat::TaskComm::new(readable))
+}
+
 /// Is `which` one of the Linux `PRIO_*` target selectors for get/setpriority?
 fn is_valid_prio_which(which: i32) -> bool {
     which == libc::PRIO_PROCESS as i32
@@ -695,6 +717,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             {
                 Ok(guest.inject(call).await?)
             }
+            // PR_SET_NAME reaches the kernel, as before, and Detcore then
+            // records the name the kernel took, which a rendered
+            // `/proc/<pid>/stat` shows where the tool cannot read the kernel's
+            // own (`procfs::task_stat`): the caller's string through its first
+            // NUL, at most 15 bytes (`strncpy_from_user(comm, arg2,
+            // sizeof(me->comm) - 1)`, kernel/sys.c:2514-2521 in 6.17), read
+            // byte-exactly through the guest's own protections
+            // (`prctl_task_name`). A string Detcore cannot read where the
+            // kernel could keeps the previous record.
+            libc::PR_SET_NAME => {
+                let result = self.passthrough(guest, call.into()).await?;
+                let dettid = guest.thread_state().dettid;
+                match prctl_task_name(&guest.memory(), call.arg2()) {
+                    Some(comm) => crate::tool_global::set_task_comm(guest, dettid, comm).await,
+                    None => tracing::warn!(
+                        "[detcore, dtid {dettid}] PR_SET_NAME succeeded but its name could not \
+                         be read again; the previous recorded name stands"
+                    ),
+                }
+                Ok(result)
+            }
             option if is_supported_prctl_option(option) => {
                 self.passthrough(guest, call.into()).await
             }
@@ -1100,15 +1143,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// getcpu system call
+    /// getcpu system call: CPU 0 of Hermit's historical single CPU, or under
+    /// `--virtual-cpus` the thread's virtual CPU (`Detcore::virtual_cpu`).
+    /// The vDSO's `getcpu` reaches here too: Reverie turns it into this
+    /// system call.
     pub async fn handle_getcpu<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Getcpu,
     ) -> Result<i64, Error> {
-        // Always set the CPU to 0.
+        let current = match self.cfg.virtual_cpus {
+            Some(cpus) => self.virtual_cpu(guest, cpus.get()).await,
+            None => 0,
+        };
         if let Some(cpu) = call.cpu() {
-            guest.memory().write_value(cpu, &0)?;
+            guest.memory().write_value(cpu, &current)?;
         }
 
         // Always set the NUMA node to 0.
@@ -1272,6 +1321,59 @@ impl<T: RecordOrReplay> Detcore<T> {
 
 #[cfg(test)]
 mod tests {
+    /// PR_SET_NAME's name: the caller's string through its first NUL, at
+    /// most 15 bytes, read exactly: a string that ends just before an
+    /// unmapped page is read whole, and one whose bytes run into it is not.
+    #[test]
+    fn prctl_set_name_reads_exactly_up_to_15_bytes_and_the_first_nul() {
+        let memory = reverie::syscalls::LocalMemory::new();
+        let name = |address: usize| {
+            super::prctl_task_name(&memory, address as libc::c_ulong)
+                .map(|comm| comm.as_bytes().to_vec())
+        };
+        let text = |bytes: &[u8]| name(bytes.as_ptr() as usize);
+        assert_eq!(text(b"worker\0junk"), Some(b"worker".to_vec()));
+        assert_eq!(
+            text(b"0123456789abcdefghij\0"),
+            Some(b"0123456789abcde".to_vec())
+        );
+        assert_eq!(text(b"\0"), Some(Vec::new()));
+        assert_eq!(text(b"\xff\n\\L\0"), Some(b"\xff\n\\L".to_vec()));
+        // Two pages, the second made unreadable: "x\0" in the last two bytes
+        // of the first page is a whole name; "xy" there runs into the
+        // unreadable page.
+        const PAGE: usize = 4096;
+        // SAFETY: a private anonymous mapping this test owns and unmaps.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        let base = base as usize;
+        // SAFETY: inside the first, writable page; then the second page is
+        // made unreadable.
+        unsafe {
+            *((base + PAGE - 2) as *mut u8) = b'x';
+            *((base + PAGE - 1) as *mut u8) = 0;
+            assert_eq!(
+                libc::mprotect((base + PAGE) as *mut _, PAGE, libc::PROT_NONE),
+                0
+            );
+        }
+        assert_eq!(name(base + PAGE - 2), Some(b"x".to_vec()));
+        // SAFETY: the first page is still writable.
+        unsafe { *((base + PAGE - 1) as *mut u8) = b'y' };
+        assert_eq!(name(base + PAGE - 2), None);
+        // SAFETY: the mapping this test made.
+        assert_eq!(unsafe { libc::munmap(base as *mut _, 2 * PAGE) }, 0);
+    }
+
     use super::*;
 
     /// D28a: on an in-guest run's default route Detcore holds 0 and every

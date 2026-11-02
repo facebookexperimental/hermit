@@ -31,6 +31,11 @@ pub struct UseCaseOptions {
     pub verify_commits: bool,
     pub verify_exit_statuses: bool,
     pub verify_schedules: bool,
+    /// Whether the two schedule files must also agree, exactly, on every
+    /// per-thread priority history and every callback checkpoint: the fixed
+    /// point of priority-history replay, which re-records what it replays.
+    /// `verify_schedules` compares only the global event stream.
+    pub verify_priority_histories: bool,
     pub ignore_lines: Vec<String>,
 }
 
@@ -57,6 +62,7 @@ pub trait UseCase {
             verify_exit_statuses: true,
             verify_desync: true,
             verify_schedules: false,
+            verify_priority_histories: false,
             ignore_lines: Vec::new(),
         }
     }

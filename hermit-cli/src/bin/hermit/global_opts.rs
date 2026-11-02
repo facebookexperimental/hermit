@@ -51,9 +51,10 @@ pub(crate) const CONTROLLER_TARGET: &str = "hermit::controller";
 /// In run and record mode, by default (`--network=local`), the guest gets its
 /// own network namespace with only a loopback interface. `--network=host`
 /// exposes the host network, which gives up isolation and reproducibility. A
-/// recording stores its choice, and `hermit replay --autopilot` replays in the
-/// same network; `hermit record start --verify-with-gdbex` defaults to, and
-/// requires, `--network=host`. The DBT backend does not apply `--network` yet:
+/// recording stores its choice, and `hermit replay` replays in the same network.
+/// `--gdbserver`, and a replay served to gdb, keep the guest's network: the
+/// gdbserver's port is bound in the host's network namespace, where a host gdb
+/// client reaches it. The DBT backend does not apply `--network` yet:
 /// its guest sees the host network
 /// (https://github.com/rrnewton/hermit/issues/3543).
 ///

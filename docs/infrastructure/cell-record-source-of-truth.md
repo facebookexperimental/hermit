@@ -269,7 +269,7 @@ with workdir:/tmp   : 10 PASS / 0 FAIL of 10
 sampled a handful of times would have called that green and defended nothing.
 What actually proved the control was the mechanism, not the verdict:
 for that same cell -- `applications/git-repository-workflow` by `ptrace` in
-`verify` mode -- `newfstatat` calls on `/home/newton` went 24 → 0 across ten runs
+`verify` mode -- `newfstatat` calls on the user's home directory went 24 → 0 across ten runs
 per arm.
 
 **Where this bites the pressure test.** Its measurement is a pass/fail count

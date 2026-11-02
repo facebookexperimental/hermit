@@ -25,6 +25,7 @@ use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
 use detcore::preemptions::strip_times_from_events_file;
 use detcore::types::SchedEvent;
+use detcore_model::config::ExpiredWaitCharge;
 use hermit::process::Bind;
 use reverie::process::Output;
 use tracing::metadata::LevelFilter;
@@ -601,6 +602,33 @@ impl AnalyzeOpts {
         RunData::get_raw_runopts(self).refuse_strict_trial_with_inexact_branch_counter()
     }
 
+    /// The warning for trials that go on without `--strict` on a
+    /// retired-branch counter that fails Reverie's validation, wherever
+    /// [`Self::refuse_strict_with_inexact_branch_counter`] refuses `--strict`
+    /// (`RunOpts::trial_inexact_branch_counter_warning`): a trial can then
+    /// disagree with another for a hardware reason, and a seed, preemption
+    /// record or schedule that analyze or bisect reports need not reproduce
+    /// its outcome.
+    pub fn trial_branch_counter_warning(&self) -> Option<String> {
+        RunData::get_raw_runopts(self).trial_inexact_branch_counter_warning()
+    }
+
+    /// The branch-counter check `analyze` and `bisect` make before any
+    /// workspace or trial, as `RunOpts::admit_branch_counter` does for a run:
+    /// [`Self::refuse_strict_with_inexact_branch_counter`], then
+    /// [`Self::trial_branch_counter_warning`] passed to `warn` (stderr in
+    /// `main`), once for all the trials, and kept in
+    /// `AnalyzeOpts::branch_counter_warning` for the final report.
+    pub fn admit_branch_counter(&mut self, warn: &mut dyn FnMut(&str)) -> anyhow::Result<()> {
+        self.refuse_strict_with_inexact_branch_counter()?;
+        let warning = self.trial_branch_counter_warning();
+        if let Some(warning) = &warning {
+            warn(warning);
+        }
+        self.branch_counter_warning = warning.map(|line| line.trim_end().to_owned());
+        Ok(())
+    }
+
     /// Installs the trials' `--skid-margin`, as `RunOpts::main` does for a
     /// run: Reverie's PMU configuration is per process, and every trial of
     /// one `analyze` or `bisect` runs in this process with the same run
@@ -729,14 +757,70 @@ impl AnalyzeOpts {
             .signal_state_copy
     }
 
-    /// `record` stamped with the trials' `--pipe-wake-latency` and
-    /// signal-state copy setting, as every record analyze writes must be: a
-    /// record that omitted either would be accepted when replayed under
-    /// another value (<https://github.com/rrnewton/hermit/issues/4380>).
+    /// The trials' `--expired-wait-charge`, from their run arguments, where
+    /// [`Self::adopt_expired_wait_charge`] puts it; `each` before then, the
+    /// rule of the `--chaos` runs analyze makes.
+    pub fn trial_expired_wait_charge(&self) -> ExpiredWaitCharge {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .expired_wait_charge
+            .unwrap_or(ExpiredWaitCharge::Each)
+    }
+
+    /// Run every trial under one `--expired-wait-charge`: the run arguments'
+    /// own, or else the rule of the `target` recording (`--run1-preemptions`
+    /// for analyze, `--bad` for bisect), or else `each`, the rule of the
+    /// `--chaos` target run analyze makes. A search mixes the target's
+    /// schedule with a baseline's recorded without `--chaos`, so the two must
+    /// not charge expired waits differently, and a failure is searched under
+    /// the rule that found it. The value is added to the run arguments, as
+    /// [`Self::adopt_recorded_epoch`] adds the epoch, so trial commands and
+    /// reproducers carry it; recordings under another rule are then refused
+    /// ([`Self::refuse_recordings_under_another_pipe_wake_latency`]).
+    pub fn adopt_expired_wait_charge(&mut self, target: Option<&Path>) -> anyhow::Result<()> {
+        if RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .expired_wait_charge
+            .is_some()
+        {
+            return Ok(());
+        }
+        let once = match target {
+            Some(path) => detcore::preemptions::read_recorded_expired_wait_runs_charged_once(path)
+                .map_err(anyhow::Error::msg)?,
+            None => false,
+        };
+        self.run_arg.push(format!(
+            "--expired-wait-charge={}",
+            ExpiredWaitCharge::from_charged_once(once).as_str()
+        ));
+        Ok(())
+    }
+
+    /// `record` stamped with the trials' `--pipe-wake-latency`, signal-state
+    /// copy setting and `--expired-wait-charge`, as every record analyze
+    /// writes must be: a record that omitted one would be accepted when
+    /// replayed under another value
+    /// (<https://github.com/rrnewton/hermit/issues/4380>).
     pub fn stamp_trial_record(&self, record: PreemptionRecord) -> PreemptionRecord {
         record
             .with_pipe_wake_latency(self.trial_pipe_wake_latency())
             .with_signal_state_copy(Some(self.trial_signal_state_copy()))
+            .with_expired_wait_runs_charged_once(
+                self.trial_expired_wait_charge() == ExpiredWaitCharge::Once,
+            )
+            .with_cap_preemption_charge(self.trial_cap_preemption_charge())
+    }
+
+    /// Whether the trials cap preemption charges (`--cap-preemption-charge`
+    /// in their run arguments).
+    pub fn trial_cap_preemption_charge(&self) -> bool {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .cap_preemption_charge
     }
 
     /// Write the schedule `events` for a trial to replay, stamped
@@ -757,7 +841,9 @@ impl AnalyzeOpts {
     /// A record without the field was made with the option off. The same
     /// recordings are checked for the signal-state copy setting
     /// (`--no-signal-state-copy`), which a record without that field does not
-    /// state, so it is accepted under either.
+    /// state, so it is accepted under either, and for the trials'
+    /// `--expired-wait-charge` ([`Self::adopt_expired_wait_charge`]), which a
+    /// record without that field states as `each`.
     pub fn refuse_recordings_under_another_pipe_wake_latency(
         &self,
         recordings: &[(&str, &Path)],
@@ -794,6 +880,25 @@ impl AnalyzeOpts {
                 &format!("{option} {}", path.display()),
                 recorded,
                 config.signal_state_copy,
+            ) {
+                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+            }
+            let recorded = detcore::preemptions::read_recorded_expired_wait_runs_charged_once(path)
+                .map_err(anyhow::Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::expired_wait_charge_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                Some(self.trial_expired_wait_charge()),
+                true,
+            ) {
+                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+            }
+            let recorded = detcore::preemptions::read_recorded_cap_preemption_charge(path)
+                .map_err(anyhow::Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::cap_preemption_charge_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                config.cap_preemption_charge,
             ) {
                 return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
             }
@@ -1125,6 +1230,99 @@ mod tests {
             options(accepted, probe)
                 .refuse_strict_with_inexact_branch_counter()
                 .unwrap_or_else(|error| panic!("{accepted:?}: {error:#}"));
+        }
+    }
+
+    /// Without `--strict`, analyze and bisect trials on a counter that fails
+    /// Reverie's validation go on, and `admit_branch_counter` writes one
+    /// warning line for all of them and keeps it, without its newline, for the
+    /// final report (`branch_counter_warning`). With `--strict` they are
+    /// refused and nothing is written. A counter that passed, a backend that
+    /// does not read it, or trials without a timeslice write nothing: the
+    /// warning goes exactly where the `--strict` refusal would.
+    #[test]
+    fn trials_without_strict_warn_once_of_an_inexact_branch_counter() {
+        let options = |argv: &[&str], probe: fn() -> Option<String>| {
+            let args = crate::Args::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.apply_global(&args.global);
+            options.inexact_branch_counter = probe;
+            options
+        };
+        let admit = |options: &mut AnalyzeOpts| {
+            let mut lines = Vec::new();
+            let result =
+                options.admit_branch_counter(&mut |line: &str| lines.push(line.to_owned()));
+            (result, lines)
+        };
+        let inexact: fn() -> Option<String> = || Some("SpecLockMap is enabled".to_string());
+        let warning = crate::run::warning_for_an_inexact_branch_counter(
+            crate::run::CounterReader::Trials,
+            inexact,
+        )
+        .unwrap();
+        for warned in [
+            &["hermit", "analyze", "--", "/bin/true"][..],
+            &["hermit", "--backend=ptrace", "analyze", "--", "/bin/true"][..],
+        ] {
+            let mut options = options(warned, inexact);
+            let (result, lines) = admit(&mut options);
+            assert!(result.is_ok(), "{warned:?}: {result:?}");
+            assert_eq!(lines, std::slice::from_ref(&warning), "{warned:?}");
+            assert_eq!(
+                options.branch_counter_warning.as_deref(),
+                Some(warning.trim_end()),
+                "{warned:?}"
+            );
+        }
+
+        let mut strict = options(
+            &["hermit", "analyze", "--", "--strict", "/bin/true"],
+            inexact,
+        );
+        let (result, lines) = admit(&mut strict);
+        assert!(
+            result.is_err_and(|error| {
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some()
+            }),
+            "--strict refuses"
+        );
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(strict.branch_counter_warning, None);
+
+        let unreachable: fn() -> Option<String> = || panic!("the counter is not consulted");
+        for (silent, probe) in [
+            (
+                &["hermit", "analyze", "--", "/bin/true"][..],
+                (|| None) as fn() -> _,
+            ),
+            (
+                &["hermit", "--backend=kvm", "analyze", "--", "/bin/true"][..],
+                unreachable,
+            ),
+            (
+                &[
+                    "hermit",
+                    "analyze",
+                    "--",
+                    "--max-timeslice=disabled",
+                    "/bin/true",
+                ][..],
+                unreachable,
+            ),
+        ] {
+            let mut options = options(silent, probe);
+            let (result, lines) = admit(&mut options);
+            assert!(
+                result.is_ok() && lines.is_empty(),
+                "{silent:?}: {result:?} {lines:?}"
+            );
+            assert_eq!(options.branch_counter_warning, None, "{silent:?}");
         }
     }
 

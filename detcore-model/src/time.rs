@@ -910,20 +910,30 @@ impl GlobalTime {
     /// error into a fatal exit. Without the option the default charge
     /// saturates, as it always did, and this never fails.
     pub fn add_scheduler_time(&mut self) -> Result<LogicalTime, ClockExhausted> {
-        let charge = match self.scheduler_turn_charge {
-            Some(charge) => {
-                if self.total.0.checked_add(charge).is_none() {
-                    return Err(ClockExhausted {
-                        charge,
-                        total: self.total,
-                    });
-                }
-                charge
-            }
-            None => (NANOS_PER_SCHED * self.multiplier) as u64,
-        };
-        let delta = Duration::from_nanos(charge);
-        Ok(self.add_extra_time(delta))
+        self.add_capped_scheduler_time(u64::MAX)
+    }
+
+    /// [`Self::add_scheduler_time`] for a turn charged at most `cap`
+    /// nanoseconds: the scheduler's charge for a turn that ends a timeslice
+    /// under `--cap-preemption-charge`, whose `cap` is the virtual time the
+    /// thread ran since its previous turn. The capped charge is at least one
+    /// nanosecond, so the turn still advances the clock, as a configured
+    /// `--scheduler-turn-cost` must (`Config::scheduler_turn_charge`); a
+    /// default charge that the clock multiplier truncates to zero stays zero,
+    /// as it always was. A `cap` at or above the turn's charge changes
+    /// nothing.
+    pub fn add_capped_scheduler_time(&mut self, cap: u64) -> Result<LogicalTime, ClockExhausted> {
+        let full = self
+            .scheduler_turn_charge
+            .unwrap_or((NANOS_PER_SCHED * self.multiplier) as u64);
+        let charge = full.min(cap.max(1));
+        if self.scheduler_turn_charge.is_some() && self.total.0.checked_add(charge).is_none() {
+            return Err(ClockExhausted {
+                charge,
+                total: self.total,
+            });
+        }
+        Ok(self.add_extra_time(Duration::from_nanos(charge)))
     }
 
     /// Update the global clock to account for time not driven by internal
@@ -1179,6 +1189,60 @@ mod global_time_tests {
             })
         );
         assert_eq!(time.as_nanos(), previous, "a refused turn adds nothing");
+    }
+
+    /// A capped turn charges the smaller of its cap and the full charge, and
+    /// at least one nanosecond, with the default and a configured cost alike.
+    #[test]
+    fn a_capped_turn_charges_its_cap_bounded_by_the_full_charge_and_one_nanosecond() {
+        let advance = |config: &Config, cap: u64| {
+            let mut time = GlobalTime::new(config);
+            let start = time.as_nanos();
+            time.add_capped_scheduler_time(cap).unwrap() - start
+        };
+        let default = Config::default();
+        let configured = Config {
+            scheduler_turn_cost: std::num::NonZeroU64::new(10_000),
+            ..Config::default()
+        };
+        for (config, full) in [(&default, NANOS_PER_SCHED as u64), (&configured, 10_000)] {
+            assert_eq!(advance(config, 1_000), LogicalTime::from_nanos(1_000));
+            assert_eq!(advance(config, full - 1), LogicalTime::from_nanos(full - 1));
+            assert_eq!(advance(config, full), LogicalTime::from_nanos(full));
+            assert_eq!(advance(config, full + 1), LogicalTime::from_nanos(full));
+            assert_eq!(advance(config, u64::MAX), LogicalTime::from_nanos(full));
+            assert_eq!(advance(config, 0), LogicalTime::from_nanos(1));
+        }
+        let mut uncapped = GlobalTime::new(&default);
+        let start = uncapped.as_nanos();
+        assert_eq!(
+            uncapped.add_scheduler_time().unwrap() - start,
+            LogicalTime::from_nanos(NANOS_PER_SCHED as u64)
+        );
+    }
+
+    /// A capped turn that would pass the end of representable time under a
+    /// configured cost is refused with its capped charge, and adds nothing.
+    #[test]
+    fn a_capped_turn_refuses_to_saturate_the_clock_with_its_capped_charge() {
+        let config = Config {
+            scheduler_turn_cost: std::num::NonZeroU64::new(crate::config::MAX_SCHEDULER_TURN_COST),
+            epoch: "2554-07-21T23:34:33Z".parse().unwrap(),
+            ..Config::default()
+        };
+        let mut time = GlobalTime::new(&config);
+        let headroom = u64::MAX - time.as_nanos().as_nanos();
+        time.add_capped_scheduler_time(headroom).unwrap();
+        let end = time.as_nanos();
+        assert_eq!(end, LogicalTime::MAX);
+        assert_eq!(
+            time.add_capped_scheduler_time(5),
+            Err(ClockExhausted {
+                charge: 5,
+                total: end,
+            })
+        );
+        assert_eq!(time.as_nanos(), end, "a refused turn adds nothing");
     }
 
     /// Without `--scheduler-turn-cost` the default charge saturates at the

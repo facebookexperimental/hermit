@@ -110,6 +110,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         in_guest_reserved_signals: 0,
         in_guest_refuses_host_timed_producers: false,
         in_guest_signal_delivery: false,
+        annotated_priority_replay: false,
         launch_image: None,
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
         virtualize_time: false,
@@ -121,6 +122,12 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         mountinfo_mount_namespace: None,
         mount_id_assignment_order: Vec::new(),
         container_mount_table: None,
+        // As a container's run on ptrace has it, so that Detcore serves
+        // `/proc` and the descriptor directories here too, each on procfs's
+        // root; no placeholder directory is mounted where the guest's procfs
+        // is the kernel's.
+        directory_placeholder: None,
+        container_procfs: true,
         sequentialize_threads: false,
         runs_post_fork: DEFAULT_CFG.runs_post_fork,
         passthru_opt: false,
@@ -132,6 +139,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         epoch: DEFAULT_CFG.epoch,
         deterministic_io: false,
         has_uts_namespace: false,
+        notice_host_network_abstract_binds: false,
         panic_on_unsupported_syscalls: false,
         exit_on_unsupported_syscall: false,
         shutdown_on_unsupported_syscall: false,
@@ -151,8 +159,10 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         target_timeslice_syscalls_only: false,
         futex_wake_yields: false,
         pipe_wake_latency: None,
+        expired_wait_charge: None,
         work_span_report: None,
         scheduler_turn_cost: None,
+        cap_preemption_charge: false,
         sigint_instakill: false,
         warn_non_zero_binds: false,
         recordreplay_modes: false,
@@ -183,6 +193,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         detlog_regs_cadence: 1,
         sysinfo_uptime_offset: 60,
         memory: 1024 * 1024 * 1024, //1 GiB
+        virtual_cpus: None,
         proc_level: Default::default(),
         interrupt_at: vec![],
         happens_before: None,
@@ -218,6 +229,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         in_guest_reserved_signals: 0,
         in_guest_refuses_host_timed_producers: false,
         in_guest_signal_delivery: false,
+        annotated_priority_replay: false,
         launch_image: None,
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
         virtualize_time: true, // stat* could depends on this
@@ -229,6 +241,12 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         mountinfo_mount_namespace: None,
         mount_id_assignment_order: Vec::new(),
         container_mount_table: None,
+        // As a container's run on ptrace has it, so that Detcore serves
+        // `/proc` and the descriptor directories here too, each on procfs's
+        // root; no placeholder directory is mounted where the guest's procfs
+        // is the kernel's.
+        directory_placeholder: None,
+        container_procfs: true,
         sequentialize_threads: false,
         runs_post_fork: DEFAULT_CFG.runs_post_fork,
         passthru_opt: false,
@@ -240,6 +258,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         epoch: DEFAULT_CFG.epoch,
         deterministic_io: true,
         has_uts_namespace: false,
+        notice_host_network_abstract_binds: false,
         panic_on_unsupported_syscalls: false,
         exit_on_unsupported_syscall: false,
         shutdown_on_unsupported_syscall: false,
@@ -259,8 +278,10 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         target_timeslice_syscalls_only: false,
         futex_wake_yields: false,
         pipe_wake_latency: None,
+        expired_wait_charge: None,
         work_span_report: None,
         scheduler_turn_cost: None,
+        cap_preemption_charge: false,
         sigint_instakill: false,
         warn_non_zero_binds: false,
         recordreplay_modes: false,
@@ -291,6 +312,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         detlog_regs_cadence: 1,
         sysinfo_uptime_offset: 60,
         memory: 1024 * 1024 * 1024, //1 GiB
+        virtual_cpus: None,
         proc_level: Default::default(),
         interrupt_at: vec![],
         happens_before: None,
@@ -326,6 +348,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         in_guest_reserved_signals: 0,
         in_guest_refuses_host_timed_producers: false,
         in_guest_signal_delivery: false,
+        annotated_priority_replay: false,
         launch_image: None,
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
         virtualize_time: true,
@@ -337,6 +360,12 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         mountinfo_mount_namespace: None,
         mount_id_assignment_order: Vec::new(),
         container_mount_table: None,
+        // As a container's run on ptrace has it, so that Detcore serves
+        // `/proc` and the descriptor directories here too, each on procfs's
+        // root; no placeholder directory is mounted where the guest's procfs
+        // is the kernel's.
+        directory_placeholder: None,
+        container_procfs: true,
         sequentialize_threads: true,
         runs_post_fork: DEFAULT_CFG.runs_post_fork,
         passthru_opt: false,
@@ -348,6 +377,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         epoch: DEFAULT_CFG.epoch,
         deterministic_io: true,
         has_uts_namespace: false,
+        notice_host_network_abstract_binds: false,
         panic_on_unsupported_syscalls: false,
         exit_on_unsupported_syscall: false,
         shutdown_on_unsupported_syscall: false,
@@ -367,8 +397,10 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         target_timeslice_syscalls_only: false,
         futex_wake_yields: false,
         pipe_wake_latency: None,
+        expired_wait_charge: None,
         work_span_report: None,
         scheduler_turn_cost: None,
+        cap_preemption_charge: false,
         sigint_instakill: true,
         warn_non_zero_binds: false,
         recordreplay_modes: false,
@@ -399,6 +431,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         detlog_regs_cadence: 1,
         sysinfo_uptime_offset: 60,
         memory: 1024 * 1024 * 1024, //1 GiB
+        virtual_cpus: None,
         proc_level: Default::default(),
         interrupt_at: vec![],
         happens_before: None,

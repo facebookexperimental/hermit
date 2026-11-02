@@ -64,6 +64,31 @@ const DETERMINISTIC_LD_SO_CACHE_ROOT: &[u8] = b"/tmpvol/.hermit/etc/ld.so.cache"
 const DETERMINISTIC_NSCD_ROOT: &[u8] = b"/tmpvol/.hermit/run/nscd";
 const DETERMINISTIC_TMP_ROOT: &[u8] = b"/tmpvol/.hermit/tmp";
 
+/// Where a container holds Detcore's placeholder directory
+/// (`DetConfig::directory_placeholder`): procfs's `/proc/fs/nfsd`, a
+/// directory every procfs has, empty and permanently so (`proc_root_init`
+/// makes it with `proc_create_mount_point`, there for the nfsd filesystem to
+/// be mounted on). Detcore's `--proc` level table hides `/proc/fs` from the
+/// guest at every level, so no guest path reaches it, and the guest's mount
+/// table leaves its mount out ([`PlannedMount::placeholder`]). Mounting on it
+/// creates nothing on the host or on an image, and a guest's own procfs mount
+/// stays permitted after it (`mnt_already_visible` accepts a submount on a
+/// permanently empty directory).
+pub(super) const DIRECTORY_PLACEHOLDER: &str = "/proc/fs/nfsd";
+
+/// The mount of Detcore's placeholder directory at `target`: a fresh tmpfs
+/// named `hermit`, read-only, holding nothing (one inode, its root, of mode
+/// 0555), with no set-user-ID, device or executable file possible on it. A
+/// fresh filesystem, not a bind of a host directory, so its mountinfo row
+/// names no host path, and nothing on the host has to outlive the run.
+pub(super) fn directory_placeholder_mount(target: impl AsRef<std::ffi::OsStr>) -> Mount {
+    Mount::tmpfs(target)
+        .source("hermit")
+        .readonly()
+        .flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_NOEXEC)
+        .data("mode=0555,size=4k,nr_inodes=1")
+}
+
 #[derive(Debug)]
 struct MountInfoRootSource {
     source: Option<File>,
@@ -311,6 +336,30 @@ impl InstallTimeTree {
         self.layers.push((mountpoint.clone(), backing));
         (Some(mountpoint), source)
     }
+}
+
+/// Whether a mount of `plan` after the one at `index` covers that one's
+/// mountpoint, as the container's setup installs them in order over the
+/// host's current tree ([`InstallTimeTree`]): its target resolves, when it
+/// is installed, to that mountpoint or one above it (`/`, `/proc`,
+/// `/proc/fs`, or the mountpoint itself, by any spelling that resolves to
+/// one: `/proc/fs/nfsd/../..`, a host symbolic link to `/proc`). A remount
+/// creates no mount and covers nothing.
+pub(super) fn later_mount_covers(plan: &[PlannedMount], index: usize) -> bool {
+    let mut tree = InstallTimeTree::default();
+    let mut covered = None;
+    for (position, planned) in plan.iter().enumerate() {
+        let (mountpoint, _) = tree.install(&planned.mount);
+        if position == index {
+            covered = mountpoint;
+        } else if position > index
+            && let (Some(covered), Some(mountpoint)) = (&covered, &mountpoint)
+            && covered.starts_with(mountpoint)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// What the kernel will list for each mount of `plan`, as the container's
@@ -581,6 +630,9 @@ pub(super) struct IdentityGuard {
     /// recorded in the container's init before the guest starts
     /// ([`Self::record_plan`]).
     plan: MountPlan,
+    /// The guest path of the placeholder directory the plan mounts
+    /// ([`DIRECTORY_PLACEHOLDER`]), if it mounts one.
+    directory_placeholder: Option<PathBuf>,
 }
 
 /// One mount of the container's mount plan.
@@ -589,11 +641,13 @@ pub(super) struct PlannedMount {
     /// The mount, at the target it is installed at (a mount below guest
     /// `/tmp` is installed in Hermit's private tmp directory first).
     pub(super) mount: Mount,
-    /// Whether it is a backend's own mount (DBT's statistics bind, e9patch's
-    /// overlay of the rewritten program), which the guest's mount table leaves
-    /// out by this identity, not by its path. DBT's tmpfs at the test workdir
-    /// is not one: it is the guest's working directory, shown as the caller's
-    /// mount there is on every other backend.
+    /// Whether it is plumbing the guest's machine does not have, which the
+    /// guest's mount table leaves out by this identity, not by its path: a
+    /// backend's own mount (DBT's statistics bind, e9patch's overlay of the
+    /// rewritten program) or Detcore's placeholder directory
+    /// ([`PlannedMount::placeholder`]). DBT's tmpfs at the test workdir is not
+    /// one: it is the guest's working directory, shown as the caller's mount
+    /// there is on every other backend.
     pub(super) backend: bool,
 }
 
@@ -612,6 +666,14 @@ impl PlannedMount {
             mount,
             backend: true,
         }
+    }
+
+    /// Detcore's placeholder directory ([`directory_placeholder_mount`]):
+    /// plumbing, which the guest's mount table leaves out as it leaves out a
+    /// backend's own mounts. No path of the guest's reaches it either: it is
+    /// below `/proc/fs`, which Detcore's `--proc` level table hides.
+    pub(super) fn placeholder(mount: Mount) -> Self {
+        Self::backend(mount)
     }
 }
 
@@ -654,6 +716,48 @@ impl IdentityGuard {
             user_binds: Vec::new(),
             host_rows: Vec::new(),
             plan: MountPlan::Unrecorded,
+            directory_placeholder: None,
+        }
+    }
+
+    /// The guest path of the placeholder directory the container's setup
+    /// mounts, if it mounts one (`DetConfig::directory_placeholder`).
+    pub(super) fn directory_placeholder(&self) -> Option<&Path> {
+        self.directory_placeholder.as_deref()
+    }
+
+    /// Record that the container's setup mounts the placeholder directory at
+    /// guest path `path` (or none).
+    pub(super) fn set_directory_placeholder(&mut self, path: Option<PathBuf>) {
+        self.directory_placeholder = path;
+    }
+
+    /// In the container's init, once its setup installed every mount and
+    /// before the guest starts: keep the placeholder directory only where its
+    /// guest path still reaches the tmpfs the setup mounted there (its mount,
+    /// by the descriptor's mount ID, is that `hermit` tmpfs at that
+    /// mountpoint). A later mount that covers it by a spelling the plan
+    /// could not resolve before setup (through procfs's own links) leaves the
+    /// guest's `/proc` unknown to Detcore, which then serves no placeholder
+    /// directory, as without a container (`DetConfig::directory_placeholder`).
+    pub(super) fn confirm_directory_placeholder(&mut self) {
+        let Some(path) = self.directory_placeholder.clone() else {
+            return;
+        };
+        let reached = (|| {
+            let directory = open_path(&path).ok()?;
+            let id = mount_id_for_fd(directory.as_raw_fd()).ok()?;
+            let rows = namespace_rows().ok()?;
+            let row = rows.iter().find(|row| row.raw_mount_id == id)?;
+            Some(
+                row.fstype.as_slice() == b"tmpfs"
+                    && row.source.as_slice() == b"hermit"
+                    && row.mountpoint == mountinfo_escape_path(&path),
+            )
+        })()
+        .unwrap_or(false);
+        if !reached {
+            self.directory_placeholder = None;
         }
     }
 
@@ -831,8 +935,27 @@ impl IdentityGuard {
                 (current, installed, backend)
             }
             MountPlan::ImageRoot => {
-                let installed = current.iter().map(|row| row.raw_mount_id).collect();
-                (current, installed, std::collections::BTreeSet::new())
+                // Every row under an image root is one the setup installed.
+                // The placeholder directory's (the one tmpfs at its path) is
+                // plumbing, which the table leaves out as it leaves out a
+                // backend's own mounts (`PlannedMount::placeholder`): not
+                // installed for rule 1, and never shown by rules 2 and 3.
+                let placeholder: std::collections::BTreeSet<u64> = current
+                    .iter()
+                    .filter(|row| {
+                        self.directory_placeholder.as_deref().is_some_and(|path| {
+                            row.mountpoint == mountinfo_escape_path(path)
+                                && row.fstype.as_slice() == b"tmpfs"
+                        })
+                    })
+                    .map(|row| row.raw_mount_id)
+                    .collect();
+                let installed = current
+                    .iter()
+                    .map(|row| row.raw_mount_id)
+                    .filter(|id| !placeholder.contains(id))
+                    .collect();
+                (current, installed, placeholder)
             }
         };
         let never = rows
@@ -1101,10 +1224,20 @@ fn frozen_group_file() -> Result<tempfile::NamedTempFile, Error> {
 /// full validation. A copy taken when the container is set up, bound
 /// read-only over the path, keeps the cache one unchanging file for the
 /// guest's whole run, as the frozen `/etc/group` keeps group resolution.
-fn frozen_ld_so_cache() -> Result<Option<tempfile::NamedTempFile>, Error> {
-    let contents = match fs::read(LD_SO_CACHE) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        read => read.context("Failed to read the host dynamic-linker cache")?,
+///
+/// Both runs of one verification must see the same bytes too, so a caller
+/// that runs both passes the one [`LdSoCacheSnapshot`] it took for them
+/// (https://github.com/rrnewton/hermit/issues/4693); without one the host's
+/// cache is read now.
+fn frozen_ld_so_cache(
+    snapshot: Option<&LdSoCacheSnapshot>,
+) -> Result<Option<tempfile::NamedTempFile>, Error> {
+    let snapshot = match snapshot {
+        Some(snapshot) => snapshot.clone(),
+        None => LdSoCacheSnapshot::of_host()?,
+    };
+    let Some(contents) = snapshot.0 else {
+        return Ok(None);
     };
     let mut cache = tempfile::NamedTempFile::new()
         .context("Failed to create the frozen dynamic-linker cache for the guest")?;
@@ -1118,6 +1251,35 @@ fn frozen_ld_so_cache() -> Result<Option<tempfile::NamedTempFile>, Error> {
     Ok(Some(cache))
 }
 
+/// The bytes of the host's `/etc/ld.so.cache` at one moment, or `None` when
+/// the host has none: what [`frozen_ld_so_cache`] gives the guest.
+///
+/// A package manager replaces the host's cache many times an hour. Two runs of
+/// one verification that each read it can see different caches -- the
+/// loader's `fstat` of it then differs, and the comparison reports a
+/// divergence no host-input check names
+/// (https://github.com/rrnewton/hermit/issues/4693) -- so the caller of both
+/// runs takes one snapshot and gives it to each.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct LdSoCacheSnapshot(Option<std::sync::Arc<Vec<u8>>>);
+
+impl LdSoCacheSnapshot {
+    /// The host's cache now.
+    pub(super) fn of_host() -> Result<Self, Error> {
+        match fs::read(LD_SO_CACHE) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self(None)),
+            read => Ok(Self(Some(std::sync::Arc::new(
+                read.context("Failed to read the host dynamic-linker cache")?,
+            )))),
+        }
+    }
+
+    /// A cache another process already sealed (`hermit verify-inputs`).
+    pub(super) fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(Some(std::sync::Arc::new(bytes)))
+    }
+}
+
 /// Deterministic identity-resolution mounts shared by `run`, `record`, and
 /// `replay`: a frozen `/etc/group`, a frozen `/etc/ld.so.cache`
 /// ([`frozen_ld_so_cache`]) and an empty directory over the host nscd
@@ -1125,7 +1287,12 @@ fn frozen_ld_so_cache() -> Result<Option<tempfile::NamedTempFile>, Error> {
 /// state (the nscd cache and the systemd-userdb socket), so record/replay
 /// reproduce the same group/user resolution that `run` mode already enforces.
 /// Returns the mounts plus a guard that must outlive container setup.
-pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard), Error> {
+///
+/// `ld_so_cache`: the snapshot both runs of a verification share, or `None`
+/// to take the host's cache now.
+pub(super) fn identity_hardening_mounts(
+    ld_so_cache: Option<&LdSoCacheSnapshot>,
+) -> Result<(Vec<Mount>, IdentityGuard), Error> {
     let group_file = frozen_group_file()?;
     let mut mountinfo_roots = vec![MountInfoRootSource::new(
         group_file.path(),
@@ -1133,7 +1300,7 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
         DETERMINISTIC_GROUP_ROOT,
     )?];
     let mut mounts = vec![Mount::bind(group_file.path(), GROUP_FILE).readonly()];
-    let ld_so_cache = frozen_ld_so_cache()?;
+    let ld_so_cache = frozen_ld_so_cache(ld_so_cache)?;
     if let Some(cache) = &ld_so_cache {
         mountinfo_roots.push(MountInfoRootSource::new(
             cache.path(),
@@ -1175,12 +1342,9 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
             user_binds: Vec::new(),
             host_rows: Vec::new(),
             plan: MountPlan::Unrecorded,
+            directory_placeholder: None,
         },
     ))
-}
-
-fn choose_affinity_core(allowed: &[usize]) -> Option<usize> {
-    (!allowed.is_empty()).then(|| allowed[rand::random_range(0..allowed.len())])
 }
 
 fn cpu_ids(affinity: &CpuSet) -> Vec<usize> {
@@ -1194,10 +1358,10 @@ pub(super) fn apply_affinity(container: &mut Container, pin_threads: bool) {
         let affinity = sched_getaffinity(Pid::from_raw(0))
             .expect("failed to query the tracer's allowed CPU affinity mask");
         let allowed = cpu_ids(&affinity);
-        let rand_core = choose_affinity_core(&allowed)
+        let (core, basis) = super::pinned_cpu::choose(&allowed)
             .expect("the tracer's allowed CPU affinity mask is empty");
-        tracing::info!("Pinning tracer and guest threads to core {}", rand_core);
-        container.affinity(rand_core);
+        tracing::info!("Pinning tracer and guest threads to core {core} ({basis})");
+        container.affinity(core);
     }
 }
 
@@ -1255,6 +1419,7 @@ pub(super) fn image_container(
     tmpfs: &Path,
     pin_threads: bool,
     private_tmp: bool,
+    placeholder: bool,
 ) -> Result<(Container, IdentityGuard), Error> {
     let mut container = Container::new();
     container
@@ -1285,6 +1450,16 @@ pub(super) fn image_container(
     // defers dir creation to the pre-exec child on a tiny clone stack).
     let proc_target = rootfs.join("proc");
     container.mount(Mount::proc().allow_readonly_fallback().target(&proc_target));
+    // Detcore's placeholder directory, where the backend needs one
+    // (`placeholder`, `detcore::needs_directory_placeholder`), on the image's
+    // own procfs (`DIRECTORY_PLACEHOLDER`), which the image's table leaves
+    // out (`IdentityGuard::container_mount_table_of`).
+    if placeholder {
+        let path = Path::new(DIRECTORY_PLACEHOLDER);
+        container.mount(directory_placeholder_mount(
+            proc_target.join(path.strip_prefix("/proc").unwrap_or(path)),
+        ));
+    }
 
     // A minimal /dev. An OCI image layer ships no device nodes, so without this
     // the guest sees an empty /dev on a read-only root: `> /dev/null` fails with
@@ -1344,6 +1519,8 @@ pub(super) fn image_container(
         identity_sources.add_private_tmp(tmpfs)?;
     }
     identity_sources.set_image_root();
+    identity_sources
+        .set_directory_placeholder(placeholder.then(|| PathBuf::from(DIRECTORY_PLACEHOLDER)));
     Ok((container, identity_sources))
 }
 
@@ -3970,7 +4147,7 @@ pub(super) mod declared_inputs {
 /// held until after `Container::run` returns.
 pub(super) fn deterministic_container() -> Result<(Container, IdentityGuard), Error> {
     let mut container = default_container(true);
-    let (mounts, identity_guard) = identity_hardening_mounts()?;
+    let (mounts, identity_guard) = identity_hardening_mounts(None)?;
     container.mounts(mounts);
     Ok((container, identity_guard))
 }
@@ -5579,6 +5756,181 @@ mod tests {
         });
     }
 
+    /// Detcore's placeholder directory is a fresh tmpfs, read-only, holding
+    /// nothing and unable to hold a set-user-ID, device or executable file,
+    /// installed at procfs's own empty mount point right after the
+    /// container's `/proc`, as plumbing the guest's mount table leaves out.
+    #[test]
+    fn the_placeholder_directory_is_a_hidden_empty_read_only_tmpfs() {
+        let mount = directory_placeholder_mount(DIRECTORY_PLACEHOLDER);
+        assert_eq!(
+            mount,
+            Mount::tmpfs("/proc/fs/nfsd")
+                .source("hermit")
+                .flags(
+                    MountFlags::MS_RDONLY
+                        | MountFlags::MS_NOSUID
+                        | MountFlags::MS_NODEV
+                        | MountFlags::MS_NOEXEC
+                )
+                .data("mode=0555,size=4k,nr_inodes=1")
+        );
+        let plan = [
+            PlannedMount::hermit(container_proc_mount()),
+            PlannedMount::placeholder(mount),
+        ];
+        let installations = installations_of(&plan);
+        assert_eq!(
+            installations[1].mountpoints,
+            vec![mountinfo_escape_path(Path::new("/proc/fs/nfsd"))]
+        );
+        assert!(installations[1].sources.is_empty(), "a fresh filesystem");
+        assert!(!installations[0].backend);
+        assert!(installations[1].backend, "left out of the guest's table");
+    }
+
+    /// A later mount whose target resolves, when the setup installs it, to
+    /// the placeholder directory's mountpoint or one above it covers the
+    /// placeholder, by any spelling: `/proc` and `/proc/fs/nfsd/../..` do; a
+    /// mount beside it, or on it from below, does not.
+    #[test]
+    fn a_later_mount_covers_the_placeholder_directory_by_any_spelling() {
+        let plan = |target: &str| {
+            vec![
+                PlannedMount::hermit(container_proc_mount()),
+                PlannedMount::placeholder(directory_placeholder_mount(DIRECTORY_PLACEHOLDER)),
+                PlannedMount::hermit(Mount::tmpfs(target)),
+            ]
+        };
+        for target in [
+            "/",
+            "/proc",
+            "/proc/fs",
+            "/proc/fs/nfsd",
+            "/proc/fs/nfsd/../..",
+            "/proc/./fs",
+        ] {
+            assert!(later_mount_covers(&plan(target), 1), "{target}");
+        }
+        for target in ["/tmp", "/proc/sys", "/procfs", "/proc/fs/nfsd/x"] {
+            assert!(!later_mount_covers(&plan(target), 1), "{target}");
+        }
+    }
+
+    /// Under an image root every row is the setup's and the table shows it,
+    /// except the placeholder directory's, which it leaves out as plumbing:
+    /// the guest's mount table is the image's own, and a descriptor on the
+    /// placeholder reports `/proc`'s mount. A tmpfs of the image's elsewhere
+    /// stays shown.
+    #[test]
+    fn an_image_roots_table_leaves_the_placeholder_directory_out() {
+        let rows = detcore_model::container_mounts::parse_container_mounts(
+            b"2201 1990 0:40 / / ro,noatime - btrfs /dev/md0 rw\n\
+              2202 2201 0:41 / /proc rw,relatime - proc none rw\n\
+              2203 2202 0:42 / /proc/fs/nfsd ro,nosuid,nodev,noexec,relatime - tmpfs hermit ro,size=4k\n\
+              2204 2201 0:43 / /run rw,nosuid,nodev,relatime - tmpfs tmpfs rw\n\
+              2205 2201 0:44 / /dev/pts rw,nosuid,noexec,relatime - devpts none rw\n",
+        )
+        .expect("the rows parse");
+        let mut guard = IdentityGuard::empty();
+        guard.set_image_root();
+        guard.set_directory_placeholder(Some(PathBuf::from(DIRECTORY_PLACEHOLDER)));
+        let table = guard
+            .container_mount_table_of(rows.clone())
+            .expect("an image root's table")
+            .expect("an image root records its table");
+        assert_eq!(
+            table.shown_mount_ids(),
+            std::collections::BTreeSet::from([2201, 2202, 2204, 2205])
+        );
+        assert_eq!(table.shown_mount_id(2203), 2202);
+        // Without a placeholder directory every row is shown.
+        guard.set_directory_placeholder(None);
+        let table = guard
+            .container_mount_table_of(rows)
+            .expect("an image root's table")
+            .expect("an image root records its table");
+        assert_eq!(
+            table.shown_mount_ids(),
+            std::collections::BTreeSet::from([2201, 2202, 2203, 2204, 2205])
+        );
+    }
+
+    /// What a process in a container with the placeholder directory finds
+    /// there: its filesystem type, whether it is read-only, how many entries
+    /// it holds, what a `mkdir` in it gets, and whether a procfs of its own
+    /// still mounts.
+    fn placeholder_directory_facts() -> Result<(i64, bool, usize, i32, i32), String> {
+        let mut statfs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: the path is NUL-terminated and `statfs` is writable.
+        if unsafe { libc::statfs(c"/proc/fs/nfsd".as_ptr(), statfs.as_mut_ptr()) } != 0 {
+            return Err(format!("statfs: {}", io::Error::last_os_error()));
+        }
+        // SAFETY: statfs returned 0, so it initialized `statfs`.
+        let statfs = unsafe { statfs.assume_init() };
+        let mut statvfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: the path is NUL-terminated and `statvfs` is writable.
+        if unsafe { libc::statvfs(c"/proc/fs/nfsd".as_ptr(), statvfs.as_mut_ptr()) } != 0 {
+            return Err(format!("statvfs: {}", io::Error::last_os_error()));
+        }
+        // SAFETY: statvfs returned 0, so it initialized `statvfs`.
+        let read_only = unsafe { statvfs.assume_init() }.f_flag & libc::ST_RDONLY != 0;
+        let entries = fs::read_dir("/proc/fs/nfsd")
+            .map_err(|error| error.to_string())?
+            .count();
+        // SAFETY: the path is NUL-terminated.
+        let mkdir = unsafe { libc::mkdir(c"/proc/fs/nfsd/x".as_ptr(), 0o755) };
+        let mkdir_errno = if mkdir == 0 {
+            0
+        } else {
+            io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        };
+        let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let target = std::ffi::CString::new(scratch.path().as_os_str().as_encoded_bytes())
+            .map_err(|error| error.to_string())?;
+        // SAFETY: every string is NUL-terminated; the data pointer may be null.
+        let mounted = unsafe {
+            libc::mount(
+                c"proc".as_ptr(),
+                target.as_ptr(),
+                c"proc".as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        let mount_errno = if mounted == 0 {
+            // SAFETY: the path is NUL-terminated.
+            unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+            0
+        } else {
+            io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        };
+        Ok((statfs.f_type, read_only, entries, mkdir_errno, mount_errno))
+    }
+
+    /// The placeholder directory mounts in the container's user namespace,
+    /// on its own procfs, and leaves the guest free to mount a procfs of its
+    /// own, as procfs permits a submount on a permanently empty directory
+    /// (`mnt_already_visible`).
+    #[test]
+    fn the_placeholder_directory_mounts_and_leaves_procfs_mountable() {
+        let facts = Container::new()
+            .run(|| {
+                let mut container = default_container(false);
+                container.mount(directory_placeholder_mount(DIRECTORY_PLACEHOLDER));
+                container
+                    .run(placeholder_directory_facts)
+                    .map_err(|error| format!("{error:?}"))?
+            })
+            .unwrap()
+            .expect("the placeholder directory should mount over procfs's empty mount point");
+        assert_eq!(
+            facts,
+            (0x0102_1994, true, 0, libc::EROFS, 0),
+            "(f_type TMPFS_MAGIC, read-only, empty, mkdir EROFS, a procfs of its own mounts)"
+        );
+    }
+
     fn namespace_proc_contents() -> Result<(String, String), String> {
         Ok((
             fs::read_to_string("/proc/mounts").map_err(|error| error.to_string())?,
@@ -5616,7 +5968,7 @@ mod tests {
             .run(|| {
                 readonly_proc::deny_writable_mounts().map_err(|error| error.to_string())?;
                 let (mut container, _identity) =
-                    image_container(rootfs.path(), tmpfs.path(), false, true)
+                    image_container(rootfs.path(), tmpfs.path(), false, true, true)
                         .map_err(|error| error.to_string())?;
                 // This closure is already loaded, so the image needs no executable
                 // or libraries. It reads the proc mount after entering the chroot.
@@ -5672,8 +6024,9 @@ mod tests {
                     File::create(rootfs.join("dev").join(node)).map_err(|e| e.to_string())?;
                 }
                 fs::create_dir(&tmpfs).map_err(|e| e.to_string())?;
-                let (mut container, _identity) = image_container(&rootfs, &tmpfs, false, true)
-                    .map_err(|error| error.to_string())?;
+                let (mut container, _identity) =
+                    image_container(&rootfs, &tmpfs, false, true, true)
+                        .map_err(|error| error.to_string())?;
                 container
                     .run(root_mount_flags)
                     .map_err(|error| format!("{error:?}"))?
@@ -5916,8 +6269,8 @@ mod tests {
     // `run` mode regardless of whether the host `/etc/group` lists 65534.
     #[test]
     fn identity_hardening_freezes_group_with_overflow_entry() {
-        let (mounts, guard) =
-            identity_hardening_mounts().expect("identity hardening mounts should be constructible");
+        let (mounts, guard) = identity_hardening_mounts(None)
+            .expect("identity hardening mounts should be constructible");
         assert!(
             !mounts.is_empty(),
             "expected at least the frozen /etc/group mount"
@@ -5945,8 +6298,8 @@ mod tests {
     // a trailing separator, which mount refuses with ENOTDIR).
     #[test]
     fn identity_hardening_freezes_the_dynamic_linker_cache() {
-        let (mounts, guard) =
-            identity_hardening_mounts().expect("identity hardening mounts should be constructible");
+        let (mounts, guard) = identity_hardening_mounts(None)
+            .expect("identity hardening mounts should be constructible");
         let Ok(host) = fs::read(LD_SO_CACHE) else {
             assert!(guard._ld_so_cache.is_none());
             return;
@@ -5971,6 +6324,38 @@ mod tests {
         }));
     }
 
+    // Both runs of a verification take the guest's cache from the one
+    // snapshot their caller took, never from the host at each run's setup
+    // (https://github.com/rrnewton/hermit/issues/4693).
+    #[test]
+    fn identity_hardening_binds_the_given_dynamic_linker_cache_snapshot() {
+        let snapshot = LdSoCacheSnapshot::from_bytes(b"not the host's cache".to_vec());
+        let (mounts, guard) = identity_hardening_mounts(Some(&snapshot))
+            .expect("identity hardening mounts should be constructible");
+        let cache = guard
+            ._ld_so_cache
+            .as_ref()
+            .expect("a snapshot with bytes gets a frozen copy");
+        assert_eq!(fs::read(cache.path()).unwrap(), b"not the host's cache");
+        assert_eq!(
+            mounts
+                .iter()
+                .filter(|mount| mount.get_target() == Path::new(LD_SO_CACHE))
+                .count(),
+            1,
+            "{mounts:?}"
+        );
+        let (mounts, guard) = identity_hardening_mounts(Some(&LdSoCacheSnapshot(None)))
+            .expect("identity hardening mounts should be constructible");
+        assert!(guard._ld_so_cache.is_none());
+        assert!(
+            mounts
+                .iter()
+                .all(|mount| mount.get_target() != Path::new(LD_SO_CACHE)),
+            "a snapshot of a host without a cache binds none: {mounts:?}"
+        );
+    }
+
     #[test]
     fn mountinfo_provenance_uses_object_identity_not_temp_name_or_target() {
         let actual = tempfile::NamedTempFile::new().expect("create actual temporary source");
@@ -5986,6 +6371,7 @@ mod tests {
             user_binds: Vec::new(),
             host_rows: Vec::new(),
             plan: MountPlan::Unrecorded,
+            directory_placeholder: None,
         };
 
         let rewrites = guard.mountinfo_root_rewrites().unwrap();
@@ -6015,11 +6401,11 @@ mod tests {
     fn image_container_registers_only_an_automatic_private_tmp() {
         let rootfs = tempfile::TempDir::new().expect("create image rootfs");
         let private_tmp = tempfile::TempDir::new().expect("create private tmp");
-        let (_, generated) = image_container(rootfs.path(), private_tmp.path(), false, true)
+        let (_, generated) = image_container(rootfs.path(), private_tmp.path(), false, true, true)
             .expect("construct image container with generated tmp");
         assert_eq!(generated.mountinfo_roots.len(), 1);
 
-        let (_, supplied) = image_container(rootfs.path(), private_tmp.path(), false, false)
+        let (_, supplied) = image_container(rootfs.path(), private_tmp.path(), false, false, true)
             .expect("construct image container with user tmp");
         assert!(supplied.mountinfo_roots.is_empty());
     }
@@ -6061,6 +6447,7 @@ mod tests {
             user_binds: Vec::new(),
             host_rows: Vec::new(),
             plan: MountPlan::Unrecorded,
+            directory_placeholder: None,
         };
 
         let error = guard.mountinfo_root_rewrites().unwrap_err().to_string();
@@ -6146,10 +6533,15 @@ mod tests {
         let allowed = cpu_ids(&affinity);
         assert_eq!(allowed, [7, 31, 211]);
         for _ in 0..128 {
-            let selected = choose_affinity_core(&allowed).expect("non-empty mask");
-            assert!(allowed.contains(&selected), "selected CPU {selected}");
+            // Without a /proc/stat reading, the draw is over every allowed CPU.
+            let (selected, basis) =
+                super::super::pinned_cpu::choose_with(&allowed, |_| None).expect("non-empty mask");
+            assert!(
+                allowed.contains(&selected),
+                "selected CPU {selected} ({basis})"
+            );
         }
-        assert_eq!(choose_affinity_core(&[]), None);
+        assert_eq!(super::super::pinned_cpu::choose(&[]), None);
     }
 
     /// How the candidate init in [`arm_after_the_parent_crossed`] ended: its

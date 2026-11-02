@@ -5,7 +5,7 @@
 //! [dependencies]
 //! chrono = "0.4"
 //! csv = "1"
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "bfd648864b74d14b96cd3af9e36f04186aca7075" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "d0c2867be75b495eb64239e664c6306af9747783" }
 //! hermit-manifest-plan = { path = "../manifest-plan" }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
@@ -82,12 +82,13 @@ use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::ObservedResult;
 use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
+use hermit_manifest_plan::runner::invocation_admits_declared_guest_exit;
 use hermit_manifest_plan::runner::retained_execution_path_error;
 use hermit_manifest_plan::runner::retained_verify_invocation_error;
 use hermit_manifest_plan::runner::retained_verify_pass_error;
 use hermit_manifest_plan::runner::run_epoch_from_env;
 use hermit_manifest_plan::runner::skid_overshoot_only_reports;
-use hermit_manifest_plan::runner::validate_expected_guest_exit;
+use hermit_manifest_plan::runner::validate_result_expected_guest_exit;
 use hermit_manifest_plan::stress_series::SeriesNoVerdictKind;
 use hermit_manifest_plan::stress_series::SeriesPressureAttempt;
 use hermit_manifest_plan::stress_series::SeriesPressureComparison;
@@ -284,7 +285,7 @@ Commands:
       [--cells-file PATH]
       [--green --backend BACKEND --repetitions COUNT] [--no-retry] [--jobs COUNT]
       [--probe-disabled --backend BACKEND]
-      [--parity-all --repetitions COUNT]
+      [--parity-all --repetitions COUNT] [--reuse-fresh-checkout]
       Run bounded probes for the selected red cells. An exact-cell run uses the
       current working tree for fast fix/test iteration; a dirty result is
       labelled exploratory and cannot promote the scorecard. Batch runs require
@@ -428,6 +429,16 @@ Selection and bounded-batch options (run and plan):
   --kvm-guest-cap N        Separately cap KVM cells (default 4). This composes
                            with --manifest-guest-cap so non-KVM work need not be
                            throttled to the KVM-safe width.
+  --reuse-fresh-checkout   Build in, and keep, the generated checkout
+                           ignored/pressure-fresh-reusable-<SHA> instead of a
+                           new one removed after the run. A later batch run of
+                           the same commit with this option reuses it, and so
+                           its build, when its HEAD is the commit, its marker
+                           names this source, and git status reports nothing;
+                           otherwise it is removed and rebuilt. One run uses it
+                           at a time (a lock beside it); another is refused.
+                           The nightly sweep runs its parts this way, so one
+                           build serves every part of a night.
   --parity-select CELLS    Also measure these parity cells (comma-separated
                            <test-id>@<backend>) after the series, besides the
                            parity population's cells. A cell is
@@ -531,10 +542,35 @@ struct CanonicalOwnedCellId {
     test: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct TrackedCells {
     schema: u64,
     cells: Vec<TrackedCell>,
+}
+
+thread_local! {
+    /// Tracked cells that pressure_cells selects from in place of the
+    /// checkout's ci/compat-envelope/cells.json. Only the self-test sets them
+    /// (PlantedTrackedCells), to plant a cell status the live scorecard no
+    /// longer has; no command reaches them.
+    static PLANTED_TRACKED_CELLS: std::cell::RefCell<Option<TrackedCells>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Plants tracked cells for this thread's pressure_cells until dropped.
+struct PlantedTrackedCells;
+
+impl PlantedTrackedCells {
+    fn install(cells: TrackedCells) -> Self {
+        PLANTED_TRACKED_CELLS.with(|planted| *planted.borrow_mut() = Some(cells));
+        Self
+    }
+}
+
+impl Drop for PlantedTrackedCells {
+    fn drop(&mut self) {
+        PLANTED_TRACKED_CELLS.with(|planted| *planted.borrow_mut() = None);
+    }
 }
 
 fn load_tracked_cells(root: &Path) -> Result<TrackedCells, String> {
@@ -1326,7 +1362,16 @@ struct FreshCheckout {
     path_inode: u64,
     sha: String,
     marker_written: bool,
+    /// A reusable checkout (--reuse-fresh-checkout) outlives the run:
+    /// cleanup leaves it for the next run of the same commit.
+    keep: bool,
+    /// The reusable checkout's lock, held until this value is dropped.
+    reuse_lock: Option<fs::File>,
 }
+
+/// The name prefix of the checkout `run --reuse-fresh-checkout` keeps; the
+/// commit's full SHA follows it.
+const REUSABLE_FRESH_PREFIX: &str = "pressure-fresh-reusable-";
 
 struct SelfTestDirectory {
     path: PathBuf,
@@ -1594,8 +1639,12 @@ fn fresh_checkout_git() -> Command {
 /// process once the checkout exists. No other thread exists yet. The
 /// exploratory dirty-source mode never calls this: it runs in the source,
 /// which is the caller's repository.
-fn enter_fresh_checkout(source: &Path, sha: &str) -> Result<FreshCheckout, String> {
-    let fresh = FreshCheckout::prepare(source, sha)?;
+fn enter_fresh_checkout(source: &Path, sha: &str, reuse: bool) -> Result<FreshCheckout, String> {
+    let fresh = if reuse {
+        FreshCheckout::reuse_or_prepare(source, sha)?
+    } else {
+        FreshCheckout::prepare(source, sha)?
+    };
     for name in GIT_REPOSITORY_LOCATION_VARIABLES {
         env::remove_var(name);
     }
@@ -1647,90 +1696,251 @@ impl FreshCheckout {
             path_inode,
             sha: sha.to_string(),
             marker_written: false,
+            keep: false,
+            reuse_lock: None,
         };
-        let initialize = (|| {
-            clone_local_without_hardlinks(source, &checkout.path)?;
-            let marker = checkout
-                .path
-                .join(".git")
-                .join("pressure-test-generated-checkout");
-            fs::write(
-                &marker,
-                format!("source={}\nsha={}\n", source.display(), sha),
-            )
-            .map_err(|e| format!("cannot write {}: {e}", marker.display()))?;
-            checkout.marker_written = true;
-            command_ok(
-                fresh_checkout_git()
-                    .args([
-                        "-C",
-                        &checkout.path.to_string_lossy(),
-                        "checkout",
-                        "--detach",
-                    ])
-                    .arg(sha),
-                "check out exact pressure-test commit",
-            )?;
-            let observed =
-                git_output_from(fresh_checkout_git(), &checkout.path, &["rev-parse", "HEAD"])?;
-            if observed != sha {
+        checkout.initialize_or_cleanup()?;
+        Ok(checkout)
+    }
+
+    /// `run --reuse-fresh-checkout`: the kept checkout of SHA, reused when it
+    /// is still exactly SHA (its build with it), or rebuilt in place.
+    fn reuse_or_prepare(source: &Path, sha: &str) -> Result<Self, String> {
+        let (parent, canonical_parent, parent_device, parent_inode) =
+            fresh_checkout_parent(source)?;
+        let path = parent.join(format!("{REUSABLE_FRESH_PREFIX}{sha}"));
+        let lock_path = parent.join(format!("{REUSABLE_FRESH_PREFIX}{sha}.lock"));
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| format!("cannot open {}: {e}", lock_path.display()))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
                 return Err(format!(
-                    "fresh pressure-test checkout resolved to {observed}, expected {sha}"
+                    "another pressure-test run is using {}; --reuse-fresh-checkout allows one run at a time",
+                    path.display()
                 ));
             }
-            // The clone's origin/main is the source's main when the clone was
-            // made, and main keeps moving during a nightly. The Reverie pin
-            // check (pre.reverie_pin) refuses a pin older than origin/main's,
-            // which is a landing rule: on 2026-10-20 main bumped Reverie at
-            // 06:48Z and every part cloned after it was refused for measuring
-            // 1e5ebe34, a commit already on main. The measured commit is the
-            // only base this run has, so the check compares the pin with
-            // itself and its other clauses still run.
-            command_ok(
-                fresh_checkout_git()
-                    .args([
-                        "-C",
-                        &checkout.path.to_string_lossy(),
-                        "update-ref",
-                        "refs/remotes/origin/main",
-                    ])
-                    .arg(sha),
-                "point the fresh checkout's origin/main at the measured commit",
-            )?;
-            command_ok(
-                fresh_checkout_git().args([
-                    "-C",
-                    &checkout.path.to_string_lossy(),
-                    "submodule",
-                    "update",
-                    "--init",
-                    "--recursive",
-                ]),
-                "initialize pressure-test submodules",
-            )?;
-            for required in [
-                "ci/compat-envelope/pressure-test.rs",
-                "agent-utils/rs/dagrun/Cargo.toml",
-            ] {
-                if !checkout.path.join(required).is_file() {
-                    return Err(format!(
-                        "fresh pressure-test checkout is missing required file {required}"
-                    ));
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(format!("cannot lock {}: {error}", lock_path.display()));
+            }
+        }
+        let mut checkout = Self {
+            source: source.to_path_buf(),
+            parent,
+            canonical_parent,
+            parent_device,
+            parent_inode,
+            path,
+            path_device: 0,
+            path_inode: 0,
+            sha: sha.to_string(),
+            marker_written: false,
+            keep: false,
+            reuse_lock: None,
+        };
+        if fs::symlink_metadata(&checkout.path).is_ok() {
+            match checkout.adopt() {
+                Ok(()) => {
+                    println!("Fresh checkout reused: {}", checkout.path.display());
+                    checkout.keep = true;
+                    checkout.reuse_lock = Some(lock);
+                    return Ok(checkout);
+                }
+                Err(reason) => {
+                    eprintln!(
+                        "compatibility pressure test: not reusing {}: {reason}; rebuilding it",
+                        checkout.path.display()
+                    );
+                    validate_generated_checkout_path(
+                        &checkout.path,
+                        &checkout.parent,
+                        &checkout.canonical_parent,
+                        checkout.parent_device,
+                        checkout.parent_inode,
+                        None,
+                    )?;
+                    fs::remove_dir_all(&checkout.path).map_err(|e| {
+                        format!(
+                            "cannot remove stale reusable checkout {}: {e}",
+                            checkout.path.display()
+                        )
+                    })?;
                 }
             }
-            Ok(())
-        })();
-        if let Err(error) = initialize {
-            let cleanup = checkout.cleanup();
+        }
+        fs::create_dir(&checkout.path).map_err(|e| {
+            format!(
+                "cannot create reusable checkout {}: {e}",
+                checkout.path.display()
+            )
+        })?;
+        (checkout.path_device, checkout.path_inode) = validate_generated_checkout_path(
+            &checkout.path,
+            &checkout.parent,
+            &checkout.canonical_parent,
+            checkout.parent_device,
+            checkout.parent_inode,
+            None,
+        )?;
+        checkout.initialize_or_cleanup()?;
+        checkout.keep = true;
+        checkout.reuse_lock = Some(lock);
+        Ok(checkout)
+    }
+
+    /// Accept an existing reusable checkout only if it is still exactly this
+    /// run's commit: this source's marker, HEAD at the commit, and nothing
+    /// that git status reports, submodules included. Build outputs are
+    /// ignored files, which status does not report and which are the point.
+    fn adopt(&mut self) -> Result<(), String> {
+        (self.path_device, self.path_inode) = validate_generated_checkout_path(
+            &self.path,
+            &self.parent,
+            &self.canonical_parent,
+            self.parent_device,
+            self.parent_inode,
+            None,
+        )?;
+        let marker = self
+            .path
+            .join(".git")
+            .join("pressure-test-generated-checkout");
+        let expected = format!("source={}\nsha={}\n", self.source.display(), self.sha);
+        match fs::read_to_string(&marker) {
+            Ok(observed) if observed == expected => {}
+            Ok(_) => {
+                return Err(format!(
+                    "{} names another source or commit",
+                    marker.display()
+                ));
+            }
+            Err(error) => return Err(format!("cannot read {}: {error}", marker.display())),
+        }
+        self.marker_written = true;
+        let head = git_output_from(fresh_checkout_git(), &self.path, &["rev-parse", "HEAD"])?;
+        if head != self.sha {
+            return Err(format!("its HEAD is {head}"));
+        }
+        let status = git_output_from(
+            fresh_checkout_git(),
+            &self.path,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
+        )?;
+        if !status.is_empty() {
+            return Err(format!(
+                "git status reports changes: {}",
+                status.lines().next().unwrap_or_default()
+            ));
+        }
+        let submodules = git_output_from(
+            fresh_checkout_git(),
+            &self.path,
+            &["submodule", "status", "--recursive"],
+        )?;
+        // git_output_from trims the output, and with it the first line's
+        // leading space, so a line is out of step only by its own marker:
+        // `-` not initialized, `+` another commit, `U` conflicted.
+        if let Some(line) = submodules
+            .lines()
+            .find(|line| line.starts_with(['-', '+', 'U']))
+        {
+            return Err(format!("a submodule is not at its recorded commit: {line}"));
+        }
+        Ok(())
+    }
+
+    fn initialize_or_cleanup(&mut self) -> Result<(), String> {
+        if let Err(error) = self.initialize() {
+            let cleanup = self.cleanup();
             return Err(match cleanup {
                 Ok(()) => error,
                 Err(cleanup) => format!("{error}; fresh-checkout cleanup also failed: {cleanup}"),
             });
         }
-        Ok(checkout)
+        Ok(())
+    }
+
+    fn initialize(&mut self) -> Result<(), String> {
+        clone_local_without_hardlinks(&self.source, &self.path)?;
+        let marker = self
+            .path
+            .join(".git")
+            .join("pressure-test-generated-checkout");
+        fs::write(
+            &marker,
+            format!("source={}\nsha={}\n", self.source.display(), self.sha),
+        )
+        .map_err(|e| format!("cannot write {}: {e}", marker.display()))?;
+        self.marker_written = true;
+        command_ok(
+            fresh_checkout_git()
+                .args(["-C", &self.path.to_string_lossy(), "checkout", "--detach"])
+                .arg(&self.sha),
+            "check out exact pressure-test commit",
+        )?;
+        let observed = git_output_from(fresh_checkout_git(), &self.path, &["rev-parse", "HEAD"])?;
+        if observed != self.sha {
+            return Err(format!(
+                "fresh pressure-test checkout resolved to {observed}, expected {}",
+                self.sha
+            ));
+        }
+        // The clone's origin/main is the source's main when the clone was
+        // made, and main keeps moving during a nightly. The Reverie pin
+        // check (pre.reverie_pin) refuses a pin older than origin/main's,
+        // which is a landing rule: on 2026-10-20 main bumped Reverie at
+        // 06:48Z and every part cloned after it was refused for measuring
+        // 1e5ebe34, a commit already on main. The measured commit is the
+        // only base this run has, so the check compares the pin with
+        // itself and its other clauses still run.
+        command_ok(
+            fresh_checkout_git()
+                .args([
+                    "-C",
+                    &self.path.to_string_lossy(),
+                    "update-ref",
+                    "refs/remotes/origin/main",
+                ])
+                .arg(&self.sha),
+            "point the fresh checkout's origin/main at the measured commit",
+        )?;
+        command_ok(
+            fresh_checkout_git().args([
+                "-C",
+                &self.path.to_string_lossy(),
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+            ]),
+            "initialize pressure-test submodules",
+        )?;
+        for required in [
+            "ci/compat-envelope/pressure-test.rs",
+            "agent-utils/rs/dagrun/Cargo.toml",
+        ] {
+            if !self.path.join(required).is_file() {
+                return Err(format!(
+                    "fresh pressure-test checkout is missing required file {required}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn cleanup(&self) -> Result<(), String> {
+        if self.keep {
+            return Ok(());
+        }
         validate_generated_checkout_path(
             &self.path,
             &self.parent,
@@ -2821,7 +3031,11 @@ fn run() -> Result<(), String> {
             );
         }
         "run" => {
-            let (log_tail_options, mut remaining) = log_tail_options(&mut args)?;
+            let (log_tail_options, remaining) = log_tail_options(&mut args)?;
+            let (reuse_fresh, remaining): (Vec<_>, Vec<_>) =
+                remaining.partition(|argument| argument == "--reuse-fresh-checkout");
+            let reuse_fresh = !reuse_fresh.is_empty();
+            let mut remaining = remaining.into_iter();
             let (results, output, selection) = result_options(&root, &mut remaining, true, true)?;
             if output.is_some() {
                 return Err(
@@ -2845,13 +3059,19 @@ fn run() -> Result<(), String> {
             require_empty_result_dir(&results)?;
             let started = Instant::now();
             let sha = git_output(&root, &["rev-parse", "HEAD"])?;
+            if reuse_fresh && selection.allows_dirty_source() {
+                return Err(
+                    "--reuse-fresh-checkout applies to batch runs, which use a generated checkout; an exact-cell run uses the working tree"
+                        .into(),
+                );
+            }
             let fresh = if selection.allows_dirty_source() {
                 eprintln!(
                     "compatibility pressure test: exact-cell iteration uses the current working tree; dirty results are exploratory and cannot promote the scorecard"
                 );
                 None
             } else {
-                let fresh = enter_fresh_checkout(&root, &sha)?;
+                let fresh = enter_fresh_checkout(&root, &sha, reuse_fresh)?;
                 println!("Fresh checkout: {}", fresh.path.display());
                 Some(fresh)
             };
@@ -2903,7 +3123,7 @@ fn run() -> Result<(), String> {
                 Ok(())
             })();
             let series_result = if std::env::var_os("DEV_HERMIT_PARENT").is_some() {
-                emit_series(&results, execution_root, true)
+                emit_series(&results, execution_root, true, true)
             } else {
                 Ok(())
             };
@@ -2945,7 +3165,7 @@ fn run() -> Result<(), String> {
             if output.is_some() {
                 return Err("emit-series does not accept --output".into());
             }
-            emit_series(&results, &root, false)?;
+            emit_series(&results, &root, false, false)?;
         }
         "self-test" => {
             if args.next().is_some() {
@@ -3922,7 +4142,8 @@ fn collect_series_rows(
     Ok(collected)
 }
 
-fn emit_series(results: &Path, checkout: &Path, fresh: bool) -> Result<(), String> {
+/// [`publish_series`] into `DEV_HERMIT_PARENT`, which must be set.
+fn emit_series(results: &Path, checkout: &Path, fresh: bool, mark: bool) -> Result<(), String> {
     let parent = std::env::var("DEV_HERMIT_PARENT")
         .ok()
         .filter(|value| !value.is_empty())
@@ -3934,18 +4155,39 @@ fn emit_series(results: &Path, checkout: &Path, fresh: bool) -> Result<(), Strin
              Set it to the dev-hermit checkout root and re-run."
                 .to_string()
         })?;
-    let emission = emit_series_to(
+    publish_series(
         Path::new(&parent),
         results,
         checkout,
         fresh,
         SERIES_APPEND_CELLS_BOUND,
         parity::AppendBounds::default(),
-    );
+        mark,
+    )
+}
+
+/// Emit RESULTS' series into `parent` ([`emit_series_to`]) and print its lines.
+/// A cell append that failed is the error; a parity append that failed is not
+/// (parity decides nothing). With MARK, [`SERIES_EMITTED_MARKER`] is written
+/// only when everything owed was published: the cells appended and every
+/// parity row accepted.
+fn publish_series(
+    parent: &Path,
+    results: &Path,
+    checkout: &Path,
+    fresh: bool,
+    cells_bound: Duration,
+    bounds: parity::AppendBounds,
+    mark: bool,
+) -> Result<(), String> {
+    let emission = emit_series_to(parent, results, checkout, fresh, cells_bound, bounds);
     if let Some(line) = &emission.parity {
         eprintln!("pressure-test: {line}");
     }
     println!("{}", emission.cells?);
+    if mark && emission.parity_accepted {
+        record_series_emitted(results)?;
+    }
     Ok(())
 }
 
@@ -3956,6 +4198,25 @@ fn emit_series(results: &Path, checkout: &Path, fresh: bool) -> Result<(), Strin
 /// one still running after half an hour is hung, not slow.
 const SERIES_APPEND_CELLS_BOUND: Duration = Duration::from_secs(30 * 60);
 
+/// The file a run writes into RESULTS once its own series emit has published
+/// everything it owed: every cell result appended and every parity row
+/// accepted (a `--parity-all` series has only parity rows). A parity append
+/// that was refused, failed or was killed at its bound leaves no marker, so the
+/// nightly's post-run emit publishes again. The nightly sweep (dev-hermit
+/// ci-hub/series/pressure_schedule.py) emitted each part again after the run,
+/// and that second emit appended nothing but repeated the published-rows
+/// lookup, up to about 250 s a part on the night of 2026-10-26; it now emits
+/// again only when this file is absent.
+const SERIES_EMITTED_MARKER: &str = "series-emitted.json";
+
+/// Record that this run's series emit published everything it owed
+/// ([`SERIES_EMITTED_MARKER`]).
+fn record_series_emitted(results: &Path) -> Result<(), String> {
+    let marker = results.join(SERIES_EMITTED_MARKER);
+    fs::write(&marker, "{\"schema\":1,\"emitted_by\":\"run\"}\n")
+        .map_err(|e| format!("cannot write {}: {e}", marker.display()))
+}
+
 /// What [`emit_series_to`] did.
 struct SeriesEmission {
     /// The cells' `emitted ...` line, or why they were not all appended.
@@ -3964,6 +4225,9 @@ struct SeriesEmission {
     /// cells' writer was started, whatever became of it or of them. `None`
     /// when the emit stopped before that.
     parity: Option<String>,
+    /// Whether the parity append completed: the writer accepted every row, or
+    /// the series had no parity output to send. False when it did not run.
+    parity_accepted: bool,
 }
 
 /// [`emit_series`] into the dev-hermit checkout `parent`: the cells to
@@ -3986,7 +4250,7 @@ fn emit_series_to(
     cells_bound: Duration,
     bounds: parity::AppendBounds,
 ) -> SeriesEmission {
-    let mut parity_line = None;
+    let mut parity_outcome: Option<parity::LedgerAppendOutcome> = None;
     let cells = (|| {
         let metadata_path = results.join("run.json");
         let metadata: RunMetadata = serde_json::from_str(
@@ -4008,7 +4272,7 @@ fn emit_series_to(
                 ));
             }
             let run_id = series_run_id(&metadata, results)?;
-            parity_line = Some(append_series_parity(
+            parity_outcome = Some(append_series_parity(
                 &script,
                 parent,
                 results,
@@ -4082,7 +4346,7 @@ fn emit_series_to(
             .map_err(|e| format!("series append did not terminate readably: {e}"));
         // The series' parity rows go beside its cells whatever became of them:
         // parity is measured after determinism and never decides the emit.
-        parity_line = Some(append_series_parity(
+        parity_outcome = Some(append_series_parity(
             &script,
             parent,
             results,
@@ -4115,7 +4379,10 @@ fn emit_series_to(
     })();
     SeriesEmission {
         cells,
-        parity: parity_line,
+        parity_accepted: parity_outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.accepted),
+        parity: parity_outcome.map(|outcome| outcome.line),
     }
 }
 
@@ -4167,7 +4434,11 @@ fn append_series_parity(
     source_tree_dirty: bool,
     producer: parity::ParityProducer,
     bounds: parity::AppendBounds,
-) -> String {
+) -> parity::LedgerAppendOutcome {
+    let refused = |line: String| parity::LedgerAppendOutcome {
+        line,
+        accepted: false,
+    };
     let rows = match parity::node_ledger_sources(
         results,
         parity::PRESSURE_TEST_LEDGER_LANE,
@@ -4176,23 +4447,27 @@ fn append_series_parity(
     ) {
         Ok(rows) => rows,
         Err(error) => {
-            return format!(
+            return refused(format!(
                 "parity: ERROR: no parity rows appended; the post-pass outputs in {} were \
                  refused: {error}",
                 results.display()
-            );
+            ));
         }
     };
     if rows.is_empty() {
         if let Some(line) = unfinished_series_post_pass(results) {
-            return line;
+            return refused(line);
         }
-        return format!(
-            "parity: no parity post-pass output in {}; nothing appended",
-            results.display()
-        );
+        // Nothing to send is complete: no publication is owed.
+        return parity::LedgerAppendOutcome {
+            line: format!(
+                "parity: no parity post-pass output in {}; nothing appended",
+                results.display()
+            ),
+            accepted: true,
+        };
     }
-    parity::append_ledger_rows(
+    parity::append_ledger_rows_outcome(
         &parity::LedgerAppend {
             series: script,
             parent,
@@ -4304,13 +4579,32 @@ struct CheckedScorecard<'a> {
 }
 
 fn check_scorecard(root: &Path) -> Result<CheckedScorecard<'_>, String> {
-    let output = Command::new(root.join("ci/compat-envelope/scorecard.rs"))
+    let mut command = Command::new(root.join("ci/compat-envelope/scorecard.rs"));
+    // A unit test never takes the checkout's real write-back lock. That lock
+    // is the Git common directory's, shared by every worktree of the primary
+    // checkout, so a live write-back elsewhere on the host would hold the
+    // test for the check's 30 s lock timeout and then fail it.
+    #[cfg(test)]
+    let private_lock = env::temp_dir().join(format!(
+        "hermit-pressure-test-scorecard-lock-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    #[cfg(test)]
+    command.env("HERMIT_SCORECARD_WRITEBACK_LOCK", &private_lock);
+    let output = command
         .arg("check")
         .current_dir(root)
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|e| format!("cannot run scorecard check: {e}"))?;
+        .map_err(|e| format!("cannot run scorecard check: {e}"));
+    #[cfg(test)]
+    let _ = fs::remove_file(&private_lock);
+    let output = output?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     eprint!("{stderr}");
     if output.status.success() {
@@ -4360,7 +4654,10 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         return Err("--sample must be positive".into());
     }
     let budgets = load_budgets(root)?;
-    let tracked = load_tracked_cells(root)?;
+    let tracked = match PLANTED_TRACKED_CELLS.with(|planted| planted.borrow().clone()) {
+        Some(planted) => planted,
+        None => load_tracked_cells(root)?,
+    };
     let (requested_cells, cells_file_sha256) = if let Some(path) = &selection.cells_file {
         let (cells, digest) = load_cells_file(path)?;
         (Some(cells), Some(digest))
@@ -7651,7 +7948,7 @@ fn matched_attempts_end_as_declared(row: &CellResult) -> bool {
         // Check the declaration before matching it, as the per-attempt check
         // does: a declaration the runner itself would refuse credits nothing,
         // and an out-of-range signal would overflow the match's `128 + signal`.
-        if validate_expected_guest_exit("result row", &row.mode, Some(declared)).is_err() {
+        if validate_result_expected_guest_exit("result row", &row.mode, Some(declared)).is_err() {
             return false;
         }
         let hermit_args = attempt
@@ -7662,10 +7959,7 @@ fn matched_attempts_end_as_declared(row: &CellResult) -> bool {
         let names_declaration = |code: Option<i32>, signal: Option<i32>| {
             code == declared.code && signal == declared.signal
         };
-        row.mode == "verify"
-            && hermit_args
-                .iter()
-                .any(|arg| arg == "--verify-allow=failure")
+        invocation_admits_declared_guest_exit(&row.mode, hermit_args)
             && declared.hermit_status_matches(attempt.status, attempt.signal)
             && names_declaration(report.guest_exit_code, report.guest_signal)
             && report.compared_outputs.as_ref().is_some_and(|outputs| {
@@ -7853,6 +8147,29 @@ fn reconcile_recorded_result(
         if derived_result == "infrastructure-error" || derived_result == recorded_result.as_str() {
             return Ok(recorded_result.as_str());
         }
+    }
+    // The consistency check cannot see a chaos cell's population floor, so it
+    // takes a FAIL whose harness exited nonzero for a crash. The runner names
+    // that FAIL a chaos-floor failure only when every attempt matched, and so
+    // does this check.
+    if recorded_result == ObservedResult::ChaosFloorFailure {
+        let every_attempt_matched = !captured_attempts.is_empty()
+            && captured_attempts.iter().all(|attempt| {
+                attempt
+                    .verification_report
+                    .as_ref()
+                    .and_then(|raw| {
+                        VerificationReport::from_current_json_slice(raw.as_bytes()).ok()
+                    })
+                    .is_some_and(|report| report.verdict == Verdict::Matched)
+            });
+        return if derived_result == "crash-error" && every_attempt_matched {
+            Ok(recorded_result.as_str())
+        } else {
+            Err(format!(
+                "framework result chaos-floor-failure needs a crash-error consistency check over attempts that all matched, got {derived_result} (every attempt matched: {every_attempt_matched})"
+            ))
+        };
     }
     if recorded_result.as_str() != derived_result {
         return Err(format!(
@@ -10552,10 +10869,10 @@ fn summarize(
         println!();
     }
     println!(
-        "| Backend | Pass | Determinism failure | Replay failure | Crash/error | Timeout | OOM | Sandbox denied | Infrastructure error | Total |"
+        "| Backend | Pass | Determinism failure | Replay failure | Crash/error | Chaos floor | Timeout | OOM | Sandbox denied | Infrastructure error | Total |"
     );
-    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
-    let mut totals = [0usize; 9];
+    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    let mut totals = [0usize; 10];
     for backend in [
         "ptrace",
         "dbt",
@@ -10570,6 +10887,7 @@ fn summarize(
         let determinism = counts.get("determinism-failure").copied().unwrap_or(0);
         let replay = counts.get("replay-failure").copied().unwrap_or(0);
         let crash_error = counts.get("crash-error").copied().unwrap_or(0);
+        let chaos_floor = counts.get("chaos-floor-failure").copied().unwrap_or(0);
         let timeout = counts.get("timeout").copied().unwrap_or(0);
         let oom = counts.get("oom").copied().unwrap_or(0);
         let sandbox_denied = counts.get("sandbox-denied").copied().unwrap_or(0);
@@ -10578,6 +10896,7 @@ fn summarize(
             + determinism
             + replay
             + crash_error
+            + chaos_floor
             + timeout
             + oom
             + sandbox_denied
@@ -10586,17 +10905,18 @@ fn summarize(
         totals[1] += determinism;
         totals[2] += replay;
         totals[3] += crash_error;
-        totals[4] += timeout;
-        totals[5] += oom;
-        totals[6] += sandbox_denied;
-        totals[7] += infrastructure;
-        totals[8] += total;
+        totals[4] += chaos_floor;
+        totals[5] += timeout;
+        totals[6] += oom;
+        totals[7] += sandbox_denied;
+        totals[8] += infrastructure;
+        totals[9] += total;
         println!(
-            "| `{backend}` | {pass} | {determinism} | {replay} | {crash_error} | {timeout} | {oom} | {sandbox_denied} | {infrastructure} | {total} |"
+            "| `{backend}` | {pass} | {determinism} | {replay} | {crash_error} | {chaos_floor} | {timeout} | {oom} | {sandbox_denied} | {infrastructure} | {total} |"
         );
     }
     println!(
-        "| **Total** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** |",
+        "| **Total** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** |",
         totals[0],
         totals[1],
         totals[2],
@@ -10605,7 +10925,8 @@ fn summarize(
         totals[5],
         totals[6],
         totals[7],
-        totals[8]
+        totals[8],
+        totals[9]
     );
     println!();
     println!(
@@ -10825,16 +11146,17 @@ fn summarize(
         &mut std::io::stdout(),
         &mut std::io::stderr(),
     );
-    if totals[6] > 0 {
-        return Err(format!(
-            "{} selected cell run(s) were sandbox-denied before the requested operation completed; retained stdout/stderr names the BPFJailer denial",
-            totals[6]
-        ));
-    }
+    // Indices as the summary table's columns: 7 sandbox denied, 8 infrastructure error.
     if totals[7] > 0 {
         return Err(format!(
-            "{} selected cell run(s) produced no trustworthy result; these are harness/infrastructure errors, not compatibility evidence",
+            "{} selected cell run(s) were sandbox-denied before the requested operation completed; retained stdout/stderr names the BPFJailer denial",
             totals[7]
+        ));
+    }
+    if totals[8] > 0 {
+        return Err(format!(
+            "{} selected cell run(s) produced no trustworthy result; these are harness/infrastructure errors, not compatibility evidence",
+            totals[8]
         ));
     }
     let repeated_red = metadata.repetitions.is_some() && !metadata.green;
@@ -13048,16 +13370,17 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
             ))
             .is_some_and(|budget| budget.attempts.is_some())
     };
-    // SaBRe has disabled, red and green verify cells. This fixture used
+    // DBT has disabled, red and green verify cells. This fixture used
     // liteinst until every liteinst cell was switched off for the in-guest
-    // reset (https://github.com/rrnewton/hermit/issues/3520).
+    // reset (https://github.com/rrnewton/hermit/issues/3520), then SaBRe until
+    // SaBRe was archived on 2026-10-25 and kept no green cell.
     let mut ids: Vec<_> = tracked
         .cells
         .iter()
         .filter(|cell| {
             !cell.is_applicable()
                 && cell.status == "not-applicable"
-                && cell.id.backend == "sabre"
+                && cell.id.backend == "dbt"
                 && cell.id.mode == "verify"
                 && executable(cell)
         })
@@ -13065,7 +13388,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         .map(|cell| cell.id.clone())
         .collect();
     if ids.len() != 2 {
-        return Err("disabled cells-file self-test needs two executable SaBRe verify cells".into());
+        return Err("disabled cells-file self-test needs two executable DBT verify cells".into());
     }
     ids.sort();
     let path = scratch.join("disabled-cells.jsonl");
@@ -13080,7 +13403,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         path.to_string_lossy().into_owned(),
         "--probe-disabled".into(),
         "--backend".into(),
-        "sabre".into(),
+        "dbt".into(),
         "--repetitions".into(),
         "10".into(),
         "--jobs".into(),
@@ -13160,13 +13483,13 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
             && executable(cell)
     })?;
     let red = fixture_id(&|cell| {
-        cell.id.backend == "sabre" && cell.status == "red" && cell.is_applicable()
+        cell.id.backend == "dbt" && cell.status == "red" && cell.is_applicable()
     })?;
     let green = fixture_id(&|cell| {
-        cell.id.backend == "sabre" && cell.status == "green" && cell.is_applicable()
+        cell.id.backend == "dbt" && cell.status == "green" && cell.is_applicable()
     })?;
     let unavailable = fixture_id(&|cell| {
-        cell.id.backend == "sabre"
+        cell.id.backend == "dbt"
             && cell.status == "not-applicable"
             && !cell.is_applicable()
             && !executable(cell)
@@ -13177,7 +13500,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         (
             "wrong backend",
             wrong_backend,
-            "does not match --probe-disabled --backend sabre",
+            "does not match --probe-disabled --backend dbt",
         ),
         (
             "not selected by full",
@@ -13278,7 +13601,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         || metadata.unavailable_cells != 0
         || !metadata.probe_disabled
         || metadata.green
-        || metadata.backend.as_deref() != Some("sabre")
+        || metadata.backend.as_deref() != Some("dbt")
         || metadata.cells_file.as_deref() != Some(path.to_string_lossy().as_ref())
         || metadata.cells_file_sha256.as_deref() != Some(file_digest.as_str())
         || metadata.selected_population_sha256.as_deref() != Some(population_digest.as_str())
@@ -13295,11 +13618,11 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         || dag.resource_caps.get("manifest_guest") != Some(&2)
         || cell_steps.iter().any(|step| {
             !step.cmd.contains("--probe-disabled")
-                || !step.cmd.contains("--backend 'sabre'")
+                || !step.cmd.contains("--backend 'dbt'")
                 || step.cmd.contains("--include-manual")
                 || !step.cmd.contains("--require-install")
                 || !step.cmd.contains("E2E_KEEP_VERIFY_LOGS=1")
-                // The SaBRe runtime is staged by build.workspace and
+                // The DBT runtime is staged by build.workspace and
                 // published with the one Hermit binary by build.e2e_artifact.
                 || !step.deps.contains(&"build.e2e_artifact".to_string())
         })
@@ -14367,7 +14690,7 @@ fn inherited_location_fresh_checkout_self_test(source: &Path, sha: &str) -> Resu
         for (name, value) in inherited {
             env::set_var(name, value);
         }
-        let prepared = enter_fresh_checkout(source, sha);
+        let prepared = enter_fresh_checkout(source, sha, false);
         let leaked = GIT_REPOSITORY_LOCATION_VARIABLES
             .into_iter()
             .filter(|name| env::var_os(name).is_some())
@@ -14462,6 +14785,84 @@ fn fresh_checkout_base_self_test(source: &Path, sha: &str) -> Result<(), String>
         ));
     }
     Ok(())
+}
+
+/// `run --reuse-fresh-checkout` keeps one generated checkout per commit: a
+/// second run of the commit reuses the same directory and what was built in
+/// it, a concurrent run is refused, and a checkout that is no longer exactly
+/// the commit (here an untracked file) is rebuilt rather than reused.
+fn reusable_fresh_checkout_self_test(source: &Path, sha: &str) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let identity = |path: &Path| -> Result<(u64, u64), String> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+        Ok((metadata.dev(), metadata.ino()))
+    };
+    let first = FreshCheckout::reuse_or_prepare(source, sha)?;
+    let path = first.path.clone();
+    let result = (|| {
+        let expected = source
+            .join("ignored")
+            .join(format!("{REUSABLE_FRESH_PREFIX}{sha}"));
+        if path != expected {
+            return Err(format!(
+                "reusable checkout is {}, not {}",
+                path.display(),
+                expected.display()
+            ));
+        }
+        // What a build leaves behind, where git status does not look.
+        let built = path.join(".git").join("pressure-test-reuse-probe");
+        fs::write(&built, "built\n")
+            .map_err(|e| format!("cannot write {}: {e}", built.display()))?;
+        let original = identity(&path)?;
+        match FreshCheckout::reuse_or_prepare(source, sha) {
+            Err(error) if error.contains("another pressure-test run is using") => {}
+            Err(error) => {
+                return Err(format!(
+                    "concurrent reuse failed for another reason: {error}"
+                ));
+            }
+            Ok(_) => return Err("a second concurrent run was given the reusable checkout".into()),
+        }
+        first.cleanup()?;
+        drop(first);
+        if identity(&path)? != original {
+            return Err("cleanup removed the reusable checkout".into());
+        }
+        let second = FreshCheckout::reuse_or_prepare(source, sha)?;
+        if identity(&second.path)? != original || !built.is_file() {
+            return Err("an exact reusable checkout was rebuilt instead of reused".into());
+        }
+        let dirty = second.path.join("pressure-test-reuse-dirty");
+        fs::write(&dirty, "dirty\n")
+            .map_err(|e| format!("cannot write {}: {e}", dirty.display()))?;
+        drop(second);
+        let third = FreshCheckout::reuse_or_prepare(source, sha)?;
+        if built.exists() || dirty.exists() {
+            return Err("a reusable checkout with an untracked file was reused".into());
+        }
+        if git_output(&third.path, &["rev-parse", "HEAD"])? != sha || worktree_dirty(&third.path)? {
+            return Err("the rebuilt reusable checkout is not exactly the commit".into());
+        }
+        drop(third);
+        Ok(())
+    })();
+    let removed = fs::remove_dir_all(&path)
+        .and_then(|()| {
+            fs::remove_file(
+                source
+                    .join("ignored")
+                    .join(format!("{REUSABLE_FRESH_PREFIX}{sha}.lock")),
+            )
+        })
+        .map_err(|e| {
+            format!(
+                "cannot remove self-test reusable checkout {}: {e}",
+                path.display()
+            )
+        });
+    result.and(removed)
 }
 
 /// The bytes of a repository's HEAD, index, config, packed refs and loose refs,
@@ -15955,6 +16356,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     inherited_location_fresh_checkout_self_test(&clone_source, &clone_sha)?;
     fresh_checkout_base_self_test(&clone_source, &clone_sha)?;
+    reusable_fresh_checkout_self_test(&clone_source, &clone_sha)?;
     fs::write(scratch.join("old-row"), "stale\n")
         .map_err(|e| format!("cannot write self-test stale row: {e}"))?;
     if require_empty_result_dir(&scratch).is_ok() {
@@ -16363,19 +16765,34 @@ fn self_test(root: &Path) -> Result<(), String> {
         .cloned()
         .ok_or("self-test needs one executable non-KVM red verify cell for --cells-file")?;
     // The mixed --cells-file plan below checks the kvm_guest resource and cap,
-    // and a cells-file names only red cells, so it still needs a red KVM
-    // verify cell (https://github.com/rrnewton/hermit/issues/4538).
-    let red_kvm = tracked
-        .cells
-        .iter()
-        .find(|cell| {
-            cell.is_applicable()
-                && cell.status == "red"
-                && cell.id.mode == "verify"
-                && cell.id.backend == "kvm"
-        })
-        .ok_or("self-test needs at least one red KVM verify cell for its --cells-file plan")?;
-    let mut cells_file_ids = vec![red_kvm.id.clone(), non_kvm_cells_file_id];
+    // and a cells-file names only red cells, so it needs a red KVM verify
+    // cell. Once every KVM verify cell is selected the live scorecard has
+    // none (https://github.com/rrnewton/hermit/issues/4538), so that plan
+    // selects from a copy of the tracked cells in which one applicable green
+    // KVM verify cell is planted red; a red one, while there is one, is used
+    // as it is.
+    let mut planted_tracked = tracked.clone();
+    let red_kvm = match planted_tracked.cells.iter().position(|cell| {
+        cell.is_applicable()
+            && cell.status == "red"
+            && cell.id.mode == "verify"
+            && cell.id.backend == "kvm"
+    }) {
+        Some(index) => index,
+        None => {
+            let index = planted_tracked
+                .cells
+                .iter()
+                .position(|cell| {
+                    cell.status == "green" && cell.id.mode == "verify" && cell.id.backend == "kvm"
+                })
+                .ok_or("self-test needs an applicable KVM verify cell for its --cells-file plan")?;
+            planted_tracked.cells[index].status = "red".into();
+            index
+        }
+    };
+    let red_kvm_id = planted_tracked.cells[red_kvm].id.clone();
+    let mut cells_file_ids = vec![red_kvm_id, non_kvm_cells_file_id];
     cells_file_ids.sort();
     let cells_file_path = scratch.join("selected-cells.jsonl");
     let cells_file_text = canonical_cells_jsonl(&cells_file_ids)?;
@@ -16482,6 +16899,9 @@ fn self_test(root: &Path) -> Result<(), String> {
     run_state_exclusive_self_test(root, &scratch)?;
     unsampleable_sample_self_test(root, &scratch)?;
 
+    // From here to the retained-run checks every selection reads the planted
+    // tracked cells (above).
+    let planted = PlantedTrackedCells::install(planted_tracked);
     let cells_file_results = scratch.join("cells-file-plan");
     let cells_file_budget_keys = cells_file_ids
         .iter()
@@ -16809,6 +17229,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             "retained --cells-file population mutation reported the wrong error: {population_mutation_error}"
         ));
     }
+    drop(planted);
     let green_id = tracked
         .cells
         .iter()
@@ -21437,6 +21858,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             virtual_nanoseconds: 35,
             syscalls: Some(6),
             dispatch: None,
+            syscall_histogram: None,
         }),
         run2: None,
     };
@@ -22733,6 +23155,19 @@ mod pressure_sample_tests {
                 "{label}"
             );
         }
+        // A replay cell carries its verify recipe's declaration (the runner's
+        // cell_expected_guest_exit) and passes on it through the same exact
+        // match, so its matched exit 23 is retained as declared too
+        // (coordinator decision, 2026-10-25; until then this was refused).
+        let replay_23 = comparison_attempt("replay", 23);
+        let retained = retained_pressure_attempt("replay", Some(&code_23), &replay_23)
+            .unwrap_or_else(|error| panic!("a replay cell: {error}"));
+        assert_eq!(inner_pressure_category(&retained), None);
+        assert!(qualifying_subruns(
+            "replay",
+            Some(&code_23),
+            std::slice::from_ref(&replay_23)
+        ));
         let mut killed_137 = killed_139.clone();
         killed_137.status = Some(137);
         let mut blank_reason = code_23.clone();
@@ -22742,7 +23177,6 @@ mod pressure_sample_tests {
         let both = declare(Some(23), Some(23));
         let exits_22 = comparison_attempt("verify", 22);
         let exits_151 = comparison_attempt("verify", 151);
-        let replay_23 = comparison_attempt("replay", 23);
         let mut failed_23 = exits_23.clone();
         failed_23.outcome = "FAIL".into();
         for (label, mode, declared, attempt) in [
@@ -22775,7 +23209,6 @@ mod pressure_sample_tests {
             // A declaration the runner itself refuses accepts nothing more.
             ("a blank reason", "verify", Some(&blank_reason), &exits_23),
             ("both a code and a signal", "verify", Some(&both), &exits_23),
-            ("a replay cell", "replay", Some(&code_23), &replay_23),
             (
                 "an invocation that did not pass",
                 "verify",
@@ -22820,6 +23253,29 @@ mod pressure_sample_tests {
         ));
         row.attempts[0].argv.push("--verify-allow=failure".into());
         assert!(matched_attempts_end_as_declared(&row));
+        // A replay cell's row carries the declaration its verify recipe made
+        // (the runner's cell_expected_guest_exit) and is credited from the
+        // replay's own invocation, `record start` with the comparison's
+        // --verify-allow=both, and from no verify invocation.
+        let mut replay = row.clone();
+        replay.mode = "replay".into();
+        assert!(!matched_attempts_end_as_declared(&replay));
+        replay.attempts[0].argv = [
+            "hermit-verify-pair",
+            "hermit",
+            "log-diff",
+            "--verify-allow=both",
+            "hermit",
+            "record",
+            "start",
+            "--verify-strict",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert!(matched_attempts_end_as_declared(&replay));
+        let mut verify_on_replay = replay.clone();
+        verify_on_replay.mode = "verify".into();
+        assert!(!matched_attempts_end_as_declared(&verify_on_replay));
         assert!(
             inner_pressure_history(std::slice::from_ref(&row))
                 .unwrap()
@@ -24572,6 +25028,58 @@ mod pressure_sample_tests {
                 "infrastructure-error"
             );
         }
+    }
+
+    /// The consistency check takes a chaos-floor failure's FAIL for a crash;
+    /// the framework's chaos-floor-failure reconciles with that only when
+    /// every captured attempt matched, as the runner assigns it.
+    #[test]
+    fn a_chaos_floor_failure_reconciles_only_over_matched_attempts() {
+        let floor = ObservedResult::ChaosFloorFailure;
+        let matched = [
+            comparison_attempt("chaos", 0),
+            comparison_attempt("chaos", 0),
+        ];
+        assert_eq!(
+            reconcile_recorded_result(Some(floor), floor.failure_class(), "crash-error", &matched)
+                .unwrap(),
+            "chaos-floor-failure"
+        );
+        for derived in [
+            "pass",
+            "determinism-failure",
+            "timeout",
+            "infrastructure-error",
+        ] {
+            assert!(
+                reconcile_recorded_result(Some(floor), floor.failure_class(), derived, &matched)
+                    .is_err(),
+                "{derived}"
+            );
+        }
+        let mut unmatched = matched.clone();
+        unmatched[1].verification_report = None;
+        assert!(
+            reconcile_recorded_result(
+                Some(floor),
+                floor.failure_class(),
+                "crash-error",
+                &unmatched
+            )
+            .is_err()
+        );
+        assert!(
+            reconcile_recorded_result(Some(floor), floor.failure_class(), "crash-error", &[])
+                .is_err()
+        );
+        let error = reconcile_recorded_result(
+            Some(floor),
+            Some(FailureClass::NoResult),
+            "crash-error",
+            &matched,
+        )
+        .unwrap_err();
+        assert!(error.contains("carries failure_class"), "{error}");
     }
 
     #[test]
@@ -28575,6 +29083,10 @@ sys.exit(2)
         }
 
         fn append(&self) -> String {
+            self.append_outcome().line
+        }
+
+        fn append_outcome(&self) -> parity::LedgerAppendOutcome {
             append_series_parity(
                 &self.path("series.py"),
                 &self.path("parent"),
@@ -28739,6 +29251,12 @@ sys.exit(2)
     /// append it is sent in `calls.jsonl`; its append-cells exits
     /// `cells_exit`.
     fn recording_parent(root: &Path, cells_exit: u8) -> PathBuf {
+        recording_parent_with(root, cells_exit, 0)
+    }
+
+    /// A recording series writer whose append-cells exits CELLS_EXIT and whose
+    /// append-parity (after its `--help` probe) exits PARITY_EXIT.
+    fn recording_parent_with(root: &Path, cells_exit: u8, parity_exit: u8) -> PathBuf {
         let parent = root.join("parent");
         let series = parent.join("ci-hub/series");
         fs::create_dir_all(&series).unwrap();
@@ -28754,6 +29272,9 @@ with parent.joinpath("calls.jsonl").open("a") as calls:
     calls.write(json.dumps({{"argv": args, "stdin": sys.stdin.read()}}) + "\n")
 if args[0] == "append-cells" and {cells_exit}:
     sys.exit({cells_exit})
+if args[0] == "append-parity" and {parity_exit}:
+    print("fixture append-parity refused", file=sys.stderr)
+    sys.exit({parity_exit})
 print("fixture " + args[0] + " accepted")
 "#
             ),
@@ -28784,6 +29305,106 @@ print("fixture " + args[0] + " accepted")
                 (argv, stdin)
             })
             .collect()
+    }
+
+    /// The series-emitted marker is written only when everything the series
+    /// owed was published: its cells appended and every parity row accepted.
+    /// A refused parity append, including a `--parity-all` series' (whose
+    /// only output is parity rows), leaves no marker, so the nightly emits the
+    /// part again; a series with no parity output owes none.
+    #[test]
+    fn a_series_is_marked_published_only_when_cells_and_parity_were_accepted() {
+        // (label, append-cells exit, append-parity exit, parity-all, parity
+        // output present, publish_series succeeds, marker written)
+        for (label, cells_exit, parity_exit, parity_all, parity_output, ok, marked) in [
+            ("all-accepted", 0u8, 0u8, false, true, true, true),
+            ("parity-refused", 0, 1, false, true, true, false),
+            ("cells-refused", 1, 0, false, true, false, false),
+            ("parity-all-refused", 0, 1, true, true, true, false),
+            ("parity-all-accepted", 0, 0, true, true, true, true),
+            ("no-parity-output", 0, 1, false, false, true, true),
+        ] {
+            let fixture = Fixture::new(&format!("marker-{label}"), WRITER);
+            let parent = recording_parent_with(&fixture.root.path, cells_exit, parity_exit);
+            let results = fixture.path("results");
+            if !parity_output {
+                fs::remove_file(results.join(parity::PARITY_STATUS_JSON)).unwrap();
+                fs::remove_file(results.join(parity::PARITY_JSONL)).unwrap();
+            }
+            fs::write(
+                results.join("run.json"),
+                json!({
+                    "schema": RUN_SCHEMA, "run_id": RUN, "hermit_sha": TREE,
+                    "detcore_tree": "fixture-detcore-tree", "source_tree_dirty": false,
+                    "run_timeout_seconds": 60, "cells": [], "parity_all": parity_all,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let cell = results.join("cells/portable-aio-refusal-verify-kvm");
+            fs::create_dir_all(&cell).unwrap();
+            let row = json!({
+                "schema": CELL_RESULT_SCHEMA, "run_id": RUN, "hermit_sha": TREE,
+                "source_tree_dirty": false, "test": "c-programs/aio-refusal",
+                "category": "c-programs", "lane": "portable", "mode": "verify",
+                "backend": "kvm", "classification": "required", "outcome": "PASS",
+                "attempt": 1, "run_index": 0, "argv": ["fixture"], "guest_argv": ["fixture"],
+                "env": {}, "cwd": "/", "shell_command": "fixture", "attempts": [],
+                "artifact_dir": "/retained/1",
+            });
+            fs::write(cell.join("results.jsonl"), format!("{row}\n")).unwrap();
+            let published = publish_series(
+                &parent,
+                &results,
+                &fixture.path("checkout"),
+                false,
+                SERIES_APPEND_CELLS_BOUND,
+                parity::AppendBounds::default(),
+                true,
+            );
+            assert_eq!(published.is_ok(), ok, "{label}: {published:?}");
+            assert_eq!(
+                results.join(SERIES_EMITTED_MARKER).is_file(),
+                marked,
+                "{label}"
+            );
+            if marked {
+                let marker: serde_json::Value = serde_json::from_str(
+                    &fs::read_to_string(results.join(SERIES_EMITTED_MARKER)).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(marker, json!({"schema": 1, "emitted_by": "run"}), "{label}");
+            }
+        }
+    }
+
+    /// `emit-series`, the post-run command, never writes the marker.
+    #[test]
+    fn the_post_run_emit_never_writes_the_marker() {
+        let fixture = Fixture::new("marker-post-run", WRITER);
+        let parent = recording_parent(&fixture.root.path, 0);
+        let results = fixture.path("results");
+        fs::write(
+            results.join("run.json"),
+            json!({
+                "schema": RUN_SCHEMA, "run_id": RUN, "hermit_sha": TREE,
+                "detcore_tree": "fixture-detcore-tree", "source_tree_dirty": false,
+                "run_timeout_seconds": 60, "cells": [], "parity_all": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        publish_series(
+            &parent,
+            &results,
+            &fixture.path("checkout"),
+            false,
+            SERIES_APPEND_CELLS_BOUND,
+            parity::AppendBounds::default(),
+            false,
+        )
+        .unwrap();
+        assert!(!results.join(SERIES_EMITTED_MARKER).exists());
     }
 
     /// `emit_series`, the call site that sends a run's cells and then its

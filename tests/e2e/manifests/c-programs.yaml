@@ -83,11 +83,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - liteinst
           - in-guest-trap
         backends_disabled:
-          dbt: "Not yet qualified for this memfd-backed procfs identity check"
           kvm: "Initial C-corpus migration preserves the established ptrace and SaBRe baseline; qualify KVM separately"
         hermit_args:
           liteinst:
@@ -1103,12 +1103,13 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: "The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest execs a child after vfork, so its run is refused. It passed before only because that exec failed with EOPNOTSUPP in both verify runs and the exec'd image never ran."
           in-guest-trap: "The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest execs a child after vfork, so its run is refused. It passed before only because that exec failed with EOPNOTSUPP in both verify runs and the exec'd image never ran."
@@ -1178,12 +1179,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -1980,14 +1981,15 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -2943,16 +2945,17 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
         backends_disabled:
           liteinst: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (no thread ever runs) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
           in-guest-trap: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (no thread ever runs) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       naked:
@@ -4046,14 +4049,23 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
+          - dbt
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: userfaultfd has not been qualified on DBT
           kvm: userfaultfd has not been qualified on KVM
           sabre: userfaultfd has not been qualified on SaBRe
-          liteinst: This verify mode stays out of CI until its first validation receipts, so full validation would not run an in-guest cell here; it passed 10 of 10 verify runs with the maximum timeslice disabled in a local survey on 2026-10-08 and joins when the mode enters CI (https://github.com/rrnewton/hermit/issues/3745); in-guest LiteInst also runs this program in hermit-cli's liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered
-          in-guest-trap: This verify mode stays out of CI until its first validation receipts, so full validation would not run an in-guest cell here; it passed 10 of 10 verify runs with the maximum timeslice disabled in a local survey on 2026-10-08 and joins when the mode enters CI (https://github.com/rrnewton/hermit/issues/3745); in-guest LiteInst also runs this program in hermit-cli's liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each ran clean that way, 3 of 3, on the five nightly pressure sweeps from 2026-10-21 to 2026-10-25 (Hermit 9b30cb9a to 7903351d), after 10 of 10 in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
         expected_stdout_contains:
           ptrace: "userfaultfd-"
       naked:
@@ -4558,16 +4570,17 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
         backends_disabled:
           liteinst: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (no thread ever runs) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
           in-guest-trap: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (no thread ever runs) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       naked:
@@ -5792,14 +5805,15 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -6309,16 +6323,17 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
         backends_disabled:
           liteinst: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 9) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
           in-guest-trap: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 9) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
@@ -6501,6 +6516,256 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/proc-stat-comm
+    description: "tests/c/proc_stat_comm.c reads its own /proc/<pid>/stat as Linux shows it (fs/proc/array.c do_task_stat): by self, its pid, thread-self and task/<tid> (52 fields; the fields that are not host numbers printed as values, and pid, parent, process group and session compared with getpid, getppid, getpgrp and getsid); a thread's task stat while it sleeps (S, exit signal -1, PF_FORKNOEXEC) and the leader's from the thread; a fork child's; a fork child's stat by number, opened and renamed by that child (whose parent is this guest, so above 1), read through an inherited descriptor by a grandchild that gave itself another name (the described task's name, not the reader's, and its parent compared with its own getppid: on DBT the tool reads the name, and numbers the parent, by the kernel's numbers); and a stat descriptor opened before an exec and read after it (the new image's name). It checks the name stat shows after PR_SET_NAME (a long name, raw bytes), after writes to /proc/<pid>/comm (a newline kept, 15 bytes, an empty write, writev, pwrite, a bad buffer, a read-only descriptor), after pthread_setname_np of another thread, and after execs of the path that started it, /proc/self/exe, a symbolic link with a long name and execveat(AT_EMPTY_PATH) of a descriptor, falling back to execve of the same file where that exec fails. Wherever it checks a name it also compares the comm file with stat's name, and for the root image Hermit launched it compares PR_GET_NAME and stat with the comm file; it reads a comm file in parts, by pread at 0 and after a rewind, across renames (fs/seq_file.c seq_read_iter and seq_lseek), and checks the flags preadv2 takes on its comm and stat (seq_read without read_iter: RWF_HIPRI alone, EOPNOTSUPP for RWF_DSYNC, RWF_SYNC and RWF_APPEND). Detcore renders a process's own stat (package K slice D4c-1), and on KVM also the reads of the process's own comm files, from its record of task names (package K slice A+); Detcore refuses an open of a rendered comm for writing with EACCES (its declared difference from Linux, which renames the task), and on ptrace and DBT the comm files stay the kernel's. The guest prints every answer as it is. Standard output is the oracle and the program exits 0; the ptrace row is the native output (Linux 7.1, host gcc and the pinned root's gcc 15.3 and glibc 2.42, as a user and as root). The ptrace row assumes a host running Linux 6.14 or later, where execveat(fd, \"\", AT_EMPTY_PATH) names the task by the file (comm_from_dentry); an older host names it by the descriptor and the row goes red for a host reason. Every row is measured under Hermit (strict verification at bitwise parity). The KVM row is the native output with Detcore's EACCES (13) for an open of /proc/<pid>/comm for writing (glibc's pthread_setname_np of another thread returns it, so that thread keeps the name it gave itself, which its comm files, pthread_getname_np and stat show) and its ENOTSUP (95) for execveat(AT_EMPTY_PATH), a named KVM refusal (reverie-kvm's executor execs only by path). The DBT row is the native output with two named DBT differences that are not Detcore's: DBT refuses execveat with ENOSYS (38; c-programs/dbt-execveat-unsupported), after which the guest execs the same file by path; and DynamoRIO, which runs an exec of /proc/self/exe as the image's real path and names the task by the basename of that path (its loader's PR_SET_NAME), leaves the task named program (the file's name) where Linux names it exe, which PR_GET_NAME, the comm file and stat all show (https://github.com/rrnewton/hermit/issues/4595)"
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/proc_stat_comm.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+        - -pthread
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - dbt
+          - kvm
+        backends_disabled:
+          sabre: "NAMED GAP, not fixed, under the owner's ruling that SaBRe is a drop candidate: the guest re-executes itself four times and starts a thread that exits; SaBRe kills a guest with SIGSEGV when a thread exits, at glibc's madvise(MADV_DONTNEED) of the exiting thread's stack (https://github.com/rrnewton/hermit/issues/4562)."
+          liteinst: "NAMED GAP: the guest re-executes itself to name itself, and the in-guest runtime refuses execve and execveat with a typed refusal that ends the run (https://github.com/rrnewton/hermit/issues/4567)."
+          in-guest-trap: "NAMED GAP: the guest re-executes itself to name itself, and the in-guest runtime refuses execve and execveat with a typed refusal that ends the run (https://github.com/rrnewton/hermit/issues/4567)."
+        expected_stdout:
+          ptrace: "root image prctl-is-comm-file=1 stat-is-comm-file=1\nnamed by the path it was started by prctl=1 stat=1 comm-file=1 comm-is-stat=1\nown stat fields=52 pid-is-task=1 comm=probe-start state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nown stat by pid fields=52 pid-is-task=1 comm=probe-start state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nthread-self stat fields=52 pid-is-task=1 comm=probe-start state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nown task stat fields=52 pid-is-task=1 comm=probe-start state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nafter PR_SET_NAME PR_GET_NAME=0123456789abcde\\0\ncomm after PR_SET_NAME len=16 bytes=0123456789abcde\\x0a\nthread-self comm after PR_SET_NAME len=16 bytes=0123456789abcde\\x0a\nstat after PR_SET_NAME fields=52 pid-is-task=1 comm=0123456789abcde state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\ncomm with raw bytes len=7 bytes=a)b\\x0a\\\\c\\x0a\nstat with raw bytes fields=52 pid-is-task=1 comm=a)b\\x0a\\\\c state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\ncomm read in parts: 3+8 bytes=first-name\\x0a\ncomm pread at 0 after a rename: bytes=second-name\\x0a\ncomm read after a rewind and a rename: bytes=third-name\\x0a\ncomm preadv2: 0=11 hipri=11 dsync=errno95 sync=errno95 append=errno95\nstat preadv2: 0=ok hipri=ok dsync=errno95 sync=errno95 append=errno95\nwrite w1\\n: 3\nposition after write: 0\ncomm after write len=4 bytes=w1\\x0a\\x0a\nstat after write fields=52 pid-is-task=1 comm=w1\\x0a state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nafter write PR_GET_NAME=w1\\x0a\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\nwrite 19 bytes: 19\ncomm after a long write len=16 bytes=0123456789abcde\\x0a\nwrite 0 bytes: 0\ncomm after an empty write len=1 bytes=\\x0a\nwritev: 11\ncomm after writev len=7 bytes=second\\x0a\npwrite: -1 errno=29\nwrite from a bad buffer: -1 errno=14\nwrite read-only: -1 errno=9\ncomm in the end len=7 bytes=second\\x0a\nthread's thread-self/stat fields=52 pid-is-task=1 comm=worker-thread state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=1 priority=20 nice=0 num_threads=2 rsslim=18446744073709551615 exit_signal=-1 rt_priority=0 policy=0 exit_code=0\nthread's thread-self/comm len=14 bytes=worker-thread\\x0a\nmain reads the thread's task stat fields=52 pid-is-task=1 comm=worker-thread state=S ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=1 priority=20 nice=0 num_threads=2 rsslim=18446744073709551615 exit_signal=-1 rt_priority=0 policy=0 exit_code=0\nmain reads the thread's task comm len=14 bytes=worker-thread\\x0a\nmain's own stat with a thread fields=52 pid-is-task=1 comm=probe-main state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=2 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\npthread_setname_np: 0\nmain reads the renamed thread's comm len=16 bytes=renamed-by-main\\x0a\npthread_getname_np: 0 name=renamed-by-main\nthread after pthread_setname_np PR_GET_NAME=renamed-by-main\\0\nthread's comm after pthread_setname_np len=16 bytes=renamed-by-main\\x0a\nthread reads /proc/self/stat fields=52 pid-is-task=1 comm=probe-main state=S ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=2 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nfork child's comm len=11 bytes=probe-main\\x0a\nfork child's stat fields=52 pid-is-task=1 comm=probe-main state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=1 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nchild reads its parent's stat fields=52 pid-is-parent=1 comm=probe-opener ppid-is-parents-getppid=1 parents-parent-above-1=1\nfailures before exec=0\nexec of /proc/self/exe: named exe prctl=1 stat=1 comm-file=1 comm-is-stat=1\nstat descriptor opened before the exec fields=52 pid-is-task=1 comm=exe state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nexec through a long symlink: named by the link prctl=1 stat=1 comm-file=1 comm-is-stat=1\nstage4 reached by execveat\nexec of the image file: named by its file prctl=1 stat=1 comm-file=1 comm-is-stat=1\nfailures=0\n"
+          dbt: "root image prctl-is-comm-file=1 stat-is-comm-file=1\nnamed by the path it was started by prctl=1 stat=1 comm-file=1 comm-is-stat=1\nown stat fields=52 pid-is-task=1 comm=probe-start state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nown stat by pid fields=52 pid-is-task=1 comm=probe-start state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nthread-self stat fields=52 pid-is-task=1 comm=probe-start state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nown task stat fields=52 pid-is-task=1 comm=probe-start state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nafter PR_SET_NAME PR_GET_NAME=0123456789abcde\\0\ncomm after PR_SET_NAME len=16 bytes=0123456789abcde\\x0a\nthread-self comm after PR_SET_NAME len=16 bytes=0123456789abcde\\x0a\nstat after PR_SET_NAME fields=52 pid-is-task=1 comm=0123456789abcde state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\ncomm with raw bytes len=7 bytes=a)b\\x0a\\\\c\\x0a\nstat with raw bytes fields=52 pid-is-task=1 comm=a)b\\x0a\\\\c state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\ncomm read in parts: 3+8 bytes=first-name\\x0a\ncomm pread at 0 after a rename: bytes=second-name\\x0a\ncomm read after a rewind and a rename: bytes=third-name\\x0a\ncomm preadv2: 0=11 hipri=11 dsync=errno95 sync=errno95 append=errno95\nstat preadv2: 0=ok hipri=ok dsync=errno95 sync=errno95 append=errno95\nwrite w1\\n: 3\nposition after write: 0\ncomm after write len=4 bytes=w1\\x0a\\x0a\nstat after write fields=52 pid-is-task=1 comm=w1\\x0a state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nafter write PR_GET_NAME=w1\\x0a\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\nwrite 19 bytes: 19\ncomm after a long write len=16 bytes=0123456789abcde\\x0a\nwrite 0 bytes: 0\ncomm after an empty write len=1 bytes=\\x0a\nwritev: 11\ncomm after writev len=7 bytes=second\\x0a\npwrite: -1 errno=29\nwrite from a bad buffer: -1 errno=14\nwrite read-only: -1 errno=9\ncomm in the end len=7 bytes=second\\x0a\nthread's thread-self/stat fields=52 pid-is-task=1 comm=worker-thread state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=1 priority=20 nice=0 num_threads=2 rsslim=18446744073709551615 exit_signal=-1 rt_priority=0 policy=0 exit_code=0\nthread's thread-self/comm len=14 bytes=worker-thread\\x0a\nmain reads the thread's task stat fields=52 pid-is-task=1 comm=worker-thread state=S ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=1 priority=20 nice=0 num_threads=2 rsslim=18446744073709551615 exit_signal=-1 rt_priority=0 policy=0 exit_code=0\nmain reads the thread's task comm len=14 bytes=worker-thread\\x0a\nmain's own stat with a thread fields=52 pid-is-task=1 comm=probe-main state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=2 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\npthread_setname_np: 0\nmain reads the renamed thread's comm len=16 bytes=renamed-by-main\\x0a\npthread_getname_np: 0 name=renamed-by-main\nthread after pthread_setname_np PR_GET_NAME=renamed-by-main\\0\nthread's comm after pthread_setname_np len=16 bytes=renamed-by-main\\x0a\nthread reads /proc/self/stat fields=52 pid-is-task=1 comm=probe-main state=S ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=2 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nfork child's comm len=11 bytes=probe-main\\x0a\nfork child's stat fields=52 pid-is-task=1 comm=probe-main state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=1 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nchild reads its parent's stat fields=52 pid-is-parent=1 comm=probe-opener ppid-is-parents-getppid=1 parents-parent-above-1=1\nfailures before exec=0\nexec of /proc/self/exe: named exe prctl=0 stat=0 comm-file=0 comm-is-stat=1\nstat descriptor opened before the exec fields=52 pid-is-task=1 comm=program state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nexec through a long symlink: named by the link prctl=1 stat=1 comm-file=1 comm-is-stat=1\nexecveat(AT_EMPTY_PATH) errno=38\nstage4 reached by execve\nexec of the image file: named by its file prctl=1 stat=1 comm-file=1 comm-is-stat=1\nfailures=0\n"
+          kvm: "root image prctl-is-comm-file=1 stat-is-comm-file=1\nnamed by the path it was started by prctl=1 stat=1 comm-file=1 comm-is-stat=1\nown stat fields=52 pid-is-task=1 comm=probe-start state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nown stat by pid fields=52 pid-is-task=1 comm=probe-start state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nthread-self stat fields=52 pid-is-task=1 comm=probe-start state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nown task stat fields=52 pid-is-task=1 comm=probe-start state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nafter PR_SET_NAME PR_GET_NAME=0123456789abcde\\0\ncomm after PR_SET_NAME len=16 bytes=0123456789abcde\\x0a\nthread-self comm after PR_SET_NAME len=16 bytes=0123456789abcde\\x0a\nstat after PR_SET_NAME fields=52 pid-is-task=1 comm=0123456789abcde state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\ncomm with raw bytes len=7 bytes=a)b\\x0a\\\\c\\x0a\nstat with raw bytes fields=52 pid-is-task=1 comm=a)b\\x0a\\\\c state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\ncomm read in parts: 3+8 bytes=first-name\\x0a\ncomm pread at 0 after a rename: bytes=second-name\\x0a\ncomm read after a rewind and a rename: bytes=third-name\\x0a\ncomm preadv2: 0=11 hipri=11 dsync=errno95 sync=errno95 append=errno95\nstat preadv2: 0=ok hipri=ok dsync=errno95 sync=errno95 append=errno95\nopen comm for writing errno=13\nthread's thread-self/stat fields=52 pid-is-task=1 comm=worker-thread state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=1 priority=20 nice=0 num_threads=2 rsslim=18446744073709551615 exit_signal=-1 rt_priority=0 policy=0 exit_code=0\nthread's thread-self/comm len=14 bytes=worker-thread\\x0a\nmain reads the thread's task stat fields=52 pid-is-task=1 comm=worker-thread state=S ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=1 priority=20 nice=0 num_threads=2 rsslim=18446744073709551615 exit_signal=-1 rt_priority=0 policy=0 exit_code=0\nmain reads the thread's task comm len=14 bytes=worker-thread\\x0a\nmain's own stat with a thread fields=52 pid-is-task=1 comm=probe-main state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=2 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\npthread_setname_np: 13\nmain reads the renamed thread's comm len=14 bytes=worker-thread\\x0a\npthread_getname_np: 0 name=worker-thread\nthread after pthread_setname_np PR_GET_NAME=worker-thread\\0\\0\\0\nthread's comm after pthread_setname_np len=14 bytes=worker-thread\\x0a\nthread reads /proc/self/stat fields=52 pid-is-task=1 comm=probe-main state=S ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=2 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nfork child's comm len=11 bytes=probe-main\\x0a\nfork child's stat fields=52 pid-is-task=1 comm=probe-main state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=1 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nchild reads its parent's stat fields=52 pid-is-parent=1 comm=probe-opener ppid-is-parents-getppid=1 parents-parent-above-1=1\nfailures before exec=0\nexec of /proc/self/exe: named exe prctl=1 stat=1 comm-file=1 comm-is-stat=1\nstat descriptor opened before the exec fields=52 pid-is-task=1 comm=exe state=R ppid-is-getppid=1 pgrp-is-getpgrp=1 session-is-getsid=1 tty_nr=0 tpgid=-1 forknoexec=0 priority=20 nice=0 num_threads=1 rsslim=18446744073709551615 exit_signal=17 rt_priority=0 policy=0 exit_code=0\nexec through a long symlink: named by the link prctl=1 stat=1 comm-file=1 comm-is-stat=1\nexecveat(AT_EMPTY_PATH) errno=95\nstage4 reached by execve\nexec of the image file: named by its file prctl=1 stat=1 comm-file=1 comm-is-stat=1\nfailures=0\n"
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the contract is the same output under Hermit on every backend; the native output equals the ptrace row, checked when the cell was written.'
+        backends_enabled: []
+        backends_disabled:
+          native: This contract asserts Hermit's output on each backend, not a native run
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-QUALIFIED: under record and replay Detcore leaves /proc/<pid>/stat to the kernel, and this cell has not been recorded; its replay is unqualified.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this cell's strict verification; under record and replay the kernel serves /proc/<pid>/stat
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the guest chooses its own arguments by re-executing itself; there are no custom arguments to calibrate.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/proc-fd-directory
+    description: "tests/c/proc_fd_directory.c lists and uses the caller's own descriptor directory, and /proc itself, as Linux allows: a /proc descriptor seeked to 0x40000000 before any descriptor directory is open (accepted, as Linux accepts any position up to 2^31-1); fstat and statx of /proc/self/fd (a directory of mode 0500, 2 links, 1024-byte blocks, a size that is the number of open descriptors); a listing with a large buffer (names, d_type, and d_off at Linux's positions: . at 0, .. at 1, descriptor N at N+2, the end at the table's capacity plus 2), whose . has fstat's inode; the same listing one record per call; EINVAL for a buffer too small for one record; lseek of every whence on an empty directory; a descriptor opened past the position and one closed before it is reached while the directory is read; the position a dup shares; an O_PATH open (EBADF for getdents64, read and lseek; F_GETFL O_PATH|O_DIRECTORY; lookups below it); readlinkat, fstatat, faccessat and openat of names below the directory's descriptor and its .; the descriptor's own link; fchdir to the directory (getcwd then names /proc/<pid>/fd); the /proc/<pid>/fd, /dev/fd, /proc/thread-self/fd and /proc/<pid>/task/<tid>/fd spellings from the main thread and the thread spellings and /proc/self/fd from another thread; descriptors received over SCM_RIGHTS, the directory's own among them; a fork's child's own listing, and its listing of the directory it inherited (the parent's table, whole); CPython 3.9's close-all loop (_posixsubprocess's _close_open_fds_safe) in a child holding descriptors up to 70; the end after the table grew to 128 slots and shrank (130), in a fork's child (66), and after a dup2(-1, 100) that failed with EBADF (130, as ksys_dup3 grows the table first); a received eventfd, listed though Detcore does not model it, closed by the close-all loop; that neither a /tmp directory seeked to 0x40000000 nor /proc passes for a descriptor directory when received over SCM_RIGHTS; a process's descriptor link read by a thread with a table of its own, in a fork's child, so that the parent's later locks stay in a process whose tables Hermit tells apart (ptrace; KVM gives no thread one and passes --no-private-tables); a FIFO opened through the directory whose writer is another thread (ptrace; KVM's executor holds the turn in a blocking FIFO open with or without the directory, base and head alike, and passes --no-fifo-threads); the main thread's /proc/thread-self/fd read by another thread; the directory's own link followed (the directory) and not (the link), and a path through it (/proc/self/fd/D/N); the status flags (O_NOFOLLOW kept, F_SETFL) and EINVAL for O_DIRECT; the O_PATH refusals (F_SETFL, fchmod, fsync, flock, ioctl, fgetxattr, file-backed mmap: EBADF) and an anonymous mmap naming the O_PATH descriptor (allowed); a 4093-byte path of ./ repeats below it; fchmodat2 below it; a name below a directory reached through the directory, by its descriptor and through its link spelled /proc/self/fd/D/T/entry, /proc//self/..., /proc/./self/..., //proc/self/... and /proc/self/fd/./D//T/entry; /proc/<pid>/fd followed by 40 of the directory's own descriptor links (the directory, for an open and a stat) and by 41 (ELOOP: MAXSYMLINKS); then /proc and /proc/self/fd as directories of their own (package K slice P1): /proc's fstat (mode 0555, 1024-byte blocks, size 0, the inode a stat of /proc gives), statx's mount root attribute, its listing (self, thread-self, the caller's pid, no fs, and a . with fstat's inode), and the readlink of its descriptor's link (/proc); fstatfs of both (PROC_SUPER_MAGIC, 4096-byte blocks, 255-byte names, no blocks or files); fsync and fdatasync of both (EINVAL) and syncfs (0); fgetxattr of a user. name (EOPNOTSUPP), flistxattr (empty), and fsetxattr and fremovexattr of one (EACCES on global root's /proc, EOPNOTSUPP on the caller's directory); the FS_IOC_GETFLAGS and FIONREAD ioctls (ENOTTY) and FIGETBSZ (1024); fchmod (EPERM), fchown to -1 (0), futimens with the current time (EACCES on /proc, 0 on the caller's directory), ftruncate (EINVAL) and read (EISDIR); mkdirat below /proc (ENOENT); flock on /proc and on /proc/self/fd (each succeeds: two directories), on a second open of each (EWOULDBLOCK: the same directory), on /proc/thread-self/fd (succeeds: another directory), on a dup of the holder (succeeds), and after an unlock; the fdinfo of both descriptors (the position each was seeked to, the directory's inode, and the mount /proc/self/mountinfo shows at /proc); fchdir to /proc (getcwd then names /proc); openat2 below /proc; /proc/fs, which Hermit hides at every --proc level, by stat and open below /proc's descriptor (fs, fs/nfsd, ./fs/, self/../fs), below the descriptor directory's (../../fs), absolutely (/proc/fs/nfsd, /proc//fs/nfsd/.), and through /proc's descriptor link (ENOENT each); names below /proc's descriptor, each answered as its absolute spelling is (self: the caller's pid; self/fd: the descriptor directory, with fstat's inode; self/fd/<it>: /proc; uptime: opened; locks: as /proc/locks, absent at the default --proc level; self/status; ..: the root directory); and a /proc descriptor received over SCM_RIGHTS (fstat's inode, and a listing naming self); each directory's own descriptor link alone, for the calls that follow it (chdir, then getcwd naming the directory; access for W_OK and R_OK|X_OK; getxattr, setxattr, removexattr and listxattr of a user. name; chmod; utimes with the current time; inotify_add_watch; statfs); Linux's order of checks (measured natively): O_NOATIME on an open of /proc (EPERM: global root's) and of /proc/self/fd (kept), F_SETFL's O_NOATIME (EPERM on /proc) and O_ASYNC (succeeds, not kept: a directory has no fasync), the write hint (set on /proc/self/fd, read by another open of it; EPERM on /proc), F_DUPFD_QUERY and F_CREATED_QUERY on an O_PATH descriptor, pread at -1 and ftruncate to -1 through it (EINVAL before EBADF), a read at UINTPTR_MAX and of SIZE_MAX bytes (EFAULT) and of 0 bytes (EISDIR), copy_file_range, sendfile, splice and tee each with /proc on one side (EBADF for the closed descriptor, EISDIR, EINVAL, and 0 for a zero length where Linux checks it first), copy_file_range with flags 1<<32 (EISDIR: its flags are an unsigned int, so the high bits do not reach the flag check), preadv2 of /proc with flags 1<<32 (EISDIR: an int) and 0x40 (EOPNOTSUPP: a flag other than RWF_HIPRI), and FIFREEZE (EOPNOTSUPP), FITHAW (EINVAL), FIDEDUPERANGE with no request (EFAULT) and FICLONE from a regular file (EXDEV) or a closed descriptor (EBADF); an O_PATH open of each directory, which syncfs, epoll_ctl and getsockopt refuse (EBADF) and poll reports invalid (POLLNVAL), where syncfs of a readable open succeeds; a lock through a /proc/self/fd descriptor received back over SCM_RIGHTS and through the one sent (one open file description: both succeed), then an unlock through the received copy, after which another open locks the directory; a send on a connected sequenced-packet socket naming a destination below the descriptor directory (sent to the peer: Linux ignores the destination) and on a connected stream socket (EISCONN, nothing looked up); a name through the descriptor directory's own link from a descriptor on / (proc/self/fd/D/T) and from the working directory / (the file T is open on); /proc/fs/nfsd, procfs's empty mount point, through the caller's root link (open, stat, statfs), through a descriptor link to / (open), through a symbolic link the guest makes (open, stat, statx) and relative to the working directory / (open, stat, statx); and after exec, the inherited directory's listing, which a close-on-exec descriptor has left, and two received eventfds, one made close-on-exec by F_SETFD (gone) and one received with MSG_CMSG_CLOEXEC then cleared by FIONCLEX (listed). A child's failed checks fail its parent, and the checks before exec count after it. Detcore serves both directories on ptrace and KVM and answers every call through their descriptors from its model, each descriptor open on procfs's root on ptrace (whose procfs is the kernel's) and on the placeholder directory, an empty read-only tmpfs hermit-cli mounts at the container's /proc/fs/nfsd, on KVM (package K slices F1 and P1, toward https://github.com/rrnewton/hermit/issues/4604). Standard output is the oracle and the program exits 0. The KVM row differs from the ptrace row in these lines, each the same at the base unless named: the child's listing of the directory it inherited is empty (KVM refuses another process's /proc/<pid>/fd with EACCES); the anonymous mmap naming a descriptor is EINVAL (KVM's executor refuses an anonymous mapping that names an open descriptor, as it does for /dev/null at the base); fchmodat2 of a name below the directory is EACCES and every stat of a name below a directory reached through it fails, as chmod and stat of the absolute /proc/self/fd/N/entry spelling do at the base (KVM's executor refuses path operations through its /proc links, ELOOP for stat); both fchdir lines are EACCES (KVM's executor refuses a working directory on /proc, as it refused fchdir to the directory at the base); and the two bare-link lines: each link is respelled as the directory's own path (/proc, /proc/self/fd), which KVM's executor refuses for chdir, access, the extended-attribute calls, chmod and utimes (EACCES), as it refuses those spellings themselves, and it has no inotify (EBADF), while statfs is Detcore's (PROC_SUPER_MAGIC); the sequenced-packet line (KVM's executor refuses a SOCK_SEQPACKET socketpair with EPROTONOSUPPORT, base and head; the stream line, the same on both rows, covers the destination no lookup reaches); and the /proc/fs/nfsd line: ELOOP through the root link and the descriptor link (KVM's executor refuses every lookup through a descriptor link, RESOLVE_NO_MAGICLINKS, a link to / too, before Detcore's check), and ENOENT through the symbolic link (Detcore hides the placeholder directory from open, stat and statx). The name through the descriptor directory's link from the working directory is the same on both rows: Detcore respells it through the link from the working directory the guest's own getcwd names, as it respells the lookup from a descriptor, where before https://github.com/rrnewton/hermit/issues/4541 it read a working directory from the host's procfs, which names no KVM guest's, and left the lookup to that executor refusal (ELOOP). The ptrace row equals Linux's output for the same program run as root in a new user and PID namespace with a /proc of its own (unshare -Urpf --mount-proc on Linux 7.1) except in four lines: the root listing's fs=0 and the hidden line (Hermit hides /proc/fs at every --proc level), openat2's ENOSYS (Detcore answers every openat2 with ENOSYS, so that callers use openat), and the /proc/fs/nfsd line, whose opens are ENOENT (Hermit hides /proc/fs from an open by these spellings too, at the base as here; no placeholder is mounted on ptrace, so stat and statfs reach procfs's own empty directory, as natively); run outside namespaces, the uid line and the root listing's own-pid (the host's /proc holds more pids than the listing's 8 KiB) also differ. KNOWN RESIDUAL, capability-keyed: where Detcore shares the guest's process and descriptor table (DBT, SaBRe, LiteInst, in-guest-trap), the table also holds the backend runtime's own descriptors, which no provider fact names (measured: DynamoRIO's 197 to 201, SaBRe's 3, 101 and 1025), so there both directories stay the kernel's, as before, and these cells are disabled (https://github.com/rrnewton/hermit/issues/4680, accepted by the coordinator on 2026-10-25)"
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/proc_fd_directory.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: The backend runtime's own descriptors are in the guest's descriptor table and no provider fact names them, so the directory stays the kernel's listing on this backend (package K slice F1's capability-keyed residual)
+          sabre: The backend runtime's own descriptors are in the guest's descriptor table and no provider fact names them, so the directory stays the kernel's listing on this backend (package K slice F1's capability-keyed residual)
+          liteinst: The backend runtime's own descriptors are in the guest's descriptor table and no provider fact names them, so the directory stays the kernel's listing on this backend (package K slice F1's capability-keyed residual)
+          in-guest-trap: The backend runtime's own descriptors are in the guest's descriptor table and no provider fact names them, so the directory stays the kernel's listing on this backend (package K slice F1's capability-keyed residual)
+        expected_stdout:
+          ptrace: "forgery before any descriptor directory: /proc lseek 0x40000000=1073741824 errno=0\nfstat: dir=1 mode=500 nlink=2 blksize=1024 size=4 uid=0\nstatx: dir=1 mode=500 nlink=2 same-ino=1\nstat path: same-ino=1\nlisting: .:d@1 ..:d@2 0:l@3 1:l@4 2:l@5 3:l@66\nlisting calls=2 dot-ino-is-fstat-ino=1 end=66\nrewind=0\npaged: .:d@1 ..:d@2 0:l@3 1:l@4 2:l@5 3:l@66\npaged calls=7\ngetdents64 10 bytes=-1 errno=EINVAL position=0\ngetdents64 0 bytes=-1 errno=EINVAL\nlseek end+0=0 errno=0\nlseek end+5=5 errno=0\nlseek data=-1 errno=ENXIO\nlseek hole=-1 errno=ENXIO\nlseek set-1=-1 errno=EINVAL\nlseek set-2^31=-1 errno=EINVAL\nlseek whence-7=-1 errno=EINVAL\nlseek set-max=2147483647 errno=0\npast the end: calls=1 position=2147483647\nlseek set-4=4 errno=0\nfrom position 4: 2:l@5 3:l@66\nlive: first call=72\nlive: rest: 1:l@4 2:l@5 3:l@22 20:l@66\ndup: after 2 entries through the original: 0:l@3 1:l@4 2:l@5 3:l@6 4:l@66\nbelow: readlinkat N=/dev/null\nbelow: fstatat N rc=0 chr=1\nbelow: fstatat N nofollow rc=0 lnk=1\nbelow: faccessat N R_OK=0\nbelow: openat N read=0\nbelow: readlinkat 999=-1 errno=ENOENT\nbelow: openat . listing: . .. 0 1 2 3 4 5\nown link names /proc/<pid>/fd=1\nO_PATH: getdents64=-1 errno=EBADF\nO_PATH: read=-1 errno=EBADF\nlseek O_PATH=-1 errno=EBADF\nO_PATH: fstat dir=1 mode=500 F_GETFL=10200000\nO_PATH: readlinkat N=/dev/null\nfchdir=0 errno=0\nfchdir: cwd is /proc/<pid>/fd=1\nmain: thread-self/fd: . .. 0 1 2 3 4 5\nmain: <pid>/task/<tid>/fd: . .. 0 1 2 3 4 5\nmain: <pid>/fd: . .. 0 1 2 3 4 5\nmain: /dev/fd: . .. 0 1 2 3 4 5\nthread: thread-self/fd: . .. 0 1 2 3 4 5\nthread: self/task/<tid>/fd: . .. 0 1 2 3 4 5\nthread: self/fd: . .. 0 1 2 3 4 5\nreceived: null=7 directory=8\nreceived: listing: . .. 0 1 2 3 4 5 6 7 8\nreceived: through the received directory: . .. 0 1 2 3 4 5 6 7 8\nreceived: readlinkat N below it=/dev/null\nchild: own listing: . .. 0 1 2 3 4\nchild: the inherited directory lists the parent's descriptor 4=1\nchild exited=0\nclose-all: before: .:d@1 ..:d@2 0:l@3 1:l@4 2:l@5 3:l@6 4:l@7 5:l@12 10:l@13 11:l@32 30:l@66 64:l@72 70:l@130\nclose-all: closed=7 after: . .. 0 1 2 3\nclose-all child exited=0\ncapacity: after dup2(0, 100) and close(100): .:d@1 ..:d@2 0:l@3 1:l@4 2:l@5 3:l@6 4:l@7 5:l@130\ncapacity: in a fork's child: .:d@1 ..:d@2 0:l@3 1:l@4 2:l@5 3:l@6 4:l@7 5:l@66\ncapacity: after a failed dup2(-1, 100)=-1 errno=EBADF: .:d@1 ..:d@2 0:l@3 1:l@4 2:l@5 3:l@6 4:l@7 5:l@130\nclose-all eventfd: received=8 listed=1\nclose-all eventfd: closed=5 close of the received eventfd after=-1 errno=EBADF\nforgery: /tmp directory lseek 0x40000000=1073741824 errno=0\nforgery: below the received /tmp directory, readlinkat 1=-1 errno=ENOENT\nforgery: /proc lseek 0x40000000=1073741824 errno=0\nforgery: below the received /proc, self is a link=1\nshared table: the main thread's directory read by another thread: . .. 0 1 2 3 4 5\nown link followed: rc=0 dir=1 mode=500 same-ino=1\nown link not followed: rc=0 lnk=1\nown link below the directory followed: rc=0 dir=1 same-ino=1\nthrough the directory's link: readlink /proc/self/fd/D/N=/dev/null\nflags: O_NOFOLLOW open F_GETFL=700000\nflags: F_SETFL O_NONBLOCK=0 errno=0\nflags: after F_SETFL F_GETFL=704000\nflags: O_DIRECT open=-1 errno=EINVAL\nO_PATH: F_SETFL=-1 errno=EBADF\nO_PATH: fchmod=-1 errno=EBADF\nO_PATH: fsync=-1 errno=EBADF\nO_PATH: flock=-1 errno=EBADF\nO_PATH: ioctl FIONREAD=-1 errno=EBADF\nO_PATH: fgetxattr=-1 errno=EBADF\nO_PATH: mmap=-1 errno=EBADF\nO_PATH: anonymous mmap naming it=0 errno=0\nlong path: 4093 bytes opened=1\nfchmodat2: rc=0 errno=0 mode=600\nnames: /proc/self/fd/D/T/entry stat=0\nnames: fstatat D T/entry=0\nnames: /proc//self/fd/D/T/entry stat=0\nnames: /proc/./self/fd/D/T/entry stat=0\nnames: //proc/self/fd/D/T/entry stat=0\nnames: /proc/self/fd/./D//T/entry stat=0\nlinks: 40 descriptor links open=1 errno=0 stat=0 errno=0\nlinks: 41 descriptor links open=0 errno=ELOOP stat=-1 errno=ELOOP\nroot: fstat dir=1 mode=555 blksize=1024 size=0 stat-path-same-ino=1\nroot: statx mount-root=1 same-ino=1\nroot: listing self=1 thread-self=1 own-pid=1 fs=0 dot-ino-is-fstat-ino=1\nroot: own link names /proc=1\nfstatfs: /proc type=9fa0 bsize=4096 namelen=255 blocks=0 files=0, /proc/self/fd type=9fa0\nsync: /proc fsync=-1 errno=EINVAL fdatasync=-1 errno=EINVAL syncfs=0 errno=0\nxattr: /proc fgetxattr=-1 errno=EOPNOTSUPP flistxattr=0 errno=0 fsetxattr=-1 errno=EACCES fremovexattr=-1 errno=EACCES\nioctl: /proc FS_IOC_GETFLAGS=-1 errno=ENOTTY FIGETBSZ=0 errno=0 block=1024 FIONREAD=-1 errno=ENOTTY\nmutation: /proc fchmod=-1 errno=EPERM fchown=0 errno=0 futimens=-1 errno=EACCES ftruncate=-1 errno=EINVAL read=-1 errno=EISDIR\nsync: /proc/self/fd fsync=-1 errno=EINVAL fdatasync=-1 errno=EINVAL syncfs=0 errno=0\nxattr: /proc/self/fd fgetxattr=-1 errno=EOPNOTSUPP flistxattr=0 errno=0 fsetxattr=-1 errno=EOPNOTSUPP fremovexattr=-1 errno=EOPNOTSUPP\nioctl: /proc/self/fd FS_IOC_GETFLAGS=-1 errno=ENOTTY FIGETBSZ=0 errno=0 block=1024 FIONREAD=-1 errno=ENOTTY\nmutation: /proc/self/fd fchmod=-1 errno=EPERM fchown=0 errno=0 futimens=0 errno=0 ftruncate=-1 errno=EINVAL read=-1 errno=EISDIR\nmutation: mkdirat /proc=-1 errno=ENOENT\nflock: /proc=0 /proc/self/fd=0 /proc again=EWOULDBLOCK /proc/self/fd again=EWOULDBLOCK /proc/thread-self/fd=0 dup of /proc=0 unlock=0 /proc again after=0\nfdinfo: /proc rc=0 pos=3 ino-is-fstat-ino=1, /proc/self/fd rc=0 pos=2 ino-is-fstat-ino=1, both on the mount mountinfo shows at /proc=1\nfchdir: /proc=0 errno=0 cwd is /proc=1\nopenat2: below /proc=ENOSYS\nhidden: (/proc)fs:stat=ENOENT,open=ENOENT (/proc)fs/nfsd:stat=ENOENT,open=ENOENT (/proc)./fs/:stat=ENOENT,open=ENOENT (/proc)self/../fs:stat=ENOENT,open=ENOENT (/proc/self/fd)../../fs:stat=ENOENT,open=ENOENT /proc/fs/nfsd:stat=ENOENT,open=ENOENT /proc//fs/nfsd/.:stat=ENOENT,open=ENOENT /proc/self/fd/(/proc)/fs:stat=ENOENT\nbelow /proc: self is the caller's pid=1 self/fd is the directory=1 self/fd/<it> names /proc=1 uptime=opened locks as /proc/locks=1 self/status starts with Name=1 ..=/:1\nreceived /proc: same-ino=1 lists self=1\nbare link /proc: chdir=0 errno=0 getcwd names it=1 access W_OK=EACCES R_OK|X_OK=0 getxattr=EOPNOTSUPP setxattr=EACCES removexattr=EACCES listxattr=0 errno=0 chmod=EPERM utimes=EACCES inotify_add_watch=1 errno=0 statfs=0 type=9fa0\nbare link /proc/self/fd: chdir=0 errno=0 getcwd names it=1 access W_OK=0 R_OK|X_OK=0 getxattr=EOPNOTSUPP setxattr=EOPNOTSUPP removexattr=EOPNOTSUPP listxattr=0 errno=0 chmod=EPERM utimes=0 inotify_add_watch=1 errno=0 statfs=0 type=9fa0\nO_NOATIME: open /proc=EPERM /proc/self/fd=opened kept=1\nF_SETFL: /proc O_NOATIME=-1 errno=EPERM, /proc/self/fd O_NOATIME=0 errno=0 kept=1, O_ASYNC=0 errno=0 kept=0\nwrite hint: /proc/self/fd set=0 errno=0 another open reads=0:2, /proc set=-1 errno=EPERM reads=0:0\nO_PATH: F_DUPFD_QUERY=1 errno=0 F_CREATED_QUERY=0 errno=0 pread at -1=EINVAL ftruncate to -1=EINVAL\nread: /proc at UINTPTR_MAX=EFAULT count SIZE_MAX=EFAULT count 0=-1 errno=EISDIR\npreadv2: /proc flags 1<<32=EISDIR flags 0x40=EOPNOTSUPP\ntransfers: copy_file_range(/proc,-1,1)=-1:EBADF copy_file_range(/proc,file,0)=-1:EISDIR copy_file_range(file,/proc,1)=-1:EISDIR sendfile(-1,/proc,1)=-1:EBADF sendfile(file,/proc,1)=-1:EINVAL splice(/proc,pipe,0)=0:0 tee(pipe,/proc,1)=-1:EBADF tee(/proc,pipe,0)=0:0 copy_file_range(file,/proc,1,flags 1<<32)=-1:EISDIR\nioctl: /proc FIFREEZE=EOPNOTSUPP FITHAW=EINVAL FIDEDUPERANGE(NULL)=EFAULT FICLONE(file)=EXDEV, /proc/self/fd FICLONE(-1)=EBADF\nO_PATH /proc: syncfs=EBADF epoll_ctl=EBADF poll=1 revents=0x20 getsockopt=EBADF; readable syncfs=0\nO_PATH /proc/self/fd: syncfs=EBADF epoll_ctl=EBADF poll=1 revents=0x20 getsockopt=EBADF; readable syncfs=0\nreceived alias: lock through it=0 through the original=0 unlock=0, then another open locks=0\nsequenced-packet send to a destination below the descriptor directory: sent=1 errno=0 received=1\nstream send to a destination below the descriptor directory: sent=-1 errno=EISCONN\nnames through the descriptor directory's link: from / by descriptor=0 same=1, from the working directory /=0 same=1\n/proc/fs/nfsd by other spellings: root link open=ENOENT stat=0 statfs=0 type=9fa0; descriptor link to / open=ENOENT; symbolic link open=ENOENT stat=0 statx=0; from the working directory / open=ENOENT stat=ENOENT statx=ENOENT\nafter exec: rewind=0\nafter exec: listing: . .. 0 1 2 3 9\nafter exec: directory listed=1 close-on-exec listed=0\nafter exec: received eventfd made close-on-exec by F_SETFD listed=0, received MSG_CMSG_CLOEXEC then FIONCLEX listed=1\nfailures=0\n"
+          kvm: "forgery before any descriptor directory: /proc lseek 0x40000000=1073741824 errno=0\nfstat: dir=1 mode=500 nlink=2 blksize=1024 size=4 uid=0\nstatx: dir=1 mode=500 nlink=2 same-ino=1\nstat path: same-ino=1\nlisting: .:d@1 ..:d@2 0:l@3 1:l@4 2:l@5 3:l@66\nlisting calls=2 dot-ino-is-fstat-ino=1 end=66\nrewind=0\npaged: .:d@1 ..:d@2 0:l@3 1:l@4 2:l@5 3:l@66\npaged calls=7\ngetdents64 10 bytes=-1 errno=EINVAL position=0\ngetdents64 0 bytes=-1 errno=EINVAL\nlseek end+0=0 errno=0\nlseek end+5=5 errno=0\nlseek data=-1 errno=ENXIO\nlseek hole=-1 errno=ENXIO\nlseek set-1=-1 errno=EINVAL\nlseek set-2^31=-1 errno=EINVAL\nlseek whence-7=-1 errno=EINVAL\nlseek set-max=2147483647 errno=0\npast the end: calls=1 position=2147483647\nlseek set-4=4 errno=0\nfrom position 4: 2:l@5 3:l@66\nlive: first call=72\nlive: rest: 1:l@4 2:l@5 3:l@22 20:l@66\ndup: after 2 entries through the original: 0:l@3 1:l@4 2:l@5 3:l@6 4:l@66\nbelow: readlinkat N=/dev/null\nbelow: fstatat N rc=0 chr=1\nbelow: fstatat N nofollow rc=0 lnk=1\nbelow: faccessat N R_OK=0\nbelow: openat N read=0\nbelow: readlinkat 999=-1 errno=ENOENT\nbelow: openat . listing: . .. 0 1 2 3 4 5\nown link names /proc/<pid>/fd=1\nO_PATH: getdents64=-1 errno=EBADF\nO_PATH: read=-1 errno=EBADF\nlseek O_PATH=-1 errno=EBADF\nO_PATH: fstat dir=1 mode=500 F_GETFL=10200000\nO_PATH: readlinkat N=/dev/null\nfchdir=-1 errno=EACCES\nmain: thread-self/fd: . .. 0 1 2 3 4 5\nmain: <pid>/task/<tid>/fd: . .. 0 1 2 3 4 5\nmain: <pid>/fd: . .. 0 1 2 3 4 5\nmain: /dev/fd: . .. 0 1 2 3 4 5\nthread: thread-self/fd: . .. 0 1 2 3 4 5\nthread: self/task/<tid>/fd: . .. 0 1 2 3 4 5\nthread: self/fd: . .. 0 1 2 3 4 5\nreceived: null=7 directory=8\nreceived: listing: . .. 0 1 2 3 4 5 6 7 8\nreceived: through the received directory: . .. 0 1 2 3 4 5 6 7 8\nreceived: readlinkat N below it=/dev/null\nchild: own listing: . .. 0 1 2 3 4\nchild: the inherited directory lists the parent's descriptor 4=0\nchild exited=0\nclose-all: before: .:d@1 ..:d@2 0:l@3 1:l@4 2:l@5 3:l@6 4:l@7 5:l@12 10:l@13 11:l@32 30:l@66 64:l@72 70:l@130\nclose-all: closed=7 after: . .. 0 1 2 3\nclose-all child exited=0\ncapacity: after dup2(0, 100) and close(100): .:d@1 ..:d@2 0:l@3 1:l@4 2:l@5 3:l@6 4:l@7 5:l@130\ncapacity: in a fork's child: .:d@1 ..:d@2 0:l@3 1:l@4 2:l@5 3:l@6 4:l@7 5:l@66\ncapacity: after a failed dup2(-1, 100)=-1 errno=EBADF: .:d@1 ..:d@2 0:l@3 1:l@4 2:l@5 3:l@6 4:l@7 5:l@130\nclose-all eventfd: received=8 listed=1\nclose-all eventfd: closed=5 close of the received eventfd after=-1 errno=EBADF\nforgery: /tmp directory lseek 0x40000000=1073741824 errno=0\nforgery: below the received /tmp directory, readlinkat 1=-1 errno=ENOENT\nforgery: /proc lseek 0x40000000=1073741824 errno=0\nforgery: below the received /proc, self is a link=1\nshared table: the main thread's directory read by another thread: . .. 0 1 2 3 4 5\nown link followed: rc=0 dir=1 mode=500 same-ino=1\nown link not followed: rc=0 lnk=1\nown link below the directory followed: rc=0 dir=1 same-ino=1\nthrough the directory's link: readlink /proc/self/fd/D/N=/dev/null\nflags: O_NOFOLLOW open F_GETFL=700000\nflags: F_SETFL O_NONBLOCK=0 errno=0\nflags: after F_SETFL F_GETFL=704000\nflags: O_DIRECT open=-1 errno=EINVAL\nO_PATH: F_SETFL=-1 errno=EBADF\nO_PATH: fchmod=-1 errno=EBADF\nO_PATH: fsync=-1 errno=EBADF\nO_PATH: flock=-1 errno=EBADF\nO_PATH: ioctl FIONREAD=-1 errno=EBADF\nO_PATH: fgetxattr=-1 errno=EBADF\nO_PATH: mmap=-1 errno=EBADF\nO_PATH: anonymous mmap naming it=-1 errno=EINVAL\nlong path: 4093 bytes opened=1\nfchmodat2: rc=-1 errno=EACCES mode=644\nnames: /proc/self/fd/D/T/entry stat=-1\nnames: fstatat D T/entry=-1\nnames: /proc//self/fd/D/T/entry stat=-1\nnames: /proc/./self/fd/D/T/entry stat=-1\nnames: //proc/self/fd/D/T/entry stat=-1\nnames: /proc/self/fd/./D//T/entry stat=-1\nlinks: 40 descriptor links open=1 errno=0 stat=0 errno=0\nlinks: 41 descriptor links open=0 errno=ELOOP stat=-1 errno=ELOOP\nroot: fstat dir=1 mode=555 blksize=1024 size=0 stat-path-same-ino=1\nroot: statx mount-root=1 same-ino=1\nroot: listing self=1 thread-self=1 own-pid=1 fs=0 dot-ino-is-fstat-ino=1\nroot: own link names /proc=1\nfstatfs: /proc type=9fa0 bsize=4096 namelen=255 blocks=0 files=0, /proc/self/fd type=9fa0\nsync: /proc fsync=-1 errno=EINVAL fdatasync=-1 errno=EINVAL syncfs=0 errno=0\nxattr: /proc fgetxattr=-1 errno=EOPNOTSUPP flistxattr=0 errno=0 fsetxattr=-1 errno=EACCES fremovexattr=-1 errno=EACCES\nioctl: /proc FS_IOC_GETFLAGS=-1 errno=ENOTTY FIGETBSZ=0 errno=0 block=1024 FIONREAD=-1 errno=ENOTTY\nmutation: /proc fchmod=-1 errno=EPERM fchown=0 errno=0 futimens=-1 errno=EACCES ftruncate=-1 errno=EINVAL read=-1 errno=EISDIR\nsync: /proc/self/fd fsync=-1 errno=EINVAL fdatasync=-1 errno=EINVAL syncfs=0 errno=0\nxattr: /proc/self/fd fgetxattr=-1 errno=EOPNOTSUPP flistxattr=0 errno=0 fsetxattr=-1 errno=EOPNOTSUPP fremovexattr=-1 errno=EOPNOTSUPP\nioctl: /proc/self/fd FS_IOC_GETFLAGS=-1 errno=ENOTTY FIGETBSZ=0 errno=0 block=1024 FIONREAD=-1 errno=ENOTTY\nmutation: /proc/self/fd fchmod=-1 errno=EPERM fchown=0 errno=0 futimens=0 errno=0 ftruncate=-1 errno=EINVAL read=-1 errno=EISDIR\nmutation: mkdirat /proc=-1 errno=ENOENT\nflock: /proc=0 /proc/self/fd=0 /proc again=EWOULDBLOCK /proc/self/fd again=EWOULDBLOCK /proc/thread-self/fd=0 dup of /proc=0 unlock=0 /proc again after=0\nfdinfo: /proc rc=0 pos=3 ino-is-fstat-ino=1, /proc/self/fd rc=0 pos=2 ino-is-fstat-ino=1, both on the mount mountinfo shows at /proc=1\nfchdir: /proc=-1 errno=EACCES cwd is /proc=0\nopenat2: below /proc=ENOSYS\nhidden: (/proc)fs:stat=ENOENT,open=ENOENT (/proc)fs/nfsd:stat=ENOENT,open=ENOENT (/proc)./fs/:stat=ENOENT,open=ENOENT (/proc)self/../fs:stat=ENOENT,open=ENOENT (/proc/self/fd)../../fs:stat=ENOENT,open=ENOENT /proc/fs/nfsd:stat=ENOENT,open=ENOENT /proc//fs/nfsd/.:stat=ENOENT,open=ENOENT /proc/self/fd/(/proc)/fs:stat=ENOENT\nbelow /proc: self is the caller's pid=1 self/fd is the directory=1 self/fd/<it> names /proc=1 uptime=opened locks as /proc/locks=1 self/status starts with Name=1 ..=/:1\nreceived /proc: same-ino=1 lists self=1\nbare link /proc: chdir=-1 errno=EACCES getcwd names it=0 access W_OK=EACCES R_OK|X_OK=EACCES getxattr=EACCES setxattr=EACCES removexattr=EACCES listxattr=-1 errno=EACCES chmod=EACCES utimes=EACCES inotify_add_watch=0 errno=EBADF statfs=0 type=9fa0\nbare link /proc/self/fd: chdir=-1 errno=EACCES getcwd names it=0 access W_OK=EACCES R_OK|X_OK=EACCES getxattr=EACCES setxattr=EACCES removexattr=EACCES listxattr=-1 errno=EACCES chmod=EACCES utimes=EACCES inotify_add_watch=0 errno=EBADF statfs=0 type=9fa0\nO_NOATIME: open /proc=EPERM /proc/self/fd=opened kept=1\nF_SETFL: /proc O_NOATIME=-1 errno=EPERM, /proc/self/fd O_NOATIME=0 errno=0 kept=1, O_ASYNC=0 errno=0 kept=0\nwrite hint: /proc/self/fd set=0 errno=0 another open reads=0:2, /proc set=-1 errno=EPERM reads=0:0\nO_PATH: F_DUPFD_QUERY=1 errno=0 F_CREATED_QUERY=0 errno=0 pread at -1=EINVAL ftruncate to -1=EINVAL\nread: /proc at UINTPTR_MAX=EFAULT count SIZE_MAX=EFAULT count 0=-1 errno=EISDIR\npreadv2: /proc flags 1<<32=EISDIR flags 0x40=EOPNOTSUPP\ntransfers: copy_file_range(/proc,-1,1)=-1:EBADF copy_file_range(/proc,file,0)=-1:EISDIR copy_file_range(file,/proc,1)=-1:EISDIR sendfile(-1,/proc,1)=-1:EBADF sendfile(file,/proc,1)=-1:EINVAL splice(/proc,pipe,0)=0:0 tee(pipe,/proc,1)=-1:EBADF tee(/proc,pipe,0)=0:0 copy_file_range(file,/proc,1,flags 1<<32)=-1:EISDIR\nioctl: /proc FIFREEZE=EOPNOTSUPP FITHAW=EINVAL FIDEDUPERANGE(NULL)=EFAULT FICLONE(file)=EXDEV, /proc/self/fd FICLONE(-1)=EBADF\nO_PATH /proc: syncfs=EBADF epoll_ctl=EBADF poll=1 revents=0x20 getsockopt=EBADF; readable syncfs=0\nO_PATH /proc/self/fd: syncfs=EBADF epoll_ctl=EBADF poll=1 revents=0x20 getsockopt=EBADF; readable syncfs=0\nreceived alias: lock through it=0 through the original=0 unlock=0, then another open locks=0\nsequenced-packet send to a destination below the descriptor directory: socketpair=EPROTONOSUPPORT\nstream send to a destination below the descriptor directory: sent=-1 errno=EISCONN\nnames through the descriptor directory's link: from / by descriptor=0 same=1, from the working directory /=0 same=1\n/proc/fs/nfsd by other spellings: root link open=ELOOP stat=ELOOP statfs=ELOOP type=0; descriptor link to / open=ELOOP; symbolic link open=ENOENT stat=ENOENT statx=ENOENT; from the working directory / open=ENOENT stat=ENOENT statx=ENOENT\nafter exec: rewind=0\nafter exec: listing: . .. 0 1 2 3 9\nafter exec: directory listed=1 close-on-exec listed=0\nafter exec: received eventfd made close-on-exec by F_SETFD listed=0, received MSG_CMSG_CLOEXEC then FIONCLEX listed=1\nfailures=0\n"
+        guest_args:
+          kvm:
+            - --no-private-tables
+            - --no-fifo-threads
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the contract is Detcore''s listing of the caller''s descriptor directory; native output differs from Hermit''s in the uid, /proc listing, /proc/fs and openat2 lines named in the description.'
+        backends_enabled: []
+        backends_disabled:
+          native: This contract asserts Hermit's descriptor directory, not native behaviour
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: Detcore serves the descriptor directory only where it renders procfs files, which record and replay do not.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record and replay leave the descriptor directory to the kernel
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the guest takes no arguments; its verify cells carry the whole contract.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/proc-own-links
+    description: "tests/c/proc_own_links.c reads the caller's own /proc/<pid>/exe, /proc/<pid>/cwd and /proc/<pid>/root links as Linux answers them (proc_exe_link, proc_cwd_link and proc_root_link, fs/proc/base.c, rendered by d_path, fs/d_path.c): for each link, that every spelling reads the same target (self, the pid, thread-self, self/task/<tid>, <pid>/task/<tid>, //proc/./self, and readlinkat of self/<link> from a /proc descriptor); the target (exe: argv[0]'s realpath; cwd: getcwd's answer; root: /); a 3-byte buffer (at most 3 bytes, no NUL, the rest untouched); EINVAL for a zero size, EFAULT for an unmapped buffer and for a mapped read-only one (left untouched); the spellings that follow the link with a trailing slash (exe/: ENOTDIR; cwd/ and root/: EINVAL); a . after the link, a lookup in the directory it leads to (root/. and cwd/.: EINVAL), and cwd/. of a working directory the caller may not search, after it drops its capabilities with capset (EACCES); a task outside the process below its task directory (ENOENT); the working directory after an absolute and a relative chdir, and after the directory it is in was removed (<path> (deleted), and getcwd's ENOENT); a thread's links read by the thread, also through its own /proc/<tid>/task/<tid> (which Linux lists), the thread's exe read by the main thread through /proc/<tid> and /proc/self/task/<tid>, and a chdir in the thread, which the process shares; a thread created without CLONE_FS whose own chdir moves its thread-self/cwd and not the process's self/cwd, which is the leader's; a fork's child, whose chdir leaves its parent's working directory alone; a process whose leader has exited, whose process links are gone (ENOENT) while the thread's remain; and a copy of the program, exec'd from <dir>/a with a second link in <dir>/b, whose exe link by each of the seven spellings (each printed) names the copy, then the new path after its directory is renamed away and the other directory renamed into its place (the file at the old path being the same untouched inode), the same path after a chmod of itself, the new path after it renames itself, and <path> (deleted) after it unlinks itself. Detcore answers these links of the caller's own process from its own knowledge wherever its answer is exactly Linux's (package K slice E1): cwd from the calling thread's getcwd and root as / on every backend, and exe on KVM from its exec record while the image is untouched at its path below the same directories; elsewhere each backend answers as it did before (exe on ptrace, LiteInst and in-guest-trap is the kernel's, on DBT and SaBRe the launcher runs' own handling, which refuses an image no longer untouched at its path by name; on KVM the executor's readlink). Standard output is the oracle and the program exits 0; every row is the native output (measured on Linux 7.1) for the same arguments, except the KVM row and one DBT line. KNOWN DIFFERENCE, NOT COMPLETION: the KVM row differs from Linux in ten lines, each the same at the base. Three are two defects of reverie-linuxemu's own working directory (https://github.com/rrnewton/hermit/issues/4698): the cwd link of a removed working directory shows its path without (deleted), because LinuxEmu's getcwd, which walks the working directory since Reverie 2459e33e, answers ENOENT there as Linux does (the row's getcwd line is Linux's), so Detcore takes the previous path, LinuxEmu's own cwd link, which keeps the path the last chdir set; and a chdir in one thread does not move the working directory getcwd and the cwd link give in another (KVM keeps a working directory per thread where CLONE_FS shares one). Four are the exec'd copy's //proc/./self/exe spelling after each of its four changes to its image, where the executor's readlink answers (as at the base) and refuses it with EACCES (its other six spellings answer as Linux: readlinkat(/proc, self/exe) too since package K slice P1, where Detcore looks a name below /proc's descriptor up by its absolute path, /proc/self/exe; at the base the executor refused it with EACCES as well). Three are the spellings with a . after the link (root/., cwd/., and cwd/. of the directory the caller may not search), which Detcore leaves to the executor and which it refuses with ELOOP (40), as at the base, where Linux answers EINVAL, EINVAL and EACCES. The DBT and KVM rows pass --no-leader-exit: after a thread-group leader exits, every readlink of the remaining thread fails with ESRCH under DBT (https://github.com/rrnewton/hermit/issues/4697), and under KVM the remaining thread's join of the exited leader waits in one run and not in the other (https://github.com/rrnewton/hermit/issues/4563). The DBT row passes --no-exe-changes too: DBT refuses the exe link of an image no longer untouched at its path by name, as at the base. KNOWN DIFFERENCE, NOT COMPLETION: the DBT row also passes --base-exe-truncation, which makes the guest check DBT's base answer for the exe link into a 3-byte buffer exactly: -1 with EINVAL, after writing the 3 bytes, where Linux returns 3 (https://github.com/rrnewton/hermit/issues/4711): the launcher runs' exe handling, which this slice leaves as it was. The KVM row passes --no-fs-threads too: KVM refuses a thread created without CLONE_FS (https://github.com/rrnewton/hermit/issues/4698). The SaBRe, LiteInst and in-guest-trap rows pass --no-threads and --no-exec: the in-guest LiteInst backends create no threads and run no exec, and under SaBRe a thread and the exec'd copy run native sites in the loader and the C library (1 and 36 trusted shared-object sites), which make a SaBRe row ineligible, and a thread joining an exited leader faults (https://github.com/rrnewton/hermit/issues/4697)."
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/proc_own_links.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+        - -pthread
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - dbt
+          - kvm
+          - sabre
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
+        expected_stdout:
+          ptrace: "exe: is argv[0]'s realpath=1\nexe: spellings=7 same=7\nexe: 3-byte buffer n=3 errno=0 written=1 untouched=1\nexe: size 0=-1 errno=EINVAL\nexe: unwritable buffer=-1 errno=EFAULT\nexe: read-only buffer=-1 errno=EFAULT untouched=1\ncwd: is getcwd=1\ncwd: spellings=7 same=7\ncwd: 3-byte buffer n=3 errno=0 written=1 untouched=1\ncwd: size 0=-1 errno=EINVAL\ncwd: unwritable buffer=-1 errno=EFAULT\ncwd: read-only buffer=-1 errno=EFAULT untouched=1\nroot=/\nroot: spellings=7 same=7\nroot: 3-byte buffer n=1 errno=0 written=1 untouched=1\nroot: size 0=-1 errno=EINVAL\nroot: unwritable buffer=-1 errno=EFAULT\nroot: read-only buffer=-1 errno=EFAULT untouched=1\nfollowed: self/exe/=-1 errno=ENOTDIR\nfollowed: self/cwd/=-1 errno=EINVAL\nfollowed: thread-self/root/=-1 errno=EINVAL\ndot: self/root/.=-1 errno=EINVAL\ndot: self/cwd/.=-1 errno=EINVAL\noutside: self/task/999999/exe=-1 errno=ENOENT\noutside: self/task/999999/cwd=-1 errno=ENOENT\nafter chdir(<dir>): cwd=<dir>\nafter chdir(\"sub\"): cwd=<dir>/sub\nafter chdir(\"sub\"): thread-self/cwd=<dir>/sub\nafter chdir(\"..\"): cwd=<dir>\ndenied search: capset=0 errno=0\ndenied search: self/cwd/.=-1 errno=EACCES\ndenied search: self/cwd=<dir>/locked\ndenied search child exited=0\nremoved: cwd=<dir>/gone (deleted)\nremoved: getcwd=NULL errno=ENOENT\nthread: exe spellings=7 same=7\nthread: cwd spellings=7 same=7\nthread: root spellings=7 same=7\nthread: /proc/<tid>/task/<tid>/root=/\nthread: /proc/<tid>/task/<tid>/cwd=<dir>\nthread: /proc/<tid>/task/<tid>/exe is the process's=1\nthread: after its chdir(\"sub\"), thread-self/cwd=<dir>/sub\nthread: after its chdir(\"sub\"), self/cwd=<dir>/sub\nmain: the thread's exe by /proc/<tid>/exe is the process's=1\nmain: the thread's exe by self/task/<tid>/exe is the process's=1\nmain: after the thread's chdir, self/cwd=<dir>/sub\nmain: after the thread's chdir, getcwd=<dir>/sub\nfs thread: after its own chdir(\"sub\"), thread-self/cwd=<dir>/sub\nfs thread: after its own chdir(\"sub\"), self/cwd=<dir>\nmain: after the fs thread's chdir, self/cwd=<dir>\nchild: after its chdir(\"sub\"), cwd=<dir>/sub\nchild: exe is the parent's=1\nchild: cwd spellings=7 same=7\nchild exited=0\nparent: after the child's chdir, cwd=<dir>\nleader exited: self/exe=-1 errno=ENOENT\nleader exited: thread-self/exe is the process's image=1\nleader exited: self/cwd=-1 errno=ENOENT\nleader exited: thread-self/cwd=<dir>\nleader exited: self/root=-1 errno=ENOENT\nleader exited: thread-self/root=/\nleader-exit child exited=0\ncopy: as exec'd, self/exe=<dir>/a/copy\ncopy: as exec'd, <pid>/exe=<dir>/a/copy\ncopy: as exec'd, thread-self/exe=<dir>/a/copy\ncopy: as exec'd, self/task/<tid>/exe=<dir>/a/copy\ncopy: as exec'd, <pid>/task/<tid>/exe=<dir>/a/copy\ncopy: as exec'd, //proc/./self/exe=<dir>/a/copy\ncopy: as exec'd, readlinkat(/proc, self/exe)=<dir>/a/copy\ncopy: cwd=<dir>\ncopy: after its directory was swapped, self/exe=<dir>/away/copy\ncopy: after its directory was swapped, <pid>/exe=<dir>/away/copy\ncopy: after its directory was swapped, thread-self/exe=<dir>/away/copy\ncopy: after its directory was swapped, self/task/<tid>/exe=<dir>/away/copy\ncopy: after its directory was swapped, <pid>/task/<tid>/exe=<dir>/away/copy\ncopy: after its directory was swapped, //proc/./self/exe=<dir>/away/copy\ncopy: after its directory was swapped, readlinkat(/proc, self/exe)=<dir>/away/copy\ncopy: after a chmod of itself, self/exe=<dir>/away/copy\ncopy: after a chmod of itself, <pid>/exe=<dir>/away/copy\ncopy: after a chmod of itself, thread-self/exe=<dir>/away/copy\ncopy: after a chmod of itself, self/task/<tid>/exe=<dir>/away/copy\ncopy: after a chmod of itself, <pid>/task/<tid>/exe=<dir>/away/copy\ncopy: after a chmod of itself, //proc/./self/exe=<dir>/away/copy\ncopy: after a chmod of itself, readlinkat(/proc, self/exe)=<dir>/away/copy\ncopy: after renaming itself, self/exe=<dir>/away/renamed\ncopy: after renaming itself, <pid>/exe=<dir>/away/renamed\ncopy: after renaming itself, thread-self/exe=<dir>/away/renamed\ncopy: after renaming itself, self/task/<tid>/exe=<dir>/away/renamed\ncopy: after renaming itself, <pid>/task/<tid>/exe=<dir>/away/renamed\ncopy: after renaming itself, //proc/./self/exe=<dir>/away/renamed\ncopy: after renaming itself, readlinkat(/proc, self/exe)=<dir>/away/renamed\ncopy: after unlinking itself, self/exe=<dir>/away/renamed (deleted)\ncopy: after unlinking itself, <pid>/exe=<dir>/away/renamed (deleted)\ncopy: after unlinking itself, thread-self/exe=<dir>/away/renamed (deleted)\ncopy: after unlinking itself, self/task/<tid>/exe=<dir>/away/renamed (deleted)\ncopy: after unlinking itself, <pid>/task/<tid>/exe=<dir>/away/renamed (deleted)\ncopy: after unlinking itself, //proc/./self/exe=<dir>/away/renamed (deleted)\ncopy: after unlinking itself, readlinkat(/proc, self/exe)=<dir>/away/renamed (deleted)\ncopy exited=0\nfailures=0\n"
+          dbt: "exe: is argv[0]'s realpath=1\nexe: spellings=7 same=7\nexe: 3-byte buffer n=-1 errno=EINVAL written=1 untouched=1\nexe: size 0=-1 errno=EINVAL\nexe: unwritable buffer=-1 errno=EFAULT\nexe: read-only buffer=-1 errno=EFAULT untouched=1\ncwd: is getcwd=1\ncwd: spellings=7 same=7\ncwd: 3-byte buffer n=3 errno=0 written=1 untouched=1\ncwd: size 0=-1 errno=EINVAL\ncwd: unwritable buffer=-1 errno=EFAULT\ncwd: read-only buffer=-1 errno=EFAULT untouched=1\nroot=/\nroot: spellings=7 same=7\nroot: 3-byte buffer n=1 errno=0 written=1 untouched=1\nroot: size 0=-1 errno=EINVAL\nroot: unwritable buffer=-1 errno=EFAULT\nroot: read-only buffer=-1 errno=EFAULT untouched=1\nfollowed: self/exe/=-1 errno=ENOTDIR\nfollowed: self/cwd/=-1 errno=EINVAL\nfollowed: thread-self/root/=-1 errno=EINVAL\ndot: self/root/.=-1 errno=EINVAL\ndot: self/cwd/.=-1 errno=EINVAL\noutside: self/task/999999/exe=-1 errno=ENOENT\noutside: self/task/999999/cwd=-1 errno=ENOENT\nafter chdir(<dir>): cwd=<dir>\nafter chdir(\"sub\"): cwd=<dir>/sub\nafter chdir(\"sub\"): thread-self/cwd=<dir>/sub\nafter chdir(\"..\"): cwd=<dir>\ndenied search: capset=0 errno=0\ndenied search: self/cwd/.=-1 errno=EACCES\ndenied search: self/cwd=<dir>/locked\ndenied search child exited=0\nremoved: cwd=<dir>/gone (deleted)\nremoved: getcwd=NULL errno=ENOENT\nthread: exe spellings=7 same=7\nthread: cwd spellings=7 same=7\nthread: root spellings=7 same=7\nthread: /proc/<tid>/task/<tid>/root=/\nthread: /proc/<tid>/task/<tid>/cwd=<dir>\nthread: /proc/<tid>/task/<tid>/exe is the process's=1\nthread: after its chdir(\"sub\"), thread-self/cwd=<dir>/sub\nthread: after its chdir(\"sub\"), self/cwd=<dir>/sub\nmain: the thread's exe by /proc/<tid>/exe is the process's=1\nmain: the thread's exe by self/task/<tid>/exe is the process's=1\nmain: after the thread's chdir, self/cwd=<dir>/sub\nmain: after the thread's chdir, getcwd=<dir>/sub\nfs thread: after its own chdir(\"sub\"), thread-self/cwd=<dir>/sub\nfs thread: after its own chdir(\"sub\"), self/cwd=<dir>\nmain: after the fs thread's chdir, self/cwd=<dir>\nchild: after its chdir(\"sub\"), cwd=<dir>/sub\nchild: exe is the parent's=1\nchild: cwd spellings=7 same=7\nchild exited=0\nparent: after the child's chdir, cwd=<dir>\ncopy: as exec'd, self/exe=<dir>/a/copy\ncopy: as exec'd, <pid>/exe=<dir>/a/copy\ncopy: as exec'd, thread-self/exe=<dir>/a/copy\ncopy: as exec'd, self/task/<tid>/exe=<dir>/a/copy\ncopy: as exec'd, <pid>/task/<tid>/exe=<dir>/a/copy\ncopy: as exec'd, //proc/./self/exe=<dir>/a/copy\ncopy: as exec'd, readlinkat(/proc, self/exe)=<dir>/a/copy\ncopy: cwd=<dir>\ncopy exited=0\nfailures=0\n"
+          kvm: "exe: is argv[0]'s realpath=1\nexe: spellings=7 same=7\nexe: 3-byte buffer n=3 errno=0 written=1 untouched=1\nexe: size 0=-1 errno=EINVAL\nexe: unwritable buffer=-1 errno=EFAULT\nexe: read-only buffer=-1 errno=EFAULT untouched=1\ncwd: is getcwd=1\ncwd: spellings=7 same=7\ncwd: 3-byte buffer n=3 errno=0 written=1 untouched=1\ncwd: size 0=-1 errno=EINVAL\ncwd: unwritable buffer=-1 errno=EFAULT\ncwd: read-only buffer=-1 errno=EFAULT untouched=1\nroot=/\nroot: spellings=7 same=7\nroot: 3-byte buffer n=1 errno=0 written=1 untouched=1\nroot: size 0=-1 errno=EINVAL\nroot: unwritable buffer=-1 errno=EFAULT\nroot: read-only buffer=-1 errno=EFAULT untouched=1\nfollowed: self/exe/=-1 errno=ENOTDIR\nfollowed: self/cwd/=-1 errno=EINVAL\nfollowed: thread-self/root/=-1 errno=EINVAL\ndot: self/root/.=-1 errno=40\ndot: self/cwd/.=-1 errno=40\noutside: self/task/999999/exe=-1 errno=ENOENT\noutside: self/task/999999/cwd=-1 errno=ENOENT\nafter chdir(<dir>): cwd=<dir>\nafter chdir(\"sub\"): cwd=<dir>/sub\nafter chdir(\"sub\"): thread-self/cwd=<dir>/sub\nafter chdir(\"..\"): cwd=<dir>\ndenied search: capset=0 errno=0\ndenied search: self/cwd/.=-1 errno=40\ndenied search: self/cwd=<dir>/locked\ndenied search child exited=0\nremoved: cwd=<dir>/gone\nremoved: getcwd=NULL errno=ENOENT\nthread: exe spellings=7 same=7\nthread: cwd spellings=7 same=7\nthread: root spellings=7 same=7\nthread: /proc/<tid>/task/<tid>/root=/\nthread: /proc/<tid>/task/<tid>/cwd=<dir>\nthread: /proc/<tid>/task/<tid>/exe is the process's=1\nthread: after its chdir(\"sub\"), thread-self/cwd=<dir>/sub\nthread: after its chdir(\"sub\"), self/cwd=<dir>/sub\nmain: the thread's exe by /proc/<tid>/exe is the process's=1\nmain: the thread's exe by self/task/<tid>/exe is the process's=1\nmain: after the thread's chdir, self/cwd=<dir>\nmain: after the thread's chdir, getcwd=<dir>\nchild: after its chdir(\"sub\"), cwd=<dir>/sub\nchild: exe is the parent's=1\nchild: cwd spellings=7 same=7\nchild exited=0\nparent: after the child's chdir, cwd=<dir>\ncopy: as exec'd, self/exe=<dir>/a/copy\ncopy: as exec'd, <pid>/exe=<dir>/a/copy\ncopy: as exec'd, thread-self/exe=<dir>/a/copy\ncopy: as exec'd, self/task/<tid>/exe=<dir>/a/copy\ncopy: as exec'd, <pid>/task/<tid>/exe=<dir>/a/copy\ncopy: as exec'd, //proc/./self/exe=<dir>/a/copy\ncopy: as exec'd, readlinkat(/proc, self/exe)=<dir>/a/copy\ncopy: cwd=<dir>\ncopy: after its directory was swapped, self/exe=<dir>/away/copy\ncopy: after its directory was swapped, <pid>/exe=<dir>/away/copy\ncopy: after its directory was swapped, thread-self/exe=<dir>/away/copy\ncopy: after its directory was swapped, self/task/<tid>/exe=<dir>/away/copy\ncopy: after its directory was swapped, <pid>/task/<tid>/exe=<dir>/away/copy\ncopy: after its directory was swapped, //proc/./self/exe=-1 errno=EACCES\ncopy: after its directory was swapped, readlinkat(/proc, self/exe)=<dir>/away/copy\ncopy: after a chmod of itself, self/exe=<dir>/away/copy\ncopy: after a chmod of itself, <pid>/exe=<dir>/away/copy\ncopy: after a chmod of itself, thread-self/exe=<dir>/away/copy\ncopy: after a chmod of itself, self/task/<tid>/exe=<dir>/away/copy\ncopy: after a chmod of itself, <pid>/task/<tid>/exe=<dir>/away/copy\ncopy: after a chmod of itself, //proc/./self/exe=-1 errno=EACCES\ncopy: after a chmod of itself, readlinkat(/proc, self/exe)=<dir>/away/copy\ncopy: after renaming itself, self/exe=<dir>/away/renamed\ncopy: after renaming itself, <pid>/exe=<dir>/away/renamed\ncopy: after renaming itself, thread-self/exe=<dir>/away/renamed\ncopy: after renaming itself, self/task/<tid>/exe=<dir>/away/renamed\ncopy: after renaming itself, <pid>/task/<tid>/exe=<dir>/away/renamed\ncopy: after renaming itself, //proc/./self/exe=-1 errno=EACCES\ncopy: after renaming itself, readlinkat(/proc, self/exe)=<dir>/away/renamed\ncopy: after unlinking itself, self/exe=<dir>/away/renamed (deleted)\ncopy: after unlinking itself, <pid>/exe=<dir>/away/renamed (deleted)\ncopy: after unlinking itself, thread-self/exe=<dir>/away/renamed (deleted)\ncopy: after unlinking itself, self/task/<tid>/exe=<dir>/away/renamed (deleted)\ncopy: after unlinking itself, <pid>/task/<tid>/exe=<dir>/away/renamed (deleted)\ncopy: after unlinking itself, //proc/./self/exe=-1 errno=EACCES\ncopy: after unlinking itself, readlinkat(/proc, self/exe)=<dir>/away/renamed (deleted)\ncopy exited=0\nfailures=0\n"
+          sabre: "exe: is argv[0]'s realpath=1\nexe: spellings=7 same=7\nexe: 3-byte buffer n=3 errno=0 written=1 untouched=1\nexe: size 0=-1 errno=EINVAL\nexe: unwritable buffer=-1 errno=EFAULT\nexe: read-only buffer=-1 errno=EFAULT untouched=1\ncwd: is getcwd=1\ncwd: spellings=7 same=7\ncwd: 3-byte buffer n=3 errno=0 written=1 untouched=1\ncwd: size 0=-1 errno=EINVAL\ncwd: unwritable buffer=-1 errno=EFAULT\ncwd: read-only buffer=-1 errno=EFAULT untouched=1\nroot=/\nroot: spellings=7 same=7\nroot: 3-byte buffer n=1 errno=0 written=1 untouched=1\nroot: size 0=-1 errno=EINVAL\nroot: unwritable buffer=-1 errno=EFAULT\nroot: read-only buffer=-1 errno=EFAULT untouched=1\nfollowed: self/exe/=-1 errno=ENOTDIR\nfollowed: self/cwd/=-1 errno=EINVAL\nfollowed: thread-self/root/=-1 errno=EINVAL\ndot: self/root/.=-1 errno=EINVAL\ndot: self/cwd/.=-1 errno=EINVAL\noutside: self/task/999999/exe=-1 errno=ENOENT\noutside: self/task/999999/cwd=-1 errno=ENOENT\nafter chdir(<dir>): cwd=<dir>\nafter chdir(\"sub\"): cwd=<dir>/sub\nafter chdir(\"sub\"): thread-self/cwd=<dir>/sub\nafter chdir(\"..\"): cwd=<dir>\ndenied search: capset=0 errno=0\ndenied search: self/cwd/.=-1 errno=EACCES\ndenied search: self/cwd=<dir>/locked\ndenied search child exited=0\nremoved: cwd=<dir>/gone (deleted)\nremoved: getcwd=NULL errno=ENOENT\nchild: after its chdir(\"sub\"), cwd=<dir>/sub\nchild: exe is the parent's=1\nchild: cwd spellings=7 same=7\nchild exited=0\nparent: after the child's chdir, cwd=<dir>\nfailures=0\n"
+          liteinst: "exe: is argv[0]'s realpath=1\nexe: spellings=7 same=7\nexe: 3-byte buffer n=3 errno=0 written=1 untouched=1\nexe: size 0=-1 errno=EINVAL\nexe: unwritable buffer=-1 errno=EFAULT\nexe: read-only buffer=-1 errno=EFAULT untouched=1\ncwd: is getcwd=1\ncwd: spellings=7 same=7\ncwd: 3-byte buffer n=3 errno=0 written=1 untouched=1\ncwd: size 0=-1 errno=EINVAL\ncwd: unwritable buffer=-1 errno=EFAULT\ncwd: read-only buffer=-1 errno=EFAULT untouched=1\nroot=/\nroot: spellings=7 same=7\nroot: 3-byte buffer n=1 errno=0 written=1 untouched=1\nroot: size 0=-1 errno=EINVAL\nroot: unwritable buffer=-1 errno=EFAULT\nroot: read-only buffer=-1 errno=EFAULT untouched=1\nfollowed: self/exe/=-1 errno=ENOTDIR\nfollowed: self/cwd/=-1 errno=EINVAL\nfollowed: thread-self/root/=-1 errno=EINVAL\ndot: self/root/.=-1 errno=EINVAL\ndot: self/cwd/.=-1 errno=EINVAL\noutside: self/task/999999/exe=-1 errno=ENOENT\noutside: self/task/999999/cwd=-1 errno=ENOENT\nafter chdir(<dir>): cwd=<dir>\nafter chdir(\"sub\"): cwd=<dir>/sub\nafter chdir(\"sub\"): thread-self/cwd=<dir>/sub\nafter chdir(\"..\"): cwd=<dir>\ndenied search: capset=0 errno=0\ndenied search: self/cwd/.=-1 errno=EACCES\ndenied search: self/cwd=<dir>/locked\ndenied search child exited=0\nremoved: cwd=<dir>/gone (deleted)\nremoved: getcwd=NULL errno=ENOENT\nchild: after its chdir(\"sub\"), cwd=<dir>/sub\nchild: exe is the parent's=1\nchild: cwd spellings=7 same=7\nchild exited=0\nparent: after the child's chdir, cwd=<dir>\nfailures=0\n"
+          in-guest-trap: "exe: is argv[0]'s realpath=1\nexe: spellings=7 same=7\nexe: 3-byte buffer n=3 errno=0 written=1 untouched=1\nexe: size 0=-1 errno=EINVAL\nexe: unwritable buffer=-1 errno=EFAULT\nexe: read-only buffer=-1 errno=EFAULT untouched=1\ncwd: is getcwd=1\ncwd: spellings=7 same=7\ncwd: 3-byte buffer n=3 errno=0 written=1 untouched=1\ncwd: size 0=-1 errno=EINVAL\ncwd: unwritable buffer=-1 errno=EFAULT\ncwd: read-only buffer=-1 errno=EFAULT untouched=1\nroot=/\nroot: spellings=7 same=7\nroot: 3-byte buffer n=1 errno=0 written=1 untouched=1\nroot: size 0=-1 errno=EINVAL\nroot: unwritable buffer=-1 errno=EFAULT\nroot: read-only buffer=-1 errno=EFAULT untouched=1\nfollowed: self/exe/=-1 errno=ENOTDIR\nfollowed: self/cwd/=-1 errno=EINVAL\nfollowed: thread-self/root/=-1 errno=EINVAL\ndot: self/root/.=-1 errno=EINVAL\ndot: self/cwd/.=-1 errno=EINVAL\noutside: self/task/999999/exe=-1 errno=ENOENT\noutside: self/task/999999/cwd=-1 errno=ENOENT\nafter chdir(<dir>): cwd=<dir>\nafter chdir(\"sub\"): cwd=<dir>/sub\nafter chdir(\"sub\"): thread-self/cwd=<dir>/sub\nafter chdir(\"..\"): cwd=<dir>\ndenied search: capset=0 errno=0\ndenied search: self/cwd/.=-1 errno=EACCES\ndenied search: self/cwd=<dir>/locked\ndenied search child exited=0\nremoved: cwd=<dir>/gone (deleted)\nremoved: getcwd=NULL errno=ENOENT\nchild: after its chdir(\"sub\"), cwd=<dir>/sub\nchild: exe is the parent's=1\nchild: cwd spellings=7 same=7\nchild exited=0\nparent: after the child's chdir, cwd=<dir>\nfailures=0\n"
+        guest_args:
+          dbt:
+            - --no-leader-exit
+            - --no-exe-changes
+            - --base-exe-truncation
+          kvm:
+            - --no-leader-exit
+            - --no-fs-threads
+          sabre:
+            - --no-threads
+            - --no-exec
+          liteinst:
+            - --no-threads
+            - --no-exec
+          in-guest-trap:
+            - --no-threads
+            - --no-exec
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the contract is Detcore''s answer for the caller''s own exe, cwd and root links; the verify rows are the native output, measured.'
+        backends_enabled: []
+        backends_disabled:
+          native: This contract asserts Hermit's own-link answers, not native behaviour
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: Detcore answers the caller''s own links only outside record and replay, which leave them to the kernel.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record and replay leave the own links to the kernel
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the guest''s arguments only skip checks a backend cannot run; its verify cells carry the whole contract.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/proc-fd-link-aliases
     description: Strict verification for tests/c/proc_fd_link_aliases.c
     lane: portable
@@ -6679,12 +6944,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -7043,14 +7308,15 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -7627,9 +7893,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -7754,14 +8020,15 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -8767,14 +9034,15 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -8884,6 +9152,167 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/scm-rights-received-anon-inodes
+    description: "tests/c/scm_rights_received_anon_inodes.c receives anonymous-inode descriptors over SCM_RIGHTS from a child that has exited: an eventfd holding 5, an EFD_SEMAPHORE eventfd holding 3, a nonblocking eventfd and a signalfd for SIGUSR1, which the parent has blocked and pending. It reads the signalfd with room for two records, reads 16 bytes from the semaphore eventfd, clears O_NONBLOCK through the received nonblocking eventfd, and reads and writes the counting eventfd, proving none of this hangs or double-counts. KNOWN GAP, pinned: fstat cannot tell one anonymous inode from another, so Detcore does not record one it receives on ptrace and KVM (package K slice F0a fails closed: a record of the wrong kind would hold a blocking signalfd read in the caller's turn, read an EFD_SEMAPHORE eventfd twice, or let F_SETFL clear a physically nonblocking description), and every call through these descriptors that consults Detcore's table fails with EBADF, as before F0a (https://github.com/rrnewton/hermit/issues/4107, signalfd mode). Natively every call succeeds. On KVM the child's sendmsg of the signalfd fails with ENOSYS (the executor refuses to donate a signalfd), so the KVM row prints that and skips the signalfd read. Enabled on ptrace and KVM only: the in-guest discovery (DBT, SaBRe, LiteInst, in-guest-trap) records an anonymous inode as an ordinary file, the defect F0a's receipt path fails closed on, so the signalfd read would hang there"
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/scm_rights_received_anon_inodes.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: The in-guest discovery records an anonymous inode as an ordinary file, so the received signalfd's blocking read would hang (the defect the ptrace and KVM receipt path fails closed on)
+          sabre: The in-guest discovery records an anonymous inode as an ordinary file, so the received signalfd's blocking read would hang (the defect the ptrace and KVM receipt path fails closed on)
+          liteinst: The in-guest discovery records an anonymous inode as an ordinary file, so the received signalfd's blocking read would hang (the defect the ptrace and KVM receipt path fails closed on)
+          in-guest-trap: The in-guest discovery records an anonymous inode as an ordinary file, so the received signalfd's blocking read would hang (the defect the ptrace and KVM receipt path fails closed on)
+        expected_stdout:
+          ptrace: "received eventfd=1 semaphore=1 nonblocking=1 signalfd=1\neventfd read=-1 errno=9\neventfd value=0\neventfd write=-1 errno=9\nsemaphore read 16=-1 errno=9\nsemaphore value=0\nnonblocking F_GETFL=-1 errno=9\nnonblocking F_SETFL 0=-1 errno=9\nnonblocking now=-1\nsignalfd read 2 records=-1 errno=9\nsignalfd signo=0\ndone\n"
+          kvm: "sender signalfd sendmsg errno=38\nreceived eventfd=1 semaphore=1 nonblocking=1 signalfd=0\neventfd read=-1 errno=9\neventfd value=0\neventfd write=-1 errno=9\nsemaphore read 16=-1 errno=9\nsemaphore value=0\nnonblocking F_GETFL=-1 errno=9\nnonblocking F_SETFL 0=-1 errno=9\nnonblocking now=-1\nsignalfd not received\ndone\n"
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): natively every call succeeds; the contract pins Hermit''s fail-closed answer.'
+        backends_enabled: []
+        backends_disabled:
+          native: This contract pins Hermit's fail-closed answer for received anonymous inodes, not native behaviour
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record and replay do not record received descriptors.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record and replay do not record descriptors received over SCM_RIGHTS
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the guest takes no arguments; its verify cells carry the whole contract.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/scm-rights-received-descriptors
+    description: "tests/c/scm_rights_received_descriptors.c receives descriptors over SCM_RIGHTS and uses them as Linux allows. From a sender that exited before any receipt: a regular file at the sender's offset (recvmsg), both ends of a pipe (MSG_CMSG_CLOEXEC), both ends of a socketpair and a write-only append file (two messages in one recvmmsg with MSG_CMSG_CLOEXEC), three descriptors into room for one (MSG_CTRUNC, one installed) and one into room for none. Sent by the process to itself while it keeps the original: a pipe end, a socketpair end, a directory read partly through the original (together they miss no entry), a regular file whose O_NONBLOCK is set through the original after the alias arrived, and a directory received at offset 0 and read through the alias alone with a 64-byte buffer; and a MSG_PEEK receive, which installs a second, distinct descriptor. It prints each descriptor's type, F_GETFD and F_GETFL, reads, writes, duplicates and seeks through them, reports from an exec'd image which survived exec, and closes them (SaBRe, LiteInst and in-guest-trap pass --no-exec and skip the exec check: in-guest LiteInst refuses execve, and SaBRe's path evidence does not admit the exec'd image's libc sites). Detcore records each received descriptor as the receive returns where its tool does not discover descriptors as they are used (ptrace, KVM), as the in-guest discovery would record it, so these calls no longer fail with EBADF there (package K slice F0a, https://github.com/rrnewton/hermit/issues/4547; toward https://github.com/rrnewton/hermit/issues/4604). Anonymous inodes are covered by c-programs/scm-rights-received-anon-inodes. Standard output is the oracle, identical on every backend apart from the skipped exec block, and the program exits 0. KNOWN-DEFECT REGRESSION BASELINE, NOT COMPLETION, on every backend, six lines differ from Linux: the received ends of the guest-made pipe (two lines), socketpair (two lines) and self-sent pipe print nonblock=1 where Linux prints 0, because Detcore keeps those descriptions physically nonblocking and a receiver's record has only the kernel's flags; and the self-sent file's alias prints alias-after=0 where Linux prints 1, because every received descriptor is a description of its own in Detcore's model, even an alias of one the process holds (https://github.com/rrnewton/hermit/issues/4670). The directory received at offset 0 lists sorted, from the stream Detcore gives every recorded or discovered directory, where Linux lists in the filesystem's order"
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/scm_rights_received_descriptors.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - dbt
+          - sabre
+          - kvm
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
+        expected_stdout:
+          ptrace: "sender exited before any receipt\nfile kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nfile read=11 from-sender-offset=1\nfile-dup kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nfile dup-rewind=0 shared-read=4 text=rece\npipe-read kind=fifo cloexec=1 access=rdonly nonblock=1 append=0\npipe-write kind=fifo cloexec=1 access=wronly nonblock=1 append=0\npipe write=4 read=4 text=ping\nrecvmmsg messages=2\nsocket-a kind=socket cloexec=1 access=rdwr nonblock=1 append=0\nsocket-b kind=socket cloexec=1 access=rdwr nonblock=1 append=0\nsocket write=4 read=4 text=pong\nappend kind=regular cloexec=1 access=wronly nonblock=0 append=1\nappend write=7 log=13\ntruncated received=1 ctrunc=1 opened=1\ntruncated-kept kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nno-room received=0 ctrunc=1 opened=0\nself pipe-read kind=fifo write=4 read=4 text=self nonblock=1\nself socket kind=socket write=4 read=4 text=echo\nself directory kind=dir missed=0\nself file nonblock-before=0 original=1 alias-after=0\nreceived directory at offset 0: entries=40 small-buffer-calls=21 sorted=1\npeek installed=1 distinct=1 peeked-usable=1 received-usable-after-closing-peeked=1\nafter-exec file open\nafter-exec file-dup open\nafter-exec pipe-read closed\nafter-exec pipe-write closed\nafter-exec socket-a closed\nafter-exec append closed\nafter-exec truncated-kept open\nclosed=8 of 8\nfailures=0\n"
+          dbt: "sender exited before any receipt\nfile kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nfile read=11 from-sender-offset=1\nfile-dup kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nfile dup-rewind=0 shared-read=4 text=rece\npipe-read kind=fifo cloexec=1 access=rdonly nonblock=1 append=0\npipe-write kind=fifo cloexec=1 access=wronly nonblock=1 append=0\npipe write=4 read=4 text=ping\nrecvmmsg messages=2\nsocket-a kind=socket cloexec=1 access=rdwr nonblock=1 append=0\nsocket-b kind=socket cloexec=1 access=rdwr nonblock=1 append=0\nsocket write=4 read=4 text=pong\nappend kind=regular cloexec=1 access=wronly nonblock=0 append=1\nappend write=7 log=13\ntruncated received=1 ctrunc=1 opened=1\ntruncated-kept kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nno-room received=0 ctrunc=1 opened=0\nself pipe-read kind=fifo write=4 read=4 text=self nonblock=1\nself socket kind=socket write=4 read=4 text=echo\nself directory kind=dir missed=0\nself file nonblock-before=0 original=1 alias-after=0\nreceived directory at offset 0: entries=40 small-buffer-calls=21 sorted=1\npeek installed=1 distinct=1 peeked-usable=1 received-usable-after-closing-peeked=1\nafter-exec file open\nafter-exec file-dup open\nafter-exec pipe-read closed\nafter-exec pipe-write closed\nafter-exec socket-a closed\nafter-exec append closed\nafter-exec truncated-kept open\nclosed=8 of 8\nfailures=0\n"
+          sabre: "sender exited before any receipt\nfile kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nfile read=11 from-sender-offset=1\nfile-dup kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nfile dup-rewind=0 shared-read=4 text=rece\npipe-read kind=fifo cloexec=1 access=rdonly nonblock=1 append=0\npipe-write kind=fifo cloexec=1 access=wronly nonblock=1 append=0\npipe write=4 read=4 text=ping\nrecvmmsg messages=2\nsocket-a kind=socket cloexec=1 access=rdwr nonblock=1 append=0\nsocket-b kind=socket cloexec=1 access=rdwr nonblock=1 append=0\nsocket write=4 read=4 text=pong\nappend kind=regular cloexec=1 access=wronly nonblock=0 append=1\nappend write=7 log=13\ntruncated received=1 ctrunc=1 opened=1\ntruncated-kept kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nno-room received=0 ctrunc=1 opened=0\nself pipe-read kind=fifo write=4 read=4 text=self nonblock=1\nself socket kind=socket write=4 read=4 text=echo\nself directory kind=dir missed=0\nself file nonblock-before=0 original=1 alias-after=0\nreceived directory at offset 0: entries=40 small-buffer-calls=21 sorted=1\npeek installed=1 distinct=1 peeked-usable=1 received-usable-after-closing-peeked=1\nafter-exec not checked (--no-exec)\nclosed=8 of 8\nfailures=0\n"
+          kvm: "sender exited before any receipt\nfile kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nfile read=11 from-sender-offset=1\nfile-dup kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nfile dup-rewind=0 shared-read=4 text=rece\npipe-read kind=fifo cloexec=1 access=rdonly nonblock=1 append=0\npipe-write kind=fifo cloexec=1 access=wronly nonblock=1 append=0\npipe write=4 read=4 text=ping\nrecvmmsg messages=2\nsocket-a kind=socket cloexec=1 access=rdwr nonblock=1 append=0\nsocket-b kind=socket cloexec=1 access=rdwr nonblock=1 append=0\nsocket write=4 read=4 text=pong\nappend kind=regular cloexec=1 access=wronly nonblock=0 append=1\nappend write=7 log=13\ntruncated received=1 ctrunc=1 opened=1\ntruncated-kept kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nno-room received=0 ctrunc=1 opened=0\nself pipe-read kind=fifo write=4 read=4 text=self nonblock=1\nself socket kind=socket write=4 read=4 text=echo\nself directory kind=dir missed=0\nself file nonblock-before=0 original=1 alias-after=0\nreceived directory at offset 0: entries=40 small-buffer-calls=21 sorted=1\npeek installed=1 distinct=1 peeked-usable=1 received-usable-after-closing-peeked=1\nafter-exec file open\nafter-exec file-dup open\nafter-exec pipe-read closed\nafter-exec pipe-write closed\nafter-exec socket-a closed\nafter-exec append closed\nafter-exec truncated-kept open\nclosed=8 of 8\nfailures=0\n"
+          liteinst: "sender exited before any receipt\nfile kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nfile read=11 from-sender-offset=1\nfile-dup kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nfile dup-rewind=0 shared-read=4 text=rece\npipe-read kind=fifo cloexec=1 access=rdonly nonblock=1 append=0\npipe-write kind=fifo cloexec=1 access=wronly nonblock=1 append=0\npipe write=4 read=4 text=ping\nrecvmmsg messages=2\nsocket-a kind=socket cloexec=1 access=rdwr nonblock=1 append=0\nsocket-b kind=socket cloexec=1 access=rdwr nonblock=1 append=0\nsocket write=4 read=4 text=pong\nappend kind=regular cloexec=1 access=wronly nonblock=0 append=1\nappend write=7 log=13\ntruncated received=1 ctrunc=1 opened=1\ntruncated-kept kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nno-room received=0 ctrunc=1 opened=0\nself pipe-read kind=fifo write=4 read=4 text=self nonblock=1\nself socket kind=socket write=4 read=4 text=echo\nself directory kind=dir missed=0\nself file nonblock-before=0 original=1 alias-after=0\nreceived directory at offset 0: entries=40 small-buffer-calls=21 sorted=1\npeek installed=1 distinct=1 peeked-usable=1 received-usable-after-closing-peeked=1\nafter-exec not checked (--no-exec)\nclosed=8 of 8\nfailures=0\n"
+          in-guest-trap: "sender exited before any receipt\nfile kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nfile read=11 from-sender-offset=1\nfile-dup kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nfile dup-rewind=0 shared-read=4 text=rece\npipe-read kind=fifo cloexec=1 access=rdonly nonblock=1 append=0\npipe-write kind=fifo cloexec=1 access=wronly nonblock=1 append=0\npipe write=4 read=4 text=ping\nrecvmmsg messages=2\nsocket-a kind=socket cloexec=1 access=rdwr nonblock=1 append=0\nsocket-b kind=socket cloexec=1 access=rdwr nonblock=1 append=0\nsocket write=4 read=4 text=pong\nappend kind=regular cloexec=1 access=wronly nonblock=0 append=1\nappend write=7 log=13\ntruncated received=1 ctrunc=1 opened=1\ntruncated-kept kind=regular cloexec=0 access=rdonly nonblock=0 append=0\nno-room received=0 ctrunc=1 opened=0\nself pipe-read kind=fifo write=4 read=4 text=self nonblock=1\nself socket kind=socket write=4 read=4 text=echo\nself directory kind=dir missed=0\nself file nonblock-before=0 original=1 alias-after=0\nreceived directory at offset 0: entries=40 small-buffer-calls=21 sorted=1\npeek installed=1 distinct=1 peeked-usable=1 received-usable-after-closing-peeked=1\nafter-exec not checked (--no-exec)\nclosed=8 of 8\nfailures=0\n"
+        guest_args:
+          sabre:
+            - --no-exec
+          liteinst:
+            - --no-exec
+          in-guest-trap:
+            - --no-exec
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled, as c-programs/recvmsg-scm-rights-mmap does (https://github.com/rrnewton/hermit/issues/3745)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the contract is Hermit''s record of received descriptors; native output differs from Hermit''s in the five nonblock bits and the self-sent file''s alias-after flag named in the description, and may differ in the order of the directory received at offset 0, which Hermit sorts.'
+        backends_enabled: []
+        backends_disabled:
+          native: This contract asserts Hermit's handling of received descriptors, not native behaviour
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record and replay do not record received descriptors (replay stands in placeholders for them), so calls through them still fail with EBADF there and the guest exits 1.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record and replay do not record descriptors received over SCM_RIGHTS, so the guest's checks fail there
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the guest takes no arguments; its verify cells carry the whole contract.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/setitimer-determinism
     description: Strict verification for tests/c/setitimer_determinism.c
     lane: portable
@@ -8915,10 +9344,10 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
         backends_disabled:
-          dbt: Strict verification fails on GitHub-hosted runners (determinism-failure, first divergence at record 158, syscall 57; both attempts of https://github.com/rrnewton/hermit/actions/runs/37784639364) though it passes on the validation host; re-enable once the run-to-run difference is understood
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
@@ -9066,14 +9495,15 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -9440,14 +9870,15 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -9517,9 +9948,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -9577,18 +10008,19 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
           in-guest-trap: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -9651,12 +10083,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -10796,11 +11228,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
           liteinst: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 373) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
           in-guest-trap: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 373) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
       naked:
         ci: false
@@ -10932,12 +11364,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -11000,12 +11432,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -11068,12 +11500,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -11210,12 +11642,13 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           sabre: false
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -11416,14 +11849,15 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -11482,12 +11916,13 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
           sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -13530,6 +13965,365 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/inotify-blocking-faults
+    description: Strict verification for tests/c/inotify_blocking_faults.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/inotify_blocking_faults.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - sabre
+          - dbt
+          - liteinst
+          - in-guest-trap
+        backends_disabled:
+          kvm: LinuxEmu refuses a blocking inotify instance (inotify_init1 without IN_NONBLOCK answers ENOSYS), and this guest reads one (https://github.com/rrnewton/hermit/issues/4768)
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled, as for c-programs/inotify-watch (https://github.com/rrnewton/hermit/issues/3745)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/inotify-faults
+    description: Strict verification for tests/c/inotify_faults.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/inotify_faults.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - sabre
+          - dbt
+          - liteinst
+          - in-guest-trap
+        backends_disabled:
+          kvm: LinuxEmu renumbers rename cookies itself and puts back the old bytes of a cookie a fault cut short, even an IN_IGNORED event's zero cookie, which the guest checks; the Reverie slice that deletes LinuxEmu's copy (row 9 of section 3 of the LinuxEmu scope document) enables it (https://github.com/rrnewton/hermit/issues/4793)
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled, as for c-programs/inotify-watch (https://github.com/rrnewton/hermit/issues/3745)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/inotify-protection-key-fault
+    description: Strict verification for tests/c/inotify_protection_key_fault.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/inotify_protection_key_fault.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - sabre
+          - dbt
+        backends_disabled:
+          kvm: LinuxEmu has no protection keys (pkey_alloc answers ENOSYS)
+          liteinst: The in-guest runtime refuses protection keys (pkey_alloc answers EOPNOTSUPP)
+          in-guest-trap: The in-guest runtime runs the guest's syscalls with its own protection-key rights, so a read into a page a key keeps the guest from writing is copied anyway (all 12 bytes changed, where Linux changes none)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: true
+        args:
+          - --passthru-opt
+          - --allow-unsupported-syscalls
+        assert:
+          runs: 3
+          repeat_identical: true
+        backends_enabled:
+          - ptrace
+          - sabre
+          - dbt
+        backends_disabled:
+          kvm: LinuxEmu has no protection keys (pkey_alloc answers ENOSYS)
+          liteinst: The in-guest runtime refuses protection keys (pkey_alloc answers EOPNOTSUPP)
+          in-guest-trap: The in-guest runtime runs the guest's syscalls with its own protection-key rights, so a read into a page a key keeps the guest from writing is copied anyway (all 12 bytes changed, where Linux changes none)
+  - id: c-programs/inotify-received-descriptor
+    description: Strict verification for tests/c/inotify_received_descriptor.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/inotify_received_descriptor.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - sabre
+          - dbt
+          - kvm
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled, as for c-programs/inotify-watch (https://github.com/rrnewton/hermit/issues/3745)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/inotify-rename-cookies
+    description: Strict verification for tests/c/inotify_rename_cookies.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/inotify_rename_cookies.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - sabre
+          - dbt
+          - kvm
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled, as for c-programs/inotify-watch (https://github.com/rrnewton/hermit/issues/3745)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/inotify-watch
     description: Strict verification for tests/c/inotify_watch.c
     lane: portable
@@ -13563,6 +14357,72 @@ test:
           in-guest-trap:
             - --max-timeslice=disabled
         hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/inotify-write-only-buffer
+    description: Strict verification for tests/c/inotify_write_only_buffer.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/inotify_write_only_buffer.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          sabre: The in-process backends read guest memory with process_vm_readv alone, which refuses a write-only page, so the io-buffer observation `--verify-strict` makes turns this successful read into EFAULT (https://github.com/rrnewton/hermit/issues/3824, https://github.com/rrnewton/hermit/issues/4530)
+          dbt: The in-process backends read guest memory with process_vm_readv alone, which refuses a write-only page, so the io-buffer observation `--verify-strict` makes turns this successful read into EFAULT (https://github.com/rrnewton/hermit/issues/3824, https://github.com/rrnewton/hermit/issues/4530)
+          liteinst: The in-process backends read guest memory with process_vm_readv alone, which refuses a write-only page, so the io-buffer observation `--verify-strict` makes turns this successful read into EFAULT (https://github.com/rrnewton/hermit/issues/3824, https://github.com/rrnewton/hermit/issues/4530)
+          in-guest-trap: The in-process backends read guest memory with process_vm_readv alone, which refuses a write-only page, so the io-buffer observation `--verify-strict` makes turns this successful read into EFAULT (https://github.com/rrnewton/hermit/issues/3824, https://github.com/rrnewton/hermit/issues/4530)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14937,16 +15797,17 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           sabre: false
           kvm: true
         ci_disabled_reason:
           sabre: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 26, 26, 26.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
         backends_disabled:
-          dbt: Portable release DynamoRIO can stall or exit during native pthread startup before Detcore readiness; this was the one declared DBT gap of the retired backend-parity matrix, and a --probe-disabled run is the way to requalify it
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
@@ -15420,6 +16281,72 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/signalfd-threads
+    description: Strict verification for tests/c/signalfd_threads.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/signalfd_threads.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          sabre: The SaBRe tracee is killed by SIGSEGV at address 0 in this multi-threaded guest; SaBRe is archived
+          dbt: DynamoRIO emulates signalfd itself (https://github.com/rrnewton/hermit/issues/4690), and in this guest neither a signal sent to one thread nor a timer's SIGALRM becomes readable or pending (9 of the 25 checks fail)
+          liteinst: The in-guest backend cannot create a thread (clone is not forwarded), and this guest needs three
+          in-guest-trap: The in-guest backend cannot create a thread (clone is not forwarded), and this guest needs three
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/socket-epoll-ordering
     description: 'Contract fixture: ephemeral-port selection and epoll readiness ORDERING; the guest branches on which fd is ready first, so the divergence propagates into the syscall sequence rather than a printable set. Loopback only.'
     lane: portable
@@ -15441,12 +16368,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          dbt: Never measured for this cell; the original .toml cited a missing toolchain on the authoring host, which is not evidence about the backend
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -18208,6 +19135,92 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/syscall-clobbers
+    description: Strict verification for tests/c/syscall_clobbers.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/syscall_clobbers.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          sabre: true
+          kvm: true
+          dbt: true
+          liteinst: true
+          in-guest-trap: true
+        backends_enabled:
+          - ptrace
+          - sabre
+          - kvm
+          - dbt
+          - liteinst
+          - in-guest-trap
+        assert:
+          bitwise_parity: true
+        backends_disabled: {}
+        expected_stdout:
+          ptrace: "getpid: rcx ok, r11 ok\ngetppid: rcx ok, r11 ok\ngettid: rcx ok, r11 ok\ngetuid: rcx ok, r11 ok\nsched_yield: rcx ok, r11 ok\nuname: rcx ok, r11 ok\ngetcwd: rcx ok, r11 ok\nclock_gettime: rcx ok, r11 ok\ngetrandom: rcx ok, r11 ok\nbrk: rcx ok, r11 ok\nwrite-empty: rcx ok, r11 ok\nclose-ebadf: rcx ok, r11 ok\nnanosleep: rcx ok, r11 ok\nclobbers-ok\n"
+          dbt: "getpid: rcx ok, r11 ok\ngetppid: rcx ok, r11 ok\ngettid: rcx ok, r11 ok\ngetuid: rcx ok, r11 ok\nsched_yield: rcx ok, r11 ok\nuname: rcx ok, r11 ok\ngetcwd: rcx ok, r11 ok\nclock_gettime: rcx ok, r11 ok\ngetrandom: rcx ok, r11 ok\nbrk: rcx ok, r11 ok\nwrite-empty: rcx ok, r11 ok\nclose-ebadf: rcx ok, r11 ok\nnanosleep: rcx ok, r11 ok\nclobbers-ok\n"
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled, as c-programs/pipe-capacity does; the guest makes only raw syscalls and needs no preemption
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/pipe-capacity-pin
     description: Detcore-created pipes expose the fixed 8192-byte scheduler capacity instead of the host default
     lane: portable
@@ -19431,12 +20444,13 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
           sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
           liteinst: New top-of-funnel coverage is established on the ptrace reference first; LiteInst ratchets against it separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -19499,12 +20513,13 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
           sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -19862,11 +20877,15 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
           - liteinst
           - in-guest-trap
         guest_args:
           ptrace:
+            - --require-small-determinized
+            - --require-large-determinized
+          dbt:
             - --require-small-determinized
             - --require-large-determinized
           kvm:
@@ -19879,7 +20898,6 @@ test:
             - --require-small-determinized
             - --require-large-determinized
         backends_disabled:
-          dbt: DBT is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBT separately
           sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
         hermit_args:
           liteinst:
@@ -20024,9 +21042,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: Not buildable on the authoring host (cmake absent); qualify DBT separately
           sabre: Not buildable on the authoring host (cmake absent); qualify SaBRe separately
           liteinst: LiteInst preload handshake fails on the authoring host; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)

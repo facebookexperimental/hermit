@@ -3390,10 +3390,13 @@ fn evaluate_history(
         ObservedResult::Oom => Some(UnavailableClass::Oom),
         ObservedResult::InfrastructureError => Some(UnavailableClass::InfrastructureError),
         ObservedResult::SandboxDenied => Some(UnavailableClass::SandboxDenied),
+        // A chaos-floor failure is a chaos cell's result; a verify row never
+        // carries one.
         ObservedResult::Pass
         | ObservedResult::DeterminismFailure
         | ObservedResult::ParityFailure
-        | ObservedResult::ReplayFailure => None,
+        | ObservedResult::ReplayFailure
+        | ObservedResult::ChaosFloorFailure => None,
     });
     let result = row.result.map_or_else(
         || "no typed result".to_string(),
@@ -5832,6 +5835,34 @@ pub fn ledger_row_counts(rows: &[ParityLedgerSource]) -> String {
         .join(", ")
 }
 
+/// [`append_ledger_rows`]'s outcome with whether the writer accepted every
+/// row: `accepted` is true only for the writer's exit status 0 on the rows
+/// themselves, false for every line [`append_ledger_rows`] calls a refusal,
+/// an `ERROR:` or a writer without `append-parity`. A caller that must not
+/// count unaccepted rows as published (the pressure test's series-emitted
+/// marker) reads it rather than the line's words.
+pub struct LedgerAppendOutcome {
+    pub line: String,
+    pub accepted: bool,
+}
+
+pub fn append_ledger_rows_outcome(
+    append: &LedgerAppend<'_>,
+    rows: &[ParityLedgerSource],
+    bounds: AppendBounds,
+) -> LedgerAppendOutcome {
+    match append_ledger_rows_checked(append, rows, bounds) {
+        Ok(line) => LedgerAppendOutcome {
+            line,
+            accepted: true,
+        },
+        Err(line) => LedgerAppendOutcome {
+            line,
+            accepted: false,
+        },
+    }
+}
+
 /// Send `rows` to `series.py append-parity` and return the one `parity:`
 /// line that reports the outcome. Parity is measured after determinism and
 /// decides nothing, so no outcome here is an error for the caller.
@@ -5859,13 +5890,23 @@ pub fn append_ledger_rows(
     rows: &[ParityLedgerSource],
     bounds: AppendBounds,
 ) -> String {
+    append_ledger_rows_outcome(append, rows, bounds).line
+}
+
+/// [`append_ledger_rows`] with its outcome typed: `Ok` only for the writer's
+/// acceptance of the rows, `Err` for every other line.
+fn append_ledger_rows_checked(
+    append: &LedgerAppend<'_>,
+    rows: &[ParityLedgerSource],
+    bounds: AppendBounds,
+) -> Result<String, String> {
     let counts = ledger_row_counts(rows);
-    let left = |why: &str| {
-        format!(
+    let left = |why: &str| -> Result<String, String> {
+        Err(format!(
             "parity: {why}; {} rows left in {} ({counts})",
             rows.len(),
             append.source.display()
-        )
+        ))
     };
     for row in rows {
         if let Err(error) = check_producer_class(
@@ -5973,7 +6014,7 @@ pub fn append_ledger_rows(
     }
     let said = String::from_utf8_lossy(&stdout);
     let said = said.trim();
-    format!(
+    Ok(format!(
         "parity: append-parity accepted {} row(s) from {} ({counts}): {}",
         rows.len(),
         append.source.display(),
@@ -5982,7 +6023,7 @@ pub fn append_ledger_rows(
         } else {
             said
         }
-    )
+    ))
 }
 
 /// A file holding `bytes`, positioned at its start and already unlinked, to
@@ -6209,7 +6250,41 @@ mod tests {
         // candidate backend: 2965.
         // c-programs/proc-cmdline-other-processes (the same guest, another
         // process's file) adds one row per candidate backend: 2970.
-        assert_eq!(parsed.cells.len(), 2970);
+        // c-programs/proc-stat-comm (LinuxEmu D4c-1's guest) adds one row per
+        // candidate backend: 2975.
+        // system-utils/stat-script-root (D4c-1's #! script root) adds one row
+        // per candidate backend: 2980.
+        // system-utils/stat-alias-root (D4c-1's root through a symbolic link)
+        // adds one row per candidate backend: 2985.
+        // c-programs/scm-rights-received-descriptors (package K slice F0a's
+        // guest) adds one row per candidate backend: 2990.
+        // c-programs/scm-rights-received-anon-inodes (F0a's anonymous-inode
+        // guest) adds one row per candidate backend: 2995.
+        // c-programs/syscall-clobbers (the capability-flag lane's slice 3
+        // guest) adds one row per candidate backend: 3000.
+        // c-programs/inotify-rename-cookies (the inotify cookie guest,
+        // https://github.com/rrnewton/hermit/issues/4765) adds one row per
+        // candidate backend: 3005.
+        // c-programs/inotify-write-only-buffer (an inotify read into a
+        // write-only page) adds one row per candidate backend: 3010.
+        // c-programs/proc-fd-directory (package K slice F1's guest) adds one
+        // row per candidate backend: 3015.
+        // c-programs/proc-own-links (package K slice E1's guest) adds one row
+        // per candidate backend: 3020.
+        // c-programs/inotify-received-descriptor (inotify descriptors received
+        // over SCM_RIGHTS) adds one row per candidate backend: 3025.
+        // c-programs/inotify-faults (the events a read copies before it
+        // faults) adds one row per candidate backend: 3030.
+        // c-programs/inotify-blocking-faults (reads of a blocking inotify
+        // descriptor that Linux refuses before it copies) adds one row per
+        // candidate backend: 3035.
+        // c-programs/inotify-protection-key-fault (a read into a page a
+        // protection key keeps the guest from writing) adds one row per
+        // candidate backend: 3040.
+        // c-programs/signalfd-threads (a signalfd in a multi-threaded process,
+        // https://github.com/rrnewton/hermit/issues/4797) adds one row per
+        // candidate backend: 3045.
+        assert_eq!(parsed.cells.len(), 3045);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448

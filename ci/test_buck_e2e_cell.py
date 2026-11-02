@@ -18,6 +18,12 @@ other run failure, it stays failed. Nothing here needs podman, /test or capabili
 A diverging verify cell's artifacts also go through ci/buck-e2e/ingest.py, as Tpx
 would list them, to check that both run logs come back to this host from a cell that
 ran remotely (fetched with testx) and from one that ran locally (read from buck-out).
+The same round trip checks the import boundary: ingest.py refuses, from both places, every
+execution whose harness output cell.sh rejected (a pass followed by a failed exit, a
+malformed, contradictory or duplicated record, a skip that is not an excused FAIL, a
+withheld pair beside a row) or whose completion was never published (a normalizer or
+publication that failed at any point), and still accepts a pass, a guest failure, an
+excused diagnostic skip, a withheld cell and a cell that returned no result.
 
 ContainerChoiceTest evaluates defs.bzl's hermit_e2e_cells over the real
 ci/expected-e2e-plan.json with stand-ins for the Buck builtins and checks which cells
@@ -111,14 +117,44 @@ outcome = os.environ.get("FAKE_OUTCOME", "PASS")
 results, tpx = host(flag("--results")), host(flag("--tpx-json"))
 os.makedirs(os.path.dirname(results), exist_ok=True)
 test, mode, backend = flag("--test"), flag("--mode"), flag("--backend")
+# FAKE_HANG_PID_FILE: start a child, record its pid there, and never finish, like a
+# harness whose guest hangs past the cell's deadline.
+if os.environ.get("FAKE_HANG_PID_FILE"):
+    import subprocess, time
+    child = subprocess.Popen(["sleep", "1000"])
+    with open(os.environ["FAKE_HANG_PID_FILE"], "w") as f:
+        f.write(str(child.pid))
+    time.sleep(1000)
+if outcome == "NO-RESULT":
+    # Like the harness when its one cell returned no result: no row, the cell's test_done
+    # failed with a null outcome, and a failed run-verdict record for the missing result.
+    open(results, "w").close()
+    with open(host(flag("--junit")), "w") as f:
+        f.write("<testsuite/>\n")
+    with open(tpx, "w") as f:
+        f.write(json.dumps({"op": "test_done", "test": test + "/" + mode + "@" + backend, "status": "failed",
+                            "details": json.dumps({"outcome": None, "reason": "the selected cell returned no result"})}) + "\n")
+        f.write(json.dumps({"op": "test_done", "test": "test-harness/run-verdict", "status": "failed",
+                            "details": json.dumps({"run_failures": ["only 0 of 1 selected cells returned a result"]})}) + "\n")
+        f.write(json.dumps({"op": "all_done"}) + "\n")
+    sys.exit(1)
 if outcome == "HOST-INAPPLICABLE":
     # Like the harness withholding its one cell: no row, the cell's test_done skipped, and
     # a failed run-verdict record because the run executed nothing. FAKE_RUN_FAILURES adds
     # further run failures; FAKE_RUN_FAILURES_ONLY replaces them all. FAKE_WITHHELD_TEST,
-    # FAKE_WITHHELD_STATUS and FAKE_WITHHELD_OUTCOME change the withheld record.
-    open(results, "w").close()
+    # FAKE_WITHHELD_STATUS and FAKE_WITHHELD_OUTCOME change the withheld record,
+    # FAKE_RUN_VERDICT_STATUS the run-verdict record's status, and FAKE_WITHHELD_ROW adds
+    # a row with that outcome, which a withheld cell never writes.
+    with open(results, "w") as f:
+        if os.environ.get("FAKE_WITHHELD_ROW"):
+            f.write(json.dumps({"test": test, "mode": mode, "backend": backend,
+                                "outcome": os.environ["FAKE_WITHHELD_ROW"],
+                                "run_id": os.environ["E2E_RUN_ID"]}) + "\n")
     with open(host(flag("--junit")), "w") as f:
         f.write("<testsuite/>\n")
+    with open(os.path.join(os.path.dirname(results), "summary.json"), "w") as f:
+        f.write(json.dumps({"schema": 1, "host_inapplicable_cells": [
+            {"test": test, "mode": mode, "backend": None if backend == "native" else backend}]}) + "\n")
     failures = ["every one of the 1 selected cell(s) was host-inapplicable; "
                 "a run that executed no cell is not a pass"]
     failures += json.loads(os.environ.get("FAKE_RUN_FAILURES") or "[]")
@@ -130,9 +166,13 @@ if outcome == "HOST-INAPPLICABLE":
                             "status": os.environ.get("FAKE_WITHHELD_STATUS", "skipped"),
                             "details": json.dumps({"outcome": os.environ.get("FAKE_WITHHELD_OUTCOME", "HOST-INAPPLICABLE"),
                                                    "reason": "NOT RUN, NOT a pass, no coverage: this machine lacks exact-branch-counter"})}) + "\n")
-        f.write(json.dumps({"op": "test_done", "test": "test-harness/run-verdict", "status": "failed",
+        f.write(json.dumps({"op": "test_done", "test": "test-harness/run-verdict",
+                            "status": os.environ.get("FAKE_RUN_VERDICT_STATUS", "failed"),
                             "details": json.dumps({"run_failures": failures})}) + "\n")
         f.write(json.dumps({"op": "all_done"}) + "\n")
+    if "FAKE_RESULTS_RAW" in os.environ:
+        with open(results, "w") as f:
+            f.write(os.environ["FAKE_RESULTS_RAW"])
     sys.exit(1)
 with open(results, "w") as f:
     f.write(json.dumps({"test": test, "mode": mode, "backend": backend, "outcome": outcome,
@@ -159,7 +199,15 @@ if verify_json != "missing":
 for n in os.environ.get("FAKE_DETLOGS", "1" if verdict == "matched" else "12"):
     with open(os.path.join(logs, "run%s_log_detlog" % n), "w") as f:
         f.write("".join("run %s detlog line %d\n" % (n, i) for i in range(int(os.environ.get("FAKE_DETLOG_LINES", "1")))))
-sys.exit(0 if outcome == "PASS" else 1)
+# FAKE_TPX_RAW replaces the payload with exactly these bytes, after the row and the
+# evidence are written, FAKE_RESULTS_RAW the rows; FAKE_EXIT replaces the exit status.
+if "FAKE_TPX_RAW" in os.environ:
+    with open(tpx, "w") as f:
+        f.write(os.environ["FAKE_TPX_RAW"])
+if "FAKE_RESULTS_RAW" in os.environ:
+    with open(results, "w") as f:
+        f.write(os.environ["FAKE_RESULTS_RAW"])
+sys.exit(int(os.environ["FAKE_EXIT"]) if "FAKE_EXIT" in os.environ else 0 if outcome == "PASS" else 1)
 """
 
 # ci/hermetic/run-in-pinned-root.sh. `--check-image` exits FAKE_IMAGE_RC. A run records
@@ -230,6 +278,29 @@ import json, os, sys
 with open(os.environ["FAKE_CALLS"], "a") as f:
     f.write(json.dumps({"who": "timeout", "argv": sys.argv[1:]}) + "\n")
 os.execv("/usr/bin/timeout", ["timeout"] + sys.argv[1:])
+"""
+
+# python3, ahead of the real one (REAL_PYTHON) on PATH: FAKE_NORMALIZER=crash makes cell.sh's
+# verdict normalizer (`python3 - .../tpx.jsonl ...`) die before it does anything, and
+# FAKE_NORMALIZER=finish-then-crash lets it finish and then die without printing;
+# FAKE_PUBLISHER does the same to the step that writes the finished copy of result.json
+# (`python3 - .../result.json CANDIDATE ...`). Anything else runs.
+FAKE_PYTHON = r"""#!/bin/bash
+knob=
+[[ ${1:-} == - && ${2:-} == */tpx.jsonl ]] && knob=${FAKE_NORMALIZER:-}
+[[ ${1:-} == - && ${2:-} == */result.json ]] && knob=${FAKE_PUBLISHER:-}
+case $knob in
+crash) exit 3 ;;
+finish-then-crash) "$REAL_PYTHON" "$@" >/dev/null; exit 3 ;;
+esac
+exec "$REAL_PYTHON" "$@"
+"""
+
+# mv, ahead of the real one on PATH: with FAKE_MV=fail, any move to or from a path
+# containing result.json fails without moving anything.
+FAKE_MV = r"""#!/bin/bash
+[[ ${FAKE_MV:-} == fail && $* == *result*.json* ]] && exit 1
+exec /usr/bin/mv "$@"
 """
 
 # The links the container's image libraries get in the private copy's client directory.
@@ -736,6 +807,90 @@ class CellTest(unittest.TestCase):
         self.assertEqual(done["status"], "failed", done)
         self.assertIn("produced 2 test_done records", json.loads(done["details"])["reason"])
 
+    # The verdict normalizer: whatever the harness wrote or however it exited, cell.sh
+    # prints exactly one record named for the cell (run_cell checks the count), and only a
+    # well-formed passing record from a harness that exited 0 with complete evidence passes.
+    def record(self, **fields) -> str:
+        base = {"op": "test_done", "test": CELL, "status": "passed", "details": json.dumps({"outcome": "PASS"})}
+        base.update(fields)
+        return json.dumps({k: v for k, v in base.items() if v is not None}) + "\n"
+
+    def assert_normalized_failure(self, needle: str, **env: str) -> dict:
+        done, result = self.run_cell(**env)
+        self.assertEqual(done["test"], CELL)
+        self.assertEqual(done["status"], "failed", done)
+        details = json.loads(done["details"])
+        self.assertEqual(details["outcome"], "ERROR")
+        self.assertIn(needle, details["reason"])
+        return result
+
+    def test_a_passing_record_from_a_failed_harness_exit_fails(self) -> None:
+        result = self.assert_normalized_failure("harness rc=1 after a passing record", FAKE_EXIT="1")
+        self.assertEqual(result["harness_rc"], 1)
+        self.assertTrue(result["evidence_complete"], "only the exit status fails this cell")
+
+    def test_an_unreadable_payload_is_one_failed_record(self) -> None:
+        self.assert_normalized_failure("unreadable tpx.jsonl", FAKE_TPX_RAW="{not json\n")
+
+    def test_a_payload_line_that_is_not_an_object_is_one_failed_record(self) -> None:
+        self.assert_normalized_failure("a record is not a JSON object", FAKE_TPX_RAW="[1, 2]\n")
+
+    def test_a_record_without_a_valid_status_fails(self) -> None:
+        for status in (None, 1, "ok"):
+            with self.subTest(status=status):
+                self.assert_normalized_failure("reported status", FAKE_TPX_RAW=self.record(status=status))
+
+    def test_a_passing_record_without_object_details_fails(self) -> None:
+        for details in (None, 7, json.dumps([1]), "not json"):
+            with self.subTest(details=details):
+                self.assert_normalized_failure("without JSON-object details",
+                                               FAKE_TPX_RAW=self.record(details=details))
+
+    def test_malformed_details_with_incomplete_evidence_fail(self) -> None:
+        self.assert_normalized_failure("without JSON-object details", FAKE_VERIFY_JSON="missing",
+                                       FAKE_TPX_RAW=self.record(details="not json"))
+
+    def test_a_failed_record_with_malformed_details_stays_failed(self) -> None:
+        self.assert_normalized_failure("without JSON-object details",
+                                       FAKE_TPX_RAW=self.record(status="failed", details="not json"))
+
+    def test_a_record_for_another_cell_fails_under_this_cells_name(self) -> None:
+        self.assert_normalized_failure("reported test 'other/verify@ptrace'",
+                                       FAKE_TPX_RAW=self.record(test="other/verify@ptrace"))
+
+    def test_duplicate_records_for_the_cell_fail(self) -> None:
+        self.assert_normalized_failure("produced 2 test_done records", FAKE_TPX_RAW=self.record() * 2)
+
+    def test_a_withheld_pair_with_malformed_run_failures_fails(self) -> None:
+        self.assert_normalized_failure("produced 2 test_done records", FAKE_OUTCOME="HOST-INAPPLICABLE",
+                                       FAKE_RUN_FAILURES_ONLY="5")
+
+    def test_a_withheld_pair_with_non_object_details_fails(self) -> None:
+        run = json.dumps({"op": "test_done", "test": "test-harness/run-verdict", "status": "failed",
+                          "details": json.dumps({"run_failures": [
+                              "every one of the 1 selected cell(s) was host-inapplicable; nothing ran"]})}) + "\n"
+        self.assert_normalized_failure("produced 2 test_done records", FAKE_EXIT="1",
+                                       FAKE_TPX_RAW=self.record(status="skipped", details=json.dumps([])) + run)
+
+    def test_a_guest_failure_with_valid_details_stays_a_failure(self) -> None:
+        done, result = self.run_cell(FAKE_OUTCOME="FAIL")
+        self.assertEqual(done["status"], "failed")
+        self.assertEqual(json.loads(done["details"])["outcome"], "FAIL")
+        self.assertEqual(result["harness_rc"], 1)
+
+    def test_the_deadline_kills_the_harness_and_its_children(self) -> None:
+        pid_file = self.tmp / "hang.pid"
+        done, result = self.run_cell(FAKE_HANG_PID_FILE=str(pid_file), CELL_DEADLINE_S="11")
+        self.assertEqual(done["status"], "failed")
+        # timeout(1) exits 124 when its SIGTERM ended the harness's process group and 137
+        # when the SIGKILL after --kill-after did; either is the deadline.
+        self.assertIn(result["harness_rc"], (124, 137))
+        child = int(pid_file.read_text())
+        alive = Path(f"/proc/{child}").exists()
+        if alive:
+            os.kill(child, 9)
+        self.assertFalse(alive, "the harness's child outlived the cell's deadline")
+
     # Each of these changes one part of the withheld pair; each must stay a plain failure,
     # not a skip, so every clause of cell.sh's withheld_here predicate is pinned.
     def assert_withheld_variant_fails(self, **env: str) -> None:
@@ -756,6 +911,346 @@ class CellTest(unittest.TestCase):
     def test_a_single_run_failure_other_than_the_vacuity_refusal_still_fails(self) -> None:
         self.assert_withheld_variant_fails(
             FAKE_RUN_FAILURES_ONLY=json.dumps(["cannot write the test-count file"]))
+
+    # The import boundary: cell.sh's artifacts, as testx lists an execution that ran
+    # remotely and as Buck leaves one that ran locally in buck-out, go through ingest.py,
+    # which accepts an execution only when result.json records that cell.sh accepted the
+    # harness output (producer_completion), whatever evidence_complete says.
+    def ingest(self, *extra: str, executions: list[Path] | None = None) -> dict[str, subprocess.CompletedProcess]:
+        """Run ingest.py over this cell's executions (default: the last run_cell's
+        artifacts), in Tpx order, fetched with testx and read locally."""
+        executions = executions or [self.tmp / "tpx" / "artifacts"]
+        fake = self.tmp / "testx"
+        buck_out = self.tmp / "buck-out-test-execution"
+        for d in (fake, buck_out):
+            shutil.rmtree(d, ignore_errors=True)
+        listing = []
+        for i, artifacts in enumerate(executions, 1):
+            shutil.copytree(artifacts, fake / "art" / f"RUN.{i}.{100 * i}")
+            listing.append({"test_details": {"name": f"//ci/buck-e2e:cell - {CELL}", "id": i}, "end_time": 100 * i,
+                            "artifacts": [{"name": p.name} for p in sorted(artifacts.iterdir())]})
+            shutil.copytree(artifacts, buck_out / "c" / f"t{i}" / "default" / "artifacts_directory")
+        (fake / "list-RUN.json").write_text(json.dumps({"results": {"test_results": listing}}))
+        write_exe(self.tmp / "bin" / "testx", ingest_test.FAKE_TESTX)
+        plan = self.tmp / "plan.json"
+        plan.write_text(json.dumps({"cells": [{"test": TEST, "mode": MODE, "backend": BACKEND,
+                                               "lane": "portable", "category": "cat"}]}))
+        procs = {}
+        for route, local in (("remote", []), ("local", ["--local-artifacts", str(buck_out)])):
+            top = self.tmp / "ingest" / route
+            shutil.rmtree(top, ignore_errors=True)
+            procs[route] = subprocess.run(
+                [sys.executable, str(CI / "buck-e2e" / "ingest.py"), "--plan", str(plan),
+                 "--out", str(top / "import"), "--work", str(top / "work"), *local,
+                 *(a.replace("{route}", route) for a in extra), "RUN"],
+                capture_output=True, text=True, timeout=120,
+                env=dict(os.environ, TESTX=str(self.tmp / "bin" / "testx"), FAKE_TESTX_DIR=str(fake)))
+        return procs
+
+    def assert_ingest_refuses(self, *needles: str) -> None:
+        for route, proc in self.ingest().items():
+            with self.subTest(ingest=route):
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                if "unreadable results.jsonl" in needles:
+                    # ingest.py parses the rows before it reads result.json, and refuses there.
+                    self.assertIn("json.decoder.JSONDecodeError", proc.stderr)
+                    expected = ()
+                else:
+                    self.assertIn("without a valid producer completion", proc.stderr)
+                    expected = needles
+                for needle in expected:
+                    self.assertIn(needle, proc.stderr)
+                self.assertFalse((self.tmp / "ingest" / route / "import").exists(), "nothing is imported")
+
+    def assert_ingest_accepts(self, source_count: int = 1, executions: list[Path] | None = None) -> dict[str, dict]:
+        summaries = {}
+        for route, proc in self.ingest(executions=executions).items():
+            with self.subTest(ingest=route):
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                summaries[route] = json.loads(proc.stdout)
+                self.assertEqual(summaries[route]["sources"],
+                                 {"testx" if route == "remote" else "local": source_count})
+        return summaries
+
+    def assert_rejected_everywhere(self, needle: str, **env: str) -> None:
+        """cell.sh reports the cell failed and records why it rejected the harness output,
+        and ingest.py refuses the execution from both places."""
+        result = self.assert_normalized_failure(needle, **env)
+        completion = result["producer_completion"]
+        self.assertEqual(completion["version"], 1)
+        self.assertEqual(completion["status"], "invalid", result)
+        self.assertIn(needle, completion["reason"])
+        self.assert_ingest_refuses(needle)
+
+    def test_control_1_a_pass_then_a_failed_exit_is_refused_by_tpx_and_ingest(self) -> None:
+        self.assert_rejected_everywhere("harness rc=1 after a passing record", FAKE_EXIT="1")
+        result = json.loads((self.tmp / "tpx" / "artifacts" / "result.json").read_text())
+        self.assertTrue(result["evidence_complete"], "only the exit status rejects these complete logs")
+        self.assertEqual(result["outcome"], "PASS")
+        # Refused, but its logs are kept as a failed execution's evidence first.
+        for route, proc in self.ingest("--failed-verify-logs", str(self.tmp / "kept-{route}")).items():
+            with self.subTest(ingest=route, kept="logs"):
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                kept = self.tmp / f"kept-{route}"
+                files = {str(p.relative_to(kept)): p.read_bytes() for p in kept.rglob("*")
+                         if p.is_file() and p.name != "index.jsonl" and p.name != "hermit-stderr.tail"}
+                self.assertEqual(files, {f"{result['run_id']}/verify-logs/verify-1/run1_log_detlog": b"run 1 detlog line 0\n"})
+        with self.subTest("a passing row and no record"):
+            self.assert_rejected_everywhere("harness rc=1 produced 0 test_done records",
+                                            FAKE_EXIT="1", FAKE_TPX_RAW="")
+        # The withheld pair with rows it never writes: whatever the route, not a skip.
+        pair = self.record(status="skipped", details=json.dumps({"outcome": "HOST-INAPPLICABLE", "reason": "probe"}))
+        pair += json.dumps({"op": "test_done", "test": "test-harness/run-verdict", "status": "failed",
+                            "details": json.dumps({"run_failures": [
+                                "every one of the 1 selected cell(s) was host-inapplicable; "
+                                "a run that executed no cell is not a pass"]})}) + "\n"
+        for route in ("local", "re"):
+            with self.subTest(f"a withheld pair over a passing row with complete evidence on {route}"):
+                self.assert_rejected_everywhere("harness rc=1 produced 2 test_done records", HERMIT_E2E_ROUTE=route,
+                                                FAKE_TPX_RAW=pair, FAKE_EXIT="1")
+                result = json.loads((self.tmp / "tpx" / "artifacts" / "result.json").read_text())
+                self.assertEqual((result["outcome"], result["evidence_complete"]), ("PASS", True))
+            for row in ("PASS", "FAIL"):
+                with self.subTest(f"a withheld pair with a {row} row on {route}"):
+                    self.assert_rejected_everywhere("harness rc=1 produced 2 test_done records",
+                                                    FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE=route,
+                                                    FAKE_WITHHELD_ROW=row)
+            with self.subTest(f"a withheld pair with unreadable rows on {route}"):
+                self.assert_rejected_everywhere("unreadable results.jsonl", FAKE_OUTCOME="HOST-INAPPLICABLE",
+                                                HERMIT_E2E_ROUTE=route, FAKE_RESULTS_RAW="{not json\n")
+            with self.subTest(f"a withheld pair whose run verdict passed on {route}"):
+                self.assert_rejected_everywhere("harness rc=1 produced 2 test_done records",
+                                                FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE=route,
+                                                FAKE_RUN_VERDICT_STATUS="passed")
+
+    def test_control_2_a_malformed_passing_payload_is_refused_by_tpx_and_ingest(self) -> None:
+        cases = [
+            ("unreadable", "unreadable tpx.jsonl", {"FAKE_TPX_RAW": "{not json\n"}),
+            ("no outcome", "a passing record with outcome None",
+             {"FAKE_TPX_RAW": self.record(details=json.dumps({"reason": "ok"}))}),
+            ("a non-string outcome", "a passing record with outcome 7",
+             {"FAKE_TPX_RAW": self.record(details=json.dumps({"outcome": 7}))}),
+            ("a contradictory outcome", "a passing record with outcome 'FAIL'",
+             {"FAKE_TPX_RAW": self.record(details=json.dumps({"outcome": "FAIL"}))}),
+            ("a row that contradicts it", "reported outcome 'PASS' but its rows say 'FAIL'",
+             {"FAKE_OUTCOME": "FAIL", "FAKE_EXIT": "0", "FAKE_TPX_RAW": self.record()}),
+            ("duplicate records", "produced 2 test_done records", {"FAKE_TPX_RAW": self.record() * 2}),
+            ("no record from a harness that exited 0", "harness rc=0 produced 0 test_done records",
+             {"FAKE_OUTCOME": "FAIL", "FAKE_EXIT": "0", "FAKE_TPX_RAW": ""}),
+            ("unreadable rows", "unreadable results.jsonl", {"FAKE_RESULTS_RAW": "{not json\n"}),
+            ("no row", "reported outcome 'PASS' but its rows say 'nothing'", {"FAKE_RESULTS_RAW": ""}),
+        ]
+        for name, needle, env in cases:
+            with self.subTest(name):
+                self.assert_rejected_everywhere(needle, **env)
+
+    def test_control_2_the_no_result_pair_is_recognized_exactly(self) -> None:
+        def pair(own_test=CELL, own_status="failed", own_details=None, run_status="failed",
+                 failures=("only 0 of 1 selected cells returned a result",), extra=""):
+            own = own_details if own_details is not None else {"outcome": None, "reason": "the selected cell returned no result"}
+            return (json.dumps({"op": "test_done", "test": own_test, "status": own_status, "details": json.dumps(own)}) + "\n"
+                    + json.dumps({"op": "test_done", "test": "test-harness/run-verdict", "status": run_status,
+                                  "details": json.dumps({"run_failures": list(failures)})}) + "\n" + extra)
+        with self.subTest("the harness's own pair: a valid failure"):
+            done, result = self.run_cell(FAKE_OUTCOME="NO-RESULT")
+            self.assertEqual(done["status"], "failed", done)
+            self.assertEqual(json.loads(done["details"]), {"outcome": None, "reason": "the selected cell returned no result"})
+            self.assertEqual(result["producer_completion"], {"version": 1, "status": "valid", "reason": None})
+        with self.subTest("the same pair from the raw payload: a valid failure"):
+            done, result = self.run_cell(FAKE_TPX_RAW=pair(), FAKE_RESULTS_RAW="", FAKE_EXIT="1")
+            self.assertEqual((done["status"], result["producer_completion"]["status"]), ("failed", "valid"))
+        no_row = {"FAKE_RESULTS_RAW": "", "FAKE_EXIT": "1"}
+        cases = [
+            ("exit 0", "harness rc=0 produced 2 test_done records", dict(no_row, FAKE_EXIT="0", FAKE_TPX_RAW=pair())),
+            ("beside a row", "harness rc=1 produced 2 test_done records",
+             {"FAKE_OUTCOME": "FAIL", "FAKE_TPX_RAW": pair()}),
+            ("an additional run failure", "produced 2 test_done records",
+             dict(no_row, FAKE_TPX_RAW=pair(failures=("only 0 of 1 selected cells returned a result",
+                                                      "cannot write the test-count file")))),
+            ("another run failure", "produced 2 test_done records",
+             dict(no_row, FAKE_TPX_RAW=pair(failures=("only 0 of 2 selected cells returned a result",)))),
+            ("another cell's record", "produced 2 test_done records",
+             dict(no_row, FAKE_TPX_RAW=pair(own_test="other/verify@ptrace"))),
+            ("a skipped own record", "produced 2 test_done records", dict(no_row, FAKE_TPX_RAW=pair(own_status="skipped"))),
+            ("an own record with an outcome", "produced 2 test_done records",
+             dict(no_row, FAKE_TPX_RAW=pair(own_details={"outcome": "ERROR"}))),
+            ("an own record without an outcome", "produced 2 test_done records",
+             dict(no_row, FAKE_TPX_RAW=pair(own_details={"reason": "the selected cell returned no result"}))),
+            ("a run verdict that passed", "produced 2 test_done records", dict(no_row, FAKE_TPX_RAW=pair(run_status="passed"))),
+            ("a third record", "produced 3 test_done records",
+             dict(no_row, FAKE_TPX_RAW=pair(extra=self.record(test="other/verify@ptrace", status="failed",
+                                                              details=json.dumps({"outcome": "FAIL"}))))),
+            ("the cell's record alone", "a failed record with outcome None",
+             dict(no_row, FAKE_TPX_RAW=pair().splitlines(keepends=True)[0])),
+        ]
+        for name, needle, env in cases:
+            with self.subTest(name):
+                self.assert_rejected_everywhere(needle, **env)
+
+    def diagnostic_skip(self, **details) -> str:
+        """The record the harness writes for an excused diagnostic failure."""
+        return self.record(status="skipped", details=json.dumps(dict({"outcome": "FAIL", "reason": "excused"}, **details)))
+
+    def test_control_3_a_valid_diagnostic_skip_survives_and_a_malformed_one_does_not(self) -> None:
+        done, result = self.run_cell(FAKE_OUTCOME="FAIL", FAKE_EXIT="0", FAKE_TPX_RAW=self.diagnostic_skip())
+        self.assertEqual(done["status"], "skipped", done)
+        self.assertEqual(json.loads(done["details"])["outcome"], "FAIL")
+        self.assertEqual(result["producer_completion"], {"version": 1, "status": "valid", "reason": None})
+        self.assert_ingest_accepts()
+        with self.subTest("a failed ERROR with its ERROR row stays a valid failure"):
+            done, result = self.run_cell(FAKE_OUTCOME="ERROR")
+            self.assertEqual((done["status"], json.loads(done["details"])["outcome"]), ("failed", "ERROR"))
+            self.assertEqual(result["producer_completion"], {"version": 1, "status": "valid", "reason": None})
+            self.assert_ingest_accepts()
+        # (name, reason, payload, the row's outcome[, raw rows]): only an excused FAIL is a lone skip.
+        cases = [
+            ("a PASS outcome", "a skipped record with outcome 'PASS'", self.diagnostic_skip(outcome="PASS"), "FAIL"),
+            ("a non-string outcome", "a skipped record with outcome 7", self.diagnostic_skip(outcome=7), "FAIL"),
+            ("an ERROR outcome with its ERROR row", "a skipped record with outcome 'ERROR'",
+             self.diagnostic_skip(outcome="ERROR"), "ERROR"),
+            ("a lone HOST-INAPPLICABLE and no row", "a skipped record with outcome 'HOST-INAPPLICABLE'",
+             self.diagnostic_skip(outcome="HOST-INAPPLICABLE"), "FAIL", ""),
+            ("a row that contradicts it", "reported outcome 'FAIL' but its rows say 'ERROR'",
+             self.diagnostic_skip(), "ERROR"),
+            ("non-object details", "reported skipped without JSON-object details",
+             self.record(status="skipped", details="not json"), "FAIL"),
+            ("duplicate records", "produced 2 test_done records", self.diagnostic_skip() * 2, "FAIL"),
+        ]
+        for name, needle, raw, row, *rows_raw in cases:
+            with self.subTest(name):
+                self.assert_rejected_everywhere(needle, FAKE_OUTCOME=row, FAKE_EXIT="0", FAKE_TPX_RAW=raw,
+                                                **({"FAKE_RESULTS_RAW": rows_raw[0]} if rows_raw else {}))
+
+    def test_control_4_valid_outcomes_keep_their_meaning_through_ingest(self) -> None:
+        valid = {"version": 1, "status": "valid", "reason": None}
+        with self.subTest("PASS, rc 0"):
+            done, result = self.run_cell()
+            self.assertEqual(done["status"], "passed", done)
+            self.assertEqual(result["producer_completion"], valid)
+            self.assertEqual(self.assert_ingest_accepts()["remote"]["evidence_complete_executions"], 1)
+        with self.subTest("a guest FAIL, rc 1"):
+            done, result = self.run_cell(FAKE_OUTCOME="FAIL")
+            self.assertEqual((done["status"], json.loads(done["details"])["outcome"]), ("failed", "FAIL"))
+            self.assertEqual((result["harness_rc"], result["producer_completion"]), (1, valid))
+            self.assert_ingest_accepts()
+        with self.subTest("withheld locally, rc 1"):
+            done, result = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="local")
+            self.assertEqual(done["status"], "skipped", done)
+            self.assertEqual((result["harness_rc"], result["producer_completion"]), (1, valid))
+            self.assert_ingest_accepts()
+        with self.subTest("withheld on RE, rc 1"):
+            # Failed, so Tpx retries it; ingest.py names it for a local rerun.
+            done, result = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="re")
+            self.assertEqual(done["status"], "failed", done)
+            self.assertIn("produced 2 test_done records", json.loads(done["details"])["reason"])
+            self.assertEqual((result["harness_rc"], result["producer_completion"]), (1, valid))
+            for route, proc in self.ingest("--withheld-on-re", str(self.tmp / "{route}-rerun.txt")).items():
+                with self.subTest(ingest=route):
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(json.loads(proc.stdout)["withheld_on_re_every_execution"], 1)
+                    self.assertEqual((self.tmp / f"{route}-rerun.txt").read_text(), SLUG + "\n")
+
+    def snapshot(self, name: str) -> Path:
+        """A copy of the last run_cell's artifacts: one execution of the cell, for ingest."""
+        return Path(shutil.copytree(self.tmp / "tpx" / "artifacts", self.tmp / "executions" / name))
+
+    def test_control_4_retry_history_keeps_every_attempt_through_ingest(self) -> None:
+        valid = {"version": 1, "status": "valid", "reason": None}
+        with self.subTest("a deadline kill, then a pass"):
+            pid_file = self.tmp / "hang.pid"
+            done, result = self.run_cell(FAKE_HANG_PID_FILE=str(pid_file), CELL_DEADLINE_S="11")
+            child = int(pid_file.read_text())
+            if Path(f"/proc/{child}").exists():
+                os.kill(child, 9)
+            self.assertEqual(done["status"], "failed", done)
+            self.assertIn("produced 0 test_done records", json.loads(done["details"])["reason"])
+            self.assertEqual(result["producer_completion"], valid, "a harness death is a failure, not invalid output")
+            killed = self.snapshot("killed")
+            self.run_cell()
+            for summary in self.assert_ingest_accepts(2, [killed, self.snapshot("passed")]).values():
+                self.assertEqual((summary["no_row_executions"], summary["final_outcomes"]), (1, {"PASS": 1}))
+                self.assertEqual(summary["attempts"], {"2": 1}, "the pass shows the attempt before it")
+        with self.subTest("no result, then a pass"):
+            done, result = self.run_cell(FAKE_OUTCOME="NO-RESULT")
+            self.assertEqual((done["status"], result["producer_completion"]), ("failed", valid))
+            lost = self.snapshot("no-result")
+            self.run_cell()
+            for summary in self.assert_ingest_accepts(2, [lost, self.snapshot("passed-after-no-result")]).values():
+                self.assertEqual((summary["no_row_executions"], summary["final_outcomes"]), (1, {"PASS": 1}))
+                self.assertEqual(summary["attempts"], {"2": 1}, "the pass shows the attempt before it")
+        with self.subTest("withheld on RE, then a pass"):
+            self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="re")
+            withheld = self.snapshot("withheld")
+            self.run_cell()
+            for summary in self.assert_ingest_accepts(2, [withheld, self.snapshot("passed-after-re")]).values():
+                self.assertEqual((summary["withheld_on_re_executions"], summary["final_outcomes"]), (1, {"PASS": 1}))
+                self.assertEqual(summary["attempts"], {"1": 1}, "a withheld execution takes no attempt number")
+
+    def test_control_5_an_unfinished_normalizer_leaves_nothing_ingest_accepts(self) -> None:
+        bin_dir = self.tmp / "python-bin"
+        write_exe(bin_dir / "python3", FAKE_PYTHON)
+        write_exe(bin_dir / "mv", FAKE_MV)
+        env = {"PATH": f"{bin_dir}:{self.tmp / 'image-bin'}:{os.environ['PATH']}", "REAL_PYTHON": sys.executable}
+        artifacts = self.tmp / "tpx" / "artifacts"
+        with self.subTest("the stand-ins alone change nothing"):
+            done, result = self.run_cell(**env)
+            self.assertEqual(done["status"], "passed", done)
+            self.assertEqual(result["producer_completion"], {"version": 1, "status": "valid", "reason": None})
+            self.assert_ingest_accepts()
+        # Each failure leaves result.json as cell.sh first wrote it: complete evidence, a
+        # PASS outcome and no producer_completion, and no scratch copy behind.
+        failures = [
+            ("the normalizer crashes", "verdict normalizer exited 3", {"FAKE_NORMALIZER": "crash"}),
+            ("the normalizer finishes, then crashes", "verdict normalizer exited 3",
+             {"FAKE_NORMALIZER": "finish-then-crash"}),
+            ("the normalizer finishes then crashes, and publication would fail too", "verdict normalizer exited 3",
+             {"FAKE_NORMALIZER": "finish-then-crash", "FAKE_PUBLISHER": "crash", "FAKE_MV": "fail"}),
+            ("publication crashes", "cannot publish the producer completion", {"FAKE_PUBLISHER": "crash"}),
+            ("publication finishes its copy, then crashes", "cannot publish the producer completion",
+             {"FAKE_PUBLISHER": "finish-then-crash"}),
+            ("the move fails", "cannot publish the producer completion", {"FAKE_MV": "fail"}),
+        ]
+        for name, needle, knobs in failures:
+            with self.subTest(name):
+                result = self.assert_normalized_failure(needle, **env, **knobs)
+                self.assertNotIn("producer_completion", result)
+                self.assertTrue(result["evidence_complete"], result)
+                self.assertEqual(result["outcome"], "PASS")
+                self.assertEqual(sorted(p.name for p in (self.tmp / "tpx").iterdir()), ["annotations", "artifacts"])
+                self.assert_ingest_refuses("without producer_completion")
+        # A passing execution whose result.json lost, garbled or never had the completion.
+        mutations = [
+            ("no producer_completion", "without producer_completion",
+             lambda r: r.pop("producer_completion")),
+            ("a malformed one", "malformed producer_completion",
+             lambda r: r.update(producer_completion="valid")),
+            ("an extra field", "malformed producer_completion",
+             lambda r: r["producer_completion"].update(extra=1)),
+            ("a valid status with a reason", "malformed producer_completion",
+             lambda r: r["producer_completion"].update(reason="x")),
+            ("an unknown version", "producer_completion version 2",
+             lambda r: r["producer_completion"].update(version=2)),
+            ("a boolean version", "producer_completion version True",
+             lambda r: r["producer_completion"].update(version=True)),
+            ("a float version", "producer_completion version 1.0",
+             lambda r: r["producer_completion"].update(version=1.0)),
+            ("a string version", "producer_completion version '1'",
+             lambda r: r["producer_completion"].update(version="1")),
+            ("an unknown status", "malformed producer_completion",
+             lambda r: r["producer_completion"].update(status="done")),
+        ]
+        for name, needle, mutate in mutations:
+            with self.subTest(name):
+                done, result = self.run_cell()
+                self.assertEqual(done["status"], "passed", done)
+                self.assertTrue(result["evidence_complete"], "evidence_complete never stands in for it")
+                mutate(result)
+                (artifacts / "result.json").write_text(json.dumps(result))
+                self.assert_ingest_refuses(needle)
+        with self.subTest("no result.json"):
+            self.run_cell()
+            (artifacts / "result.json").unlink()
+            self.assert_ingest_refuses("has no result.json")
 
     def test_a_diverged_cells_run_logs_come_back_through_ingest(self) -> None:
         # Run 2's log is over cell.sh's 256 KiB compression threshold, as a real DETLOG is.
@@ -914,7 +1409,9 @@ class ParityRouteTest(unittest.TestCase):
         for routing in self.CONFIGS:
             routes = self.routes(routing)
             sabre = sorted(test for test, backend in routes if backend == "sabre")
-            self.assertGreater(len(sabre), 200, routing)
+            # SaBRe is archived (ci/manifest-plan/src/archived.rs): its cells left
+            # per-commit validation for the nightly sweep, so no Buck cell remains.
+            self.assertEqual(len(sabre), 0, routing)
             for test in sabre:
                 if (test, "ptrace") in routes:
                     self.assertEqual(routes[(test, "sabre")], routes[(test, "ptrace")], (routing, test))

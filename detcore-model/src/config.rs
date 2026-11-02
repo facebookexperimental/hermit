@@ -11,6 +11,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
+use std::num::NonZeroU32;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -214,8 +215,11 @@ pub struct Config {
 
     /// The CPU the guest sees: virtual x86-64-v2/v3 or intercepted host
     /// features without hardware randomness. The long help states each
-    /// profile's host requirements and determinism limits.
-    #[clap(long, value_enum, default_value_t, long_help = crate::cpu_profile::CPU_PROFILE_LONG_HELP)]
+    /// profile's host requirements and determinism limits. Like
+    /// HERMIT_EPOCH, HERMIT_CPU_PROFILE supplies the value when the flag is
+    /// absent; an explicit flag wins, unset means x86-64-v2, and a value that
+    /// names no profile is refused. Admission is the same either way.
+    #[clap(long, value_enum, default_value_t, env = "HERMIT_CPU_PROFILE", long_help = crate::cpu_profile::CPU_PROFILE_LONG_HELP)]
     #[serde(default)]
     pub cpu_profile: crate::cpu_profile::CpuProfile,
 
@@ -415,6 +419,14 @@ pub struct Config {
     /// The stable default here is for library callers and wire-format fixtures;
     /// the `hermit run` and `hermit oci run` commands replace an omitted CLI
     /// default with one host wall-clock sample taken before backend dispatch.
+    ///
+    /// A guest that checks TLS certificates over the host network (`--network=host` or
+    /// `--record-networking`) checks them against this clock, so an epoch outside a server
+    /// certificate's validity fails the HTTPS connections to that server: curl exits 60 with "SSL
+    /// certificate problem: certificate is not yet valid" (or "certificate has expired"), and a
+    /// libcurl caller sees "SSL peer certificate or SSH remote key was not OK". For such a run omit
+    /// `--epoch`: `hermit run` then starts the clock at the current time and saves it in the run's
+    /// manifest, and `hermit run --from last-run` repeats the run with that epoch.
     #[clap(
         long,
         env = "HERMIT_EPOCH",
@@ -539,6 +551,40 @@ pub struct Config {
     #[serde(default)]
     #[clap(skip)]
     pub container_mount_table: Option<crate::container_mounts::ContainerMountTable>,
+
+    /// The guest path of the empty, read-only directory hermit-cli mounted in
+    /// the guest's container for Detcore's placeholder directories where the
+    /// guest's procfs is not the kernel's (KVM: the backend provides process
+    /// signal control, `procfs_inode::tool_can_name_guest_descriptors`): a
+    /// tmpfs at `/proc/fs/nfsd`, procfs's own permanently empty mount point,
+    /// which Detcore's `--proc` level table hides from the guest at every
+    /// level, and which the guest's mount table leaves out. Each descriptor
+    /// Detcore serves there for `/proc` itself or the caller's own
+    /// `/proc/<pid>/fd` is open on this directory, and Detcore answers every
+    /// call through it from its model; an open, stat or statx of the guest's
+    /// that reaches the directory otherwise fails as `/proc/fs` does. `None`
+    /// where the guest's procfs is the kernel's (ptrace, the in-guest
+    /// backends: nothing is mounted, see [`Self::container_procfs`]), and
+    /// where hermit-cli mounted none or a later mount covers it:
+    /// `--no-namespace`, `--namespace-only`, record and replay, a user mount
+    /// over the placeholder, every library caller, and every older
+    /// configuration. On KVM, Detcore then serves no placeholder directory,
+    /// and an open of `/proc` or a descriptor directory is refused (`EACCES`).
+    /// Runtime provenance, not a user option.
+    #[serde(default)]
+    #[clap(skip)]
+    pub directory_placeholder: Option<PathBuf>,
+
+    /// Whether the guest runs in hermit-cli's container, whose procfs mount
+    /// at `/proc` is its own (every container hermit-cli runs a guest in, not
+    /// `--no-namespace`, not a library caller, not an older configuration).
+    /// Where the guest's procfs is the kernel's (ptrace), Detcore serves
+    /// `/proc` itself and the caller's own `/proc/<pid>/fd` then, each on a
+    /// descriptor on that procfs's root, and serves neither without it.
+    /// Runtime provenance, not a user option.
+    #[serde(default)]
+    #[clap(skip)]
+    pub container_procfs: bool,
 
     /// Sequentialize thread execution deterministically.
     #[clap(long)]
@@ -757,6 +803,17 @@ pub struct Config {
     #[clap(skip)]
     pub has_uts_namespace: bool,
 
+    /// **Internal:** Print a one-time notice on Hermit's standard error when the guest binds an
+    /// abstract `AF_UNIX` name, or fails to with `EADDRINUSE`. `hermit run` sets it for a run that
+    /// asked for `--network=host` on the ptrace backend: the guest then shares the host's network
+    /// namespace, and with it the abstract names of every program on the host, other Hermit runs
+    /// included, and Detcore runs in Hermit's own process, so the notice reaches Hermit's stderr
+    /// and never the guest's. Nothing the guest observes depends on it. The DBT backend's runtime
+    /// reads the frozen legacy form ([`to_legacy_backend_json`]), which leaves this field out.
+    #[serde(default)]
+    #[clap(skip)]
+    pub notice_host_network_abstract_binds: bool,
+
     /// **Internal:** Path to the replay data folder.
     #[clap(skip)]
     pub replay_data: Option<PathBuf>,
@@ -766,17 +823,25 @@ pub struct Config {
     #[clap(long)]
     pub kill_daemons: bool,
 
-    /// Start gdbserver on `gdbserver_port` for remote debugging
-    /// Disabled by default.
+    /// Serve the guest to one gdb client on 127.0.0.1:`--gdbserver-port`, and
+    /// wait for it before the guest runs; attach with
+    /// `gdb -ex 'target remote 127.0.0.1:PORT' PROGRAM`. The port is bound in the
+    /// host's network namespace, so the guest keeps the network `--network`
+    /// gives it, and a `--strict` run can be debugged with every strict refusal
+    /// in force. The debugger is an input of the run: breakpoints, writes to the
+    /// guest's memory or registers and the signals it sends all change it. With
+    /// a gdbserver, Detcore also takes no reports of the guest's signal-handler
+    /// returns, so a multithreaded guest whose handlers take scheduler turns can
+    /// be scheduled differently than without one (docs/SIGNAL_STATE_CHECK.md).
+    /// Only the ptrace backend (the default, and `--backend=e9patch`, whose
+    /// rewritten guest runs under it) serves gdb: `--backend=kvm`, `dbt`,
+    /// `sabre`, `liteinst` and `in-guest-trap`, and `--namespace-only`, refuse
+    /// `--gdbserver` and `--dap-listen`.
     #[clap(long)]
     pub gdbserver: bool,
-    /// port gdbserver listening on
-    #[clap(
-        long,
-        value_name = "uint16",
-        help = "Port gdbserver listening on",
-        default_value = "1234"
-    )]
+    /// The loopback TCP port `--gdbserver` serves on; 0 lets the system pick a
+    /// free one, which the run prints.
+    #[clap(long, value_name = "uint16", default_value = "1234")]
     pub gdbserver_port: u16,
 
     /// Configure the maximum time a guest thread may run without returning to Detcore. This is
@@ -860,6 +925,22 @@ pub struct Config {
     #[clap(long, value_name = "nanos")]
     pub pipe_wake_latency: Option<u64>,
 
+    /// How a run of consecutive scheduler turns that each end an expired timed wait (a futex wait
+    /// answered `ETIMEDOUT`, or a sleep already due) is charged while another thread is queued:
+    /// `once`, one scheduler turn for the whole run, or `each`, a turn per wait. Unset, `each`
+    /// under `--chaos` or a `--sched-heuristic` that does not select by priority, where the time
+    /// each charge adds stretches short waits as race search relies on, and `once` otherwise, so
+    /// that a thread polling with waits shorter than a turn charge blocks and lets other threads
+    /// run. A replay of a schedule or of preemptions that leaves this unset takes the value its
+    /// record stores (a record that stores none, written before the option existed or by an
+    /// `each` run, charged each wait), and an explicit value that disagrees with the record is
+    /// refused. `hermit analyze` and `hermit bisect` run every trial under the value of the
+    /// recording they start from, or `each` when analyze records its own chaos target. Under
+    /// `hermit record` and `hermit replay` every wait is charged, whatever the value.
+    #[serde(default)]
+    #[clap(long, value_enum, value_name = "each|once")]
+    pub expired_wait_charge: Option<ExpiredWaitCharge>,
+
     /// Write a work/span report of the run's schedule to this path as JSON when the run ends
     /// normally: work (the sum of every thread's guest CPU time, in virtual nanoseconds), a
     /// lower span over the scheduler's certain happens-before edges (program order, spawn, a
@@ -890,6 +971,26 @@ pub struct Config {
     #[serde(default)]
     #[clap(long, value_name = "virtual-nanoseconds")]
     pub scheduler_turn_cost: Option<NonZeroU64>,
+
+    /// Charge a scheduler turn that ends a timeslice because its time ran out (a preemption)
+    /// at most the virtual time its thread ran since its previous turn, instead of the full
+    /// turn charge (`--scheduler-turn-cost`, default 500000 virtual nanoseconds). Without it,
+    /// every preemption adds the full charge however short the slice was, so a small
+    /// `--max-timeslice`, or a short `--chaos` draw, multiplies the guest-visible time of
+    /// CPU-bound work by about `1 + charge / slice`: 501 times at `--max-timeslice=1000`,
+    /// enough for a test's own timeouts to expire before it reaches the code under test. With
+    /// it the factor is at most 2, what a slice one full charge long already costs; a slice
+    /// at least that long is charged as before. A capped turn is charged at least one virtual
+    /// nanosecond. An explicit `sched_yield`, and every turn that does not end a timeslice,
+    /// keep the full charge. This changes the guest-visible time of runs with short slices:
+    /// recorded schedules store the setting, and a replay under the other is refused.
+    /// Refused where no timeslice ends by expiry (`--max-timeslice=disabled` without
+    /// `--target-timeslice`) or no Detcore scheduler orders the threads (`--namespace-only`,
+    /// `--strace-only`, `--no-sequentialize-threads`), and with the DBT backend; never applied
+    /// in record mode.
+    #[serde(default)]
+    #[clap(long)]
+    pub cap_preemption_charge: bool,
 
     /// Shut down immediately upon SIGINT, rather than letting the guest handle it.
     #[clap(long)]
@@ -939,9 +1040,9 @@ pub struct Config {
     /// they finish. Otherwise the descriptor-table changes of different threads could
     /// interleave differently from one replay to the next.
     ///
-    /// It never enters the legacy form ([`to_legacy_backend_json`]), so the DBT runtime's
-    /// `HERMIT_DBT_DETCONFIG` in the guest's environment is unchanged by its introduction
-    /// and reads it as false. Record and replay run only on the ptrace backend.
+    /// It never enters the legacy form ([`to_legacy_backend_json`]), so a standalone DBT
+    /// run's `HERMIT_DBT_DETCONFIG` reads it as false. Record and replay run only on the
+    /// ptrace backend.
     #[serde(default)]
     #[clap(skip = false)]
     pub replaying: bool,
@@ -1089,6 +1190,21 @@ pub struct Config {
     #[clap(long, default_value = "1GB", value_parser = try_parse_memory, value_name = "bytesize")]
     pub memory: u64,
 
+    /// Present a machine with this many CPUs, 1 to 128, so that `nproc`,
+    /// `sysconf(_SC_NPROCESSORS_ONLN/CONF)` and thread pools size themselves
+    /// to it. Threads still run one at a time. The affinity mask,
+    /// `getcpu`, CPUID's APIC IDs, `/proc/cpuinfo`, `/proc/stat`, a task's
+    /// `Cpus_allowed` and `/sys/devices/system/cpu` (its CPU lists, `cpuN`
+    /// directories, topology and cache files) all describe the same N
+    /// single-core sockets on one NUMA node. `sched_setaffinity` follows
+    /// Linux: a mask with none of the N CPUs is EINVAL. The host must list
+    /// at least N CPUs under `/sys/devices/system/cpu`. Without this flag the
+    /// guest sees Hermit's historical single CPU, whose `sched_setaffinity`
+    /// accepts any mask.
+    #[serde(default)]
+    #[clap(long, value_name = "count", value_parser = parse_virtual_cpus)]
+    pub virtual_cpus: Option<NonZeroU32>,
+
     /// How much of `/proc` the guest sees. Every level is the same on every
     /// backend and host. `minimal` (the default) shows a small set, modelled
     /// on gVisor's; `standard` shows every system-wide name Detcore serves or
@@ -1193,6 +1309,26 @@ pub struct Config {
     #[serde(default)]
     #[clap(skip)]
     pub in_guest_signal_delivery: bool,
+
+    /// Whether `--replay-preemptions-from` names a record that carries
+    /// callback checkpoints, so priority-history replay ends each annotated
+    /// row at its recorded callback endpoint instead of at the first stop that
+    /// reaches the row's RCB count
+    /// (<https://github.com/rrnewton/hermit/issues/4082>).
+    ///
+    /// The host sets it, not a flag, from the validated record before the
+    /// scheduler or any Tool reads the configuration, and refuses a
+    /// configuration it does not qualify for such a record
+    /// (`preemption_admission::refuse_unqualified_annotated_replay`). Preparing
+    /// any run sets it from the record, so a caller's configuration cannot
+    /// carry it in; Detcore refuses a record whose checkpoints disagree with
+    /// it. A record so annotated was made with `--record-preemptions`, so the
+    /// replay observes schedule events as its recording did
+    /// (`observes_schedevents`). False, the default, changes nothing. Like
+    /// `in_guest_signal_delivery`, it has no legacy key.
+    #[serde(default)]
+    #[clap(skip)]
+    pub annotated_priority_replay: bool,
 }
 
 /// Where and how much [`Config::fatal_core_capture`] may write.
@@ -1234,7 +1370,31 @@ fn try_parse_memory(from_str: &str) -> anyhow::Result<u64> {
         .map_err(anyhow::Error::msg)
 }
 
+/// The most CPUs `--virtual-cpus` presents: the bits of the 128-bit mask
+/// Detcore's `sched_getaffinity` answers with, whose highest CPU is the
+/// `kernel_max` (127) it reports.
+pub const MAX_VIRTUAL_CPUS: u32 = 128;
+
+fn parse_virtual_cpus(value: &str) -> Result<NonZeroU32, String> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|count| (1..=MAX_VIRTUAL_CPUS).contains(count))
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| {
+            format!(
+                "expected a CPU count from 1 to {MAX_VIRTUAL_CPUS}, for example --virtual-cpus 4"
+            )
+        })
+}
+
 impl Config {
+    /// How many CPUs the guest sees: `--virtual-cpus`, or Hermit's
+    /// historical one.
+    pub fn virtual_cpu_count(&self) -> u32 {
+        self.virtual_cpus.map_or(1, NonZeroU32::get)
+    }
+
     /// Whether the scheduler models which thread the kernel gives a signal,
     /// from the signal masks it reads from the kernel, and keeps the
     /// per-process ledger of signals discarded at send time; the guest side
@@ -1485,6 +1645,19 @@ impl Config {
         })
     }
 
+    /// Whether a run of consecutive turns that each end an expired timed wait is charged one
+    /// scheduler turn (`--expired-wait-charge`): the explicit value, or by default outside race
+    /// search (`--chaos`, or a `--sched-heuristic` that does not select by priority). Never under
+    /// `hermit record` and `hermit replay`. A replay that leaves the option unset takes its
+    /// record's value instead (`Scheduler::new`).
+    pub fn expired_wait_runs_charged_once(&self) -> bool {
+        !self.recordreplay_modes
+            && match self.expired_wait_charge {
+                Some(charge) => charge == ExpiredWaitCharge::Once,
+                None => !self.chaos && self.sched_heuristic.is_priority_ordered(),
+            }
+    }
+
     /// Should we convert sockets to SOCK_NONBLOCK?
     pub fn use_nonblocking_sockets(&self) -> bool {
         self.sequentialize_threads && !self.debug_externalize_sockets
@@ -1494,6 +1667,42 @@ impl Config {
     /// This applies to both record and replay for scheduled events.
     pub fn should_trace_schedevent(&self) -> bool {
         self.record_preemptions || self.replay_schedule_from.is_some()
+    }
+
+    /// Whether this run produces and traces schedule events: the decision
+    /// `should_trace_schedevent` makes for recording and schedule replay, and
+    /// also replay of a callback-annotated priority history
+    /// (`annotated_priority_replay`). Such a record was made with
+    /// `--record-preemptions`, so its replay makes every decision this gates
+    /// as its recording did, whether or not it writes a record, and its
+    /// callback checkpoints compare against the progress those events count.
+    pub fn observes_schedevents(&self) -> bool {
+        self.should_trace_schedevent() || self.annotated_priority_replay
+    }
+
+    /// Why this effective configuration cannot replay a callback-annotated
+    /// priority history, or `None` when it can. Its row ends are actual
+    /// callback endpoints at exact RCB counts, guarded one RCB past each: that
+    /// needs the backend's own Detcore preemption timer events
+    /// (`delivers_preemption_timer_events`), sequentialized threads (the
+    /// scheduler that grants each history and acknowledges each row), an
+    /// active maximum timeslice, precise timers and RCB time. The answer
+    /// names the first unmet requirement. It reads capabilities, never a
+    /// backend's name, and never changes the configuration.
+    pub fn annotated_priority_replay_unqualified(&self) -> Option<&'static str> {
+        if !self.backend.delivers_preemption_timer_events {
+            Some("cannot deliver Detcore preemption timer events")
+        } else if !self.sequentialize_threads {
+            Some("does not sequentialize threads (--no-sequentialize-threads)")
+        } else if self.max_timeslice.is_none() {
+            Some("has its preemption timer disabled (--max-timeslice=disabled)")
+        } else if self.imprecise_timers {
+            Some("requests imprecise timers (--imprecise-timers)")
+        } else if self.no_rcb_time {
+            Some("requests logical time without RCBs (--no-rcb-time)")
+        } else {
+            None
+        }
     }
 
     /// Returns manual interuption points for a given thread
@@ -1652,11 +1861,17 @@ impl fmt::Display for Config {
         if let Some(latency) = self.pipe_wake_latency {
             write!(f, " --pipe-wake-latency={}", latency)?;
         }
+        if let Some(charge) = self.expired_wait_charge {
+            write!(f, " --expired-wait-charge={}", charge.as_str())?;
+        }
         if let Some(report) = &self.work_span_report {
             write!(f, " --work-span-report={}", report.display())?;
         }
         if let Some(cost) = self.scheduler_turn_cost {
             write!(f, " --scheduler-turn-cost={}", cost)?;
+        }
+        if self.cap_preemption_charge {
+            write!(f, " --cap-preemption-charge")?;
         }
         if self.sigint_instakill {
             write!(f, " --sigint-instakill")?;
@@ -1730,6 +1945,9 @@ impl fmt::Display for Config {
         }
         if self.memory != 1_000_000_000 {
             write!(f, " --memory={}", self.memory)?;
+        }
+        if let Some(cpus) = self.virtual_cpus {
+            write!(f, " --virtual-cpus={cpus}")?;
         }
         match self.proc_level {
             ProcLevel::Minimal => {}
@@ -1856,6 +2074,43 @@ impl FromStr for BlockingMode {
                 "Expected Polling|Precise|External, could not parse: {:?}",
                 s
             )),
+        }
+    }
+}
+
+/// How a run of consecutive scheduler turns that each end an expired timed wait is charged while
+/// another thread is queued (`--expired-wait-charge`).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ExpiredWaitCharge {
+    /// Every expired wait is charged a scheduler turn.
+    Each,
+    /// A run of expired waits is charged one scheduler turn.
+    Once,
+}
+
+impl ExpiredWaitCharge {
+    /// The rule a run follows when it charges a run of expired waits once
+    /// (`once`) or not (`each`).
+    pub fn from_charged_once(once: bool) -> Self {
+        if once { Self::Once } else { Self::Each }
+    }
+
+    /// The option's value as `--expired-wait-charge` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Each => "each",
+            Self::Once => "once",
         }
     }
 }
@@ -2082,15 +2337,18 @@ pub const MAX_SCHEDULER_TURN_COST: u64 = 1_000_000_000;
 
 /// N.B. we don't want to specify two different notions of "default", so we use the
 /// `Clap` instance above.
-/// Environment variable carrying the coordinator's [`config_wire_fingerprint`]
-/// to an out-of-process plugin.
+/// Environment variable carrying the coordinator's fingerprint to an
+/// out-of-process plugin: `detcore::config_wire_fingerprint`, which extends
+/// [`config_wire_fingerprint`] with Detcore's global RPC definitions.
 ///
 /// Named alongside the other `REVERIE_SABRE_HERMIT_*` launch variables so the
 /// two travel together and a reader finds them in one place.
 pub const CONFIG_FINGERPRINT_ENV: &str = "REVERIE_SABRE_HERMIT_CONFIG_FINGERPRINT";
 
-/// Environment variable carrying the coordinator's [`config_wire_fingerprint`]
-/// to the in-guest LiteInst runtime (`libdetcore_liteinst.so`), which checks it
+/// Environment variable carrying the coordinator's fingerprint
+/// (`detcore::config_wire_fingerprint`, which extends
+/// [`config_wire_fingerprint`] with Detcore's global RPC definitions) to the
+/// in-guest LiteInst runtime (`libdetcore_liteinst.so`), which checks it
 /// before it decodes the configuration the coordinator sends. Without the
 /// check, a runtime built from another tree fails with a bare decoding error
 /// that names neither build (<https://github.com/rrnewton/hermit/issues/3986>).
@@ -2150,8 +2408,8 @@ const CONFIG_DEFINITION_SOURCES: &[&[u8]] = &[
 /// can make it decode the handshake or a subsequent request at the wrong offsets.
 fn config_wire_default() -> Config {
     // `Config::default()` is intentionally environment-aware through Clap.
-    // A coordinator may therefore inherit HERMIT_EPOCH/HERMIT_PRNG or
-    // HERMIT_SCHED_SEED even though the separately loaded plugin receives a
+    // A coordinator may therefore inherit HERMIT_EPOCH/HERMIT_PRNG,
+    // HERMIT_SCHED_SEED or HERMIT_CPU_PROFILE even though the separately loaded plugin receives a
     // minimal guest environment. Those invocation values are payload data,
     // not wire shape, and must not make two artifacts from the same source
     // reject one another. Explicit arguments take precedence over Clap's
@@ -2162,6 +2420,7 @@ fn config_wire_default() -> Config {
         &format!("--epoch={DEFAULT_EPOCH_STR}"),
         "--seed=0",
         "--sched-seed=0",
+        "--cpu-profile=x86-64-v2",
     ]);
     config.sched_seed = None;
     // `BackendCapabilities` is defined in Reverie, outside
@@ -2254,24 +2513,29 @@ impl Default for Config {
 /// [`Config::in_guest_site_patching_off`], which is unset for DBT, and
 /// [`Config::launch_image`], which came after it. So is [`Config::target_timeslice_syscalls_only`],
 /// added after this form froze; DBT runs without a PMU maximum, where the
-/// option has no effect. So are [`Config::futex_wake_yields`] and
-/// [`Config::scheduler_turn_cost`], also added after this form froze, which
+/// option has no effect. So are [`Config::futex_wake_yields`],
+/// [`Config::scheduler_turn_cost`] and [`Config::cap_preemption_charge`],
+/// also added after this form froze, which
 /// `hermit run` refuses with the DBT backend, and [`Config::replaying`], set
 /// only by `hermit replay`, which runs only on the ptrace backend. So is
 /// [`Config::inherited_seccomp`], added after this form froze, which reads
-/// back as unknown. So is [`Config::in_guest_reserved_signals`], empty for
-/// DBT (it is set only for in-guest runs), which reads back as empty, and
+/// back as unknown, and [`Config::virtual_cpus`], which `hermit run`
+/// refuses with the DBT backend and reads back as unset. So is
+/// [`Config::in_guest_reserved_signals`], empty for DBT (it is set only for
+/// in-guest runs), which reads back as empty, and
 /// [`Config::in_guest_refuses_host_timed_producers`] and
 /// [`Config::in_guest_signal_delivery`], false for DBT, which read back as
-/// false. Every
+/// false. So is [`Config::notice_host_network_abstract_binds`], added after this form
+/// froze, which reads back as false: DBT's runtime then prints no notice for
+/// an abstract `AF_UNIX` bind. Every
 /// other field is serialized exactly as `serde_json::to_string(config)`
 /// serializes it.
 ///
-/// Use this wherever the JSON is visible to the guest. `hermit run
-/// --backend=dbt` passes the configuration to the in-guest DBT runtime in the
-/// guest's own environment, so a guest that reads its environment, or whose
-/// initial stack layout depends on the environment's size, observes this
-/// string; producing the earlier bytes keeps that observation unchanged.
+/// A standalone DBT run (one with no coordinator) reads its configuration
+/// from `HERMIT_DBT_DETCONFIG` in this form or in the versioned envelope of
+/// [`encode_backend_config_json`]. `hermit run --backend=dbt` writes neither:
+/// it launches DBT coordinated, and the runtime receives the typed `Config`
+/// through the coordinator's first RPC frame.
 ///
 /// Read the result with [`from_legacy_backend_json`], which recovers
 /// [`Config::backend`] from the fifteen keys. A plain `Config`
@@ -2307,7 +2571,10 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
         // No backend installs a CPUID policy of its own any more, so the key
         // is always written false; see `from_legacy_backend_json`.
         ("cpuid_virtualized_by_backend", false),
-        ("backend_supports_madvise", backend.supports_madvise),
+        // Every backend now takes every madvise advice and refuses what it does
+        // not implement itself, so the key is always written true, its value on
+        // DBT, the form's only reader; see `from_legacy_backend_json`.
+        ("backend_supports_madvise", true),
         (
             "discover_live_file_metadata",
             backend.tool_shares_guest_descriptor_table,
@@ -2316,10 +2583,11 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
             "detect_host_clock_futex_timeouts",
             backend.guest_clock_reads_bypass_backend,
         ),
-        (
-            "syscall_clobbers_virtualized_by_backend",
-            backend.virtualizes_syscall_clobbers,
-        ),
+        // Reverie's backend contract now requires every backend to leave the
+        // syscall-clobbered registers as a native return would (with the
+        // exceptions it names), so the key is always written false, its value
+        // on DBT, the form's only reader; see `from_legacy_backend_json`.
+        ("syscall_clobbers_virtualized_by_backend", false),
         (
             "cancel_killed_thread_rpcs",
             backend.needs_killed_thread_rpc_cancellation,
@@ -2353,10 +2621,11 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
         // the kernel on every backend. Always false; see
         // `from_legacy_backend_json`.
         ("backend_virtualizes_capability_prctls", false),
-        (
-            "backend_defers_vfork_child_registration",
-            backend.defers_vfork_child_registration,
-        ),
+        // A vfork child may register before or after the parent's call returns
+        // on every backend now, and Detcore waits for it either way, so the key
+        // is always written false, its value on DBT, the form's only reader;
+        // see `from_legacy_backend_json`.
+        ("backend_defers_vfork_child_registration", false),
     ]
 }
 
@@ -2370,11 +2639,8 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// replaced a read of it, so a decoded configuration behaves as the same JSON
 /// did before:
 ///
-/// - `discover_live_file_metadata` supplies the four descriptor and loopback
+/// - `discover_live_file_metadata` supplies the three descriptor and loopback
 ///   facts that were each a read of it;
-/// - `backend_reports_physical_process_exits` supplies
-///   `reports_physical_process_exits` and
-///   `signal_interrupts_external_syscalls`;
 /// - `backend_is_kvm` supplies the two behaviours it selected that remain
 ///   capabilities, `provides_process_signal_control` and
 ///   `emulates_child_waits` (the other three are now answered by the backend
@@ -2383,6 +2649,12 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 ///   `time(2)` probe and `Guest::storable_memory_ranges`, and the user
 ///   address limit is each guest's own `Guest::user_address_limit` report);
 /// - every other key supplies the one capability of the same meaning.
+///
+/// `backend_supports_madvise` supplies no capability any more: it said the
+/// tool could forward every madvise advice to the backend, which every backend
+/// now accepts, refusing an advice it does not implement itself. Since
+/// `supports_madv_dontneed` was deleted, `MADV_DONTNEED` had been forwarded
+/// whatever this key said.
 ///
 /// This inverts [`to_legacy_backend_json`] for every capability value the keys
 /// can express, which includes every backend's own constant except for
@@ -2404,14 +2676,35 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// `cpuid_virtualized_by_backend` supplies no capability either: it said the
 /// backend installed a CPUID policy of its own, which no backend does any
 /// more (KVM stopped with Reverie 0f4d8852). It is still written, as false,
-/// so DBT's guest-visible configuration keeps its bytes, and an input that
+/// so the legacy form keeps its bytes, and an input that
 /// says `true` fails the parse rather than being read as a policy no backend
 /// has.
 ///
+/// `backend_defers_vfork_child_registration` supplies no capability either: it
+/// said the backend registered a vfork child only after the parent's call
+/// returned, which Reverie's backend contract now allows of every backend. It
+/// is written as false, its value on DBT, so the legacy form keeps its bytes.
+/// The reader still takes it as one of the fifteen keys, so it keeps its
+/// position in the array form, must be a boolean and may appear once, and
+/// ignores its value (KVM wrote true).
+///
+/// `backend_supports_madvise` is written as true, its value on DBT, so the
+/// legacy form keeps its bytes. The reader still takes it as one of the fifteen
+/// keys, so it keeps its position in the array form, must be a boolean and may
+/// appear once, and ignores its value (KVM wrote false).
+///
+/// `syscall_clobbers_virtualized_by_backend` supplies no capability either: it
+/// said the backend left the registers a `syscall` instruction clobbers as a
+/// native return would, which Reverie's backend contract now requires of every
+/// backend (with the exceptions that contract names). It is written as false,
+/// its value on DBT, so the legacy form keeps its bytes. The reader still takes it as one of the fifteen keys, so
+/// it keeps its position in the array form, must be a boolean and may appear
+/// once, and ignores its value (SaBRe and KVM wrote true).
+///
 /// `backend_virtualizes_capability_prctls` supplies no capability either: it
 /// said the backend answered the capability-set prctls itself, and every
-/// backend now passes them to the kernel. It is written as false, so DBT's
-/// configuration keeps its bytes, and `true` fails the parse.
+/// backend now passes them to the kernel. It is written as false, so the
+/// legacy form keeps its bytes, and `true` fails the parse.
 ///
 /// `kvm_shared_dequeue_timers` supplies no capability. It was read into a
 /// `Config` field that chose the controlled signal path, and that choice is
@@ -2483,8 +2776,8 @@ pub fn from_legacy_backend_json(json: &str) -> serde_json::Result<Config> {
 /// Preserve the exact backend facts alongside an already encoded legacy config.
 ///
 /// The legacy form couples some capabilities and omits others. When it can
-/// express `backend` exactly, return `legacy_json` byte for byte: DBT exposes
-/// this string in the guest's environment. Otherwise wrap it in a versioned
+/// express `backend` exactly, return `legacy_json` byte for byte, so a reader
+/// of the legacy form reads it unchanged. Otherwise wrap it in a versioned
 /// envelope whose typed backend replaces the legacy projection on decoding.
 /// Non-backend fields keep the legacy form's semantics in either case.
 pub fn encode_backend_config_json(
@@ -2573,12 +2866,24 @@ const fn legacy_backend_key_default_true() -> bool {
 struct LegacyBackendKeys {
     #[serde(default)]
     cpuid_virtualized_by_backend: bool,
+    // Supplies no capability; declared so that the key, like the others,
+    // fails the parse when it is given twice.
+    #[expect(
+        dead_code,
+        reason = "read only to refuse a repeated key; its value is ignored"
+    )]
     #[serde(default = "legacy_backend_key_default_true")]
     backend_supports_madvise: bool,
     #[serde(default)]
     discover_live_file_metadata: bool,
     #[serde(default)]
     detect_host_clock_futex_timeouts: bool,
+    // Supplies no capability; declared so that the key, like the others,
+    // fails the parse when it is given twice.
+    #[expect(
+        dead_code,
+        reason = "read only to refuse a repeated key; its value is ignored"
+    )]
     #[serde(default)]
     syscall_clobbers_virtualized_by_backend: bool,
     #[serde(default)]
@@ -2602,6 +2907,12 @@ struct LegacyBackendKeys {
     backend_supports_parked_write_signal_interruption: bool,
     #[serde(default)]
     backend_virtualizes_capability_prctls: bool,
+    // Supplies no capability; declared so that the key, like the others,
+    // fails the parse when it is given twice.
+    #[expect(
+        dead_code,
+        reason = "read only to refuse a repeated key; its value is ignored"
+    )]
     #[serde(default)]
     backend_defers_vfork_child_registration: bool,
 }
@@ -2614,10 +2925,8 @@ impl LegacyBackendKeys {
         let mut backend = BackendCapabilities::PTRACE;
         backend.tool_shares_guest_descriptor_table = self.discover_live_file_metadata;
         backend.rediscovers_descriptors_after_exec = self.discover_live_file_metadata;
-        backend.internal_pipe_turns_are_host_timed = self.discover_live_file_metadata;
         backend.loopback_pollers_yield_to_peers = self.discover_live_file_metadata;
         backend.guest_clock_reads_bypass_backend = self.detect_host_clock_futex_timeouts;
-        backend.virtualizes_syscall_clobbers = self.syscall_clobbers_virtualized_by_backend;
         backend.needs_killed_thread_rpc_cancellation = self.cancel_killed_thread_rpcs;
         // A legacy encoding predates this key. Only the ptrace tracer reports
         // child-exit publication, and it is the one backend that needs no
@@ -2629,18 +2938,12 @@ impl LegacyBackendKeys {
         // the form's only reader), so it is read back the same way.
         backend.reports_kernel_child_exit_signals = backend.reports_child_exit_publication;
         backend.reports_physical_process_exits = self.backend_reports_physical_process_exits;
-        backend.signal_interrupts_external_syscalls = self.backend_reports_physical_process_exits;
         backend.tracks_process_children = self.backend_tracks_process_children;
         backend.runs_exit_robust_list = self.backend_runs_exit_robust_list;
         backend.requires_thread_directed_process_signals =
             self.backend_requires_thread_directed_process_signals;
         backend.supports_parked_write_signal_interruption =
             self.backend_supports_parked_write_signal_interruption;
-        backend.defers_vfork_child_registration = self.backend_defers_vfork_child_registration;
-        backend.supports_madvise = self.backend_supports_madvise;
-        // A legacy encoding predates this key: every backend that supports
-        // madvise supports MADV_DONTNEED, and KVM implements it alone.
-        backend.supports_madv_dontneed = self.backend_supports_madvise || self.backend_is_kvm;
         backend.provides_process_signal_control = self.backend_is_kvm;
         backend.emulates_child_waits = self.backend_is_kvm;
         // A legacy encoding predates this key. DBT, the form's only reader,
@@ -2714,9 +3017,9 @@ mod legacy_backend_json {
     /// the behaviour every legacy reader already has.
     /// `in_guest_detlog_forward_policy` is unset for DBT (its runtime forwards
     /// no records on a socket), so it is never written and reads as unset.
-    /// `futex_wake_yields`, `pipe_wake_latency` and `scheduler_turn_cost` came
-    /// after the legacy form froze too, and `hermit run` refuses them with the
-    /// DBT backend.
+    /// `futex_wake_yields`, `pipe_wake_latency`, `scheduler_turn_cost` and
+    /// `cap_preemption_charge` came after the legacy form froze too, and
+    /// `hermit run` refuses them with the DBT backend.
     /// `replaying` is never written either: only `hermit replay` sets it, and
     /// replay runs only on the ptrace backend.
     /// `in_guest_site_patching_off` is false for DBT (it is set only for
@@ -2737,12 +3040,14 @@ mod legacy_backend_json {
     /// `signal_state_copy` came after it too. The copy is never kept on DBT
     /// (its kernel signal state is not the guest's), so it is never written
     /// and reads as on, its serde default.
-    /// And `container_mount_table`. DBT's launcher encodes the
-    /// legacy form before the container exists, so it has no table to write;
-    /// it is never written and reads as absent. The coordinated startup's
-    /// typed configuration carries the table.
+    /// And `container_mount_table`, which describes one run's container: the
+    /// frozen form omits it, so it is never written and reads as absent. The
+    /// coordinated startup's typed configuration, which is how Hermit
+    /// launches DBT, carries the table.
     /// `mountinfo_mount_namespace` too, for the same reason: it is never
-    /// written and reads as absent.
+    /// written and reads as absent. So are `directory_placeholder` and
+    /// `container_procfs`, which describe one run's container; the
+    /// coordinated startup's typed configuration carries them.
     /// `signal_delivery_check_fatal` matters only where the copy is kept, so
     /// it is never written and reads as false.
     /// `work_span_report` came after it as well: the report is written by the
@@ -2750,7 +3055,18 @@ mod legacy_backend_json {
     /// as unset.
     /// `signal_at` came after the form froze; the scheduler acts on it, not
     /// the runtime, so it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 25] = [
+    /// `annotated_priority_replay` came after it too, and is false for every
+    /// backend that reads the legacy form: priority replay needs a preemption
+    /// timer, which none of them delivers, so it is never written and reads
+    /// as false.
+    /// `virtual_cpus` came after it too, and `hermit run` refuses it with the
+    /// DBT backend: it is never written and reads as unset.
+    /// `expired_wait_charge` too: the scheduler charges turns, not the
+    /// runtime, so it is never written and reads as unset.
+    /// `notice_host_network_abstract_binds` came after it too. It is never written and
+    /// reads as false, so the DBT runtime prints no notice for an abstract
+    /// `AF_UNIX` bind under host networking.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 32] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -2763,8 +3079,10 @@ mod legacy_backend_json {
         "target_timeslice_syscalls_only",
         "futex_wake_yields",
         "pipe_wake_latency",
+        "expired_wait_charge",
         "replaying",
         "scheduler_turn_cost",
+        "cap_preemption_charge",
         "inherited_seccomp",
         "cpu_profile",
         "cpu_profile_host",
@@ -2772,10 +3090,15 @@ mod legacy_backend_json {
         "signal_state_copy",
         "container_mount_table",
         "mountinfo_mount_namespace",
+        "directory_placeholder",
+        "container_procfs",
         "signal_delivery_check_fatal",
         "work_span_report",
         "signal_at",
         "in_guest_signal_delivery",
+        "annotated_priority_replay",
+        "virtual_cpus",
+        "notice_host_network_abstract_binds",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -2873,7 +3196,8 @@ mod legacy_backend_json {
     /// [`Config::in_guest_signal_delivery`], [`Config::launch_image`],
     /// [`Config::target_timeslice_syscalls_only`],
     /// [`Config::futex_wake_yields`], [`Config::replaying`],
-    /// [`Config::scheduler_turn_cost`] or [`Config::inherited_seccomp`] takes
+    /// [`Config::scheduler_turn_cost`], [`Config::cap_preemption_charge`] or
+    /// [`Config::inherited_seccomp`] takes
     /// an element. Each gets a
     /// placeholder; [`super::from_legacy_backend_json`] replaces the first.
     struct LegacyPositions<'f, 'l, A> {
@@ -2911,10 +3235,14 @@ mod legacy_backend_json {
                     | "in_guest_site_patching_off"
                     | "in_guest_refuses_host_timed_producers"
                     | "in_guest_signal_delivery"
+                    | "annotated_priority_replay"
                     | "target_timeslice_syscalls_only"
                     | "futex_wake_yields"
+                    | "cap_preemption_charge"
                     | "replaying"
-                    | "signal_delivery_check_fatal",
+                    | "signal_delivery_check_fatal"
+                    | "container_procfs"
+                    | "notice_host_network_abstract_binds",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is.
                 Some("in_guest_reserved_signals") => {
@@ -2930,10 +3258,13 @@ mod legacy_backend_json {
                     | "launch_image"
                     | "scheduler_turn_cost"
                     | "pipe_wake_latency"
+                    | "expired_wait_charge"
                     | "container_mount_table"
                     | "mountinfo_mount_namespace"
+                    | "directory_placeholder"
                     | "work_span_report"
-                    | "signal_at",
+                    | "signal_at"
+                    | "virtual_cpus",
                 ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
@@ -2973,7 +3304,7 @@ mod legacy_backend_json {
     /// `Arg::env` reads a variable's value when the binding is made), but
     /// removing the bindings discards those values, so no ambient value
     /// reaches the parse. `Config::default()` would instead parse
-    /// HERMIT_EPOCH, HERMIT_PRNG and HERMIT_SCHED_SEED, and exit the process
+    /// HERMIT_EPOCH, HERMIT_PRNG, HERMIT_SCHED_SEED and HERMIT_CPU_PROFILE, and exit the process
     /// when one of them does not parse; the legacy decoder was not affected
     /// by any of them.
     fn config_field_order() -> serde_json::Result<Vec<String>> {
@@ -3208,8 +3539,10 @@ mod legacy_backend_json {
                 | "target_timeslice_syscalls_only"
                 | "futex_wake_yields"
                 | "pipe_wake_latency"
+                | "expired_wait_charge"
                 | "replaying"
                 | "scheduler_turn_cost"
+                | "cap_preemption_charge"
                 | "inherited_seccomp"
                 | "cpu_profile"
                 | "cpu_profile_host"
@@ -3217,10 +3550,15 @@ mod legacy_backend_json {
                 | "signal_state_copy"
                 | "container_mount_table"
                 | "mountinfo_mount_namespace"
+                | "directory_placeholder"
+                | "container_procfs"
                 | "signal_delivery_check_fatal"
                 | "work_span_report"
                 | "signal_at"
-                | "in_guest_signal_delivery" => Ok(()),
+                | "in_guest_signal_delivery"
+                | "annotated_priority_replay"
+                | "virtual_cpus"
+                | "notice_host_network_abstract_binds" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -3338,7 +3676,6 @@ mod tests {
         assert!(config.backend.runs_exit_robust_list);
         assert!(!config.backend.requires_thread_directed_process_signals);
         assert!(config.backend.supports_parked_write_signal_interruption);
-        assert!(!config.backend.defers_vfork_child_registration);
         assert!(!config.sequentialize_threads);
         assert!(
             legacy_backend_keys(&config).contains(&("kvm_shared_dequeue_timers", false)),
@@ -3376,7 +3713,7 @@ mod tests {
     /// it was a field still reads and the key decides nothing, whatever it
     /// holds and however often it appears. This is the whole compatibility
     /// policy for the named form, and it is safe because no production code
-    /// reads a `Config` by field name: the guest-visible DBT form is read by
+    /// reads a `Config` by field name: the standalone DBT form is read by
     /// [`from_legacy_backend_json`], which checks the key, and the bincode form
     /// that crosses process boundaries is positional. Removing the field
     /// changed that positional form and [`config_wire_fingerprint`]. SaBRe's
@@ -3426,13 +3763,12 @@ mod tests {
         backend.runs_guest_code_between_injections = false;
         backend.reports_sigreturns = false;
         backend.reports_kernel_child_exit_signals = backend.reports_child_exit_publication;
-        // The legacy discover_live_file_metadata bit couples four facts.
+        // The legacy discover_live_file_metadata bit couples three facts.
         backend.rediscovers_descriptors_after_exec = backend.tool_shares_guest_descriptor_table;
         // The legacy form derives promotion from the thread-directed signal
         // bit, which only DBT, the form's only reader, sets.
         backend.promotes_open_files_before_native_lifecycle =
             backend.requires_thread_directed_process_signals;
-        backend.internal_pipe_turns_are_host_timed = backend.tool_shares_guest_descriptor_table;
         backend.loopback_pollers_yield_to_peers = backend.tool_shares_guest_descriptor_table;
         backend
     }
@@ -3745,21 +4081,26 @@ mod tests {
                     assert!(error.to_string().contains(key), "{error}");
                     continue;
                 }
-                "backend_supports_madvise" => {
-                    expected.supports_madvise = false;
-                    expected.supports_madv_dontneed = false;
+                "syscall_clobbers_virtualized_by_backend"
+                | "backend_supports_madvise"
+                | "backend_defers_vfork_child_registration" => {
+                    // None supplies a capability: either value reads back the
+                    // same configuration.
+                    let mut flipped = ptrace.clone();
+                    flipped.insert(key.to_owned(), serde_json::Value::Bool(!ptrace_value));
+                    let decoded =
+                        from_legacy_backend_json(&serde_json::to_string(&flipped).unwrap())
+                            .unwrap();
+                    assert_eq!(serde_json::to_string(&decoded).unwrap(), unflipped, "{key}");
+                    continue;
                 }
                 "discover_live_file_metadata" => {
                     expected.tool_shares_guest_descriptor_table = true;
                     expected.rediscovers_descriptors_after_exec = true;
-                    expected.internal_pipe_turns_are_host_timed = true;
                     expected.loopback_pollers_yield_to_peers = true;
                 }
                 "detect_host_clock_futex_timeouts" => {
                     expected.guest_clock_reads_bypass_backend = true
-                }
-                "syscall_clobbers_virtualized_by_backend" => {
-                    expected.virtualizes_syscall_clobbers = true
                 }
                 "cancel_killed_thread_rpcs" => {
                     expected.needs_killed_thread_rpc_cancellation = true;
@@ -3767,8 +4108,7 @@ mod tests {
                     expected.reports_kernel_child_exit_signals = false;
                 }
                 "backend_reports_physical_process_exits" => {
-                    expected.reports_physical_process_exits = true;
-                    expected.signal_interrupts_external_syscalls = true;
+                    expected.reports_physical_process_exits = true
                 }
                 "backend_tracks_process_children" => expected.tracks_process_children = false,
                 "backend_runs_exit_robust_list" => expected.runs_exit_robust_list = false,
@@ -3805,9 +4145,6 @@ mod tests {
                         .unwrap_err();
                     assert!(error.to_string().contains(key), "{error}");
                     continue;
-                }
-                "backend_defers_vfork_child_registration" => {
-                    expected.defers_vfork_child_registration = true
                 }
                 other => panic!("no expectation for legacy key {other}"),
             }
@@ -3909,7 +4246,7 @@ mod tests {
     /// `in_guest_signal_delivery`,
     /// `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
     /// `replaying`,
-    /// `scheduler_turn_cost` or
+    /// `scheduler_turn_cost`, `cap_preemption_charge` or
     /// `inherited_seccomp`, which is the
     /// key order the encoder writes.
     #[test]
@@ -3937,8 +4274,10 @@ mod tests {
                 | "target_timeslice_syscalls_only"
                 | "futex_wake_yields"
                 | "pipe_wake_latency"
+                | "expired_wait_charge"
                 | "replaying"
                 | "scheduler_turn_cost"
+                | "cap_preemption_charge"
                 | "inherited_seccomp"
                 | "cpu_profile"
                 | "cpu_profile_host"
@@ -3946,10 +4285,15 @@ mod tests {
                 | "signal_state_copy"
                 | "container_mount_table"
                 | "mountinfo_mount_namespace"
+                | "directory_placeholder"
+                | "container_procfs"
                 | "signal_delivery_check_fatal"
                 | "work_span_report"
                 | "signal_at"
-                | "in_guest_signal_delivery" => {}
+                | "in_guest_signal_delivery"
+                | "annotated_priority_replay"
+                | "virtual_cpus"
+                | "notice_host_network_abstract_binds" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -3964,19 +4308,23 @@ mod tests {
         // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
         // `in_guest_reserved_signals`, `in_guest_refuses_host_timed_producers`,
         // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
-        // `pipe_wake_latency`, `replaying`, `scheduler_turn_cost`,
-        // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`, `cpu_profile_source`,
+        // `pipe_wake_latency`, `expired_wait_charge`, `replaying`, `scheduler_turn_cost`,
+        // `cap_preemption_charge`, `inherited_seccomp`, `cpu_profile`,
+        // `cpu_profile_host`, `cpu_profile_source`,
         // `signal_state_copy`, `container_mount_table`,
-        // `mountinfo_mount_namespace`, `signal_delivery_check_fatal`,
-        // `work_span_report`, `signal_at` and `in_guest_signal_delivery`
-        // and `strict_schedule_boundaries` none: fourteen more keys and
-        // twenty-four fewer, so ten keys fewer than fields.
+        // `mountinfo_mount_namespace`, `directory_placeholder`,
+        // `container_procfs`, `signal_delivery_check_fatal`,
+        // `work_span_report`, `signal_at`, `in_guest_signal_delivery`,
+        // `annotated_priority_replay`, `virtual_cpus`,
+        // `notice_host_network_abstract_binds` and `strict_schedule_boundaries`
+        // none: fourteen more keys and thirty-one fewer, so seventeen keys fewer
+        // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 10);
+        assert_eq!(fields.len(), keys.len() + 17);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
-    /// the guest-visible string stays the legacy bytes, and it reads back as
+    /// the legacy string keeps its bytes, and it reads back as
     /// false from both the object and the array form.
     #[test]
     fn record_host_inputs_never_enters_the_legacy_form() {
@@ -4002,8 +4350,8 @@ mod tests {
 
     /// `process_exits_complete_asynchronously`, added after the legacy form
     /// froze, never enters it, whatever its value, exactly as
-    /// `record_host_inputs` does not: the guest-visible bytes stay the legacy
-    /// bytes, and it reads back as false from the object and the array form.
+    /// `record_host_inputs` does not: the legacy string keeps its bytes, and
+    /// it reads back as false from the object and the array form.
     #[test]
     fn process_exits_complete_asynchronously_never_enters_the_legacy_form() {
         let on = Config {
@@ -4041,7 +4389,7 @@ mod tests {
     /// it, `delivers_preemption_timer_events`,
     /// `runs_guest_code_between_injections`, `reports_sigreturns`) never enter
     /// it, whatever their
-    /// value: the guest-visible string stays the legacy bytes, and they read
+    /// value: the legacy string keeps its bytes, and they read
     /// back as false from both the object and the array form.
     #[test]
     fn post_freeze_capabilities_never_enter_the_legacy_form() {
@@ -4088,7 +4436,7 @@ mod tests {
     }
 
     /// `guest_may_inherit_a_terminal` never enters the legacy form, whatever
-    /// its value: the guest-visible string stays the legacy bytes, and it reads
+    /// its value: the legacy string keeps its bytes, and it reads
     /// back as false from both the object and the array form.
     /// `in_guest_detlog_forward_policy` is unset for DBT, so the legacy form
     /// never carries it, and it reads back as unset.
@@ -4215,7 +4563,7 @@ mod tests {
     }
 
     /// `inherited_seccomp` never enters the legacy form, whatever its value:
-    /// the guest-visible string stays the legacy bytes, and it reads back as
+    /// the legacy string keeps its bytes, and it reads back as
     /// unknown from both the object and the array form.
     #[test]
     fn the_cpu_profile_never_enters_the_legacy_form() {
@@ -4339,7 +4687,7 @@ mod tests {
     }
 
     /// `target_timeslice_syscalls_only` never enters the legacy form, whatever
-    /// its value: the guest-visible string stays the legacy bytes, and it reads
+    /// its value: the legacy string keeps its bytes, and it reads
     /// back as false from both the object and the array form.
     #[test]
     fn target_timeslice_syscalls_only_never_enters_the_legacy_form() {
@@ -4462,7 +4810,7 @@ mod tests {
     }
 
     /// `futex_wake_yields` never enters the legacy form, whatever its
-    /// value: the guest-visible string stays the legacy bytes, and it reads
+    /// value: the legacy string keeps its bytes, and it reads
     /// back as false from both the object and the array form.
     #[test]
     fn futex_wake_yields_never_enters_the_legacy_form() {
@@ -4487,7 +4835,7 @@ mod tests {
     }
 
     /// `scheduler_turn_cost` never enters the legacy form, whatever its value:
-    /// the guest-visible string stays the legacy bytes, and it reads back as
+    /// the legacy string keeps its bytes, and it reads back as
     /// unset from both the object and the array form.
     #[test]
     fn scheduler_turn_cost_never_enters_the_legacy_form() {
@@ -4519,8 +4867,71 @@ mod tests {
         );
     }
 
+    /// `cap_preemption_charge` never enters the legacy form, whatever its
+    /// value: the legacy string keeps its bytes, and it reads
+    /// back as false from both the object and the array form.
+    #[test]
+    fn cap_preemption_charge_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            cap_preemption_charge: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("cap_preemption_charge"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .cap_preemption_charge
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .cap_preemption_charge
+        );
+    }
+
+    /// `--cap-preemption-charge` is off by default, parses, and survives the
+    /// rendered command line and serde, so a recorded configuration replays
+    /// with the rule it ran with.
+    #[test]
+    fn cap_preemption_charge_is_opt_in_and_round_trips() {
+        let default = Config::default();
+        assert!(!default.cap_preemption_charge);
+        assert!(!default.to_string().contains("--cap-preemption-charge"));
+        let config = Config::parse_from(["detcore", "--cap-preemption-charge"]);
+        assert!(config.cap_preemption_charge);
+        let rendered = config.to_string();
+        assert!(rendered.contains(" --cap-preemption-charge"), "{rendered}");
+        let reparsed =
+            Config::parse_from(std::iter::once("detcore").chain(rendered.split_whitespace()));
+        assert!(reparsed.cap_preemption_charge);
+        let json = serde_json::to_string(&config).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert!(back.cap_preemption_charge);
+        let mut legacy: serde_json::Value = serde_json::to_value(&default).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("cap_preemption_charge");
+        let old: Config = serde_json::from_value(legacy).unwrap();
+        assert!(
+            !old.cap_preemption_charge,
+            "a configuration from before the option reads as off"
+        );
+    }
+
     /// `replaying` never enters the legacy form, whatever its value: the
-    /// guest-visible string stays the legacy bytes, and it reads back as false
+    /// legacy string keeps its bytes, and it reads back as false
     /// from both the object and the array form.
     #[test]
     fn replaying_never_enters_the_legacy_form() {
@@ -4593,6 +5004,47 @@ mod tests {
         assert_eq!(from_legacy_backend_json(&array).unwrap().signal_at, None);
     }
 
+    /// `virtual_cpus` came after the legacy form froze, so it never enters
+    /// it: the DBT runtime's environment keeps its bytes, and the option
+    /// reads back as unset (`hermit run` refuses it with DBT).
+    #[test]
+    fn virtual_cpus_never_enter_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            virtual_cpus: NonZeroU32::new(4),
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("virtual_cpus"), "{json}");
+        assert_eq!(from_legacy_backend_json(&json).unwrap().virtual_cpus, None);
+    }
+
+    /// `--virtual-cpus` takes a count from 1 to the 128 CPUs Detcore's mask
+    /// holds, and names the range when refused; it reaches the reproducer
+    /// command line.
+    #[test]
+    fn virtual_cpus_parse_from_1_to_128() {
+        let parse = |count: &str| {
+            Config::try_parse_from(["detcore".to_owned(), format!("--virtual-cpus={count}")])
+        };
+        assert_eq!(parse("1").unwrap().virtual_cpus, NonZeroU32::new(1));
+        assert_eq!(parse("128").unwrap().virtual_cpus, NonZeroU32::new(128));
+        for refused in ["0", "129", "-1", "four"] {
+            let error = parse(refused).unwrap_err().to_string();
+            assert!(error.contains("from 1 to 128"), "{refused}: {error}");
+        }
+        let config = parse("8").unwrap();
+        assert_eq!(config.virtual_cpu_count(), 8);
+        assert!(config.to_string().contains(" --virtual-cpus=8"));
+        assert_eq!(Config::default().virtual_cpus, None);
+        assert_eq!(Config::default().virtual_cpu_count(), 1);
+        assert!(!Config::default().to_string().contains("virtual-cpus"));
+    }
+
     /// `Config` crosses Reverie RPC as positional legacy bincode, so
     /// `signal_at` is encoded whether set or not.
     #[test]
@@ -4613,6 +5065,62 @@ mod tests {
                 bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
             assert_eq!(read, wire.len());
             assert_eq!(decoded.signal_at, signal_at);
+        }
+    }
+
+    /// `notice_host_network_abstract_binds` came after the legacy form froze, so it never
+    /// enters it, and both the object and the array form read it back as
+    /// false.
+    #[test]
+    fn notice_host_network_abstract_binds_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            notice_host_network_abstract_binds: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(
+            !json.contains("notice_host_network_abstract_binds"),
+            "{json}"
+        );
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .notice_host_network_abstract_binds
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .notice_host_network_abstract_binds
+        );
+    }
+
+    /// `Config` crosses Reverie RPC as positional legacy bincode, so
+    /// `notice_host_network_abstract_binds` is encoded whether set or not.
+    #[test]
+    fn notice_host_network_abstract_binds_round_trips_through_reverie_bincode() {
+        for notice_host_network_abstract_binds in [false, true] {
+            let config = Config {
+                notice_host_network_abstract_binds,
+                ..Config::default()
+            };
+            let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(
+                decoded.notice_host_network_abstract_binds,
+                notice_host_network_abstract_binds
+            );
         }
     }
 
@@ -4846,6 +5354,152 @@ mod tests {
         assert!(!decoded.in_guest_signal_delivery);
     }
 
+    /// `annotated_priority_replay` never enters the legacy form, and reads
+    /// back as false from both its object and array forms; it crosses
+    /// Reverie's positional bincode and JSON unchanged, and a JSON
+    /// configuration without the key reads as off.
+    #[test]
+    fn annotated_priority_replay_never_enters_the_legacy_form_and_round_trips() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            annotated_priority_replay: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("annotated_priority_replay"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .annotated_priority_replay
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .annotated_priority_replay
+        );
+        for annotated in [false, true] {
+            let config = Config {
+                annotated_priority_replay: annotated,
+                ..Config::default()
+            };
+            let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(decoded.annotated_priority_replay, annotated);
+            let json: Config =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            assert_eq!(json.annotated_priority_replay, annotated);
+        }
+        let mut encoded = serde_json::to_value(Config::default()).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("annotated_priority_replay")
+            .expect("the field is serialized");
+        let decoded: Config = serde_json::from_value(encoded).unwrap();
+        assert!(!decoded.annotated_priority_replay);
+    }
+
+    /// Schedule events are observed exactly where they are traced, and also
+    /// in replay of a callback-annotated priority history, whose recording
+    /// traced them, whether or not that replay records.
+    #[test]
+    fn annotated_priority_replay_observes_schedule_events() {
+        let plain = Config::default();
+        assert!(!plain.should_trace_schedevent() && !plain.observes_schedevents());
+        let recording = Config {
+            record_preemptions: true,
+            ..Config::default()
+        };
+        assert!(recording.should_trace_schedevent() && recording.observes_schedevents());
+        let replay = Config {
+            replay_preemptions_from: Some("history.json".into()),
+            ..Config::default()
+        };
+        assert!(!replay.observes_schedevents(), "an unannotated history");
+        let annotated = Config {
+            annotated_priority_replay: true,
+            ..replay
+        };
+        assert!(!annotated.should_trace_schedevent());
+        assert!(annotated.observes_schedevents());
+    }
+
+    /// An annotated priority history replays only on an effective
+    /// configuration with the backend's own preemption timer events,
+    /// sequentialized threads, an active maximum, precise timers and RCB time.
+    /// A configuration nobody prepared for a backend has no timer events and
+    /// is refused; each other unmet requirement is named in turn, and the
+    /// answer never changes the configuration.
+    #[test]
+    fn annotated_priority_replay_requires_a_qualified_effective_configuration() {
+        let unprepared = Config {
+            annotated_priority_replay: true,
+            replay_preemptions_from: Some("history.json".into()),
+            ..Config::default()
+        };
+        assert_eq!(
+            unprepared.annotated_priority_replay_unqualified(),
+            Some("cannot deliver Detcore preemption timer events")
+        );
+        let qualified = Config {
+            backend: BackendCapabilities::PTRACE,
+            sequentialize_threads: true,
+            max_timeslice: NonZeroU64::new(1_000_000),
+            imprecise_timers: false,
+            no_rcb_time: false,
+            ..unprepared.clone()
+        };
+        assert_eq!(qualified.annotated_priority_replay_unqualified(), None);
+        let before = serde_json::to_value(&qualified).unwrap();
+        for (config, setting) in [
+            (
+                Config {
+                    sequentialize_threads: false,
+                    ..qualified.clone()
+                },
+                "does not sequentialize threads (--no-sequentialize-threads)",
+            ),
+            (
+                Config {
+                    max_timeslice: None,
+                    ..qualified.clone()
+                },
+                "has its preemption timer disabled (--max-timeslice=disabled)",
+            ),
+            (
+                Config {
+                    imprecise_timers: true,
+                    ..qualified.clone()
+                },
+                "requests imprecise timers (--imprecise-timers)",
+            ),
+            (
+                Config {
+                    no_rcb_time: true,
+                    ..qualified.clone()
+                },
+                "requests logical time without RCBs (--no-rcb-time)",
+            ),
+        ] {
+            assert_eq!(
+                config.annotated_priority_replay_unqualified(),
+                Some(setting)
+            );
+        }
+        assert_eq!(serde_json::to_value(&qualified).unwrap(), before);
+    }
+
     /// `--signal-at` takes `turn=N:SIGNAL` with SIGNAL a name or a number.
     /// SIGKILL and SIGSTOP are refused, by name or number: the kernel acts on
     /// them at once, outside the scheduler's protocols for them.
@@ -4968,7 +5622,7 @@ mod tests {
     /// that run from one that selected no test.
     const LEGACY_DECODED_IN_CHILD: &str = "legacy configuration decoded under the ambient settings";
 
-    /// Clap reads HERMIT_EPOCH, HERMIT_PRNG and HERMIT_SCHED_SEED when it
+    /// Clap reads HERMIT_EPOCH, HERMIT_PRNG, HERMIT_SCHED_SEED and HERMIT_CPU_PROFILE when it
     /// parses a `Config`, and exits the process when one of them does not
     /// parse. The legacy decoder read none of them, so a valid legacy object
     /// or array decodes to the configuration it lists whatever they hold. Each
@@ -4994,7 +5648,12 @@ mod tests {
             return;
         }
 
-        const VARIABLES: [&str; 3] = ["HERMIT_EPOCH", "HERMIT_PRNG", "HERMIT_SCHED_SEED"];
+        const VARIABLES: [&str; 4] = [
+            "HERMIT_EPOCH",
+            "HERMIT_PRNG",
+            "HERMIT_SCHED_SEED",
+            "HERMIT_CPU_PROFILE",
+        ];
         let text = OsStr::new("not-a-value");
         let bytes = OsStr::from_bytes(b"\xff");
         let mut settings: Vec<Vec<(&str, &OsStr)>> = vec![Vec::new()];
@@ -5050,6 +5709,93 @@ mod tests {
         }
     }
 
+    /// Set in the child process of
+    /// [`hermit_cpu_profile_supplies_the_profile_only_when_the_flag_is_absent`]:
+    /// the arguments it parses, one per line.
+    const CPU_PROFILE_ARGS_IN_CHILD: &str = "DETCORE_MODEL_TEST_CPU_PROFILE_ARGS";
+
+    /// HERMIT_CPU_PROFILE gives `--cpu-profile` its value when the flag is
+    /// absent: unset is x86-64-v2, an explicit flag wins over the variable,
+    /// and a value that names no profile is refused. The wire default stays
+    /// x86-64-v2 whatever the variable holds. Each parse runs in a child
+    /// process given exactly the variable under test, because Clap reads the
+    /// process environment.
+    #[test]
+    fn hermit_cpu_profile_supplies_the_profile_only_when_the_flag_is_absent() {
+        use clap::Parser;
+
+        if let Some(args) = std::env::var_os(CPU_PROFILE_ARGS_IN_CHILD) {
+            let args = args.into_string().unwrap();
+            let argv = std::iter::once("config").chain(args.lines());
+            match Config::try_parse_from(argv) {
+                Ok(config) => println!(
+                    "cpu-profile={} wire={}",
+                    config.cpu_profile.name(),
+                    config_wire_default().cpu_profile.name()
+                ),
+                Err(error) => println!("refused: {:?}", error.kind()),
+            }
+            return;
+        }
+
+        let test = format!(
+            "{}::hermit_cpu_profile_supplies_the_profile_only_when_the_flag_is_absent",
+            module_path!().split_once("::").unwrap().1
+        );
+        let parse = |variable: Option<&str>, args: &[&str]| -> String {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", &test, "--nocapture"])
+                .env(CPU_PROFILE_ARGS_IN_CHILD, args.join("\n"));
+            for name in [
+                "HERMIT_EPOCH",
+                "HERMIT_PRNG",
+                "HERMIT_SCHED_SEED",
+                "HERMIT_CPU_PROFILE",
+            ] {
+                child.env_remove(name);
+            }
+            if let Some(value) = variable {
+                child.env("HERMIT_CPU_PROFILE", value);
+            }
+            let output = child.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+                "the child for {variable:?} {args:?} did not run exactly once: {}\n{stdout}",
+                output.status,
+            );
+            stdout
+                .lines()
+                .find(|line| line.starts_with("cpu-profile=") || line.starts_with("refused: "))
+                .unwrap_or_else(|| panic!("the child printed no verdict:\n{stdout}"))
+                .to_owned()
+        };
+
+        assert_eq!(parse(None, &[]), "cpu-profile=x86-64-v2 wire=x86-64-v2");
+        assert_eq!(
+            parse(Some("x86-64-v3"), &[]),
+            "cpu-profile=x86-64-v3 wire=x86-64-v2"
+        );
+        assert_eq!(
+            parse(Some("host-no-rdrand"), &[]),
+            "cpu-profile=host-no-rdrand wire=x86-64-v2"
+        );
+        assert_eq!(
+            parse(None, &["--cpu-profile=x86-64-v3"]),
+            "cpu-profile=x86-64-v3 wire=x86-64-v2"
+        );
+        assert_eq!(
+            parse(Some("x86-64-v3"), &["--cpu-profile=x86-64-v2"]),
+            "cpu-profile=x86-64-v2 wire=x86-64-v2"
+        );
+        assert_eq!(parse(Some("x86-64-v4"), &[]), "refused: InvalidValue");
+        assert_eq!(
+            parse(Some("x86-64-v4"), &["--cpu-profile=x86-64-v2"]),
+            "cpu-profile=x86-64-v2 wire=x86-64-v2"
+        );
+    }
+
     /// `backend` and `shared_dequeue_timers` were not keys of the legacy form,
     /// which ignored every key it did not name. They are still ignored,
     /// whatever they hold, however often they appear and wherever they stand,
@@ -5069,7 +5815,7 @@ mod tests {
             r#""shared_dequeue_timers":null"#.to_owned(),
             r#""backend":null,"shared_dequeue_timers":null"#.to_owned(),
             format!(r#""backend":{kvm},"shared_dequeue_timers":true"#),
-            r#""backend":7,"backend":{"supports_madvise":false}"#.to_owned(),
+            r#""backend":7,"backend":{"tracks_process_children":false}"#.to_owned(),
             r#""shared_dequeue_timers":"yes","shared_dequeue_timers":true"#.to_owned(),
             r#""no_such_field":[1,{"x":null}]"#.to_owned(),
         ] {
@@ -5139,6 +5885,11 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("mountinfo_mount_namespace");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("directory_placeholder");
+        value.as_object_mut().unwrap().remove("container_procfs");
         let restored: Config = serde_json::from_value(value).unwrap();
         assert!(restored.mountinfo_root_rewrites.is_empty());
         assert!(restored.mountinfo_device_rewrites.is_empty());
@@ -5147,6 +5898,8 @@ mod tests {
         assert!(restored.mount_id_assignment_order.is_empty());
         assert!(restored.container_mount_table.is_none());
         assert!(restored.mountinfo_mount_namespace.is_none());
+        assert!(restored.directory_placeholder.is_none());
+        assert!(!restored.container_procfs);
     }
 
     #[test]
@@ -5200,6 +5953,44 @@ mod tests {
 
         config.runs_post_fork = RunsPostFork::Random;
         assert!(config.to_string().contains(" --runs-post-fork=random"));
+    }
+
+    /// `--expired-wait-charge` is unset by default, parses both values, is
+    /// printed by `Display` (reproducer commands are built from it) only when
+    /// set, round-trips through serde, and never enters the legacy form.
+    #[test]
+    fn the_expired_wait_charge_is_printed_when_set_and_never_enters_the_legacy_form() {
+        assert_eq!(Config::default().expired_wait_charge, None);
+        assert!(
+            !Config::default()
+                .to_string()
+                .contains("--expired-wait-charge")
+        );
+        for (value, charge) in [
+            ("each", ExpiredWaitCharge::Each),
+            ("once", ExpiredWaitCharge::Once),
+        ] {
+            let set =
+                Config::try_parse_from(["detcore", &format!("--expired-wait-charge={value}")])
+                    .unwrap();
+            assert_eq!(set.expired_wait_charge, Some(charge));
+            assert!(
+                set.to_string()
+                    .contains(&format!(" --expired-wait-charge={value}")),
+                "{set}"
+            );
+            let reparsed: Config =
+                serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+            assert_eq!(reparsed.expired_wait_charge, Some(charge));
+            let legacy = to_legacy_backend_json(&set).unwrap();
+            assert!(!legacy.contains("expired_wait_charge"), "{legacy}");
+            assert_eq!(
+                from_legacy_backend_json(&legacy)
+                    .unwrap()
+                    .expired_wait_charge,
+                None
+            );
+        }
     }
 
     #[test]
@@ -5417,9 +6208,9 @@ mod tests {
             fields.len()
         );
         // The backend's values are part of the encoded default.
-        let flipped = config
-            .clone()
-            .with_backend(|backend| backend.supports_madvise = !backend.supports_madvise);
+        let flipped = config.clone().with_backend(|backend| {
+            backend.tracks_process_children = !backend.tracks_process_children
+        });
         assert_eq!(encode(&flipped).len(), encode(&config).len());
         assert_ne!(encode(&flipped), encode(&config));
     }
@@ -5625,6 +6416,7 @@ mod tests {
             epoch: "2042-03-04T05:06:07.890123456Z".parse().unwrap(),
             seed: 41,
             sched_seed: Some(42),
+            cpu_profile: crate::cpu_profile::CpuProfile::X86_64V3,
             ..Config::default()
         };
 
@@ -5640,6 +6432,10 @@ mod tests {
         );
         assert_eq!(canonical.seed, 0);
         assert_eq!(canonical.sched_seed, None);
+        assert_eq!(
+            canonical.cpu_profile,
+            crate::cpu_profile::CpuProfile::X86_64V2
+        );
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

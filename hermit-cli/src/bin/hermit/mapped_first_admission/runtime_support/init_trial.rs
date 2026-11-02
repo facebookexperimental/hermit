@@ -21,10 +21,89 @@ use super::need;
 use super::rpc;
 
 const RECORD_LIMIT: usize = 8 * 1024 * 1024;
-#[derive(Default)]
+
+/// The sink owns the complete stream in both modes, and successful completion
+/// requires forwarded records in both. Only finite qualification additionally
+/// retains the historical bounded byte observation. This never selects RPC,
+/// stats or physical cleanup policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObservationPolicy {
+    Production,
+    Qualification,
+}
+impl ObservationPolicy {
+    pub(crate) fn is_qualification(self) -> bool {
+        self == Self::Qualification
+    }
+}
+
+pub(crate) struct RecordObservation {
+    pub(crate) messages: u64,
+    pub(crate) bytes: u64,
+    // None means no duplicate capture was requested, not a complete empty log.
+    retained: Option<Vec<u8>>,
+}
+impl RecordObservation {
+    pub(crate) fn required_records_absent(&self) -> bool {
+        self.messages == 0 || self.retained.as_ref().is_some_and(Vec::is_empty)
+    }
+}
+
 struct CapturedRecords {
-    bytes: Vec<u8>,
+    messages: u64,
+    observed_bytes: u64,
+    retained: Option<Vec<u8>>,
     overflow: bool,
+    counter_overflow: bool,
+}
+impl CapturedRecords {
+    fn new(policy: ObservationPolicy) -> Self {
+        Self {
+            messages: 0,
+            observed_bytes: 0,
+            retained: policy.is_qualification().then(Vec::new),
+            overflow: false,
+            counter_overflow: false,
+        }
+    }
+    fn observe(&mut self, record: &[u8]) {
+        match (
+            self.messages.checked_add(1),
+            self.observed_bytes.checked_add(record.len() as u64),
+        ) {
+            (Some(messages), Some(bytes)) => {
+                self.messages = messages;
+                self.observed_bytes = bytes;
+            }
+            _ => self.counter_overflow = true,
+        }
+        if let Some(bytes) = self.retained.as_mut() {
+            if record.len() > RECORD_LIMIT.saturating_sub(bytes.len()) {
+                self.overflow = true;
+            } else {
+                bytes.extend_from_slice(record);
+            }
+        }
+    }
+    fn snapshot(&self) -> RecordObservation {
+        RecordObservation {
+            messages: self.messages,
+            bytes: self.observed_bytes,
+            retained: self.retained.clone(),
+        }
+    }
+}
+
+fn observing_sink(
+    records: Arc<Mutex<CapturedRecords>>,
+    mut output: detcore::detlog::ForwardedRecordSink,
+) -> detcore::detlog::ForwardedRecordSink {
+    Box::new(move |record| {
+        // Invoke the full sink before local DATA observation. A callback count
+        // is not delivery proof: SharedLog's errors remain mandatory at close.
+        output(record);
+        records.lock().unwrap().observe(record);
+    })
 }
 pub(crate) struct Trial {
     serving: Option<Serving>,
@@ -35,46 +114,17 @@ pub(crate) struct Trial {
 impl Trial {
     #[cfg(test)]
     pub(crate) fn register(receiver: OwnedFd) -> Self {
-        let records = Arc::new(Mutex::new(CapturedRecords::default()));
-        let sink = records.clone();
-        detcore::detlog::set_forwarded_source(
-            receiver,
-            Box::new(move |record| {
-                let mut captured = sink.lock().unwrap();
-                if record.len() > RECORD_LIMIT.saturating_sub(captured.bytes.len()) {
-                    captured.overflow = true;
-                } else {
-                    captured.bytes.extend_from_slice(record);
-                }
-            }),
-        );
-        Self {
-            serving: None,
-            records,
-            source_registered: true,
-            request_cancellation: None,
-        }
+        Self::register_with_sink(receiver, Box::new(|_| {}), ObservationPolicy::Qualification)
     }
-    /// Register the actual inherited source into the existing full-record sink.
-    /// The fixture's bounded byte observation remains available independently.
+    /// Register the actual source into the existing full-record sink. Production
+    /// counts every callback without imposing the qualification capture bound.
     pub(crate) fn register_with_sink(
         receiver: OwnedFd,
-        mut output: detcore::detlog::ForwardedRecordSink,
+        output: detcore::detlog::ForwardedRecordSink,
+        observation: ObservationPolicy,
     ) -> Self {
-        let records = Arc::new(Mutex::new(CapturedRecords::default()));
-        let sink = records.clone();
-        detcore::detlog::set_forwarded_source(
-            receiver,
-            Box::new(move |record| {
-                output(record);
-                let mut captured = sink.lock().unwrap();
-                if record.len() > RECORD_LIMIT.saturating_sub(captured.bytes.len()) {
-                    captured.overflow = true;
-                } else {
-                    captured.bytes.extend_from_slice(record);
-                }
-            }),
-        );
+        let records = Arc::new(Mutex::new(CapturedRecords::new(observation)));
+        detcore::detlog::set_forwarded_source(receiver, observing_sink(records.clone(), output));
         Self {
             serving: None,
             records,
@@ -123,13 +173,15 @@ impl Trial {
         });
         Ok(())
     }
-    /// Safety: the enclosing root fulfils the exact V11 bounded-entry contract;
-    /// source qualification for production/Guest release is explicitly absent.
+    /// Safety: the enclosing root fulfils the bounded valid-path entry contract
+    /// for this same retained image and its exact coordinates. Package DATA
+    /// supplies neither source qualification nor permission for Guest release.
     #[cfg(test)]
     pub(crate) async unsafe fn observe(
         &self,
         mapped: &mut PreparedMapping<'_>,
         config: &detcore::Config,
+        coordinates: BootstrapEntryCoordinates,
     ) -> io::Result<()> {
         let serving = self
             .serving
@@ -144,10 +196,6 @@ impl Trial {
         if subscriptions.has_cpuid() || subscriptions.has_rdtsc() {
             reserved_signals |= 1_u64 << (libc::SIGSEGV - 1);
         }
-        let coordinates = BootstrapEntryCoordinates {
-            entry: 0x6000e179aba0,
-            terminal_int3: 0x6000e16688d4,
-        };
         let result = tokio::select! {
             // SAFETY: owner and all leases stay in the outer synchronous root.
             observed = unsafe { mapped.observe_until_terminal(
@@ -415,10 +463,16 @@ impl Trial {
             !records.overflow,
             "initializer DETLOG capture exceeded bound",
         )?;
-        eprintln!(
-            "INITIALIZER_DETLOG_CAPTURE: bytes={}; cancelled before Guest; no final strict-cut claim",
-            records.bytes.len()
-        );
+        need(
+            !records.counter_overflow,
+            "initializer DETLOG observation count overflow",
+        )?;
+        if let Some(bytes) = records.retained.as_ref() {
+            eprintln!(
+                "INITIALIZER_DETLOG_CAPTURE: bytes={}; cancelled before Guest; no final strict-cut claim",
+                bytes.len()
+            );
+        }
         closed
     }
 }
@@ -433,3 +487,113 @@ impl Drop for Trial {
 }
 
 pub(crate) mod hello_consumer;
+
+#[cfg(test)]
+mod observation_policy_tests {
+    use super::*;
+
+    #[test]
+    fn both_policies_require_forwarded_records_without_a_production_copy() {
+        for policy in [
+            ObservationPolicy::Production,
+            ObservationPolicy::Qualification,
+        ] {
+            let mut records = CapturedRecords::new(policy);
+            let report = records.snapshot();
+            assert_eq!((report.messages, report.bytes), (0, 0));
+            assert_eq!(report.retained.is_some(), policy.is_qualification());
+            assert!(
+                report.required_records_absent(),
+                "successful completion requires actual forwarded evidence"
+            );
+            assert!(!records.overflow && !records.counter_overflow);
+
+            let record = b"INFO detcore: DETLOG genuine record\n";
+            records.observe(record);
+            let report = records.snapshot();
+            assert_eq!((report.messages, report.bytes), (1, record.len() as u64));
+            assert!(!report.required_records_absent());
+            match policy {
+                ObservationPolicy::Production => assert!(report.retained.is_none()),
+                ObservationPolicy::Qualification => {
+                    assert_eq!(report.retained.as_deref(), Some(record.as_slice()));
+                }
+            }
+        }
+        let mut finite = CapturedRecords::new(ObservationPolicy::Qualification);
+        finite.observe(b"");
+        assert!(
+            finite.snapshot().required_records_absent(),
+            "a callback without bytes cannot satisfy finite nonempty evidence"
+        );
+    }
+
+    #[test]
+    fn full_sink_receives_beyond_finite_bound_without_a_production_copy() {
+        for policy in [
+            ObservationPolicy::Production,
+            ObservationPolicy::Qualification,
+        ] {
+            let captured = Arc::new(Mutex::new(CapturedRecords::new(policy)));
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let output = delivered.clone();
+            let mut sink = observing_sink(
+                captured.clone(),
+                Box::new(move |bytes| {
+                    output.lock().unwrap().extend_from_slice(bytes);
+                }),
+            );
+            let mut chunk = vec![0; 64 * 1024];
+            for ordinal in 0..129 {
+                chunk.fill(ordinal);
+                sink(&chunk);
+            }
+            let records = captured.lock().unwrap();
+            let report = records.snapshot();
+            assert_eq!(report.messages, 129);
+            assert_eq!(report.bytes, 129 * 64 * 1024);
+            let delivered = delivered.lock().unwrap();
+            assert_eq!(delivered.len(), 129 * 64 * 1024);
+            for (ordinal, actual) in delivered.chunks_exact(chunk.len()).enumerate() {
+                assert!(actual.iter().all(|byte| *byte == ordinal as u8));
+            }
+            assert!(!records.counter_overflow);
+            match policy {
+                ObservationPolicy::Production => {
+                    assert!(report.retained.is_none());
+                    assert!(!records.overflow);
+                }
+                ObservationPolicy::Qualification => {
+                    assert_eq!(report.retained.as_ref().unwrap().len(), RECORD_LIMIT);
+                    assert!(
+                        records.overflow,
+                        "same finite overflow stays fatal at close"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn production_counter_overflow_is_sticky_instead_of_wrapping() {
+        for policy in [
+            ObservationPolicy::Production,
+            ObservationPolicy::Qualification,
+        ] {
+            let mut records = CapturedRecords::new(policy);
+            records.messages = u64::MAX;
+            records.observe(b"one");
+            assert!(records.counter_overflow);
+            records.observe(b"two");
+            assert!(records.counter_overflow);
+            assert_eq!(records.messages, u64::MAX);
+            let mut bytes = CapturedRecords::new(policy);
+            bytes.observed_bytes = u64::MAX;
+            bytes.observe(b"one");
+            bytes.observe(b"two");
+            assert!(bytes.counter_overflow);
+            assert_eq!(bytes.observed_bytes, u64::MAX);
+            assert_eq!(bytes.messages, 0, "partial counter updates are refused");
+        }
+    }
+}

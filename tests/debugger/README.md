@@ -10,8 +10,9 @@ exercise the interactive-debugging surface end to end: breakpoints, stepping
 | File | What it covers |
 | --- | --- |
 | `guests/debuggee.c` | Tiny deterministic C guest with stable symbols/values. |
-| `harness.py` | Shared, stdlib-only harness: locate/`build` hermit, compile the guest, start `hermit run --gdbserver`, wait for the port, record/replay helpers, precondition-based skipping. |
+| `harness.py` | Shared, stdlib-only harness: locate/`build` hermit, compile the guest, start `hermit run [ARGS] --gdbserver` on Hermit's default isolated network, wait for the port, record/replay helpers, precondition-based skipping. |
 | `test_gdb_run_gdbserver.py` | GDB vs `hermit run --gdbserver`: breakpoint, step in/over/out, args/locals, `print` expr, registers, continue-to-exit. **Full assertions.** |
+| `test_gdb_strict_gdbserver.py` | GDB vs `hermit run --strict --gdbserver`: breakpoint in a strict `--chaos` run, a continue-only session matches the strict run without gdb (stdout and exit status), and the strict guest keeps its loopback-only network. Skips where `hermit host-capabilities --json` reports no exact retired-branch counter, where `--strict` refuses. |
 | `test_gdb_replay_gdbserver.py` | GDB vs `hermit replay`: deterministic replay — the debugger observes identical state (incl. a virtualized pid) across replays. **Full assertions.** |
 | `test_lldb_run_gdbserver.py` | LLDB (Python API) vs `hermit run --gdbserver`: connect + plant breakpoint always asserted; stopped-state inspection asserted when available, else skipped with a reason. |
 | `test_lldb_replay_gdbserver.py` | LLDB vs replay: documented skip until a serve-only replay mode exists (auto-activates when it does). |

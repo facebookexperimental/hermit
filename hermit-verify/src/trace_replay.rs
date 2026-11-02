@@ -144,6 +144,7 @@ impl UseCase for TraceReplayOpts {
             verify_exit_statuses: true,
             verify_desync: true,
             verify_schedules: false,
+            verify_priority_histories: false,
             ignore_lines: if self.chaos {
                 vec![
                     "CHAOSRAND".to_string(),

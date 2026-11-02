@@ -52,9 +52,13 @@
 //!
 //! # SCOPE
 //!
-//! Symbols named `reverie_dbt_runtime_*` only. Everything else the client needs
-//! comes from DynamoRIO core or its extensions, which DynamoRIO's own build
-//! system already checks.
+//! Symbols named `reverie_dbt_runtime_*`, plus one export Hermit itself looks
+//! for: `detcore_dbt_checks_coordinator_fingerprint`, the marker that says the
+//! runtime refuses a coordinator built from another tree. Hermit refuses at
+//! launch a runtime without it, so a build that loses it would fail every DBT
+//! run; this check reports that from the artifact instead. Everything else the
+//! client needs comes from DynamoRIO core or its extensions, which DynamoRIO's
+//! own build system already checks.
 //!
 //! Usage:
 //!   scripts/check-dbt-runtime-abi.rs [--client PATH] [--runtime PATH]
@@ -68,6 +72,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 const PREFIX: &str = "reverie_dbt_runtime_";
+/// `detcore_dbt::FINGERPRINT_CHECK_SYMBOL`, which Hermit requires the runtime
+/// to export before it launches it.
+const FINGERPRINT_CHECK: &str = "detcore_dbt_checks_coordinator_fingerprint";
 const DEFAULT_CLIENT: &str = "target/install_pkg/rsrcs/libreverie_dbt_client.so";
 /// The packaged runtime, which is the file Hermit loads. It is a symlink into
 /// the release-derived Cargo profile that staged the package (`validate` for a
@@ -116,9 +123,8 @@ fn require_artifact(path: &Path, what: &str) {
     );
 }
 
-/// Undefined (`U`) or defined symbols from a shared object, filtered to the
-/// runtime-callback prefix. `nm -D` reads the dynamic table, which is the table
-/// the loader itself consults.
+/// Undefined (`U`) or defined symbols from a shared object. `nm -D` reads the
+/// dynamic table, which is the table the loader itself consults.
 fn symbols(path: &Path, undefined: bool) -> BTreeSet<String> {
     let flag = if undefined {
         "--undefined-only"
@@ -149,7 +155,15 @@ fn symbols(path: &Path, undefined: bool) -> BTreeSet<String> {
         .lines()
         .filter_map(|line| line.split_whitespace().last())
         .map(|s| s.split('@').next().unwrap_or(s).to_string())
+        .collect()
+}
+
+/// The names in `symbols` with the runtime-callback prefix.
+fn callbacks(symbols: &BTreeSet<String>) -> BTreeSet<String> {
+    symbols
+        .iter()
         .filter(|s| s.starts_with(PREFIX))
+        .cloned()
         .collect()
 }
 
@@ -172,8 +186,9 @@ fn main() {
     require_artifact(&client, "DBT client");
     require_artifact(&runtime, "Detcore DBT runtime");
 
-    let needed = symbols(&client, true);
-    let supplied = symbols(&runtime, false);
+    let needed = callbacks(&symbols(&client, true));
+    let exported = symbols(&runtime, false);
+    let supplied = callbacks(&exported);
 
     // A scope that selected nothing cannot certify anything.
     if needed.is_empty() {
@@ -235,8 +250,22 @@ fn main() {
         }
     }
 
+    if !exported.contains(FINGERPRINT_CHECK) {
+        refuse(
+            "REFUSED - the runtime does not export Hermit's fingerprint-check marker",
+            &format!(
+                "{} exports no {FINGERPRINT_CHECK}. Hermit refuses to launch a runtime without it \
+                 (such a runtime would accept a coordinator built from any tree), so with this \
+                 artifact every DBT run would fail. It is defined in detcore-dbt/src/lib.rs with \
+                 #[unsafe(no_mangle)], and libdetcore_dbt.so re-exports it from that crate.",
+                runtime.display()
+            ),
+        );
+    }
+
     println!(
-        "DBT runtime ABI is complete: all {} client callback(s) are supplied by Hermit.",
+        "DBT runtime ABI is complete: all {} client callback(s) are supplied by Hermit, and the \
+         runtime exports {FINGERPRINT_CHECK}.",
         needed.len()
     );
 }

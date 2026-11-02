@@ -3467,26 +3467,20 @@ const RESERVED_ARMINGS: [(&str, &str); 5] = [
 
 /// What `reserved_signal_send_probe sends` prints for `signals`. On Linux each
 /// send succeeds and kills the child with its signal. A send of a signal in
-/// `reserved` is refused: it returns EPERM and the child exits 0. Under ptrace
-/// (`ptrace_drops_sigtrap`) each send succeeds and kills the child, except that
-/// a SIGTRAP from another process never reaches the child, which exits 0: a
-/// known ptrace-backend deviation from Linux,
-/// https://github.com/rrnewton/hermit/issues/4555, measured at Hermit 1538d448
-/// before the reserved set existed and unrelated to it (ptrace's set is empty),
-/// pinned here at its current value so that this test shows the reserved-signal
-/// rule leaves ptrace unchanged.
-fn reserved_sends_expected(
-    signals: &[(&str, i32)],
-    reserved: &[i32],
-    ptrace_drops_sigtrap: bool,
-) -> String {
+/// `reserved` is refused: it returns EPERM and the child exits 0. Under ptrace,
+/// whose reserved set is empty, each send succeeds and kills the child as on
+/// Linux, SIGTRAP included: since Reverie a8e9d1d52b31 the ptrace backend
+/// delivers a sender-coded SIGTRAP that reaches an ordinary signal-delivery
+/// stop instead of dropping it (it dropped it before, and the child exited 0).
+/// https://github.com/rrnewton/hermit/issues/4555 stays open for the
+/// injection windows that can still drop one under `--chaos`; this probe's
+/// plain runs, under `--max-timeslice=disabled`, do not meet them.
+fn reserved_sends_expected(signals: &[(&str, i32)], reserved: &[i32]) -> String {
     let mut expected = String::new();
     for call in RESERVED_SEND_CALLS {
         for &(name, number) in signals {
             expected.push_str(&if reserved.contains(&number) {
                 format!("{call} {name}: rc=-1 errno=EPERM child=exit 0\n")
-            } else if ptrace_drops_sigtrap && number == libc::SIGTRAP {
-                format!("{call} {name}: rc=0 errno=0 child=exit 0\n")
             } else {
                 format!("{call} {name}: rc=0 errno=0 child=signal {number}\n")
             });
@@ -3789,11 +3783,12 @@ fn assert_unscheduled_probe_deaths(
 /// ones, which verify; arming SIGTRAP succeeds there and verifies. Each
 /// backend's guest also reads its own SigCgt (`router` mode), which shows
 /// SIGTRAP caught exactly where LiteInst installed its guard router: on
-/// `liteinst`, not on `in-guest-trap`, ptrace or natively. The same guest under ptrace, whose reserved set
-/// is empty, prints
-/// what it printed before the set existed (see `reserved_sends_expected` and
-/// `reserved_armings_expected` for its two named deviations from Linux) and
-/// Hermit warns of nothing.
+/// `liteinst`, not on `in-guest-trap`, ptrace or natively. The same guest
+/// under ptrace, whose reserved set is empty, prints Linux's answers for its
+/// sends, SIGTRAP from another process included (Reverie a8e9d1d52b31; see
+/// `reserved_sends_expected`), keeps one named deviation from Linux for its
+/// armings (see `reserved_armings_expected`), verifies bitwise, and Hermit
+/// warns of nothing.
 /// The loader route cannot run here (it needs a private musl runtime that no
 /// validation node builds); its set is empty whatever its input, pinned by
 /// `a_poisoned_reserved_signal_set_never_survives_preparation`.
@@ -3811,7 +3806,7 @@ fn liteinst_in_guest_reserved_signal_sends_and_armings_are_refused() {
     assert!(native.status.success(), "{native:?}");
     assert_eq!(
         String::from_utf8_lossy(&native.stdout),
-        reserved_sends_expected(&RESERVED_SIGNALS, &[], false),
+        reserved_sends_expected(&RESERVED_SIGNALS, &[]),
         "native"
     );
     let native = Command::new(guest)
@@ -3853,7 +3848,7 @@ fn liteinst_in_guest_reserved_signal_sends_and_armings_are_refused() {
             &[],
             "sends",
             selected,
-            &reserved_sends_expected(&verifiable, reserved, ptrace),
+            &reserved_sends_expected(&verifiable, reserved),
         );
         if refused {
             assert_eq!(
@@ -3888,7 +3883,7 @@ fn liteinst_in_guest_reserved_signal_sends_and_armings_are_refused() {
                 backend,
                 "sends",
                 &delivered,
-                &reserved_sends_expected(&delivered, &[], false),
+                &reserved_sends_expected(&delivered, &[]),
             );
         }
 
@@ -3963,7 +3958,7 @@ fn liteinst_in_guest_patching_off_by_environment_still_reserves_sigtrap() {
         &patching_off,
         "sends",
         &trap,
-        &reserved_sends_expected(&trap, &[libc::SIGTRAP], false),
+        &reserved_sends_expected(&trap, &[libc::SIGTRAP]),
     );
     assert_eq!(
         stderr

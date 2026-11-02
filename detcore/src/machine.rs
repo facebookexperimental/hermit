@@ -12,12 +12,14 @@
 //! (<https://github.com/rrnewton/hermit/issues/4266>).
 //!
 //! Today `uname`, `sysinfo` and the fixed procfs files (`procfs::fixed`)
-//! read it. The virtual CPU (CPUID, `/proc/cpuinfo`, the CPU files under
-//! `/sys`, `sched_getaffinity`) still has its own sources, which this
+//! read it, and the CPU count: `/proc/stat`, `/proc/cpuinfo`, the CPU files
+//! under `/sys` and the per-CPU tables. The rest of the virtual CPU (CPUID's
+//! table, `sched_getaffinity`) still has its own sources, which this
 //! description is to absorb; the design lists every source that must agree.
 //!
 //! The values are fixed. They may come only from Hermit's configuration
-//! (today: the epoch and the memory size), never from the host.
+//! (today: the epoch, the memory size and the CPU count), never from the
+//! host.
 
 use chrono::DateTime;
 use chrono::Utc;
@@ -29,11 +31,12 @@ pub struct MachineDescription {
     pub kernel: Kernel,
     /// The kernel's fixed limits and settings.
     pub limits: KernelLimits,
-    /// The number of CPUs: 1. Detcore runs a guest's threads one at a time,
-    /// as on one CPU, and `/proc/stat`, the CPU files under `/sys` and
-    /// `sched_getaffinity` already report one; the tables that have a column
-    /// or block per CPU (`/proc/interrupts`, `/proc/softirqs`,
-    /// `/proc/schedstat`, `/proc/zoneinfo`) render this many.
+    /// The number of CPUs: `--virtual-cpus`, or 1 without it. Detcore runs a
+    /// guest's threads one at a time whatever the count; it is what the
+    /// guest is told. `/proc/stat`, `/proc/cpuinfo`, the CPU files under
+    /// `/sys` and the tables that have a column or block per CPU
+    /// (`/proc/interrupts`, `/proc/softirqs`, `/proc/schedstat`,
+    /// `/proc/zoneinfo`) render this many.
     pub cpus: u32,
     /// The memory size in bytes, which `/proc/meminfo` (in kB, rounded
     /// down) and `sysinfo` report: the configured `--memory` (1 GB by
@@ -79,6 +82,7 @@ impl MachineDescription {
     pub fn of(config: &crate::config::Config) -> Self {
         Self {
             memory: config.memory,
+            cpus: config.virtual_cpu_count(),
             ..Self::new(config.epoch)
         }
     }

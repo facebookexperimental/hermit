@@ -146,14 +146,14 @@ fn assert_startup_guards(backend: &str) {
 // ignore annotations when the startup entropy defect is fixed.
 #[cfg(feature = "liteinst")]
 #[test]
-#[ignore = "known failure: https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/issue-drafts/2026-10-17-in-guest-trap-canary-pointer-guard-host-entropy.md"]
+#[ignore = "known failure: glibc's loader derives the stack-protector canary and pointer guard from AT_RANDOM before any preloaded constructor runs, so on this backend both still come from host entropy"]
 fn liteinst_startup_guards_derive_from_at_random_and_repeat() {
     assert_startup_guards("liteinst");
 }
 
 #[cfg(feature = "liteinst")]
 #[test]
-#[ignore = "known failure: https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/issue-drafts/2026-10-17-in-guest-trap-canary-pointer-guard-host-entropy.md"]
+#[ignore = "known failure: glibc's loader derives the stack-protector canary and pointer guard from AT_RANDOM before any preloaded constructor runs, so on this backend both still come from host entropy"]
 fn in_guest_trap_startup_guards_derive_from_at_random_and_repeat() {
     assert_startup_guards("in-guest-trap");
 }

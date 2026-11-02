@@ -430,7 +430,7 @@ mod tests {
         let (cfg, mut thread, mut observed) = fixture();
         thread.committed_clock_value = 71;
         thread.thread_logical_time.add_rcbs(71);
-        thread.stats.count_syscall();
+        thread.stats.count_syscall(Sysno::write);
         observed
             .syscall(&thread, Sysno::write, Phase::Prehook)
             .unwrap();

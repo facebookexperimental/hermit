@@ -94,7 +94,13 @@ fn socket_timestamp_ioctls_use_logical_time() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    for backend in ["ptrace", "dbt"] {
+    // The DBT leg runs only in builds that include DBT; the ptrace leg always runs.
+    let backends: &[&str] = if cfg!(feature = "dbt") {
+        &["ptrace", "dbt"]
+    } else {
+        &["ptrace"]
+    };
+    for backend in backends {
         for mode in ["v4-us", "v4-ns", "v6-us"] {
             let mut command = Command::new("timeout");
             command

@@ -93,6 +93,12 @@ pub(super) fn looked_up(sysno: Sysno) -> Option<Lookups> {
     if let Some(paths) = path_operands(sysno) {
         return Some(Lookups::Paths(paths.to_vec()));
     }
+    socket_lookups(sysno)
+}
+
+/// What a socket call numbered `sysno` looks up: the address it binds,
+/// connects or sends to ([`looked_up`] for a call with no path operands).
+fn socket_lookups(sysno: Sysno) -> Option<Lookups> {
     match sysno {
         Sysno::bind | Sysno::connect => Some(Lookups::SocketAddress {
             address: 1,
@@ -107,6 +113,22 @@ pub(super) fn looked_up(sysno: Sysno) -> Option<Lookups> {
         Sysno::sendmsg => Some(Lookups::MessageAddress),
         _ => None,
     }
+}
+
+/// Whether a call numbered `sysno` looks anything up ([`looked_up`] is
+/// `Some`), without allocating: the calls
+/// `Detcore::refuse_procfs_name_outside_level` can act on. Part of
+/// `may_name_file_or_descriptor`.
+pub(crate) fn looks_up_names(sysno: Sysno) -> bool {
+    path_operands(sysno).is_some() || socket_lookups(sysno).is_some()
+}
+
+/// Take the device of the guest's procfs mount now, if it was not taken
+/// yet, as `Detcore::refuse_procfs_name_outside_level` does first for every
+/// call: it must be taken before the guest's first call can change its root,
+/// so a call that skips the check takes it here.
+pub(crate) fn take_proc_device() {
+    let _ = rendered_procfs::proc_device();
 }
 
 /// The path operands of a call that looks up paths ([`Lookups::Paths`] of
@@ -310,7 +332,7 @@ struct Replacement {
 
 /// A transient anonymous page of at least `length` bytes in the guest, or
 /// `None` if the guest's address space has no room.
-pub(super) async fn map_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) async fn map_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
     guest: &mut G,
     length: usize,
 ) -> Option<AddrMut<'static, u8>> {
@@ -332,7 +354,7 @@ pub(super) async fn map_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
 
 /// Unmap a page from [`map_transient`]: a mapping left behind would be
 /// visible to the guest.
-pub(super) async fn unmap_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) async fn unmap_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
     guest: &mut G,
     page: AddrMut<'_, u8>,
     length: usize,
@@ -383,7 +405,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: &Syscall,
     ) -> Result<Option<i64>, Error> {
         // Taken before the guest's first call can change its root.
-        let _ = rendered_procfs::proc_device();
+        take_proc_device();
         let (sysno, args) = call.into_parts();
         let Some(lookups) = looked_up(sysno) else {
             return Ok(None);
@@ -394,8 +416,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut values = [
             args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
         ];
-        // A relative spelling below a descriptor Detcore has no record of (one
-        // received over `SCM_RIGHTS`) is judged as the name the kernel will
+        // A relative spelling below a descriptor Detcore has no recorded path
+        // for (one received over `SCM_RIGHTS`) is judged as the name the kernel will
         // look up: the directory the descriptor is open on, joined with it
         // (`Detcore::unrecorded_procfs_directory`). Otherwise a received
         // `/proc` descriptor would reach a name the level omits. Recovered
@@ -432,6 +454,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         let numbers = self
             .parent_numbers(guest, &lookups, &values, &recovered_paths)
             .await;
+        // A spelling relative to the working directory is decided from the
+        // guest's working directory, which the tool may first have to read
+        // from the guest (`Detcore::prepare_guest_cwd`: KVM), here, before
+        // the decisions, which do not await.
+        if !crate::procfs_inode::tool_can_read_guest_cwd(&self.cfg.backend) {
+            for (dirfd, spelling) in Self::looked_up_spellings(guest, &lookups, &values) {
+                Self::prepare_guest_cwd(guest, dirfd, &spelling).await;
+            }
+        }
         // Whether a refusal for permission can only be the KVM executor's.
         let mut confined = true;
         let replacements = match lookups {
@@ -579,6 +610,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             .iter()
             .map(|path| (libc::AT_FDCWD, path.clone()))
             .collect::<Vec<_>>();
+        spellings.extend(Self::looked_up_spellings(guest, lookups, values));
+        let named = spellings
+            .iter()
+            .filter_map(|(dirfd, spelling)| Self::observed_path(guest, *dirfd, spelling).ok())
+            .flat_map(|path| crate::procfs::ids::named_ids(&path))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if named.is_empty() {
+            return Some(BTreeMap::new());
+        }
+        let kernel = crate::tool_global::procfs_ids(guest, true, named.clone()).await;
+        Some(named.into_iter().zip(kernel).collect())
+    }
+
+    /// The spellings `lookups` names in a call's argument `values`, each with
+    /// the directory descriptor it is looked up from (`AT_FDCWD` for the
+    /// working directory): the path operands, or the pathname a socket
+    /// address names.
+    fn looked_up_spellings<G: Guest<Self>>(
+        guest: &G,
+        lookups: &Lookups,
+        values: &[usize; 6],
+    ) -> Vec<(i32, PathBuf)> {
+        let mut spellings = Vec::new();
         match lookups {
             Lookups::Paths(operands) => {
                 for (dirfd, path) in operands {
@@ -614,18 +670,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
         }
-        let named = spellings
-            .iter()
-            .filter_map(|(dirfd, spelling)| Self::observed_path(guest, *dirfd, spelling).ok())
-            .flat_map(|path| crate::procfs::ids::named_ids(&path))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        if named.is_empty() {
-            return Some(BTreeMap::new());
-        }
-        let kernel = crate::tool_global::procfs_ids(guest, true, named.clone()).await;
-        Some(named.into_iter().zip(kernel).collect())
+        spellings
     }
 
     /// What Detcore decides about `spelling`, relative to `dirfd` (`None`
@@ -656,6 +701,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             .filter(|observed| observed.is_absolute())
         else {
             return Decision::default();
+        };
+        // The path Linux's walk reaches: through the caller's descriptor
+        // links to the `/proc` directories Detcore serves on placeholders,
+        // and back through `..` over the directories every procfs has, so
+        // that no spelling a placeholder's respelling or a `..` makes of an
+        // omitted name reaches it (`descriptor_directory`). Not from a
+        // descriptor whose recorded path is a descriptor link's spelling,
+        // which need not name the file it is open on
+        // (`Detcore::starts_at_a_recorded_link`).
+        let observed = if Self::starts_at_a_recorded_link(guest, dirfd, spelling) {
+            observed
+        } else {
+            let observed = match Self::decided_path(guest, &observed) {
+                Ok((decided, _)) => decided,
+                Err(_) => observed,
+            };
+            // A task the spelling names on the way that does not exist ends
+            // the kernel's walk with ENOENT, as every name this refuses does.
+            super::descriptor_directory::resolved_procfs_dotdot(&observed)
+                .map_or(observed, |(resolved, _)| resolved)
         };
         let in_view = match root {
             None => observed.clone(),
@@ -881,8 +946,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (`getsockopt(SO_TYPE)`, into a transient page): only such a socket
     /// looks up the address a send gives. `None` where there is no room for
     /// the question. Asked only for a send whose address reaches an omitted
-    /// name, outside record and replay.
-    async fn socket_is_datagram<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) -> Option<bool> {
+    /// name, or leads below a `/proc` directory Detcore serves on a
+    /// placeholder (`Detcore::refuse_lookup_below_placeholder`), outside
+    /// record and replay.
+    pub(super) async fn socket_is_datagram<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Option<bool> {
         const LENGTH: usize = 8;
         let page = map_transient(guest, LENGTH).await?;
         let base = page.as_raw();
@@ -911,6 +982,52 @@ impl<T: RecordOrReplay> Detcore<T> {
                 && i32::from_ne_bytes(contents[..4].try_into().expect("4 bytes"))
                     == libc::SOCK_DGRAM,
         )
+    }
+
+    /// Whether the socket `fd` can pass descriptors over `SCM_RIGHTS`: an
+    /// `AF_UNIX` socket, as the socket says (`getsockopt(SO_DOMAIN)`, into a
+    /// transient page). `false` where the socket does not answer because `fd`
+    /// is no socket or no descriptor, where Linux's send fails before it reads
+    /// the control data (`sockfd_lookup_light`); `true` where Detcore cannot
+    /// ask (no room for the question, or another failure).
+    pub(super) async fn socket_carries_descriptors<G: Guest<Self>>(
+        guest: &mut G,
+        fd: RawFd,
+    ) -> bool {
+        const LENGTH: usize = 8;
+        let Some(page) = map_transient(guest, LENGTH).await else {
+            return true;
+        };
+        let base = page.as_raw();
+        // The domain, an int, then its length, a socklen_t.
+        let mut contents = [0u8; LENGTH];
+        contents[4..].copy_from_slice(&4u32.to_ne_bytes());
+        let carries = if guest.memory().write_exact(page, &contents).is_err() {
+            true
+        } else {
+            match guest
+                .inject(Syscall::from_raw(
+                    Sysno::getsockopt,
+                    raw_args([
+                        fd as usize,
+                        libc::SOL_SOCKET as usize,
+                        libc::SO_DOMAIN as usize,
+                        base,
+                        base + 4,
+                        0,
+                    ]),
+                ))
+                .await
+            {
+                Ok(_) if guest.memory().read_exact(page, &mut contents).is_ok() => {
+                    i32::from_ne_bytes(contents[..4].try_into().expect("4 bytes")) == libc::AF_UNIX
+                }
+                Err(syscalls::Errno::ENOTSOCK | syscalls::Errno::EBADF) => false,
+                _ => true,
+            }
+        };
+        unmap_transient(guest, page, LENGTH).await;
+        carries
     }
 
     /// The guest's root in the tool's view: `Some(None)` where they are the
@@ -1108,12 +1225,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let level = self.cfg.proc_level;
         let Some(resolved) = (match self.guest_root_in_view(guest) {
-            Some(None) => call
-                .path()
-                .and_then(|path| path.read(&guest.memory()).ok())
-                .and_then(|path| Self::observed_path(guest, call.dirfd(), &path).ok())
-                .filter(|observed| observed.is_absolute())
-                .and_then(|observed| resolve_links(&observed)),
+            Some(None) => {
+                let spelling: Option<PathBuf> =
+                    call.path().and_then(|path| path.read(&guest.memory()).ok());
+                match spelling {
+                    Some(path) => {
+                        Self::prepare_guest_cwd(guest, call.dirfd(), &path).await;
+                        Self::observed_path(guest, call.dirfd(), &path)
+                            .ok()
+                            .filter(|observed| observed.is_absolute())
+                            .and_then(|observed| resolve_links(&observed))
+                    }
+                    None => None,
+                }
+            }
             _ => None,
         }) else {
             return false;

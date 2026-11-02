@@ -123,7 +123,7 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 # Keep `validate` as an explicit .PHONY convenience target for the sole Rust
 # validation entrypoint.
 validate: verify-submodules ## Run the full validation suite (Rust driver; pass flags via ARGS)
-	./scripts/validate.rs $(ARGS)
+	./scripts/validate.rs --all $(ARGS)
 
 validate-plan: ## Print the boxed DAG plan (nodes, wall/CPU/memory caps, deps) without running it
 	./scripts/validate.rs --show-plan $(ARGS)
@@ -203,6 +203,7 @@ LINT_CHECK_TARGETS := \
     lint-check-docs-pages-contract \
     lint-check-pre-push-submodule-diagnosis \
     lint-check-doc-bare-urls \
+    lint-check-private-workspace-refs \
     lint-check-pre-push-doc-bare-urls \
     lint-check-required-check-outcomes \
     lint-check-check-status-outcome \
@@ -263,6 +264,9 @@ lint-check-pre-push-submodule-diagnosis:
 
 lint-check-doc-bare-urls:
 	./scripts/check-doc-bare-urls.rs
+
+lint-check-private-workspace-refs:
+	./scripts/check-private-workspace-refs.sh
 
 lint-check-pre-push-doc-bare-urls:
 	./scripts/test-pre-push-doc-bare-urls.sh
@@ -427,7 +431,7 @@ help: ## Show this help (the list of make targets)
 	@printf '  validate-dbt       DBT manifest cells    (third-party-backends)      not yet timed\n'
 	@printf '  validate-sabre     SaBRe corpus          (needs HERMIT_SABRE_BINARY) ~10-20 min\n'
 	@printf '  validate-e9patch   e9patch corpus        (needs HERMIT_E9PATCH_BACKEND) ~5-20 min\n'
-	@printf '\nThe full multi-backend suite is ./scripts/validate.rs (see ./scripts/validate.rs --help).\n'
+	@printf '\nThe full multi-backend suite is ./scripts/validate.rs --all (see ./scripts/validate.rs --help).\n'
 
 # Detect the native build toolchain (cmake + a C and C++ compiler) that the
 # third-party backends need. reverie-dbt's build.rs CMake-configures DynamoRIO

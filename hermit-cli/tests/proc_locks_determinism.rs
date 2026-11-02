@@ -1907,8 +1907,9 @@ fn expected(sections: Vec<(&str, Vec<&str>)>) -> Sections {
 ///   the child exits;
 /// - an OFD lock sent over `SCM_RIGHTS` is shown while both hold it, and
 ///   goes once both have closed it; after the sender's close alone it stays
-///   shown where Detcore models the receiver's descriptor (DBT) and is hidden
-///   on ptrace, a named residual;
+///   shown, as Linux shows it, because Detcore models the receiver's
+///   descriptor on every backend (recorded as it arrives on ptrace,
+///   `Detcore::record_received_descriptors`; discovered on DBT);
 /// - an OFD lock whose argument is on a write-only page is shown.
 fn lock_rows_follow_the_guests_descriptions(backend: &str) {
     let root = tempfile::Builder::new()
@@ -1932,17 +1933,10 @@ fn lock_rows_follow_the_guests_descriptions(backend: &str) {
     );
     let own = root.path().join("own");
     fs::create_dir(&own).expect("create the guest's own lock directory");
-    // The sender closes before the receiver looks. A receiver whose
-    // descriptor Detcore models (the in-guest backends) registers it, so the
-    // row survives the sender's close; on ptrace Detcore keeps no model of a
-    // received descriptor, so once the sender closes, the lock is hidden: a
-    // named residual, pinned here so the hidden row is tested, not unasserted.
-    let receiver_registers = backend != "ptrace";
-    let after_sender_close = if receiver_registers {
-        vec!["OFDLCK"]
-    } else {
-        vec![]
-    };
+    // The sender closes before the receiver looks. The receiver's descriptor
+    // is modelled and registered on reception on every backend, so the row
+    // survives the sender's close, as on Linux.
+    let after_sender_close = vec!["OFDLCK"];
     let scenarios: [(&str, &OsStr, Sections); 5] = [
         (
             "unlock",
@@ -2202,7 +2196,7 @@ fn recordings_from_before_the_lock_ledger_are_refused_by_the_version_gate() {
     let mut metadata: serde_json::Value =
         serde_json::from_str(&text).expect("recording metadata is not JSON");
     assert_eq!(
-        metadata["version"], 0x186,
+        metadata["version"], 0x187,
         "RECORD_VERSION moved; point this test at the current version and the ledger's predecessor"
     );
     // 0x180, 0x17f, 0x17e, 0x17d and 0x17c keep, or drop by length alone, the

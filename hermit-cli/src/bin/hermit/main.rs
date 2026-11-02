@@ -64,6 +64,7 @@ mod native_exec_run;
 mod native_exec_setup;
 mod oci;
 mod owned_container;
+mod pinned_cpu;
 mod podman_store;
 mod record;
 mod record_envelope;
@@ -631,6 +632,7 @@ impl Subcommand {
         match self {
             Subcommand::Run(run) => {
                 run.set_backend(global.backend);
+                run.prepare_mapped_verification_inputs()?;
                 run.refuse_unready_exec_stop()?;
             }
             Subcommand::Oci(oci) => oci.refuse_unready_exec_stop()?,
@@ -698,6 +700,10 @@ fn main() {
     // container inits -- three on `--verify`, which forks once per run. This
     // placement dominates every with_container and run_guarded_at site.
     detcore::util::init_shared_stderr_deadline_origin();
+    // This process traces guests from outside and never shares a guest's
+    // descriptor table, so Detcore may keep each traced thread's /proc status
+    // file open here. The in-guest runtimes never make this call.
+    detcore::keep_host_status_files_open();
     // Parse through `ArgMatches` so the run command can distinguish an
     // omitted epoch from an explicit CLI/environment value. `Config` keeps a
     // stable library default for wire fingerprints and unit fixtures; only an
@@ -1678,6 +1684,7 @@ mod tests {
             "~/.hermit",
             "content addressible",
             "Record mode has no `--network` flag",
+            "defaults to, and requires, `--network=host`",
         ] {
             assert!(!help.contains(stale), "stale claim {stale:?} in:\n{help}");
         }
@@ -1688,7 +1695,8 @@ mod tests {
             "In run and record mode, by default (`--network=local`)",
             "only a loopback interface",
             "A recording stores its choice",
-            "`hermit record start --verify-with-gdbex` defaults to, and requires, `--network=host`",
+            "`--gdbserver`, and a replay served to gdb, keep the guest's network",
+            "bound in the host's network namespace",
             "The DBT backend does not apply `--network` yet",
             "`$XDG_CACHE_HOME/hermit`, which is `~/.cache/hermit`",
             "`--data-dir` or `HERMIT_DATA_DIR`",

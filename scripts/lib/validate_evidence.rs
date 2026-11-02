@@ -470,7 +470,9 @@ mod tests {
             "--requalify-cell".into(),
             "c-programs/pid-probe".into(),
             "verify".into(),
-            "sabre".into(),
+            // SaBRe is archived (ci/manifest-plan/src/archived.rs), so its cells
+            // are no longer selected per commit; use a selected DBT cell.
+            "dbt".into(),
             "--no-label-pr".into(),
         ])
         .unwrap();
@@ -485,7 +487,7 @@ mod tests {
             category: "c-programs".into(),
             test: Some("c-programs/pid-probe".into()),
             mode: Some("verify".into()),
-            backend: Some("sabre".into()),
+            backend: Some("dbt".into()),
         };
         let committed = super::super::validate_plan::validation_config(root).unwrap();
         let lane =

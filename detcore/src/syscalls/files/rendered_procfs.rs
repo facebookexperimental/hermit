@@ -147,6 +147,24 @@ fn descriptor_stable_across_injections(sequentialized: bool, guest_code_between:
     sequentialized && !guest_code_between
 }
 
+/// Whether the tool may read a task's kernel `comm` by path at all: not
+/// where it shares the guest's root (`shares_root`: DBT, SaBRe, LiteInst)
+/// and the guest has changed that root (`changed_root`), because the path is
+/// then looked up through a root the guest controls, where no check on the
+/// opened file authenticates the task (`Detcore::kernel_task_comm`). A
+/// tracer's own root is not the guest's.
+fn comm_read_is_trusted(shares_root: bool, changed_root: bool) -> bool {
+    !(shares_root && changed_root)
+}
+
+/// Whether the open file `file` is on a procfs (`fstatfs` reports
+/// `PROC_SUPER_MAGIC`), which refuses an ordinary file mounted over a
+/// task's `comm` path.
+fn comm_file_is_on_procfs(file: &crate::util::RawFd) -> bool {
+    file.fs_type()
+        .is_ok_and(|kind| kind == reverie::syscalls::linux_abi::PROC_SUPER_MAGIC as u64)
+}
+
 /// Whether a first read may read and write the uptime carried on the
 /// placeholder behind its descriptor (`Detcore::first_read_uptime`): only
 /// where the descriptor number keeps naming the same file between Detcore's
@@ -547,6 +565,19 @@ pub(super) fn guest_procfs_mount_id() -> Result<u64, Error> {
     GuestProcfs::mount_id()
 }
 
+/// The mode, owner and group of the guest's procfs root, `/proc` itself, as
+/// the guest's user namespace sees them, read once: the tool runs in the
+/// guest's mount and user namespaces outside record and replay
+/// ([`GuestProcfs`]), where Detcore serves `/proc` on a placeholder.
+pub(super) fn guest_procfs_root() -> Result<(u32, u32, u32), Errno> {
+    static ROOT: std::sync::OnceLock<(u32, u32, u32)> = std::sync::OnceLock::new();
+    if let Some(root) = ROOT.get() {
+        return Ok(*root);
+    }
+    let stat = GuestProcfs::stat(c"/proc")?;
+    Ok(*ROOT.get_or_init(|| (stat.st_mode, stat.st_uid, stat.st_gid)))
+}
+
 /// The metadata Linux gives the procfs file at `path`, owned by `owner`,
 /// with Detcore's procfs device, the inode its path names, and every time at
 /// `epoch`, on every backend.
@@ -557,6 +588,8 @@ fn rendered_stat(path: &Path, epoch: Timespec, owner: (u32, u32)) -> DetStat {
         .map_or(0o444, FixedProcfsFile::permissions);
     let permissions = if rendered_path_is_owner_only(path) {
         0o400
+    } else if rendered_path_is_owner_writable(path) {
+        0o644
     } else {
         permissions
     };
@@ -589,6 +622,213 @@ fn rendered_stat(path: &Path, epoch: Timespec, owner: (u32, u32)) -> DetStat {
 /// process's `auxv` (`proc_pid_auxv`'s `S_IRUSR`).
 pub(super) fn rendered_path_is_owner_only(path: &Path) -> bool {
     crate::procfs::per_process_name(path).is_some_and(|name| name.filename == "auxv")
+}
+
+/// Whether the rendered file `path` has Linux's mode 0644: a task's `comm`
+/// (`S_IRUGO|S_IWUSR`, fs/proc/base.c:3335 and 3677 in 6.17). Detcore
+/// renders it for reading only: it refuses a write open itself
+/// ([`asks_to_write_comm`]), and the access checks it answers grant write
+/// permission by `CAP_DAC_OVERRIDE`, as for every rendered file
+/// ([`FileAccess::may_write`]), not by the owner's write bit (declared).
+fn rendered_path_is_owner_writable(path: &Path) -> bool {
+    crate::procfs::per_process_name(path).is_some_and(|name| name.filename == "comm")
+}
+
+/// Where Detcore's lexical walk of an absolute `/proc` spelling that holds a
+/// `..` and ends in `comm` lands ([`walk_comm_alias`]): package K slice A+,
+/// so that no such spelling of a `comm` Detcore renders reaches the kernel
+/// beneath, whose answer to it is a host lookup's
+/// (<https://github.com/rrnewton/hermit/issues/4263> is the general class).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CommAliasWalk {
+    /// Not a spelling the walk decides: no `..`, not under `/proc` as
+    /// spelled, or a last component other than `comm`.
+    NotApplicable,
+    /// The `comm` of `task`, provided every task in `checks` exists, in
+    /// order (else Linux's lookup fails with ENOENT there first).
+    Comm {
+        checks: Vec<crate::procfs::BoundTask>,
+        task: crate::procfs::BoundTask,
+    },
+    /// Linux's lookup fails with `errno`, provided every task in `checks`
+    /// exists (else ENOENT first).
+    Fails {
+        checks: Vec<crate::procfs::BoundTask>,
+        errno: Errno,
+    },
+    /// The walk passes a component Detcore does not model (a link such as
+    /// `cwd` or `fd/N`, a directory it does not list, or a step out of
+    /// `/proc`), after which a `..` or the last component may land anywhere,
+    /// a rendered `comm` included; `checks` are the tasks it passed first.
+    Undetermined(Vec<crate::procfs::BoundTask>),
+}
+
+/// A procfs directory the walk models: Linux's `proc_pid_lookup` and
+/// `proc_task_lookup` decide what is below `/proc` and `task`.
+#[derive(Clone, Copy)]
+enum ProcNode {
+    /// The root directory, `/proc`'s parent.
+    Root,
+    Proc,
+    Pid(i32),
+    TaskDir(i32),
+    Task(i32, i32),
+}
+
+/// A task number as procfs's `name_to_int` takes one: decimal digits, no
+/// leading zero unless the number is 0, at most `i32::MAX`. `None` for any
+/// other name (which procfs's lookup of a number refuses with ENOENT).
+fn proc_number(name: &str) -> Option<i32> {
+    if name.is_empty()
+        || !name.bytes().all(|byte| byte.is_ascii_digit())
+        || (name.len() > 1 && name.starts_with('0'))
+    {
+        return None;
+    }
+    name.parse().ok()
+}
+
+/// Walk `path`, an absolute spelling, lexically through the procfs
+/// directories Detcore models, for a caller whose own process and thread
+/// are `own` (`self`, `thread-self`), as Linux's path walk goes through them:
+/// `..` goes to the parent directory (procfs has no other way back up:
+/// `self` and `thread-self` are links to `<pid>` and `<pid>/task/<tid>`, which
+/// the walk follows); a number below `/proc` names a task that must exist,
+/// and a number below `<pid>/task` a task of that process; a name below
+/// `task` that is no number is ENOENT (`proc_task_lookup`); `comm` is a file,
+/// so a component after it is ENOTDIR. Only a spelling under `/proc` as
+/// spelled, holding a `..`, whose last component is `comm`
+/// ([`CommAliasWalk::NotApplicable`] otherwise).
+pub(super) fn walk_comm_alias(path: &Path, own: (i32, i32)) -> CommAliasWalk {
+    use std::path::Component;
+    let components: Vec<Component<'_>> = path
+        .components()
+        .filter(|component| *component != Component::CurDir)
+        .collect();
+    let applies = path.is_absolute()
+        && components.get(1) == Some(&Component::Normal("proc".as_ref()))
+        && components.contains(&Component::ParentDir)
+        && components.last() == Some(&Component::Normal("comm".as_ref()));
+    if !applies {
+        return CommAliasWalk::NotApplicable;
+    }
+    let mut checks = Vec::new();
+    let mut node = ProcNode::Root;
+    let count = components.len();
+    for (index, component) in components.iter().enumerate() {
+        let last = index + 1 == count;
+        let name = match component {
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => continue,
+            Component::ParentDir => {
+                node = match node {
+                    ProcNode::Root | ProcNode::Proc => ProcNode::Root,
+                    ProcNode::Pid(_) => ProcNode::Proc,
+                    ProcNode::TaskDir(process) => ProcNode::Pid(process),
+                    ProcNode::Task(process, _) => ProcNode::TaskDir(process),
+                };
+                continue;
+            }
+            Component::Normal(name) => match name.to_str() {
+                Some(name) => name,
+                None => return CommAliasWalk::Undetermined(checks),
+            },
+        };
+        node = match (node, name) {
+            (ProcNode::Root, "proc") => ProcNode::Proc,
+            (ProcNode::Proc, "self") => ProcNode::Pid(own.0),
+            (ProcNode::Proc, "thread-self") => ProcNode::Task(own.0, own.1),
+            (ProcNode::Proc, name) if name.bytes().all(|byte| byte.is_ascii_digit()) => {
+                match proc_number(name) {
+                    Some(process) => {
+                        checks.push(crate::procfs::BoundTask {
+                            process,
+                            thread: None,
+                        });
+                        ProcNode::Pid(process)
+                    }
+                    None => {
+                        return CommAliasWalk::Fails {
+                            checks,
+                            errno: Errno::ENOENT,
+                        };
+                    }
+                }
+            }
+            (ProcNode::Pid(process), "task") => ProcNode::TaskDir(process),
+            (ProcNode::TaskDir(process), name) => match proc_number(name) {
+                Some(thread) => {
+                    checks.push(crate::procfs::BoundTask {
+                        process,
+                        thread: Some(thread),
+                    });
+                    ProcNode::Task(process, thread)
+                }
+                None => {
+                    return CommAliasWalk::Fails {
+                        checks,
+                        errno: Errno::ENOENT,
+                    };
+                }
+            },
+            (ProcNode::Pid(process), "comm") | (ProcNode::Task(process, _), "comm") => {
+                if !last {
+                    return CommAliasWalk::Fails {
+                        checks,
+                        errno: Errno::ENOTDIR,
+                    };
+                }
+                let thread = match node {
+                    ProcNode::Task(_, thread) => Some(thread),
+                    _ => None,
+                };
+                return CommAliasWalk::Comm {
+                    checks,
+                    task: crate::procfs::BoundTask { process, thread },
+                };
+            }
+            _ => return CommAliasWalk::Undetermined(checks),
+        };
+    }
+    // The last component is `comm`, which every model node answers above.
+    CommAliasWalk::Undetermined(checks)
+}
+
+/// What [`Detcore::resolve_comm_alias`] makes of a spelling.
+pub(super) enum CommAlias {
+    /// Not a spelling it decides ([`CommAliasWalk::NotApplicable`]), or
+    /// Detcore does not render `comm` on this backend.
+    NotApplicable,
+    /// The spelling of a task's `comm`, without its `..`:
+    /// `/proc/<pid>/comm` or `/proc/<pid>/task/<tid>/comm`.
+    Resolved(std::path::PathBuf),
+    /// [`CommAliasWalk::Undetermined`]: answered by the kernel beneath for
+    /// reading, refused by name for writing
+    /// ([`Detcore::refuse_undetermined_comm_write`]).
+    Undetermined,
+}
+
+/// Whether an open with `flags` asks to write the file it opens: a write or
+/// read-write access mode, or `O_TRUNC`, which needs write permission
+/// (`may_open`), but not `O_PATH`, which opens for neither.
+pub(super) fn open_asks_to_write(flags: OFlag) -> bool {
+    !flags.contains(OFlag::O_PATH)
+        && (flags & OFlag::O_ACCMODE != OFlag::O_RDONLY || flags.contains(OFlag::O_TRUNC))
+}
+
+/// Whether an open of the rendered file `procfs` with `flags` is an open of
+/// a task's `comm` for writing (package K slice A+), which Detcore refuses
+/// with EACCES itself, before any injected call or request
+/// (`Detcore::open_rendered_procfs`), by every route that reaches a rendered
+/// `comm`: its path (`openat`, `open`, `creat`; `openat2` is Detcore's fixed
+/// ENOSYS) and a descriptor link to one (`/proc/*/fd/N`, `/dev/fd/N`).
+/// Detcore renders a `comm` from its record and writes no name, so the
+/// record never falls behind a write it did not see, and the answer depends
+/// on neither the host nor the kernel beneath (the KVM executor's own answer
+/// to that path is a host lookup's: its EACCES only where the host has the
+/// path). DECLARED: Linux renames the task (`comm_write`); Detcore's EACCES
+/// is its named difference.
+pub(super) fn asks_to_write_comm(procfs: &ProcfsFile, flags: OFlag) -> bool {
+    procfs.is_task_comm() && open_asks_to_write(flags)
 }
 
 /// What decides another process's open of a rendered `/proc/<pid>/auxv`
@@ -674,6 +914,19 @@ impl FileAccess {
         dac_override: false,
         sys_admin: false,
     };
+
+    /// The caller's own descriptor directory (mode 0500), which it owns and
+    /// may also write as a thread of the directory's task
+    /// (`proc_fd_permission`), with `CAP_SYS_ADMIN` from the caller's
+    /// `capabilities` (a `capget` set).
+    fn own_descriptor_directory(capabilities: u64) -> Self {
+        Self {
+            owner: true,
+            readable: true,
+            dac_override: true,
+            sys_admin: capabilities & (1 << CAP_SYS_ADMIN) != 0,
+        }
+    }
 
     /// A per-process file, which the caller owns, with the capabilities
     /// `capabilities` (a `capget` set) of the caller.
@@ -1121,7 +1374,7 @@ pub(super) struct RenderedTarget {
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// Whether Detcore renders procfs files for this guest thread now.
-    pub(super) fn renders_procfs<G: Guest<Self>>(&self, guest: &G) -> bool {
+    pub(crate) fn renders_procfs<G: Guest<Self>>(&self, guest: &G) -> bool {
         !self.cfg.recordreplay_modes
             && !guest
                 .thread_state()
@@ -1233,14 +1486,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         // components before it, which need not exist or be directories, while
         // Detcore's names drop them. (A valid `..` spelling of a rendered file
         // so reaches the kernel's own: a known limitation, see
-        // <https://github.com/rrnewton/hermit/issues/4263>.)
-        if !self.renders_procfs(guest)
-            || path
-                .components()
-                .any(|component| component == std::path::Component::ParentDir)
-        {
+        // <https://github.com/rrnewton/hermit/issues/4263>.) Except a
+        // spelling of a task's `comm` where Detcore renders it (package K
+        // slice A+): Detcore walks it itself, checking every task it passes
+        // as Linux's lookup does, and answers it as the file it reaches, or
+        // fails it as Linux would ([`Self::resolve_comm_alias`]).
+        if !self.renders_procfs(guest) {
             return Ok(None);
         }
+        let resolved;
+        let path = if path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+        {
+            match self.resolve_comm_alias(guest, path).await? {
+                CommAlias::Resolved(comm) => {
+                    resolved = comm;
+                    resolved.as_path()
+                }
+                CommAlias::NotApplicable | CommAlias::Undetermined => return Ok(None),
+            }
+        } else {
+            path
+        };
         if let Some(mut procfs) = ProcfsFile::from_path(path) {
             // A per-process file belongs to the task its path names, which
             // Detcore's process table decides exists, as Linux's lookup of
@@ -1252,6 +1520,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             // task a spelling names, its existence and identity from Detcore's
             // process table, and its owner's access (FileAccess).
             if procfs.per_process_name().is_some() {
+                if self.kernel_serves_every_comm(&procfs) {
+                    return Ok(None);
+                }
                 let Some((pid, tid)) = self.procfs_caller_ids(guest) else {
                     return Ok(None);
                 };
@@ -1772,6 +2043,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let path = procfs
             .opened_path()
             .expect("a file opened as rendered has a path");
+        // A rendered `comm` is read only (package K slice A+): an open of
+        // it for writing, by its path or a descriptor link, is Detcore's
+        // EACCES, with nothing injected and nothing asked of the global tool
+        // ([`asks_to_write_comm`], declared).
+        if asks_to_write_comm(&procfs, flags) {
+            return Err(Errno::EACCES.into());
+        }
         let writes = flags & OFlag::O_ACCMODE != OFlag::O_RDONLY || flags.contains(OFlag::O_TRUNC);
         let access = self
             .rendered_file_access(guest, path, writes, CapabilitySet::Effective)
@@ -2069,7 +2347,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let virtual_pty_count = guest
             .thread_state()
             .count_open_files_at_paths(&[Path::new("/dev/ptmx"), Path::new("/dev/pts/ptmx")]);
-        let virtual_cpuinfo = file.is_cpuinfo().then(|| self.virtual_cpuid().cpuinfo());
+        let virtual_cpuinfo = file.is_cpuinfo().then(|| {
+            self.virtual_cpuid()
+                .cpuinfo(guest.config().virtual_cpu_count())
+        });
         let template = file.rendering_template().to_vec();
         file.initialize(
             template,
@@ -2330,7 +2611,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             && let Some(mut file) = ProcfsFile::from_path(&path)
             && file.per_process_name().is_some()
         {
-            if !self.renders_procfs(guest) {
+            if !self.renders_procfs(guest) || self.kernel_serves_every_comm(&file) {
                 return Ok(None);
             }
             let Some(task) = file.bound_task() else {
@@ -2376,6 +2657,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// target's memory at each read), or the caller's own where Detcore
     /// recorded no argument area for its image (the same backends and stacks
     /// as for `auxv`).
+    ///
+    /// And whether `file` is a process's `stat` that the kernel serves:
+    /// another process's (package K slice D4c-1 renders the reader's own
+    /// process's only), or, where the name's source is Detcore's record
+    /// (`Self::comm_source`), the caller's own before a name is recorded
+    /// (`procfs::task_stat::renders_task_stat`).
+    ///
+    /// And whether `file` is a task's `comm` that the kernel serves: every
+    /// one where the name's source is the kernel
+    /// ([`Self::kernel_serves_every_comm`]), and elsewhere another process's,
+    /// or the caller's own before a name is recorded
+    /// (`procfs::task_stat::renders_task_comm`, package K slice A+).
     async fn kept_by_kernel<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2385,6 +2678,46 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Some(task) = file.bound_task() else {
             return false;
         };
+        // A task's `comm` (package K slice A+): Detcore renders only the
+        // reader's own process's, from its record, where the record is the
+        // name's source (`procfs::task_stat::renders_task_comm`).
+        if file.is_task_comm() {
+            if self.kernel_serves_every_comm(file) {
+                return true;
+            }
+            let facts = crate::tool_global::task_stat_facts(guest, task).await;
+            let own = self.own_detpid(guest).as_raw();
+            return !crate::procfs::task_stat::renders_task_comm(&facts, own, self.comm_source());
+        }
+        if file.is_task_stat() {
+            let facts = crate::tool_global::task_stat_facts(guest, task).await;
+            let own = self.own_detpid(guest).as_raw();
+            let rendered =
+                crate::procfs::task_stat::renders_task_stat(&facts, own, self.comm_source());
+            // The guest-visible parent of a process whose real parent is
+            // outside the guest's tree (the run's root, and a CLONE_PARENT
+            // child of such a process), which no other record of Detcore's
+            // holds, is its own getppid answer, recorded here, in its own
+            // turn, before any descriptor of its rendered stat exists: a
+            // descriptor that reaches another process (across fork or
+            // SCM_RIGHTS) renders it (`Scheduler::guest_visible_parent`).
+            // Every rendered stat of a process is opened, or listed, by one of
+            // its own threads, so this runs before any other process can read
+            // one. The global tool ignores it for a process whose model knows
+            // its parent.
+            if rendered
+                && facts.parent.is_none()
+                && let Ok(parent) = guest.inject(syscalls::Getppid::new()).await
+            {
+                crate::tool_global::record_external_parent(
+                    guest,
+                    detcore_model::pid::DetPid::from_raw(own),
+                    parent as i32,
+                )
+                .await;
+            }
+            return !rendered;
+        }
         let process = detcore_model::pid::DetPid::from_raw(task.process);
         if file.is_process_cmdline() {
             let (process, area) = crate::tool_global::process_cmdline(guest, process).await;
@@ -2396,6 +2729,347 @@ impl<T: RecordOrReplay> Detcore<T> {
         crate::tool_global::process_auxv(guest, process)
             .await
             .is_none()
+    }
+
+    /// Where a rendered `stat`'s name comes from on this backend
+    /// (`procfs::task_stat::CommSource::of_backend`): the kernel beneath's
+    /// own where its guest threads are host tasks the tool can name (the
+    /// declared `tool_can_name_guest_descriptors` capability: ptrace, DBT,
+    /// SaBRe, LiteInst), Detcore's record elsewhere (KVM).
+    pub(super) fn comm_source(&self) -> crate::procfs::task_stat::CommSource {
+        crate::procfs::task_stat::CommSource::of_backend(
+            crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend),
+        )
+    }
+
+    /// Whether `file` is a task's `comm` and the name's source on this
+    /// backend is the kernel's own ([`Self::comm_source`]): then every
+    /// spelling of every task's `comm`, its lookup, metadata and listing
+    /// included, is the kernel's, unclassified, exactly as before Detcore
+    /// rendered any (package K slice A+), decided before any request to the
+    /// global tool, so those backends pay nothing for the file.
+    pub(super) fn kernel_serves_every_comm(&self, file: &ProcfsFile) -> bool {
+        file.is_task_comm() && self.comm_source() == crate::procfs::task_stat::CommSource::Kernel
+    }
+
+    /// Resolve `path`, an absolute spelling with a `..`, where Detcore renders
+    /// `comm` (its record is the name's source, package K slice A+):
+    /// [`walk_comm_alias`], then each task the walk passed must exist in
+    /// Detcore's process table, in order, as Linux's lookup requires of the
+    /// components a `..` later undoes (ENOENT otherwise); a walk that fails
+    /// is Linux's error there (ENOENT, ENOTDIR). Only global-tool requests,
+    /// no injected call. An undetermined walk is returned unchecked: only a
+    /// write open refuses it ([`Self::refuse_undetermined_comm_write`]).
+    pub(super) async fn resolve_comm_alias<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &Path,
+    ) -> Result<CommAlias, Error> {
+        if self.comm_source() != crate::procfs::task_stat::CommSource::Record {
+            return Ok(CommAlias::NotApplicable);
+        }
+        let Some(own) = self.procfs_caller_ids(guest) else {
+            return Ok(CommAlias::NotApplicable);
+        };
+        let (checks, outcome) = match walk_comm_alias(path, own) {
+            CommAliasWalk::NotApplicable => return Ok(CommAlias::NotApplicable),
+            CommAliasWalk::Undetermined(_) => return Ok(CommAlias::Undetermined),
+            CommAliasWalk::Comm { checks, task } => (checks, Ok(task)),
+            CommAliasWalk::Fails { checks, errno } => (checks, Err(errno)),
+        };
+        self.check_alias_tasks(guest, checks).await?;
+        let task = outcome?;
+        Ok(CommAlias::Resolved(std::path::PathBuf::from(
+            match task.thread {
+                Some(thread) => format!("/proc/{}/task/{thread}/comm", task.process),
+                None => format!("/proc/{}/comm", task.process),
+            },
+        )))
+    }
+
+    /// ENOENT unless every task in `checks` exists in Detcore's process
+    /// table (`tool_global::procfs_task`, the lookup Linux makes of
+    /// `/proc/<n>` and `task/<tid>`), checked in order.
+    async fn check_alias_tasks<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        checks: Vec<crate::procfs::BoundTask>,
+    ) -> Result<(), Error> {
+        for task in checks {
+            if !crate::tool_global::procfs_task(guest, task).await.exists {
+                return Err(Errno::ENOENT.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse an open with `flags` that asks to write of `path`, an absolute
+    /// `/proc` spelling with a `..` and a last component `comm`, whose walk
+    /// Detcore cannot finish ([`CommAlias::Undetermined`]): it may name a
+    /// `comm` Detcore renders, whose write open is refused
+    /// ([`asks_to_write_comm`]), and forwarding it would hand the kernel
+    /// beneath a writable open of it (package K slice A+;
+    /// <https://github.com/rrnewton/hermit/issues/4263>). The tasks the walk
+    /// passed are checked first (ENOENT, as Linux's lookup); then the
+    /// failure policy's named refusal. Nothing else is refused.
+    pub(super) async fn refuse_undetermined_comm_write<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &Path,
+        flags: OFlag,
+    ) -> Result<(), Error> {
+        if !open_asks_to_write(flags)
+            || !self.renders_procfs(guest)
+            || self.comm_source() != crate::procfs::task_stat::CommSource::Record
+        {
+            return Ok(());
+        }
+        let Some(own) = self.procfs_caller_ids(guest) else {
+            return Ok(());
+        };
+        // The walk alone (no request): a spelling it resolves, or fails, is
+        // checked once, by `Self::rendered_procfs_at`.
+        if let CommAliasWalk::Undetermined(checks) = walk_comm_alias(path, own) {
+            self.check_alias_tasks(guest, checks).await?;
+            let reason = format!(
+                "a writable open of {} passes a /proc component Detcore does not model before \
+                 its `..` and may name a task's comm, which Detcore renders and does not write \
+                 (https://github.com/rrnewton/hermit/issues/4263)",
+                path.display()
+            );
+            return Err(
+                Self::scratch_failure(guest, reverie::syscalls::Sysno::openat, reason).await,
+            );
+        }
+        Ok(())
+    }
+
+    /// The parent Detcore's model records for another process's rendered
+    /// `stat` (`parent`), numbered as that process's own `getppid` answers
+    /// it, which Detcore passes to the kernel: where the kernel numbers
+    /// processes otherwise than Detcore (DBT,
+    /// `Self::translates_procfs_numbers`), the kernel's number for that
+    /// guest process (`tool_global::procfs_ids`); a number of no guest
+    /// process (the namespace's init, 1, whose number both numberings share,
+    /// and 0 for a parent outside the PID namespace, the only outside
+    /// parents a guest has) as it is. So a descriptor that reached another
+    /// process shows the parent the described process's own `stat` shows,
+    /// the reader's `getppid` answer, on every backend.
+    async fn getppid_numbered_parent<G: Guest<Self>>(guest: &mut G, parent: i32) -> i32 {
+        if parent <= 1 || !Self::registered_kernel_ids(guest) {
+            return parent;
+        }
+        crate::tool_global::procfs_ids(guest, true, vec![parent])
+            .await
+            .into_iter()
+            .next()
+            .flatten()
+            .unwrap_or(parent)
+    }
+
+    /// Whether this guest thread's backend registered its kernel ids (DBT,
+    /// and an in-guest native exec, whose numberings agree), so that a
+    /// number Detcore gives a task may not be the kernel's: whatever the
+    /// guest's root or PID namespace, which `Self::translates_procfs_numbers`
+    /// also weighs because it translates the guest's own paths. A rendered
+    /// `stat` reaches the container's procfs by the tool's own spelling, so
+    /// it translates by this alone. `tool_global::procfs_ids` returns each
+    /// number unchanged where the numberings agree.
+    fn registered_kernel_ids<G: Guest<Self>>(guest: &G) -> bool {
+        guest.thread_state().physical_tid.is_some()
+    }
+
+    /// The kernel beneath's name (`comm`) of the task a rendered `stat`
+    /// describes (the thread below `task/`, else the task the top-level
+    /// number names), read by the tool itself from that task's own procfs
+    /// directory, `/proc/<pid>/task/<tid>/comm` (`/proc/<pid>/comm` for a
+    /// top-level number), by the kernel's numbers for them
+    /// (`tool_global::procfs_ids` wherever the backend registered kernel ids,
+    /// [`Self::registered_kernel_ids`], whatever the guest's root or PID
+    /// namespace), with raw syscalls; never through the reader's own
+    /// `/proc/self`, so a descriptor that reached another process (across
+    /// fork or `SCM_RIGHTS`) reads the described task's name. Only where
+    /// [`Self::comm_source`] is the kernel. It runs in the reader's turn, and
+    /// the name is the guest's own history's: every way Linux renames a task
+    /// (an exec, by Linux's own rule for the host's kernel version, a clone,
+    /// `PR_SET_NAME`, a write to a `comm` file by any spelling) is a guest
+    /// system call, sequentialized.
+    ///
+    /// Where the tool shares the guest's root (DBT, SaBRe, LiteInst) and the
+    /// guest has changed it, nothing is read: the path would be looked up
+    /// through the guest's own root, where the guest decides what
+    /// /proc/<pid>/comm is (an ordinary file, a link into a bind-mounted
+    /// procfs naming another task, a bind-mounted subdirectory), and no
+    /// check on the opened file can tell that it is the described task's.
+    /// That read is the failure policy's named refusal (declared). A tracer
+    /// (ptrace) reads its own `/proc`, which no guest `chroot` changes.
+    /// Otherwise the file must be on a procfs ([`comm_file_is_on_procfs`]),
+    /// which refuses an ordinary file mounted over the path.
+    /// `Err` names why there is no name.
+    async fn kernel_task_comm<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        task: crate::procfs::BoundTask,
+    ) -> Result<crate::procfs::task_stat::TaskComm, &'static str> {
+        let changed_root = guest
+            .thread_state()
+            .changed_root
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if !comm_read_is_trusted(
+            guest.config().backend.tool_shares_guest_descriptor_table,
+            changed_root,
+        ) {
+            return Err(
+                "the guest changed its root, and the tool, which shares it, would look the \
+                 task's comm up through it",
+            );
+        }
+        let unreadable = "the tool could not read the kernel's comm of the task";
+        let mut ids = vec![task.process];
+        ids.extend(task.thread);
+        let kernel = if Self::registered_kernel_ids(guest) {
+            crate::tool_global::procfs_ids(guest, true, ids)
+                .await
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or(unreadable)?
+        } else {
+            ids
+        };
+        let path = match kernel[..] {
+            [process] => format!("/proc/{process}/comm"),
+            [process, thread] => format!("/proc/{process}/task/{thread}/comm"),
+            _ => return Err(unreadable),
+        };
+        let file =
+            crate::util::RawFd::open(Path::new(&path), libc::O_RDONLY).map_err(|_| unreadable)?;
+        if !comm_file_is_on_procfs(&file) {
+            return Err("the task's comm path is not on a procfs");
+        }
+        let mut bytes = [0_u8; 2 * crate::procfs::task_stat::TASK_COMM_LEN];
+        let read = file.read_at(&mut bytes, 0).map_err(|_| unreadable)?;
+        Ok(crate::procfs::task_stat::TaskComm::from_comm_file(
+            &bytes[..read],
+        ))
+    }
+
+    /// The facts a snapshot of the rendered `stat` open as `fd` renders
+    /// (`procfs::task_stat::TaskStat`), taken at its first read and again
+    /// where Linux's `seq_file` would run `do_task_stat` again
+    /// (`ProcfsFile::drop_stale_task_snapshot`). The same for a rendered
+    /// `comm` (package K slice A+), which shows only the name, chosen by the
+    /// same rule, where `comm_show` would run again. `None` for any other
+    /// file.
+    ///
+    /// - The task must still be the one the file was bound to (ESRCH
+    ///   otherwise), as `do_task_stat`'s `get_proc_task` requires.
+    /// - The name, from [`Self::comm_source`]
+    ///   (`procfs::task_stat::stat_comm`): the kernel's own
+    ///   ([`Self::kernel_task_comm`]) where the backend's guest threads are
+    ///   host tasks, and a failed read there is the failure policy's named
+    ///   refusal, never Detcore's record, which a host resource would then
+    ///   choose and which a write to a `comm` file leaves stale; Detcore's
+    ///   record elsewhere (KVM), and with none, the same refusal.
+    /// - The parent: the reader's own `getppid` answer (`ppid`) for its own
+    ///   process; for another process's file (a descriptor that reached the
+    ///   reader across `fork` or `SCM_RIGHTS`), the guest-visible parent
+    ///   Detcore's model records (`procfs::task_stat::TaskStatFacts::parent`),
+    ///   numbered as that process's `getppid` answers it
+    ///   ([`Self::getppid_numbered_parent`]).
+    /// - `rsslim`: the described process's virtual `RLIMIT_RSS`, whoever
+    ///   reads it (`procfs::task_stat::TaskStatFacts::rsslim`).
+    /// - The CPU times, for the reader's own process's file
+    ///   ([`Self::stat_cpu_times`]).
+    pub(super) async fn rendered_task_stat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        ppid: i32,
+    ) -> Result<Option<crate::procfs::task_stat::TaskStat>, Error> {
+        let Some(path) = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_rendered_path())?
+        else {
+            return Ok(None);
+        };
+        let Some(file) = ProcfsFile::from_rendered_path(path)
+            .filter(|file| file.is_task_stat() || file.is_task_comm())
+        else {
+            return Ok(None);
+        };
+        let task = file.bound_task().ok_or(Errno::ESRCH)?;
+        match self.rendered_task_state(guest, path).await {
+            Some((_, true)) => {}
+            _ => return Err(Errno::ESRCH.into()),
+        }
+        let facts = crate::tool_global::task_stat_facts(guest, task).await;
+        let source = self.comm_source();
+        let kernel = if source == crate::procfs::task_stat::CommSource::Kernel {
+            self.kernel_task_comm(guest, task).await
+        } else {
+            Err("the backend's tasks have no kernel comm the tool can read")
+        };
+        let comm = match crate::procfs::task_stat::stat_comm(source, kernel, facts.comm) {
+            Ok(comm) => comm,
+            Err(why) => {
+                let file_name = if file.is_task_comm() { "comm" } else { "stat" };
+                let reason = format!(
+                    "the /proc/<pid>/{file_name} of task {task:?} has no name to render: {why}"
+                );
+                return Err(Self::scratch_failure(guest, Sysno::read, reason).await);
+            }
+        };
+        let described = task.thread.unwrap_or(task.process);
+        let own = facts.process == Some(self.own_detpid(guest).as_raw());
+        // A `comm` shows the name alone.
+        let ppid = if own || file.is_task_comm() {
+            ppid
+        } else {
+            Self::getppid_numbered_parent(guest, facts.parent.unwrap_or(0)).await
+        };
+        let cpu = if own && file.is_task_stat() {
+            Self::stat_cpu_times(guest, task)
+        } else {
+            crate::procfs::task_stat::TaskCpuTimes::default()
+        };
+        Ok(Some(crate::procfs::task_stat::TaskStat {
+            pid: described,
+            comm,
+            facts,
+            reader_is_task: described == guest.thread_state().dettid.as_raw(),
+            ppid,
+            rsslim: facts.rsslim,
+            processor: facts.cpus.current(guest.config().virtual_cpu_count()),
+            cpu,
+        }))
+    }
+
+    /// The CPU times the `stat` of `task`, a task of the reader's own
+    /// process, shows now (`procfs::task_stat::TaskCpuTimes`): the process's
+    /// for its top-level file, which counts every thread, exited ones
+    /// included (`thread_group_cputime_adjusted`), and one thread's for a
+    /// file below `task/` (`task_cputime_adjusted`): the reader's own, or a
+    /// sibling's as of its last accounting, where it last stopped running
+    /// (`ThreadState::task_cpu_time`). The children's are the process's in
+    /// both. The same accounting `times(2)`, `getrusage(2)` and the CPU-time
+    /// clocks read, so every view agrees.
+    fn stat_cpu_times<G: Guest<Self>>(
+        guest: &mut G,
+        task: crate::procfs::BoundTask,
+    ) -> crate::procfs::task_stat::TaskCpuTimes {
+        let process = guest.thread_state_mut().process_cpu_time();
+        let (user, system) = match task.thread {
+            None => (process.user, process.system),
+            Some(thread) => guest
+                .thread_state()
+                .task_cpu_time(crate::types::DetTid::from_raw(thread)),
+        };
+        crate::procfs::task_stat::TaskCpuTimes {
+            user,
+            system,
+            children_user: process.children_user,
+            children_system: process.children_system,
+        }
     }
 
     /// One plain read of the rendered `/proc/<pid>/cmdline` open as `fd`, of
@@ -2713,6 +3387,25 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Detcore keeps at each one's cursor after every read and seek
     /// (`sync_rendered_procfs_position`). Where one tool process serves every
     /// guest, the cursor itself is shared.
+    ///
+    /// DECLARED for a rendered `stat` (package K slice D4c-1), whose
+    /// description is never promoted to Detcore's global state: where the
+    /// tool runs in each guest process (DBT, SaBRe, LiteInst), each process
+    /// that holds it after `fork` keeps its own copy of its snapshot and
+    /// sequence (`ProcfsFile::read_pos`), and only this kernel cursor is
+    /// shared. A read by a process whose copy holds no snapshot, or whose
+    /// sequence is not at the shared cursor (another process read or seeked
+    /// since), renders the record anew at the shared cursor, in the reader's
+    /// turn, where Linux continues the one buffered record (and is at its end
+    /// once another process consumed it). A stat descriptor sent with
+    /// `SCM_RIGHTS` to another process that holds no alias of the same open
+    /// file Detcore models is rebuilt there from its placeholder (the registry
+    /// of placeholders is each tool process's own) and renders anew at its
+    /// next read, even while the sender still holds it; a receiver that
+    /// already holds an alias (inherited at `fork`, say) joins that local
+    /// description (`FileMetadata::adopt_placeholder`) and shares its copy's
+    /// state. Every outcome follows from the guest's own sequentialized
+    /// history.
     pub(super) async fn adopt_rendered_procfs_position<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2786,6 +3479,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         target: StatTarget<'_>,
     ) -> Result<Option<DetStat>, Error> {
+        // A placeholder directory Detcore serves (`descriptor_directory`).
+        if let Some(stat) = self.placeholder_stat(guest, target).await? {
+            return Ok(Some(stat));
+        }
         let path = match target {
             StatTarget::Descriptor(fd) => {
                 match guest
@@ -2986,19 +3683,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         if c.flags().contains(MapFlags::MAP_ANONYMOUS) {
             return None;
         }
+        // A rendered file, or a placeholder directory Detcore serves
+        // (`descriptor_directory`), which has no `mmap` method either.
         let (path, status_flags) = guest
             .thread_state()
             .with_detfd(c.fd(), |detfd| {
                 (detfd.status_flags() & libc::O_PATH == 0)
-                    .then(|| detfd.procfs_rendered_path())
+                    .then(|| {
+                        detfd
+                            .procfs_rendered_path()
+                            .map(Some)
+                            .or_else(|| detfd.placeholder().map(|_| None))
+                    })
                     .flatten()
                     .map(|path| (path, detfd.status_flags()))
             })
             .ok()
             .flatten()?;
         // A per-process file has no `mmap` method, as a sysctl file has none.
-        let seq_file = crate::procfs::rendered_path_is_seq_file(path)
-            && !crate::procfs::rendered_path_is_per_process(path);
+        let seq_file = path.is_some_and(|path| {
+            crate::procfs::rendered_path_is_seq_file(path)
+                && !crate::procfs::rendered_path_is_per_process(path)
+        });
         let access_mode = status_flags & libc::O_ACCMODE;
         // Exactly: access mode 3 can neither read nor write.
         let mode = (
@@ -3114,12 +3820,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         sysno: Sysno,
         args: &reverie::syscalls::SyscallArgs,
     ) -> Option<Result<i64, Errno>> {
-        let fd = match sysno {
-            Sysno::write | Sysno::writev | Sysno::ftruncate | Sysno::fallocate => args.arg0,
-            Sysno::pwritev2 if args.arg3 as i64 == -1 => args.arg0,
-            Sysno::sendfile => args.arg0,
-            Sysno::splice => args.arg2,
-            _ => return None,
+        let fd = match written_descriptor_position(sysno)? {
+            // Only `pwritev2` at the file position writes as `writev` does.
+            _ if sysno == Sysno::pwritev2 && args.arg3 as i64 != -1 => return None,
+            0 => args.arg0,
+            _ => args.arg2,
         } as RawFd;
         let status = guest
             .thread_state()
@@ -3373,10 +4078,13 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Adopt, before `call` runs, each descriptor it names that Detcore has
     /// no record of and that is a placeholder this tool process made: a
-    /// rendered procfs descriptor that reached this table by a route Detcore
-    /// does not model, `SCM_RIGHTS` (where the tool does not discover
-    /// descriptors as they are used: ptrace and KVM; an in-guest backend
-    /// discovers it first, `discover_fd_from_current_process`). Then every
+    /// rendered procfs descriptor that reached this table over `SCM_RIGHTS`
+    /// and was not recorded as it arrived. Where the tool does not discover
+    /// descriptors as they are used (ptrace and KVM), Detcore records each
+    /// received descriptor as the receive returns, adopting a placeholder
+    /// there (`Detcore::record_received_descriptors`), except without
+    /// sequentialized threads, which leaves it to this adoption; an in-guest
+    /// backend discovers it first (`discover_fd_from_current_process`). Then every
     /// call through it (reads, the cursor, a mapping, the write family, the
     /// task's reap) is answered as for a descriptor Detcore opened, and none
     /// reaches the memfd.
@@ -3406,10 +4114,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: &Syscall,
     ) -> Result<(), Error> {
-        if !placeholders_exist() || !self.renders_procfs(guest) {
+        let (sysno, args) = call.into_parts();
+        // The number first: it takes no lock, and most calls name no
+        // descriptor (`descriptor_arguments` would name none).
+        if !names_a_descriptor(sysno) || !placeholders_exist() || !self.renders_procfs(guest) {
             return Ok(());
         }
-        let (sysno, args) = call.into_parts();
         for fd in descriptor_arguments(&guest.memory(), sysno, &args) {
             if fd < 0 || guest.thread_state().with_detfd(fd, |_| ()).is_ok() {
                 continue;
@@ -3474,9 +4184,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Make descriptor `fd`, which Detcore has no record of, the placeholder
-    /// `identity` for the rendered file `path` it is
+    /// `identity` for the rendered file `path` it is, as it is received
+    /// (`Detcore::record_received_descriptors`) or first named
     /// ([`Self::adopt_received_placeholders`]).
-    async fn adopt_received_placeholder<G: Guest<Self>>(
+    pub(crate) async fn adopt_received_placeholder<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
@@ -3528,6 +4239,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         // its placeholder (as `/proc/uptime` carries its first read's uptime,
         // `first_read_uptime`) before it is rendered, or its rebuilt
         // descriptor reads other bytes than the sender's buffer held.
+        // DECLARED for a process's `stat` (package K slice D4c-1), which
+        // carries none: its record is rendered again wherever Linux's
+        // seq_file traverses, so no one snapshot can be carried, and neither
+        // the placeholder's name, fixed when it is made, nor its modification
+        // time, 64 bits, can hold one. A rebuilt `stat` renders its record
+        // again at its next read, at the shared cursor, where Linux continues
+        // the buffered one: where one tool process serves every guest
+        // (ptrace, KVM), a descriptor whose every modeled alias closed before
+        // a receiver's first call naming it
+        // (tests/misc/proc_stat_lifecycle.rs
+        // `a_queued_stat_descriptor_whose_sender_closed_it_renders_again_under_detcore`);
+        // where the tool runs in each guest process, a descriptor another
+        // process receives when it holds no alias of the open file Detcore
+        // models, and the image after `exec`
+        // (`Detcore::adopt_rendered_procfs_position`).
         let snapshot = registered.map(|(_, snapshot)| snapshot).unwrap_or_default();
         let metadata = self.rendered_metadata(guest, path).await?;
         let mut flags = OFlag::from_bits_truncate(status);
@@ -3736,6 +4462,83 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Linux's answer to an extended-attribute call (`fgetxattr`,
+    /// `flistxattr`, `fsetxattr`, `fremovexattr`) through a placeholder
+    /// directory Detcore serves (`descriptor_directory`): procfs's, which has
+    /// no attribute handlers, as for the files it renders. `owned` is the
+    /// process whose descriptor directory it is, which the caller owns and,
+    /// as one of its threads, may write; `None` for `/proc`, which global
+    /// root owns.
+    pub(super) async fn placeholder_xattr_answer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+        owned: Option<i32>,
+    ) -> Result<i64, Error> {
+        let (_, args) = call.into_parts();
+        let answer = match call {
+            Syscall::Fgetxattr(c) => match c.name().map(|name| name.read(&guest.memory())) {
+                Some(Ok(name)) => xattr_get_answer(name.as_bytes(), true),
+                Some(Err(errno)) => Err(errno),
+                None => Err(Errno::EFAULT),
+            },
+            Syscall::Flistxattr(_) => Ok(0),
+            Syscall::Fsetxattr(c)
+                if c.flags() & !(libc::XATTR_CREATE | libc::XATTR_REPLACE) != 0 =>
+            {
+                Err(Errno::EINVAL)
+            }
+            Syscall::Fsetxattr(c) => match c.name().map(|name| name.read(&guest.memory())) {
+                Some(Ok(name)) => {
+                    let access =
+                        Self::placeholder_xattr_access(guest, name.as_bytes(), owned).await?;
+                    xattr_change_answer(
+                        name.as_bytes(),
+                        Some(c.size()),
+                        read_value(&guest.memory(), args.arg2 as u64, c.size()).as_deref(),
+                        access,
+                    )
+                }
+                Some(Err(errno)) => Err(errno),
+                None => Err(Errno::EFAULT),
+            },
+            Syscall::Fremovexattr(c) => match c.name().map(|name| name.read(&guest.memory())) {
+                Some(Ok(name)) => {
+                    let access =
+                        Self::placeholder_xattr_access(guest, name.as_bytes(), owned).await?;
+                    xattr_change_answer(name.as_bytes(), None, None, access)
+                }
+                Some(Err(errno)) => Err(errno),
+                None => Err(Errno::EFAULT),
+            },
+            _ => Err(Errno::ENOSYS),
+        };
+        Ok(answer?)
+    }
+
+    /// What decides Linux's answer to a change of the extended attribute
+    /// `name` through a placeholder directory (see
+    /// [`Self::placeholder_xattr_answer`]): global root's `/proc`, or the
+    /// caller's own descriptor directory, with `CAP_SYS_ADMIN` from its
+    /// effective set, read only for a `security.` attribute.
+    async fn placeholder_xattr_access<G: Guest<Self>>(
+        guest: &mut G,
+        name: &[u8],
+        owned: Option<i32>,
+    ) -> Result<FileAccess, Error> {
+        if owned.is_none() {
+            return Ok(FileAccess::GLOBAL_ROOT);
+        }
+        let capabilities = if name.starts_with(b"security.") {
+            Self::inject_capget(guest, CapabilitySet::Effective)
+                .await?
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(FileAccess::own_descriptor_directory(capabilities))
+    }
+
     /// Answer `call` if it must not reach the placeholder behind a rendered
     /// procfs descriptor: what a procfs file refuses, in the order Linux
     /// checks. A read-only placeholder's description already makes the kernel
@@ -3758,21 +4561,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Some(answer);
         }
-        let fd = match sysno {
-            Sysno::pwrite64
-            | Sysno::pwritev
-            | Sysno::pwritev2
-            | Sysno::fsync
-            | Sysno::fdatasync
-            | Sysno::fchmod
-            | Sysno::fgetxattr
-            | Sysno::flistxattr
-            | Sysno::fsetxattr
-            | Sysno::fremovexattr
-            | Sysno::ioctl
-            | Sysno::fcntl => args.arg0 as i32,
-            _ => return None,
-        };
+        if !operates_on_descriptor(sysno) {
+            return None;
+        }
+        let fd = args.arg0 as i32;
         let (path, status_flags) = guest
             .thread_state()
             .with_detfd(fd, |detfd| {
@@ -4139,6 +4931,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(None);
         }
         let (sysno, args) = call.into_parts();
+        let Some(kind) = path_call_kind(sysno) else {
+            return Ok(None);
+        };
         let [a0, a1, a2, a3, a4] =
             [args.arg0, args.arg1, args.arg2, args.arg3, args.arg4].map(|arg| arg as u64);
         let at = libc::AT_FDCWD as u64;
@@ -4147,10 +4942,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // before the descriptor is looked up (both times omitted), or refused
         // first (unknown flags).
         let mut decided_before_descriptor = false;
-        let (dirfd, path, flags, request, name) = match sysno {
+        let (dirfd, path, flags, request, name) = match kind {
             // Linux declares mode and flags `int`: it ignores the upper bits
             // of the raw registers.
-            Sysno::access => (
+            PathCall::Access => (
                 at,
                 a0,
                 0,
@@ -4160,7 +4955,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 0,
             ),
-            Sysno::faccessat => (
+            PathCall::Faccessat => (
                 a0,
                 a1,
                 0,
@@ -4170,7 +4965,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 0,
             ),
-            Sysno::faccessat2 => (
+            PathCall::Faccessat2 => (
                 a0,
                 a1,
                 u64::from(a3 as u32),
@@ -4180,11 +4975,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 0,
             ),
-            Sysno::getxattr => (at, a0, 0, PathRequest::GetXattr, a1),
-            Sysno::lgetxattr => (at, a0, nofollow(), PathRequest::GetXattr, a1),
-            Sysno::listxattr => (at, a0, 0, PathRequest::ListXattr, 0),
-            Sysno::llistxattr => (at, a0, nofollow(), PathRequest::ListXattr, 0),
-            Sysno::setxattr | Sysno::lsetxattr => (
+            PathCall::Getxattr => (at, a0, 0, PathRequest::GetXattr, a1),
+            PathCall::Lgetxattr => (at, a0, nofollow(), PathRequest::GetXattr, a1),
+            PathCall::Listxattr => (at, a0, 0, PathRequest::ListXattr, 0),
+            PathCall::Llistxattr => (at, a0, nofollow(), PathRequest::ListXattr, 0),
+            PathCall::Setxattr => (
                 at,
                 a0,
                 if sysno == Sysno::lsetxattr {
@@ -4200,7 +4995,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 a1,
             ),
-            Sysno::removexattr | Sysno::lremovexattr => (
+            PathCall::Removexattr => (
                 at,
                 a0,
                 if sysno == Sysno::lremovexattr {
@@ -4215,13 +5010,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 a1,
             ),
-            Sysno::chmod => (at, a0, 0, PathRequest::Chmod { flags: 0 }, 0),
-            Sysno::fchmodat => (a0, a1, 0, PathRequest::Chmod { flags: 0 }, 0),
-            Sysno::fchmodat2 => (a0, a1, a3, PathRequest::Chmod { flags: a3 }, 0),
+            PathCall::Chmod => (at, a0, 0, PathRequest::Chmod { flags: 0 }, 0),
+            PathCall::Fchmodat => (a0, a1, 0, PathRequest::Chmod { flags: 0 }, 0),
+            PathCall::Fchmodat2 => (a0, a1, a3, PathRequest::Chmod { flags: a3 }, 0),
             // Ownership changes keep Detcore's policy for every file
             // (`handle_ownership_change_noop`).
-            Sysno::truncate => (at, a0, 0, PathRequest::Truncate { length: a1 as i64 }, 0),
-            Sysno::utimensat => {
+            PathCall::Truncate => (at, a0, 0, PathRequest::Truncate { length: a1 as i64 }, 0),
+            PathCall::Utimensat => {
                 // Unreadable times are the kernel's EFAULT to report.
                 let Ok(times) = read_pair::<libc::timespec, _>(&guest.memory(), a2) else {
                     return Ok(None);
@@ -4270,14 +5065,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     0,
                 )
             }
-            Sysno::utime => (
+            PathCall::Utime => (
                 at,
                 a0,
                 0,
                 legacy_times_request(&guest.memory(), a1, false),
                 0,
             ),
-            Sysno::utimes => (
+            PathCall::Utimes => (
                 at,
                 a0,
                 0,
@@ -4285,8 +5080,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 0,
             ),
             // `futimesat` is ENOSYS under Detcore for every file.
-            Sysno::chdir => (at, a0, 0, PathRequest::Chdir, 0),
-            _ => return Ok(None),
+            PathCall::Chdir => (at, a0, 0, PathRequest::Chdir, 0),
         };
         // Linux refuses invalid access arguments before it looks up the path
         // or the descriptor, for every file; leave that order to the backend.
@@ -4326,11 +5120,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // checks them first where it may answer: a spelling that could name
         // a rendered file. Any other path goes to the kernel untouched.
         let session_files = self.rendered_files(guest);
+        let renders_comm = self.comm_source() == crate::procfs::task_stat::CommSource::Record;
         let xattr_arguments = if self.renders_procfs(guest)
             && (by_descriptor
                 || path_text
                     .as_deref()
-                    .is_some_and(|text| could_name_rendered(text, session_files)))
+                    .is_some_and(|text| could_name_rendered(text, session_files, renders_comm)))
         {
             checked_xattr_arguments(&guest.memory(), request, name)?
         } else {
@@ -4390,7 +5185,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // The spellings Detcore resolves itself, which end in a rendered
             // file's name or a descriptor number.
             let files = self.rendered_files(guest);
-            let lexical = if could_name_rendered(&text, files) {
+            let lexical = if could_name_rendered(&text, files, renders_comm) {
                 let observed = self.procfs_spelling_at(guest, dirfd, &text).await?;
                 match self.rendered_procfs_at(guest, &observed).await? {
                     // A call that does not follow a descriptor link acts on
@@ -4522,7 +5317,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 /// transfers an open file, and the directory descriptor of a path call whose
 /// path is empty or NULL, which names that descriptor itself. Not `close`,
 /// which needs no model of what it closes.
-fn descriptor_arguments<M: MemoryAccess>(
+pub(super) fn descriptor_arguments<M: MemoryAccess>(
     memory: &M,
     sysno: Sysno,
     args: &reverie::syscalls::SyscallArgs,
@@ -4535,8 +5330,37 @@ fn descriptor_arguments<M: MemoryAccess>(
                 .is_ok_and(|path: std::path::PathBuf| path.as_os_str().is_empty()),
         }
     };
-    let fd = |raw: usize| raw as i32 as RawFd;
-    match sysno {
+    let values = [
+        args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
+    ];
+    let fd = |position: usize| values[position] as i32 as RawFd;
+    match descriptor_positions(sysno) {
+        Some(DescriptorPositions::Always(positions)) => {
+            positions.iter().map(|&position| fd(position)).collect()
+        }
+        Some(DescriptorPositions::WhenPathNamesItself { dirfd, path })
+            if names_itself(values[path]) =>
+        {
+            vec![fd(dirfd)]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Where a call's descriptor arguments ([`descriptor_arguments`]) are.
+#[derive(Clone, Copy, Debug)]
+enum DescriptorPositions {
+    /// The descriptors at these argument positions, always.
+    Always(&'static [usize]),
+    /// The directory descriptor at `dirfd`, when the path at `path` is empty
+    /// or NULL and so names that descriptor itself.
+    WhenPathNamesItself { dirfd: usize, path: usize },
+}
+
+/// The argument positions of the descriptors a call numbered `sysno` may
+/// name ([`descriptor_arguments`]); `None` for a call that names none.
+fn descriptor_positions(sysno: Sysno) -> Option<DescriptorPositions> {
+    Some(match sysno {
         Sysno::read
         | Sysno::readv
         | Sysno::pread64
@@ -4556,6 +5380,7 @@ fn descriptor_arguments<M: MemoryAccess>(
         | Sysno::fallocate
         | Sysno::fsync
         | Sysno::fdatasync
+        | Sysno::syncfs
         | Sysno::fadvise64
         | Sysno::readahead
         | Sysno::sync_file_range
@@ -4571,24 +5396,143 @@ fn descriptor_arguments<M: MemoryAccess>(
         | Sysno::dup3
         | Sysno::getdents
         | Sysno::getdents64
-        | Sysno::fchdir => vec![fd(args.arg0)],
-        Sysno::mmap => vec![fd(args.arg4)],
-        Sysno::sendfile | Sysno::tee => vec![fd(args.arg0), fd(args.arg1)],
-        Sysno::splice | Sysno::copy_file_range => vec![fd(args.arg0), fd(args.arg2)],
-        Sysno::epoll_ctl => vec![fd(args.arg2)],
+        | Sysno::fchdir => DescriptorPositions::Always(&[0]),
+        Sysno::mmap => DescriptorPositions::Always(&[4]),
+        Sysno::sendfile | Sysno::tee => DescriptorPositions::Always(&[0, 1]),
+        Sysno::splice | Sysno::copy_file_range => DescriptorPositions::Always(&[0, 2]),
+        Sysno::epoll_ctl => DescriptorPositions::Always(&[2]),
         Sysno::newfstatat
         | Sysno::statx
         | Sysno::utimensat
         | Sysno::faccessat2
         | Sysno::fchownat
         | Sysno::fchmodat
-        | Sysno::readlinkat
-            if names_itself(args.arg1) =>
-        {
-            vec![fd(args.arg0)]
-        }
-        _ => Vec::new(),
+        | Sysno::readlinkat => DescriptorPositions::WhenPathNamesItself { dirfd: 0, path: 1 },
+        _ => return None,
+    })
+}
+
+/// Whether a call numbered `sysno` may name a descriptor
+/// ([`descriptor_arguments`], whatever its arguments): the calls
+/// [`Detcore::adopt_received_placeholders`] can act on. Part of
+/// `may_name_file_or_descriptor`.
+pub(crate) fn names_a_descriptor(sysno: Sysno) -> bool {
+    descriptor_positions(sysno).is_some()
+}
+
+/// The argument position of the descriptor a call numbered `sysno` writes
+/// through, as [`Detcore::answer_rendered_procfs_write`] answers it: `write`,
+/// `writev`, `ftruncate`, `fallocate`, `pwritev2` (only at the file
+/// position, which its offset decides) and `sendfile` write their argument
+/// 0, and `splice` its argument 2. `None` for any other call.
+fn written_descriptor_position(sysno: Sysno) -> Option<usize> {
+    match sysno {
+        Sysno::write
+        | Sysno::writev
+        | Sysno::ftruncate
+        | Sysno::fallocate
+        | Sysno::pwritev2
+        | Sysno::sendfile => Some(0),
+        Sysno::splice => Some(2),
+        _ => None,
     }
+}
+
+/// Whether a call numbered `sysno` is one whose argument-0 descriptor
+/// [`Detcore::answer_rendered_procfs_operation`] answers for a rendered
+/// procfs file, after the writes ([`written_descriptor_position`]).
+fn operates_on_descriptor(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::pwrite64
+            | Sysno::pwritev
+            | Sysno::pwritev2
+            | Sysno::fsync
+            | Sysno::fdatasync
+            | Sysno::fchmod
+            | Sysno::fgetxattr
+            | Sysno::flistxattr
+            | Sysno::fsetxattr
+            | Sysno::fremovexattr
+            | Sysno::ioctl
+            | Sysno::fcntl
+    )
+}
+
+/// Whether [`Detcore::answer_rendered_procfs_operation`] can answer a call
+/// numbered `sysno`: a write through a descriptor
+/// ([`written_descriptor_position`], `splice` included, which a `cmdline`
+/// source also answers) or an operation on one ([`operates_on_descriptor`]).
+/// Part of `may_name_file_or_descriptor`.
+pub(crate) fn may_answer_operation(sysno: Sysno) -> bool {
+    written_descriptor_position(sysno).is_some() || operates_on_descriptor(sysno)
+}
+
+/// Whether [`Detcore::answer_rendered_procfs_mapping`] can answer a call
+/// numbered `sysno`: only `mmap` (`Syscall::Mmap`). Part of
+/// `may_name_file_or_descriptor`.
+pub(crate) fn may_answer_mapping(sysno: Sysno) -> bool {
+    sysno == Sysno::mmap
+}
+
+/// The calls [`Detcore::answer_rendered_procfs_path_call`] answers, one per
+/// arm of its table, which matches on this exhaustively: a call can reach
+/// the table only through [`path_call_kind`], and a new arm needs a variant
+/// here.
+#[derive(Clone, Copy, Debug)]
+enum PathCall {
+    Access,
+    Faccessat,
+    Faccessat2,
+    Getxattr,
+    Lgetxattr,
+    Listxattr,
+    Llistxattr,
+    /// `setxattr` and `lsetxattr`.
+    Setxattr,
+    /// `removexattr` and `lremovexattr`.
+    Removexattr,
+    Chmod,
+    Fchmodat,
+    Fchmodat2,
+    Truncate,
+    Utimensat,
+    Utime,
+    Utimes,
+    Chdir,
+}
+
+/// The arm of [`Detcore::answer_rendered_procfs_path_call`]'s table for a
+/// call numbered `sysno`, or `None` for a call the table has no arm for.
+fn path_call_kind(sysno: Sysno) -> Option<PathCall> {
+    Some(match sysno {
+        Sysno::access => PathCall::Access,
+        Sysno::faccessat => PathCall::Faccessat,
+        Sysno::faccessat2 => PathCall::Faccessat2,
+        Sysno::getxattr => PathCall::Getxattr,
+        Sysno::lgetxattr => PathCall::Lgetxattr,
+        Sysno::listxattr => PathCall::Listxattr,
+        Sysno::llistxattr => PathCall::Llistxattr,
+        Sysno::setxattr | Sysno::lsetxattr => PathCall::Setxattr,
+        Sysno::removexattr | Sysno::lremovexattr => PathCall::Removexattr,
+        Sysno::chmod => PathCall::Chmod,
+        Sysno::fchmodat => PathCall::Fchmodat,
+        Sysno::fchmodat2 => PathCall::Fchmodat2,
+        Sysno::truncate => PathCall::Truncate,
+        Sysno::utimensat => PathCall::Utimensat,
+        Sysno::utime => PathCall::Utime,
+        Sysno::utimes => PathCall::Utimes,
+        Sysno::chdir => PathCall::Chdir,
+        _ => return None,
+    })
+}
+
+/// Whether [`Detcore::answer_rendered_procfs_path_call`] can answer a call
+/// numbered `sysno`: whether its table has an arm for it
+/// ([`path_call_kind`], the only way into the table). Part of
+/// `may_name_file_or_descriptor`.
+pub(crate) fn may_answer_path_call(sysno: Sysno) -> bool {
+    path_call_kind(sysno).is_some()
 }
 
 /// An extended attribute's name, and the value a change sets.
@@ -4675,8 +5619,11 @@ const fn nofollow() -> u64 {
 
 /// Whether `path` could be a spelling Detcore resolves to a rendered file
 /// itself: its last component is a rendered file's name or a descriptor
-/// number.
-fn could_name_rendered(path: &Path, files: RenderedFiles) -> bool {
+/// number. A task's `comm` is one only where Detcore may render it
+/// (`renders_comm`: its record is the name's source, package K slice A+);
+/// elsewhere the kernel serves every `comm` and its spelling goes to the
+/// kernel untouched, as before.
+fn could_name_rendered(path: &Path, files: RenderedFiles, renders_comm: bool) -> bool {
     let Some(std::path::Component::Normal(last)) = path.components().next_back() else {
         return false;
     };
@@ -4684,6 +5631,7 @@ fn could_name_rendered(path: &Path, files: RenderedFiles) -> bool {
     rendered_paths(files).any(|rendered| rendered_name(rendered) == last)
         || ProcfsFile::PER_PROCESS_NAMES
             .iter()
+            .filter(|name| renders_comm || **name != "comm")
             .any(|name| name.as_bytes() == last)
         || (!last.is_empty() && last.iter().all(u8::is_ascii_digit))
 }
@@ -5184,6 +6132,47 @@ mod tests {
         assert_eq!(joined, snapshot);
     }
 
+    /// Where the tool shares the guest's root and the guest has changed it,
+    /// no task's kernel `comm` is read by path at all: a forged ordinary
+    /// file and a substitution on the very procfs (a link or bind mount to
+    /// another task's genuine `comm`, which no check on the opened file can
+    /// tell apart) both get the named refusal. Shown here: another task's
+    /// genuine comm (the parent's) passes the procfs check, so only the
+    /// root rule refuses it. A tracer, or an unchanged root, reads; an
+    /// ordinary file is refused by the procfs check.
+    #[test]
+    fn a_comm_is_not_read_through_a_changed_root_the_tool_shares() {
+        assert!(!comm_read_is_trusted(true, true));
+        assert!(comm_read_is_trusted(true, false));
+        assert!(comm_read_is_trusted(false, true));
+        assert!(comm_read_is_trusted(false, false));
+        let substituted = crate::util::RawFd::open(
+            Path::new(&format!(
+                "/proc/{}/comm",
+                std::os::unix::process::parent_id()
+            )),
+            libc::O_RDONLY,
+        )
+        .unwrap();
+        assert!(
+            comm_file_is_on_procfs(&substituted),
+            "a same-device substitution passes every file check"
+        );
+        let forged = std::env::temp_dir().join(format!(
+            "detcore-forged-comm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&forged, b"forged\n").unwrap();
+        let file = crate::util::RawFd::open(&forged, libc::O_RDONLY).unwrap();
+        assert!(!comm_file_is_on_procfs(&file));
+        drop(file);
+        std::fs::remove_file(&forged).unwrap();
+    }
+
     #[test]
     fn rendered_stat_is_a_read_only_regular_procfs_file() {
         let epoch = Timespec {
@@ -5229,13 +6218,20 @@ mod tests {
             );
             // (That its placeholder's name, with its snapshot, fits a memfd
             // name is checked in `namespace`'s readlink scratch test.)
-            assert!(could_name_rendered(path, RenderedFiles::ALL), "{path:?}");
+            assert!(
+                could_name_rendered(path, RenderedFiles::ALL, false),
+                "{path:?}"
+            );
         }
         // `/proc/cpuinfo` is rendered only in a session that renders it.
         let without = RenderedFiles::WITHOUT_CPUINFO;
         assert_eq!(rendered_paths(without).count() + 1, paths.len());
         assert!(rendered_paths(without).all(|path| path != c"/proc/cpuinfo"));
-        assert!(!could_name_rendered(Path::new("/proc/cpuinfo"), without));
+        assert!(!could_name_rendered(
+            Path::new("/proc/cpuinfo"),
+            without,
+            false
+        ));
         assert_eq!(rendered_path_within(Path::new("/cpuinfo"), without), None);
         assert_eq!(
             rendered_path_within(Path::new("/cpuinfo"), RenderedFiles::ALL),
@@ -6202,11 +7198,196 @@ mod tests {
         );
         assert!(could_name_rendered(
             Path::new("/proc/self/cgroup"),
-            RenderedFiles::WITHOUT_CPUINFO
+            RenderedFiles::WITHOUT_CPUINFO,
+            false
         ));
         assert!(could_name_rendered(
             Path::new("cgroup"),
-            RenderedFiles::WITHOUT_CPUINFO
+            RenderedFiles::WITHOUT_CPUINFO,
+            false
         ));
+    }
+
+    /// A rendered `comm` (package K slice A+) has Linux's mode, 0644, at its
+    /// task's path, and Detcore never opens one for writing: an open that
+    /// asks to write (a write or read-write access mode, or `O_TRUNC`) is
+    /// one it refuses (`asks_to_write_comm`). A read-only or `O_PATH` open
+    /// is not, and a write open of any other rendered file stays Detcore's
+    /// own access check's. Where the kernel serves every `comm`, a spelling ending in
+    /// `comm` is not one Detcore resolves.
+    #[test]
+    fn a_rendered_comm_is_0644_and_detcore_opens_it_only_for_reading() {
+        let bound = |spelling: &str| {
+            let mut file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            file.bind_task(3, 5);
+            file
+        };
+        let comm = bound("/proc/thread-self/comm");
+        let path = comm.rendered_path(RenderedFiles::ALL).unwrap();
+        assert_eq!(path, Path::new("/proc/3/task/5/comm"));
+        let epoch = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            rendered_stat(path, epoch, (0, 0)).mode,
+            libc::S_IFREG | 0o644
+        );
+        let stat = bound("/proc/thread-self/stat");
+        let stat_path = stat.rendered_path(RenderedFiles::ALL).unwrap();
+        assert_eq!(
+            rendered_stat(stat_path, epoch, (0, 0)).mode,
+            libc::S_IFREG | 0o444
+        );
+        for flags in [
+            OFlag::O_WRONLY,
+            OFlag::O_RDWR,
+            OFlag::O_RDWR | OFlag::O_CLOEXEC,
+            OFlag::O_ACCMODE,
+            OFlag::O_RDONLY | OFlag::O_TRUNC,
+            OFlag::O_WRONLY | OFlag::O_APPEND,
+        ] {
+            assert!(asks_to_write_comm(&comm, flags), "{flags:?}");
+            assert!(!asks_to_write_comm(&stat, flags), "{flags:?}");
+        }
+        for flags in [
+            OFlag::O_RDONLY,
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+            OFlag::O_PATH,
+            OFlag::O_PATH | OFlag::O_CLOEXEC,
+        ] {
+            assert!(!asks_to_write_comm(&comm, flags), "{flags:?}");
+        }
+        for spelling in ["/proc/self/comm", "comm", "/proc/3/task/5/comm"] {
+            assert!(
+                could_name_rendered(Path::new(spelling), RenderedFiles::ALL, true),
+                "{spelling}"
+            );
+            assert!(
+                !could_name_rendered(Path::new(spelling), RenderedFiles::ALL, false),
+                "{spelling}"
+            );
+        }
+        assert!(could_name_rendered(
+            Path::new("/proc/self/stat"),
+            RenderedFiles::ALL,
+            false
+        ));
+    }
+
+    /// Detcore refuses an open of a rendered `comm` for writing itself
+    /// (package K slice A+): EACCES, with no injected call and no request to
+    /// the global tool (the guest records every injection and panics on any
+    /// request), by its path and through a descriptor link, for a write or
+    /// read-write access mode, `O_TRUNC`, and `creat`'s flags. So the answer
+    /// depends on neither the host nor the kernel beneath.
+    #[test]
+    fn a_write_open_of_a_rendered_comm_is_refused_with_nothing_injected() {
+        use crate::record_or_replay::NoopTool;
+        use crate::syscall_hot_path_tests::InjectGuest;
+        use crate::syscall_hot_path_tests::detcore;
+        futures::executor::block_on(async {
+            let tool = detcore::<NoopTool>();
+            for spelling in ["/proc/self/comm", "/proc/thread-self/comm", "/proc/3/comm"] {
+                for via_link in [false, true] {
+                    for flags in [
+                        OFlag::O_WRONLY,
+                        OFlag::O_RDWR,
+                        OFlag::O_RDWR | OFlag::O_CLOEXEC,
+                        OFlag::O_RDONLY | OFlag::O_TRUNC,
+                        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC,
+                        OFlag::O_ACCMODE,
+                    ] {
+                        let mut procfs = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+                        procfs.bind_task(3, 5);
+                        let target = RenderedTarget { procfs, via_link };
+                        let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+                        let answer = tool
+                            .open_rendered_procfs(&mut guest, flags, target)
+                            .await
+                            .map_err(|error| error.into_errno().unwrap());
+                        assert_eq!(
+                            answer,
+                            Err(Errno::EACCES),
+                            "{spelling} {flags:?} via_link={via_link}"
+                        );
+                        assert!(
+                            guest.injected().is_empty(),
+                            "{spelling} {flags:?}: {:?}",
+                            guest.injected()
+                        );
+                    }
+                }
+            }
+        })
+    }
+
+    /// Detcore's walk of a `..` spelling ending in `comm` (package K slice
+    /// A+) follows Linux's path walk through the procfs directories it
+    /// models: `self` and `thread-self` are links it follows, `..` goes to the
+    /// parent, every task a component names is a check in path order, a name
+    /// below `task` that is no number is ENOENT, a component after `comm` is
+    /// ENOTDIR, and anything else it does not model (a link such as `cwd`, a
+    /// directory such as `attr`, a step out of `/proc`) is undetermined.
+    #[test]
+    fn a_comm_alias_walk_follows_linuxs_lookup_through_what_detcore_models() {
+        use crate::procfs::BoundTask;
+        let own = (3, 5);
+        let task = |process, thread| BoundTask { process, thread };
+        let comm = |checks: Vec<BoundTask>, process, thread| CommAliasWalk::Comm {
+            checks,
+            task: task(process, thread),
+        };
+        let fails = |checks: Vec<BoundTask>, errno| CommAliasWalk::Fails { checks, errno };
+        for (path, expected) in [
+            (
+                "/proc/self/task/5/../5/comm",
+                comm(vec![task(3, Some(5)), task(3, Some(5))], 3, Some(5)),
+            ),
+            (
+                "/proc/self/task/9/../5/comm",
+                comm(vec![task(3, Some(9)), task(3, Some(5))], 3, Some(5)),
+            ),
+            (
+                "/proc/thread-self/../5/comm",
+                comm(vec![task(3, Some(5))], 3, Some(5)),
+            ),
+            ("/proc/thread-self/../../comm", comm(vec![], 3, None)),
+            ("/proc/self/../3/comm", comm(vec![task(3, None)], 3, None)),
+            ("/proc/../proc/self/comm", comm(vec![], 3, None)),
+            ("/proc/./self/task/../comm", comm(vec![], 3, None)),
+            (
+                "/proc/7/../7/task/8/comm",
+                comm(
+                    vec![task(7, None), task(7, None), task(7, Some(8))],
+                    7,
+                    Some(8),
+                ),
+            ),
+            ("/proc/self/comm/../comm", fails(vec![], Errno::ENOTDIR)),
+            ("/proc/self/task/x/../5/comm", fails(vec![], Errno::ENOENT)),
+            ("/proc/self/task/05/../5/comm", fails(vec![], Errno::ENOENT)),
+            ("/proc/007/../self/comm", fails(vec![], Errno::ENOENT)),
+            ("/proc/self/task/comm/../comm", fails(vec![], Errno::ENOENT)),
+            (
+                "/proc/self/attr/../comm",
+                CommAliasWalk::Undetermined(vec![]),
+            ),
+            (
+                "/proc/self/cwd/../comm",
+                CommAliasWalk::Undetermined(vec![]),
+            ),
+            (
+                "/proc/7/fd/../comm",
+                CommAliasWalk::Undetermined(vec![task(7, None)]),
+            ),
+            ("/proc/../etc/comm", CommAliasWalk::Undetermined(vec![])),
+            ("/proc/self/comm", CommAliasWalk::NotApplicable),
+            ("/proc/self/task/../stat", CommAliasWalk::NotApplicable),
+            ("/tmp/../proc/self/comm", CommAliasWalk::NotApplicable),
+            ("proc/self/../self/comm", CommAliasWalk::NotApplicable),
+        ] {
+            assert_eq!(walk_comm_alias(Path::new(path), own), expected, "{path}");
+        }
     }
 }

@@ -72,6 +72,7 @@ use reverie::process::Namespace;
 use reverie::process::Output;
 
 use super::container::IdentityGuard;
+use super::container::LogCapExceeded;
 use super::container::PlannedMount;
 use super::container::PolicyRefusal;
 use super::container::apply_affinity;
@@ -126,6 +127,12 @@ type NativeContainerRun = super::native_exec_cli::PhysicalContainer;
 #[cfg(not(feature = "native-exec"))]
 type NativeContainerRun = ();
 
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+struct MappedVerificationRun {
+    image: std::sync::Arc<super::mapped_first_admission::RetainedImage>,
+    policy: super::mapped_first_admission::CapturePolicy,
+}
+
 /// Descriptor-free forwarding selection retained by the common container owner.
 /// Open the one physical stream only inside that container's child.
 pub(super) enum ForwardedDetlogPlan {
@@ -141,6 +148,12 @@ impl ForwardedDetlogPlan {
     #[cfg(all(test, feature = "dbt"))]
     pub(super) fn is_none(&self) -> bool {
         !self.requires_socket()
+    }
+
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    pub(super) fn open_mapped_in_container(&mut self) -> Result<(OwnedFd, OwnedFd), Error> {
+        self.open_in_container()?
+            .ok_or_else(|| Error::msg("mapped verification requires its actual DETLOG plan"))
     }
 
     fn open_in_container(&mut self) -> Result<Option<(OwnedFd, OwnedFd)>, Error> {
@@ -436,6 +449,59 @@ pub(crate) fn refuse_an_inexact_branch_counter(
         backend.as_str(),
         cpu_identity()
     )))
+}
+
+/// What reads the retired-conditional-branch counter on a command that
+/// [`refuse_an_inexact_branch_counter`] refuses with `--strict`, and so what
+/// [`warning_for_an_inexact_branch_counter`] says is not guaranteed without it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CounterReader {
+    /// A `hermit run`.
+    Run,
+    /// The trials of one `hermit analyze` or `hermit bisect`.
+    Trials,
+    /// A `hermit record start` recording.
+    Recording,
+}
+
+/// The one-line stderr warning for a command that goes on without `--strict`
+/// where [`refuse_an_inexact_branch_counter`] refuses it with `--strict`:
+/// Hermit times preemptions, and by default virtual time, with the
+/// retired-conditional-branch counter, so on a counter that failed Reverie's
+/// validation what `reader` would repeat is not guaranteed to repeat, and the
+/// command says so (https://github.com/rrnewton/hermit/issues/4515) and how
+/// to get a reproducible result. `None` when `inexact_branch_counter` finds the
+/// counter exact.
+///
+/// The fixed text comes first and Reverie's reason last: that reason carries
+/// measured counts that differ from one process to the next, so one host's
+/// warnings for one command share everything up to it. Reverie's message can
+/// span lines (`HardwareCountersNotWorking` embeds two newlines); the warning
+/// stays one line.
+pub(crate) fn warning_for_an_inexact_branch_counter(
+    reader: CounterReader,
+    inexact_branch_counter: fn() -> Option<String>,
+) -> Option<String> {
+    let reason = inexact_branch_counter()?;
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let not_guaranteed = match reader {
+        CounterReader::Run => {
+            "the same arguments and --seed, or a preemption record, are not guaranteed to \
+             reproduce this run"
+        }
+        CounterReader::Trials => {
+            "analyze and bisect trials can disagree for a hardware reason, and a seed, \
+             preemption record or schedule they report is not guaranteed to reproduce its outcome"
+        }
+        CounterReader::Recording => "a replay of this recording is not guaranteed to follow it",
+    };
+    Some(format!(
+        "WARNING: this host's retired-branch counter failed Reverie's performance-counter \
+         validation. Hermit times preemptions, and by default virtual time, with that counter, \
+         so {not_guaranteed}. For reproducible results use a host whose counters pass the \
+         validation (`hermit host-capabilities` reports exact-branch-counter: PRESENT, \
+         validation passed); --strict refuses this host. Reverie reports: {reason}\n"
+    ))
 }
 
 /// `hermit host-capabilities`'s own `exact_branch_counter` verdict, for a
@@ -762,6 +828,34 @@ fn verification_log(
     ))
 }
 
+/// The `--print-verify-logs` echo of the first verification run's log.
+///
+/// With --verify the first run's `--log` output was diverted to a temporary
+/// file for later comparison rather than shown to the user. Echo that log to
+/// stderr so the user still sees `--log` output, matching a normal
+/// (non-verify) run. The log file is fully flushed here because run_verify
+/// runs each execution in a child process that has already exited.
+///
+/// Run 2 has not started yet, so under --max-log-bytes this echo must not
+/// wait on stderr: the log goes through `DroppingStderr`, which waits for a
+/// full pipe only within `RetryingStderr`'s bounded deadline and drops what it
+/// then cannot deliver. Without the cap it is written exactly as before, and a
+/// failed write is still an error.
+fn echo_first_run_log(log1_path: &Path) -> Result<(), Error> {
+    match fs::read(log1_path) {
+        Ok(bytes) if hermit::nonwaiting_write::diagnostics_must_not_wait() => {
+            let _ = detcore::util::DroppingStderr.write_all(&bytes);
+        }
+        Ok(bytes) => std::io::stderr().write_all(&bytes)?,
+        Err(err) => crate::tracing::diagnostic_eprintln!(
+            "WARNING: --print-verify-logs could not read first-run log {}: {}",
+            log1_path.display(),
+            err
+        ),
+    }
+    Ok(())
+}
+
 impl Write for SharedLog {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.with(|writer| writer.write(bytes))
@@ -994,6 +1088,15 @@ fn bind_dap_supervisor_socket() -> Result<(std::os::unix::net::UnixListener, Str
 /// was given `--dap-listen` (on its command line or in a `--config` file).
 /// Any other parent, a shell that set the variable to its own ID for one, is
 /// not a supervisor.
+/// Where `RunOpts::main` sends an invocation once its prelude is settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunDispatch {
+    /// `--dap-listen` without a supervisor marker: supervise a child run.
+    DapSupervisor,
+    /// The run itself (also the child a DAP supervisor started).
+    Run,
+}
+
 fn started_by_a_dap_supervisor(owner: &OsStr) -> bool {
     let parent = std::os::unix::process::parent_id();
     let Some((pid, token)) = owner.to_str().and_then(|owner| owner.split_once(':')) else {
@@ -1042,12 +1145,22 @@ fn started_by_a_dap_supervisor(owner: &OsStr) -> bool {
     same_executable && holds_the_socket
 }
 
+/// The role `hermit verify-inputs --input ROLE:PATH` seals the host's
+/// dynamic-linker cache under for a `--verify-run` pair, and its path.
+pub(crate) const LD_SO_CACHE_ROLE: &str = "ld-so-cache";
+pub(crate) const LD_SO_CACHE_PATH: &str = "/etc/ld.so.cache";
+
 /// Command-line options for the "run" subcommand.
 #[derive(Debug, Parser, Clone)]
 #[clap(group(clap::ArgGroup::new("verification").args(["verify", "verify_run"])))]
 pub struct RunOpts {
-    /// Request the first-image exec-stop launcher. Not ready for production:
-    /// refuses before launch until the genuine Detcore runtime is integrated.
+    /// Run the guest's first image through the packaged singleton exec-stop launcher,
+    /// which starts the in-guest Detcore runtime before the guest's first instruction.
+    /// Admitted only on in-guest-trap with the `exec-stop-launcher` and `liteinst`
+    /// features, an installed private runtime package, and supported direct-run or
+    /// singleton verification options. Namespace-only, strace-only, debugger and
+    /// network recording/replay/perturbation requests refuse before launch with
+    /// exec-stop-runtime-not-ready. Threads and a later exec remain named refusals.
     #[clap(long)]
     in_guest_exec_stop: bool,
 
@@ -1081,8 +1194,9 @@ pub struct RunOpts {
     /// Implies --gdbserver: it starts `hermit-dap --listen` from beside this
     /// executable, and the client's attach request names the program and the
     /// GDB server, as printed. Not with --verify, which runs the program
-    /// twice, --namespace-only, which has no GDB server, or --image, whose
-    /// program lives in the image. See DEBUGGING.md.
+    /// twice, --namespace-only, which has no GDB server, a backend without
+    /// one (only ptrace serves gdb), or --image, whose program lives in the
+    /// image. See DEBUGGING.md.
     #[clap(
         long,
         value_name = "[HOST:]PORT",
@@ -1314,7 +1428,7 @@ pub struct RunOpts {
     /// Mount a file or directory. This uses the same syntax as Docker's `--mount` option. The
     /// source must exist on the host. For simple bind mounts into guest `/tmp`, use `--bind`.
     #[clap(long, value_name = "path")]
-    mount: Vec<Mount>,
+    mount: Vec<MountArg>,
 
     /// Bind-mount a host file or directory into guest `/tmp`. Use `SOURCE` to preserve its path or
     /// `SOURCE:TARGET` to choose a target under `/tmp`; the source must already exist.
@@ -1323,6 +1437,16 @@ pub struct RunOpts {
 
     /// Select guest networking. `local` creates an isolated loopback interface; `host` exposes the
     /// host network and compromises isolation and deterministic reproducibility.
+    ///
+    /// `local`, the default, gives each run its own network namespace, so a run's ports and
+    /// abstract unix socket names (`@name`) are its own. Under `host` the guest shares the host's:
+    /// every guest's first process is pid 3 and Hermit picks autobind names the same way in every
+    /// run, so two concurrent `host` runs whose guests bind the same abstract name, for instance
+    /// one built from the pid, collide and the second bind fails with EADDRINUSE. On the ptrace
+    /// backend Hermit prints a one-time NOTICE on stderr when a guest binds an abstract name under
+    /// `--network=host`, or fails to with EADDRINUSE. Use `host` only
+    /// for a guest that must reach the host's network, and run such guests one at a time when
+    /// they bind abstract names.
     #[clap(
         long,
         alias = "net",
@@ -1442,6 +1566,32 @@ pub struct RunOpts {
     /// randomness to generate a seed, and creates a log message recording it.
     #[clap(long, value_name = "'Args'|'SystemRandom'")]
     seed_from: Option<SeedFrom>,
+
+    /// With `--chaos`, draw `--max-timeslice` from the scheduler seed instead of using one value
+    /// for every seed. Chaos ends each timeslice after a random number of retired conditional
+    /// branches whose mean is the maximum timeslice; a race whose window is a few branches long
+    /// needs a mean of about a hundred branches, and a race whose other thread must first run far
+    /// needs a mean that lets it get there. Two in five seeds draw their maximum from 1000 to 2000
+    /// virtual nanoseconds (slices of about 100 to 200 branches), two in five from 1000000 to
+    /// 200000000 (the `--max-timeslice` default), and one in five from the decades between, each
+    /// log-uniformly within its range (raised to one RCB where `--clock-multiplier` makes that
+    /// longer), so a sweep over seeds tries every scale and most often the two that races have
+    /// needed. A seed
+    /// (`--sched-seed`, else `--seed`) always draws the same value, and the run is the run with
+    /// that value given as `--max-timeslice`, except that the guest can read Hermit's own command
+    /// line as PID 1's. Hermit prints the drawn value on stderr, and `--summary` reports it. The
+    /// draw is part of what a seed selects: a Hermit release that changed it would change every
+    /// seed's schedule, so pass the printed value as `--max-timeslice` to pin a run. Seeds that
+    /// draw small values run much slower: every timeslice ends with a timer event, and the ptrace
+    /// backend steps the guest through the last skid margin of each slice (all of a slice shorter
+    /// than the margin, which is 100 to 10000 branches depending on the processor). Needs a backend with a
+    /// PMU timer (ptrace, with or without e9patch preprocessing); elsewhere use
+    /// `--target-timeslice`. Cannot be combined with a positive `--max-timeslice` or with
+    /// `--target-timeslice`. There is nothing to draw with `--max-timeslice=disabled` or on a host
+    /// without usable performance counters, and a run that replays preemptions or a schedule keeps
+    /// the default maximum, since the recording supplies its preemption points.
+    #[clap(long, requires = "chaos")]
+    chaos_seeded_timeslice: bool,
 
     /// After running, immediately run a SECOND time, and compare the two
     /// executions. This will exit with an error if the guest process does OR if
@@ -1593,6 +1743,19 @@ pub struct RunOpts {
     #[clap(skip)]
     shared_inputs: Option<std::sync::Arc<super::verify_inputs::AdoptedInputs>>,
 
+    /// The guest's `/etc/ld.so.cache`, when one snapshot serves both runs of a
+    /// verification: taken once by `run --verify`, or the object the holder
+    /// sealed as [`LD_SO_CACHE_ROLE`] for `--verify-run`. `None` reads the
+    /// host's cache at container setup
+    /// (https://github.com/rrnewton/hermit/issues/4693).
+    #[clap(skip)]
+    ld_so_cache_snapshot: Option<super::container::LdSoCacheSnapshot>,
+    /// Exact original package for both verification runs: inherited from the
+    /// shared-input holder, or opened once by inline verification.
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[clap(skip)]
+    mapped_shared_image: Option<std::sync::Arc<super::mapped_first_admission::RetainedImage>>,
+
     /// Print a summary of the process tree's execution to stderr before exiting.
     #[clap(long, short = 'u')]
     pub(crate) summary: bool,
@@ -1719,8 +1882,8 @@ pub struct RunOpts {
     e9patch_sites: Option<reverie::SiteCounters>,
 
     /// Why this host's retired-branch counter is inexact, if it is. Only the
-    /// `--strict` refusal consults it; tests replace it to reach that refusal
-    /// on a host whose counters pass.
+    /// `--strict` refusal and the warning without `--strict` consult it; tests
+    /// replace it to reach both on a host whose counters pass.
     #[clap(skip = host_inexact_branch_counter as fn() -> Option<String>)]
     inexact_branch_counter: fn() -> Option<String>,
 }
@@ -1964,6 +2127,35 @@ impl FromStr for SeedFrom {
     }
 }
 
+/// A `--mount`: the mount, and the spec it was parsed from, so that a
+/// rendered command line (`hermit analyze`'s reproducers) passes the same
+/// mount again. Reverie's `Mount` does not give its fields back, and some
+/// (its flags, data, pinned source) have no spec syntax.
+#[derive(Clone, Debug)]
+pub struct MountArg {
+    mount: Mount,
+    spec: String,
+}
+
+impl FromStr for MountArg {
+    type Err = <Mount as FromStr>::Err;
+
+    fn from_str(spec: &str) -> Result<Self, Self::Err> {
+        Ok(Self {
+            mount: spec.parse()?,
+            spec: spec.to_owned(),
+        })
+    }
+}
+
+impl std::ops::Deref for MountArg {
+    type Target = Mount;
+
+    fn deref(&self) -> &Mount {
+        &self.mount
+    }
+}
+
 /// Displays the `run` subcommand's own options, so that
 /// `hermit{global_backend_arg()} run{self}` is a runnable command. The backend is a
 /// global option and is therefore rendered by [`RunOpts::global_backend_arg`],
@@ -2120,12 +2312,7 @@ impl fmt::Display for RunOpts {
         }
 
         for mount in &self.mount {
-            let mut acc = Vec::new();
-            if let Some(s) = &mount.get_source() {
-                acc.push(format!("source={}", s.display()));
-            }
-            acc.push(format!("target={}", mount.get_target().display()));
-            write!(f, "--mount={}", shell_words::quote(&acc.join(",")),)?;
+            write!(f, " --mount={}", shell_words::quote(&mount.spec))?;
         }
         for bind in &self.bind {
             let src = bind.source.to_str().expect("valid unicode bind source");
@@ -2140,6 +2327,16 @@ impl fmt::Display for RunOpts {
                     shell_words::quote(tar)
                 )?;
             }
+        }
+
+        // A seeded maximum is rendered as the flag the run was given, which
+        // draws the same value from the same seed; the value beside it would
+        // be refused as a conflict. Without chaos the flag draws nothing (and
+        // would need `--chaos`), and a disabled maximum is rendered as such,
+        // so neither renders the flag.
+        if self.chaos_seeded_timeslice && dop.chaos && dop.max_timeslice.is_some() {
+            write!(f, " --chaos-seeded-timeslice")?;
+            dop.max_timeslice = Some(hermit::chaos_timeslice::DEFAULT_MAX_TIMESLICE);
         }
 
         // A reproducer must retain the actual epoch, including the stable
@@ -2394,6 +2591,124 @@ fn exec_stop_admission_reads_the_global_backend_before_launch() {
             );
         }
     }
+}
+
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[test]
+fn exec_stop_verification_admits_both_shared_comparators_without_clearing_flags() {
+    for strict in [false, true] {
+        let mut argv = vec![
+            "hermit",
+            "--backend=in-guest-trap",
+            "run",
+            "--in-guest-exec-stop",
+            "--verify",
+        ];
+        if strict {
+            argv.push("--verify-strict");
+        }
+        argv.extend(["--", "/bin/true"]);
+        let options = run_opts_for(&argv);
+        assert!(options.verify);
+        assert_eq!(options.verify_strict, strict);
+        assert!(!options.exec_stop_direct_domain(true));
+        assert!(options.exec_stop_verification_domain(true));
+        options
+            .refuse_unready_exec_stop_with_availability(true)
+            .unwrap();
+        assert_exec_stop_not_ready(
+            &options
+                .refuse_unready_exec_stop_with_availability(false)
+                .unwrap_err(),
+        );
+        assert_eq!(
+            options.verification_strictness(),
+            if strict {
+                LogCompareStrictness::Canonical
+            } else {
+                LogCompareStrictness::Stripped
+            }
+        );
+    }
+}
+
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[test]
+fn exec_stop_verification_preserves_unsupported_domain_refusals() {
+    // Clap rejects some of these combinations too. Check the runtime guard
+    // independently for constructed callers without relaxing those conflicts.
+    for forbidden in ["no-namespace", "namespace-only", "strace-only", "debugger"] {
+        let mut options = run_opts_for(&[
+            "hermit",
+            "--backend=in-guest-trap",
+            "run",
+            "--in-guest-exec-stop",
+            "--verify",
+            "--",
+            "/bin/true",
+        ]);
+        match forbidden {
+            "no-namespace" => options.no_namespace = true,
+            "namespace-only" => options.namespace_only = true,
+            "strace-only" => options.strace_only = true,
+            "debugger" => options.dap_listen = Some("127.0.0.1:0".to_owned()),
+            _ => unreachable!(),
+        }
+        assert_exec_stop_not_ready(
+            &options
+                .refuse_unready_exec_stop_with_availability(true)
+                .unwrap_err(),
+        );
+    }
+    let mut split = run_opts_for(&[
+        "hermit",
+        "--backend=in-guest-trap",
+        "run",
+        "--in-guest-exec-stop",
+        "--verify-run=/tmp/mapped-split-refusal",
+        "--",
+        "/bin/true",
+    ]);
+    assert_exec_stop_not_ready(
+        &split
+            .refuse_unready_exec_stop_with_availability(true)
+            .unwrap_err(),
+    );
+    split.native_exec_shared_inputs = Some(197);
+    assert!(split.exec_stop_verification_domain(true));
+    assert!(!split.exec_stop_verification_domain(false));
+    // Option admission alone is not adoption or image validation. The real
+    // availability check still refuses this constructed run with no image.
+    assert_exec_stop_not_ready(&split.refuse_unready_exec_stop().unwrap_err());
+    split.epoch_omitted = true;
+    let epoch_error = split.refuse_unready_exec_stop().unwrap_err();
+    assert!(epoch_error.is::<PolicyRefusal>());
+    assert!(
+        format!("{epoch_error:#}")
+            .contains("mapped-shared-verification-requires-one-explicit-pair-epoch")
+    );
+    split.epoch_omitted = false;
+    split.verify = true; // An in-memory caller cannot combine the two domains.
+    assert_exec_stop_not_ready(
+        &split
+            .refuse_unready_exec_stop_with_availability(true)
+            .unwrap_err(),
+    );
+    let mut debugger = run_opts_for(&[
+        "hermit",
+        "--backend=in-guest-trap",
+        "run",
+        "--in-guest-exec-stop",
+        "--verify",
+        "--",
+        "/bin/true",
+    ]);
+    debugger.det_opts.det_config.gdbserver = true;
+    assert_exec_stop_not_ready(
+        &debugger
+            .refuse_unready_exec_stop_with_availability(true)
+            .unwrap_err(),
+    );
 }
 
 #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
@@ -2996,6 +3311,92 @@ fn every_backend_keeps_io_buffer_checking_on_by_default() {
     }
 }
 
+// Both runs of an in-process `--verify` bind the snapshot their owner took,
+// and a run refuses to set up its container without it
+// (https://github.com/rrnewton/hermit/issues/4693).
+#[test]
+fn verification_runs_bind_one_shared_ld_so_cache_snapshot() {
+    let tmpfs = tempfile::tempdir().unwrap();
+    let mut ro = run_opts_for(&["hermit", "run", "/bin/true"]);
+    assert!(
+        ro.mounts(tmpfs.path()).is_ok(),
+        "a plain run reads the host's cache"
+    );
+    ro.fatal_core_run_label = Some("run2");
+    let refused = ro
+        .mounts(tmpfs.path())
+        .err()
+        .expect("run 2 without the snapshot");
+    assert!(
+        refused
+            .to_string()
+            .contains("verification run run2 has no shared /etc/ld.so.cache snapshot"),
+        "{refused:#}"
+    );
+    let shared = ro.with_verification_ld_so_cache().unwrap();
+    assert_eq!(
+        shared.ld_so_cache_snapshot,
+        Some(super::container::LdSoCacheSnapshot::of_host().unwrap())
+    );
+    assert!(shared.mounts(tmpfs.path()).is_ok());
+    // An existing snapshot (one the holder sealed) is kept, not re-read.
+    let sealed = super::container::LdSoCacheSnapshot::from_bytes(b"sealed".to_vec());
+    ro.ld_so_cache_snapshot = Some(sealed.clone());
+    assert_eq!(
+        ro.with_verification_ld_so_cache()
+            .unwrap()
+            .ld_so_cache_snapshot,
+        Some(sealed)
+    );
+}
+
+// `--verify-run` under the holder takes the sealed /etc/ld.so.cache as its
+// snapshot, and only that role at that path.
+#[test]
+fn an_adopted_ld_so_cache_role_becomes_the_runs_snapshot() {
+    let mut ro = run_opts_for(&["hermit", "run", "/bin/true"]);
+    let dir = tempfile::tempdir().unwrap();
+    let other = dir.path().join("other");
+    fs::write(&other, b"not the cache").unwrap();
+    let unrelated =
+        super::verify_inputs::AdoptedInputs::sealed_for_test(&[("data".into(), other.clone())])
+            .unwrap();
+    ro.adopt_shared_ld_so_cache(&unrelated).unwrap();
+    assert_eq!(ro.ld_so_cache_snapshot, None);
+    let misplaced =
+        super::verify_inputs::AdoptedInputs::sealed_for_test(&[(LD_SO_CACHE_ROLE.into(), other)])
+            .unwrap();
+    assert!(ro.adopt_shared_ld_so_cache(&misplaced).is_err());
+    let Ok(host) = fs::read(LD_SO_CACHE_PATH) else {
+        return;
+    };
+    let sealed = super::verify_inputs::AdoptedInputs::sealed_for_test(&[(
+        LD_SO_CACHE_ROLE.into(),
+        PathBuf::from(LD_SO_CACHE_PATH),
+    )])
+    .unwrap();
+    // A run that holds the sealed role but did not adopt it is refused.
+    let tmpfs = tempfile::tempdir().unwrap();
+    ro.shared_inputs = Some(std::sync::Arc::new(sealed));
+    let refused = ro
+        .mounts(tmpfs.path())
+        .err()
+        .expect("an unadopted sealed cache");
+    assert!(
+        refused
+            .to_string()
+            .contains("the shared inputs seal /etc/ld.so.cache, but this run did not adopt it"),
+        "{refused:#}"
+    );
+    let adopted = std::sync::Arc::clone(ro.shared_inputs.as_ref().unwrap());
+    ro.adopt_shared_ld_so_cache(&adopted).unwrap();
+    assert_eq!(
+        ro.ld_so_cache_snapshot,
+        Some(super::container::LdSoCacheSnapshot::from_bytes(host))
+    );
+    assert!(ro.mounts(tmpfs.path()).is_ok());
+}
+
 #[test]
 fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
     let mut ro = run_opts_for(&[
@@ -3197,14 +3598,14 @@ fn dbt_runtime_binds_do_not_change_original_options_or_guest_inputs() {
     ]);
     let original = format!("{options:?}");
     let guest = options.guest_command().unwrap();
-    let config = hermit::dbt_detconfig_json(&options.effective_det_config()).unwrap();
+    let config = serde_json::to_string(&options.effective_det_config()).unwrap();
     let binding = Bind::new("/host/private/stats", "/tmp/.hermit-dbt-stats-0");
     let launch = options.with_dbt_mounts(std::slice::from_ref(&binding), Vec::new());
     assert_eq!(launch.bind.last(), Some(&binding));
     assert_eq!(format!("{options:?}"), original);
     assert!(options.dbt_binds().is_empty());
     assert_eq!(
-        hermit::dbt_detconfig_json(&launch.effective_det_config()).unwrap(),
+        serde_json::to_string(&launch.effective_det_config()).unwrap(),
         config
     );
     let launched_guest = launch.guest_command().unwrap();
@@ -3314,6 +3715,62 @@ fn source_less_mount_hides_program_from_resolution() {
     );
     let error = ro.resolve_guest_and_host_program().unwrap_err().to_string();
     assert!(error.contains("not visible through the configured guest mounts"));
+}
+
+/// The rendered options (what `hermit analyze` prints as a reproducer and
+/// writes to its `*.repro` files) are a shell command line that parses back
+/// to the same options: each `--mount` is its own word and keeps its whole
+/// spec, type and `readonly` included. Before, the first `--mount` was glued
+/// to the option before it, and every mount was shown as its source and
+/// target only, so a pasted reproducer lost the bind.
+#[test]
+fn rendered_options_parse_back_to_the_same_mounts() {
+    let bind = "type=bind,source=/etc/hostname,target=/etc/ld.so.cache,readonly";
+    let argv = [
+        "fakehermit",
+        "--save-config=/tmp/run one.config",
+        &format!("--mount={bind}"),
+        "--mount=type=tmpfs,target=/test",
+        "--bind=/tmp",
+        "--",
+        "/bin/echo",
+        "a b",
+    ];
+    // Options as `hermit run` and `hermit analyze` hold them, validated.
+    let validated = |argv: Vec<String>| {
+        let mut options = RunOpts::parse_from(argv);
+        options.validate_args_with_timer_support(Ok(())).unwrap();
+        options
+    };
+    let options = validated(argv.iter().map(|arg| arg.to_string()).collect());
+    let rendered = options.to_string();
+    assert!(
+        rendered.contains(&format!(
+            " --mount={} --mount={} ",
+            shell_words::quote(bind),
+            shell_words::quote("type=tmpfs,target=/test")
+        )),
+        "{rendered}"
+    );
+    let words = shell_words::split(&rendered).unwrap();
+    let reparsed = validated(
+        std::iter::once("fakehermit".to_owned())
+            .chain(words)
+            .collect(),
+    );
+    let mounts = |options: &RunOpts| -> Vec<Mount> {
+        options.mount.iter().map(|arg| arg.mount.clone()).collect()
+    };
+    assert_eq!(mounts(&reparsed), mounts(&options));
+    // The bind is still read-only: the source and target alone, the old
+    // rendering, parse to another mount.
+    let source_and_target: Mount = "source=/etc/hostname,target=/etc/ld.so.cache"
+        .parse()
+        .unwrap();
+    assert_ne!(mounts(&reparsed)[0], source_and_target);
+    assert_eq!(reparsed.save_config, options.save_config);
+    assert_eq!(reparsed.args, options.args);
+    assert_eq!(reparsed.to_string(), rendered);
 }
 
 #[test]
@@ -3791,6 +4248,52 @@ fn replay_networking_adopts_the_trace_epoch_and_refuses_another() {
     );
 }
 
+#[test]
+fn replay_takes_the_recorded_rng_seed_and_refuses_another() {
+    let directory = tempfile::tempdir().unwrap();
+    let record = directory.path().join("schedule.preempts");
+    fs::write(&record, r#"{"per_thread":{},"global":[],"rng_seed":6}"#).unwrap();
+    let replay_arg = format!("--replay-schedule-from={}", record.display());
+
+    let mut omitted =
+        RunOpts::parse_from(["fakehermit", "--seed=1", replay_arg.as_str(), "fakeprog"]);
+    omitted.adopt_replayed_rng_seed().unwrap();
+    let config = &omitted.det_opts.det_config;
+    assert_eq!(
+        config.rng_seed(),
+        6,
+        "the recorded seed replaces the one --seed implies"
+    );
+    assert_eq!(
+        config.sched_seed(),
+        1,
+        "the schedule seed stays the caller's"
+    );
+
+    let mut explicit = RunOpts::parse_from([
+        "fakehermit",
+        "--rng-seed=1",
+        replay_arg.as_str(),
+        "fakeprog",
+    ]);
+    let refusal = explicit
+        .adopt_replayed_rng_seed()
+        .expect_err("the guest would read other random values than the recording");
+    assert!(
+        format!("{refusal:#}").contains("--rng-seed=1 differs from the seed 6"),
+        "{refusal:#}"
+    );
+
+    let mut matching = RunOpts::parse_from([
+        "fakehermit",
+        "--rng-seed=6",
+        replay_arg.as_str(),
+        "fakeprog",
+    ]);
+    matching.adopt_replayed_rng_seed().unwrap();
+    assert_eq!(matching.det_opts.det_config.rng_seed(), 6);
+}
+
 /// The environment variable that turned the signal-state copy on while it
 /// was opt-in (before A5 step 2d). It is no longer read.
 const SIGNAL_STATE_CHECK_ENV: &str = "HERMIT_SIGNAL_STATE_CHECK";
@@ -3820,6 +4323,51 @@ fn the_retired_signal_state_check_variable_is_refused() {
     for value in ["0", "1", "", "false"] {
         let error = refuse_signal_state_check_env(Some(OsStr::new(value))).unwrap_err();
         assert!(error.contains("--no-signal-state-copy"), "{error}");
+    }
+}
+
+/// A replay under an explicit `--expired-wait-charge` other than the rule its
+/// record states is refused, under both replay flags; a record without the
+/// field charged each wait; a replay that leaves the option unset is never
+/// refused (it takes the record's rule).
+#[test]
+fn replay_refuses_another_expired_wait_charge() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = |name: &str, once: bool| {
+        let path = dir.path().join(name);
+        let record = detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+            .with_expired_wait_runs_charged_once(once);
+        std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+        path
+    };
+    let each = record("each.json", false);
+    let once = record("once.json", true);
+    for flag in ["--replay-schedule-from", "--replay-preemptions-from"] {
+        for (path, charge, refused) in [
+            (&each, None, false),
+            (&each, Some("each"), false),
+            (&each, Some("once"), true),
+            (&once, None, false),
+            (&once, Some("once"), false),
+            (&once, Some("each"), true),
+        ] {
+            let replay = format!("{flag}={}", path.display());
+            let mut argv = vec!["fakehermit".to_owned(), replay];
+            if let Some(charge) = charge {
+                argv.push(format!("--expired-wait-charge={charge}"));
+            }
+            argv.push("fakeprog".to_owned());
+            let ro = RunOpts::parse_from(&argv);
+            let result = ro.refuse_replay_under_another_expired_wait_charge();
+            assert_eq!(result.is_err(), refused, "{argv:?}: {result:?}");
+            if let Err(error) = result {
+                let error = format!("{error:#}");
+                assert!(
+                    error.contains(flag) && error.contains("cannot reproduce the run"),
+                    "{error}"
+                );
+            }
+        }
     }
 }
 
@@ -4531,6 +5079,135 @@ fn pipe_wake_latency_parses_round_trips_and_is_refused_where_inert() {
     }
 }
 
+/// `--cap-preemption-charge` parses, is rendered into the reproduce command
+/// and round-trips. It is refused where no turn ends an expired timeslice:
+/// without a timeslice (given or downgraded for a host without a PMU timer),
+/// without Detcore's sequentializing scheduler, and with the DBT backend,
+/// whose runtime reads a configuration form that cannot carry it. A logical
+/// `--target-timeslice` without the PMU maximum still ends slices.
+#[test]
+fn cap_preemption_charge_parses_round_trips_and_is_refused_where_inert() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--cap-preemption-charge", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert!(opts.det_opts.det_config.cap_preemption_charge);
+    let rendered = format!("{opts}");
+    assert!(rendered.contains(" --cap-preemption-charge"), "{rendered}");
+    let mut reparsed_args = vec!["fakehermit".to_owned()];
+    reparsed_args.extend(shell_words::split(&rendered).unwrap());
+    let mut reparsed = RunOpts::parse_from(reparsed_args);
+    reparsed.validate_args_with_perf_support(true).unwrap();
+    assert!(reparsed.det_opts.det_config.cap_preemption_charge);
+
+    let mut default = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    default.validate_args_with_perf_support(true).unwrap();
+    assert!(!default.det_opts.det_config.cap_preemption_charge);
+    assert!(!format!("{default}").contains("preemption-charge"));
+
+    let mut logical = RunOpts::parse_from([
+        "fakehermit",
+        "--cap-preemption-charge",
+        "--max-timeslice=disabled",
+        "--target-timeslice=1000000",
+        "fakeprog",
+    ]);
+    logical.validate_args_with_perf_support(true).unwrap();
+
+    let error = RunOpts::parse_from(["fakehermit", "--cap-preemption-charge", "fakeprog"])
+        .validate_args_with_perf_support(false)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("no timeslice ends by expiry because this host's PMU timer is unavailable")
+            && error.contains("Give a --max-timeslice"),
+        "{error}"
+    );
+
+    for (argv, expected) in [
+        (
+            vec![
+                "hermit",
+                "run",
+                "--max-timeslice=disabled",
+                "--cap-preemption-charge",
+                "fakeprog",
+            ],
+            "no timeslice ends by expiry because --max-timeslice=disabled",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--no-sequentialize-threads",
+                "--cap-preemption-charge",
+                "fakeprog",
+            ],
+            "Drop --no-sequentialize-threads or --cap-preemption-charge",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--strace-only",
+                "--cap-preemption-charge",
+                "fakeprog",
+            ],
+            "Drop --strace-only or --cap-preemption-charge",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--namespace-only",
+                "--cap-preemption-charge",
+                "fakeprog",
+            ],
+            "Drop --namespace-only or --cap-preemption-charge",
+        ),
+        (
+            vec![
+                "hermit",
+                "--backend=dbt",
+                "run",
+                "--cap-preemption-charge",
+                "fakeprog",
+            ],
+            "the dbt backend cannot apply --cap-preemption-charge",
+        ),
+    ] {
+        let error = run_opts_for(&argv)
+            .validate_args_with_perf_support(true)
+            .err()
+            .unwrap_or_else(|| panic!("{argv:?} was accepted"));
+        assert!(error.to_string().contains(expected), "{argv:?}: {error}");
+    }
+}
+
+/// A replay of a record made under the other `--cap-preemption-charge`
+/// setting is refused before launch with the setting to replay with; the
+/// recorded setting is accepted.
+#[test]
+fn a_replay_under_another_cap_preemption_charge_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("schedule.json");
+    let record = detcore::preemptions::PreemptionWriter::new(None)
+        .with_cap_preemption_charge(true)
+        .into_string();
+    std::fs::write(&path, record).unwrap();
+    let replay = |extra: &[&str]| {
+        let schedule = format!("--replay-schedule-from={}", path.display());
+        let mut argv = vec!["fakehermit", schedule.as_str()];
+        argv.extend_from_slice(extra);
+        argv.push("fakeprog");
+        RunOpts::parse_from(argv).refuse_replay_under_another_cap_preemption_charge()
+    };
+    replay(&["--cap-preemption-charge"]).unwrap();
+    let error = replay(&[]).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Replay with --cap-preemption-charge."),
+        "{error:#}"
+    );
+}
+
 /// `--scheduler-turn-cost` parses, is rendered into the reproduce command and
 /// round-trips; zero and the DBT backend are refused.
 #[test]
@@ -4711,6 +5388,74 @@ fn liteinst_in_guest_refuses_options_it_cannot_honour() {
     run_opts_for(&["hermit", "--backend=liteinst", "run", "fakeprog"])
         .refuse_liteinst_without_the_feature()
         .unwrap();
+}
+
+/// Only the ptrace backend serves gdb. `--gdbserver` and `--dap-listen` on a
+/// backend without a gdbserver, `--strict` included, and with
+/// `--namespace-only`, are refused naming the remedy; the ptrace and e9patch
+/// backends keep them, and the other backends run without them as before.
+#[test]
+fn backends_without_a_gdbserver_refuse_gdbserver_and_dap_listen() {
+    let refusal = |argv: &[&str]| {
+        let mut argv = argv.to_vec();
+        argv.push("fakeprog");
+        run_opts_for(&argv).refuse_gdbserver_without_a_gdbserver()
+    };
+    for backend in ["kvm", "dbt", "sabre"] {
+        let flag = format!("--backend={backend}");
+        for (options, option) in [
+            (&["--gdbserver"][..], "--gdbserver"),
+            (&["--strict", "--gdbserver"], "--gdbserver"),
+            (&["--dap-listen=4711"], "--dap-listen"),
+        ] {
+            let mut argv = vec!["hermit", flag.as_str(), "run"];
+            argv.extend_from_slice(options);
+            let error = refusal(&argv).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                error.downcast_ref::<PolicyRefusal>().is_some(),
+                "{argv:?}: {error:#}"
+            );
+            assert!(
+                message.starts_with(&format!("{option} needs a gdbserver")),
+                "{argv:?}: {message}"
+            );
+            assert!(
+                message.contains(&format!("the {backend} backend has none")),
+                "{argv:?}: {message}"
+            );
+            assert!(
+                message.contains(&format!("drop {flag} (ptrace is the default)")),
+                "{argv:?}: {message}"
+            );
+        }
+        refusal(&["hermit", flag.as_str(), "run"]).unwrap();
+    }
+    let error = refusal(&["hermit", "run", "--namespace-only", "--gdbserver"]).unwrap_err();
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    assert!(
+        error.to_string().contains("drop --namespace-only"),
+        "{error:#}"
+    );
+    for flag in ["--backend=ptrace", "--backend=e9patch"] {
+        refusal(&["hermit", flag, "run", "--gdbserver"]).unwrap();
+        refusal(&["hermit", flag, "run", "--strict", "--gdbserver"]).unwrap();
+    }
+    refusal(&["hermit", "run", "--dap-listen=4711"]).unwrap();
+    // Argument validation refuses it too, before any other check of the run.
+    let mut strict_kvm = run_opts_for(&[
+        "hermit",
+        "--backend=kvm",
+        "run",
+        "--strict",
+        "--gdbserver",
+        "fakeprog",
+    ]);
+    let error = strict_kvm.validate_args().unwrap_err();
+    assert!(
+        error.to_string().contains("the kvm backend has none"),
+        "{error:#}"
+    );
 }
 
 /// Without the `liteinst` feature there is no in-guest runtime to advise
@@ -5095,16 +5840,223 @@ fn strict_rejects_strace_only() {
     assert!(message.contains("--strace-only"));
 }
 
+/// The options `--strace-only`'s help says it is shorthand for.
+#[cfg(test)]
+const STRACE_ONLY_EXPANSION: [&str; 8] = [
+    "--tmp=/tmp",
+    "--network=host",
+    "--no-virtualize-cpuid",
+    "--no-virtualize-time",
+    "--no-virtualize-metadata",
+    "--no-sequentialize-threads",
+    "--no-deterministic-io",
+    "--no-rcb-time",
+];
+
+/// Validates `--strace-only SHORT_EXTRA fakeprog` and the documented expansion
+/// with `LONG_EXTRA`, and lists every way the two resolved runs differ: a
+/// refusal, thread pinning, network, `/tmp`, each top-level Detcore
+/// configuration field, and the rendered command. Empty when they are the same
+/// run. Collected rather than asserted one by one, so a failure names every
+/// difference at once.
+#[cfg(test)]
+fn strace_only_differences(
+    short_extra: &[&str],
+    long_extra: &[&str],
+) -> (RunOpts, RunOpts, Vec<String>) {
+    let resolve = |options: &[&str], extra: &[&str]| {
+        let mut args = vec!["fakehermit"];
+        args.extend_from_slice(options);
+        args.extend_from_slice(extra);
+        args.push("fakeprog");
+        let mut opts = RunOpts::parse_from(args);
+        let validated = opts.validate_args_with_perf_support(true);
+        (opts, validated.map_err(|error| format!("{error:#}")))
+    };
+    let (shorthand, shorthand_validated) = resolve(&["--strace-only"], short_extra);
+    let (expansion, expansion_validated) = resolve(&STRACE_ONLY_EXPANSION, long_extra);
+    let mut differences = Vec::new();
+    if let Err(error) = &shorthand_validated {
+        differences.push(format!("--strace-only is refused: {error}"));
+    }
+    if let Err(error) = &expansion_validated {
+        differences.push(format!("the expansion is refused: {error}"));
+    }
+    if !differences.is_empty() {
+        return (shorthand, expansion, differences);
+    }
+    let mut differ = |what: &str, short: String, long: String| {
+        if short != long {
+            differences.push(format!("{what}: --strace-only {short}, expansion {long}"));
+        }
+    };
+    differ(
+        "pin_threads",
+        shorthand.pin_threads.to_string(),
+        expansion.pin_threads.to_string(),
+    );
+    differ(
+        "network",
+        format!("{:?}", shorthand.network),
+        format!("{:?}", expansion.network),
+    );
+    differ(
+        "tmp",
+        format!("{:?}", shorthand.tmp),
+        format!("{:?}", expansion.tmp),
+    );
+    let fields = |opts: &RunOpts| match serde_json::to_value(&opts.det_opts.det_config).unwrap() {
+        serde_json::Value::Object(fields) => fields,
+        other => panic!("the Detcore configuration serialized as {other}"),
+    };
+    let (short_fields, long_fields) = (fields(&shorthand), fields(&expansion));
+    for (name, long) in &long_fields {
+        let short = short_fields.get(name).cloned().unwrap_or_default();
+        differ(
+            &format!("Detcore {name}"),
+            short.to_string(),
+            long.to_string(),
+        );
+    }
+    // A validated `--strace-only` used to reach the rendering's
+    // `assert!(dop.deterministic_io)` with deterministic I/O cleared. A panic
+    // on either side is a difference of its own, so two panics never compare
+    // equal; only two successful renderings are compared.
+    let render = |opts: &RunOpts| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| opts.to_string()))
+    };
+    match (render(&shorthand), render(&expansion)) {
+        (Ok(short), Ok(long)) => differ("rendered command", short, long),
+        (short, long) => {
+            if short.is_err() {
+                differences.push("rendering --strace-only panicked".to_owned());
+            }
+            if long.is_err() {
+                differences.push("rendering the expansion panicked".to_owned());
+            }
+        }
+    }
+    (shorthand, expansion, differences)
+}
+
+#[test]
+fn strace_only_resolves_like_its_documented_expansion() {
+    // `--strace-only`'s help names the options it is shorthand for. Resolved,
+    // the two spellings must be the same run: the same Detcore configuration,
+    // thread pinning, network and `/tmp`, and the same rendered command, also
+    // with an extra option whose handling reads the lowered ones. Applied
+    // after those readers, the shorthand pinned every guest thread to one CPU
+    // (the pin decision still saw sequentialized threads), was refused with
+    // `--no-virtualize-time` (the time/metadata check still saw virtualized
+    // metadata), and kept the options `Config::validate` drops without
+    // sequentialized threads.
+    let cases: [(&[&str], &[&str]); 5] = [
+        (&[], &[]),
+        // Already part of the expansion, which clap refuses to repeat.
+        (&["--no-virtualize-time"], &[]),
+        (&["--stop-after-turn=5"], &["--stop-after-turn=5"]),
+        (&["--stop-after-iter=5"], &["--stop-after-iter=5"]),
+        (
+            &["--debug-externalize-sockets"],
+            &["--debug-externalize-sockets"],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (short_extra, long_extra) in cases {
+        let (shorthand, expansion, differences) = strace_only_differences(short_extra, long_extra);
+        if !differences.is_empty() {
+            failures.push(format!("{short_extra:?}: {differences:#?}"));
+            continue;
+        }
+        let config = &shorthand.det_opts.det_config;
+        assert!(!shorthand.pin_threads, "{short_extra:?}");
+        assert!(config.max_timeslice.is_some(), "{short_extra:?}");
+        assert!(!config.sequentialize_threads, "{short_extra:?}");
+        assert!(config.stop_after_turn.is_none(), "{short_extra:?}");
+        assert!(config.stop_after_iter.is_none(), "{short_extra:?}");
+        assert!(!config.debug_externalize_sockets, "{short_extra:?}");
+        assert_eq!(shorthand.tmp.as_deref(), Some(Path::new(TMP_DIR)));
+        assert_eq!(expansion.network, NetworkingMode::Host);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn dap_supervisor_maps_guest_paths_like_the_strace_only_expansion() {
+    // `--dap-listen` supervises the run from `main`, before `validate_args`,
+    // and checks the host file it names to the debugger through the guest-path
+    // mapping. With `--strace-only` that mapping must see the lowered
+    // `--tmp=/tmp`, as the expansion does; otherwise a program under /tmp is
+    // treated as hidden and the supervisor ends the run. A path a source-less
+    // mount hides must stay hidden in both spellings.
+    let settle = |options: &[&str]| {
+        let mut args = vec!["fakehermit"];
+        args.extend_from_slice(options);
+        args.extend([
+            "--dap-listen=127.0.0.1:0",
+            "--gdbserver-port=1234",
+            "--mount=type=tmpfs,target=/hidden",
+            "/tmp/guest",
+        ]);
+        let mut opts = RunOpts::parse_from(args);
+        // The prelude `main` runs; without a supervisor marker it hands off
+        // to the supervisor, which uses these options from here on.
+        assert_eq!(
+            opts.dispatch_before_validation(None, None).unwrap(),
+            RunDispatch::DapSupervisor
+        );
+        opts
+    };
+    let shorthand = settle(&["--strace-only"]);
+    let expansion = settle(&STRACE_ONLY_EXPANSION);
+    assert_eq!(shorthand.tmp.as_deref(), Some(Path::new(TMP_DIR)));
+    assert_eq!(shorthand.tmp, expansion.tmp);
+    assert_eq!(shorthand.network, NetworkingMode::Host);
+    assert_eq!(shorthand.network, expansion.network);
+    assert!(shorthand.no_sequentialize_threads && expansion.no_sequentialize_threads);
+    assert!(shorthand.no_deterministic_io && expansion.no_deterministic_io);
+    assert!(shorthand.det_opts.det_config.gdbserver);
+    assert_eq!(
+        serde_json::to_value(&shorthand.det_opts.det_config).unwrap(),
+        serde_json::to_value(&expansion.det_opts.det_config).unwrap()
+    );
+    for path in ["/tmp/guest", "/hidden/guest", "/usr/bin/true"] {
+        let path = Path::new(path);
+        assert_eq!(
+            shorthand.mapped_host_program(path),
+            expansion.mapped_host_program(path),
+            "{}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        shorthand.mapped_or_visible_host_program(Path::new("/tmp/guest")),
+        Some(PathBuf::from("/tmp/guest"))
+    );
+    assert_eq!(
+        shorthand.mapped_host_program(Path::new("/hidden/guest")),
+        GuestPathMapping::Hidden
+    );
+    assert_eq!(
+        shorthand.mapped_or_visible_host_program(Path::new("/hidden/guest")),
+        None
+    );
+}
+
 #[test]
 fn strict_rejects_every_route_to_host_networking() {
-    // Explicit, and the two routes that reach host networking as a side effect
-    // of a flag that is not about networking. All three were accepted silently
-    // before: measured from inside the guest, each showed interfaces `eth0 lo`
-    // where `--strict` alone shows `lo`.
+    // Explicit, and the route that reaches host networking as a side effect of
+    // a flag that is not about networking. Both were accepted silently before:
+    // measured from inside the guest, each showed interfaces `eth0 lo` where
+    // `--strict` alone shows `lo`. With `--gdbserver` as well, the refusal
+    // still names the network flag, the one cause.
     for (args, expected_cause) in [
         (vec!["--strict", "--network=host"], "--network=host"),
         (vec!["--strict", "--no-namespace"], "--no-namespace"),
-        (vec!["--strict", "--gdbserver"], "--gdbserver"),
+        (
+            vec!["--strict", "--gdbserver", "--network=host"],
+            "--network=host",
+        ),
     ] {
         let mut argv = vec!["fakehermit"];
         argv.extend(args.iter().copied());
@@ -5179,6 +6131,58 @@ fn a_run_on_an_inexact_branch_counter_warns_without_strict() {
         multiline,
     );
     assert!(result.is_ok() && lines.is_empty(), "{lines:?}");
+}
+
+/// The inexact-counter warning that `run`, `analyze`, `bisect` and `record
+/// start` share says, in one line, what the counter drives, what this command
+/// would repeat that is not guaranteed to (the run's seed or preemption
+/// record, the trials and what they report, a recording's replay), and what to
+/// do instead (a host whose counters pass, as `hermit host-capabilities`
+/// reports it; `--strict` refuses this one). It ends with Reverie's reason,
+/// whose counts vary between processes. A counter that passed gets no warning.
+#[test]
+fn the_inexact_branch_counter_warning_says_what_may_not_reproduce_and_what_to_do() {
+    let inexact: fn() -> Option<String> =
+        || Some("SpecLockMap is enabled\n  (91 of 95 locked\ninstructions)".to_string());
+    for (reader, not_guaranteed) in [
+        (
+            CounterReader::Run,
+            "so the same arguments and --seed, or a preemption record, are not guaranteed to \
+             reproduce this run.",
+        ),
+        (
+            CounterReader::Trials,
+            "so analyze and bisect trials can disagree for a hardware reason, and a seed, \
+             preemption record or schedule they report is not guaranteed to reproduce its \
+             outcome.",
+        ),
+        (
+            CounterReader::Recording,
+            "so a replay of this recording is not guaranteed to follow it.",
+        ),
+    ] {
+        assert_eq!(warning_for_an_inexact_branch_counter(reader, || None), None);
+        let warning = warning_for_an_inexact_branch_counter(reader, inexact)
+            .unwrap_or_else(|| panic!("{reader:?}: an inexact counter warns"));
+        for expected in [
+            "WARNING: this host's retired-branch counter failed Reverie's performance-counter \
+             validation. Hermit times preemptions, and by default virtual time, with that \
+             counter, ",
+            not_guaranteed,
+            " For reproducible results use a host whose counters pass the validation (`hermit \
+             host-capabilities` reports exact-branch-counter: PRESENT, validation passed); \
+             --strict refuses this host.",
+            " Reverie reports: SpecLockMap is enabled (91 of 95 locked instructions)\n",
+        ] {
+            assert!(
+                warning.contains(expected),
+                "{reader:?}: {expected:?}: {warning}"
+            );
+        }
+        assert!(warning.starts_with("WARNING: "), "{warning}");
+        assert!(warning.ends_with("instructions)\n"), "{warning:?}");
+        assert_eq!(warning.matches('\n').count(), 1, "one line: {warning:?}");
+    }
 }
 
 #[test]
@@ -5312,20 +6316,26 @@ fn non_strict_runs_still_allow_host_networking() {
     assert_eq!(opts.network, NetworkingMode::Host);
 }
 
+/// `--gdbserver` leaves the network as asked: its port is bound in the host's
+/// network namespace before the container exists, so the guest keeps its
+/// private network, under `--strict` too, where a debugger can now attach to
+/// the strict run itself.
 #[test]
-fn gdbserver_forces_host_networking() {
-    // Without --gdbserver the default networking stays local.
-    let mut plain = RunOpts::parse_from(["fakehermit", "fakeprog"]);
-    plain.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(plain.network, NetworkingMode::Local);
-
-    // With --gdbserver the isolated network namespace would hide the gdbserver
-    // port from a host gdb client, so networking is forced to host.
-    let mut opts = RunOpts::parse_from(["fakehermit", "--gdbserver", "fakeprog"]);
-    assert_eq!(opts.network, NetworkingMode::Local);
-    opts.validate_args_with_perf_support(true).unwrap();
-    assert!(opts.det_opts.det_config.gdbserver);
-    assert_eq!(opts.network, NetworkingMode::Host);
+fn gdbserver_keeps_the_guest_network() {
+    for args in [
+        &["--gdbserver"][..],
+        &["--strict", "--gdbserver"],
+        &["--strict", "--gdbserver", "--gdbserver-port=0"],
+    ] {
+        let mut argv = vec!["fakehermit"];
+        argv.extend(args);
+        argv.push("fakeprog");
+        let mut opts = RunOpts::parse_from(&argv);
+        opts.validate_args_with_perf_support(true)
+            .unwrap_or_else(|error| panic!("{argv:?} must be admitted: {error:#}"));
+        assert!(opts.det_opts.det_config.gdbserver, "{argv:?}");
+        assert_eq!(opts.network, NetworkingMode::Local, "{argv:?}");
+    }
 }
 
 #[test]
@@ -5335,21 +6345,76 @@ fn gdbserver_respects_explicit_host_networking() {
     assert_eq!(opts.network, NetworkingMode::Host);
 }
 
+/// Detcore's notice for an abstract `AF_UNIX` bind is on only for a run that asked
+/// for `--network=host` (given, or through `--strace-only`'s expansion), really
+/// shares the host's network namespace, has its own PID namespace, is not under
+/// `--gdbserver`, and runs Detcore in Hermit's own process.
 #[test]
-fn gdbserver_conflicts_with_analyze_networking() {
+fn abstract_bind_notice_is_on_only_for_a_host_network_run_on_ptrace() {
+    let resolved = |global: &[&str], args: &[&str]| {
+        let argv: Vec<&str> = std::iter::once("hermit")
+            .chain(global.iter().copied())
+            .chain(std::iter::once("run"))
+            .chain(args.iter().copied())
+            .chain(std::iter::once("fakeprog"))
+            .collect();
+        let mut opts = run_opts_for(&argv);
+        opts.validate_args_with_perf_support(true)
+            .unwrap_or_else(|error| panic!("{argv:?}: {error:#}"));
+        opts.det_opts.det_config.notice_host_network_abstract_binds
+    };
+    assert!(resolved(&[], &["--network=host"]));
+    assert!(!resolved(&[], &[]));
+    assert!(!resolved(&[], &["--network=local"]));
+    assert!(!resolved(&[], &["--analyze-networking"]));
+    // --analyze-networking isolates the run even under --network=host.
+    assert!(!resolved(&[], &["--network=host", "--analyze-networking"]));
+    // Host networking that another mode needs, or forces.
+    assert!(!resolved(&[], &["--no-namespace"]));
+    assert!(!resolved(&[], &["--gdbserver"]));
+    assert!(!resolved(&[], &["--gdbserver", "--network=host"]));
+    // --strace-only is shorthand for an expansion that includes
+    // --network=host, and resolves like it: the notice is on for both.
+    assert!(resolved(&[], &["--strace-only"]));
+    assert!(resolved(&[], &["--strace-only", "--network=host"]));
+    assert!(resolved(
+        &[],
+        &[
+            "--tmp=/tmp",
+            "--network=host",
+            "--no-virtualize-cpuid",
+            "--no-virtualize-time",
+            "--no-virtualize-metadata",
+            "--no-sequentialize-threads",
+            "--no-deterministic-io",
+            "--no-rcb-time",
+        ]
+    ));
+    // A recording forces host networking but refuses abstract AF_UNIX
+    // addresses outright (and clap refuses it with --network=host).
+    let dir = tempfile::tempdir().unwrap();
+    let record = format!(
+        "--record-networking={}",
+        dir.path().join("net.trace").display()
+    );
+    assert!(!resolved(&[], &[&record]));
+    // Only the ptrace backend: KVM is not covered, and on the in-guest
+    // backends Detcore's stderr would be the guest's.
+    assert!(!resolved(&["--backend", "kvm"], &["--network=host"]));
+}
+
+/// `--analyze-networking` needs the isolated namespace, which `--gdbserver`
+/// no longer leaves, so the two combine.
+#[test]
+fn gdbserver_combines_with_analyze_networking() {
     let mut opts = RunOpts::parse_from([
         "fakehermit",
         "--gdbserver",
         "--analyze-networking",
         "fakeprog",
     ]);
-    let error = opts.validate_args_with_perf_support(true).unwrap_err();
-    let message = error.to_string();
-    assert!(message.contains("--gdbserver"), "message: {message}");
-    assert!(
-        message.contains("--analyze-networking"),
-        "message: {message}"
-    );
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert!(opts.network.uses_local_namespace(opts.analyze_networking));
 }
 
 #[test]
@@ -5908,6 +6973,62 @@ pub(super) fn path_resolution_visits_prefix(path: &Path, prefix: &Path) -> Resul
     anyhow::bail!("executable path exceeded Linux's symlink traversal limit")
 }
 
+/// Refuse `--virtual-cpus cpus` on a host whose CPU directory, `directory`
+/// (`/sys/devices/system/cpu`), lacks one of `cpu0` to `cpu<cpus - 1>` or
+/// has it offline. The guest sees those directories, with their topology and
+/// cache files rendered for the virtual CPUs, in place of its own: Detcore
+/// can leave a CPU out of the listing, but cannot add one the host does not
+/// have, nor the `topology` directory Linux removes from an offline CPU's
+/// (`topology_remove_dev`).
+fn check_host_lists_virtual_cpus(cpus: u32, directory: &Path) -> Result<(), Error> {
+    let listed = (0..cpus)
+        .take_while(|cpu| directory.join(format!("cpu{cpu}/topology")).is_dir())
+        .count();
+    if listed < cpus as usize {
+        let fewer = match listed {
+            0 => "run without --virtual-cpus".to_owned(),
+            listed => format!("pass --virtual-cpus {listed} or fewer"),
+        };
+        anyhow::bail!(
+            "--virtual-cpus {cpus} shows the guest this host's cpu0 to cpu{} in {}, rendered \
+             for the virtual CPUs, but only the first {listed} are there and online; {fewer}, \
+             or run on a host with at least {cpus} online CPUs",
+            cpus - 1,
+            directory.display(),
+        );
+    }
+    Ok(())
+}
+
+/// `--virtual-cpus` is admitted where the host has an online CPU directory
+/// for each virtual CPU, and otherwise refused with the count that would be.
+#[test]
+fn virtual_cpus_need_a_host_directory_per_cpu() {
+    let host = tempfile::TempDir::new().unwrap();
+    for cpu in ["cpu0", "cpu1", "cpu2", "cpu4"] {
+        std::fs::create_dir_all(host.path().join(cpu).join("topology")).unwrap();
+    }
+    // An offline CPU keeps its directory but loses its topology.
+    std::fs::create_dir(host.path().join("cpu3")).unwrap();
+    std::fs::create_dir(host.path().join("cpufreq")).unwrap();
+    check_host_lists_virtual_cpus(1, host.path()).unwrap();
+    check_host_lists_virtual_cpus(3, host.path()).unwrap();
+    let error = check_host_lists_virtual_cpus(4, host.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cpu0 to cpu3"), "{error}");
+    assert!(
+        error.contains("only the first 3 are there and online"),
+        "{error}"
+    );
+    assert!(error.contains("pass --virtual-cpus 3 or fewer"), "{error}");
+    let empty = tempfile::TempDir::new().unwrap();
+    let error = check_host_lists_virtual_cpus(2, empty.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("run without --virtual-cpus"), "{error}");
+}
+
 fn validate_e9patch_mount_target(path: &Path) -> Result<(), Error> {
     if !path.is_absolute() {
         anyhow::bail!("e9patch mount target must be absolute: {}", path.display());
@@ -6192,6 +7313,51 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Replay a preemption or schedule record with the guest random seed it was
+    /// recorded under.
+    ///
+    /// `--seed` also seeds what the guest reads as randomness (getrandom,
+    /// `/dev/urandom`), so a replay at another `--seed`, or at the default one,
+    /// handed the guest other values than the recording did and desynced from
+    /// the schedule it replays. An omitted `--rng-seed` now takes the recorded
+    /// one, and a different explicit one is refused before anything is
+    /// launched. A record written before the seed was stored is replayed as
+    /// before.
+    fn adopt_replayed_rng_seed(&mut self) -> Result<(), Error> {
+        if self.namespace_only {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        let Some(path) = config
+            .replay_preemptions_from
+            .clone()
+            .or_else(|| config.replay_schedule_from.clone())
+        else {
+            return Ok(());
+        };
+        let Some(recorded) =
+            detcore::preemptions::read_recorded_rng_seed(&path).map_err(Error::msg)?
+        else {
+            return Ok(());
+        };
+        match self.det_opts.det_config.rng_seed {
+            None => {
+                self.det_opts.det_config.rng_seed = Some(recorded);
+                Ok(())
+            }
+            Some(explicit) if explicit != recorded => {
+                Err(Error::new(PolicyRefusal).context(format!(
+                    "the explicit --rng-seed={explicit} differs from the seed {recorded} that {} \
+                     was recorded under. The guest would read other random values than the \
+                     recorded run did, so the recorded schedule cannot reproduce it. Omit \
+                     --rng-seed to replay with the recorded seed, or pass --rng-seed={recorded}.",
+                    path.display(),
+                )))
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
     /// Refuse to replay a preemption or schedule record made under another
     /// `--pipe-wake-latency` than this run's, including a different latency
     /// (https://github.com/rrnewton/hermit/issues/4380). A record without the
@@ -6215,6 +7381,37 @@ impl RunOpts {
                 &format!("{option} {}", path.display()),
                 recorded,
                 config.pipe_wake_latency,
+            ) {
+                return Err(Error::new(PolicyRefusal).context(refusal));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse to replay a preemption or schedule record under an explicit
+    /// `--expired-wait-charge` other than the rule the record states. A replay
+    /// that leaves the option unset takes the record's rule (a record without
+    /// the field charged every wait), so it is never refused. As for the
+    /// epoch, the record is read before anything is launched.
+    fn refuse_replay_under_another_expired_wait_charge(&self) -> Result<(), Error> {
+        if self.namespace_only || self.det_opts.det_config.expired_wait_charge.is_none() {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        for (option, path) in [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            let recorded = detcore::preemptions::read_recorded_expired_wait_runs_charged_once(path)
+                .map_err(Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::expired_wait_charge_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                config.expired_wait_charge,
+                false,
             ) {
                 return Err(Error::new(PolicyRefusal).context(refusal));
             }
@@ -6252,6 +7449,61 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Whether the record `--replay-preemptions-from` names carries callback
+    /// checkpoints (`Config::annotated_priority_replay`), refusing a
+    /// configuration that cannot replay such a record
+    /// (`preemption_admission::refuse_unqualified_annotated_replay`). As for
+    /// the epoch, the record is read before anything is launched. Preparing a
+    /// run sets the configuration from this answer, whatever it carried.
+    fn annotated_priority_replay_admission(&self) -> Result<bool, Error> {
+        if self.namespace_only {
+            return Ok(false);
+        }
+        let config = &self.det_opts.det_config;
+        let Some(path) = &config.replay_preemptions_from else {
+            return Ok(false);
+        };
+        let annotated =
+            detcore::preemptions::read_recorded_callback_checkpoints(path).map_err(Error::msg)?;
+        if annotated {
+            hermit::preemption_admission::refuse_unqualified_annotated_replay(
+                config,
+                self.selected_backend(),
+            )
+            .map_err(|refusal| Error::new(PolicyRefusal).context(refusal))?;
+        }
+        Ok(annotated)
+    }
+
+    /// Refuses a replay of a recorded schedule under the other
+    /// `--cap-preemption-charge` setting, as
+    /// `refuse_replay_under_another_pipe_wake_latency` refuses another
+    /// latency. A record without the field was made with the option off.
+    fn refuse_replay_under_another_cap_preemption_charge(&self) -> Result<(), Error> {
+        if self.namespace_only {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        for (option, path) in [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            let recorded = detcore::preemptions::read_recorded_cap_preemption_charge(path)
+                .map_err(Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::cap_preemption_charge_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                config.cap_preemption_charge,
+            ) {
+                return Err(Error::new(PolicyRefusal).context(refusal));
+            }
+        }
+        Ok(())
+    }
+
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
     /// Used by `hermit oci run`, which resolves the user's reference to the
@@ -6276,6 +7528,67 @@ impl RunOpts {
     /// validation and reproducers see the backend the run will use.
     pub(crate) fn set_backend(&mut self, backend: Option<Backend>) {
         self.backend = backend;
+    }
+
+    /// Lower `--strace-only` onto exactly the options its help names: `--tmp=/tmp
+    /// --network=host --no-virtualize-cpuid --no-virtualize-time
+    /// --no-virtualize-metadata --no-sequentialize-threads --no-deterministic-io
+    /// --no-rcb-time` (a `--tmp` given explicitly is kept). Every reader of those
+    /// options then sees the spelled-out configuration: thread pinning, Detcore's
+    /// own flag implications in `Config::validate`, the time/metadata check, and
+    /// the `--dap-listen` supervisor's guest-path mapping, which runs before
+    /// validation. Applied late, after the pin decision, the shorthand used to pin
+    /// every guest thread to one CPU, which the expansion does not do.
+    ///
+    /// Idempotent, and a no-op without `--strace-only`.
+    pub(crate) fn lower_strace_only(&mut self) {
+        if !self.strace_only {
+            return;
+        }
+        self.tmp.get_or_insert_with(|| PathBuf::from(TMP_DIR));
+        self.network = NetworkingMode::Host;
+        self.no_sequentialize_threads = true;
+        self.no_deterministic_io = true;
+        let config = &mut self.det_opts.det_config;
+        config.virtualize_cpuid = false;
+        config.virtualize_time = false;
+        config.virtualize_metadata = false;
+        config.no_rcb_time = true;
+    }
+
+    /// `main`'s prelude: what it settles before it can dispatch anywhere, and
+    /// where it dispatches. The `--dap-listen` supervisor never reaches
+    /// `validate_args`, so the global backend, the `--strace-only` lowering,
+    /// the exec-stop admission, and the `--gdbserver` a DAP listener implies
+    /// (set before validation, so every `--gdbserver` refusal applies) are all
+    /// settled before the choice is made. `inner` is the value of
+    /// `DAP_LISTEN_INNER_ENV`, which marks the run a supervisor started.
+    fn dispatch_before_validation(
+        &mut self,
+        backend: Option<Backend>,
+        inner: Option<std::ffi::OsString>,
+    ) -> Result<RunDispatch, Error> {
+        self.set_backend(backend);
+        self.lower_strace_only();
+        self.prepare_mapped_verification_inputs()?;
+        self.refuse_unready_exec_stop()?;
+        // Before stdin is read or any backend is probed, so a backend that
+        // cannot even start here gets the same verdict, and before
+        // `--dap-listen` binds its port and starts the run it supervises.
+        self.refuse_gdbserver_without_a_gdbserver()?;
+        if self.dap_listen.is_none() {
+            return Ok(RunDispatch::Run);
+        }
+        self.det_opts.det_config.gdbserver = true;
+        match inner {
+            None => Ok(RunDispatch::DapSupervisor),
+            // The run a supervising `hermit run --dap-listen` started.
+            Some(owner) if started_by_a_dap_supervisor(&owner) => Ok(RunDispatch::Run),
+            Some(owner) => anyhow::bail!(
+                "{DAP_LISTEN_INNER_ENV}={owner:?} is set, but its parent did not start this \
+                 hermit run --dap-listen; unset {DAP_LISTEN_INNER_ENV}"
+            ),
+        }
     }
 
     /// The global `--backend` option that selected this run's backend, rendered
@@ -6478,6 +7791,47 @@ impl RunOpts {
             Err(refusal) => Err(Error::new(PolicyRefusal)
                 .context(format!("--cpu-profile x86-64-v3 refused: {refusal}"))),
         }
+    }
+
+    /// Refuses `--gdbserver`, and `--dap-listen`, which implies it, where the
+    /// run would have no gdbserver. Only Reverie's ptrace tracer serves gdb:
+    /// `--backend=ptrace`, the default, and `--backend=e9patch`, whose
+    /// rewritten guest runs under it. The KVM, DBT and SaBRe backends used to
+    /// run the guest without a gdbserver and without a word, so the debugger
+    /// waited on a port nothing served, and a `--strict` run took the flag
+    /// once `--gdbserver` stopped forcing host networking. `--namespace-only`
+    /// runs no tracer at all. The in-guest LiteInst backends refuse it on
+    /// their own (`refuse_unqualified_liteinst_in_guest_options`).
+    fn refuse_gdbserver_without_a_gdbserver(&self) -> Result<(), Error> {
+        let option = if self.dap_listen.is_some() {
+            "--dap-listen"
+        } else if self.det_opts.det_config.gdbserver {
+            "--gdbserver"
+        } else {
+            return Ok(());
+        };
+        let (cause, remedy) = if self.namespace_only {
+            (
+                "--namespace-only runs the guest without a tracer".to_owned(),
+                "drop --namespace-only".to_owned(),
+            )
+        } else {
+            match self.selected_backend() {
+                backend @ (Backend::Kvm | Backend::Dbt | Backend::Sabre) => (
+                    format!("the {} backend has none", backend.as_str()),
+                    format!(
+                        "run it with the ptrace backend: drop --backend={} (ptrace is the \
+                         default) or pass --backend=ptrace",
+                        backend.as_str()
+                    ),
+                ),
+                _ => return Ok(()),
+            }
+        };
+        Err(Error::new(PolicyRefusal).context(format!(
+            "{option} needs a gdbserver, which only the ptrace backend runs: {cause}, so no \
+             debugger could attach; {remedy}"
+        )))
     }
 
     fn refuse_unqualified_liteinst_in_guest_options(&self) -> Result<(), Error> {
@@ -6763,14 +8117,12 @@ impl RunOpts {
         })?))
     }
 
-    // Pure option/availability admission. The caller supplies real package
-    // discovery; retained opening still authenticates actual files before spawn.
+    // Pure option/availability admission. Availability comes from an already
+    // retained package or initial discovery; actual file checks remain required.
     #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
-    fn exec_stop_direct_domain(&self, package_available: bool) -> bool {
+    fn exec_stop_common_domain(&self, package_available: bool) -> bool {
         self.selected_backend() == Backend::InGuestTrap
             && package_available
-            && !self.verify
-            && self.verify_run.is_none()
             && !self.namespace_only
             && !self.strace_only
             && self.dap_listen.is_none()
@@ -6781,14 +8133,90 @@ impl RunOpts {
                 .is_ok_and(|command| command.find_program().is_ok())
     }
 
-    /// Admit only the opt-in packaged first-image direct-run domain. Resource
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    fn exec_stop_verification_domain(&self, package_available: bool) -> bool {
+        self.exec_stop_common_domain(package_available)
+            && ((self.verify && self.verify_run.is_none())
+                || (!self.verify
+                    && self.verify_run.is_some()
+                    && self.native_exec_shared_inputs.is_some()))
+            && !self.no_namespace
+    }
+
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    fn mapped_command_config(
+        &self,
+        identity_sources: Option<&IdentityGuard>,
+    ) -> Result<(Command, detcore::Config), Error> {
+        let command = self.guest_command()?;
+        let config = complete_container_config(
+            self.effective_det_config(),
+            identity_sources,
+            self.launch_workdir(),
+        )?;
+        let mut config = hermit::prepare_in_guest_loader_route_config(config);
+        // The encoded ForwardPolicy cannot carry span/field-dependent answers.
+        // Refuse those actual RUST_LOG directives before enabling plain INFO.
+        let directives = match std::env::var("RUST_LOG") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => String::new(),
+            Err(error) => return Err(Error::msg(error)),
+        };
+        detcore::detlog::validate_plain_info_directives(&directives).map_err(Error::msg)?;
+        config.in_guest_detlog_forward_policy =
+            Some(hermit::in_guest_detlog_forward_policy_for_native().encode());
+        Ok((command, config))
+    }
+
+    fn verification_run_log(
+        &self,
+        log_file: &mut Option<fs::File>,
+        global: &GlobalOpts,
+    ) -> Result<(SharedLog, super::tracing::TracingGuard), Error> {
+        // HACK: Use interior mutability to workaround not being able to pass
+        // `log_file` by value. Guaranteed by caller to never panic.
+        let log_file = log_file.take().unwrap();
+
+        let strictness = self.verification_strictness();
+        let level = verification_log_level(global.log, strictness, self.verify_verbose);
+
+        // Bound this log too. `hermit run --verify` opens its own file and
+        // calls `init_file_tracing` directly instead of going through
+        // `GlobalOpts::init_tracing`, so without this wrapper the bound that
+        // was measured on exactly these `--verify` comparison logs would not
+        // apply to the path that produces them: a livelocked run here could
+        // still fill the disk.
+        let limit = log_max_bytes().map_err(Error::msg)?;
+        // SYNCHRONOUS, so a fatal diagnostic in the tail survives the run that
+        // emitted it. The non-blocking appender loses whatever has not drained
+        // when a fail-closed guest dies, which is precisely the line naming the
+        // cause -- measured 0 of 18 runs versus 4 of 4. See
+        // `init_sync_file_tracing`.
+        // The coordinator writes forwarded records through this same writer, so
+        // a record and a tracing event never share a line.
+        //
+        // `--max-log-bytes` counts these logs too, forwarded records as well
+        // as tracing events, and its counter is shared across the verify runs,
+        // so the cap is a total for the invocation.
+        let log = verification_log(log_file, limit, global.log_budget());
+        let guard = init_sync_file_tracing(Some(level), log.clone(), self.runtime_backend());
+        Ok((log, guard))
+    }
+
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    fn exec_stop_direct_domain(&self, package_available: bool) -> bool {
+        self.exec_stop_common_domain(package_available) && !self.verify && self.verify_run.is_none()
+    }
+
+    /// Admit the opt-in packaged first-image direct-run or verification domain. Resource
     /// availability does not replace the retained image and actual startup checks.
     pub(crate) fn refuse_unready_exec_stop(&self) -> Result<(), Error> {
         #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
         let package_available = self.in_guest_exec_stop
             && !self.exec_stop_epoch_refused
             && self.selected_backend() == Backend::InGuestTrap
-            && super::mapped_first_admission::packaged_image_declared();
+            && (self.mapped_shared_image.is_some()
+                || super::mapped_first_admission::packaged_image_declared());
         #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
         let package_available = false;
         self.refuse_unready_exec_stop_with_availability(package_available)
@@ -6802,13 +8230,26 @@ impl RunOpts {
         #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
         let _ = package_available;
         if self.in_guest_exec_stop {
+            if self.verify_run.is_some() && self.epoch_omitted {
+                return Err(Error::new(PolicyRefusal)
+                    .context("mapped-shared-verification-requires-one-explicit-pair-epoch"));
+            }
+            #[cfg(feature = "native-exec")]
+            if self.native_exec_inputs.is_some() {
+                return Err(Error::new(PolicyRefusal).context(
+                    "--in-guest-exec-stop: exec-stop-runtime-not-ready: native successor verification is not admitted",
+                ));
+            }
             #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
-            if !self.exec_stop_epoch_refused && self.exec_stop_direct_domain(package_available) {
+            if !self.exec_stop_epoch_refused
+                && (self.exec_stop_direct_domain(package_available)
+                    || self.exec_stop_verification_domain(package_available))
+            {
                 return Ok(());
             }
             return Err(Error::new(PolicyRefusal).context(
                 "--in-guest-exec-stop: exec-stop-runtime-not-ready: requires the packaged private runtime, \
-                 in-guest-trap, and the supported direct-run options",
+                 in-guest-trap, and supported direct-run or singleton verification options",
             ));
         }
         Ok(())
@@ -6816,20 +8257,11 @@ impl RunOpts {
 
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Admission must see the actual global backend before any launch.
-        self.set_backend(global.backend);
-        self.refuse_unready_exec_stop()?;
-        if self.dap_listen.is_some() {
-            // Before validation, so every --gdbserver refusal applies.
-            self.det_opts.det_config.gdbserver = true;
-            match std::env::var_os(DAP_LISTEN_INNER_ENV) {
-                None => return self.serve_dap(),
-                // The run a supervising `hermit run --dap-listen` started.
-                Some(owner) if started_by_a_dap_supervisor(&owner) => {}
-                Some(owner) => anyhow::bail!(
-                    "{DAP_LISTEN_INNER_ENV}={owner:?} is set, but its parent did not start this \
-                     hermit run --dap-listen; unset {DAP_LISTEN_INNER_ENV}"
-                ),
-            }
+        match self
+            .dispatch_before_validation(global.backend, std::env::var_os(DAP_LISTEN_INNER_ENV))?
+        {
+            RunDispatch::DapSupervisor => return self.serve_dap(),
+            RunDispatch::Run => {}
         }
         let result = self.main_without_core_cleanup(global);
         if let Ok(status) = &result {
@@ -6897,6 +8329,69 @@ impl RunOpts {
         )
     }
 
+    pub(crate) fn adopt_verification_inputs(&mut self) -> Result<(), Error> {
+        // Before stdin or any backend: a pair whose shared inputs are missing,
+        // unsealed or not the manifest's objects is refused before it starts.
+        #[cfg(feature = "native-exec")]
+        anyhow::ensure!(
+            self.native_exec_inputs.is_none()
+                || self.verify_run.is_none()
+                || self.native_exec_shared_inputs.is_some(),
+            "native --verify-run requires the holder's shared-input manifest"
+        );
+        // Explicit mapped entry may already hold this owner. Omitted routes
+        // reach this at the unchanged post-policy-check point in main.
+        let retained = self.shared_inputs.is_some();
+        #[cfg(feature = "native-exec")]
+        let retained = retained || self.native_exec_capture.is_some();
+        if retained {
+            return Ok(());
+        }
+        if let Some(fd) = self.native_exec_shared_inputs {
+            let adopted = super::verify_inputs::take_adopted(fd)?;
+            self.adopt_shared_ld_so_cache(&adopted)?;
+            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            let adopted = {
+                let mut adopted = adopted;
+                if self.in_guest_exec_stop {
+                    self.mapped_shared_image =
+                        Some(std::sync::Arc::new(adopted.take_mapped_package()?));
+                } else {
+                    anyhow::ensure!(
+                        !adopted.has_mapped_package(),
+                        "shared mapped package requires the mapped launch mechanism"
+                    );
+                }
+                adopted
+            };
+            #[cfg(feature = "native-exec")]
+            if self.native_exec_inputs.is_some() {
+                self.native_exec_capture = Some(std::sync::Arc::new(
+                    adopted.into_inputs::<super::native_exec_cli::Capture>()?,
+                ));
+            } else {
+                self.shared_inputs = Some(std::sync::Arc::new(adopted));
+            }
+            #[cfg(not(feature = "native-exec"))]
+            {
+                self.shared_inputs = Some(std::sync::Arc::new(adopted));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_mapped_verification_inputs(&mut self) -> Result<(), Error> {
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        if self.in_guest_exec_stop {
+            // Reject unsupported options before consuming the holder's entry.
+            // Availability here is only a precheck: each caller still performs
+            // the real package-availability admission after adoption.
+            self.refuse_unready_exec_stop_with_availability(true)?;
+            self.adopt_verification_inputs()?;
+        }
+        Ok(())
+    }
+
     fn main_without_core_cleanup(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Set up an early tracing option before we're ready to set the global default:
 
@@ -6929,30 +8424,7 @@ impl RunOpts {
         // happens-before spec this launch cannot enforce needs neither, so it
         // is refused at once rather than after input or availability checks.
         self.refuse_unenforceable_happens_before()?;
-        // Before stdin or any backend: a pair whose shared inputs are missing,
-        // unsealed or not the manifest's objects is refused before it starts.
-        #[cfg(feature = "native-exec")]
-        anyhow::ensure!(
-            self.native_exec_inputs.is_none()
-                || self.verify_run.is_none()
-                || self.native_exec_shared_inputs.is_some(),
-            "native --verify-run requires the holder's shared-input manifest"
-        );
-        if let Some(fd) = self.native_exec_shared_inputs {
-            let adopted = super::verify_inputs::take_adopted(fd)?;
-            #[cfg(feature = "native-exec")]
-            if self.native_exec_inputs.is_some() {
-                self.native_exec_capture = Some(std::sync::Arc::new(
-                    adopted.into_inputs::<super::native_exec_cli::Capture>()?,
-                ));
-            } else {
-                self.shared_inputs = Some(std::sync::Arc::new(adopted));
-            }
-            #[cfg(not(feature = "native-exec"))]
-            {
-                self.shared_inputs = Some(std::sync::Arc::new(adopted));
-            }
-        }
+        self.adopt_verification_inputs()?;
         // Also before stdin is read: a host or run the x86-64-v3 profile
         // cannot qualify is refused at once.
         self.admit_cpu_profile()?;
@@ -6972,11 +8444,26 @@ impl RunOpts {
         // off, and still before stdin is read or anything is launched.
         self.refuse_happens_before_without_preemption()?;
         self.adopt_replayed_schedule_epoch()?;
+        self.adopt_replayed_rng_seed()?;
         // After the replayed epoch is adopted, which makes an omitted epoch
         // explicit, and still before stdin is read or anything is launched.
         self.refuse_strict_with_host_drawn_inputs()?;
         self.refuse_replay_under_another_pipe_wake_latency()?;
         self.refuse_replay_under_another_signal_state_copy()?;
+        // Refused here too, before stdin is read; each run's preparation
+        // below sets the configuration from the same record.
+        self.annotated_priority_replay_admission()?;
+        // As `--seed-from` prints the seed it chose: the value pins this
+        // run's maximum with `--max-timeslice`.
+        if let Some(drawn) = self.seeded_chaos_timeslice() {
+            crate::tracing::diagnostic_eprintln!(
+                "[hermit] --chaos-seeded-timeslice: scheduler seed {} drew --max-timeslice={}",
+                self.det_opts.det_config.sched_seed(),
+                drawn
+            );
+        }
+        self.refuse_replay_under_another_expired_wait_charge()?;
+        self.refuse_replay_under_another_cap_preemption_charge()?;
         if !self.namespace_only
             && (self.verify_verbose
                 || global
@@ -7264,6 +8751,7 @@ impl RunOpts {
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
         self.refuse_unready_exec_stop()?;
+        self.refuse_gdbserver_without_a_gdbserver()?;
         refuse_signal_state_check_env(std::env::var_os(SIGNAL_STATE_CHECK_ENV).as_deref())
             .map_err(Error::msg)?;
         let timer = if self.arms_reverie_ptrace_pmu_timer() {
@@ -7313,6 +8801,9 @@ impl RunOpts {
         &mut self,
         timer: Result<(), TimerUnavailable>,
     ) -> Result<(), Error> {
+        // Callers other than `main` (analyze, oci, tests) reach validation
+        // without `dispatch_before_validation`; lowering again is a no-op.
+        self.lower_strace_only();
         self.refuse_unready_exec_stop()?;
         self.resolve_preemption_settings()?;
         let backend = self.selected_backend();
@@ -7374,6 +8865,9 @@ impl RunOpts {
             );
         }
 
+        // What the command line asked for, before the modes below that force
+        // host networking.
+        let host_network_requested = self.network == NetworkingMode::Host;
         let config = &mut self.det_opts.det_config;
 
         // Every backend, DBT included, launches the guest through Reverie's
@@ -7577,6 +9071,24 @@ impl RunOpts {
                  configuration form that predates the option"
             );
         }
+        if let Some(cpus) = config.virtual_cpus {
+            if self.namespace_only {
+                anyhow::bail!(
+                    "--virtual-cpus is presented by Detcore, and --namespace-only (--lite) runs \
+                     the guest natively, without it, so the guest would see the host's CPUs; \
+                     drop one of the two"
+                );
+            }
+            if !matches!(backend, Backend::Ptrace | Backend::E9patch) {
+                anyhow::bail!(
+                    "--virtual-cpus has been checked on the ptrace backend only (and on e9patch \
+                     preprocessing, which runs on it); backend `{}` is refused: run with the \
+                     ptrace backend (the default) or without --virtual-cpus",
+                    backend.as_str()
+                );
+            }
+            check_host_lists_virtual_cpus(cpus.get(), Path::new("/sys/devices/system/cpu"))?;
+        }
         config.deterministic_io = self.strict || !self.no_deterministic_io;
         // An unmodeled host syscall makes a successful result unqualified.
         // Ordinary execution therefore fails closed; compatibility passthrough
@@ -7614,6 +9126,30 @@ impl RunOpts {
         if let Err(error) = config.scheduler_turn_charge() {
             anyhow::bail!("{error}");
         }
+
+        if let Some(sf) = &self.seed_from {
+            let seed = match sf {
+                SeedFrom::Args => {
+                    let mut hasher = DefaultHasher::new();
+                    self.args.hash(&mut hasher);
+                    self.program.hash(&mut hasher);
+                    hasher.finish()
+                }
+                SeedFrom::SystemRandom => rand::random::<u64>(),
+            };
+            // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
+            crate::tracing::diagnostic_eprintln!(
+                "[hermit] auto setting --seed {0:?} --sched-seed {0:?}",
+                seed
+            );
+            config.seed = seed;
+            self.seed_from_resolved = Some(seed);
+        }
+
+        // Once the seed is final, and before the checks below, so that they
+        // check the maximum the run will use.
+        self.resolve_seeded_chaos_timeslice()?;
+        let config = &mut self.det_opts.det_config;
         let minimum_max_timeslice = config.minimum_max_timeslice_nanos();
         if let Some(max_timeslice) = config.max_timeslice
             && u64::from(max_timeslice) < minimum_max_timeslice
@@ -7655,41 +9191,50 @@ impl RunOpts {
             self.timer_downgrade = Some(unavailable.clone());
         }
 
-        if let Some(sf) = &self.seed_from {
-            let seed = match sf {
-                SeedFrom::Args => {
-                    let mut hasher = DefaultHasher::new();
-                    self.args.hash(&mut hasher);
-                    self.program.hash(&mut hasher);
-                    hasher.finish()
-                }
-                SeedFrom::SystemRandom => rand::random::<u64>(),
-            };
-            // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
-            crate::tracing::diagnostic_eprintln!(
-                "[hermit] auto setting --seed {0:?} --sched-seed {0:?}",
-                seed
-            );
-            config.seed = seed;
-            self.seed_from_resolved = Some(seed);
-        }
-
         // Deterministic RCB counts requires thread pinning.  But this only matters if
         // we're expecting full determinstic execution (sequentialize_threads).
         if config.max_timeslice.is_some() && config.sequentialize_threads {
             self.pin_threads = true;
         }
 
-        if self.strace_only {
-            config.virtualize_cpuid = false;
-            config.virtualize_metadata = false;
-            config.virtualize_time = false;
-            config.deterministic_io = false;
-            self.network = NetworkingMode::Host;
-            config.sequentialize_threads = false;
-            config.no_rcb_time = true;
-            if self.tmp.is_none() {
-                self.tmp = Some(PathBuf::from("/tmp"));
+        // `--cap-preemption-charge` lowers the charge of turns that end an
+        // expired timeslice under Detcore's scheduler. A launch where no such
+        // turn can happen would accept the flag and ignore it, so it is
+        // refused before launch. Checked after the timer downgrade above, which
+        // can take the timeslices away, and after `lower_strace_only`.
+        if config.cap_preemption_charge {
+            if backend == Backend::Dbt {
+                anyhow::bail!(
+                    "the dbt backend cannot apply --cap-preemption-charge: its runtime reads a \
+                     frozen configuration form that predates the option; use the ptrace backend"
+                );
+            }
+            let unscheduled = if self.namespace_only {
+                Some("--namespace-only")
+            } else if self.strace_only {
+                Some("--strace-only")
+            } else if !config.sequentialize_threads {
+                Some("--no-sequentialize-threads")
+            } else {
+                None
+            };
+            if let Some(option) = unscheduled {
+                anyhow::bail!(
+                    "--cap-preemption-charge lowers the charge of the scheduler turns that end \
+                     timeslices; {option} runs the guest without them. Drop {option} or \
+                     --cap-preemption-charge"
+                );
+            }
+            if config.max_timeslice.is_none() && config.target_timeslice.is_none() {
+                let cause = match &self.timer_downgrade {
+                    Some(_) => "this host's PMU timer is unavailable (see the warning above)",
+                    None => "--max-timeslice=disabled",
+                };
+                anyhow::bail!(
+                    "--cap-preemption-charge has no effect: no timeslice ends by expiry because \
+                     {cause}. Give a --max-timeslice (or --target-timeslice), or drop \
+                     --cap-preemption-charge"
+                );
             }
         }
 
@@ -7706,32 +9251,6 @@ impl RunOpts {
             );
         }
 
-        // The gdbserver listens on a TCP port that is bound inside the guest's
-        // network namespace. With the default isolated (`local`) networking, that
-        // port lives in the guest's unshared netns and is unreachable from a host
-        // gdb client, so `hermit run --gdbserver` silently hangs waiting for a
-        // connection that can never arrive. Fall back to host networking so the
-        // debugger can attach. This mirrors how replay-mode gdbserver already
-        // works: a gdb-served replay never unshares the network namespace, which
-        // is exactly why its gdbserver is reachable from the host.
-        if self.det_opts.det_config.gdbserver && self.network == NetworkingMode::Local {
-            if self.analyze_networking {
-                anyhow::bail!(
-                    "--gdbserver requires host networking so a host gdb client can reach the \
-                     gdbserver port, but --analyze-networking forces an isolated network \
-                     namespace. Run these two modes separately."
-                );
-            }
-            // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
-            crate::tracing::diagnostic_eprintln!(
-                "WARNING: --gdbserver requires host networking so a host gdb client can reach \
-                 the gdbserver port; overriding --network=local with --network=host for this \
-                 debug session. Network isolation and deterministic networking are disabled \
-                 while the gdbserver is attached."
-            );
-            self.network = NetworkingMode::Host;
-        }
-
         // `--strict` calls itself fail-closed strict deterministic mode, so it
         // must refuse the settings hermit itself documents as
         // determinism-compromising rather than accept them silently. Before
@@ -7739,14 +9258,14 @@ impl RunOpts {
         // `--network`'s own help says `host` "compromises isolation and
         // deterministic reproducibility".
         //
-        // Checked HERE, after every override above, because two of the three
-        // routes to host networking are side effects of flags that are not
-        // about networking at all: `--no-namespace` sets it above, and
-        // `--gdbserver` sets it just above (that one at least prints a
-        // warning; the others were silent). Measured from inside the guest,
-        // `--strict` alone sees interfaces `lo`, while `--strict --network=host`,
-        // `--strict --no-namespace` and `--strict --strace-only` all see
-        // `eth0 lo`.
+        // Checked HERE, after every override above, because one of the two
+        // routes to host networking is a side effect of a flag that is not
+        // about networking at all: `--no-namespace` sets it above, silently.
+        // Measured from inside the guest, `--strict` alone sees interfaces
+        // `lo`, while `--strict --network=host`, `--strict --no-namespace` and
+        // `--strict --strace-only` all see `eth0 lo`. `--gdbserver` is not a
+        // route: its port is bound in the host's namespace before the
+        // container exists (`hermit::gdbserver`), so the guest keeps `lo`.
         //
         // This forbids rather than warns because the directive is that a hole
         // must be opened deliberately: drop `--strict`, or ask for the hole
@@ -7754,8 +9273,6 @@ impl RunOpts {
         if self.strict && self.network == NetworkingMode::Host {
             let cause = if self.no_namespace {
                 "--no-namespace, which forces host networking"
-            } else if self.det_opts.det_config.gdbserver {
-                "--gdbserver, which forces host networking"
             } else {
                 "--network=host"
             };
@@ -7778,6 +9295,21 @@ impl RunOpts {
         // documentation lists the routes that remain open. Replay applies the
         // same refusals in its private namespace.
         self.det_opts.det_config.network_trace = self.network_trace_config()?;
+        // Detcore's notice for an abstract AF_UNIX bind, on only where its
+        // advice holds and it reaches Hermit's stderr rather than the guest's:
+        // --network=host, given or as part of --strace-only's documented
+        // expansion (lowered before this, so both spellings resolve alike),
+        // whose run really shares the host's namespace (--analyze-networking
+        // isolates it), in a PID namespace (every guest's first process is
+        // pid 3), not taken over by --gdbserver, which needs host networking
+        // (a recording, which refuses abstract addresses outright, cannot be
+        // combined with --network=host), and with Detcore in Hermit's own
+        // process (the ptrace backend, e9patch preprocessing included).
+        self.det_opts.det_config.notice_host_network_abstract_binds = host_network_requested
+            && !self.network.uses_local_namespace(self.analyze_networking)
+            && !self.no_namespace
+            && !self.det_opts.det_config.gdbserver
+            && matches!(backend, Backend::Ptrace | Backend::E9patch);
         if self.record_networking.is_some() {
             self.network = NetworkingMode::Host;
         }
@@ -7839,8 +9371,7 @@ impl RunOpts {
             (
                 config.gdbserver,
                 "--gdbserver",
-                "it moves every trial to the host network and makes each one wait for a debugger \
-                 on the same port",
+                "it makes every trial wait for a debugger on the same port",
             ),
             (
                 self.dap_listen.is_some(),
@@ -8800,6 +10331,8 @@ impl RunOpts {
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         self.refuse_unready_exec_stop()?;
         let mut options = self.clone();
+        options.det_opts.det_config.annotated_priority_replay =
+            options.annotated_priority_replay_admission()?;
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
         #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
@@ -8887,6 +10420,7 @@ impl RunOpts {
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
         self.refuse_unready_exec_stop()?;
+        let gdbserver_port = self.bind_gdbserver_port()?;
         let (mut container, tmpfs, identity, resources) = if self.no_namespace {
             let mut container = Container::new();
             apply_affinity(&mut container, self.pin_threads);
@@ -8915,16 +10449,22 @@ impl RunOpts {
         let native_plan: Option<()> = None;
         super::owned_container::run(
             &mut container,
-            (tmpfs, identity, guards, native_plan),
+            (tmpfs, identity, guards, native_plan, gdbserver_port),
             resources,
             !self.no_namespace,
             "with_container",
             timeout,
-            move |(_, identity, guards, native_plan)| {
+            move |(_, identity, guards, native_plan, gdbserver_port)| {
                 // What the mount plan made, before anything else uses the
-                // container's mounts (a no-op for a plan with no record).
+                // container's mounts (a no-op for a plan with no record), and
+                // whether the placeholder directory is still where the guest
+                // path reaches it.
                 if let Some(identity) = identity.as_mut() {
                     identity.record_plan()?;
+                    identity.confirm_directory_placeholder();
+                }
+                if let Some(port) = gdbserver_port.take() {
+                    port.serve_next_gdbserver();
                 }
                 #[cfg(feature = "native-exec")]
                 let native = native_plan
@@ -8936,7 +10476,41 @@ impl RunOpts {
                 work(guards, identity.as_ref(), native)
             },
         )
-        .map(|(value, (_, _, guards, _))| (value, guards))
+        .map(|(value, (_, _, guards, _, _))| (value, guards))
+    }
+
+    /// For a `--gdbserver` run on the ptrace tracer, the one that serves gdb,
+    /// binds the gdbserver's port here, in the host's network namespace,
+    /// before the container exists, so a gdb client on the host reaches it
+    /// whatever network the guest has ([`hermit::gdbserver`]), and says where
+    /// to attach.
+    fn bind_gdbserver_port(&self) -> Result<Option<hermit::gdbserver::GdbPort>, Error> {
+        let config = &self.det_opts.det_config;
+        if !config.gdbserver || self.runtime_backend() != Backend::Ptrace {
+            return Ok(None);
+        }
+        let port = hermit::gdbserver::GdbPort::bind(config.gdbserver_port).with_context(|| {
+            // `--dap-listen` must know the port, so it refuses 0.
+            let remedy = if self.dap_listen.is_some() {
+                "pass another --gdbserver-port"
+            } else {
+                "pass another --gdbserver-port, or --gdbserver-port=0 to let the system pick one"
+            };
+            format!(
+                "Hermit cannot serve gdb on 127.0.0.1:{}: {remedy}",
+                config.gdbserver_port
+            )
+        })?;
+        // A `--dap-listen` run's supervisor names the attach request instead.
+        if self.dap_listen.is_none() {
+            crate::tracing::diagnostic_eprintln!(
+                "hermit run: the guest waits for one gdb client on 127.0.0.1:{0} before it \
+                 starts; attach with: gdb -ex 'target remote 127.0.0.1:{0}' {1}",
+                port.port(),
+                self.program.display()
+            );
+        }
+        Ok(Some(port))
     }
 
     fn run_with_namespace_only(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
@@ -9118,29 +10692,54 @@ impl RunOpts {
             .arms_reverie_ptrace_pmu_timer()
             .then(branch_counter_verdict);
 
-        let completed = options
-            .run_verify(
-                log_file,
-                &log_path,
+        let execute = || {
+            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            let mapped_image = if self.in_guest_exec_stop {
+                Some(
+                    self.mapped_shared_image
+                        .as_ref()
+                        .context("mapped --verify-run requires its holder's retained package")?,
+                )
+            } else {
+                None
+            };
+            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            if let Some(image) = mapped_image {
+                image.verify()?;
+            }
+            let result = options.run_verify(
+                (log_file, &log_path),
                 forwarded,
                 global,
                 VerificationRun::Run1,
                 #[cfg(feature = "dbt")]
                 None,
-            )
-            .and_then(|completed| {
-                let VerificationRunOutput {
-                    mut output,
-                    skid_overshoots,
-                    latches,
-                    #[cfg(feature = "dbt")]
-                        dbt: _,
-                } = completed;
-                latches.refuse_comparison("run")?;
-                let forwarded_syscalls =
-                    self.take_forwarded_detlogs(&log_path, &mut output.stderr, socket)?;
-                Ok((output, skid_overshoots, forwarded_syscalls))
-            });
+                #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+                mapped_image.map(|image| MappedVerificationRun {
+                    image: image.clone(),
+                    policy: super::mapped_first_admission::CapturePolicy::Full,
+                }),
+            );
+            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            if let Some(image) = mapped_image {
+                return finish_mapped_verification_image(result, image.verify());
+            }
+            result
+        };
+        let executed = execute();
+        let completed = executed.and_then(|completed| {
+            let VerificationRunOutput {
+                mut output,
+                skid_overshoots,
+                latches,
+                #[cfg(feature = "dbt")]
+                    dbt: _,
+            } = completed;
+            latches.refuse_comparison("run")?;
+            let forwarded_syscalls =
+                self.take_forwarded_detlogs(&log_path, &mut output.stderr, socket)?;
+            Ok((output, skid_overshoots, forwarded_syscalls))
+        });
         let (outcome, result) = match completed {
             Ok((output, skid_overshoots, forwarded_syscalls)) => {
                 writer.write(verify_run::STDOUT, &output.stdout)?;
@@ -9206,22 +10805,90 @@ impl RunOpts {
         if let Some(path) = &self.verify_json {
             write_pending_verification_json(path)?;
         }
+        // One /etc/ld.so.cache snapshot for both runs, taken before anything
+        // copies these options -- the DBT adapter keeps its own copy and runs
+        // both executions from it (https://github.com/rrnewton/hermit/issues/4693).
+        self.with_verification_ld_so_cache()?
+            .verify_sharing_ld_so_cache(global, _dbt_stdin)
+    }
+
+    /// [`Self::verify`] once these options carry the snapshot both runs bind.
+    fn verify_sharing_ld_so_cache(
+        &self,
+        global: &GlobalOpts,
+        _dbt_stdin: Option<fs::File>,
+    ) -> Result<ExitStatus, Error> {
         #[cfg(feature = "dbt")]
-        let mut dbt = if self.selected_backend() == Backend::Dbt {
+        let dbt = if self.selected_backend() == Backend::Dbt {
             Some(self.dbt_invocation()?.verification(_dbt_stdin)?)
         } else {
             None
         };
-        self.verify_with_execution(|options, log, path, forwarded, run| {
-            options.run_verify(
-                log,
-                path,
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        let mapped_image = if self.in_guest_exec_stop {
+            self.refuse_unready_exec_stop()?;
+            Some(std::sync::Arc::new(
+                super::mapped_first_admission::RetainedImage::open()?,
+            ))
+        } else {
+            None
+        };
+        self.verify_with_retained_adapters(
+            global,
+            #[cfg(feature = "dbt")]
+            dbt,
+            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            mapped_image,
+        )
+    }
+
+    /// Run the common pair after its physical adapters and inputs are retained.
+    fn verify_with_retained_adapters(
+        &self,
+        global: &GlobalOpts,
+        #[cfg(feature = "dbt")] mut dbt: Option<super::backends::DbtVerification>,
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))] mapped_image: Option<
+            std::sync::Arc<super::mapped_first_admission::RetainedImage>,
+        >,
+    ) -> Result<ExitStatus, Error> {
+        // Admission inside the common pair owner and each container must use
+        // this same retained package too. Resource paths may disappear after
+        // opening; neither run may turn them into a second mutable input.
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        let retained_options = mapped_image.as_ref().map(|image| {
+            let mut options = self.clone();
+            options.mapped_shared_image = Some(image.clone());
+            options
+        });
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        let pair_options = retained_options.as_ref().unwrap_or(self);
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        let pair_options = self;
+        pair_options.verify_with_execution(|options, log, path, forwarded, run| {
+            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            if let Some(image) = mapped_image.as_ref() {
+                image.verify()?;
+            }
+            let result = options.run_verify(
+                (log, path),
                 forwarded,
                 global,
                 run,
                 #[cfg(feature = "dbt")]
                 dbt.as_mut(),
-            )
+                #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+                mapped_image.as_ref().map(|image| MappedVerificationRun {
+                    image: image.clone(),
+                    policy: super::mapped_first_admission::CapturePolicy::Full,
+                }),
+            );
+            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            if let Some(image) = mapped_image.as_ref() {
+                // The same opened image is checked after owned finalization on
+                // both outcomes. A close error cannot replace an execution error.
+                return finish_mapped_verification_image(result, image.verify());
+            }
+            result
         })
     }
 
@@ -9279,9 +10946,18 @@ impl RunOpts {
         let summary2_path = records_run_metadata
             .then(|| self.summary_json.as_deref().or(summary1_path.as_deref()))
             .flatten();
+        // Both runs bind one snapshot of the host's /etc/ld.so.cache: the
+        // package manager can replace it between them, and the two loaders'
+        // `fstat` of it would then differ (https://github.com/rrnewton/hermit/issues/4693).
+        let ld_so_cache = self
+            .with_verification_ld_so_cache()?
+            .ld_so_cache_snapshot
+            .expect("with_verification_ld_so_cache always sets the snapshot");
         let mut run1_options = self.clone();
         run1_options.summary_json = summary1_path.clone();
+        run1_options.ld_so_cache_snapshot = Some(ld_so_cache.clone());
         let mut run2_options = self.clone();
+        run2_options.ld_so_cache_snapshot = Some(ld_so_cache);
         run2_options.summary_json = summary2_path.map(Path::to_owned);
 
         // Each run records the host files its guest opens, so that a
@@ -9349,6 +11025,19 @@ impl RunOpts {
                 }
                 error =
                     publish_run_failure(self.verify_json.as_deref(), VerificationRun::Run1, error);
+                // A refused or failed first run names its reason only in its
+                // own log (a policy refusal's reason is a Detcore tracing
+                // event, and only the exit status leaves the container), so
+                // --print-verify-logs echoes it here too, before retention
+                // takes the log. Not after the log cap: that exit must stay
+                // prompt, and the log is the one that crossed it.
+                if self.print_verify_logs
+                    && error.downcast_ref::<LogCapExceeded>().is_none()
+                    && let Err(echo_error) = echo_first_run_log(&log1_path)
+                {
+                    error =
+                        retain_verification_error(error, "echoing the first-run log", echo_error);
+                }
                 if self.keep_logs {
                     error = retain_logs_after_verification_error(error, [("run 1", log1_path)]);
                 }
@@ -9386,30 +11075,8 @@ impl RunOpts {
             signal_reports.prepare("run 1", out1.status, &log1_path);
         }
 
-        // With --verify the first run's `--log` output was diverted to a
-        // temporary file for later comparison rather than shown to the user.
-        // When --print-verify-logs is set, echo that first run's log to stderr so the
-        // user still sees `--log` output, matching a normal (non-verify) run.
-        // The log file is fully flushed here because run_verify runs each
-        // execution in a child process that has already exited.
-        //
-        // Run 2 has not started yet, so under --max-log-bytes this echo must not
-        // wait on stderr: the log goes through `DroppingStderr`, which waits for
-        // a full pipe only within `RetryingStderr`'s bounded deadline and drops
-        // what it then cannot deliver. Without the cap it is written exactly as
-        // before, and a failed write is still an error.
         if self.print_verify_logs {
-            match fs::read(&log1_path) {
-                Ok(bytes) if hermit::nonwaiting_write::diagnostics_must_not_wait() => {
-                    let _ = detcore::util::DroppingStderr.write_all(&bytes);
-                }
-                Ok(bytes) => std::io::stderr().write_all(&bytes)?,
-                Err(err) => crate::tracing::diagnostic_eprintln!(
-                    "WARNING: --print-verify-logs could not read first-run log {}: {}",
-                    log1_path.display(),
-                    err
-                ),
-            }
+            echo_first_run_log(&log1_path)?;
         }
 
         if let Some(error) = reject_first_run(
@@ -9721,7 +11388,7 @@ impl RunOpts {
     /// These options with the DBT adapter's own container inputs added after
     /// the caller's, only for this physical launch.
     #[cfg(feature = "dbt")]
-    pub(super) fn with_dbt_mounts(&self, binds: &[Bind], mounts: Vec<Mount>) -> Self {
+    pub(super) fn with_dbt_mounts(&self, binds: &[Bind], mounts: Vec<MountArg>) -> Self {
         let mut options = self.clone();
         options.backend_mounts.0 += mounts.len();
         options.backend_mounts.1 += binds.len();
@@ -9734,7 +11401,7 @@ impl RunOpts {
     /// them (shown in the guest's mount table): the DBT adapter's tmpfs at
     /// the test workdir, which the guest uses as its working directory.
     #[cfg(feature = "dbt")]
-    pub(super) fn with_guest_mount(&self, mount: Mount) -> Self {
+    pub(super) fn with_guest_mount(&self, mount: MountArg) -> Self {
         let mut options = self.clone();
         options.mount.push(mount);
         options
@@ -9746,6 +11413,7 @@ impl RunOpts {
     pub(super) fn mounts_tmpfs_at(&self, target: &Path) -> bool {
         self.mount
             .iter()
+            .map(|arg| &arg.mount)
             .any(|mount| mount.get_target() == target && mount.clone().fstype("tmpfs") == *mount)
     }
 
@@ -9756,12 +11424,66 @@ impl RunOpts {
         !self.no_namespace
     }
 
+    /// Take the `/etc/ld.so.cache` role the `hermit verify-inputs` holder
+    /// sealed, if it sealed one, as this run's snapshot: both runs of the pair
+    /// then bind the same bytes whatever the host's package manager does
+    /// between them (https://github.com/rrnewton/hermit/issues/4693).
+    fn adopt_shared_ld_so_cache(
+        &mut self,
+        adopted: &super::verify_inputs::AdoptedInputs,
+    ) -> Result<(), Error> {
+        if let Some(bytes) = adopted.read_role(LD_SO_CACHE_ROLE, Path::new(LD_SO_CACHE_PATH))? {
+            self.ld_so_cache_snapshot =
+                Some(super::container::LdSoCacheSnapshot::from_bytes(bytes));
+        }
+        Ok(())
+    }
+
+    /// Whether these options carry the `/etc/ld.so.cache` snapshot both runs
+    /// of a verification bind.
+    #[cfg(feature = "dbt")]
+    pub(super) fn has_ld_so_cache_snapshot(&self) -> bool {
+        self.ld_so_cache_snapshot.is_some()
+    }
+
+    /// These options with the `/etc/ld.so.cache` snapshot both runs of an
+    /// in-process verification bind: the one already taken, else the host's
+    /// cache now.
+    fn with_verification_ld_so_cache(&self) -> Result<Self, Error> {
+        let mut shared = self.clone();
+        if shared.ld_so_cache_snapshot.is_none() {
+            shared.ld_so_cache_snapshot = Some(super::container::LdSoCacheSnapshot::of_host()?);
+        }
+        Ok(shared)
+    }
+
     /// Returns the mounts to be used with the container, in the order they are
     /// installed: the identity-hardening mounts, the caller's `--mount`s and
     /// `--bind`s (a backend adapter's own last, marked as a backend's), the
     /// e9patch overlay (a backend's own), and the private `/tmp`.
     fn mounts(&self, tmpfs: &Path) -> Result<PreparedMounts, Error> {
-        let (mut identity_mounts, identity_sources) = identity_hardening_mounts()?;
+        // Each run of an in-process `--verify` must bind the one snapshot its
+        // owner took for both; reading the host here would let a cache
+        // replaced between the runs reach only one of them
+        // (https://github.com/rrnewton/hermit/issues/4693).
+        anyhow::ensure!(
+            !matches!(self.fatal_core_run_label, Some("run1" | "run2"))
+                || self.ld_so_cache_snapshot.is_some(),
+            "verification run {} has no shared /etc/ld.so.cache snapshot",
+            self.fatal_core_run_label.unwrap_or_default()
+        );
+        // And a `--verify-run` whose holder sealed the cache binds that copy,
+        // never the host's (`adopt_shared_ld_so_cache`).
+        anyhow::ensure!(
+            self.ld_so_cache_snapshot.is_some()
+                || !self
+                    .shared_inputs
+                    .as_ref()
+                    .is_some_and(|inputs| inputs.has_role(LD_SO_CACHE_ROLE)),
+            "the shared inputs seal /etc/ld.so.cache, but this run did not adopt it"
+        );
+        let (mut identity_mounts, identity_sources) =
+            identity_hardening_mounts(self.ld_so_cache_snapshot.as_ref())?;
         let mut identity_sources = identity_sources;
         let mut explicit_tmp_mount = false;
         let mut user_mounts = Vec::with_capacity(self.mount.len() + self.bind.len());
@@ -9775,7 +11497,7 @@ impl RunOpts {
             }
         };
 
-        for (index, mount) in self.mount.iter().enumerate() {
+        for (index, mount) in self.mount.iter().map(|arg| &arg.mount).enumerate() {
             let backend = index >= backend_mounts_from;
             let user_target = mount.get_target();
             identity_sources.discard_mounts_shadowed_by(&mut identity_mounts, user_target);
@@ -9879,10 +11601,22 @@ impl RunOpts {
         // image's materialized rootfs (deterministic file inputs) rather than
         // the host filesystem. This replaces the default namespace+mounts setup
         // with a chroot into the pinned image root.
+        // Detcore's placeholder directory, only where the guest's procfs is
+        // not the kernel's (`detcore::needs_directory_placeholder`): where it
+        // is, Detcore serves its `/proc` directories on that procfs's root,
+        // and no tmpfs of Hermit's is there for a guest to reach.
+        let mounts_placeholder = detcore::needs_directory_placeholder(
+            &hermit::backend_capabilities(self.runtime_backend()),
+        );
         if let Some(image) = &self.image {
             let rootfs = crate::image::materialize_rootfs(image)?;
-            let (mut container, identity_sources) =
-                image_container(&rootfs, tmpfs, self.pin_threads, self.tmp.is_none())?;
+            let (mut container, identity_sources) = image_container(
+                &rootfs,
+                tmpfs,
+                self.pin_threads,
+                self.tmp.is_none(),
+                mounts_placeholder,
+            )?;
             self.network
                 .configure(&mut container, self.analyze_networking);
             return Ok((container, identity_sources));
@@ -9896,9 +11630,33 @@ impl RunOpts {
             mounts,
             mut identity_sources,
         } = self.mounts(tmpfs)?;
+        // Detcore's placeholder directory, where the backend needs one, right
+        // after the container's own `/proc`, which holds its mount point,
+        // unless a later mount of the plan covers it, as the setup resolves
+        // each target in turn (a `--mount` at `/proc/fs` or the directory
+        // itself, by any spelling that resolves there:
+        // `container::later_mount_covers`): then Detcore serves no
+        // placeholder directory, as without a container. The container's init
+        // checks again once every mount is in
+        // (`IdentityGuard::confirm_directory_placeholder`).
+        let placeholder = PathBuf::from(super::container::DIRECTORY_PLACEHOLDER);
         let mut plan = vec![PlannedMount::hermit(container_proc_mount())];
+        if mounts_placeholder {
+            plan.push(PlannedMount::placeholder(
+                super::container::directory_placeholder_mount(&placeholder),
+            ));
+        }
         plan.extend(mounts);
+        let placeholder = if !mounts_placeholder {
+            None
+        } else if super::container::later_mount_covers(&plan, 1) {
+            plan.remove(1);
+            None
+        } else {
+            Some(placeholder)
+        };
         identity_sources.set_plan(&mut container, plan)?;
+        identity_sources.set_directory_placeholder(placeholder);
         #[cfg(feature = "native-exec")]
         if self.native_exec_capture.is_some() {
             identity_sources.forget_plan();
@@ -9922,13 +11680,21 @@ impl RunOpts {
 
     fn run_verify(
         &self,
-        log_file: fs::File,
-        _log_path: &Path,
+        log: (fs::File, &Path),
         forwarded_detlogs: ForwardedDetlogPlan,
         global: &GlobalOpts,
         _run: VerificationRun,
         #[cfg(feature = "dbt")] dbt: Option<&mut super::backends::DbtVerification>,
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))] mapped: Option<
+            MappedVerificationRun,
+        >,
     ) -> Result<VerificationRunOutput, Error> {
+        let (log_file, _log_path) = log;
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        anyhow::ensure!(
+            self.in_guest_exec_stop == mapped.is_some(),
+            "mapped verification requires its retained image context"
+        );
         #[cfg(feature = "dbt")]
         if let Some(dbt) = dbt {
             return dbt.run(
@@ -9941,6 +11707,8 @@ impl RunOpts {
             );
         }
         let mut options = self.clone();
+        options.det_opts.det_config.annotated_priority_replay =
+            options.annotated_priority_replay_admission()?;
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
         let resources = format!(
@@ -9956,14 +11724,25 @@ impl RunOpts {
                 ""
             },
         );
-        self.launch_in_container(
-            (Some(log_file), network_trace, forwarded_detlogs),
-            &resources,
-            None,
-            move |(log, _, forwarded), identity, native| {
-                options.run_verify_in_container(log, forwarded, &global, identity, native)
-            },
-        )
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        let guards = (Some(log_file), network_trace, forwarded_detlogs, mapped);
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        let guards = (Some(log_file), network_trace, forwarded_detlogs);
+        self.launch_in_container(guards, &resources, None, move |guards, identity, native| {
+            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            let (log, _, forwarded, mapped) = guards;
+            #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+            let (log, _, forwarded) = guards;
+            options.run_verify_in_container(
+                log,
+                forwarded,
+                &global,
+                identity,
+                native,
+                #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+                mapped.as_ref(),
+            )
+        })
         .map(
             |((output, skid_overshoots, latches), _guards)| VerificationRunOutput {
                 output,
@@ -10109,6 +11888,75 @@ impl RunOpts {
     pub(crate) fn capture_max_timeslice_source(&mut self, matches: &clap::ArgMatches) {
         self.max_timeslice_explicit =
             matches.value_source("max_timeslice") != Some(clap::parser::ValueSource::DefaultValue);
+    }
+
+    /// The maximum timeslice `--chaos-seeded-timeslice` drew from the
+    /// scheduler seed, or `None` when this run does not draw one: the flag is
+    /// off, the run is not in chaos mode or replays preemptions or a schedule
+    /// (the recording supplies its preemption points), or the maximum is
+    /// disabled because the host cannot arm the timer.
+    fn seeded_chaos_timeslice(&self) -> Option<NonZeroU64> {
+        let config = &self.det_opts.det_config;
+        let draws = self.chaos_seeded_timeslice
+            && config.chaos
+            && config.replay_preemptions_from.is_none()
+            && config.replay_schedule_from.is_none()
+            && config.max_timeslice.is_some();
+        draws.then(|| {
+            hermit::chaos_timeslice::seeded_max_timeslice(
+                config.sched_seed(),
+                config.minimum_max_timeslice_nanos(),
+            )
+        })
+    }
+
+    /// Lower `--chaos-seeded-timeslice` to `--max-timeslice`: the value drawn
+    /// from the scheduler seed, or else the default the flag stands in for.
+    /// Validation runs again whenever a caller changes the options, as `hermit
+    /// analyze` does when it gives a trial a new seed, turns chaos off for its
+    /// baseline or replays a trial's preemptions, so this derives the value
+    /// afresh from the current options every time rather than from what an
+    /// earlier call stored. A disabled maximum, given or set because the host
+    /// cannot arm the timer, leaves nothing to draw and stays disabled.
+    fn resolve_seeded_chaos_timeslice(&mut self) -> Result<(), Error> {
+        if !self.chaos_seeded_timeslice {
+            return Ok(());
+        }
+        // `--chaos`, which the flag requires, already refuses `--namespace-only`.
+        if !self.backend_arms_reverie_ptrace_pmu_timer() {
+            anyhow::bail!(
+                "--chaos-seeded-timeslice draws the maximum timeslice that the PMU timer \
+                 enforces, and --backend={} has no such timer: run it on --backend=ptrace, or \
+                 give chaos a fixed cooperative deadline with --target-timeslice=N",
+                self.selected_backend().as_str()
+            );
+        }
+        let config = &self.det_opts.det_config;
+        if self.max_timeslice_explicit
+            && let Some(given) = config.max_timeslice
+        {
+            anyhow::bail!(
+                "--chaos-seeded-timeslice draws --max-timeslice from the scheduler seed, so it \
+                 cannot be combined with --max-timeslice={given}: drop --max-timeslice to draw \
+                 the value from the seed, or drop --chaos-seeded-timeslice to keep \
+                 --max-timeslice={given} for every seed"
+            );
+        }
+        if let Some(target) = config.target_timeslice {
+            anyhow::bail!(
+                "--chaos-seeded-timeslice draws --max-timeslice from the scheduler seed, but \
+                 --target-timeslice={target} would set the mean of chaos's timeslices instead: \
+                 drop --target-timeslice to draw the mean from the seed, or drop \
+                 --chaos-seeded-timeslice to keep --target-timeslice={target}"
+            );
+        }
+        if self.det_opts.det_config.max_timeslice.is_some() {
+            self.det_opts.det_config.max_timeslice = Some(
+                self.seeded_chaos_timeslice()
+                    .unwrap_or(hermit::chaos_timeslice::DEFAULT_MAX_TIMESLICE),
+            );
+        }
+        Ok(())
     }
 
     fn resolve_preemption_settings(&self) -> Result<(), Error> {
@@ -10608,7 +12456,7 @@ impl RunOpts {
     /// The one-line stderr warning for a run that goes on without `--strict`
     /// while reading a retired-branch counter that failed Reverie's validation,
     /// which `--strict` refuses: the run proceeds on a degraded capability, so
-    /// it says so (https://github.com/rrnewton/hermit/issues/4515). Reverie
+    /// it says so ([`warning_for_an_inexact_branch_counter`]). Reverie
     /// validates the counters once per process, on its first timer, so asking
     /// here costs nothing more.
     fn inexact_branch_counter_warning(&self) -> Option<String> {
@@ -10617,16 +12465,7 @@ impl RunOpts {
         if !self.reads_the_branch_counter() {
             return None;
         }
-        (self.inexact_branch_counter)().map(|reason| {
-            // Reverie's message can span lines (`HardwareCountersNotWorking`
-            // embeds two newlines); the warning stays one line.
-            let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
-            format!(
-                "WARNING: this host's performance counters failed Reverie's validation \
-                 ({reason}); preemption by retired branches may not repeat, so a run may \
-                 not replay or verify. `hermit run --strict` refuses here.\n"
-            )
-        })
+        warning_for_an_inexact_branch_counter(CounterReader::Run, self.inexact_branch_counter)
     }
 
     /// `main`'s branch-counter check: a `--strict` run on a counter that failed
@@ -10647,20 +12486,35 @@ impl RunOpts {
         self.arms_reverie_ptrace_pmu_timer() && self.det_opts.det_config.max_timeslice.is_some()
     }
 
-    /// [`Self::refuse_strict_with_inexact_branch_counter`] for an `analyze` or
-    /// `bisect` trial (`AnalyzeOpts::refuse_strict_with_inexact_branch_counter`).
+    /// [`Self::reads_the_branch_counter`] for an `analyze` or `bisect` trial.
     /// Trials start through `RunOpts::run` and never pass through `main`
     /// (<https://github.com/rrnewton/hermit/issues/3810>), so `--namespace-only`
     /// (alias `--lite`) does not reach `run_with_namespace_only`: the trial
     /// still runs on the backend's runtime and its counter, and is not exempt.
+    fn trial_reads_the_branch_counter(&self) -> bool {
+        self.backend_arms_reverie_ptrace_pmu_timer()
+            && self.det_opts.det_config.max_timeslice.is_some()
+    }
+
+    /// [`Self::refuse_strict_with_inexact_branch_counter`] for an `analyze` or
+    /// `bisect` trial (`AnalyzeOpts::refuse_strict_with_inexact_branch_counter`),
+    /// under [`Self::trial_reads_the_branch_counter`].
     pub(crate) fn refuse_strict_trial_with_inexact_branch_counter(&self) -> Result<(), Error> {
-        if !self.strict
-            || !self.backend_arms_reverie_ptrace_pmu_timer()
-            || self.det_opts.det_config.max_timeslice.is_none()
-        {
+        if !self.strict || !self.trial_reads_the_branch_counter() {
             return Ok(());
         }
         refuse_an_inexact_branch_counter(self.selected_backend(), self.inexact_branch_counter)
+    }
+
+    /// [`Self::inexact_branch_counter_warning`] for the trials of one
+    /// `analyze` or `bisect` (`AnalyzeOpts::branch_counter_warning`): wherever
+    /// [`Self::refuse_strict_trial_with_inexact_branch_counter`] refuses
+    /// `--strict`, trials without it warn.
+    pub(crate) fn trial_inexact_branch_counter_warning(&self) -> Option<String> {
+        if !self.trial_reads_the_branch_counter() {
+            return None;
+        }
+        warning_for_an_inexact_branch_counter(CounterReader::Trials, self.inexact_branch_counter)
     }
 
     /// The run options set here that only `RunOpts::main` applies, as the
@@ -10926,37 +12780,37 @@ impl RunOpts {
         global: &GlobalOpts,
         identity_sources: Option<&IdentityGuard>,
         native: Option<NativeContainerRun>,
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))] mapped: Option<
+            &MappedVerificationRun,
+        >,
     ) -> Result<(Output, u64, RunLatches), Error> {
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        if let Some(mapped) = mapped {
+            anyhow::ensure!(
+                identity_sources.is_some(),
+                "mapped verification requires actual container identity"
+            );
+            hermit::proc_mount::warn_if_readonly_proc();
+            let (log, _guard) = self.verification_run_log(log_file, global)?;
+            let (command, config) = self.mapped_command_config(identity_sources)?;
+            let result = super::mapped_first_admission::capture_verification_in_container(
+                super::mapped_first_admission::VerificationCapture {
+                    command,
+                    config,
+                    retained: &mapped.image,
+                    records: log.record_sink(),
+                    print_summary: self.summary,
+                    summary_json: &self.summary_json,
+                    policy: mapped.policy,
+                    forwarded: forwarded_detlogs,
+                },
+            );
+            return finish_mapped_verification_log(result, log);
+        }
         let mut forwarded_detlogs = forwarded_detlogs.open_in_container()?;
         hermit::proc_mount::warn_if_readonly_proc();
 
-        // HACK: Use interior mutability to workaround not being able to pass
-        // `log_file` by value. Guaranteed by caller to never panic.
-        let log_file = log_file.take().unwrap();
-
-        let strictness = self.verification_strictness();
-        let level = verification_log_level(global.log, strictness, self.verify_verbose);
-
-        // Bound this log too. `hermit run --verify` opens its own file and
-        // calls `init_file_tracing` directly instead of going through
-        // `GlobalOpts::init_tracing`, so without this wrapper the bound that
-        // was measured on exactly these `--verify` comparison logs would not
-        // apply to the path that produces them: a livelocked run here could
-        // still fill the disk.
-        let limit = log_max_bytes().map_err(Error::msg)?;
-        // SYNCHRONOUS, so a fatal diagnostic in the tail survives the run that
-        // emitted it. The non-blocking appender loses whatever has not drained
-        // when a fail-closed guest dies, which is precisely the line naming the
-        // cause -- measured 0 of 18 runs versus 4 of 4. See
-        // `init_sync_file_tracing`.
-        // The coordinator writes forwarded records through this same writer, so
-        // a record and a tracing event never share a line.
-        //
-        // `--max-log-bytes` counts these logs too, forwarded records as well
-        // as tracing events, and its counter is shared across the verify runs,
-        // so the cap is a total for the invocation.
-        let log = verification_log(log_file, limit, global.log_budget());
-        let _guard = init_sync_file_tracing(Some(level), log.clone(), self.runtime_backend());
+        let (log, _guard) = self.verification_run_log(log_file, global)?;
 
         let command = self.guest_command()?;
 
@@ -11028,6 +12882,48 @@ impl RunOpts {
             log_sink_failure: log.failure(),
         };
         Ok((output, skid_overshoots, latches))
+    }
+}
+
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+fn finish_mapped_verification_image<T>(
+    outcome: Result<T, Error>,
+    close: std::io::Result<()>,
+) -> Result<T, Error> {
+    match (outcome, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(close)) => Err(close.into()),
+        (Err(error), Err(close)) => Err(retain_verification_error(
+            error,
+            "closing private verifier image",
+            close.into(),
+        )),
+    }
+}
+
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+fn finish_mapped_verification_log(
+    outcome: Result<Output, Error>,
+    mut log: SharedLog,
+) -> Result<(Output, u64, RunLatches), Error> {
+    // Flush the same writer even after an execution refusal. A later log error
+    // cannot replace the original typed execution error or disappear silently.
+    let _ = log.flush();
+    let latches = RunLatches {
+        determinism_loss: detcore::detlog::determinism_loss(),
+        log_sink_failure: log.failure(),
+    };
+    match outcome {
+        Ok(output) => Ok((output, 0, latches)),
+        Err(error) => match latches.log_sink_failure {
+            Some(failure) => Err(retain_verification_error(
+                error,
+                "flushing private verifier log",
+                Error::msg(failure),
+            )),
+            None => Err(error),
+        },
     }
 }
 
@@ -11341,6 +13237,14 @@ pub(super) fn complete_container_config(
         .transpose()?;
     config.mount_id_assignment_order.clear();
     config.mountinfo_mount_ids_captured = true;
+    // The placeholder directory the container's setup mounted, if any, and
+    // whether the guest runs in a container with a procfs of its own; neither
+    // without a container (`--no-namespace`), where Detcore serves no `/proc`
+    // directory.
+    config.directory_placeholder = identity_sources
+        .and_then(IdentityGuard::directory_placeholder)
+        .map(Path::to_path_buf);
+    config.container_procfs = identity_sources.is_some();
     match view {
         Some(view) => {
             config.mountinfo_root_rewrites = view.root_rewrites;
@@ -11487,6 +13391,290 @@ mod tests {
 
     use super::*;
 
+    /// The outer package gate owns source/qualification binding. This selected
+    /// test requires its actual installation and the regular-file stdin-cat
+    /// fixture; neither missing operand is a reason to skip a real execution.
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[test]
+    #[ignore = "requires the fresh qualified private runtime and piped_stdin_cat fixture; run the exact package gate"]
+    fn mapped_verification_retains_actual_package_after_parent_rename() {
+        use std::os::unix::fs::MetadataExt;
+        use std::process::Stdio;
+        use std::sync::Arc;
+
+        use super::super::mapped_first_admission::RetainedImage;
+
+        const NAME: &str =
+            "run::tests::mapped_verification_retains_actual_package_after_parent_rename";
+        const CHILD: &str = "HERMIT_RETAINED_PACKAGE_TEST_CHILD";
+        const INSTALL: &str = "HERMIT_RETAINED_PACKAGE_TEST_INSTALL";
+        const PROGRAM: &str = "HERMIT_RETAINED_PACKAGE_TEST_PROGRAM";
+        const INPUT: &[u8] = b"first\0line\nlast-without-newline\xff";
+        const MEMBERS: [&str; 2] = [
+            "detcore_private_runtime.elf",
+            "detcore_private_runtime.package.json",
+        ];
+
+        let required_path = |name: &str| {
+            let path = std::env::var_os(name)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| panic!("{name} must name an actual package-gate input"));
+            fs::canonicalize(path).unwrap_or_else(|error| panic!("{name}: {error}"))
+        };
+        let program = required_path(PROGRAM);
+        assert!(
+            program.is_file(),
+            "{PROGRAM} must name the stdin-cat fixture"
+        );
+
+        if std::env::var(CHILD).ok().as_deref() != Some(NAME) {
+            let source = required_path(INSTALL);
+            let directory = tempfile::tempdir().unwrap();
+            let install = directory.path().join("selected-install");
+            fs::create_dir_all(install.join("rsrcs")).unwrap();
+            for member in MEMBERS {
+                let input = source.join("rsrcs").join(member);
+                assert!(
+                    input.is_file(),
+                    "required package member: {}",
+                    input.display()
+                );
+                fs::copy(&input, install.join("rsrcs").join(member)).unwrap();
+            }
+            // Child-local discovery and a test-owned copy keep the rename from
+            // changing either another test's environment or the producer files.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    NAME,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, NAME)
+                .env(PROGRAM, &program)
+                .env(hermit_resources::INSTALL_DIR_ENV, &install)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let written = child.stdin.take().unwrap().write_all(INPUT);
+            if written.is_err() {
+                let _ = child.kill();
+            }
+            // wait_with_output drains both streams and reaps the isolated
+            // child; the package gate owns its wall/CPU/memory/pid bounds.
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                written.is_ok(),
+                "stdin write failed: {written:?}; {output:?}"
+            );
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.starts_with(
+                        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;"
+                    )),
+                "the exact ignored child test must actually execute: {output:?}"
+            );
+            assert_eq!(
+                output
+                    .stdout
+                    .windows(INPUT.len())
+                    .filter(|bytes| *bytes == INPUT)
+                    .count(),
+                1,
+                "the real verifier must emit the complete guest stdout once: {output:?}"
+            );
+            // Retain the actual comparison in the outer gate's captured log.
+            let report = fs::read_to_string(directory.path().join("verification.json")).unwrap();
+            eprintln!("retained package verification report: {report}");
+            return;
+        }
+
+        let install = required_path(hermit_resources::INSTALL_DIR_ENV);
+        let directory = install.parent().unwrap();
+        let report = directory.join("verification.json");
+        let held = directory.join("retained-install");
+        let original = RetainedImage::open().expect("open the actual provided runtime package");
+        let (expected, files) = original.export_pair_inputs().unwrap();
+        let image = Arc::new(
+            RetainedImage::adopt_pair_inputs(expected.clone(), files)
+                .expect("adopt the original runtime and descriptor OFDs once"),
+        );
+        drop(original);
+        let retained_fds = image.pair_fds().map(|fd| fd.as_raw_fd());
+
+        // Exercise the real capture entry with the actual retained package.
+        // Requested-PID refusal must precede both the expired qualification
+        // deadline and any rewind of the shared verification stdin snapshot.
+        // This negative control creates no guest and never enters the image.
+        {
+            use crate::mapped_first_admission::CapturePolicy;
+            use crate::mapped_first_admission::VerificationCapture;
+            use crate::mapped_first_admission::capture_verification_in_container;
+
+            let mut command = Command::new("/not-an-executable/mapped-command-control");
+            command.pid(reverie::process::Pid::from_raw(123));
+            let mut forwarded = ForwardedDetlogPlan::Socket { opened: false };
+            let error = capture_verification_in_container(VerificationCapture {
+                command,
+                config: detcore::Config::default(),
+                retained: &image,
+                records: Box::new(|_| panic!("refused command must emit no guest records")),
+                print_summary: false,
+                summary_json: &None,
+                policy: CapturePolicy::Qualification {
+                    deadline: tokio::time::Instant::now() - std::time::Duration::from_secs(1),
+                },
+                forwarded: &mut forwarded,
+            })
+            .unwrap_err();
+            let error = error.downcast_ref::<std::io::Error>().unwrap();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(
+                error.to_string(),
+                "mapped-command-requested-pid-unsupported"
+            );
+            assert!(matches!(
+                forwarded,
+                ForwardedDetlogPlan::Socket { opened: false }
+            ));
+            image.verify().unwrap();
+        }
+
+        let mut options = run_opts_for(&[
+            "hermit",
+            "--backend=in-guest-trap",
+            "--log=info",
+            "run",
+            "--in-guest-exec-stop",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            "--seed=0",
+            "--sched-seed=0",
+            "--rng-seed=0",
+            "--max-timeslice=disabled",
+            "--no-rcb-time",
+            "--base-env=empty",
+            "--verify-json",
+            report.to_str().unwrap(),
+            "--",
+            program.to_str().unwrap(),
+        ]);
+        let global = GlobalOpts::parse_from(["hermit", "--backend=in-guest-trap", "--log=info"]);
+        // Use real admission and argument validation while initial discovery
+        // still exists, just as the production pre-retention path does.
+        options.validate_args().unwrap();
+        options.refuse_strict_with_host_drawn_inputs().unwrap();
+        options.validate_program().unwrap();
+        options.validate_mount_sources().unwrap();
+        validate_log_level(&global).unwrap();
+        hermit::validate_tracing_environment(hermit::NamespaceUse::Creates).unwrap();
+        hermit::reserve_output_stdin_snapshot(super::super::startup_stdin().unwrap()).unwrap();
+        write_pending_verification_json(&report).unwrap();
+        let options = options.with_verification_ld_so_cache().unwrap();
+        assert!(options.mapped_shared_image.is_none());
+
+        let inode_state = |path: &Path| {
+            let m = fs::metadata(path).unwrap();
+            [
+                m.dev(),
+                m.ino(),
+                m.len(),
+                u64::from(m.mode()),
+                m.mtime() as u64,
+                m.mtime_nsec() as u64,
+                m.ctime() as u64,
+                m.ctime_nsec() as u64,
+            ]
+        };
+        let before = MEMBERS.map(|name| inode_state(&install.join("rsrcs").join(name)));
+        assert_eq!(before[0], expected.image.state);
+        assert_eq!(before[1], expected.descriptor.state);
+        // Moving the ancestor removes both discovery paths without changing
+        // either retained file's ctime. File rename/unlink would test mutation.
+        fs::rename(&install, &held).unwrap();
+        for (index, name) in MEMBERS.iter().enumerate() {
+            assert!(!install.join("rsrcs").join(name).exists());
+            assert_eq!(inode_state(&held.join("rsrcs").join(name)), before[index]);
+        }
+        assert!(!super::super::mapped_first_admission::packaged_image_declared());
+        image.verify().unwrap();
+
+        // This is the production pair owner, including both physical runs,
+        // full capture, all admission checks and the unchanged comparator.
+        let status = options
+            .verify_with_retained_adapters(
+                &global,
+                #[cfg(feature = "dbt")]
+                None,
+                Some(image.clone()),
+            )
+            .unwrap();
+        assert_eq!(status, ExitStatus::Exited(0));
+
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert_eq!(verdict["verdict"], "matched", "{verdict}");
+        assert_eq!(verdict["verified"], true, "{verdict}");
+        assert_eq!(verdict["bitwise_parity"], true, "{verdict}");
+        assert_eq!(
+            verdict["comparison"]["strictness"], "canonical",
+            "{verdict}"
+        );
+        assert_eq!(
+            verdict["comparison"]["compare_io_buffers"], true,
+            "{verdict}"
+        );
+        let compared = &verdict["compared_log_messages"];
+        assert!(
+            compared["left"].as_u64().is_some_and(|count| count > 0)
+                && compared["left"] == compared["right"],
+            "both actual runs must compare nonempty INFO streams: {verdict}"
+        );
+        for side in ["left", "right"] {
+            let actual = &verdict["compared_outputs"][side];
+            assert_eq!(actual["exit_code"], 0, "{side}: {verdict}");
+            assert!(actual["signal"].is_null(), "{side}: {verdict}");
+            assert_eq!(actual["stdout_bytes"], INPUT.len(), "{side}: {verdict}");
+            assert_eq!(
+                actual["stdout_sha256"],
+                detcore::Digest::new(INPUT).to_string(),
+                "{side}: {verdict}"
+            );
+            assert_eq!(actual["stderr_bytes"], 0, "{side}: {verdict}");
+            assert_eq!(
+                actual["stderr_sha256"],
+                detcore::Digest::new(b"").to_string(),
+                "{side}: {verdict}"
+            );
+        }
+        image.verify().unwrap();
+        for (index, name) in MEMBERS.iter().enumerate() {
+            assert!(!install.join("rsrcs").join(name).exists());
+            assert_eq!(inode_state(&held.join("rsrcs").join(name)), before[index]);
+        }
+        assert_eq!(
+            Arc::strong_count(&image),
+            1,
+            "both run owners must have retired"
+        );
+        drop(image);
+        for fd in retained_fds {
+            // SAFETY: F_GETFD only queries whether this descriptor is open.
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+        }
+    }
+
     fn forwarding_plan_options(forwarded: bool) -> RunOpts {
         let backend = if forwarded { "in-guest-trap" } else { "ptrace" };
         run_opts_for(&["hermit", "--backend", backend, "run", "--", "/bin/true"])
@@ -11568,6 +13756,112 @@ mod tests {
             },
             0,
             "last writer must yield actual recv EOF"
+        );
+    }
+
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[test]
+    fn mapped_verification_requires_unconsumed_real_forwarded_plan() {
+        assert!(
+            ForwardedDetlogPlan::None
+                .open_mapped_in_container()
+                .is_err()
+        );
+        let mut plan = ForwardedDetlogPlan::Socket { opened: false };
+        let (sender, receiver) = plan.open_mapped_in_container().unwrap();
+        assert_channel_record(&sender, &receiver, b"actual mapped verification channel");
+        assert!(plan.open_mapped_in_container().is_err());
+        drop(sender);
+        assert_channel_eof_after_last_writer(&receiver);
+    }
+
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    struct VerificationFlushFailure;
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    impl Write for VerificationFlushFailure {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "late verifier flush",
+            ))
+        }
+    }
+
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[test]
+    fn mapped_verification_late_flush_refuses_output_comparison() {
+        let output = Output {
+            status: ExitStatus::Exited(23),
+            stdout: b"actual output".to_vec(),
+            stderr: vec![],
+        };
+        let (output, skid, latches) =
+            finish_mapped_verification_log(Ok(output), SharedLog::new(VerificationFlushFailure))
+                .unwrap();
+        assert_eq!(output.status, ExitStatus::Exited(23));
+        assert_eq!(output.stdout, b"actual output");
+        assert_eq!(skid, 0);
+        assert!(
+            latches
+                .log_sink_failure
+                .as_deref()
+                .unwrap()
+                .contains("late verifier flush")
+        );
+        assert!(latches.refuse_comparison("private unit").is_err());
+    }
+
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[test]
+    fn mapped_verification_execution_error_survives_late_flush_failure() {
+        let error = finish_mapped_verification_log(
+            Err(
+                std::io::Error::new(std::io::ErrorKind::Interrupted, "original setup error").into(),
+            ),
+            SharedLog::new(VerificationFlushFailure),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert!(format!("{error:#}").contains("late verifier flush"));
+        assert!(format!("{error:#}").contains("original setup error"));
+    }
+
+    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[test]
+    fn mapped_verification_image_close_preserves_original_error() {
+        let error = finish_mapped_verification_image::<()>(
+            Err(
+                std::io::Error::new(std::io::ErrorKind::Interrupted, "original execution error")
+                    .into(),
+            ),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "late image verification",
+            )),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert!(format!("{error:#}").contains("late image verification"));
+        let error = finish_mapped_verification_image(
+            Ok(23),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "late image verification",
+            )),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
         );
     }
 

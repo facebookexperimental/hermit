@@ -94,6 +94,8 @@ use crate::types::FutexID;
 use crate::types::LogicalTime;
 use crate::types::SigWrapper;
 
+#[path = "affinity.rs"]
+mod affinity;
 #[path = "emulated_waitid.rs"]
 mod emulated_waitid;
 
@@ -1147,7 +1149,7 @@ impl KernelSignalState {
 }
 
 /// The signals whose default action ignores them.
-fn default_ignored_signals() -> KernelSigset {
+pub(crate) fn default_ignored_signals() -> KernelSigset {
     [libc::SIGCHLD, libc::SIGCONT, libc::SIGURG, libc::SIGWINCH]
         .into_iter()
         .fold(0, |set, signal| set | kernel_sigset_bit(signal))
@@ -1254,9 +1256,178 @@ pub(crate) fn read_kernel_signal_state(pid: Pid, tid: Pid) -> Result<KernelSigna
         });
         return Err(Errno::ENOSYS);
     }
-    let path = format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw());
-    let status = std::fs::read_to_string(path).map_err(|_| Errno::ESRCH)?;
+    let status = status_files::read(pid, tid)?;
     KernelSignalState::parse(&status).ok_or(Errno::EIO)
+}
+
+/// Drop thread `tid`'s open status files (`status_files`). Called when the
+/// thread exits; a later read of a reused TID opens the file afresh.
+pub(crate) fn forget_thread_status(tid: Pid) {
+    status_files::forget(tid);
+}
+
+/// Keep status files open from now on, in this process (`status_files`).
+/// Only a process that never shares a guest's descriptor table may call this:
+/// Hermit's own process, where Detcore traces the guest from outside. Detcore
+/// linked into a guest (the in-guest runtimes) never calls it, so it reads the
+/// path each time and no descriptor of its appears in the guest's table.
+pub(crate) fn keep_status_files_open() {
+    status_files::enable();
+}
+
+/// `/proc/<pid>/task/<tid>/status`, kept open per traced thread, so that a
+/// signal-state read is one pread(2) at offset 0 rather than an open(2),
+/// read(2) and close(2). A gated wait reads its thread's state at every turn,
+/// and every open(2) runs the host's file-open security hooks: measured on
+/// 2026-10-24, Hermit spent 20.7% of its samples opening this file and 18.5% in
+/// security_file_open alone, and on hosts where a BPF file-open hook takes its
+/// slow path (a mount walk and a contended map update) the same opens made the
+/// inherited-terminal poll tests of hermit-cli/tests/external_signal_interrupt.rs
+/// spend six times their ordinary system CPU.
+///
+/// An open procfs task file stays bound to the task it was opened for: after
+/// that thread exits it reads ESRCH, never a later task given the same TID. So
+/// a failed read drops the entry and opens the path once more, which reads
+/// exactly what reading the path did before this cache. At most `CAPACITY`
+/// files are kept, so a guest with many threads cannot exhaust Hermit's own
+/// descriptors; past that, reads open the path as before.
+///
+/// Files are kept only once `enable` has run in the process, which Hermit's
+/// own binary does at startup ([`keep_status_files_open`]). Where Detcore runs
+/// inside the guest (liteinst, in-guest-trap, DBT, SaBRe), a kept file would
+/// be a descriptor in the guest's own table, visible to it and inherited by its
+/// children; there nothing enables keeping, every read is the plain
+/// `read_to_string` of the path, and the map is never created (a `BTreeMap`,
+/// so no hasher state either).
+mod status_files {
+    use std::collections::BTreeMap;
+    use std::fs::File;
+    use std::os::unix::fs::FileExt;
+    use std::sync::Arc;
+    use std::sync::LazyLock;
+    use std::sync::Mutex;
+
+    use reverie::Pid;
+    use reverie::syscalls::Errno;
+
+    /// The most status files kept open at once.
+    pub(super) const CAPACITY: usize = 256;
+
+    /// The kept files, by (pid, tid).
+    type Kept = BTreeMap<(i32, i32), Arc<File>>;
+
+    static OPEN: LazyLock<Mutex<Kept>> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+    /// Whether this process keeps files (`enable`).
+    #[cfg(not(test))]
+    static KEEPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(test)]
+    thread_local! {
+        /// The switch for unit tests, per test thread, so that a test that
+        /// keeps no files runs beside one that keeps them.
+        static KEEPS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Keep files from now on (`keep_status_files_open`).
+    pub(super) fn enable() {
+        #[cfg(not(test))]
+        KEEPS.store(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        KEEPS_FOR_TEST.with(|keeps| keeps.set(true));
+    }
+
+    fn enabled() -> bool {
+        #[cfg(not(test))]
+        {
+            KEEPS.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(test)]
+        {
+            KEEPS_FOR_TEST.with(|keeps| keeps.get())
+        }
+    }
+
+    fn open() -> std::sync::MutexGuard<'static, Kept> {
+        OPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The whole file, read from offset 0. procfs regenerates a status file
+    /// for every read that starts at offset 0.
+    fn read_whole(file: &File) -> std::io::Result<String> {
+        let mut bytes = Vec::with_capacity(4096);
+        loop {
+            let filled = bytes.len();
+            bytes.resize(filled + 4096, 0);
+            let read = file.read_at(&mut bytes[filled..], filled as u64)?;
+            bytes.truncate(filled + read);
+            if read == 0 {
+                break;
+            }
+        }
+        String::from_utf8(bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    /// Thread `tid`'s status file text. `ESRCH` when it cannot be read, as
+    /// when the path could not be read before this cache.
+    pub(super) fn read(pid: Pid, tid: Pid) -> Result<String, Errno> {
+        if !enabled() {
+            let path = format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw());
+            return std::fs::read_to_string(path).map_err(|_| Errno::ESRCH);
+        }
+        let key = (pid.as_raw(), tid.as_raw());
+        let kept = open().get(&key).cloned();
+        if let Some(file) = kept {
+            if let Ok(text) = read_whole(&file)
+                && !text.is_empty()
+            {
+                return Ok(text);
+            }
+            open().remove(&key);
+        }
+        let path = format!("/proc/{}/task/{}/status", key.0, key.1);
+        let file = File::open(path).map_err(|_| Errno::ESRCH)?;
+        let text = read_whole(&file).map_err(|_| Errno::ESRCH)?;
+        let mut files = open();
+        if files.len() < CAPACITY {
+            files.insert(key, Arc::new(file));
+        }
+        Ok(text)
+    }
+
+    /// Drop every kept file of thread `tid`.
+    pub(super) fn forget(tid: Pid) {
+        if !enabled() {
+            return;
+        }
+        open().retain(|&(_, kept_tid), _| kept_tid != tid.as_raw());
+    }
+
+    /// How many files are kept open now.
+    #[cfg(test)]
+    pub(super) fn kept() -> usize {
+        open().len()
+    }
+
+    /// Whether a file of thread `tid` of process `pid` is kept open.
+    #[cfg(test)]
+    pub(super) fn keeps(pid: Pid, tid: Pid) -> bool {
+        open().contains_key(&(pid.as_raw(), tid.as_raw()))
+    }
+
+    /// The kept file of thread `tid` of process `pid`, if one is kept, for a
+    /// test to read without the fallback to the path.
+    #[cfg(test)]
+    pub(super) fn kept_file(pid: Pid, tid: Pid) -> Option<Arc<File>> {
+        open().get(&(pid.as_raw(), tid.as_raw())).cloned()
+    }
+
+    /// `read_whole`, for tests.
+    #[cfg(test)]
+    pub(super) fn read_kept(file: &File) -> std::io::Result<String> {
+        read_whole(file)
+    }
 }
 
 /// Why a blocked wait ended the run instead of returning to the guest
@@ -1435,6 +1606,21 @@ pub(super) fn blocked_signal_mask() -> KernelSigset {
     })
 }
 
+/// Whether a managed child wait reads the guest's mask without replacing it
+/// (`block_signals_for_disposition`), and so restores nothing after:
+/// - on a backend whose application signals the runtime already holds while
+///   the callback runs (DBT, `requires_thread_directed_process_signals`);
+/// - under the in-guest delivery gate (A5 step 3c.1e B,
+///   <https://github.com/rrnewton/hermit/issues/4485>): the in-guest runtime
+///   runs every callback under its own mask, which blocks every blockable
+///   guest signal, so the guest's are held already; the query is answered from
+///   the guest's saved mask (`Guest::resume_signal_mask`'s record), and a
+///   block would make the mask the request publishes, and the guest resumes
+///   under, "every signal blocked" until the restore.
+fn reads_mask_in_place(config: &Config) -> bool {
+    config.backend.requires_thread_directed_process_signals || config.in_guest_signal_delivery
+}
+
 pub(super) async fn block_signals_for_disposition<G, T>(
     guest: &mut G,
     blocked_mask_addr: Addr<'_, KernelSigset>,
@@ -1446,13 +1632,7 @@ where
 {
     let block_signals = syscalls::RtSigprocmask::new()
         .with_how(libc::SIG_SETMASK)
-        .with_set(
-            (!guest
-                .config()
-                .backend
-                .requires_thread_directed_process_signals)
-                .then_some(blocked_mask_addr.cast()),
-        )
+        .with_set((!reads_mask_in_place(guest.config())).then_some(blocked_mask_addr.cast()))
         .with_oldset(Some(old_mask_addr.cast()))
         .with_sigsetsize(KERNEL_SIGSET_SIZE);
     guest.inject_with_retry(block_signals).await?;
@@ -1477,11 +1657,7 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if !guest
-        .config()
-        .backend
-        .requires_thread_directed_process_signals
-    {
+    if !reads_mask_in_place(guest.config()) {
         let old_mask: Addr<'_, KernelSigset> = old_mask_addr.into();
         let restore_signals = syscalls::RtSigprocmask::new()
             .with_how(libc::SIG_SETMASK)
@@ -1835,6 +2011,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         // cloned thread's syscalls through this tool.
         let is_vfork = flags.contains(CloneFlags::CLONE_VFORK);
 
+        // D41 with IR-5 (A5 step 3c.1c): the first statement of the vfork
+        // branch, before `clone_flags` and `pending_vfork` are set, the
+        // descriptors promoted or the signal-state copy cloned, so a vfork not
+        // run leaves none of them for the death path's exit lifecycle to read.
+        if is_vfork && let Some(refused) = super::helpers::kernel_run_entry_refusal(guest)? {
+            return Err(refused);
+        }
+
         let ts = guest.thread_state_mut();
         assert_eq!(ts.clone_flags, None);
         assert!(ts.pending_vfork.is_none());
@@ -1851,9 +2035,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        let blocking_child_op_id = ExternalOpId::new(parent_dettid, ts.stats.syscall_count);
         if is_vfork {
             ts.pending_vfork = Some(PendingVfork {
                 parent_dettid,
+                op: blocking_child_op_id,
                 parent_detpid: ts.detpid.expect("detpid unset"),
                 child_tid_addr: ctid,
                 flags,
@@ -1880,8 +2066,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         super::signal_shadow::before_clone(guest, flags.bits()).await;
 
         trace!("[detcore, dtid {}] parent invoking clone.", parent_dettid);
-        let blocking_child_op_id =
-            ExternalOpId::new(parent_dettid, guest.thread_state().stats.syscall_count);
 
         // A CLONE_VFORK parent cannot resume until the child execs or exits.
         // Relinquish the parent's scheduler turn before entering that
@@ -1911,10 +2095,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut resources = Resources::new(parent_dettid);
             if maybe_res.is_err() {
                 // TODO-HUMAN-REVIEW(PR-1152): Review failed deferred-vfork cancellation.
-                // A deferred-spawn backend cannot infer failure from the absence of a registered
-                // child: a successful child also registers after this continuation. Report the
-                // known injected-syscall outcome explicitly so the scheduler can cancel the
-                // barrier and re-admit this parent before we propagate the original error below.
+                // The scheduler cannot infer failure from the absence of a registered child: a
+                // successful child may also register after this continuation. Report the known
+                // injected-syscall outcome explicitly so the scheduler can cancel the barrier and
+                // re-admit this parent before we propagate the original error below.
                 resources.insert(
                     ResourceID::VforkFailed(blocking_child_op_id),
                     Permission::RW,
@@ -2489,12 +2673,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// so none runs guest code before the native delivery (Claude re-check of
     /// https://github.com/rrnewton/hermit/pull/4387).
     ///
-    /// One path can still run a sibling first: an exit parked behind a
-    /// sibling's signal-delivery permit (`Scheduler::exit_awaits_sibling_permit`).
-    /// DynamoRIO reads the action again when it delivers, so after the grant
-    /// the action is read again and, if a sibling changed it, set back to
-    /// `SIG_DFL` in this dying process, and the delivery carries out the
-    /// committed decision (Codex review of
+    /// Should a sibling still run first, its action change must not undo the
+    /// decision. DynamoRIO reads the action again when it delivers, so after
+    /// the grant the action is read again and, if a sibling changed it, set
+    /// back to `SIG_DFL` in this dying process, and the delivery carries out
+    /// the committed decision (Codex review of
     /// https://github.com/rrnewton/hermit/pull/4387, P1).
     ///
     /// The gate is this backend's: DynamoRIO carries out a default action in
@@ -2811,10 +2994,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Err(Error::Errno(Errno::EAGAIN))
                 } else {
                     let maybe_timeout_lt = self.futex_deadline(guest, call, deadline).await?;
+                    // D50 reader 9 (A5 step 3c.1c): the capability, or the
+                    // in-guest delivery gate, which decides by the design's
+                    // deliverable set under the thread's published mask.
+                    let gated = guest.config().in_guest_signal_delivery;
                     let signal_interruption = guest
                         .config()
                         .backend
-                        .supports_blocked_wait_signal_interruption;
+                        .supports_blocked_wait_signal_interruption
+                        || gated;
                     // Whether this wait was woken for a signal and is checking again.
                     let mut rewait = false;
                     // The signals the scheduler committed to this waiter at that wake
@@ -2867,7 +3055,48 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // can change the dispositions at any time, so the scheduler
                         // reads them when it commits a wake, not here
                         // (https://github.com/rrnewton/hermit/issues/3146).
-                        let signal_watch = if signal_interruption {
+                        let signal_watch = if gated {
+                            // Under the gate: a deliverable signal pending at
+                            // the park, or still pending after a wake, ends the
+                            // wait with the futex's restart errno, its end
+                            // recorded for the restart checkpoint (D40).
+                            let state = match read_wait_signal_state(guest.pid(), guest.tid()) {
+                                Ok(state) => state,
+                                Err(error) => break Err(error),
+                            };
+                            let mask = super::helpers::gated_own_mask(guest, state.blocked);
+                            if let Some(end) = crate::wait_signal_end::wait_end(
+                                &state,
+                                mask,
+                                guest.config().in_guest_reserved_signals,
+                            ) {
+                                let errno = call.kernel_restart_errno();
+                                trace!(
+                                    "[detcore, dtid {}] futex wait ended under the in-guest delivery gate by {:?}: {:?}",
+                                    &dettid, end, errno
+                                );
+                                guest.thread_state_mut().wait_signal_end = Some(end);
+                                break Err(Error::Errno(errno));
+                            }
+                            // The futex wait files no `Resources` request, so
+                            // it publishes the guest's mask itself, before its
+                            // wait request, as every request does under the gate
+                            // (step 3c.1b, carried into 3c.1c): the scheduler's
+                            // readers then see this wait's mask, not an earlier
+                            // request's. None clears the entry, as at a request.
+                            let published = crate::tool_global::publish_request_guest_mask(
+                                guest,
+                                &Resources::new(dettid),
+                            );
+                            crate::tool_global::set_saved_guest_sigmask(guest, published).await;
+                            Some(FutexSignalWatch {
+                                unblocked: !mask
+                                    & !kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32),
+                                defers_default_stops: call.restart_keeps_deadline(),
+                                pid: guest.pid().as_raw(),
+                                tid: guest.tid().as_raw(),
+                            })
+                        } else if signal_interruption {
                             // A failed read is never the call's errno
                             // (`read_wait_signal_state`).
                             let state = match read_wait_signal_state(guest.pid(), guest.tid()) {
@@ -3307,6 +3536,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.exec_image_at(guest, libc::AT_FDCWD, &path)
     }
 
+    /// The name this image's exec gave it as Linux names it from the
+    /// filename the exec was given (`kbasename(bprm->filename)`,
+    /// `procfs::task_stat::TaskComm::of_exec_filename`), read from the
+    /// image's `AT_EXECFN`, which points at a copy of that filename on its
+    /// initial stack (`create_elf_tables`). `None` where the auxiliary vector
+    /// has no such entry or its string cannot be read.
+    pub(crate) fn execfn_comm<G: Guest<Self>>(
+        &self,
+        guest: &G,
+    ) -> Option<crate::procfs::task_stat::TaskComm> {
+        use std::os::unix::ffi::OsStrExt;
+
+        use reverie::syscalls::FromToRaw;
+        let address = guest.auxv().at_execfn()?.as_raw();
+        let path: std::path::PathBuf = Option::<syscalls::PathPtr>::from_raw(address)?
+            .read(&guest.memory())
+            .ok()?;
+        Some(crate::procfs::task_stat::TaskComm::of_exec_filename(
+            path.as_os_str().as_bytes(),
+        ))
+    }
+
     /// `Self::exec_image` for a `path` the caller already read from the
     /// guest: public for a backend that runs the native `execve` outside
     /// Detcore's handler, prepares the exec itself (`crate::prepare_exec`)
@@ -3350,6 +3601,83 @@ impl<T: RecordOrReplay> Detcore<T> {
         crate::exec_record::ExecRecord::resolve(&root, &cwd, &spelled)
     }
 
+    /// [`Self::exec_image`] where the tool cannot read the guest's procfs
+    /// directory but sees the guest's files in its own filesystem view
+    /// (`Detcore::exec_record_root` is `/`: KVM, whose executor opens every
+    /// absolute guest path in the tool's own view), resolved as that
+    /// executor resolves the exec (reverie-linuxemu's
+    /// `resolve_guest_exec_image`): an absolute path as it is, a relative one
+    /// with a slash from the working directory the calling thread's own
+    /// `getcwd` gives, and an exec of the caller's own `exe` link spelled
+    /// under `/proc` the image it executes. Only an ELF image is recorded:
+    /// `None` for a script (the executor reads its interpreter its own way),
+    /// for a name without a slash (which the executor searches on `PATH`,
+    /// where Linux does not), for a path relative to a directory descriptor
+    /// or empty (`AT_EMPTY_PATH`), for any other path under `/proc` (the
+    /// tool's `/proc` is not the guest's), in a nested PID namespace, and for
+    /// the tool's own image, which a path through the tool's `/proc` could
+    /// have led to. Without a record the new image's `exe` link is the
+    /// executor's, as before (`Detcore::readlink_own_task_link`); with one,
+    /// Detcore answers only while it names the image exactly, and the
+    /// executor holds the image open, so its inode cannot be reused meanwhile.
+    async fn exec_image_without_procfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &syscalls::Execveat,
+    ) -> Option<crate::exec_record::ExecRecord> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        if crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend)
+            || guest.thread_state().nested_pid_namespace
+        {
+            return None;
+        }
+        let root = self.exec_record_root(guest)?;
+        let path: std::path::PathBuf = call.path()?.read(&guest.memory()).ok()?;
+        if path.as_os_str().is_empty()
+            || (!path.is_absolute() && call.dirfd() != libc::AT_FDCWD)
+            || (!path.is_absolute() && path.components().count() < 2)
+        {
+            return None;
+        }
+        let cwd = if path.is_absolute() {
+            None
+        } else {
+            let directory = self.injected_working_directory(guest, None, 0).await.ok()?;
+            Some(std::path::PathBuf::from(
+                <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(directory),
+            ))
+            .filter(|directory| directory.is_absolute())
+        };
+        let spelled = match &cwd {
+            Some(cwd) => cwd.join(&path),
+            None => path.clone(),
+        };
+        let own_pid = self.own_detpid(guest).as_raw();
+        if spelled.starts_with("/proc") {
+            return match crate::syscalls::namespace::exe_link_subject(
+                spelled.as_os_str().as_bytes(),
+                own_pid,
+            ) {
+                Some(crate::syscalls::namespace::ExeLinkSubject::Own) => {
+                    guest.thread_state().exe.as_deref().cloned()
+                }
+                _ => None,
+            };
+        }
+        let record = crate::exec_record::ExecRecord::resolve_from(&root, cwd.as_deref(), &path)?;
+        // The file the path names itself, which the record is only where it
+        // is no script (a script's record is its interpreter's).
+        let named = std::fs::metadata(root.join(spelled.strip_prefix("/").ok()?))
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        let tool_image = std::fs::metadata("/proc/self/exe")
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        (Some(record.identity()) == named && Some(record.identity()) != tool_image)
+            .then_some(record)
+    }
+
     /// Execveat system call.  Doesn't return if successful.
     pub async fn handle_execveat<G: Guest<Self>>(
         &self,
@@ -3378,7 +3706,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
         };
         let preserve_exec_fd_status = guest.config().backend.rediscovers_descriptors_after_exec;
-        let exe = self.exec_image(guest, &call);
+        let exe = match self.exec_image(guest, &call) {
+            Some(exe) => Some(exe),
+            None => self.exec_image_without_procfs(guest, &call).await,
+        };
 
         prepare_exec(
             guest,
@@ -4529,11 +4860,19 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#546)
     /// Accept valid affinity masks without changing the host scheduler.
+    /// Under `--virtual-cpus` the mask is checked and kept as Linux does
+    /// (`virtual_sched_setaffinity`); Hermit's historical single CPU accepts
+    /// any readable mask and stays CPU 0.
     pub async fn handle_sched_setaffinity<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::SchedSetaffinity,
     ) -> Result<i64, Error> {
+        if let Some(cpus) = self.cfg.virtual_cpus {
+            return self
+                .virtual_sched_setaffinity(guest, call, cpus.get())
+                .await;
+        }
         let size_bytes = call.len() as usize;
         if size_bytes == 0 {
             return Err(Errno::EINVAL.into());
@@ -4564,11 +4903,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (`kernel_max` 127), so an 8-byte set, which `CPU_ALLOC` gives for the
     /// one CPU that `sysconf(_SC_NPROCESSORS_CONF)` reports, receives its
     /// first 8 bytes (<https://github.com/rrnewton/hermit/issues/4160>).
+    /// Under `--virtual-cpus` it is the named task's mask over the machine's
+    /// CPUs (`virtual_sched_getaffinity`).
     pub async fn handle_sched_getaffinity<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::SchedGetaffinity,
     ) -> Result<i64, Error> {
+        if let Some(cpus) = self.cfg.virtual_cpus {
+            return self
+                .virtual_sched_getaffinity(guest, call, cpus.get())
+                .await;
+        }
         let size_bytes: usize = call.len() as usize;
         if size_bytes == 0 || !size_bytes.is_multiple_of(std::mem::size_of::<libc::c_ulong>()) {
             return Err(Errno::EINVAL.into());
@@ -5184,7 +5530,7 @@ enum KeyAccess {
 /// kernel, which is also the guest's kernel: a private FUTEX_WAKE with count 0
 /// keys the word without touching it and fails with EFAULT exactly when
 /// `access_ok` refuses it.
-fn user_ptr_max() -> usize {
+pub(crate) fn user_ptr_max() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
         let accepted = |address: usize| {
@@ -5925,6 +6271,115 @@ mod tests {
         assert!(host_signal_state_reads_refused());
         assert_eq!(read_kernel_signal_state(pid, tid), Err(Errno::ENOSYS));
         assert_eq!(read_thread_signal_state(pid, tid), Err(Errno::ENOSYS));
+    }
+
+    /// A kept status file is read afresh each time: a signal blocked after
+    /// the first read shows in the second, which reuses the kept file, and the
+    /// thread's exit hook drops it (`forget_thread_status`).
+    #[test]
+    fn a_kept_status_file_reads_the_current_state_until_its_thread_is_forgotten() {
+        std::thread::spawn(|| {
+            status_files::enable();
+            let pid = Pid::from_raw(unsafe { libc::getpid() });
+            let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+            let usr2 = crate::scheduler::kernel_signal_bit(libc::SIGUSR2);
+            let before = read_kernel_signal_state(pid, tid).unwrap();
+            assert_eq!(before.blocked & usr2, 0);
+            assert!(status_files::keeps(pid, tid));
+            // SAFETY: changes only this spawned thread's own mask.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGUSR2);
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()),
+                    0
+                );
+            }
+            let after = read_kernel_signal_state(pid, tid).unwrap();
+            assert_eq!(after.blocked & usr2, usr2);
+            assert!(status_files::keeps(pid, tid));
+            forget_thread_status(tid);
+            assert!(!status_files::keeps(pid, tid));
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Until keeping is enabled, which only Hermit's own process does, a read
+    /// keeps no file: no descriptor of this process names the thread's status
+    /// file afterwards. Detcore linked into a guest is in this state, so its
+    /// reads leave nothing in the guest's descriptor table.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // a host unit test lists its own descriptors
+    fn without_keeping_a_read_leaves_no_descriptor_open() {
+        std::thread::spawn(|| {
+            let pid = Pid::from_raw(unsafe { libc::getpid() });
+            let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+            assert!(read_kernel_signal_state(pid, tid).is_ok());
+            assert!(read_kernel_signal_state(pid, tid).is_ok());
+            assert!(status_files::kept_file(pid, tid).is_none());
+            let status = format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw());
+            for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+                let target = std::fs::read_link(entry.unwrap().path()).unwrap_or_default();
+                assert_ne!(target.to_str(), Some(status.as_str()));
+            }
+            forget_thread_status(tid);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// A kept status file stays bound to the thread it was opened for: once
+    /// that thread has exited, the kept file is unreadable (`ESRCH`), so a
+    /// read never takes a later thread's state from it. The read then drops
+    /// the file and reads the path, as it did before files were kept: `ESRCH`
+    /// while the TID is free, or the state of a thread that reused it (other
+    /// tests in this process start threads concurrently).
+    #[test]
+    fn a_kept_status_file_of_an_exited_thread_is_unreadable_and_dropped() {
+        status_files::enable();
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let (tid, kept) = std::thread::spawn(move || {
+            status_files::enable();
+            let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+            assert!(read_kernel_signal_state(pid, tid).is_ok());
+            let kept = status_files::kept_file(pid, tid).expect("the read keeps its file");
+            (tid, kept)
+        })
+        .join()
+        .unwrap();
+        // join() returns before the kernel has finished tearing the thread
+        // down; until then the kept file still reads it (as its path would).
+        // Every read names that thread, and the file becomes unreadable.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let error = loop {
+            match status_files::read_kept(&kept) {
+                Ok(text) => {
+                    let own = format!("\nPid:\t{}\n", tid.as_raw());
+                    assert!(text.contains(&own), "{text}");
+                    assert!(std::time::Instant::now() < deadline, "{text}");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+        match read_kernel_signal_state(pid, tid) {
+            Err(errno) => {
+                assert_eq!(errno, Errno::ESRCH);
+                assert!(!status_files::keeps(pid, tid));
+            }
+            // A thread of another test took the TID: the read is the path's.
+            Ok(_) => {
+                // The kept file, if any, is the reopened one (the cache may be
+                // full of other tests' threads, which never run the exit hook).
+                if let Some(now) = status_files::kept_file(pid, tid) {
+                    assert!(!Arc::ptr_eq(&now, &kept));
+                }
+            }
+        }
+        assert!(status_files::kept() <= status_files::CAPACITY);
     }
     use crate::config::Config;
     use crate::tool_global::GlobalRequest;
@@ -7614,4 +8069,208 @@ fn clone_pidfd_address<M: MemoryAccess>(
         return None;
     }
     address
+}
+
+/// A5 step 3c.1e B (<https://github.com/rrnewton/hermit/issues/4485>): a
+/// managed child wait under the in-guest delivery gate reads the guest's mask
+/// without replacing it and restores nothing, so the mask its requests publish
+/// while it parks, and the one the guest resumes under, is the guest's own,
+/// never "every signal blocked".
+#[cfg(test)]
+mod disposition_mask_tests {
+    use std::sync::Mutex;
+
+    use reverie::Errno;
+    use reverie::Error;
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Guest;
+    use reverie::Pid;
+    use reverie::syscalls::Addr;
+    use reverie::syscalls::AddrMut;
+    use reverie::syscalls::LocalMemory;
+    use reverie::syscalls::MemoryAccess;
+    use reverie::syscalls::SyscallInfo;
+
+    use super::*;
+    use crate::tool_global::GlobalState;
+
+    const GUEST_MASK: KernelSigset = (1 << (libc::SIGUSR1 - 1)) | (1 << (libc::SIGHUP - 1));
+
+    struct UnusedStack;
+    struct UnusedStackGuard;
+    impl Drop for UnusedStackGuard {
+        fn drop(&mut self) {}
+    }
+    impl reverie::Stack for UnusedStack {
+        type StackGuard = UnusedStackGuard;
+        fn size(&self) -> usize {
+            panic!("the disposition mask uses the caller's addresses")
+        }
+        fn capacity(&self) -> usize {
+            panic!("the disposition mask uses the caller's addresses")
+        }
+        fn push<'a, V>(&mut self, _: V) -> Addr<'a, V> {
+            panic!("the disposition mask uses the caller's addresses")
+        }
+        fn reserve<'a, V>(&mut self) -> AddrMut<'a, V> {
+            panic!("the disposition mask uses the caller's addresses")
+        }
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            panic!("the disposition mask uses the caller's addresses")
+        }
+    }
+
+    /// A thread whose backend answers each injected `rt_sigprocmask` as the
+    /// kernel would for a thread whose mask is `mask`, and records the
+    /// `(how, set given)` of each.
+    struct MaskGuest {
+        config: Config,
+        thread: crate::ThreadState<()>,
+        mask: KernelSigset,
+        calls: Mutex<Vec<(i32, bool)>>,
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for MaskGuest {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            panic!("the disposition mask sends no RPC here: {:?}", message.2)
+        }
+        fn config(&self) -> &Config {
+            &self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for MaskGuest {
+        type Memory = LocalMemory;
+        type Stack = UnusedStack;
+        fn tid(&self) -> Pid {
+            Pid::from_raw(41)
+        }
+        fn pid(&self) -> Pid {
+            Pid::from_raw(41)
+        }
+        fn ppid(&self) -> Option<Pid> {
+            None
+        }
+        fn memory(&self) -> LocalMemory {
+            LocalMemory::new()
+        }
+        fn thread_state(&self) -> &crate::ThreadState<()> {
+            &self.thread
+        }
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+            &mut self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("no registers are read")
+        }
+        async fn stack(&mut self) -> UnusedStack {
+            panic!("the disposition mask uses the caller's addresses")
+        }
+        async fn daemonize(&mut self) {
+            panic!("no daemonize")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, call: S) -> Result<i64, Errno> {
+            assert_eq!(call.number(), syscalls::Sysno::rt_sigprocmask);
+            let args = call.into_parts().1;
+            let (how, set, old) = (args.arg0 as i32, args.arg1, args.arg2);
+            self.calls.lock().unwrap().push((how, set != 0));
+            let previous = self.mask;
+            if set != 0 {
+                let set: KernelSigset = LocalMemory::new()
+                    .read_value(Addr::<KernelSigset>::from_raw(set).unwrap())
+                    .unwrap();
+                self.mask = set;
+            }
+            if old != 0 {
+                LocalMemory::new()
+                    .write_value(AddrMut::<KernelSigset>::from_raw(old).unwrap(), &previous)
+                    .unwrap();
+            }
+            Ok(0)
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
+            panic!("no tail injection")
+        }
+        fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("no timer")
+        }
+        fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("no timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("no clock")
+        }
+    }
+
+    fn mask_guest(gate: bool) -> MaskGuest {
+        let mut config = Config {
+            sequentialize_threads: true,
+            max_timeslice: None,
+            in_guest_signal_delivery: gate,
+            ..Config::default()
+        };
+        config.backend = reverie::BackendCapabilities::LITEINST_IN_GUEST;
+        let detpid = DetPid::from_raw(41);
+        let mut thread = crate::ThreadState::new(detpid, &config, ());
+        thread.detpid = Some(detpid);
+        MaskGuest {
+            config,
+            thread,
+            mask: GUEST_MASK,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Under the gate the wait's mask step is a query and its restore is
+    /// nothing, so the guest's mask stays its own throughout; with the gate
+    /// off the in-guest backend keeps today's block and restore. Mutation:
+    /// "the block left in place under the gate" (the gated row's mask is the
+    /// blocked set while the wait runs, and its calls show a set).
+    #[tokio::test]
+    async fn a_gated_managed_wait_reads_the_guest_mask_without_replacing_it() {
+        for (gate, calls_during, mask_during, calls_after) in [
+            (
+                true,
+                vec![(libc::SIG_SETMASK, false)],
+                GUEST_MASK,
+                vec![(libc::SIG_SETMASK, false)],
+            ),
+            (
+                false,
+                vec![(libc::SIG_SETMASK, true)],
+                blocked_signal_mask(),
+                vec![(libc::SIG_SETMASK, true), (libc::SIG_SETMASK, true)],
+            ),
+        ] {
+            let mut guest = mask_guest(gate);
+            let blocked = blocked_signal_mask();
+            let mut old = 0 as KernelSigset;
+            let blocked_addr =
+                Addr::<KernelSigset>::from_raw(&blocked as *const _ as usize).unwrap();
+            let old_addr = AddrMut::<KernelSigset>::from_raw(&mut old as *mut _ as usize).unwrap();
+            let read = block_signals_for_disposition(&mut guest, blocked_addr, old_addr)
+                .await
+                .unwrap();
+            assert_eq!(read, GUEST_MASK, "gate={gate}");
+            assert_eq!(*guest.calls.lock().unwrap(), calls_during, "gate={gate}");
+            assert_eq!(
+                guest.mask, mask_during,
+                "gate={gate}: the mask while the wait runs"
+            );
+            restore_signals_after_disposition(&mut guest, old_addr)
+                .await
+                .unwrap();
+            assert_eq!(*guest.calls.lock().unwrap(), calls_after, "gate={gate}");
+            assert_eq!(
+                guest.mask, GUEST_MASK,
+                "gate={gate}: the mask after the wait"
+            );
+        }
+    }
 }

@@ -128,6 +128,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/chaos_poller_beside_sleepers.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/chaos_poller_beside_sleepers.c is owned by hermit-cli/tests/cli.rs: The integration test a_last_band_poller_sees_a_pipe_write_beside_two_sleepers_under_chaos runs this guest under run --strict --chaos --chaos-target-races at four seeds where the server thread polls a pipe from the last priority band beside two 1 ms sleepers, and requires every round to be answered; a generic manifest cannot pin the seeds whose schedule starved the poller."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/chaos_spinner_and_new_thread.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/chaos_spinner_and_new_thread.c is owned by hermit-cli/tests/cli.rs: chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting (ptrace) and run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting (KVM) run it under --chaos --sched-seed=7 with 1 ms slices, where a new low-priority thread waits behind a main thread busy-waiting on getpid; the chaos starvation bound must let it run within two slices (https://github.com/rrnewton/hermit/issues/4374). Each run requires run --strict --verify --verify-strict at bitwise parity and parses the guest's own virtual wait, so it remains a guest fixture rather than a manifest cell."
@@ -265,6 +271,12 @@
       "why": "tests/c/cpu_directory_reads.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test cpu_directory_reads_list_only_cpu0_on_every_path compiles this guest, which lists /sys/devices/system/cpu through an ordinary descriptor, through one received over SCM_RIGHTS with a 48-byte buffer (checking the entry count, the bytes past each return and the buffer of the call that ends the listing, also for /sys/bus/cpu/devices), and after a getdents64 with a count that does not fit in an int, and requires exact lines showing no CPU other than cpu0 at bitwise parity under hermit run --strict --verify --verify-strict (https://github.com/rrnewton/hermit/issues/4160); it remains a guest fixture because a generic manifest cannot assert this exact output."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/cpu_time_clocks.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/cpu_time_clocks.c is owned by hermit-cli/tests/cli.rs: cpu_time_clocks_read_the_logical_cpu_accounting runs it natively and under hermit run --strict and requires equal stdout, one result line for each of 24 checks of CLOCK_THREAD_CPUTIME_ID, CLOCK_PROCESS_CPUTIME_ID, clock(), the pthread_getcpuclockid and clock_getcpuclockid clocks of the caller and of another thread, getrusage, times, fork, exec and clock_nanosleep, and requires bitwise parity under --verify --verify-strict for its values mode, which prints the CPU times; it stays a fixture because a generic manifest cannot compare a run with the same program's native output."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/cpu_virtualization.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -301,10 +313,22 @@
       "why": "tests/c/cpuinfo_matches_cpuid.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test cpuinfo_matches_cpuid compiles this guest, which compares /proc/cpuinfo's vendor, family, model, stepping, model name and 22 feature flags with what the CPUID instruction reports and prints only whether each matches, and requires every line to match at bitwise parity under hermit run --strict --verify --verify-strict (https://github.com/rrnewton/hermit/issues/4161: /proc/cpuinfo showed the host CPU while CPUID showed the virtual one); it remains a guest fixture because a generic manifest cannot assert this exact output."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/cwd_dotdot_lookups.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/cwd_dotdot_lookups.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests dotdot_names_are_decided_by_where_they_lead (ptrace) and run_kvm_dotdot_names_are_decided_by_where_they_lead (KVM) compile this guest, which looks names up through their leading `..` from a removed working directory, whose getcwd fails with ENOENT, and from one whose path is longer than PATH_MAX (ENAMETOOLONG), as Linux still walks `..` out of both, and other names below the long one, and require the same exact lines on both backends from Hermit started in / and elsewhere (https://github.com/rrnewton/hermit/issues/4541); it remains a guest fixture because a generic manifest cannot start Hermit from two working directories and compare."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/cwd_roundtrip.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/cwd_roundtrip.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/datagram_read_shutdown.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/datagram_read_shutdown.c is owned by hermit-cli/tests/cli.rs: a_datagram_receive_ends_when_its_read_side_is_shut_down runs it natively and under ptrace, --strict and not, and requires byte-identical output with a fixed expectation: once a UDP or AF_UNIX datagram socket's read side is shut down, a blocking recvfrom, recv, recvmsg, recvmmsg or read returns at once (0 with nothing queued, a queued datagram first), with the address lengths Linux writes, a thread joining its shut-down reader returns, a later blocking send on that socket still waits for its peer to drain, and a TCP listener that SHUT_RD disconnected, so its read side is open again, still waits for data once it connects elsewhere. It stays a fixture because the test compares native and Hermit output."
     },
     {
       "disposition": "manifest-test",
@@ -764,9 +788,15 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/group_exit_signal_wait.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/group_exit_signal_wait.c is owned by hermit-cli/tests/cli.rs: one thread waits for a signal that never comes (sigwaitinfo, or sigtimedwait for 100 s) while another thread calls exit(0), which ends the whole thread group on Linux (https://github.com/rrnewton/hermit/issues/4798). run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing and its ptrace reference require each of the three modes to exit 0 with its line within 10 s under --no-sequentialize-threads --max-timeslice disabled, and run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity and its ptrace reference require bitwise parity under run --strict --verify --verify-strict; a generic manifest cannot bound the wall time of a relaxed run or select the mode per case, so it remains a guest fixture rather than a manifest cell."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/guest_discard_at_send.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/guest_discard_at_send.c is owned by hermit-cli/tests/cli.rs: the Rust CLI integration tests a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take, a_signal_linux_discarded_before_a_wait_files_does_not_end_it and the_discarded_at_send_rows_record_and_replay compile this guest, whose modes send a standard signal Linux discards at generation and then install a handler, and require each mode's exact line under strict verify and record/replay (https://github.com/rrnewton/hermit/issues/4293); it remains a guest fixture because its CLI tests check the exact status and stdout of strict runs."
+      "why": "tests/c/guest_discard_at_send.c is owned by hermit-cli/tests/cli.rs: the Rust CLI integration tests a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take, a_discarded_timer_expiry_or_take_fault_keeps_linuxs_wait_and_take_results, a_signal_discarded_by_its_named_task_or_namespace_init_reaches_no_take, a_signal_linux_discarded_before_a_wait_files_does_not_end_it and the_discarded_at_send_rows_record_and_replay compile this guest, whose modes send a standard signal Linux discards at generation and then install a handler, and require each mode's exact line under strict verify and record/replay (https://github.com/rrnewton/hermit/issues/4293); it remains a guest fixture because its CLI tests check the exact status and stdout of strict runs."
     },
     {
       "disposition": "guest-fixture",
@@ -926,9 +956,45 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/inotify_blocking_faults.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace, SaBRe, DBT, LiteInst and in-guest-trap; ci=true)",
+      "why": "tests/c/inotify_blocking_faults.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: reads of a blocking inotify descriptor that Linux refuses before it reads the queue (a count past the address space, a readv whose second iovec lies outside it, a readv whose iovec array the guest cannot read) must fail with EFAULT and leave the buffer, which holds earlier events, and the queue exactly as they were, and a later read must return every event with the cookies another instance sees (https://github.com/rrnewton/hermit/issues/4793)"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/inotify_faults.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace, SaBRe, DBT, LiteInst and in-guest-trap; ci=true)",
+      "why": "tests/c/inotify_faults.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: the events a read or readv copies before it fails with EFAULT, with the buffer ending inside the next event's header, cookie or length, at a read-only page, or after more than 64 KiB of events, must carry the cookie another instance sees for their rename, as must the event a readv copies into a second iovec that faults and the events a readv returns before an overlapping second iovec that receives nothing, an IN_IGNORED event's cut zero cookie must stay zeros, a rename split by the page boundary before a write-only page must keep one cookie in both events, a read Linux refuses before reading the queue (a count past the address space, a second iovec outside it, an unreadable iovec array) must leave the buffer and the queue as they were, and the cookie values must repeat in every run (https://github.com/rrnewton/hermit/issues/4793)"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/inotify_protection_key_fault.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify, and custom with --passthru-opt, on ptrace, SaBRe and DBT; ci=true)",
+      "why": "tests/c/inotify_protection_key_fault.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: an inotify read into a page a protection key keeps the guest from writing fails with EFAULT and copies nothing, so the twelve bytes of an earlier event header there, cookie included, must stay as they were, although Hermit's copies, which do not check protection keys, could write them (https://github.com/rrnewton/hermit/issues/4793)"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/inotify_received_descriptor.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on every backend; ci=true)",
+      "why": "tests/c/inotify_received_descriptor.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: an inotify descriptor received over SCM_RIGHTS, in the process that sent it and in a forked child that holds it only by receiving it, must give each rename the cookie another instance gives it, with values that repeat in every run (https://github.com/rrnewton/hermit/issues/4765)"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/inotify_rename_cookies.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on every backend; ci=true)",
+      "why": "tests/c/inotify_rename_cookies.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: a readv with overlapping iovecs must leave exactly Linux's bytes; five inotify instances, two created later and one in a forked child that sees a rename before the parent, read with read (a pair split over two reads among them), readv over three iovecs and preadv2 at offset -1, must see each rename's IN_MOVED_FROM and IN_MOVED_TO share one nonzero cookie, four renames get four cookies, every instance agrees, and the cookie values must repeat in every run (https://github.com/rrnewton/hermit/issues/4765)"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/inotify_watch.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/inotify_watch.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/inotify_write_only_buffer.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and kvm; ci=true)",
+      "why": "tests/c/inotify_write_only_buffer.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: an inotify read into a write-only page must succeed and carry the same rename cookie as another instance's read into an ordinary buffer, with values that repeat in every run (https://github.com/rrnewton/hermit/issues/4765)"
     },
     {
       "disposition": "manifest-test",
@@ -1354,7 +1420,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/omitted_procfs_names.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/omitted_procfs_names.c is owned by hermit-cli/tests/cli.rs: the CLI test detcore_omits_the_procfs_names_outside_the_level_on_every_backend runs it natively, to show that the host has the omitted names, then on ptrace, DBT, KVM and e9patch preprocessing with ptrace at --proc=standard and --proc=minimal (verified at L2; SaBRe, LiteInst and in-guest-trap are named as not yet, with their issues), on ptrace without virtualized metadata, and under record and replay. It requires /proc names in no level (kallsyms, kcore, sysvipc, sys/kernel/core_pattern and others), and at minimal the standard level's names, to fail as Linux fails a missing procfs name through the calls and spellings it tries, listings to leave them out, and the level's names to stay (https://github.com/rrnewton/hermit/issues/4266). Each run's expected output names the checks it cannot make there (KVM's own /proc, the KVM backend's missing calls, record and replay, the kernel's listings without virtualized metadata). It stays a fixture because a generic manifest cannot compare one guest across backends, levels and modes."
+      "why": "tests/c/omitted_procfs_names.c is owned by hermit-cli/tests/cli.rs: the CLI tests detcore_omits_the_procfs_names_outside_the_level_on_every_backend and detcore_omits_the_procfs_names_outside_the_level_on_dbt (DBT's runs, https://github.com/rrnewton/hermit/issues/4783) run it (the first of them natively too, to show that the host has the omitted names) on ptrace, DBT, KVM and e9patch preprocessing with ptrace at --proc=standard and --proc=minimal (verified at L2; SaBRe, LiteInst and in-guest-trap are named as not yet, with their issues), on ptrace without virtualized metadata, and under record and replay. They require /proc names in no level (kallsyms, kcore, sysvipc, sys/kernel/core_pattern and others), and at minimal the standard level's names, to fail as Linux fails a missing procfs name through the calls and spellings it tries, listings to leave them out, and the level's names to stay (https://github.com/rrnewton/hermit/issues/4266). Each run's expected output names the checks it cannot make there (KVM's own /proc, the KVM backend's missing calls, record and replay, the kernel's listings without virtualized metadata). It stays a fixture because a generic manifest cannot compare one guest across backends, levels and modes."
     },
     {
       "disposition": "manifest-test",
@@ -1573,6 +1639,12 @@
       "why": "tests/c/poll_timeout_vs_spinner.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test poll_timeout_returns_on_time_while_another_thread_spins compiles this two-thread pthread guest, in which one thread busy-loops without syscalls while the other waits five times in a 50 ms ppoll on an empty pipe, and requires every wait to return 0 within [50 ms, 100 ms) of virtual time under --max-timeslice 5000000 (https://github.com/rrnewton/hermit/issues/3952); it remains a guest fixture because a generic manifest cannot assert per-call virtual elapsed times, and the case needs the PMU timer, so it runs in privileged-test.pmu_cli_cases."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/poll_zero_timeout_restart.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/poll_zero_timeout_restart.c is owned by hermit-cli/tests/cli.rs: a_zero_timeout_poll_ended_by_a_signal_restarts_as_on_linux runs it natively, under ptrace with --strict, plain and with --no-sequentialize-threads, and under record start --verify --verify-strict, and requires native's fixed line: 2000 zero-timeout polls of an empty pipe all return 0 while 200 children exit, even when a child's SIGCHLD ends a poll with ERESTART_RESTARTBLOCK in the kernel. It stays a fixture because the test compares native and Hermit output."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/ppoll_readv.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -1615,6 +1687,24 @@
       "why": "tests/c/preadv2_flags.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "cargo-integration-test-fixture",
+      "path": "tests/c/preemption_callback_boundaries.c",
+      "runner": "cargo test -p hermit-run --test clock_determinism preemption_replay_preserves_equal_rcb_software_callback_boundaries",
+      "why": "tests/c/preemption_callback_boundaries.c is compiled and exercised by hermit-cli/tests/clock_determinism.rs::preemption_replay_preserves_equal_rcb_software_callback_boundaries: direct unrolled clock_gettime syscalls require an Exec/Prehook endpoint at RCB zero and distinct adjacent equal-RCB software callback boundaries, then compare the complete recorded and replayed schedule bytes with exactly one attempt per run (https://github.com/rrnewton/hermit/issues/4082)."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/preemption_charge_replay.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/preemption_charge_replay.c is owned by hermit-cli/tests/cli.rs: a_capped_chaos_recording_replays_its_schedule_with_the_recordings_clock records two threads of short syscalls under --chaos --target-timeslice=20000 --cap-preemption-charge, replays the schedule with --replay-schedule-from, and requires no desync and the recording's printed virtual times; it remains a guest fixture because a generic manifest cannot compare a recording's output with its replay's."
+    },
+    {
+      "disposition": "cargo-integration-test-fixture",
+      "path": "tests/c/preemption_replay_syscall_slice_end.c",
+      "runner": "cargo test -p hermit-run --test cli",
+      "why": "tests/c/preemption_replay_syscall_slice_end.c is compiled and exercised by hermit-cli/tests/cli.rs: a sleeper's pending timed wait ends a computing worker's --chaos slices at the prehook of its next write, and the guest prints the virtual clock last; on PMU hosts (privileged-test.pmu_cli_cases) a replay of such a recording must reproduce it, so that no replayed slice ends at a PMU stop on the branch count before the prehook"
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/print_memaddrs.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (blocking CI)",
@@ -1652,9 +1742,21 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/proc_cpu_times.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/proc_cpu_times.c is owned by hermit-cli/tests/cli.rs: proc_cpu_times_agree_with_every_cpu_time_view runs it natively and under hermit run --strict and requires equal stdout, one result line for each of 17 checks that /proc/<pid>/stat and /proc/<pid>/task/<tid>/stat CPU times and /proc/<pid>/schedstat runtimes agree with times(), getrusage() and the CPU-time clocks, and requires bitwise parity under --verify --verify-strict for its values mode, which prints the times; it stays a fixture because a generic manifest cannot compare a run with the same program's native output."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/proc_directory_alias_level.c",
       "runner": "hermit-cli/tests/procfs_determinism.rs",
       "why": "tests/c/proc_directory_alias_level.c is owned by hermit-cli/tests/procfs_determinism.rs: a_name_outside_the_level_through_a_directory_alias_is_refused_before_its_turn records it with --proc=minimal under record start --verify --verify-strict and requires openat(<a /proc descriptor reopened through /proc/self/fd/N or /dev/fd/N>, \"kallsyms\") to fail with ENOENT (in the root process, in a thread of a process created with CLONE_FILES, and in a thread of an image a non-leader thread executed), the recording to replay with bitwise parity, and the recording's log to show no scheduler turn for the name (which the guest's --control shows the log check can see), the change behind RECORD_VERSION 0x164 (https://github.com/rrnewton/hermit/issues/4213); a generic manifest cannot pass the record options or inspect the log, and natively /proc/kallsyms exists."
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/proc_fd_directory.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/proc_fd_directory.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Lists and uses the caller's own /proc/self/fd (getdents64 paging and positions, lseek, O_PATH, dup, names below it, the thread and /dev/fd spellings, SCM_RIGHTS, fork, exec, CPython's close-all loop), which Detcore serves from its own descriptor table on every backend"
     },
     {
       "disposition": "manifest-test",
@@ -1679,6 +1781,18 @@
       "path": "tests/c/proc_locks.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/proc_locks.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/proc_own_links.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/proc_own_links.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Reads the caller's own /proc/<pid>/exe, cwd and root links by every spelling (truncation, EINVAL, EFAULT, followed spellings, chdir, a removed directory, a thread, a fork, an exited leader, an exec'd copy that unlinks itself), which Detcore answers from its own knowledge on every backend"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/proc_stat_comm.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/proc_stat_comm.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Reads its own /proc/<pid>/stat (52 fields) by every spelling, a thread's task stat, a fork child's and a descriptor kept across an exec, and checks the name stat shows after PR_SET_NAME, comm writes, pthread_setname_np, an exec through a long symbolic link and execveat(AT_EMPTY_PATH), comparing the comm file with stat and PR_GET_NAME and reading it by seq_file positions (c-programs/proc-stat-comm); Detcore renders a process's own stat, and on KVM its own comm reads"
     },
     {
       "disposition": "guest-fixture",
@@ -1879,6 +1993,12 @@
       "why": "tests/c/received_directory_swap.c is owned by hermit-cli/tests/cli.rs: the CLI test a_received_directory_replaced_during_an_open_is_what_the_open_returned runs it natively and then on ptrace with --no-sequentialize-threads and the procfs_spelling_resolved race probe, so that a second thread replaces a received /proc descriptor with an ordinary directory between Detcore naming it and the kernel's open, and requires the returned directory to behave as what it holds (marker found, mountinfo ENOENT), not as /proc/self (https://github.com/rrnewton/hermit/issues/4213, K3b). It stays a fixture because a generic manifest cannot set a race probe or assert which object the open returned."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/received_dotdot_lookups.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/received_dotdot_lookups.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests dotdot_from_a_received_descriptor_finds_the_guests_own_files (ptrace) and run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files (KVM) compile this guest, which looks names up through `..` from a directory descriptor it opened and from the same directory received over SCM_RIGHTS, and require the guest's own proc/uptime and proc/fs below that directory's parent, not /proc's, together with the EBADF and ENOTDIR of lookups Linux refuses (https://github.com/rrnewton/hermit/issues/4541); it remains a guest fixture because a generic manifest cannot compare the exact lines across backends."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/record_lock.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -1895,6 +2015,12 @@
       "path": "tests/c/record_replay_accept_in_turn.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_accept_in_turn.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and checks that a blocking accept on a listener the container created waits for a late connector, times out, restarts or fails on a signal, and reports a reset, a shutdown and a nonblocking listener as Linux does, under record and under replay; that a killed accepting process leaves the listener blocking; and that record refuses by name to export a listener or close one while an accept still waits on it. Each expected line is what the guest prints natively."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_chaos_race.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_chaos_race.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload, whose output is the interleaving of four threads that append to a shared buffer, and checks that recordings made under hermit record start --chaos with several seeds record more than one interleaving and that each replay prints its recording's."
     },
     {
       "disposition": "guest-fixture",
@@ -2128,7 +2254,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/rendered_procfs_files.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/rendered_procfs_files.c is owned by hermit-cli/tests/cli.rs: the CLI test detcore_renders_its_procfs_files_on_every_backend runs it on ptrace, DBT, KVM and e9patch preprocessing with ptrace (SaBRe, LiteInst and in-guest-trap are named as not yet, with their issues) and requires every backend to give Linux's answers for /proc/sys/kernel/random/uuid and /proc/sys/kernel/pty/nr, which Detcore renders without the backend opening them, and the same device and inode on each (https://github.com/rrnewton/hermit/issues/4213). It stays a fixture because a generic manifest cannot pass the KVM-only option or compare stdout across backends."
+      "why": "tests/c/rendered_procfs_files.c is owned by hermit-cli/tests/cli.rs: the CLI tests detcore_renders_its_procfs_files_on_every_backend, detcore_renders_its_procfs_files_on_dbt_as_on_ptrace and detcore_keeps_its_procfs_files_across_a_chroot_and_trusts_no_forged_placeholder_on_dbt run it on ptrace, DBT, KVM and e9patch preprocessing with ptrace (SaBRe, LiteInst and in-guest-trap are named as not yet, with their issues; DBT's runs are in the second and third test, https://github.com/rrnewton/hermit/issues/4783) and require every backend to give Linux's answers for /proc/sys/kernel/random/uuid and /proc/sys/kernel/pty/nr, which Detcore renders without the backend opening them, and the same device and inode on each (https://github.com/rrnewton/hermit/issues/4213). It stays a fixture because a generic manifest cannot pass the KVM-only option or compare stdout across backends."
     },
     {
       "disposition": "cargo-integration-test-fixture",
@@ -2146,7 +2272,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/reserved_signal_send_probe.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/reserved_signal_send_probe.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this probe of sends and armings of the signals the in-guest runtime keeps for itself (SIGSYS, SIGSEGV, SIGTRAP; A5 step 3c slice 0a), requires both in-guest LiteInst backends to refuse each send of a signal they keep to another live process and each arming of one with EPERM and a named WARN while verifying bitwise (SIGTRAP only on liteinst, whose site patching installs LiteInst's guard router; in-guest-trap, with patching off and no router, delivers a SIGTRAP from another process as Linux does, and each guest's SigCgt shows SIGTRAP caught only where the router is installed; A5 step 3c slice 0c), requires sends to zombie and reaped children (0 and ESRCH) and sends whose siginfo Linux refuses first (EFAULT, E2BIG, EINVAL) to keep Linux's answers natively and on every backend, requires ptrace to print its pre-existing output (Linux's, except a SIGTRAP from another process that ptrace drops, https://github.com/rrnewton/hermit/issues/4555, and timer clocks Detcore does not check, https://github.com/rrnewton/hermit/issues/4556), and requires the process-group forms to stay refused by name; it remains a guest fixture because a generic manifest cannot express those per-backend verdicts, and its group modes signal the caller's process group or every process it may signal, which must never run natively."
+      "why": "tests/c/reserved_signal_send_probe.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this probe of sends and armings of the signals the in-guest runtime keeps for itself (SIGSYS, SIGSEGV, SIGTRAP; A5 step 3c slice 0a), requires both in-guest LiteInst backends to refuse each send of a signal they keep to another live process and each arming of one with EPERM and a named WARN while verifying bitwise (SIGTRAP only on liteinst, whose site patching installs LiteInst's guard router; in-guest-trap, with patching off and no router, delivers a SIGTRAP from another process as Linux does, and each guest's SigCgt shows SIGTRAP caught only where the router is installed; A5 step 3c slice 0c), requires sends to zombie and reaped children (0 and ESRCH) and sends whose siginfo Linux refuses first (EFAULT, E2BIG, EINVAL) to keep Linux's answers natively and on every backend, requires ptrace to print Linux's output, a SIGTRAP from another process included (delivered since Reverie a8e9d1d52b31), except timer clocks Detcore does not check (https://github.com/rrnewton/hermit/issues/4556), and requires the process-group forms to stay refused by name; it remains a guest fixture because a generic manifest cannot express those per-backend verdicts, and its group modes signal the caller's process group or every process it may signal, which must never run natively."
     },
     {
       "disposition": "manifest-test",
@@ -2243,6 +2369,18 @@
       "path": "tests/c/scheduler_signal_waiting.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/scheduler_signal_waiting.c is owned by hermit-cli/tests/cli.rs: The integration tests a_scheduler_child_exit_signal_removed_without_a_delivery_arms_no_call and a_scheduler_timer_signal_removed_without_a_delivery_arms_no_call run each of its eleven modes under run --strict, with the scheduler's SIGCHLD from a child exit and its SIGALRM from ITIMER_REAL, require the line Linux prints, and record and replay one mode each: a signal every thread blocked that SIG_DFL, SIG_IGN, sigwaitinfo, a signalfd read, a handler or a sibling removed must not arm a later sigsuspend, a shared copy left after a thread took its own must still end one, a signal still pending after another ended the call armed for it must arm the next, and an idle or closed signalfd must not stop the arming (https://github.com/rrnewton/hermit/pull/4314); a generic manifest cannot assert per-mode output or the replay verdict."
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/scm_rights_received_anon_inodes.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/scm_rights_received_anon_inodes.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Receives an eventfd, an EFD_SEMAPHORE eventfd, a nonblocking eventfd and a signalfd over SCM_RIGHTS and pins, on ptrace and KVM, that Detcore leaves received anonymous inodes unrecorded without hanging"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/scm_rights_received_descriptors.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/scm_rights_received_descriptors.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Receives a file, pipe, eventfd, socketpair and append descriptor over SCM_RIGHTS (recvmsg, MSG_CMSG_CLOEXEC, recvmmsg, MSG_CTRUNC) and uses them, on every backend, as Detcore records received descriptors where its tool does not discover them as they are used"
     },
     {
       "disposition": "manifest-test",
@@ -2344,7 +2482,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/sigkill_cross_process.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/sigkill_cross_process.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests a_cross_process_sigkill_verifies_at_bitwise_parity, a_cross_process_sigkill_edge_case_verifies_at_bitwise_parity and a_cross_process_sigkill_notification_verifies_at_bitwise_parity (one mode table, split so each stays inside the per-test CPU budget, https://github.com/rrnewton/hermit/issues/4220) compile this guest, in which a process kills its parent with SIGKILL (with and without a bystander process taking scheduler turns), and requires five consecutive `run --strict --verify --verify-strict` runs per mode to reach canonical bitwise parity and print how the parent ended (https://github.com/rrnewton/hermit/issues/3994); it remains a guest fixture because a manifest cell runs one verified run, while this regression needs repeated runs to show the retirement no longer lands at a host-chosen position."
+      "why": "tests/c/sigkill_cross_process.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests a_cross_process_sigkill_verifies_at_bitwise_parity, a_cross_process_sigkill_of_a_child_or_own_group_verifies_at_bitwise_parity, a_cross_process_sigkill_edge_case_verifies_at_bitwise_parity, a_cross_process_sigkill_notification_verifies_at_bitwise_parity, a_late_or_vectored_sigkill_notification_read_verifies_at_bitwise_parity and a_positioned_or_self_read_sigkill_notification_verifies_at_bitwise_parity (one mode table, split so each stays inside the per-test CPU and wall budgets, https://github.com/rrnewton/hermit/issues/4220 and https://github.com/rrnewton/hermit/issues/4783) compile this guest, in which a process kills its parent with SIGKILL (with and without a bystander process taking scheduler turns), and requires five consecutive `run --strict --verify --verify-strict` runs per mode to reach canonical bitwise parity and print how the parent ended (https://github.com/rrnewton/hermit/issues/3994); it remains a guest fixture because a manifest cell runs one verified run, while this regression needs repeated runs to show the retirement no longer lands at a host-chosen position."
     },
     {
       "disposition": "manifest-test",
@@ -2390,6 +2528,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/signal_permits_per_thread.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/signal_permits_per_thread.c is owned by hermit-cli/tests/cli.rs. Its sixteen modes have threads of one process take signals at the same time (both raise or tgkill themselves, a worker signals a spinning or sigsuspending main thread and then itself), have a worker keep signaling itself while the main thread's parked wait (nanosleep, clock_nanosleep, pause, sigsuspend, read, waitid or a getpid loop) takes a process ITIMER_REAL alarm, have a worker keep signaling itself while another thread exits or the process ends by exit_group, SIGTERM or a default-action SIGALRM, and have a worker call exit_group while that alarm interrupts the main thread's nanosleep. Detcore once held one signal-delivery permit per process and the KVM backend failed the run when a sibling's boundary was refused (https://github.com/rrnewton/hermit/issues/4899). run_kvm_signal_permits_are_per_thread runs all sixteen modes on KVM and run_ptrace_signal_permits_are_per_thread fifteen on ptrace: each must print the line Linux prints and reach bitwise parity under run --strict --verify --verify-strict, and on KVM the retained INFO log of alarm-exit-group must show the worker's group exit committed after the main thread began handling its SIGALRM and before the main thread's InboundSignal turn, while it held its observed wait's permit. alarm-waitid stays an unmet ptrace requirement: there the alarm does not interrupt waitid and the run never ends, at main b82ae16f as well (https://github.com/rrnewton/hermit/issues/4133). A generic manifest cell cannot assert any of this per mode."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/signal_state_kept.c",
       "runner": "hermit-cli/tests/signal_determinism.rs",
       "why": "tests/c/signal_state_kept.c is owned by hermit-cli/tests/signal_determinism.rs: the ptrace_signal_state_kept_* tests run it natively and under run --strict --verify --verify-strict, single-threaded and around a joined thread (glibc's pthread_create blocks every signal around the clone with a call Detcore injects, and Reverie single-steps), and compare SIGTRAP's action, rt_sigprocmask bit and procfs SigBlk/SigIgn/SigCgt with the native run's for an ignored, blocked-ignored, caught, blocked-caught and blocked-default SIGTRAP. Where Reverie keeps its step shield (a blocked-caught SIGTRAP, and every blocked state once a second thread has used the table) only SIGTRAP's SigBlk bit may differ, a pinned limit. A generic manifest cannot compare a guest's output with a native run of it (A5 step 3.0, https://github.com/rrnewton/hermit/issues/4485)."
@@ -2398,7 +2542,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/signal_then_sibling_exit.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/signal_then_sibling_exit.c is owned by hermit-cli/tests/cli.rs: run_kvm_a_sibling_may_exit_while_its_signal_is_taken runs it on the KVM backend, where a worker signals the main thread and exits at once while the main thread takes the signal at a system-call return (spin) or in a sigsuspend loop; the worker's exit must wait for the delivery permit rather than fail the parked signal protocol (https://github.com/rrnewton/hermit/issues/4367). It requires repeated run --strict --verify --verify-strict runs, with chaos seeds for sigsuspend, at bitwise parity, so it remains a guest fixture rather than a manifest cell."
+      "why": "tests/c/signal_then_sibling_exit.c is owned by hermit-cli/tests/cli.rs: run_kvm_a_sibling_may_exit_while_its_signal_is_taken runs it on the KVM backend, where a worker signals the main thread and exits at once while the main thread takes the signal at a system-call return (spin) or in a sigsuspend loop; the worker's exit must not fail the parked signal protocol (https://github.com/rrnewton/hermit/issues/4367), and since delivery permits are per thread it proceeds while the main thread holds its own (https://github.com/rrnewton/hermit/issues/4899). It requires repeated run --strict --verify --verify-strict runs, with chaos seeds for sigsuspend, at bitwise parity, so it remains a guest fixture rather than a manifest cell."
     },
     {
       "disposition": "guest-fixture",
@@ -2417,6 +2561,12 @@
       "path": "tests/c/signalfd_create.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/signalfd_create.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/signalfd_threads.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and KVM; ci=true)",
+      "why": "tests/c/signalfd_threads.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: a signalfd created while a second thread exists, with a third thread started while it is open, must answer each thread from its own pending signals and its process's: a tgkill to one thread is readable by that thread only (poll, select and read), a timer's SIGALRM and a child's SIGCHLD by every thread and read once, a read takes the thread's own signal before the process's, and a ppoll ends for a signal sent to the waiting thread and not for one sent to another (https://github.com/rrnewton/hermit/issues/4797)"
     },
     {
       "disposition": "manifest-test",
@@ -2593,6 +2743,12 @@
       "why": "tests/c/socket_options.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/socket_reader_beside_spinner.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/socket_reader_beside_spinner.c is owned by hermit-cli/tests/cli.rs: The integration test a_socket_reader_beside_a_spinner_is_retried_within_a_poll_upgrade_period runs this guest under run --strict, without chaos and at three chaos seeds (one with --verify --verify-strict), requires all five socket round trips to finish before the guest's 10 s deadline while main spins without system calls, and replays a chaos recording under --replay-schedule-from without a desync; a generic manifest cannot express the deadline, the parity check or the replay."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/socket_timestamp_edge_cases.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -2699,6 +2855,12 @@
       "path": "tests/c/sync_file_range.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/sync_file_range.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/syscall_clobbers.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on every backend; ci=true)",
+      "why": "tests/c/syscall_clobbers.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: after raw syscalls of each kind (emulated, run by the kernel, tail-injected, failing), every backend must leave %rcx at the next instruction and %r11 at RFLAGS, as a native Linux return does"
     },
     {
       "disposition": "manifest-test",
@@ -2831,6 +2993,12 @@
       "path": "tests/c/threads_fd_churn.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and KVM; ci=true)",
       "why": "tests/c/threads_fd_churn.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and KVM; ci=true): threads that share one descriptor table keep their descriptors while another thread churns it (a cross-thread pipe EOF, an epoll registration modified and deleted after the table is republished, a dup3 seen across threads), for KVM's copy-only-changed-entries file table (https://github.com/rrnewton/hermit/issues/4287); verify cells on ptrace and KVM, other backends to ratchet against the ptrace reference"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/timed_wait_pollers.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/timed_wait_pollers.c is owned by hermit-cli/tests/cli.rs: The integration test short_timed_wait_pollers_do_not_inflate_a_cpu_bound_threads_time runs this guest under run --strict with one or six 100 us pollers (pthread_cond_timedwait or clock_nanosleep) beside a CPU-bound main thread, without chaos and at two chaos seeds, and requires the run's virtual time to stay under twice that of the same work with no poller (five times when main's loop makes system calls), plus chaos runs at bitwise parity; a generic manifest cannot compare two runs' guest-reported virtual times."
     },
     {
       "disposition": "guest-fixture",
@@ -3020,6 +3188,18 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/virtual_cpus.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/virtual_cpus.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests virtual_cpus_every_cpu_count_agrees and virtual_cpus_affinity_follows_linux compile this guest. In counts mode it prints how many CPUs sysconf, get_nprocs, sched_getaffinity, the /sys CPU lists and directories, /proc/cpuinfo, /proc/stat, Cpus_allowed, node 0, CPUID's APIC IDs, getcpu and one thread per CPU report, and the test requires 1 without --virtual-cpus and N with it at bitwise parity; in affinity mode it checks sched_setaffinity's read-back, Linux's EINVAL, EFAULT and ESRCH cases, getcpu and status on the pinned CPU, inheritance and a cross-thread mask, printing only whether each held, and the test requires Hermit's output under --virtual-cpus=4 to equal the native one; it remains a guest fixture because a generic manifest cannot assert this exact output."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/virtual_cpus_pool_race.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/virtual_cpus_pool_race.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test virtual_cpus_let_a_sysconf_sized_pool_race compiles this guest, a worker pool sized from sysconf(_SC_NPROCESSORS_ONLN) whose workers race on an unsynchronized counter with a yield between each read and write, and requires under --chaos that one worker loses no update without --virtual-cpus and that four workers lose updates with --virtual-cpus=4; it is nondeterministic natively by design, so it remains a test-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/virtual_kernel_files.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/virtual_kernel_files.c is owned by hermit-cli/tests/cli.rs: the CLI tests detcore_fixes_the_virtual_kernel_files_on_<backend>, one per backend, run it natively, on ptrace, and on DBT, KVM, SaBRe and e9patch preprocessing with ptrace, each compared with ptrace (LiteInst and in-guest-trap are named as not yet, https://github.com/rrnewton/hermit/issues/4450), requires the procfs files that describe the kernel and its fixed limits (/proc/version, /proc/cmdline, the kernel and vm scalars) to agree with uname, and the kernel's tables (interrupts, softirqs, zoneinfo, meminfo and the others) to describe one machine, as Linux guarantees, and requires every backend to show the same fixed contents, device and inode (https://github.com/rrnewton/hermit/issues/4266). It stays a fixture because a generic manifest cannot compare stdout across backends."
@@ -3185,6 +3365,12 @@
       "path": "tests/debugger/test_gdb_run_gdbserver.py",
       "runner": "tests/debugger/run_debugger_tests.sh",
       "why": "tests/debugger/test_gdb_run_gdbserver.py is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `test_gdb_run_gdbserver.py` is a debugger-specific Python case requiring a live gdbserver and GDB/LLDB client. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/debugger/test_gdb_strict_gdbserver.py",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "tests/debugger/test_gdb_strict_gdbserver.py is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `test_gdb_strict_gdbserver.py` is a debugger-specific Python case requiring a live gdbserver and GDB/LLDB client. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
     },
     {
       "disposition": "guest-fixture",
@@ -4151,6 +4337,18 @@
       "path": "tests/e2e/system-utils/ssh-keygen-ed25519.sh",
       "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
       "why": "tests/e2e/system-utils/ssh-keygen-ed25519.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/e2e/system-utils/stat-alias",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
+      "why": "tests/e2e/system-utils/stat-alias is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: A symbolic link to /usr/bin/bash through which system-utils/stat-alias-root launches its root image, so the run's root is an ELF executed by an alias name; Detcore's stat, and on KVM its comm reads, name it by the link on ptrace, DBT and KVM; the DBT row matches native alias naming through Reverie's explicit executable selection, while the KVM row retains the executor's canonical status naming"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/stat-root.sh",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
+      "why": "tests/e2e/system-utils/stat-root.sh is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: The run's root image is this #!/usr/bin/bash script, which prints the name its own /proc/<pid>/stat, status Name: and comm show (system-utils/stat-script-root); Detcore renders the stat, and on KVM the comm reads; the KVM row records the executor's interpreter naming of a script root, the DBT row DynamoRIO's"
     },
     {
       "disposition": "manifest-test",

@@ -9,12 +9,16 @@
 //! The image a process executes, which its `/proc/<pid>/exe` link names.
 //!
 //! Detcore records it at each exec, on every backend, and checks it against
-//! the kernel's own link when the exec completes (`tool_global`). The
-//! kernel's answer is the file it exec'd, and a backend whose launcher loads
-//! the guest itself (SaBRe's loader) has the kernel exec the launcher, so the
-//! kernel names the launcher; only there does Detcore answer the link from
-//! the record (`Detcore::launched_exe`). Everywhere else the kernel's answer
-//! stands.
+//! the kernel's own link when the exec completes (`tool_global`). Where the
+//! backend's own procfs is not the guest's kernel procfs (KVM), the caller's
+//! own link (`/proc/self/exe` and its other spellings) is answered from the
+//! record while it still names exactly the image the process executes
+//! ([`ExecRecord::names_path_exactly`]; `Detcore::readlink_own_task_link`,
+//! package K slice E1); otherwise it is answered as before. Where the
+//! kernel's link names a launcher in the guest's place (SaBRe's loader,
+//! DynamoRIO's library; `Detcore::launched_exe`), the record answers every
+//! process's link while the image is at its path, as before. The kernel's
+//! link stands elsewhere.
 //!
 //! Only the path is recorded. Where the image ends, which a program-break
 //! model would need, is known only once the image is loaded, and nothing
@@ -54,6 +58,31 @@ pub struct ExecRecord {
     /// at `exe`, which Linux's link would no longer name.
     nlink: u64,
     ctime: (i64, i64),
+    /// The device and inode of each directory above the image, from its
+    /// parent up to the process's root directory, when it was exec'd
+    /// ([`Self::names_path_exactly`]).
+    directories: Vec<(u64, u64)>,
+}
+
+/// The device and inode of each directory above `path`, a canonical path
+/// below `root`, from its parent up to `root`, not following a symbolic link
+/// at any of them, read with raw syscalls (in-guest Detcore must not call
+/// libc's wrappers: `crate::util::raw_syscall`). `None` where one cannot be
+/// read or is no directory ([`directory_sample`]).
+fn directory_chain(root: &Path, path: &Path) -> Option<Vec<(u64, u64)>> {
+    path.ancestors()
+        .skip(1)
+        .take_while(|directory| directory.starts_with(root))
+        .map(|directory| directory_sample(&crate::util::raw_lstat(directory).ok()?))
+        .collect()
+}
+
+/// The device and inode of a directory, from its unfollowed status: `None`
+/// for anything but a directory, so that another kind of file put in a
+/// directory's place never matches it, even where it reuses the freed
+/// directory's inode number (a symbolic link to where the directory went).
+fn directory_sample(stat: &libc::stat) -> Option<(u64, u64)> {
+    (stat.st_mode & libc::S_IFMT == libc::S_IFDIR).then_some((stat.st_dev, stat.st_ino))
 }
 
 impl ExecRecord {
@@ -74,7 +103,22 @@ impl ExecRecord {
     /// caller sees another filesystem; `tool_global` checks every record
     /// against the kernel's own link after the exec.
     pub fn resolve(root: &Path, cwd: &Path, path: &Path) -> Option<Self> {
-        let mut spelled = cwd.join(path);
+        Self::resolve_from(root, Some(cwd), path)
+    }
+
+    /// [`Self::resolve`] for a caller whose working directory may be unknown
+    /// (`cwd` is `None`): then `None` wherever the kernel would look a
+    /// relative path up from it (a relative `path`, or a script whose `#!`
+    /// line names a relative interpreter).
+    pub fn resolve_from(root: &Path, cwd: Option<&Path>, path: &Path) -> Option<Self> {
+        let from_cwd = |path: &Path| {
+            if path.is_absolute() {
+                Some(path.to_path_buf())
+            } else {
+                Some(cwd?.join(path))
+            }
+        };
+        let mut spelled = from_cwd(path)?;
         for _ in 0..=MAX_INTERPRETER_DEPTH {
             let found = crate::util::canonicalize(&below(root, &spelled)?).ok()?;
             // Linux execs only a regular file, and refuses anything else
@@ -86,7 +130,7 @@ impl ExecRecord {
                 Script::Not => return Self::at(root, &found),
                 // The kernel opens the interpreter from the caller's working
                 // directory, as it opened the script.
-                Script::Interpreter(interpreter) => spelled = cwd.join(interpreter),
+                Script::Interpreter(interpreter) => spelled = from_cwd(&interpreter)?,
                 Script::Declined | Script::Unread => return None,
             }
         }
@@ -103,6 +147,7 @@ impl ExecRecord {
             ino: metadata.ino(),
             nlink: metadata.nlink(),
             ctime: (metadata.ctime(), metadata.ctime_nsec()),
+            directories: directory_chain(root, found).unwrap_or_default(),
         })
     }
 
@@ -128,6 +173,26 @@ impl ExecRecord {
                     (now.ctime(), now.ctime_nsec()),
                 ) == (self.dev, self.ino, self.nlink, self.ctime)
             })
+    }
+
+    /// Whether the image's path still names exactly the file the process
+    /// executes, as Linux's `exe` link renders it (`d_path` of the image's
+    /// dentry), for a process whose root directory the caller sees at
+    /// `root`: the file is untouched at its path ([`Self::is_present`]), and
+    /// every directory above it is the one that was there at the exec (its
+    /// device and inode, not following a symbolic link). A directory has one
+    /// dentry, so the same directory inode at a path is that path's dentry,
+    /// and the same untouched file in the same directory under the same name
+    /// is the same dentry: a rename of the image or of any directory above
+    /// it, another directory or a symbolic link put at one of their paths,
+    /// and a hard link of the image put back at its path all read as not
+    /// exact. (Mounts are refused in the guest.)
+    pub fn names_path_exactly(&self, root: &Path) -> bool {
+        self.is_present(root)
+            && !self.directories.is_empty()
+            && below(root, &self.exe)
+                .and_then(|path| directory_chain(root, &path))
+                .is_some_and(|now| now == self.directories)
     }
 }
 
@@ -872,5 +937,65 @@ mod tests {
         // resolve (Linux runs an execute-only script's interpreter): its
         // header reads as unread, never as not a script.
         assert_eq!(script_interpreter(&root), Script::Unread);
+    }
+
+    #[test]
+    fn only_a_directory_samples_as_one() {
+        // SAFETY: an all-zero `stat` is a valid value.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        stat.st_dev = 7;
+        stat.st_ino = 42;
+        stat.st_mode = libc::S_IFDIR | 0o755;
+        assert_eq!(directory_sample(&stat), Some((7, 42)));
+        // A symbolic link, or any other file, with the recorded directory's
+        // device and inode (a freed inode number reused) is not that
+        // directory.
+        for kind in [
+            libc::S_IFLNK,
+            libc::S_IFREG,
+            libc::S_IFIFO,
+            libc::S_IFSOCK,
+            libc::S_IFCHR,
+            libc::S_IFBLK,
+        ] {
+            stat.st_mode = kind | 0o777;
+            assert_eq!(directory_sample(&stat), None, "{kind:o}");
+        }
+        // And a chain through such a file is no chain.
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::util::canonicalize(directory.path()).unwrap();
+        fs::create_dir(root.join("away")).unwrap();
+        std::os::unix::fs::symlink("away", root.join("a")).unwrap();
+        assert_eq!(directory_chain(&root, &root.join("a/image")), None);
+        assert!(directory_chain(&root, &root.join("away/image")).is_some());
+    }
+
+    #[test]
+    fn a_renamed_directory_above_the_image_is_not_its_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::util::canonicalize(directory.path()).unwrap();
+        fs::create_dir(root.join("a")).unwrap();
+        fs::create_dir(root.join("b")).unwrap();
+        let image = root.join("a/image");
+        fs::write(&image, b"image").unwrap();
+        fs::hard_link(&image, root.join("b/image")).unwrap();
+        let record = ExecRecord::at(&root, &image).unwrap();
+        assert_eq!(record.exe, Path::new("/a/image"));
+        assert!(record.names_path_exactly(&root));
+        // The image's directory renamed away and another directory holding a
+        // link of the same file renamed into its place: the file is untouched
+        // at the path, but Linux's link names /away/image.
+        fs::rename(root.join("a"), root.join("away")).unwrap();
+        fs::rename(root.join("b"), root.join("a")).unwrap();
+        assert!(record.is_present(&root));
+        assert!(!record.names_path_exactly(&root));
+        // Renamed back: the same directories at the same paths.
+        fs::rename(root.join("a"), root.join("b")).unwrap();
+        fs::rename(root.join("away"), root.join("a")).unwrap();
+        assert!(record.names_path_exactly(&root));
+        // A symbolic link in a directory's place.
+        fs::rename(root.join("a"), root.join("away")).unwrap();
+        std::os::unix::fs::symlink("away", root.join("a")).unwrap();
+        assert!(!record.names_path_exactly(&root));
     }
 }

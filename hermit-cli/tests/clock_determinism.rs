@@ -26,6 +26,7 @@ const REPEATABLE_EPOCH: &str = "2000-12-31T23:59:59.123456789Z";
 static HERMIT_CLOCK_LOCK: Mutex<()> = Mutex::new(());
 static CLOCK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CALLBACK_BOUNDARY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 fn command_output(mut command: Command, label: &str) -> Output {
     hermit_binary::configure_guest_execution(&mut command);
@@ -109,6 +110,40 @@ fn replay_epoch_guest() -> &'static Path {
                 .arg("-o")
                 .arg(&binary);
             command_output(command, "replay epoch guest compilation");
+            binary
+        })
+        .as_path()
+}
+
+/// Direct, unrolled syscalls give software callbacks distinct progress/time
+/// coordinates without advancing the conditional-branch counter.
+fn callback_boundary_guest() -> &'static Path {
+    CALLBACK_BOUNDARY_GUEST
+        .get_or_init(|| {
+            let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("clock-callback-boundaries-{}", std::process::id()));
+            fs::create_dir_all(&build_root).unwrap();
+            let binary = build_root.join("clock_unrolled");
+            let mut command = Command::new("cc");
+            command
+                .args([
+                    "-std=gnu11",
+                    "-O2",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-nostdlib",
+                    "-static",
+                    "-fno-stack-protector",
+                    "-fno-pie",
+                    "-no-pie",
+                    "-Wl,--build-id=none",
+                ])
+                .arg(repository.join("tests/c/preemption_callback_boundaries.c"))
+                .arg("-o")
+                .arg(&binary);
+            command_output(command, "unrolled callback guest compilation");
             binary
         })
         .as_path()
@@ -466,4 +501,87 @@ fn replay_without_virtual_time_adopts_the_recorded_epoch() {
         rerecord["epoch"], "2000-12-31T23:59:59.123456789Z",
         "a --no-virtualize-time replay did not start from the recorded epoch: {rerecord}"
     );
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4082>: RCB0 is not a callback
+/// identity. An Exec point must not fire at ThreadStart, and successive clock
+/// syscalls at the same RCB must retain their actual phase/progress/time.
+#[test]
+fn preemption_replay_preserves_equal_rcb_software_callback_boundaries() {
+    let _guard = hermit_clock_lock();
+    let recorded_path = schedule_path("unrolled-clock-record.json");
+    let replayed_path = schedule_path("unrolled-clock-replay.json");
+    let run = |record: &Path, replay: Option<&Path>| {
+        let mut command = Command::new(hermit_binary::hermit_binary());
+        command.args([
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-10-25T00:00:00Z",
+            "--clock-multiplier=.1",
+            "--target-timeslice=20000",
+            "--max-timeslice=100000",
+            "--target-timeslice-syscalls-only",
+            "--futex-wake-yields",
+            "--seed=1",
+            "--chaos",
+            "--sched-seed=1",
+        ]);
+        if let Some(replay) = replay {
+            command.arg(format!("--replay-preemptions-from={}", replay.display()));
+        } else {
+            command.arg("--imprecise-timers");
+        }
+        command
+            .arg(format!("--record-preemptions-to={}", record.display()))
+            .arg("--")
+            .arg(callback_boundary_guest());
+        hermit_binary::configure_guest_execution(&mut command);
+        let rendered = format!("{command:?}");
+        // This branchless guest needs no physical timer delivery or retry.
+        let output = hermit_binary::hermit_output_attempts(&rendered, 1, &mut command);
+        assert_success(&output, &rendered);
+        assert_eq!(output.stdout, b"CLOCK_OK\n");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        output
+    };
+    let recorded = run(&recorded_path, None);
+    let original = fs::read(&recorded_path).unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let checkpoints = record["callback_checkpoints"].as_object().unwrap();
+    let mut exec_at_rcb_zero = false;
+    let mut distinct_equal_rcb_endpoints = false;
+    for points in checkpoints.values() {
+        let points = points.as_array().unwrap();
+        exec_at_rcb_zero |= points.iter().any(|point| {
+            let origin = &point["origin"];
+            origin["callback"] == "Exec"
+                && origin["site"] == "Prehook"
+                && origin["rcbs"].as_u64() == Some(0)
+                && origin["progress"].as_u64() == Some(3)
+        });
+        distinct_equal_rcb_endpoints |= points.windows(2).any(|pair| {
+            let left = &pair[0]["origin"];
+            let right = &pair[1]["origin"];
+            right["callback"] == serde_json::json!({ "Syscall": 228 })
+                && right["site"] == "Posthook"
+                && left["rcbs"].as_u64().unwrap() == right["rcbs"].as_u64().unwrap()
+                && left["progress"].as_u64().unwrap() < right["progress"].as_u64().unwrap()
+                && left["time"].as_u64().unwrap() < right["time"].as_u64().unwrap()
+        });
+    }
+    assert!(
+        exec_at_rcb_zero,
+        "the recording missed the startup counterexample"
+    );
+    assert!(
+        distinct_equal_rcb_endpoints,
+        "the recording did not exercise distinct equal-RCB callback boundaries"
+    );
+    let replayed = run(&replayed_path, Some(&recorded_path));
+    assert_eq!(replayed.stdout, recorded.stdout);
+    assert_eq!(fs::read(&recorded_path).unwrap(), original);
+    // Compare the complete wire bytes, including every event, callback, clock,
+    // priority and register field. No normalization or summary-only oracle.
+    assert_eq!(fs::read(&replayed_path).unwrap(), original);
 }

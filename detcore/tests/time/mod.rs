@@ -1126,6 +1126,85 @@ fn tod_clock_gettime() {
     );
 }
 
+/// Makes 200 `getppid` calls, reading `CLOCK_MONOTONIC` around each, and
+/// prints the virtual nanoseconds the loop took. Every read must be later than
+/// the one before.
+fn syscall_loop_elapsed() {
+    let read_time = || {
+        let mut now = MaybeUninit::<libc::timespec>::uninit();
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_clock_gettime,
+                libc::CLOCK_MONOTONIC,
+                now.as_mut_ptr(),
+            )
+        };
+        assert_eq!(result, 0);
+        let now = unsafe { now.assume_init() };
+        now.tv_sec as i128 * 1_000_000_000 + now.tv_nsec as i128
+    };
+    let start = read_time();
+    let mut last = start;
+    for _ in 0..200 {
+        unsafe { libc::syscall(libc::SYS_getppid) };
+        let now = read_time();
+        assert!(now > last, "the clock did not advance: {last} then {now}");
+        last = now;
+    }
+    let line = format!("elapsed_ns={}\n", last - start);
+    unsafe { libc::write(1, line.as_ptr().cast(), line.len()) };
+}
+
+/// The virtual nanoseconds [`syscall_loop_elapsed`] reports under a
+/// sequentializing scheduler without a PMU, with `target` as the logical
+/// `--target-timeslice` and `--cap-preemption-charge` as `cap`.
+fn syscall_loop_elapsed_with(target: Option<u64>, cap: bool) -> i128 {
+    let config = detcore::Config {
+        virtualize_time: true,
+        max_timeslice: None,
+        target_timeslice: target.and_then(std::num::NonZeroU64::new),
+        sequentialize_threads: true,
+        no_rcb_time: true,
+        // Without a PMU each syscall costs about 2.5 virtual ms here; a 5 ms
+        // turn charge makes the charge, not the syscall, the larger cost.
+        scheduler_turn_cost: std::num::NonZeroU64::new(5_000_000),
+        cap_preemption_charge: cap,
+        ..Default::default()
+    };
+    let (output, _) = test_fn_with_config::<Detcore, _>(syscall_loop_elapsed, config, true)
+        .expect("the syscall loop runs under Detcore");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .trim()
+        .strip_prefix("elapsed_ns=")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected output {stdout:?}"))
+}
+
+/// A logical timeslice shorter than one syscall's virtual cost ends a slice
+/// at every syscall, and each such turn pays the full scheduler charge (here
+/// 5 ms, twice a syscall's cost), so the loop's guest-visible time nearly
+/// triples (measured: 1025 ms unsliced, 3025 ms). With
+/// `--cap-preemption-charge` a slice's turn costs at most the slice, so the
+/// loop takes about twice its unsliced time (measured: 2055 ms), and two runs
+/// read the same time. No PMU is needed: the target is checked at syscalls.
+#[test]
+fn a_capped_preemption_charge_bounds_the_time_short_slices_add() {
+    let unsliced = syscall_loop_elapsed_with(None, false);
+    let full = syscall_loop_elapsed_with(Some(20_000), false);
+    let capped = syscall_loop_elapsed_with(Some(20_000), true);
+    assert!(
+        2 * full > 5 * unsliced,
+        "full charges: {full} ns against {unsliced} ns unsliced"
+    );
+    assert!(
+        capped > unsliced && 10 * capped <= 21 * unsliced,
+        "capped charges: {capped} ns against {unsliced} ns unsliced"
+    );
+    assert_eq!(capped, syscall_loop_elapsed_with(Some(20_000), true));
+}
+
 #[test]
 fn target_timeslice_yields_at_syscall_boundaries_without_pmu() {
     let config = detcore::Config {

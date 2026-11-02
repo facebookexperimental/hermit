@@ -158,7 +158,13 @@ fn socket_receive_timestamps_use_logical_time() {
             String::from_utf8_lossy(&compile.stderr)
         );
 
-        for backend in ["ptrace", "dbt"] {
+        // The DBT leg runs only in builds that include DBT; the ptrace leg always runs.
+        let backends: &[&str] = if cfg!(feature = "dbt") {
+            &["ptrace", "dbt"]
+        } else {
+            &["ptrace"]
+        };
+        for backend in backends {
             let mut command = Command::new("timeout");
             command
                 .args(["--kill-after", "5s", "90s"])

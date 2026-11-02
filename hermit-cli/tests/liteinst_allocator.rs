@@ -172,7 +172,7 @@ fn qualify(
                     manifest,
                     Some(source.clone()),
                     format!(
-                        "git+https://github.com/rrnewton/reverie.git?rev={pin}#reverie-liteinst-preload@0.5.3"
+                        "git+https://github.com/rrnewton/reverie.git?rev={pin}#reverie-liteinst-preload@0.5.4"
                     ),
                     artifact::STANDALONE_ROOT,
                 )
@@ -184,7 +184,7 @@ fn qualify(
                     manifest,
                     None,
                     format!(
-                        "path+file://{}#0.5.3",
+                        "path+file://{}#0.5.4",
                         root.join("detcore-liteinst").display()
                     ),
                     "detcore_liteinst_initialize",

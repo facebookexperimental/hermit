@@ -795,8 +795,10 @@ async fn proc_status_sigblk_shows_the_published_mask_under_the_gate() {
         file.bind_thread_identity(THREAD.as_raw(), THREAD.as_raw(), 1);
         let mask_thread = file.status_mask_thread(&contents);
         assert_eq!(mask_thread, Some(THREAD.as_raw()), "{case}");
-        let published_sigblk =
-            crate::syscalls::status_published_sigblk(&mut guest, mask_thread).await;
+        let published_sigblk = crate::syscalls::status_published_sigblk(&mut guest, mask_thread)
+            .await
+            .expect("no refusal")
+            .sigblk;
         file.initialize(
             contents.clone(),
             crate::procfs::ProcfsSnapshotContext {

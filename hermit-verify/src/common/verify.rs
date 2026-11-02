@@ -126,9 +126,130 @@ impl<P: AsRef<OsStr>> Verify<P> {
         Self::verify_lines(left, right)
     }
 
+    /// Every difference between two schedule files in what priority-history
+    /// replay must reproduce beside the global events: each per-thread
+    /// history, whole, and each callback checkpoint. A key present on one
+    /// side only is a difference; absent on both is equal. Nothing is
+    /// projected, reordered or normalized.
+    fn priority_history_differences(
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+    ) -> Vec<String> {
+        let mut differences = Vec::new();
+        for key in ["per_thread", "callback_checkpoints"] {
+            match (left.get(key), right.get(key)) {
+                (None, None) => {}
+                (Some(_), None) => differences.push(format!("{key}: in the first run only")),
+                (None, Some(_)) => differences.push(format!("{key}: in the second run only")),
+                (Some(left), Some(right)) => {
+                    Self::value_differences(key.to_owned(), left, right, &mut differences)
+                }
+            }
+        }
+        differences
+    }
+
+    /// The number of per-thread histories, their preemption rows, and the
+    /// callback checkpoints in one schedule file.
+    fn priority_history_extent(schedule: &serde_json::Value) -> (usize, usize, usize) {
+        let threads = schedule.get("per_thread").and_then(|t| t.as_object());
+        let rows = threads.map_or(0, |threads| {
+            threads
+                .values()
+                .filter_map(|t| t.get("preemption_rcbs")?.as_array().map(Vec::len))
+                .sum()
+        });
+        let checkpoints = schedule
+            .get("callback_checkpoints")
+            .and_then(|c| c.as_object())
+            .map_or(0, |c| {
+                c.values().filter_map(|t| t.as_array().map(Vec::len)).sum()
+            });
+        (threads.map_or(0, |t| t.len()), rows, checkpoints)
+    }
+
+    fn value_differences(
+        path: String,
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+        differences: &mut Vec<String>,
+    ) {
+        use serde_json::Value;
+        if left == right {
+            return;
+        }
+        match (left, right) {
+            (Value::Object(left), Value::Object(right)) => {
+                let keys: std::collections::BTreeSet<&String> =
+                    left.keys().chain(right.keys()).collect();
+                for key in keys {
+                    match (left.get(key), right.get(key)) {
+                        (Some(l), Some(r)) => {
+                            Self::value_differences(format!("{path}.{key}"), l, r, differences)
+                        }
+                        (Some(_), None) => {
+                            differences.push(format!("{path}.{key}: in the first run only"))
+                        }
+                        (None, Some(_)) => {
+                            differences.push(format!("{path}.{key}: in the second run only"))
+                        }
+                        (None, None) => unreachable!(),
+                    }
+                }
+            }
+            (Value::Array(l), Value::Array(r)) => {
+                if l.len() != r.len() {
+                    differences.push(format!("{path}: {} entries vs {}", l.len(), r.len()));
+                }
+                for (index, (l, r)) in l.iter().zip(r).enumerate() {
+                    Self::value_differences(format!("{path}[{index}]"), l, r, differences);
+                }
+            }
+            _ => differences.push(format!("{path}: {left} vs {right}")),
+        }
+    }
+
+    /// The fixed point of priority-history replay, which re-records what it
+    /// replays: the two schedule files must agree exactly on every
+    /// per-thread priority history and every callback checkpoint.
+    /// `verify_schedules`, which compares only the global events, is
+    /// unchanged and checked separately.
+    pub fn verify_priority_histories(
+        &self,
+        left: &RunEnvironment,
+        right: &RunEnvironment,
+    ) -> anyhow::Result<bool> {
+        println!(
+            "{}",
+            "::  Checking that per-thread priority histories and callback checkpoints match".bold()
+        );
+        let read = |path: &Path| -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::from_reader(BufReader::new(
+                std::fs::File::open(path)?,
+            ))?)
+        };
+        let (left, right) = (read(&left.schedule_file)?, read(&right.schedule_file)?);
+        // Name what was compared, so an exact agreement of two empty
+        // histories is never mistaken for coverage.
+        let (threads, rows, checkpoints) = Self::priority_history_extent(&left);
+        println!(
+            "   first run: {threads} per-thread histories, {rows} preemption rows, \
+             {checkpoints} callback checkpoints"
+        );
+        let differences = Self::priority_history_differences(&left, &right);
+        const SHOWN: usize = 20;
+        for difference in differences.iter().take(SHOWN) {
+            println!("{}", difference.red().bold());
+        }
+        if differences.len() > SHOWN {
+            println!("... and {} more differences", differences.len() - SHOWN);
+        }
+        Ok(differences.is_empty())
+    }
+
     fn format_json<TPath: AsRef<Path>>(path: TPath) -> anyhow::Result<String> {
         let value: serde_json::Value =
-            serde_json::from_reader(std::fs::File::open(path.as_ref())?)?;
+            serde_json::from_reader(BufReader::new(std::fs::File::open(path.as_ref())?))?;
         let schedules = match &value {
             serde_json::Value::Object(sched_file) => sched_file.get("global").ok_or_else(|| {
                 anyhow::Error::msg("expecting \"global\" key in the target json file")
@@ -266,6 +387,95 @@ mod test {
 
     use super::*;
     use crate::common::TemporaryEnvironmentBuilder;
+
+    /// A schedule file as priority-history replay writes it: global events,
+    /// one thread's history and one callback checkpoint.
+    fn priority_schedule() -> serde_json::Value {
+        serde_json::json!({
+            "global": [{"dettid": 3, "op": "Branch", "count": 4}],
+            "per_thread": {
+                "3": {
+                    "final_prio": 2195,
+                    "prio_changes": [[1792847361183390955u64, 2195]],
+                    "preemption_rcbs": [1253548],
+                    "chaos_epochs": []
+                }
+            },
+            "callback_checkpoints": {
+                "3": [{
+                    "history_index": 0,
+                    "origin": {
+                        "callback": {"Syscall": 1},
+                        "site": "Posthook",
+                        "progress": 1256742,
+                        "last_op": {"Syscall": [1, "Posthook"]},
+                        "time": 1792847361183390955u64,
+                        "rcbs": 1253548
+                    }
+                }]
+            }
+        })
+    }
+
+    /// The priority-history fixed point passes only on exact agreement of
+    /// every per-thread history and every checkpoint: one changed field, a
+    /// missing checkpoint map, a removed checkpoint and an added row each
+    /// fail, named by path, while the global events are left to
+    /// `verify_schedules`.
+    #[test]
+    fn priority_histories_must_agree_exactly() {
+        let left = priority_schedule();
+        assert!(Verify::<PathBuf>::priority_history_differences(&left, &left).is_empty());
+        assert_eq!(Verify::<PathBuf>::priority_history_extent(&left), (1, 1, 1));
+        assert_eq!(
+            Verify::<PathBuf>::priority_history_extent(&serde_json::json!({"global": []})),
+            (0, 0, 0)
+        );
+        let mut global_only = left.clone();
+        global_only["global"] = serde_json::json!([]);
+        assert!(
+            Verify::<PathBuf>::priority_history_differences(&left, &global_only).is_empty(),
+            "global events are verify_schedules' to compare"
+        );
+
+        let mut site = left.clone();
+        site["callback_checkpoints"]["3"][0]["origin"]["site"] = serde_json::json!("Prehook");
+        assert_eq!(
+            Verify::<PathBuf>::priority_history_differences(&left, &site),
+            vec!["callback_checkpoints.3[0].origin.site: \"Posthook\" vs \"Prehook\"".to_owned()]
+        );
+
+        let mut absent = left.clone();
+        absent
+            .as_object_mut()
+            .unwrap()
+            .remove("callback_checkpoints");
+        assert_eq!(
+            Verify::<PathBuf>::priority_history_differences(&left, &absent),
+            vec!["callback_checkpoints: in the first run only".to_owned()]
+        );
+
+        let mut removed = left.clone();
+        removed["callback_checkpoints"]["3"] = serde_json::json!([]);
+        assert_eq!(
+            Verify::<PathBuf>::priority_history_differences(&left, &removed),
+            vec!["callback_checkpoints.3: 1 entries vs 0".to_owned()]
+        );
+
+        let mut added = left.clone();
+        added["per_thread"]["3"]["preemption_rcbs"] = serde_json::json!([1253548, 2000000]);
+        assert_eq!(
+            Verify::<PathBuf>::priority_history_differences(&left, &added),
+            vec!["per_thread.3.preemption_rcbs: 1 entries vs 2".to_owned()]
+        );
+
+        let mut thread = left.clone();
+        thread["per_thread"]["5"] = left["per_thread"]["3"].clone();
+        assert_eq!(
+            Verify::<PathBuf>::priority_history_differences(&left, &thread),
+            vec!["per_thread.5: in the second run only".to_owned()]
+        );
+    }
 
     #[test]
     fn test_build_command_args_ignore_lines_provided() -> anyhow::Result<()> {

@@ -138,7 +138,8 @@ fn madvise_policy_verifies_in_run_record_and_kvm_modes() {
         .arg("--data-dir")
         .arg(&recording)
         .arg("--")
-        .arg(&guest);
+        .arg(&guest)
+        .arg("--record");
     let output = command_output(record, "madvise record/replay verification");
     assert_marker(
         &output,

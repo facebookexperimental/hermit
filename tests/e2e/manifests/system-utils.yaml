@@ -243,14 +243,15 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           kvm: true
           sabre: false
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
           - sabre
         backends_disabled:
-          dbt: DBT wedges when the guest execs a new program image, and this script ends in `exec hexdump`. Measured 2026-08-24 - the run never exits and emits zero DETLOG records after "[dbt backend] Detcore Tool active"; a cell timeout then misreports it as "failed to launch drrun". Note DBT refuses execveat legibly with ENOSYS (tests/c/dbt_execveat_unsupported.c passes), so it is execve specifically that hangs
           liteinst: The preload runtime cannot survive the hexdump script's post-start exec
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -379,11 +380,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: Ptrace and SaBRe each reach L2, but coreutils mktemp consumes different deterministic entropy positions and emits different name suffixes
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -515,9 +516,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -580,9 +581,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -646,11 +647,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe and ptrace each reach L2, but libcrypto consumes different deterministic entropy positions and emits different hex stdout
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -713,9 +714,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: Certificate issuance combines wall-clock validity with multiple entropy draws; clock, random-stream, and full-trace support remain unqualified
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -769,8 +770,8 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           kvm: KVM requires the privileged runner
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -908,9 +909,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
           sabre: Path evidence found 33 raw syscall sites per execution in ld-linux and libc; trusted shared-object native execution is not SaBRe support
@@ -1049,9 +1050,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -1114,9 +1115,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -1178,12 +1179,13 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -1246,11 +1248,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -1313,8 +1315,8 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
@@ -1669,12 +1671,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          dbt: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -1898,8 +1900,8 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
         backends_disabled:
-          dbt: Enable once the DBI post-exec clock path is qualified against the ptrace baseline
           kvm: Enable once the KVM post-exec clock path is qualified against the ptrace baseline
           sabre: SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC
           liteinst: The preload runtime does not survive the guest's own re-exec
@@ -2229,9 +2231,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness
           sabre: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness
           liteinst: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -2295,9 +2297,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: The harness control is backend-independent; ptrace is the canonical required witness
           sabre: The harness control is backend-independent; ptrace is the canonical required witness
           liteinst: The harness control is backend-independent; ptrace is the canonical required witness
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -2616,6 +2618,149 @@ test:
         backends_enabled: []
         backends_disabled:
           ptrace: Record/replay qualification is separate from this strict-verification contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the workload is single-threaded, so chaos scheduling has no schedule to diversify.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this guest
+          dbt: No custom edge-case arguments have been calibrated for this guest
+          kvm: No custom edge-case arguments have been calibrated for this guest
+          sabre: No custom edge-case arguments have been calibrated for this guest
+          liteinst: No custom edge-case arguments have been calibrated for this guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: system-utils/stat-script-root
+    description: "tests/e2e/system-utils/stat-root.sh is the run's root image, executed by its #!/usr/bin/bash line, and prints the name its own /proc/<pid>/stat, the Name: line of its /proc/<pid>/status and its /proc/<pid>/comm show, read by the shell itself. Linux names the task by the script's file name (kbasename(bprm->filename), fs/exec.c begin_new_exec), so all three say stat-root.sh; the ptrace row is the native output. Detcore renders the stat (package K slice D4c-1): on ptrace and DBT its name is the kernel's, on KVM Detcore's record from the image's AT_EXECFN, the script's path, so stat says stat-root.sh on ptrace and KVM. On KVM Detcore also renders the read of the comm file from the same record (package K slice A+), so comm says stat-root.sh there too. The KVM and DBT rows are measured under Hermit (strict verification at bitwise parity). The DBT row records a named DBT difference that is not Detcore's: DynamoRIO runs a #! script root through its interpreter and names the task by the basename of the image it runs (its loader's PR_SET_NAME), so the kernel's name, which stat, status and comm all show there, is bash (https://github.com/rrnewton/hermit/issues/4595). The KVM row records a named difference that is not Detcore's: the KVM executor, which still serves status and PR_GET_NAME there, names the root image by the resolved argv[0], which Hermit's launcher rewrites to the interpreter for a #! script (reverie-kvm elf.rs initial_thread_name), so its status says bash, while the comm file Detcore renders from its record says stat-root.sh, as stat does: the executor's name, which PR_GET_NAME also returns, differs from the record's for such a root (https://github.com/rrnewton/reverie/issues/1106)"
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - bash
+    occasional: false
+    program: tests/e2e/system-utils/stat-root.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - dbt
+          - kvm
+        backends_disabled:
+          sabre: "NOT-QUALIFIED: this cell checks the name Detcore's rendered stat gives a #! script root against the kernel's status and comm; SaBRe has not been run on it, and SaBRe is a drop candidate under the owner's ruling."
+          liteinst: "NOT-QUALIFIED: this cell checks the name Detcore's rendered stat gives a #! script root; in-guest LiteInst has not been run on it."
+          in-guest-trap: "NOT-QUALIFIED: this cell checks the name Detcore's rendered stat gives a #! script root; in-guest-trap has not been run on it."
+        expected_stdout:
+          ptrace: "stat=stat-root.sh status=stat-root.sh comm=stat-root.sh\n"
+          dbt: "stat=bash status=bash comm=bash\n"
+          kvm: "stat=stat-root.sh status=bash comm=stat-root.sh\n"
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the contract is the same output under Hermit on every backend; the native output equals the ptrace row, checked when the cell was written.'
+        backends_enabled: []
+        backends_disabled:
+          native: This contract asserts Hermit's output on each backend, not a native run
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-QUALIFIED: under record and replay Detcore leaves /proc/<pid>/stat to the kernel, and this cell has not been recorded; its replay is unqualified.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this cell's strict verification; under record and replay the kernel serves /proc/<pid>/stat
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the workload is single-threaded, so chaos scheduling has no schedule to diversify.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this guest
+          dbt: No custom edge-case arguments have been calibrated for this guest
+          kvm: No custom edge-case arguments have been calibrated for this guest
+          sabre: No custom edge-case arguments have been calibrated for this guest
+          liteinst: No custom edge-case arguments have been calibrated for this guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: system-utils/stat-alias-root
+    description: "The run's root image is /usr/bin/bash (an ELF) launched through tests/e2e/system-utils/stat-alias, a symbolic link to it, with tests/e2e/system-utils/stat-root.sh as its script, which prints the name the shell's own /proc/<pid>/stat, the Name: line of its /proc/<pid>/status and its /proc/<pid>/comm show, read by the shell itself. Linux names the task by the path it was executed by (kbasename(bprm->filename), fs/exec.c begin_new_exec), the link's, so all three say stat-alias; the ptrace row is the native output. Detcore renders the stat (package K slice D4c-1): on ptrace and DBT its name is the kernel's, on KVM Detcore's record from the image's AT_EXECFN, the path as launched, so stat says stat-alias on ptrace, DBT and KVM. On KVM Detcore also renders the read of the comm file from the same record (package K slice A+), so comm says stat-alias there too. The KVM row is measured under Hermit (strict verification at bitwise parity). The DBT row matches the native alias control: Reverie now passes the selected executable spelling separately from argv[0] to DynamoRIO, whose loader's PR_SET_NAME uses the alias basename. Thus stat, status and comm all say stat-alias; direct /usr/bin/bash controls still say bash. This removes the earlier DBT link-target naming difference (https://github.com/rrnewton/hermit/issues/4595). The KVM row records a named difference that is not Detcore's: the KVM executor, which still serves status and PR_GET_NAME there, names the root image by its resolved, canonical argv[0] (reverie-kvm elf.rs initial_thread_name), the link's target, so its status says bash, while the comm file Detcore renders from its record says stat-alias, as stat does: the executor's name, which PR_GET_NAME also returns, differs from the record's for such a root (https://github.com/rrnewton/reverie/issues/1106)"
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - bash
+    occasional: false
+    direct:
+      - "{{ROOT_DIR}}/tests/e2e/system-utils/stat-alias"
+      - "{{ROOT_DIR}}/tests/e2e/system-utils/stat-root.sh"
+      - "--run"
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - dbt
+          - kvm
+        backends_disabled:
+          sabre: "NOT-QUALIFIED: this cell checks the name Detcore's rendered stat gives a root launched through a symbolic link against the kernel's status and comm; SaBRe has not been run on it, and SaBRe is a drop candidate under the owner's ruling."
+          liteinst: "NOT-QUALIFIED: this cell checks the name Detcore's rendered stat gives a root launched through a symbolic link; in-guest LiteInst has not been run on it."
+          in-guest-trap: "NOT-QUALIFIED: this cell checks the name Detcore's rendered stat gives a root launched through a symbolic link; in-guest-trap has not been run on it."
+        expected_stdout:
+          ptrace: "stat=stat-alias status=stat-alias comm=stat-alias\n"
+          dbt: "stat=stat-alias status=stat-alias comm=stat-alias\n"
+          kvm: "stat=stat-alias status=bash comm=stat-alias\n"
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the contract is the same output under Hermit on every backend; the native output equals the ptrace row, checked when the cell was written.'
+        backends_enabled: []
+        backends_disabled:
+          native: This contract asserts Hermit's output on each backend, not a native run
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-QUALIFIED: under record and replay Detcore leaves /proc/<pid>/stat to the kernel, and this cell has not been recorded; its replay is unqualified.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this cell's strict verification; under record and replay the kernel serves /proc/<pid>/stat
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe

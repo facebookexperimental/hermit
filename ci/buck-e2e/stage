@@ -79,8 +79,47 @@ fi
 #     checkout through HERMIT_BUCK_STAGE_GIT_ROOT, not to the copy: a submodule
 #     whose .git file names its gitdir by a relative path (agent-utils) does not
 #     resolve from the copy, and `git status` there fails;
-#   - the build is still cold every run: the fixed directory is wiped before and
-#     removed after, and only staged/ is copied back into this checkout.
+#   - the build is warm (2026-10-26): the fixed directory, its target with it, is
+#     kept between stages, so a stage rebuilds only what changed since the last
+#     one (wiped and built cold every run, the stage compiled 862 crates, 1.17
+#     CPU-h of each validate of ccbec065). The copy is the files Git tracks
+#     (submodules included, with their .git links), refreshed by content with
+#     rsync --checksum --files-from, never preserving times: a file whose bytes
+#     are unchanged keeps the time of the stage that copied it, older than every
+#     build since, and a changed or new file is written now, newer than every
+#     build, so Cargo's mtime freshness rebuilds exactly the crates and build
+#     scripts whose inputs changed. ci/buck-e2e/refresh_copy.py does the
+#     refresh: it removes a path an earlier stage copied that Git no longer
+#     tracks (each completed refresh records what it copied in
+#     $HERMIT_BUCK_STAGE_DIR/src.copied) and anything standing where a tracked
+#     path now goes (a file that became a directory or the reverse, a .git
+#     directory that became a .git link) before it copies; what the stage's own
+#     builds write into the copy otherwise stays. It journals the refresh
+#     ($HERMIT_BUCK_STAGE_DIR/src.refreshing, written before the copy is
+#     touched and removed once the record is replaced), so a refresh that did
+#     not finish wipes the copy at the next stage instead of leaving a path it
+#     copied unrecorded. Only tracked files are read: the validation's other nodes
+#     build into the checkout while this stage runs (build.rust_scripts writes
+#     agent-utils/rs/target), and copying that tree, as the first version of
+#     this did with rsync --delete over everything but target/ and ignored/,
+#     failed the validate of 3b0374ae with rsync code 24 when a compiler
+#     temporary vanished mid-copy. Copying this checkout's own times (cp -a) would not be safe
+#     once the target is kept: a checkout made before another validate's stage
+#     carries times older than that stage's build, and Cargo would keep stale
+#     objects. Measured on two consecutive main commits (ebf077bc, 44981290c):
+#     cold 263-280 s and 3,157-3,384 CPU-s, 863 crates; warm after a Detcore
+#     change 157 s and 1,273 CPU-s, 17 crates; warm with nothing changed 17 s;
+#     and every staged file of the warm stage byte-identical to the cold stage's
+#     except libdetcore_liteinst.package.json, whose receipt names its run's own
+#     log directory and timings in any stage. The directory is wiped, and that
+#     stage is cold, once it is older than HERMIT_BUCK_STAGE_MAX_AGE_SECONDS
+#     (default a day), which bounds how long an input some build script reads
+#     without declaring it could leave an output stale, or larger than
+#     HERMIT_BUCK_STAGE_MAX_BYTES (default 64 GiB; about 5.5 GiB after one
+#     stage), when it has no record of what an earlier stage copied (a
+#     directory the first version of this left, holding copies of other nodes'
+#     build output), or when an earlier refresh did not finish. Only staged/ is
+#     copied back into this checkout.
 # One stage at a time holds the fixed directory: concurrent validations on a host
 # wait for the lock (about three minutes, one stage's length), up to
 # HERMIT_BUCK_STAGE_LOCK_TIMEOUT seconds (default 1200). flock releases the lock
@@ -104,16 +143,33 @@ if [[ $mode == cargo && -z ${HERMIT_BUCK_STAGE_INNER:-} && ${HERMIT_BUCK_STAGE_R
         exit 1
     fi
     echo "pid $$ since $(date -u +%FT%TZ) for $root" >"$fixed.holder"
-    cleanup_fixed() { rm -rf "${fixed_src:?}" "${fixed:?}/cargo" "${fixed:?}.holder"; }
+    cleanup_fixed() { rm -rf "${fixed:?}/cargo" "${fixed:?}.holder"; }
     trap cleanup_fixed EXIT
-    rm -rf "${fixed_src:?}"
+    max_bytes=${HERMIT_BUCK_STAGE_MAX_BYTES:-$((64 * 1024 * 1024 * 1024))}
+    max_age=${HERMIT_BUCK_STAGE_MAX_AGE_SECONDS:-86400}
+    born=$fixed_src/.stage-born
+    copied=$fixed/src.copied
+    journal=$fixed/src.refreshing
+    if [[ -d $fixed_src ]]; then
+        held=$(du -sb "$fixed_src" 2>/dev/null | cut -f1) || held=0
+        age=$(($(date +%s) - $(stat -c %Y "$born" 2>/dev/null || echo 0)))
+        cold=
+        [[ ${held:-0} -gt $max_bytes ]] && cold="it holds ${held:-0} bytes, over $max_bytes"
+        [[ $age -gt $max_age ]] && cold="it is ${age} s old, over $max_age"
+        [[ -f $copied ]] || cold="it has no record of what was copied"
+        [[ -e $journal ]] && cold="an earlier refresh of it did not finish"
+        if [[ -n $cold ]]; then
+            echo "ci/buck-e2e/stage: $fixed_src is wiped because $cold; this stage is cold" >&2
+            rm -rf "${fixed_src:?}" "${copied:?}" "${journal:?}"
+        fi
+    fi
     mkdir -p "$fixed_src"
-    # Everything but build outputs and local state. The copy keeps .git, so the
-    # inner stage reads this checkout's commit and status.
-    for entry in "$root"/* "$root"/.[!.]*; do
-        case ${entry##*/} in target | ignored) continue ;; esac
-        cp -a --reflink=auto "$entry" "$fixed_src/"
-    done
+    [[ -e $born ]] || : >"$born"
+    # The files Git tracks, refreshed by content (above), journaled, with
+    # obsolete paths and file/directory changes reconciled before the copy:
+    # ci/buck-e2e/refresh_copy.py. Nothing untracked is read, so no other node's
+    # build output can vanish under the copy.
+    python3 "$root/ci/buck-e2e/refresh_copy.py" "$root" "$fixed_src" "$copied" "$journal"
     ln -sfn "$(realpath -m "${CARGO_HOME:-$HOME/.cargo}")" "$fixed/cargo"
     status=0
     HERMIT_BUCK_STAGE_INNER=1 HERMIT_BUCK_STAGE_GIT_ROOT=$root CARGO_HOME=$fixed/cargo \

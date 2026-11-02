@@ -94,8 +94,13 @@ cc -g -O0 -fno-pie -no-pie squares.c -o squares
 
 `--gdbserver` makes Hermit serve the guest through the GDB remote protocol
 and wait for a debugger before the guest's first instruction. It needs the
-ptrace backend (the default) and switches the run to host networking, so
-that GDB can reach the port; Hermit prints a warning when it does.
+ptrace backend (the default; `--backend=e9patch` runs its rewritten guest
+under it too). Every other backend has no GDB server, and `hermit run`
+refuses `--gdbserver` there, as with `--namespace-only`, naming the remedy:
+`--backend=kvm`, `dbt` and `sabre` used to run the guest without one and
+without a word. Hermit binds the port in the host's network
+namespace, so the guest keeps its own network and GDB reaches the port, and
+prints where to attach.
 
 ```bash
 hermit run --epoch=2026-01-01T00:00:00Z --gdbserver --gdbserver-port=1234 -- ./squares
@@ -112,10 +117,13 @@ gdb -ex 'set sysroot /' -ex 'target remote 127.0.0.1:1234' ./squares
 `set sysroot /` makes GDB read shared libraries from the local file system
 instead of requesting each one through the remote connection. With the same
 `--epoch`, executable and input files, every rerun of this command stops at
-the same breakpoint hits with the same values. A program that uses the
-network is the exception: under `--gdbserver` it runs on the host network,
-whose answers can change from run to run. Record such a program instead and
-debug the recording.
+the same breakpoint hits with the same values, as long as GDB is driven the
+same way: the debugger is an input of the run (the
+[user guide](docs/USER_GUIDE.md#file-system-environment-and-network) says what
+it changes). `--strict` can be added, with every strict refusal in force. A
+program run with `--network=host` is the exception: the host network's answers
+can change from run to run. Record such a program instead and debug the
+recording.
 
 ### On a recording
 
@@ -176,12 +184,12 @@ hermit-dap: listening on 127.0.0.1:4711
 
 `--dap-listen` implies `--gdbserver`, so everything said above about
 `--gdbserver` holds. Before anything starts, `hermit run` refuses a run it
-could not serve: one whose `--gdbserver` would be refused (under `--strict`,
-for example), one with `--verify` (which runs the program twice, and the
-adapter serves one session), `--namespace-only` (which has no GDB server) or
-`--image` (whose program lives in the image), `--gdbserver-port=0` (it
-must know the port to give the debugger), and an address that does not
-parse or cannot be listened on. A program that does not exist is reported
+could not serve: one whose `--gdbserver` would be refused (with
+`--backend=liteinst` or `--backend=kvm`, for example), one with `--verify` (which runs the
+program twice, and the adapter serves one session), `--namespace-only`
+(which has no GDB server) or `--image` (whose program lives in the image),
+`--gdbserver-port=0` (it must know the port to give the debugger), and an
+address that does not parse or cannot be listened on. A program that does not exist is reported
 as in any run, with status 127, and other refusals of the run come before
 any complaint about a missing `hermit-dap`.
 
@@ -453,5 +461,6 @@ download and so is not part of validation, is described in
 - A `--listen` adapter serves one client and one session, then exits.
 - Reverse execution is source-line granular and restarts the replay for each
   reverse request. See [How stepBack and reverseContinue work](#how-stepback-and-reversecontinue-work).
-- `--gdbserver` and a gdb-served replay run on the host network, so their
-  network behavior is not isolated or deterministic while debugging.
+- What the debugger writes to the guest (memory, registers, signals) is an
+  input Hermit does not control: a session repeats a run only if it does the
+  same.

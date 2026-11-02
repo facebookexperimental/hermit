@@ -418,3 +418,266 @@ fn direct_parser_without_source_capture_does_not_claim_an_inherited_default() {
     assert!(run.max_timeslice_explicit);
     assert_refuses(&run, "--max-timeslice");
 }
+
+fn maximum(run: &RunOpts) -> Option<u64> {
+    run.det_opts
+        .det_config
+        .max_timeslice
+        .map(|maximum| maximum.get())
+}
+
+fn seeded(seed: u64) -> Option<u64> {
+    Some(hermit::chaos_timeslice::seeded_max_timeslice(seed, 10).get())
+}
+
+const SEEDED: [&str; 2] = ["--chaos", "--chaos-seeded-timeslice"];
+
+#[test]
+fn chaos_seeded_timeslice_draws_the_maximum_from_the_scheduler_seed() {
+    for (options, seed) in [
+        (vec!["--seed=1"], 1),
+        (vec!["--seed=1", "--sched-seed=3"], 3),
+        (vec![], 0),
+    ] {
+        let mut run = parse(Backend::Ptrace, &[&SEEDED[..], &options].concat());
+        assert!(!run.max_timeslice_explicit);
+        run.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(maximum(&run), seeded(seed), "{options:?}");
+        assert_eq!(
+            run.seeded_chaos_timeslice().map(|drawn| drawn.get()),
+            seeded(seed)
+        );
+        assert_eq!(run.preemption_summary().max_timeslice_ns, seeded(seed));
+    }
+    // Draws differ across seeds, or the flag would choose nothing.
+    assert_ne!(seeded(0), seeded(1));
+
+    // The seed `--seed-from` chooses during validation is the one drawn from.
+    let mut run = parse(Backend::Ptrace, &[SEEDED[0], SEEDED[1], "--seed-from=Args"]);
+    run.validate_args_with_perf_support(true).unwrap();
+    let chosen = run
+        .seed_from_resolved
+        .expect("--seed-from=Args chose a seed");
+    assert_eq!(maximum(&run), seeded(chosen));
+}
+
+/// `hermit analyze` validates a trial's options again after giving it a seed,
+/// after turning chaos off for its baseline, and after pointing it at a
+/// recording to replay. Each validation derives the maximum from the options
+/// it sees, not from what an earlier one stored.
+#[test]
+fn every_validation_derives_the_seeded_maximum_afresh() {
+    let mut run = parse(Backend::Ptrace, &SEEDED);
+    run.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(maximum(&run), seeded(0));
+
+    run.det_opts.det_config.sched_seed = Some(5);
+    run.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(maximum(&run), seeded(5));
+
+    run.det_opts.det_config.chaos = false;
+    run.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(maximum(&run), Some(200_000_000));
+    assert_eq!(run.seeded_chaos_timeslice(), None);
+
+    run.det_opts.det_config.chaos = true;
+    run.det_opts.det_config.replay_preemptions_from = Some("unused-preemptions".into());
+    run.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(maximum(&run), Some(200_000_000));
+    assert_eq!(run.seeded_chaos_timeslice(), None);
+
+    run.det_opts.det_config.replay_preemptions_from = None;
+    run.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(maximum(&run), seeded(5));
+}
+
+#[test]
+fn without_a_timer_a_seeded_run_keeps_the_disabled_maximum() {
+    let mut run = parse(Backend::Ptrace, &SEEDED);
+    run.validate_args_with_perf_support(false).unwrap();
+    assert_eq!(maximum(&run), None);
+    assert_eq!(run.seeded_chaos_timeslice(), None);
+    // And stays disabled when validated again.
+    run.validate_args_with_perf_support(false).unwrap();
+    assert_eq!(maximum(&run), None);
+}
+
+#[test]
+fn chaos_seeded_timeslice_refuses_an_explicit_maximum_or_target() {
+    for (option, keep) in [
+        ("--max-timeslice=5000", "--max-timeslice=5000"),
+        (
+            "--preemption-timeout=200000000",
+            "--max-timeslice=200000000",
+        ),
+        ("--target-timeslice=5000", "--target-timeslice=5000"),
+    ] {
+        let mut run = parse(Backend::Ptrace, &[SEEDED[0], SEEDED[1], option]);
+        let maximum_before = maximum(&run);
+        let message = format!(
+            "{:#}",
+            run.validate_args_with_perf_support(true).unwrap_err()
+        );
+        assert!(message.contains("--chaos-seeded-timeslice"), "{message}");
+        assert!(
+            message.contains(&format!("drop --chaos-seeded-timeslice to keep {keep}")),
+            "{message}"
+        );
+        assert!(message.contains("draw"), "{message}");
+        assert_eq!(maximum(&run), maximum_before, "{option}");
+    }
+}
+
+#[test]
+fn chaos_seeded_timeslice_requires_chaos() {
+    let error = crate::Args::command()
+        .try_get_matches_from(["hermit", "run", "--chaos-seeded-timeslice", "/bin/true"])
+        .unwrap_err();
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument
+    );
+    assert!(error.to_string().contains("--chaos"), "{error}");
+}
+
+/// A reproducer names the flag the run was given rather than the drawn
+/// value, which beside the flag would be refused; the flag draws the same
+/// value from the same seed, so the reparsed run has the same configuration.
+/// Without chaos, or with the maximum disabled, the flag is not rendered,
+/// since it draws nothing there.
+#[test]
+fn a_seeded_reproducer_redraws_the_same_maximum() {
+    for backend in [Backend::Ptrace, Backend::E9patch] {
+        let mut run = parse(backend, &[SEEDED[0], SEEDED[1], "--seed=9"]);
+        run.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(maximum(&run), seeded(9));
+        let rendered = run.to_string();
+        assert!(rendered.contains(" --chaos-seeded-timeslice"), "{rendered}");
+        assert!(!rendered.contains("--max-timeslice"), "{rendered}");
+
+        let mut argv: Vec<OsString> = vec![
+            "hermit".into(),
+            format!("--backend={}", backend.as_str()).into(),
+            "run".into(),
+        ];
+        argv.extend(
+            shell_words::split(&rendered)
+                .unwrap()
+                .into_iter()
+                .map(OsString::from),
+        );
+        let mut reparsed = parse_raw(argv);
+        assert!(!reparsed.max_timeslice_explicit);
+        reparsed.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(
+            config_snapshot(&reparsed),
+            config_snapshot(&run),
+            "{backend:?}"
+        );
+    }
+
+    let mut baseline = parse(Backend::Ptrace, &SEEDED);
+    baseline.det_opts.det_config.chaos = false;
+    baseline.validate_args_with_perf_support(true).unwrap();
+    assert!(!baseline.to_string().contains("--chaos-seeded-timeslice"));
+
+    let mut timerless_host = parse(Backend::Ptrace, &SEEDED);
+    timerless_host
+        .validate_args_with_perf_support(false)
+        .unwrap();
+    let rendered = timerless_host.to_string();
+    assert!(!rendered.contains("--chaos-seeded-timeslice"), "{rendered}");
+    assert!(rendered.contains("--max-timeslice=disabled"), "{rendered}");
+}
+
+/// A seeded run hands Detcore exactly the configuration of a run given the
+/// drawn value as `--max-timeslice`: nothing else in it differs, so the two
+/// runs are the same run.
+#[test]
+fn a_seeded_run_is_the_run_with_its_drawn_maximum_given() {
+    for seed in [0u64, 1, 9] {
+        let seed_option = format!("--seed={seed}");
+        let mut drawn = parse(Backend::Ptrace, &[SEEDED[0], SEEDED[1], &seed_option]);
+        drawn.validate_args_with_perf_support(true).unwrap();
+        let given_option = format!("--max-timeslice={}", seeded(seed).unwrap());
+        let mut given = parse(Backend::Ptrace, &[SEEDED[0], &seed_option, &given_option]);
+        given.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(
+            config_snapshot(&drawn),
+            config_snapshot(&given),
+            "seed {seed}"
+        );
+    }
+}
+
+/// A backend without a PMU timer has no maximum timeslice to draw; the
+/// refusal names the backend and the working options.
+#[test]
+fn chaos_seeded_timeslice_needs_a_pmu_timer() {
+    for backend in TIMERLESS {
+        let mut run = parse(backend, &SEEDED);
+        let message = format!("{:#}", run.resolve_seeded_chaos_timeslice().unwrap_err());
+        assert!(
+            message.contains(&format!("--backend={} has no such timer", backend.as_str())),
+            "{message}"
+        );
+        assert!(message.contains("run it on --backend=ptrace"), "{message}");
+        assert!(message.contains("--target-timeslice=N"), "{message}");
+        assert_eq!(maximum(&run), Some(200_000_000), "{backend:?}");
+    }
+}
+
+/// With the maximum disabled there is nothing to draw: given as
+/// `--max-timeslice=disabled`, the flag is accepted and the maximum stays
+/// disabled, so the options a run without performance counters saves in its
+/// manifest (`begin_manifest` adds `max-timeslice: disabled` beside the
+/// options given) replay on any host.
+#[test]
+fn a_seeded_run_saved_without_a_timer_replays_with_its_maximum_disabled() {
+    let mut run = parse(Backend::Ptrace, &[SEEDED[0], SEEDED[1], "--seed=4"]);
+    run.validate_args_with_perf_support(false).unwrap();
+    assert_eq!(maximum(&run), None);
+    let saved = run.saved_run_config().unwrap();
+    let (global, mut run_inputs) = crate::run_config::to_manifest_parts(&saved).unwrap();
+    assert_eq!(
+        run_inputs.get("chaos-seeded-timeslice"),
+        Some(&serde_json::Value::from(true))
+    );
+    run_inputs.insert(
+        crate::manifest::MAX_TIMESLICE_KEY.to_owned(),
+        serde_json::Value::from("disabled"),
+    );
+    let manifest = crate::manifest::Manifest::new(
+        hermit::Id::unique(),
+        crate::manifest::Kind::InputsOnly,
+        crate::manifest::Command {
+            program: saved.program,
+            args: saved.args,
+            cwd: None,
+        },
+        crate::manifest::Inputs {
+            global,
+            run: run_inputs,
+            host_drawn: Default::default(),
+        },
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory
+        .path()
+        .join("id")
+        .join(crate::manifest::MANIFEST_NAME);
+    crate::manifest::write(&path, &manifest).unwrap();
+    for timer_supported in [false, true] {
+        let mut replay = parse_raw(vec![
+            "hermit".into(),
+            "run".into(),
+            "--from".into(),
+            path.parent().unwrap().into(),
+        ]);
+        replay
+            .validate_args_with_perf_support(timer_supported)
+            .unwrap();
+        assert_eq!(maximum(&replay), None, "timer supported: {timer_supported}");
+        assert_eq!(replay.seeded_chaos_timeslice(), None);
+    }
+}

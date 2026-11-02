@@ -16,12 +16,14 @@
 mod cpuinfo_sessions;
 mod inode_reuse;
 mod notification_fds;
+mod proc_stat_lifecycle;
 mod procfs_caller_buffer;
 mod procfs_inode;
 mod raw_clone;
 mod readdir_order;
 mod subreaper;
 mod tight_stack_openat;
+mod tight_stack_received_inotify;
 mod vfork;
 
 use std::io::Read;

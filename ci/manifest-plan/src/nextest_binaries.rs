@@ -1052,7 +1052,7 @@ fn cargo_output(root: &Path, args: &[String], destination: &Path) -> Result<(), 
 
 /// Runs each `program` (Cargo) command of `listings` (arguments, output file), which
 /// must compile nothing, such as `nextest list` given both metadata files, up
-/// to [`preparation_build_jobs`] at a time and without
+/// to `jobs` at a time and without
 /// ci/run-with-reverie-dbt-budget.sh. That wrapper binds the Reverie DBT build
 /// budget to its pin with a pin check of about 0.8 s a call, and a command
 /// that builds nothing has no budget to bind; `run` already starts its
@@ -1064,11 +1064,9 @@ fn listing_outputs(
     root: &Path,
     program: &std::ffi::OsStr,
     listings: &[(Vec<String>, PathBuf)],
+    jobs: usize,
 ) -> Result<(), PreparationError> {
-    let jobs = preparation_build_jobs()
-        .parse::<usize>()
-        .unwrap_or(1)
-        .max(1);
+    let jobs = jobs.max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let failures = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
@@ -1325,13 +1323,41 @@ fn has_test_selection<'a>(selections: impl Iterator<Item = &'a Vec<String>>, nam
         .any(|args| args.windows(2).any(|args| args == ["--test", name]))
 }
 
+// An explicit target override also owns retained executables. Metadata and the
+// preparation lock remain source-local. Preserve the old default when no
+// nonempty override was recorded, including targets selected only by Cargo config.
+fn record_workload_directory(
+    generation: &Path,
+    target: &Path,
+    cargo_target: Option<&str>,
+) -> Result<PathBuf, String> {
+    if !cargo_target.is_some_and(|value| !value.is_empty()) {
+        return Ok(generation.join("record-workloads"));
+    }
+    Ok(target
+        .join("ci/nextest-binaries")
+        .join(
+            generation
+                .file_name()
+                .ok_or("missing prepared generation name")?,
+        )
+        .join("record-workloads"))
+}
+
 fn prepare_record_workloads(
     root: &Path,
     generation: &Path,
     cargo: &Value,
     target: &Path,
+    environment: &BTreeMap<String, String>,
 ) -> Result<RecordWorkloads, PreparationError> {
-    let directory = generation.join("record-workloads");
+    let directory = record_workload_directory(
+        generation,
+        target,
+        environment.get("CARGO_TARGET_DIR").map(String::as_str),
+    )?;
+    fs::create_dir_all(directory.parent().expect("record workloads have a parent"))
+        .map_err(|e| e.to_string())?;
     fs::create_dir(&directory).map_err(|e| e.to_string())?;
     let compiler = file_identity(&record_workloads::c_compiler()?, true)?;
     let cargo_events = file_identity(&generation.join("guests.jsonl"), false)?;
@@ -1395,7 +1421,14 @@ fn verify_record_workloads(
         .path
         .parent()
         .ok_or("missing prepared generation")?;
-    let directory = generation.join("record-workloads");
+    let directory = record_workload_directory(
+        generation,
+        &record.target,
+        record
+            .build_environment
+            .get("CARGO_TARGET_DIR")
+            .map(String::as_str),
+    )?;
     if workloads.cargo_events.path != generation.join("guests.jsonl") {
         return Err("record workload Cargo events are outside the selected generation".into());
     }
@@ -1969,7 +2002,12 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     }
     // Nextest itself must accept every complete metadata pair after the final
     // build; this enumerates tests and never invokes the compiler.
-    listing_outputs(&root, "cargo".as_ref(), &listings)?;
+    listing_outputs(
+        &root,
+        "cargo".as_ref(),
+        &listings,
+        preparation_build_jobs().parse::<usize>().unwrap_or(1),
+    )?;
     let guests = if needs_guests {
         guest_executables(
             &fs::read_to_string(&guest_path).map_err(|e| e.to_string())?,
@@ -1996,6 +2034,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
             &generation,
             &cargo,
             &target,
+            &before_environment,
         )?)
     } else {
         None
@@ -2263,9 +2302,7 @@ mod tests {
                 )
             })
             .collect();
-        // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var("CARGO_BUILD_JOBS", "4") };
-        listing_outputs(&root, program.as_os_str(), &listings).unwrap();
+        listing_outputs(&root, program.as_os_str(), &listings, 4).unwrap();
         for index in 0..4 {
             assert_eq!(
                 fs::read_to_string(root.join(format!("{index}.json"))).unwrap(),
@@ -2280,7 +2317,7 @@ mod tests {
             "the listings never overlapped: {overlap:?}"
         );
         let failing = vec![(args("fail now"), root.join("fail.json"))];
-        let error = listing_outputs(&root, program.as_os_str(), &failing).unwrap_err();
+        let error = listing_outputs(&root, program.as_os_str(), &failing, 4).unwrap_err();
         assert!(
             error.message.contains("Cargo listing failed"),
             "{}",
@@ -2648,7 +2685,16 @@ mod tests {
         let (mut record, _) = fixture.selection();
         record.selections.values_mut().next().unwrap().build_args =
             argv(&["-p", "hermit-run", "--test", "record_replay"]);
-        let directory = fixture.root.join("record-workloads");
+        record.build_environment.insert(
+            "CARGO_TARGET_DIR".into(),
+            fixture.target.to_str().unwrap().into(),
+        );
+        let directory = fixture
+            .target
+            .join("ci/nextest-binaries")
+            .join(fixture.root.file_name().unwrap())
+            .join("record-workloads");
+        fs::create_dir_all(directory.parent().unwrap()).unwrap();
         fs::create_dir(&directory).unwrap();
         let mut targets = Vec::new();
         let mut events = Vec::new();
@@ -2716,7 +2762,7 @@ mod tests {
         let population = record_workloads::consume_prepared(true, Some(&raw))
             .unwrap()
             .unwrap();
-        assert_eq!(population.len(), 73);
+        assert_eq!(population.len(), 74);
         assert_eq!(
             population.iter().map(|w| w.name).collect::<BTreeSet<_>>(),
             record_workloads::names().collect()
@@ -2727,8 +2773,19 @@ mod tests {
                 .find(|w| w.name == "rs_clock_gettime")
                 .unwrap()
                 .path,
-            fixture.root.join("record-workloads/rs_clock_gettime")
+            fixture
+                .target
+                .join("ci/nextest-binaries")
+                .join(fixture.root.file_name().unwrap())
+                .join("record-workloads/rs_clock_gettime")
         );
+        assert!(!fixture.root.join("record-workloads").exists());
+        for cargo_target in [None, Some("")] {
+            assert_eq!(
+                record_workload_directory(&fixture.root, &fixture.target, cargo_target).unwrap(),
+                fixture.root.join("record-workloads")
+            );
+        }
         assert!(record.guests.is_empty());
         assert_eq!(cargo_guests::CARGO_GUEST_BINARIES.len(), 21);
     }
@@ -2790,6 +2847,14 @@ mod tests {
             .executable
             .path = fixture.target.join("outside-generation");
         assert!(verify_record_workloads(&changed, &cargo).is_err());
+        let mut changed = record.clone();
+        let workload = &mut changed.record_workloads.as_mut().unwrap().workloads[0];
+        workload.executable.path = fixture.root.join("record-workloads").join(&workload.name);
+        assert!(
+            verify_record_workloads(&changed, &cargo)
+                .unwrap_err()
+                .contains("retained path differs")
+        );
         let mut changed = record.clone();
         changed
             .record_workloads

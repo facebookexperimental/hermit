@@ -72,6 +72,14 @@ if [[ -n ${GITHUB_ACTIONS:-} || -n ${CI:-} ]]; then
     extra+=(--allow-cgroup-failure \
         --skip-inner-dirty-working-tree-and-rebase-freshness-checks)
 fi
+# validate.rs points an unset TMPDIR at its run directory under
+# target/validation, which is inside the checkout, and selftest.validate_rs
+# refuses a fixture inside a Cargo workspace. A GitHub-hosted runner sets no
+# TMPDIR, so use the job's own temporary directory, which is outside the
+# checkout. A caller's TMPDIR wins (run-hosted-node.sh sets its own /tmp).
+if [[ -n ${GITHUB_ACTIONS:-} && -z ${TMPDIR:-} && -n ${RUNNER_TEMP:-} ]]; then
+    export TMPDIR=$RUNNER_TEMP
+fi
 if [[ -n ${RUN_NODE_PRINT_ONLY:-} ]]; then
     extra+=(--show-plan)
 fi

@@ -6,7 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! End-to-end coverage for host scheduler counters in /proc/self/schedstat.
+//! End-to-end coverage for /proc/<pid>/schedstat: the task's runtime from
+//! Detcore's CPU accounting, and no host scheduler counters.
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
@@ -37,9 +38,16 @@ paths = [
     f"/proc/self/task/{tid}/schedstat",
     f"/proc/{pid}/task/{tid}/schedstat",
 ]
+# Each alias names this thread: its runtime, which only grows, then the
+# run-queue wait and the run count, which Detcore does not model.
+previous = 0
 for path in paths:
     with open(path, "rb") as schedstat:
-        assert schedstat.read() == b"0 0 0\n", path
+        text = schedstat.read()
+    runtime, delay, count = (int(field) for field in text.split())
+    assert text.endswith(b"\n") and runtime > 0 and delay == 0 and count == 0, (path, text)
+    assert runtime >= previous, (path, runtime, previous)
+    previous = runtime
 "#;
 
 fn hermit_run_lock() -> MutexGuard<'static, ()> {
@@ -136,7 +144,18 @@ fn read_self_schedstat() -> Vec<u8> {
 #[test]
 fn self_schedstat_consumers_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
-    assert_eq!(read_self_schedstat(), b"0 0 0\n");
+    // The reader's runtime, the same in every run, and no host counter.
+    let schedstat = read_self_schedstat();
+    let text = String::from_utf8(schedstat.clone()).unwrap();
+    let fields: Vec<u64> = text
+        .split_whitespace()
+        .map(|field| field.parse().unwrap())
+        .collect();
+    assert!(
+        text.ends_with('\n') && fields.len() == 3 && fields[0] > 0 && fields[1..] == [0, 0],
+        "{text:?}"
+    );
+    assert_eq!(read_self_schedstat(), schedstat);
 
     let cases = [
         ProgramCase {

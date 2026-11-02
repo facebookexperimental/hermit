@@ -1,0 +1,17 @@
+/* Source-only private fixture constants. No production counter API. */
+#define APP_ENTRY 0x401000
+#define PHASE_PREFIX 0x43425201
+#define PHASE_MAIN 0x43425202
+#define PHASE_HELPER 0x43425203
+#define PHASE_ZERO 0x43425204
+#define PHASE_EXIT 0x434252ff
+#define SENTINEL_RBX 0x1122334455667701
+#define SENTINEL_RBP 0x1122334455667705
+#define SENTINEL_R12 0x112233445566770a
+#define SENTINEL_R13_INITIAL 0x112233445566770b
+#define SENTINEL_R14 0x112233445566770c
+
+/* Kernel-zeroed BSS in the companion main executable, not an interpreter relocation. */
+#define FIRST_INSTRUCTION_MARKER 0x402000
+#define FIRST_INSTRUCTION_STACK_POINTER 0x402008
+#define FIRST_INSTRUCTION_ENTRY_PC 0x402010

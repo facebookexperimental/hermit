@@ -14,6 +14,7 @@ use reverie::syscalls;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
+use tracing::warn;
 
 use crate::Detcore;
 use crate::RecordOrReplay;
@@ -101,15 +102,15 @@ fn validate_common_args(call: syscalls::Madvise) -> Result<(), Error> {
 impl<T: RecordOrReplay> Detcore<T> {
     /// Apply a deterministic policy to madvise(2).
     ///
-    /// Ptrace/DBT forward hints and supported advice with guest-visible semantics.
+    /// Hints and advice with guest-visible semantics are forwarded to the
+    /// backend, on every backend. A backend that does not implement an advice
+    /// answers ENOSYS with the typed refusal `MemoryAdvice`, which is logged as a
+    /// warning naming the advice; the guest sees the ENOSYS.
     /// Record/replay accepts pure hints as no-ops and passes guest-semantic advice
     /// to the recorder and replayer, which record and restore the effects that
     /// differ because replay replaces file mappings with anonymous mappings.
     /// Reclaim and asynchronous VM-policy advice receives fixed success without exposing host memory pressure. Resource-
     /// dependent, backing-store, and hardware-failure operations receive fixed errors.
-    /// KVM accepts pure hints as no-ops, implements MADV_DONTNEED in its executor
-    /// (`supports_madv_dontneed`), and reports ENOSYS for the other guest-visible
-    /// semantics it cannot provide.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#548): Recheck advice policy and record/replay boundaries.
     pub async fn handle_madvise<G: Guest<Self>>(
@@ -137,31 +138,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         match action {
-            MadviseAction::ForwardHint if self.cfg.backend.supports_madvise => {
-                Ok(self.record_or_replay(guest, call).await?)
-            }
-            MadviseAction::ForwardHint => {
-                crate::detlog!(
-                    "[dtid {}] madvise hint {} accepted as backend no-op",
-                    guest.thread_state().dettid,
-                    advice,
-                );
-                Ok(0)
-            }
-            MadviseAction::ForwardSemantic
-                if self.cfg.backend.supports_madvise
-                    || (advice == libc::MADV_DONTNEED
-                        && self.cfg.backend.supports_madv_dontneed) =>
-            {
-                Ok(self.record_or_replay(guest, call).await?)
-            }
-            MadviseAction::ForwardSemantic => {
-                crate::detlog!(
-                    "[dtid {}] madvise advice {} is unsupported by this backend",
-                    guest.thread_state().dettid,
-                    advice,
-                );
-                Err(Errno::ENOSYS.into())
+            MadviseAction::ForwardHint | MadviseAction::ForwardSemantic => {
+                let result = self.record_or_replay(guest, call).await;
+                if result.is_err()
+                    && let Some(refusal) = guest.take_unsupported_refusal().filter(|refusal| {
+                        refusal.operation == reverie::UnsupportedOperation::MemoryAdvice
+                    })
+                {
+                    warn!(
+                        "[dtid {}] madvise advice {} refused by the backend: {}",
+                        guest.thread_state().dettid,
+                        advice,
+                        refusal.diagnostic,
+                    );
+                }
+                Ok(result?)
             }
             MadviseAction::Ignore => {
                 crate::detlog!(

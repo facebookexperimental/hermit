@@ -154,7 +154,13 @@ fn proc_fd_link_aliases_and_truncation_verify() {
         "lexical=/tmp/hermit-proc-fd-link-aliases\n",
         "readlinkat=/tmp/hermit-proc-fd-link-aliases\n",
     );
-    for backend in ["ptrace", "dbt"] {
+    // The DBT leg runs only in builds that include DBT; the ptrace leg always runs.
+    let backends: &[&str] = if cfg!(feature = "dbt") {
+        &["ptrace", "dbt"]
+    } else {
+        &["ptrace"]
+    };
+    for backend in backends {
         let mut command = Command::new("timeout");
         command
             .args(["--kill-after", "10s", "90s"])

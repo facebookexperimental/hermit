@@ -154,9 +154,10 @@ pub struct DetFd {
 /// A handle on an open file description that Detcore models, which does not
 /// keep it alive: once no modeled descriptor refers to the description, the
 /// handle reaches nothing. Where one tool process serves every guest process
-/// (ptrace, KVM), a descriptor that reaches the same Linux `struct file` by a
-/// route Detcore does not model (`SCM_RIGHTS`) joins the description through
-/// it, as a `dup` would (`Detcore::adopt_received_placeholders`).
+/// (ptrace, KVM), a rendered procfs descriptor that reaches the same Linux
+/// `struct file` over `SCM_RIGHTS` joins the description through it, as a
+/// `dup` would, when it is received (`Detcore::record_received_descriptors`)
+/// or first named (`Detcore::adopt_received_placeholders`).
 #[derive(Clone, Debug)]
 pub(crate) struct OpenFileHandle(std::sync::Weak<Mutex<OpenFileState>>);
 
@@ -389,6 +390,15 @@ struct OpenFileDescription {
     /// name is below it (ENOTDIR), whatever its recorded `path` spells.
     #[serde(default)]
     procfs_link_itself: bool,
+    /// This open file is a `/proc` directory Detcore serves itself, `/proc`
+    /// or a task's descriptor directory, `/proc/<pid>/fd`
+    /// (`procfs::fd_directory::PlaceholderDirectory`): which directory, its
+    /// position, and whether it was opened with `O_PATH`. The kernel's
+    /// descriptor is on the placeholder directory, an empty read-only tmpfs
+    /// (`DetConfig::directory_placeholder`). Shared by descriptor aliases and
+    /// a fork's copies, as Linux shares the position.
+    #[serde(default)]
+    placeholder: Option<PlaceholderState>,
     /// File status flags shared by dup and fork aliases.
     status_flags: i32,
     /// File path associated with fd.
@@ -504,6 +514,12 @@ struct OpenFileDescription {
     // TODO-HUMAN-REVIEW(PR-3908)
     #[serde(default)]
     accept_in_turn_eligible: bool,
+    /// True once a guest's `shutdown(2)` with `SHUT_RD` or `SHUT_RDWR` shut
+    /// this socket's read side. A polled blocking receive on it then asks the
+    /// kernel whether the call would still wait. Permanent. See
+    /// `read_shutdown_requested`.
+    #[serde(default)]
+    read_shutdown_requested: bool,
     /// True once this socket was named in an `SCM_RIGHTS` message, so a
     /// process outside Detcore's view may hold it. Permanent. See
     /// `is_exported`.
@@ -619,6 +635,9 @@ impl std::fmt::Debug for OpenFileDescription {
         debug.field("inherited_external_read", &self.inherited_external_read);
         debug.field("pidfd_target", &self.pidfd_target);
         debug.field("procfs_reached", &self.procfs_reached);
+        if let Some(placeholder) = &self.placeholder {
+            debug.field("placeholder", placeholder);
+        }
         debug.field("status_flags", &self.status_flags);
         debug.field("path", &self.path);
         debug.field("inode", &self.inode);
@@ -643,6 +662,7 @@ impl std::fmt::Debug for OpenFileDescription {
         debug.field("socketpair_endpoint", &self.socketpair_endpoint);
         debug.field("accepted_connection", &self.accepted_connection);
         debug.field("accept_in_turn_eligible", &self.accept_in_turn_eligible);
+        debug.field("read_shutdown_requested", &self.read_shutdown_requested);
         debug.field("exported", &self.exported);
         debug.field("receive_timeout", &self.receive_timeout);
         debug.field("flock_mode", &self.flock_mode);
@@ -654,6 +674,24 @@ impl std::fmt::Debug for OpenFileDescription {
         }
         debug.finish()
     }
+}
+
+/// What Detcore keeps of an open file that is a `/proc` directory it serves
+/// on a placeholder descriptor (`procfs::fd_directory::PlaceholderDirectory`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PlaceholderState {
+    /// Which directory: `/proc`, or a descriptor directory and the task it
+    /// is bound to.
+    pub(crate) directory: crate::procfs::fd_directory::PlaceholderDirectory,
+    /// The kernel position that tags the descriptor
+    /// (`procfs::fd_directory::tag`), if it has one.
+    pub(crate) tag: Option<u64>,
+    /// The guest's position in a descriptor directory, as Linux numbers it.
+    /// `/proc`'s position is its directory stream's (`DirectoryStream`).
+    pub(crate) position: u64,
+    /// Opened with `O_PATH`: it lists nothing, and reads and seeks fail with
+    /// `EBADF`.
+    pub(crate) path_only: bool,
 }
 
 /// A timerfd's expirations counted on Detcore's virtual clock instead of the
@@ -859,6 +897,7 @@ impl DetFd {
                 pidfd_target: None,
                 procfs_reached: None,
                 procfs_link_itself: false,
+                placeholder: None,
                 inherited_external_read: None,
                 status_flags: bits & !OFlag::O_CLOEXEC.bits(),
                 path: None,
@@ -883,6 +922,7 @@ impl DetFd {
                 socketpair_endpoint: false,
                 accepted_connection: false,
                 accept_in_turn_eligible: false,
+                read_shutdown_requested: false,
                 exported: false,
                 receive_timeout: ReceiveTimeout::None,
                 flock_mode: None,
@@ -1041,6 +1081,22 @@ impl DetFd {
         }
     }
 
+    /// Give this open file description the identity `id` of the one it is a
+    /// copy of in Linux: a placeholder descriptor received over `SCM_RIGHTS`,
+    /// whose sender's description Linux shares, so that the locks Detcore
+    /// follows by description (`procfs::locks::LockLedger`) are that one's.
+    /// Its other state stays its own, as for every received descriptor
+    /// (<https://github.com/rrnewton/hermit/issues/4670>). A shared
+    /// description (one promoted to Detcore's global state) keeps its
+    /// identity; placeholders are never promoted.
+    pub(crate) fn adopt_open_file_id(&self, id: OpenFileId) {
+        if let OpenFileState::Local(description) =
+            &mut *self.open_file.lock().expect("open file mutex poisoned")
+        {
+            description.id = id;
+        }
+    }
+
     /// Number of modeled descriptor slots that retain this open file description.
     pub(crate) fn open_file_alias_count(&self) -> usize {
         Arc::strong_count(&self.open_file)
@@ -1099,6 +1155,17 @@ impl DetFd {
     /// Whether this open file is a `/proc` selector link itself.
     pub(crate) fn procfs_link_itself(&self) -> bool {
         self.with_description(|d| d.procfs_link_itself)
+    }
+
+    /// The placeholder directory this open file is, if it is one
+    /// (`OpenFileDescription::placeholder`).
+    pub(crate) fn placeholder(&self) -> Option<PlaceholderState> {
+        self.with_description(|d| d.placeholder)
+    }
+
+    /// Make this open file a placeholder directory, or change its state.
+    pub(crate) fn set_placeholder(&self, state: PlaceholderState) {
+        self.with_description(|d| d.placeholder = Some(state))
     }
 
     /// The task directory this open file is, if Detcore knows it
@@ -1440,6 +1507,21 @@ impl DetFd {
         })
     }
 
+    /// The task a `schedstat` describes (`ProcfsFile::schedstat_thread`).
+    pub(crate) fn procfs_schedstat_thread(&self) -> Option<DetTid> {
+        self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::schedstat_thread))
+    }
+
+    /// Before a positioned read at `position`
+    /// (`ProcfsFile::drop_schedstat_snapshot_for_read_at`).
+    pub(crate) fn procfs_drop_schedstat_snapshot_for_read_at(&self, position: u64) {
+        self.with_description(|d| {
+            if let Some(procfs) = d.procfs.as_mut() {
+                procfs.drop_schedstat_snapshot_for_read_at(position);
+            }
+        });
+    }
+
     /// The guest's numbers for the kernel's numbers in the snapshot about to
     /// be taken (`ProcfsFile::set_guest_numbers`).
     pub(crate) fn set_procfs_guest_numbers(&self, numbers: std::collections::BTreeMap<i32, i32>) {
@@ -1479,6 +1561,67 @@ impl DetFd {
                 .as_mut()
                 .expect("procfs fd disappeared while committing a read")
                 .commit_read(offset, copied)
+        });
+    }
+
+    /// Whether this is a process's `stat` Detcore opened as rendered
+    /// (`ProcfsFile::renders_task_record`).
+    pub(crate) fn procfs_renders_task_record(&self) -> bool {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .is_some_and(ProcfsFile::renders_task_record)
+        })
+    }
+
+    /// Drop a rendered `stat`'s snapshot before a read at `position` that
+    /// Linux would render anew (`ProcfsFile::drop_stale_task_snapshot`).
+    pub(crate) fn procfs_drop_stale_task_snapshot(&self, position: usize) {
+        self.with_description(|d| {
+            if let Some(procfs) = d.procfs.as_mut() {
+                procfs.drop_stale_task_snapshot(position);
+            }
+        });
+    }
+
+    /// Record where a positioned read left a rendered `stat`'s sequence
+    /// (`ProcfsFile::note_read_end`).
+    pub(crate) fn procfs_note_read_end(&self, position: usize) {
+        self.with_description(|d| {
+            if let Some(procfs) = d.procfs.as_mut() {
+                procfs.note_read_end(position);
+            }
+        });
+    }
+
+    /// Record the outcome of rendering a rendered `stat`'s record for a read
+    /// at `position` (`ProcfsFile::note_task_record_rendered`).
+    pub(crate) fn procfs_note_task_record_rendered(&self, position: usize, rendered: bool) {
+        self.with_description(|d| {
+            if let Some(procfs) = d.procfs.as_mut() {
+                procfs.note_task_record_rendered(position, rendered);
+            }
+        });
+    }
+
+    /// Move a rendered `stat`'s cursor as `seq_lseek` does
+    /// (`ProcfsFile::seek_task_record`): whether the caller must render its
+    /// record now.
+    pub(crate) fn seek_procfs_task_record(&self, offset: usize) -> bool {
+        self.with_description(|d| {
+            d.procfs
+                .as_mut()
+                .is_some_and(|procfs| procfs.seek_task_record(offset))
+        })
+    }
+
+    /// Leave a rendered `stat` whose `show` failed at a seek as `seq_lseek`
+    /// does (`ProcfsFile::reset_task_record`).
+    pub(crate) fn reset_procfs_task_record(&self) {
+        self.with_description(|d| {
+            if let Some(procfs) = d.procfs.as_mut() {
+                procfs.reset_task_record();
+            }
         });
     }
 
@@ -1620,6 +1763,24 @@ impl DetFd {
         f: impl FnOnce(&mut DirectoryStream) -> R,
     ) -> Result<R, Errno> {
         self.with_description(|d| d.directory.as_mut().map(f).ok_or(Errno::EBADF))
+    }
+
+    /// The position of this open file's directory stream, 0 before it has
+    /// one.
+    pub(crate) fn directory_stream_position(&self) -> u64 {
+        self.with_description(|d| d.directory.as_ref().map_or(0, DirectoryStream::position))
+    }
+
+    /// Move this open file's directory stream to `position`, creating the
+    /// stream, without a snapshot, if it has none (`DirectoryStream::seek`):
+    /// for a directory Detcore lists from its model alone, whose stream a
+    /// seek may come before.
+    pub(crate) fn seek_directory_stream(&self, position: u64) {
+        self.with_description(|d| {
+            d.directory
+                .get_or_insert_with(DirectoryStream::default)
+                .seek(position)
+        })
     }
 
     /// Return the shared procfs cursor and initialized snapshot length.
@@ -1836,6 +1997,21 @@ impl DetFd {
     /// Whether this open file was marked eligible, exported or not.
     pub(crate) fn is_accept_in_turn_eligible(&self) -> bool {
         self.with_description(|d| d.accept_in_turn_eligible)
+    }
+
+    /// Mark this socket as one whose read side a guest shut down. It applies
+    /// to the open file description, so dup and fork aliases are covered too.
+    pub(crate) fn set_read_shutdown_requested(&self) {
+        self.with_description(|d| d.read_shutdown_requested = true);
+    }
+
+    /// Whether a guest shut this socket's read side down. Only such a datagram
+    /// socket can have a blocking receive that Linux ends at once while its
+    /// nonblocking attempt fails with `EAGAIN`, because Linux sets a datagram
+    /// socket's read shutdown only in its own `shutdown(2)`
+    /// (`syscalls::helpers::finish_after_read_shutdown`).
+    pub(crate) fn read_shutdown_requested(&self) -> bool {
+        self.with_description(|d| d.read_shutdown_requested)
     }
 
     /// Mark this open file description's locks as followed by

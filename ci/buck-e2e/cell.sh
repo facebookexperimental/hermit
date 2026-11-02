@@ -321,6 +321,13 @@ fi
 outcome=$(python3 -c 'import json,sys
 rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
 print(rows[-1]["outcome"] if rows else "")' "$out/results.jsonl" 2>/dev/null)
+# The same rows as the verdict normalizer will judge them: how many, and the last one's outcome.
+rows_seen=$(python3 -c 'import json,os,sys
+p=sys.argv[1]
+rows=[json.loads(l) for l in open(p) if l.strip()] if os.path.exists(p) else []
+assert all(isinstance(r, dict) for r in rows)
+print(json.dumps({"count": len(rows), "outcome": rows[-1].get("outcome") if rows else None}))' "$out/results.jsonl" 2>/dev/null) ||
+    rows_seen=unreadable
 n_run1=$(find "$A" -maxdepth 1 -name 'cell__verify-logs__*run1_log_*' | wc -l)
 n_run2=$(find "$A" -maxdepth 1 -name 'cell__verify-logs__*run2_log_*' | wc -l)
 n_detlogs=$((n_run1 + n_run2))
@@ -367,47 +374,210 @@ for f in result.json tpx.jsonl summary.json results.jsonl harness.stderr; do
 done
 rm -rf "${W:?}"
 
-python3 - "$A/tpx.jsonl" "$CELL" "$evidence_complete" "$harness_rc" "${missing[*]}" "${HERMIT_E2E_ROUTE:-}" <<'PY'
+# Exactly one record, named for this cell, whatever the harness wrote, and the verdict on
+# the harness's output recorded for ingest.py as result.json's producer_completion. An
+# unreadable, malformed, contradictory or ambiguous payload is a failed cell and an
+# "invalid" completion: never a cell with no record (Tpx would count only the target's
+# passing "unmanaged" twin) and never a pass. The normalizer only prints: its record,
+# all_done and the completion it proposes. Only once it has exited 0 with exactly those
+# three lines does cell.sh publish the completion, by renaming a finished copy of
+# result.json over the original, so a normalizer or publication that fails at any point
+# leaves result.json without producer_completion, which ingest.py refuses.
+verdict_out=$(python3 - "$A/tpx.jsonl" "$CELL" "$evidence_complete" "$harness_rc" "${missing[*]}" "${HERMIT_E2E_ROUTE:-}" "$rows_seen" <<'PY'
 import json, os, re, sys
-path, cell, complete, rc, missing, route = sys.argv[1:7]
-records = [json.loads(l) for l in open(path) if l.strip()] if os.path.exists(path) else []
-done = [r for r in records if r.get("op") == "test_done"]
+path, cell, complete, rc, missing, route, rows_seen = sys.argv[1:8]
 
-def withheld_here(done):
-    """The cell's own record, as a skip, when the harness withheld this one cell as
-    HOST-INAPPLICABLE and failed the run only because it executed nothing; else None.
+class Invalid(Exception):
+    """The harness output breaks its contract with this cell; the reason says how."""
+
+def failed(reason):
+    details = {"outcome": "ERROR", "reason": reason}
+    return {"op": "test_done", "test": cell, "status": "failed", "details": json.dumps(details)}
+
+def details_of(record):
+    """The record's details as a dict, or None unless they are a JSON object in a string."""
+    raw = record.get("details")
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+def read_records():
+    """Every nonblank line of the payload, each a JSON object."""
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path) as f:
+            records = [json.loads(l) for l in f if l.strip()]
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise Invalid(f"unreadable tpx.jsonl: {error}")
+    if not all(isinstance(r, dict) for r in records):
+        raise Invalid("unreadable tpx.jsonl: a record is not a JSON object")
+    return records
+
+def read_rows():
+    """(how many rows the harness wrote, the last row's outcome or None)."""
+    try:
+        seen = json.loads(rows_seen)
+    except ValueError:
+        raise Invalid(f"harness rc={rc} wrote an unreadable results.jsonl")
+    if seen["count"] > 1:
+        raise Invalid(f"harness rc={rc} wrote {seen['count']} rows; a cell runs the harness once, which writes one")
+    return seen["count"], seen["outcome"]
+
+def withheld_pair(done, rows):
+    """The cell's own record when the harness withheld this one cell as HOST-INAPPLICABLE
+    and failed the run only because it executed nothing; else None. A withheld cell runs
+    nothing, so it writes no row. This is valid output on any route; withheld_here decides
+    what the route makes of it."""
+    if rows != 0 or len(done) != 2:
+        return None
+    own = [r for r in done if r.get("test") == cell]
+    run = [r for r in done if r.get("test") == "test-harness/run-verdict"]
+    if (len(own) != 1 or len(run) != 1 or own[0].get("status") != "skipped"
+            or run[0].get("status") != "failed"):
+        return None
+    details, run_details = details_of(own[0]), details_of(run[0])
+    if details is None or run_details is None:
+        return None
+    failures = run_details.get("run_failures")
+    vacuous = r"every one of the 1 selected cell\(s\) was host-inapplicable; .*"
+    if (details.get("outcome") != "HOST-INAPPLICABLE" or not isinstance(failures, list)
+            or len(failures) != 1 or not isinstance(failures[0], str)
+            or not re.fullmatch(vacuous, failures[0])):
+        return None
+    return own[0], details
+
+def withheld_here(pair):
+    """The withheld cell's record, as a skip, on a local route; else None.
 
     A local host that lacks a capability lacks it on a retry too, so the cell is
     reported skipped with the harness's reason, never as a pass. Only a local route
     qualifies: an RE worker that lacks the capability is retried on another worker."""
-    if route != "local" or len(done) != 2:
+    if route != "local" or pair is None:
+        return None
+    record, details = pair
+    reason = details.get("reason")
+    details["reason"] = "SKIP: " + (reason if isinstance(reason, str) and reason else "host-inapplicable")
+    return dict(record, details=json.dumps(details))
+
+def no_result_pair(done, rows):
+    """The cell's own record when the harness ran this one cell and got no result back:
+    it reports the cell failed with a null outcome and fails the run for exactly that
+    reason, with a nonzero exit and no row; else None."""
+    if rows != 0 or rc == "0" or len(done) != 2:
         return None
     own = [r for r in done if r.get("test") == cell]
     run = [r for r in done if r.get("test") == "test-harness/run-verdict"]
-    if len(own) != 1 or len(run) != 1 or own[0].get("status") != "skipped":
+    if (len(own) != 1 or len(run) != 1 or own[0].get("status") != "failed"
+            or run[0].get("status") != "failed"):
         return None
-    try:
-        details = json.loads(own[0]["details"])
-        failures = json.loads(run[0]["details"])["run_failures"]
-    except (KeyError, TypeError, ValueError):
+    details, run_details = details_of(own[0]), details_of(run[0])
+    if details is None or run_details is None or "outcome" not in details or details["outcome"] is not None:
         return None
-    vacuous = r"every one of the 1 selected cell\(s\) was host-inapplicable; .*"
-    if details.get("outcome") != "HOST-INAPPLICABLE" or len(failures) != 1 or not re.fullmatch(vacuous, failures[0]):
+    if run_details.get("run_failures") != ["only 0 of 1 selected cells returned a result"]:
         return None
-    details["reason"] = "SKIP: " + (details.get("reason") or "host-inapplicable")
-    return dict(own[0], details=json.dumps(details))
+    return own[0]
 
-skip = withheld_here(done)
-if skip:
-    done = [skip]
-elif len(done) != 1:
-    done = [{"op": "test_done", "test": cell, "status": "failed",
-             "details": json.dumps({"outcome": "ERROR", "reason": f"harness rc={rc} produced {len(done)} test_done records"})}]
-elif complete != "true" and done[0]["status"] == "passed":
-    details = json.loads(done[0]["details"])
-    details.update(outcome="ERROR", reason=f"evidence incomplete: {missing}")
-    done[0].update(status="failed", details=json.dumps(details))
-print(json.dumps(done[0]))
+def verdict():
+    """The one record for Tpx; raises Invalid when the harness output is invalid."""
+    rows, row_outcome = read_rows()
+    done = [r for r in read_records() if r.get("op") == "test_done"]
+    pair = withheld_pair(done, rows)
+    skip = withheld_here(pair)
+    if skip:
+        return skip
+    if pair:
+        # The existing RE policy: a withheld cell fails there, so Tpx retries it.
+        return failed(f"harness rc={rc} produced {len(done)} test_done records")
+    lost = no_result_pair(done, rows)
+    if lost:
+        # A failure like any other, which ingest.py keeps as the attempt it was, so a Tpx
+        # retry imports with that history.
+        return lost
+    if not done and rc != "0" and (rows == 0 or row_outcome not in ("PASS", None)):
+        # The harness died before its record (a deadline kill, a crash): a failure like any
+        # other, which ingest.py keeps as the attempt it was. Its exit status or a passing
+        # row would contradict that, so those stay invalid.
+        return failed(f"harness rc={rc} produced 0 test_done records")
+    if len(done) != 1:
+        raise Invalid(f"harness rc={rc} produced {len(done)} test_done records")
+    record = done[0]
+    if record.get("test") != cell:
+        raise Invalid(f"harness rc={rc} reported test {record.get('test')!r}, not {cell}")
+    status, details = record.get("status"), details_of(record)
+    if status not in ("passed", "failed", "skipped"):
+        raise Invalid(f"harness rc={rc} reported status {status!r}")
+    if details is None:
+        raise Invalid(f"harness rc={rc} reported {status} without JSON-object details")
+    outcome = details.get("outcome")
+    # The harness writes `passed` exactly for a PASS outcome; for one selected cell, a
+    # lone `skipped` only for a FAIL it excuses as a diagnostic (a withheld cell is the
+    # pair above); and `failed` otherwise. A null outcome comes only with the run
+    # failure no_result_pair recognizes, never alone. The row carries the record's outcome.
+    if status == "passed" and outcome != "PASS":
+        raise Invalid(f"harness rc={rc} reported a passing record with outcome {outcome!r}")
+    if status == "skipped" and outcome != "FAIL":
+        raise Invalid(f"harness rc={rc} reported a skipped record with outcome {outcome!r}")
+    if status == "failed" and not (isinstance(outcome, str) and outcome
+                                   and outcome not in ("PASS", "HOST-INAPPLICABLE")):
+        raise Invalid(f"harness rc={rc} reported a failed record with outcome {outcome!r}")
+    if outcome != (row_outcome if rows else None):
+        raise Invalid(f"harness rc={rc} reported outcome {outcome!r} but its rows say "
+                      f"{row_outcome if rows else 'nothing'!r}")
+    if status == "passed" and rc != "0":
+        raise Invalid(f"harness rc={rc} after a passing record")
+    if status == "passed" and complete != "true":
+        details.update(outcome="ERROR", reason=f"evidence incomplete: {missing}")
+        return dict(record, status="failed", details=json.dumps(details))
+    return record
+
+try:
+    record, problem = verdict(), None
+except Invalid as error:
+    record, problem = failed(str(error)), str(error)
+except Exception as error:  # a normalizer fault is the cell's failure, not a missing record
+    problem = f"harness rc={rc}: verdict normalizer error: {type(error).__name__}: {error}"
+    record = failed(problem)
+print(json.dumps(record))
 print(json.dumps({"op": "all_done"}))
+print(json.dumps({"version": 1, "status": "invalid" if problem else "valid", "reason": problem}))
 PY
+)
+normalizer_rc=$?
+mapfile -t verdict_lines <<<"$verdict_out"
+if [[ $normalizer_rc -ne 0 || ${#verdict_lines[@]} -ne 3 || ${verdict_lines[1]} != '{"op": "all_done"}' ]]; then
+    emit_fatal "verdict normalizer exited $normalizer_rc without exactly one record (harness rc=$harness_rc)"
+fi
+candidate=$(mktemp "$(dirname "$A")/hermit-cell-result.XXXXXX") ||
+    emit_fatal "cannot create a scratch result.json (harness rc=$harness_rc)"
+if ! python3 - "$A/result.json" "$candidate" "$CELL" "${verdict_lines[0]}" "${verdict_lines[2]}" <<'PY' ||
+import json, os, sys
+result_path, candidate, cell, record, completion = sys.argv[1:6]
+record, completion = json.loads(record), json.loads(completion)
+assert record["op"] == "test_done" and record["test"] == cell, record
+assert record["status"] in ("passed", "failed", "skipped"), record
+assert set(completion) == {"version", "status", "reason"} and type(completion["version"]) is int, completion
+assert completion["version"] == 1, completion
+assert ((completion["status"] == "valid" and completion["reason"] is None)
+        or (completion["status"] == "invalid" and isinstance(completion["reason"], str))), completion
+assert completion["status"] == "valid" or record["status"] == "failed", (record, completion)
+with open(result_path) as f:
+    result = json.load(f)
+assert "producer_completion" not in result, result_path
+result["producer_completion"] = completion
+with open(candidate, "w") as f:
+    json.dump(result, f, indent=1, sort_keys=True)
+    f.flush()
+    os.fsync(f.fileno())
+os.chmod(candidate, os.stat(result_path).st_mode & 0o777)
+PY
+    ! mv -f -- "$candidate" "$A/result.json"; then
+    rm -f -- "$candidate"
+    emit_fatal "cannot publish the producer completion in result.json (harness rc=$harness_rc)"
+fi
+printf '%s\n' "${verdict_lines[0]}" "${verdict_lines[1]}"
 exit 0

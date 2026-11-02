@@ -17,6 +17,7 @@ cannot run Hermit (no PMU / no user namespaces / no CPUID interception) or that
 lack a debugger. Real functional gaps are asserted, not skipped.
 """
 
+import json
 import os
 import re
 import shutil
@@ -136,31 +137,49 @@ def _wait_for_port(port: int, proc: subprocess.Popen, timeout: float = 30.0) -> 
 
 class HermitGdbserver:
     """Context manager: start `hermit run --gdbserver` and wait until the
-    gdbserver port is reachable. Force host networking so the port is reachable
-    from the host debugger (see hermit-cli run.rs / PR #144)."""
+    gdbserver port is reachable. The guest keeps Hermit's default isolated
+    network: Hermit binds the port in the host's network namespace. `run_args`
+    go before `--gdbserver` (for example `--strict` and its `--epoch`)."""
 
-    def __init__(self, hermit: Path, guest: Path, port: int):
+    def __init__(
+        self,
+        hermit: Path,
+        guest: Path,
+        port: int,
+        run_args: list[str] | None = None,
+        guest_args: list[str] | None = None,
+        separate_stdout: bool = False,
+    ):
         self.hermit = hermit
         self.guest = guest
         self.port = port
+        self.run_args = run_args or []
+        self.guest_args = guest_args or []
         self.proc: subprocess.Popen | None = None
         self.log = BUILD_DIR / f"hermit_run_{port}.log"
+        # With `separate_stdout`, the guest's stdout goes here and the log
+        # keeps stderr only, so the stdout can be compared byte for byte.
+        self.stdout = (
+            BUILD_DIR / f"hermit_run_{port}.stdout" if separate_stdout else None
+        )
 
     def __enter__(self) -> "HermitGdbserver":
         logf = open(self.log, "wb")
         self._logf = logf
+        self._stdoutf = open(self.stdout, "wb") if self.stdout else None
         self.proc = subprocess.Popen(
             [
                 str(self.hermit),
                 "run",
+                *self.run_args,
                 "--gdbserver",
                 f"--gdbserver-port={self.port}",
-                "--network=host",
                 "--",
                 str(self.guest),
+                *self.guest_args,
             ],
-            stdout=logf,
-            stderr=subprocess.STDOUT,
+            stdout=self._stdoutf or logf,
+            stderr=logf if self._stdoutf else subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
         )
         if not _wait_for_port(self.port, self.proc):
@@ -177,6 +196,12 @@ class HermitGdbserver:
         except OSError:
             return ""
 
+    def wait(self, timeout: float = 120.0) -> int:
+        """Wait for hermit to exit (after the debugger let the guest finish)
+        and return its exit status."""
+        assert self.proc is not None
+        return self.proc.wait(timeout=timeout)
+
     def _cleanup(self):
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
@@ -185,10 +210,12 @@ class HermitGdbserver:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait(timeout=10)
-        try:
-            self._logf.close()
-        except Exception:
-            pass
+        for f in (self._logf, self._stdoutf):
+            try:
+                if f:
+                    f.close()
+            except Exception:
+                pass
 
     def __exit__(self, *exc):
         self._cleanup()
@@ -290,6 +317,24 @@ def can_run_hermit(hermit: Path) -> tuple[bool, str]:
             errors="replace"
         )
     return True, ""
+
+
+def exact_branch_counter(hermit: Path) -> tuple[bool, str]:
+    """The binary's own `exact_branch_counter` verdict from
+    `hermit host-capabilities --json`, as (present, evidence). `hermit run
+    --strict` on ptrace refuses where it is absent, so strict tests skip there,
+    as the CI runner skips strict cells on such hosts."""
+    try:
+        r = subprocess.run(
+            [str(hermit), "host-capabilities", "--json"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+        )
+        verdict = json.loads(r.stdout)["exact_branch_counter"]
+        return bool(verdict["present"]), str(verdict.get("evidence", ""))
+    except Exception as e:  # noqa: BLE001
+        return False, f"hermit host-capabilities --json failed: {e}"
 
 
 class DebuggerTestBase(unittest.TestCase):

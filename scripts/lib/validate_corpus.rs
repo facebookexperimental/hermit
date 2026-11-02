@@ -43,6 +43,10 @@ use std::path::Path;
 pub struct CorpusRow {
     pub label: String,
     pub argv: Vec<String>,
+    /// The `/proc` level the row runs at (`--proc`), when the program reads
+    /// a name Hermit's default level, minimal, omits. Mirrors the `proc`
+    /// field of tests/e2e/manifests/compat.yaml rows.
+    pub proc: Option<String>,
 }
 
 /// Runtime values substituted into the `{{PLACEHOLDER}}` tokens the extractor left
@@ -105,9 +109,25 @@ pub fn load(root: &Path, mode: &str, paths: &CorpusPaths) -> Result<Vec<CorpusRo
         if argv.is_empty() {
             return Err(format!("{} row {i} ({label}): empty argv", file.display()));
         }
+        let proc = match row.get("proc") {
+            None => None,
+            Some(value) => {
+                let level = value.as_str().ok_or_else(|| {
+                    format!("{} row {i} ({label}): non-string `proc`", file.display())
+                })?;
+                if !matches!(level, "minimal" | "standard") {
+                    return Err(format!(
+                        "{} row {i} ({label}): proc {level:?} is not one of minimal|standard",
+                        file.display()
+                    ));
+                }
+                Some(level.to_string())
+            }
+        };
         out.push(CorpusRow {
             label: label.to_string(),
             argv,
+            proc,
         });
     }
     if out.is_empty() {
