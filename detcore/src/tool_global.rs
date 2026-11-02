@@ -3573,6 +3573,7 @@ impl GlobalState {
                 .unwrap()
                 .insert(*id, sequence.clone());
             return (None, GlobalResponse::StoreProcfsSequence(()));
+        }
         // When the timed signal that woke the sender's `nanosleep` was due
         // (`Scheduler::take_sleep_interruption`): the sender's own entry,
         // answered before the forwarded-record drain and any clock
