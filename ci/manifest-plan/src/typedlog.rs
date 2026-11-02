@@ -281,6 +281,8 @@ mod tests {
                 retries: 1,
                 attempt_outcomes: vec!["FAIL".into(), "PASS".into()],
                 attempt_classes: vec![Some("product_failure".into()), None],
+                attempt_error_kinds: vec![None, None],
+                attempt_signatures: vec![None, None],
                 final_outcome: "PASS".into(),
                 flaky_pass: true,
             }]);
