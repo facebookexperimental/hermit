@@ -20394,8 +20394,11 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // run_kvm_a_late_timer_event_refuses_the_run_by_name and
         // run_kvm_a_late_timer_event_is_a_verify_infrastructure_error: 116.
         // And run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name:
-        // 117.
-        ("privileged-only-test.cli_kvm", 117usize),
+        // 117. And run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name
+        // (https://github.com/rrnewton/hermit/issues/4768): 118. And K9a-h's
+        // main-stack maps test: 119. And the same K8-d dot-dot spellings
+        // test: 120, matching the DAG pin in validation_dag_static.
+        ("privileged-only-test.cli_kvm", 120usize),
     ] {
         let step = privileged
             .steps
