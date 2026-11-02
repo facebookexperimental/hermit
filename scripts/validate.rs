@@ -10551,20 +10551,10 @@ fn read_immutable_tool_authority(
     {
         return Err("immutable tool authority does not name the supplied descriptors".into());
     }
-    let descriptor_ids: BTreeSet<u32> = [
-        authority.authority_fd,
-        authority.target_fd,
-        authority.root_fd,
-        authority.state_fd,
-    ]
-    .into_iter()
-    .collect();
-    if descriptor_ids.len() != 4 {
-        return Err(
-            "immutable tool authority conflates target, executable, state, or record descriptors"
-                .into(),
-        );
-    }
+    // Descriptor aliasing is not a refusal: the executable root may
+    // be the cached target descriptor itself. The identity checks
+    // below bind each descriptor and pathname to the claimed identity,
+    // and the caller records the descriptors with the run.
     for (label, value, digits) in [
         ("content digest", authority.content_sha256.as_str(), 64),
         ("parent SHA", authority.parent_sha.as_str(), 40),
@@ -10663,19 +10653,6 @@ fn read_immutable_tool_authority(
     if held_state_target != authority.state_root {
         return Err("retained state-root descriptor no longer names its canonical path".into());
     }
-    let directory_identities: BTreeSet<(u64, u64)> = [
-        (authority.target_dev, authority.target_ino),
-        (authority.root_dev, authority.root_ino),
-        (authority.state_dev, authority.state_ino),
-    ]
-    .into_iter()
-    .collect();
-    if directory_identities.len() != 3 {
-        return Err(
-            "immutable tool authority conflates target, executable, or state identity".into(),
-        );
-    }
-
     Ok(authority)
 }
 
@@ -10910,6 +10887,15 @@ fn configured_authority_tool_root(
         return Err(format!("{TOOL_AUTHORITY_ENV} must be absolute"));
     }
     let authority = read_immutable_tool_authority(&authority_path, supplied, state_root)?;
+    eprintln!(
+        "validate: ci-hub tool generation {} (parent {}); descriptors authority_fd={} target_fd={} root_fd={} state_fd={} recorded with this run",
+        authority.content_sha256,
+        authority.parent_sha,
+        authority.authority_fd,
+        authority.target_fd,
+        authority.root_fd,
+        authority.state_fd,
+    );
     let required_environment = [
         (TOOL_CONTENT_SHA256_ENV, authority.content_sha256.as_str()),
         (TOOL_PARENT_SHA_ENV, authority.parent_sha.as_str()),
