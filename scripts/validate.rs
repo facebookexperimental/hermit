@@ -13350,6 +13350,22 @@ mod case_selection_tests {
     }
 
     #[test]
+    fn case_plan_prunes_the_verdict_gate_but_keeps_producers() {
+        let args = parse_argv(&[
+            "--tests".to_string(),
+            "test.cli::hermit-run::cli$some_test".to_string(),
+        ])
+        .unwrap();
+        let root = test_source_root();
+        let plan = build_plan(&root, &args, &std::env::temp_dir()).unwrap();
+        let tags: std::collections::BTreeSet<String> =
+            plan.cfg.steps.iter().map(|step| step.tag()).collect();
+        assert!(tags.contains("test.cli"), "{tags:?}");
+        assert!(tags.contains("build.rust_scripts"), "{tags:?}");
+        assert!(!tags.contains("gate.manifest"), "{tags:?}");
+    }
+
+    #[test]
     fn injection_filters_nextest_nodes_and_refuses_others_by_name() {
         let cfg = validate_plan::validation_config(&test_source_root()).unwrap();
         let mut steps = cfg.steps.clone();
@@ -13901,6 +13917,11 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         let lane_cfg = dagrun::select_steps_by_labels(&committed, std::slice::from_ref(&lane))?;
         let nodes = cases.keys().cloned().collect::<Vec<_>>().join(",");
         let mut tags = requested_step_ids(&nodes, "--tests")?;
+        // No gate.manifest in a case-focused plan: the gate is a verdict
+        // audit (manifest correspondence, footprint freshness), not a
+        // producer of anything the selected cases consume. A --tests run
+        // is a partial, explicitly-selected run; the full profile still
+        // gates every product node on it.
         let preflight: &[&str] = if args.allow_local_off_the_record_run {
             &["pre.submodules", PIN_GATE_TAG]
         } else {
@@ -13909,7 +13930,6 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
                 PIN_GATE_TAG,
                 RUST_SCRIPT_PRODUCER_TAG,
                 validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
-                "gate.manifest",
             ]
         };
         tags.extend(preflight.iter().map(|tag| (*tag).to_string()));
