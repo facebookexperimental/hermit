@@ -396,7 +396,7 @@ class CellTest(unittest.TestCase):
                          "the wrapper would replace E2E_BUILD_ROOT with /src/target/e2e-build")
         self.assertNotIn("HERMIT_EPOCH", wrapper["forwarded"], "an unset HERMIT_EPOCH is not forwarded")
         self.assertEqual(command[:2], ["sh", "-c"])
-        self.assertEqual(command[3:6], ["link-dbt-runtime", "/src/bundle/hermit/install/rsrcs", "env"])
+        self.assertEqual(command[3:6], ["bundle-setup", "/src/bundle/", BACKEND])
         for assignment in ("E2E_BUILD_ROOT=/src/bundle/build", "HERMIT_BIN=/src/bundle/hermit/hermit",
                            "HERMIT_INSTALL_DIR=/src/bundle/hermit/install"):
             self.assertIn(assignment, command)
@@ -427,6 +427,34 @@ class CellTest(unittest.TestCase):
         self.assertEqual((self.bundle / "hermit" / "hermit").read_text(), "hermit\n",
                          "a write in the container reached the bundle: the copy shares its inodes")
         self.assertEqual(list(self.tmp.joinpath("tpx").glob("hermit-cell.*")), [], "scratch left behind")
+
+    def test_shared_bundle_prep_is_journaled_and_never_writes_the_bundle(self) -> None:
+        done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root")
+        self.assertEqual(done["status"], "passed", done)
+        self.assertEqual(result["bundle_mode"], "shared")
+        self.assertIsInstance(result["bundle_prep_ns"], int)
+        self.assertGreaterEqual(result["bundle_prep_ns"], 0)
+        stderr = (self.tmp / "tpx" / "artifacts" / "harness.stderr").read_text()
+        self.assertIn("CELL_BUNDLE_MODE=shared", stderr)
+        self.assertIn("CELL_BUNDLE_PREP_NS=", stderr)
+        self.assertEqual((self.bundle / "hermit" / "hermit").read_text(), "hermit\n")
+
+    def test_copy_bundle_mode_keeps_the_reflink_copy_and_journals_it(self) -> None:
+        done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", CELL_BUNDLE_MODE="copy")
+        self.assertEqual(done["status"], "passed", done)
+        [wrapper] = self.calls_by("wrapper")
+        self.assertEqual(wrapper["command"][3:6],
+                         ["link-dbt-runtime", "/src/bundle/hermit/install/rsrcs", "env"])
+        self.assertEqual(result["bundle_mode"], "copy")
+        self.assertIsInstance(result["bundle_prep_ns"], int)
+        stderr = (self.tmp / "tpx" / "artifacts" / "harness.stderr").read_text()
+        self.assertIn("CELL_BUNDLE_MODE=copy", stderr)
+        self.assertIn("CELL_BUNDLE_PREP_NS=", stderr)
+        self.assertEqual((self.bundle / "hermit" / "hermit").read_text(), "hermit\n")
+
+    def test_unknown_bundle_mode_is_an_error_not_a_run(self) -> None:
+        done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", CELL_BUNDLE_MODE="bogus")
+        self.assert_error(done, "CELL_BUNDLE_MODE must be copy or shared")
 
     def test_hermit_epoch_reaches_the_harness_in_and_out_of_the_container(self) -> None:
         # Backend parity compares a ptrace reference with its candidates only under one guest
@@ -465,7 +493,8 @@ class CellTest(unittest.TestCase):
         done, result = self.run_cell("ptrace", HERMIT_E2E_CONTAINER="pinned-root", FAKE_LDD_RC="1")
         self.assertEqual(done["status"], "passed", done)
         [wrapper] = self.calls_by("wrapper")
-        self.assertEqual(wrapper["command"][0], "env", wrapper["command"])
+        self.assertEqual(wrapper["command"][:2], ["sh", "-c"], wrapper["command"])
+        self.assertEqual(wrapper["command"][3:6], ["bundle-setup", "/src/bundle/", "ptrace"])
         [harness] = self.calls_by("harness")
         self.assertEqual(harness["rsrcs"], {"libshipped.so": None})
         self.assertEqual(result["harness_rc"], 0)

@@ -16,6 +16,13 @@
 #        CELL_DEADLINE_S           optional cap on the harness wall time
 #                                  (default: Tpx timeout - 30 s; Tpx returns no
 #                                  artifacts at all from an RE action it kills)
+#        CELL_BUNDLE_MODE          pinned-root bundle preparation: "shared"
+#                                  (default) hard-links the bundle as an overlay
+#                                  lower in the container, so per-cell writes
+#                                  copy up to a per-cell upper and never reach
+#                                  the shared bundle; "copy" is the previous
+#                                  per-cell reflink copy, kept so the two can
+#                                  be compared by CELL_BUNDLE_PREP_NS
 #        HERMIT_E2E_KVM_SLOTS      how many local KVM cells may run at once on this host
 #                                  (default 16; see acquire_kvm_slot)
 #        HERMIT_E2E_KVM_SLOT_DIR   where their slot files live
@@ -176,6 +183,13 @@ PY
     for fd in "${fds[@]}"; do exec {fd}>&-; done
 }
 
+bundle_mode=${CELL_BUNDLE_MODE:-shared}
+case $bundle_mode in
+copy | shared) ;;
+*) emit_fatal "CELL_BUNDLE_MODE must be copy or shared, not '$bundle_mode'" ;;
+esac
+bundle_prep_ns=0 bundle_prep_start_ns=0 bundle_prep_end_ns=0
+
 out=$W/out
 case $container in
 "")
@@ -220,15 +234,44 @@ pinned-root)
         emit_fatal "pinned-root image unavailable: $(tr '\n' ' ' <"$W/check-image.log")(build it with ci/hermetic/build-image.sh)"
     # /src is mounted read-write, as in the cargo flow (--src-rw): hermit writes its
     # private verify and engagement summaries into its working directory, the bundle's
-    # src/, when no enclosing git checkout ignores `ignored/`. /src/bundle is therefore
-    # a private copy (a reflink on btrfs, about 1 s), never hard links, so nothing in
-    # buck-out is written. The mountpoints the wrapper adds under /src are created first.
+    # src/, when no enclosing git checkout ignores `ignored/`. Nothing in buck-out may
+    # be written. The mountpoints the wrapper adds under /src are created first.
+    #
+    # A host-side bind or overlay at $R/bundle is impossible in this cell's mount
+    # context: cell.sh runs unprivileged on the host (no CAP_SYS_ADMIN, and Buck/Tpx
+    # may sandbox it further), and the wrapper bind-mounts $R at /src with private
+    # propagation, so a mount cell.sh could create would not reliably appear in the
+    # container. The privileged container is the mount context that can hold an
+    # overlay, so in shared mode the host only hard-links the bundle (cp -al:
+    # directories are per-cell copies, files share inodes with the bundle) as the
+    # overlay's lower layer, and the container prologue below mounts a writable
+    # overlay over /src/bundle with its upper and work directories on the per-cell
+    # scratch under /src (.bundle-upper/.bundle-work, i.e. $R on the host). Every
+    # write then copies up into the upper and never reaches the shared bundle. If
+    # hard links are impossible (bundle and scratch on different filesystems) the
+    # lower layer is the old reflink copy instead, still overlay-isolated; if the
+    # overlay mount itself fails in the container, the prologue breaks the hard
+    # links with a reflink copy before the harness runs. In copy mode the host
+    # reflink copy (about 1 s on btrfs) is the bundle, exactly as before.
     R=$W/root
     mkdir -p "$R/target" "$R/agent-utils/rs/target" "$R/agent-utils/rs/.agent-utils-locks" \
         "$R/agent-utils/rs/.agent-utils-snapshots" "$W/results/buck-cell-out" "$W/pinned" ||
         emit_fatal "cannot create the pinned-root scratch tree"
-    cp -a --reflink=auto "$B" "$R/bundle" ||
-        emit_fatal "cannot place the bundle in the pinned-root scratch tree"
+    bundle_prep_start_ns=$(date +%s%N)
+    if [[ $bundle_mode == copy ]]; then
+        cp -a --reflink=auto "$B" "$R/bundle" ||
+            emit_fatal "cannot place the bundle in the pinned-root scratch tree"
+    else
+        mkdir -p "$R/.bundle-upper" "$R/.bundle-work" ||
+            emit_fatal "cannot create the pinned-root bundle overlay scratch"
+        if ! cp -al "$B" "$R/bundle" 2>"$W/bundle-prep.log"; then
+            rm -rf "$R/bundle"
+            cp -a --reflink=auto "$B" "$R/bundle" ||
+                emit_fatal "cannot place the bundle in the pinned-root scratch tree"
+        fi
+    fi
+    bundle_prep_end_ns=$(date +%s%N)
+    bundle_prep_ns=$((bundle_prep_end_ns - bundle_prep_start_ns))
     # DynamoRIO's private loader loads the DBT client's own libc, libm and libgcc_s. It
     # searches the client's RPATH and directory, LD_LIBRARY_PATH and /lib, /lib64,
     # /usr/lib64..., not the paths the image's nix loader knows, so in the container it
@@ -253,15 +296,53 @@ printf "%s\n" "$deps" | while read -r name arrow path rest; do
     esac
 done
 exec "$@"'
+    # Shared-mode container prologue: mount the writable overlay over the hard-linked
+    # bundle (upper/work are the per-cell scratch directories beside it under /src),
+    # then, for a DBT cell, the same library links link_dbt_runtime makes in the
+    # private copy, now in the overlay's upper. If the overlay mount fails (a
+    # container without overlay support), break the hard links with a reflink copy
+    # first, so a write still cannot reach the shared bundle. Ends by exec'ing the
+    # rest of the command, like link_dbt_runtime.
+    bundle_setup='set -eu
+bundle=${1%/} backend=$2
+shift 2
+root=$(dirname "$bundle")
+upper=$root/.bundle-upper work=$root/.bundle-work
+mkdir -p "$upper" "$work"
+if ! mount -t overlay overlay -o "lowerdir=$bundle,upperdir=$upper,workdir=$work" "$bundle" 2>/dev/null; then
+    lower=$bundle.cell-lower
+    rm -rf "$lower"
+    mv "$bundle" "$lower"
+    mkdir -p "$bundle"
+    cp -a --reflink=auto "$lower/." "$bundle/"
+    rm -rf "$lower"
+fi
+if [ "$backend" = dbt ]; then
+    r=$bundle/hermit/install/rsrcs
+    link() { [ -e "$r/$2" ] || [ -L "$r/$2" ] || ln -s "$1" "$r/$2"; }
+    deps=$(ldd "$r/libreverie_dbt_client.so" "$r/libdetcore_dbt.so")
+    printf "%s\n" "$deps" | while read -r name arrow path rest; do
+        case "$arrow $path" in
+        "=> not"*) echo "cell.sh: the pinned-root image has no $name, which the DBT client needs" >&2; exit 125 ;;
+        "=> $r/"*) ;;
+        "=> /"*) link "$path" "${name##*/}" ;;
+        "("*) case $name in /*) link "$name" "${name##*/}" ;; esac ;;
+        esac
+    done
+fi
+exec "$@"'
     prologue=()
-    [[ $BACKEND != dbt ]] ||
+    if [[ $bundle_mode == shared ]]; then
+        prologue=(sh -c "$bundle_setup" bundle-setup /src/bundle/ "$BACKEND")
+    elif [[ $BACKEND == dbt ]]; then
         prologue=(sh -c "$link_dbt_runtime" link-dbt-runtime /src/bundle/hermit/install/rsrcs)
+    fi
     # Outputs go through the wrapper's /results mount (E2E_RESULT_ROOT).
     out=$W/results/buck-cell-out
     o=/results/buck-cell-out
     # Tpx kills the cell at deadline + 30 s. The wrapper gets what is left of the deadline
-    # after the copy above, and the harness that less 15 s for starting and removing the
-    # container, so a hung container is stopped here, with its artifacts, before Tpx.
+    # after the bundle preparation above, and the harness that less 15 s for starting and
+    # removing the container, so a hung container is stopped here, with its artifacts, before Tpx.
     # A KVM cell's wait for a slot comes out of the same deadline.
     acquire_kvm_slot
     outer=$((deadline - ($(date +%s%N) - t0) / 1000000000))
@@ -292,6 +373,10 @@ exec "$@"'
 *) emit_fatal "unknown HERMIT_E2E_CONTAINER '$container' (expected pinned-root or empty)" ;;
 esac
 t1=$(date +%s%N)
+if ((bundle_prep_ns > 0)); then
+    printf 'cell.sh: CELL_BUNDLE_MODE=%s CELL_BUNDLE_PREP_NS=%s bundle_prep_start_ns=%s bundle_prep_end_ns=%s\n' \
+        "$bundle_mode" "$bundle_prep_ns" "$bundle_prep_start_ns" "$bundle_prep_end_ns" >>"$W/harness.stderr"
+fi
 
 copy_errors=0
 put() { # put SRC NAME: logs over 256 KiB are zstd'd
@@ -358,6 +443,7 @@ json.dump({
     "container_reason": os.environ.get("HERMIT_E2E_CONTAINER_REASON", ""),
     "empty_workdir": "$workdir",
     "kvm_slot": "$kvm_slot", "kvm_slot_wait_ms": $kvm_slot_wait_ms,
+    "bundle_mode": "$bundle_mode", "bundle_prep_ns": $bundle_prep_ns,
     "harness_rc": $harness_rc, "outcome": "$outcome", "deadline_s": $deadline,
     "tpx_timeout_s": $tpx_timeout, "wall_ms": $(((t1 - t0) / 1000000)),
     "evidence_complete": "$evidence_complete" == "true", "missing": "${missing[*]}".split(),
