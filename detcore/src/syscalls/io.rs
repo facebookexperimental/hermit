@@ -5200,6 +5200,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             socket: call.sockfd(),
             peek: call.flags() & libc::MSG_PEEK != 0,
             messages: 1,
+            call: Sysno::recvmsg,
         };
         // A datagram or seqpacket receive takes its message before it copies
         // the bytes, and frees it if that copy fails.
@@ -5633,6 +5634,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             socket: call.fd(),
             peek: call.flags() & libc::MSG_PEEK as u32 != 0,
             messages: 1,
+            call: Sysno::recvmmsg,
         };
         // As for `recvmsg`: an error before any message is the first
         // message's.

@@ -528,6 +528,18 @@ struct SocketRights {
     /// either socket of the pair is passed to another table, which may hold
     /// it as an open file of its own (`DetFd::give_up_pair_completeness`).
     complete: bool,
+    /// Whether only its peer can reach this socket, through sends Detcore
+    /// sees: set with `Self::complete` for both sockets of a `socketpair`
+    /// (`DetFd::mark_complete_pair`), and cleared for good when the socket
+    /// gets a name another socket can send to (a `bind`, or `SO_PASSCRED`,
+    /// `DetFd::set_unix_name`, `DetFd::give_up_completeness`) or either
+    /// socket of the pair is passed to another table
+    /// (`DetFd::give_up_pair_completeness`). Unlike `Self::complete`, losing
+    /// track of which message a receive took leaves it set.
+    sealed: bool,
+    /// Whether a message sent to this socket carried descriptors, or may
+    /// have without being queued (`DetFd::lose_peer_lockstep_with_rights`).
+    rights_sent: bool,
 }
 
 /// Whether `received`, the identities of the descriptors one receive
@@ -2989,6 +3001,7 @@ impl DetFd {
             d.rights.unix_name = Some((name, generation));
             // Any socket can now send to it by name, unseen by the queue.
             give_up_completeness(&mut d.rights);
+            d.rights.sealed = false;
         });
     }
 
@@ -2996,8 +3009,12 @@ impl DetFd {
     /// `socketpair`, which nothing but each other can reach, start with
     /// queues that hold every message (`SocketRights::complete`).
     pub(crate) fn mark_complete_pair(&self, peer: &DetFd) {
-        self.with_description(|d| d.rights.complete = true);
-        peer.with_description(|d| d.rights.complete = true);
+        let mark = |d: &mut OpenFileDescription| {
+            d.rights.complete = true;
+            d.rights.sealed = true;
+        };
+        self.with_description(mark);
+        peer.with_description(mark);
     }
 
     /// Messages Detcore does not see sent may now reach this socket: a
@@ -3005,7 +3022,10 @@ impl DetFd {
     /// its next send (`unix_autobind`). Its queue no longer holds every
     /// message (`SocketRights::complete`).
     pub(crate) fn give_up_completeness(&self) {
-        self.with_description(|d| give_up_completeness(&mut d.rights));
+        self.with_description(|d| {
+            give_up_completeness(&mut d.rights);
+            d.rights.sealed = false;
+        });
     }
 
     /// Another descriptor table may now hold this socket without Detcore
@@ -3017,10 +3037,14 @@ impl DetFd {
     pub(crate) fn give_up_pair_completeness(&self) {
         let peer = self.with_description(|d| {
             give_up_completeness(&mut d.rights);
+            d.rights.sealed = false;
             d.rights.peer.clone()
         });
         if let Some(peer) = peer {
-            peer.with_description(|d| give_up_completeness(&mut d.rights));
+            peer.with_description(|d| {
+                give_up_completeness(&mut d.rights);
+                d.rights.sealed = false;
+            });
         }
     }
 
@@ -3137,6 +3161,7 @@ impl DetFd {
         let outcome = peer.with_description(|d| {
             let rights = &mut d.rights;
             let message = message.take().expect("a message is queued once");
+            rights.rights_sent |= !message.descriptors.is_empty();
             if rights.queued.len() >= MAX_QUEUED_RIGHTS_MESSAGES {
                 // No room to keep messages of data alone: none carried a
                 // descriptor, so the queue stays in lockstep without them.
@@ -3197,6 +3222,19 @@ impl DetFd {
         }
     }
 
+    /// As [`Self::lose_peer_lockstep`], for a message that may have carried
+    /// descriptors its peer's queue does not hold, so that a receive
+    /// through the peer may install some (`SocketRights::rights_sent`).
+    pub(crate) fn lose_peer_lockstep_with_rights(&self) {
+        if let Some(peer) = self.with_description(|d| d.rights.peer.clone()) {
+            peer.with_description(|d| {
+                d.rights.lockstep_lost = true;
+                d.rights.rights_sent = true;
+                give_up_completeness(&mut d.rights);
+            });
+        }
+    }
+
     /// A call took up to `taken` messages from this socket that Detcore
     /// could not match to its queue. The queue is kept: Detcore cannot tell
     /// whether the messages the call took carried descriptors, and Linux
@@ -3239,6 +3277,14 @@ impl DetFd {
     /// Whether a message is queued to this socket.
     pub(crate) fn has_queued_rights(&self) -> bool {
         self.with_description(|d| !d.rights.queued.is_empty())
+    }
+
+    /// Whether a receive through this socket may install descriptors
+    /// sent to it: false only where nothing but its peer can reach it,
+    /// through sends Detcore sees (`SocketRights::sealed`), and no message
+    /// sent to it carried any (`SocketRights::rights_sent`).
+    pub(crate) fn may_deliver_rights(&self) -> bool {
+        self.with_description(|d| !d.rights.sealed || d.rights.rights_sent)
     }
 
     /// A call took the oldest message Linux held for this datagram or
@@ -5536,14 +5582,22 @@ mod tests {
     fn a_complete_queue_gives_up_the_message_a_read_takes() {
         let owner = DetTid::from_raw(10);
         let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
+        assert!(
+            right.may_deliver_rights(),
+            "before the pair is known complete"
+        );
         left.mark_complete_pair(&right);
+        assert!(!right.may_deliver_rights(), "an empty complete queue");
         assert!(matches!(left.queue_rights_to_peer(Vec::new(), 3), Ok(())));
+        assert!(!right.may_deliver_rights(), "data alone carries none");
         let alias = sent.clone();
         queue_and_close(&left, sent, true);
+        assert!(right.may_deliver_rights(), "a message with a descriptor");
         let data_only = right.take_head_message(|head| head.bytes == 3);
         assert!(matches!(data_only, Some(ref sent) if sent.is_empty()));
         let carried = right.take_head_message(|head| head.bytes == 1).unwrap();
         assert_eq!(carried.len(), 1);
+        assert!(right.may_deliver_rights(), "once sent one, for good");
         assert!(!alias.is_last_reference());
         assert_eq!(
             carried
@@ -5553,6 +5607,31 @@ mod tests {
             0
         );
         assert!(alias.is_last_reference(), "released at the read");
+
+        // A pair whose queue loses track of which message a receive took,
+        // with no descriptor ever sent, still cannot deliver one.
+        let (left, right, _) = pair_and_sent(owner, FdType::Pipe);
+        left.mark_complete_pair(&right);
+        assert!(matches!(left.queue_rights_to_peer(Vec::new(), 3), Ok(())));
+        assert!(
+            right
+                .take_head_message(|head| !head.descriptors.is_empty())
+                .is_none()
+        );
+        assert!(
+            !right.may_deliver_rights(),
+            "out of lockstep, never sent one"
+        );
+        left.lose_peer_lockstep();
+        assert!(
+            !right.may_deliver_rights(),
+            "a send of data alone outside the queue's order carries none"
+        );
+        left.lose_peer_lockstep_with_rights();
+        assert!(
+            right.may_deliver_rights(),
+            "a send that may not have queued its own"
+        );
 
         // A message that does not fit what the call reports leaves the queue
         // out of lockstep, taking nothing.
@@ -5566,6 +5645,7 @@ mod tests {
         let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
         left.mark_complete_pair(&right);
         right.set_unix_name(Box::from(&b"\0bound"[..]), 1);
+        assert!(right.may_deliver_rights(), "a bound socket may receive any");
         queue_and_close(&left, sent, true);
         assert!(right.take_head_message(|_| true).is_none());
         assert!(matches!(left.queue_rights_to_peer(Vec::new(), 1), Ok(())));

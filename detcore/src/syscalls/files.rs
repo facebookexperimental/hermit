@@ -13927,6 +13927,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // No `SCM_RIGHTS` message is queued to a binder
                         // descriptor, so no count of messages taken matters.
                         messages: 1,
+                        call: Sysno::ioctl,
                     },
                 )
                 .await?;

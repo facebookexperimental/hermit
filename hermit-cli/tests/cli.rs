@@ -281,6 +281,7 @@ static RECEIVED_DOTDOT_LOOKUPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static ABSENT_CPU_LOOKUPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SCM_RIGHTS_RECEIVED_ANON_INODES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SCM_RIGHTS_EXITED_RECEIVER_PORT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SCM_RIGHTS_OVERLAPPING_RECEIPT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_TIME_CLOCKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -9402,6 +9403,113 @@ fn run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first() {
         return;
     }
     receive_from_an_exited_sender_in_both_orders("kvm", SCM_RIGHTS_RECEIVED_ANON_INODES_KVM);
+}
+
+/// What `tests/c/scm_rights_overlapping_receipt.c` prints natively, where it
+/// runs to the end.
+const SCM_RIGHTS_OVERLAPPING_RECEIPT_LINUX: &str = "sent\nreceived\n\
+    sent through the received descriptor from two threads\nboth records arrived\n";
+
+/// An `SCM_RIGHTS` receive whose 8-byte payload lands on the `msg_name` field
+/// of its own header, with its control buffer elsewhere
+/// (`tests/c/scm_rights_overlapping_receipt.c`), is valid on Linux: natively
+/// the guest receives a descriptor, two threads send through it, and it runs
+/// to the end. Detcore does not trust the control data such a receive leaves
+/// (it writes over a header it reads), so it cannot record the descriptor,
+/// and a later call through an unrecorded descriptor runs on the background
+/// path, outside the turn order. On `backend`, a strict run therefore ends at
+/// the receive as a named policy refusal (exit 122) before the guest prints
+/// "received", where Detcore used to warn and let the guest go on. With
+/// unsupported operations allowed, the receipt still warns and the guest runs
+/// to the end; that leg runs on ptrace.
+fn an_scm_rights_receipt_over_its_own_header_refuses(backend: &str) {
+    let guest = compiled_c_guest(
+        &SCM_RIGHTS_OVERLAPPING_RECEIPT_GUEST,
+        "scm_rights_overlapping_receipt",
+    )
+    .to_str()
+    .expect("guest path is UTF-8");
+    let native = Command::new(guest)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the guest natively");
+    assert!(
+        native.status.success(),
+        "natively: {}\nstderr:\n{}",
+        native.status,
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        SCM_RIGHTS_OVERLAPPING_RECEIPT_LINUX,
+        "natively"
+    );
+
+    let _guard = hermit_run_guard();
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+    let refused_stdout = stdout(&output);
+    let refused_stderr = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{backend}: the receipt must end the strict run as a policy refusal\nstdout:\n{refused_stdout}\nstderr:\n{refused_stderr}"
+    );
+    assert!(
+        refused_stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+            && refused_stderr.contains(
+                "recvmsg: the descriptors it may have received over SCM_RIGHTS cannot be \
+                 recorded (a buffer it writes overlaps a buffer or header it reads)"
+            ),
+        "{backend}: the run did not name the receipt refusal on stderr\nstderr:\n{refused_stderr}"
+    );
+    assert_eq!(
+        refused_stdout, "sent\n",
+        "{backend}: the guest went on past the refused receipt"
+    );
+
+    if backend == "ptrace" {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--allow-unsupported-syscalls",
+            "--base-env=minimal",
+            "--",
+            guest,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            SCM_RIGHTS_OVERLAPPING_RECEIPT_LINUX,
+            "{backend} with unsupported operations allowed; stderr:\n{}",
+            stderr(&output)
+        );
+    }
+}
+
+/// [`an_scm_rights_receipt_over_its_own_header_refuses`] on ptrace.
+#[test]
+fn an_scm_rights_receipt_over_its_own_header_is_a_named_refusal() {
+    an_scm_rights_receipt_over_its_own_header_refuses("ptrace");
+}
+
+/// [`an_scm_rights_receipt_over_its_own_header_refuses`] on KVM.
+#[test]
+fn run_kvm_an_scm_rights_receipt_over_its_own_header_is_a_named_refusal() {
+    if kvm_unavailable("run_kvm_an_scm_rights_receipt_over_its_own_header_is_a_named_refusal") {
+        return;
+    }
+    an_scm_rights_receipt_over_its_own_header_refuses("kvm");
 }
 
 /// A loopback address of this test process's own for

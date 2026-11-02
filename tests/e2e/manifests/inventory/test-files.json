@@ -2617,6 +2617,12 @@
       "why": "tests/c/scm_rights_exited_receiver_port.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests scm_rights_exited_receivers_queue_goes_with_its_exit (ptrace) and run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit (KVM) compile this guest, in which a bound UDP socket rides an SCM_RIGHTS message queued to a datagram socket a child holds (modes alone and shared) or the child inherits the bound socket itself (mode inherited), the child exits, and the parent binds a new socket to port 0 at a loopback address of the test's own; they require, with and without the exit_hook_tail race probe, that the next bind reuses the first port, which shows that Detcore released the child's descriptor table at its exit rather than when the backend tore the child's state down; it remains a guest fixture because a generic manifest cannot pass the per-test address, set the race probe, or compare Detcore's port-0 choice, which native Linux makes at random."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/scm_rights_overlapping_receipt.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/scm_rights_overlapping_receipt.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests an_scm_rights_receipt_over_its_own_header_is_a_named_refusal (ptrace) and run_kvm_an_scm_rights_receipt_over_its_own_header_is_a_named_refusal (KVM) compile this guest, which receives one end of a datagram socketpair over SCM_RIGHTS with its 8-byte payload on the msg_name field of its own msghdr and its control buffer elsewhere, then sends through the received descriptor from two threads; they require that it runs to the end natively, that a strict run ends at the receive as a named policy refusal (exit 122) because Detcore cannot record that descriptor and a call through it would leave the turn order, and on ptrace that with unsupported operations allowed it runs to the end; it remains a guest fixture because a generic manifest cannot compare the native run with a refusal's exit status and stderr."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/scm_rights_received_anon_inodes.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",

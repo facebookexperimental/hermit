@@ -51,12 +51,21 @@
 //! inode (eventfd, signalfd, timerfd, epoll, pidfd, userfaultfd, ...), which
 //! an ordinary record would mishandle
 //! (<https://github.com/rrnewton/hermit/issues/4107>'s signalfd mode), and
-//! one whose link cannot be read; a receive whose buffers overlap so that the
-//! call may have overwritten its
-//! own inputs, whose vector cannot be read in full, or whose inputs changed
-//! before the attempt that succeeded; and every receive on the background
-//! path. Without sequentialized threads no receive is recorded, logged at
-//! debug level only (`ReceiptMode`).
+//! one whose link cannot be read; every receive on the background path; and
+//! a receive whose layout cannot be trusted (its buffers overlap so that the
+//! call may have overwritten its own inputs, its vector cannot be read in
+//! full, or its inputs changed before the attempt that succeeded), where
+//! unsupported operations are allowed or the receive ran on the background
+//! path. In the caller's turn, a fail-closed run ends at such a receive
+//! that names a control buffer (or whose geometry cannot say), through a
+//! socket whose queue does not rule descriptors out (`DetFd::may_deliver_rights`:
+//! a datagram or seqpacket `socketpair` whose queue holds every message and
+//! none with descriptors rules them out), as a policy refusal: the
+//! descriptors it may have installed
+//! would be missing from the table, and a later call through one would run
+//! on the background path, outside the turn order. Without sequentialized
+//! threads no receive is recorded, logged at debug level only
+//! (`ReceiptMode`).
 //!
 //! Under record and replay every fact is taken through the recording, so
 //! replay, which serves the receive from the log and holds a stand-in in each
@@ -428,6 +437,7 @@ use reverie::syscalls::Addr;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::PathPtr;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::Sysno;
 use reverie::syscalls::linux_abi::Mmsghdr;
 use reverie::syscalls::linux_abi::Msghdr;
 use tracing::debug;
@@ -747,6 +757,12 @@ pub(crate) struct Delivered {
     /// Why the receive's descriptors cannot be named, if they cannot: then
     /// `fds` is empty, and none of the call's descriptors is recorded.
     pub(crate) refused: Option<&'static str>,
+    /// With [`Self::refused`], for a receive that completed in the caller's
+    /// turn: whether it may have installed descriptors. Linux installs one
+    /// only into a control buffer the message names (`scm_detach_fds`), so
+    /// this is false where no message of the geometry names one and the
+    /// geometry says which header each message used.
+    pub(crate) may_have_installed: bool,
 }
 
 /// The descriptors one received message delivered.
@@ -789,6 +805,9 @@ pub(crate) struct ReceivedFrom {
     /// How many messages the call took: one for `recvmsg`, as many as it
     /// reports for `recvmmsg`.
     pub(crate) messages: usize,
+    /// The call that took them: `recvmsg`, `recvmmsg`, or the `ioctl` of a
+    /// binder transaction.
+    pub(crate) call: Sysno,
 }
 
 /// A receive through a call that passes no control buffer
@@ -1320,22 +1339,41 @@ impl ReceiveGeometry {
     /// Linux reports more control bytes than the buffer named before the call
     /// held.
     pub(crate) fn delivered<M: MemoryAccess>(&self, memory: &M, ret: i64) -> Delivered {
-        let refused = |reason| Delivered {
+        let refused = |reason, may_have_installed| Delivered {
             fds: Vec::new(),
             messages: Vec::new(),
             refused: Some(reason),
+            may_have_installed,
         };
         if ret < 0 {
             return Delivered::default();
         }
+        // Whether a refused receive may have installed descriptors
+        // (`Delivered::may_have_installed`). The geometry is that of the
+        // attempt that completed, read right before it
+        // (`ThreadState::receive_geometry`), and Linux copies a header in
+        // before it writes anything for its message (`___sys_recvmsg`), so
+        // the geometry names the control buffers Linux used, except where
+        // it is incomplete or a batch's output overlaps a header: Linux
+        // reads each later entry's header only when it reaches it.
+        let names_control = self
+            .messages
+            .iter()
+            .any(|message| message.control.0 != 0 && message.control.1 != 0);
         if let Some(reason) = self.unusable {
-            return refused(reason);
+            return refused(reason, true);
         }
         if self.overlapping() {
-            return refused("a buffer it writes overlaps a buffer or header it reads");
+            return refused(
+                "a buffer it writes overlaps a buffer or header it reads",
+                names_control || self.batch,
+            );
         }
         if !self.still_named(memory) {
-            return refused("its buffers changed before the attempt that succeeded");
+            return refused(
+                "its buffers changed before the attempt that succeeded",
+                names_control,
+            );
         }
         let count = if self.batch {
             (ret as usize).min(self.messages.len())
@@ -1365,10 +1403,13 @@ impl ReceiveGeometry {
                 let Some(length) =
                     Addr::<usize>::from_raw(written).and_then(|at| memory.read_value(at).ok())
                 else {
-                    return refused("its control length cannot be read back");
+                    return refused("its control length cannot be read back", true);
                 };
                 if length > message.control.1 {
-                    return refused("its control buffer grew before the attempt that succeeded");
+                    return refused(
+                        "its control buffer grew before the attempt that succeeded",
+                        true,
+                    );
                 }
                 let length = length.min(MAX_CONTROL_BYTES);
                 let mut control = vec![0; length];
@@ -1377,7 +1418,7 @@ impl ReceiveGeometry {
                 {
                     _ if length == 0 => Vec::new(),
                     Some(Ok(())) => received_descriptors(&control),
-                    _ => return refused("its control data cannot be read back"),
+                    _ => return refused("its control data cannot be read back", true),
                 }
             };
             if received.is_empty() {
@@ -1407,6 +1448,7 @@ impl ReceiveGeometry {
             fds,
             messages,
             refused: None,
+            may_have_installed: false,
         }
     }
 }
@@ -1602,11 +1644,23 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// table modeled (see the module documentation) is not returned: it brings
     /// the lock ledger no new identity, and `refresh_description_locks` would
     /// mark that shared open file, the sender's too, as received. The guest's
-    /// result is never changed. A descriptor left out of the table, as every
-    /// received descriptor was before, is named in a warning: for each receive
-    /// whose layout cannot be trusted, each receive on the background path,
-    /// each number that already has a record, each anonymous inode other than
-    /// an inotify instance, and each descriptor whose facts cannot be taken.
+    /// result is never changed. An `SCM_RIGHTS` receive in the caller's turn
+    /// whose layout cannot be trusted, and which may have installed
+    /// descriptors (its geometry names a control buffer,
+    /// [`Delivered::may_have_installed`], and its socket's queue does not rule
+    /// them out, `DetFd::may_deliver_rights`), ends a fail-closed run as a
+    /// policy refusal
+    /// ([`Self::refuse_unserviceable_operation_because`]): the
+    /// descriptors it may have installed would be left out of the table, and
+    /// a later call through one would run on the background path
+    /// (`BlockingExternalIO`), outside the turn order. Otherwise a descriptor
+    /// left out of the table, as every received descriptor was before, is
+    /// named in a warning: for each receive whose layout cannot be trusted
+    /// (where it can have installed none, where unsupported operations are
+    /// allowed, on the background path, or in a binder transaction), each
+    /// receive on the background path, each
+    /// number that already has a record, each anonymous inode other than an
+    /// inotify instance, and each descriptor whose facts cannot be taken.
     /// Without sequentialized threads none is recorded, logged at debug level
     /// only (a warning per call, or per tool process, would differ between
     /// runs that share a process). Where the tool discovers them, none is
@@ -1647,6 +1701,36 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         if let Some(reason) = delivered.refused {
             guest.thread_state().note_unaccounted_receipt();
+            if channel == Channel::ScmRights
+                && in_turn
+                && delivered.may_have_installed
+                && self.cfg.panic_on_unsupported_syscalls
+                && guest
+                    .thread_state()
+                    .with_detfd(from.socket, |socket| socket.may_deliver_rights())
+                    .unwrap_or(true)
+            {
+                let refusal = format!(
+                    "the descriptors it may have received over SCM_RIGHTS cannot be \
+                     recorded ({reason}), and a call through one would leave the turn order"
+                );
+                // Named on stderr before the policy ends the run, as a
+                // backend's refusal is (`Detcore::report_backend_refusal`).
+                let dettid = guest.thread_state().dettid;
+                crate::syscalls::helpers::report_refusal_reason(
+                    true,
+                    &format!("[dtid {dettid}] {}: {refusal}", from.call),
+                );
+                // Only a fail-closed run asks: the receive has already run,
+                // so the errno a permissive run would get is never given.
+                self.refuse_unserviceable_operation_because(
+                    guest,
+                    from.call,
+                    Errno::EOPNOTSUPP,
+                    &refusal,
+                )
+                .await?;
+            }
             warn!(
                 "[detcore] the descriptors a receive got {channel}, if any, are not recorded: \
                  {reason}"
@@ -3106,11 +3190,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// A send through `socket` may have passed descriptors its peer's queue
     /// does not hold: a message whose control data could not be read, one
     /// whose descriptors' facts could not be taken, or a send outside the
-    /// caller's turn (`DetFd::lose_peer_lockstep`).
+    /// caller's turn (`DetFd::lose_peer_lockstep_with_rights`).
     pub(crate) fn lose_peer_lockstep<G: Guest<Self>>(&self, guest: &mut G, socket: RawFd) {
         let _ = guest
             .thread_state()
-            .with_detfd(socket, |socket| socket.lose_peer_lockstep());
+            .with_detfd(socket, |socket| socket.lose_peer_lockstep_with_rights());
     }
 
     /// Whether this run pairs `AF_UNIX` connections, so that their sends
@@ -3566,6 +3650,7 @@ mod tests {
                     bytes: Some(1),
                 }],
                 refused: None,
+                may_have_installed: false,
             }
         );
         // More bytes than the buffer named before the call held: the
@@ -3685,6 +3770,67 @@ mod tests {
             &[header],
             &[((1056, 8), false), ((1000, 0), false)]
         ));
+    }
+
+    /// A refused receive may have installed descriptors only where a
+    /// message names a control buffer, or where the geometry cannot say
+    /// which header Linux used: a batch whose outputs overlap its inputs,
+    /// since Linux reads each later entry's header only when it reaches it.
+    /// A payload over the header's own msg_name field, with the control
+    /// buffer elsewhere, may have; without a control buffer it cannot have.
+    #[test]
+    fn a_refused_receive_may_have_installed_descriptors_only_where_it_names_a_control_buffer() {
+        let memory = LocalMemory::new();
+        let mut control = message(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[4]);
+        let length = control.len();
+        for names_control in [true, false] {
+            // On the heap, so that the iovec can name its own header's
+            // msg_name field.
+            let header = Box::into_raw(Box::new(header(
+                &mut control,
+                if names_control { length } else { 0 },
+            )));
+            let iov = [libc::iovec {
+                // SAFETY: `header` is a live allocation this test owns.
+                iov_base: unsafe { (&raw mut (*header).msg_name).cast() },
+                iov_len: size_of::<usize>(),
+            }];
+            // SAFETY: as above.
+            unsafe {
+                (*header).msg_iov = iov.as_ptr().cast_mut().cast();
+                (*header).msg_iovlen = 1;
+                if !names_control {
+                    (*header).msg_control = std::ptr::null_mut();
+                }
+            }
+            // SAFETY: as above.
+            let call = recvmsg_of(unsafe { &mut *header });
+            let geometry = ReceiveGeometry::before(&memory, &call).unwrap();
+            let delivered = geometry.delivered(&memory, 8);
+            assert!(delivered.refused.is_some(), "names_control {names_control}");
+            assert_eq!(
+                delivered.may_have_installed, names_control,
+                "names_control {names_control}"
+            );
+            // SAFETY: made by `Box::into_raw` above, and no longer read.
+            drop(unsafe { Box::from_raw(header) });
+        }
+        // A batch whose timeout overlaps an entry's header, naming no
+        // control buffer: Linux reads that header only when it reaches the
+        // entry, so the geometry cannot say what it named.
+        // SAFETY: all-zero is a valid `mmsghdr`.
+        let mut vector: [Mmsghdr; 1] = unsafe { std::mem::zeroed() };
+        let timeout = vector.as_ptr().cast::<Timespec>();
+        let call = Syscall::Recvmmsg(
+            syscalls::Recvmmsg::new()
+                .with_fd(7)
+                .with_mmsg(AddrMut::from_ptr(vector.as_mut_ptr()))
+                .with_vlen(1)
+                .with_timeout(Addr::from_ptr(timeout)),
+        );
+        let geometry = ReceiveGeometry::before(&memory, &call).unwrap();
+        let delivered = geometry.delivered(&memory, 1);
+        assert!(delivered.refused.is_some() && delivered.may_have_installed);
     }
 
     /// Whatever the call may write over what it reads refuses the whole

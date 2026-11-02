@@ -414,6 +414,7 @@ pub(crate) fn delivered<M: MemoryAccess>(
             }],
             fds,
             refused: None,
+            may_have_installed: false,
         },
         Err(why) => refused(why),
     }
@@ -424,6 +425,8 @@ fn refused(why: &'static str) -> Delivered {
         fds: Vec::new(),
         messages: Vec::new(),
         refused: Some(why),
+        // A transaction Detcore cannot read may have carried descriptors.
+        may_have_installed: true,
     }
 }
 
@@ -880,7 +883,8 @@ mod tests {
                     truncated: false,
                     bytes: None,
                 }],
-                refused: None
+                refused: None,
+                may_have_installed: false,
             }
         );
         let words = call(256, 0);
