@@ -24557,7 +24557,11 @@
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+<<<<<<< HEAD
         "NEXTEST_EXPECTED_EXECUTED": "1944",
+=======
+        "NEXTEST_EXPECTED_EXECUTED": "1975",
+>>>>>>> fad3193979d (Train 5 recount: update nextest expected counts to combined-head measurements (cli 792, detcore_unit 3428, hermit_unit 1345, regular_crates 1975, hosted twins same growth))
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit-detcore-tests\",\"--exclude\",\"hermit-run\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -24607,7 +24611,11 @@
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+<<<<<<< HEAD
         "NEXTEST_EXPECTED_EXECUTED": "1212",
+=======
+        "NEXTEST_EXPECTED_EXECUTED": "1349",
+>>>>>>> fad3193979d (Train 5 recount: update nextest expected counts to combined-head measurements (cli 792, detcore_unit 3428, hermit_unit 1345, regular_crates 1975, hosted twins same growth))
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -24657,7 +24665,11 @@
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+<<<<<<< HEAD
         "NEXTEST_EXPECTED_EXECUTED": "3395",
+=======
+        "NEXTEST_EXPECTED_EXECUTED": "3430",
+>>>>>>> fad3193979d (Train 5 recount: update nextest expected counts to combined-head measurements (cli 792, detcore_unit 3428, hermit_unit 1345, regular_crates 1975, hosted twins same growth))
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -25764,7 +25776,7 @@
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
         "HERMIT_REQUIRE_DAP_GDB": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "789",
+        "NEXTEST_EXPECTED_EXECUTED": "794",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -25817,7 +25829,7 @@
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "708",
+        "NEXTEST_EXPECTED_EXECUTED": "713",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -42965,7 +42977,11 @@
       "env": {
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+<<<<<<< HEAD
         "NEXTEST_EXPECTED_EXECUTED": "1930",
+=======
+        "NEXTEST_EXPECTED_EXECUTED": "1961",
+>>>>>>> fad3193979d (Train 5 recount: update nextest expected counts to combined-head measurements (cli 792, detcore_unit 3428, hermit_unit 1345, regular_crates 1975, hosted twins same growth))
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit-detcore-tests\",\"--exclude\",\"hermit-run\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -43012,7 +43028,11 @@
       "env": {
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+<<<<<<< HEAD
         "NEXTEST_EXPECTED_EXECUTED": "1206",
+=======
+        "NEXTEST_EXPECTED_EXECUTED": "1343",
+>>>>>>> fad3193979d (Train 5 recount: update nextest expected counts to combined-head measurements (cli 792, detcore_unit 3428, hermit_unit 1345, regular_crates 1975, hosted twins same growth))
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -43059,7 +43079,11 @@
       "env": {
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+<<<<<<< HEAD
         "NEXTEST_EXPECTED_EXECUTED": "3395",
+=======
+        "NEXTEST_EXPECTED_EXECUTED": "3430",
+>>>>>>> fad3193979d (Train 5 recount: update nextest expected counts to combined-head measurements (cli 792, detcore_unit 3428, hermit_unit 1345, regular_crates 1975, hosted twins same growth))
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
