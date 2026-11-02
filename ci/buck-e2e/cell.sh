@@ -230,8 +230,38 @@ pinned-root)
         emit_fatal "HERMIT_E2E_CONTAINER=pinned-root needs a local route, not '${HERMIT_E2E_ROUTE:-}'"
     wrapper=$B/src/ci/hermetic/run-in-pinned-root.sh
     [[ -x $wrapper ]] || emit_fatal "the bundle source has no executable ci/hermetic/run-in-pinned-root.sh"
-    "$wrapper" --check-image >"$W/check-image.log" 2>&1 ||
-        emit_fatal "pinned-root image unavailable: $(tr '\n' ' ' <"$W/check-image.log")(build it with ci/hermetic/build-image.sh)"
+    probe_rc=0
+    "$wrapper" --check-image >"$W/check-image.log" 2>&1 || probe_rc=$?
+    if ((probe_rc != 0)); then
+        # The image probe is infrastructure, not the cell's test: synthesize
+        # harness-shaped outputs so the shared tail publishes an explicit
+        # ERROR row (plus result.json with a producer completion) for this
+        # cell, instead of the missing cell an early exit leaves behind —
+        # ingest counts a cell with no result.json as absent, not failed.
+        out=$W/out
+        mkdir -p "$out"
+        : >"$W/harness.stdout"
+        {
+            printf 'pinned-root image unavailable (infra probe rc=%s):\n' "$probe_rc"
+            cat "$W/check-image.log"
+        } >"$W/harness.stderr"
+        python3 - "$out" "$TEST" "$MODE" "$BACKEND" "$run_id" "$probe_rc" <<'PY'
+import json, sys
+out, test, mode, backend, run_id, rc = sys.argv[1:7]
+reason = (f"pinned-root image unavailable: the --check-image infra probe "
+          f"failed with rc={rc} before the harness ran (see harness.stderr)")
+with open(f"{out}/results.jsonl", "w") as f:
+    f.write(json.dumps({"test": test, "mode": mode, "backend": backend,
+                        "outcome": "ERROR", "attempt": 1, "run_id": run_id}) + "\n")
+with open(f"{out}/tpx.jsonl", "w") as f:
+    f.write(json.dumps({"op": "test_done", "test": f"{test}/{mode}@{backend}",
+                        "status": "failed",
+                        "details": json.dumps({"outcome": "ERROR", "reason": reason})}) + "\n")
+with open(f"{out}/junit.xml", "w") as f:
+    f.write("<testsuite/>\n")
+PY
+        harness_rc=$probe_rc
+    else
     # /src is mounted read-write, as in the cargo flow (--src-rw): hermit writes its
     # private verify and engagement summaries into its working directory, the bundle's
     # src/, when no enclosing git checkout ignores `ignored/`. Nothing in buck-out may
@@ -369,6 +399,7 @@ exec "$@"'
         --results "$o/results.jsonl" --junit "$o/junit.xml" --tpx-json "$o/tpx.jsonl" \
         "${extra[@]}" "$@" >"$W/harness.stdout" 2>"$W/harness.stderr" 9>&-
     harness_rc=$?
+    fi
     ;;
 *) emit_fatal "unknown HERMIT_E2E_CONTAINER '$container' (expected pinned-root or empty)" ;;
 esac

@@ -88,6 +88,7 @@ class CargoCacheMounts(unittest.TestCase):
             "    image = next(i for i, arg in enumerate(sys.argv) if arg.startswith('fixture@sha256:'))\n"
             "    os.execv(sys.argv[image + 1], sys.argv[image + 1:])\n"
             "if sys.argv[1:3] == ['image', 'inspect']: print('c' * 64); sys.exit(0)\n"
+            "if sys.argv[1:3] == ['image', 'exists'] and os.environ.get('PINNED_ROOT_IMAGE_EXISTS_RC'): sys.exit(int(os.environ['PINNED_ROOT_IMAGE_EXISTS_RC']))\n"
             "sys.exit(0 if sys.argv[1:3] == ['image', 'exists'] or sys.argv[1] == 'run' else 90)\n"
         )
         fake.chmod(0o755)
@@ -149,6 +150,44 @@ class CargoCacheMounts(unittest.TestCase):
         )
         calls = [json.loads(line) for line in self.capture.read_text().splitlines()]
         return result, calls
+
+    def check_image(self, exists_rc):
+        env = repository_neutral_env()
+        env["PATH"] = str(self.root / "tools") + os.pathsep + env["PATH"]
+        env["PINNED_ROOT_CAPTURE"] = str(self.capture)
+        env["PINNED_ROOT_IMAGE_EXISTS_RC"] = str(exists_rc)
+        result = subprocess.run(
+            [
+                "bash",
+                str(WRAPPER),
+                "--check-image",
+                "--digest",
+                "fixture@sha256:" + "0" * 64,
+            ],
+            cwd=self.root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        calls = [json.loads(line) for line in self.capture.read_text().splitlines()]
+        return result, [c for c in calls if c[:2] == ["image", "exists"]]
+
+    def test_check_image_timeout_gets_one_logged_retry_and_still_refuses(self):
+        # The probe's WALL bound is generous (120 s) and a timeout status is
+        # retried once, logged; admission still refuses afterwards. The fake
+        # podman answers 124 at once, so no real 120 s elapses.
+        result, exists = self.check_image(124)
+        self.assertEqual(result.returncode, 124)
+        self.assertEqual(len(exists), 2)
+        self.assertIn("retrying once", result.stderr)
+        self.assertIn("120s query bound", result.stderr)
+
+    def test_check_image_missing_image_is_not_retried(self):
+        result, exists = self.check_image(1)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(exists), 1)
+        self.assertIn("is not present locally", result.stderr)
 
     def prepare_capture_fixture(self, probe_status=0, resolve_status=0):
         source = self.root / "source"

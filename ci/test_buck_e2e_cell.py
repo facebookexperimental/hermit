@@ -526,9 +526,23 @@ class CellTest(unittest.TestCase):
 
     def test_missing_image_is_an_error_not_a_host_run(self) -> None:
         done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", FAKE_IMAGE_RC="2")
-        self.assert_error(done, "pinned-root image unavailable", "is not present", "ci/hermetic/build-image.sh")
+        self.assert_error(done, "pinned-root image unavailable", "infra probe")
         self.assertEqual(self.calls_by("wrapper"), [])
-        self.assertIsNone(result)
+        # A probe failure is an explicit infra ERROR row for the cell (plus a
+        # result.json with a producer completion), not a missing cell.
+        self.assertIsNotNone(result)
+        self.assertEqual(result["outcome"], "ERROR")
+        self.assertEqual(result["harness_rc"], 2)
+        self.assertEqual(result["producer_completion"]["status"], "valid")
+        rows = [json.loads(l) for l in (self.tmp / "tpx" / "artifacts" / "results.jsonl").read_text().splitlines()]
+        self.assertEqual([r["outcome"] for r in rows], ["ERROR"])
+
+    def test_image_probe_timeout_is_an_infra_row_not_a_missing_cell(self) -> None:
+        done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", FAKE_IMAGE_RC="124")
+        self.assert_error(done, "pinned-root image unavailable", "rc=124")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["outcome"], "ERROR")
+        self.assertEqual(result["harness_rc"], 124)
 
     def test_missing_wrapper_is_an_error(self) -> None:
         (self.bundle / "src" / "ci" / "hermetic" / "run-in-pinned-root.sh").unlink()

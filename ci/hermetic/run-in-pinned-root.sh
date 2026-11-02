@@ -92,15 +92,26 @@ check_pinned_image() {
     fi
 
     # Admission runs before any DAG node, so store inspection needs its own
-    # bound. Keep stderr and the actual status (including timeout/tool failure)
-    # instead of converting every nonzero result into 'image missing'. GNU
-    # timeout also signals its command group; the forced-stop grace is finite.
-    local status
-    if timeout --verbose --signal=TERM --kill-after=2s 10s podman image exists "$digest"; then
-        return 0
-    else
-        status=$?
-    fi
+    # bound. It is a WALL bound on a query that normally takes ~0.05 s, so it
+    # is generous (120 s) and a timeout gets one bounded retry, logged: under
+    # validate load a 10 s bound timed out (status 124) for hundreds of cells
+    # whose images were present. Keep stderr and the actual status (including
+    # timeout/tool failure) instead of converting every nonzero result into
+    # 'image missing'. GNU timeout also signals its command group; the
+    # forced-stop grace is finite.
+    local bound=120 status attempt
+    for attempt in 1 2; do
+        if timeout --verbose --signal=TERM --kill-after=2s "${bound}s" podman image exists "$digest"; then
+            return 0
+        else
+            status=$?
+        fi
+        if [[ ( "$status" == 124 || "$status" == 137 ) && "$attempt" == 1 ]]; then
+            echo "run-in-pinned-root: inspection of $digest timed out (probe status $status; ${bound}s query bound); retrying once." >&2
+            continue
+        fi
+        break
+    done
     if [[ "$status" == 1 ]]; then
         echo "run-in-pinned-root: image $digest is not present locally (Podman status 1)." >&2
         echo "  This path does not fall back to a tag or to the host." >&2
@@ -112,10 +123,10 @@ check_pinned_image() {
         # had. Before a node's run, the run itself is the exact check: it uses
         # --pull=never, so a missing image still fails there and nothing is
         # fetched. Admission (--check-image) keeps refusing on a timeout.
-        echo "run-in-pinned-root: inspection of $digest timed out (probe status $status; 10s query bound); the run below uses --pull=never and fails if the image is absent." >&2
+        echo "run-in-pinned-root: inspection of $digest timed out (probe status $status; ${bound}s query bound); the run below uses --pull=never and fails if the image is absent." >&2
         return 0
     else
-        echo "run-in-pinned-root: inspection unavailable for $digest (probe status $status; 10s query bound, 2s forced-stop grace)." >&2
+        echo "run-in-pinned-root: inspection unavailable for $digest (probe status $status; ${bound}s query bound, 2s forced-stop grace)." >&2
     fi
     return "$status"
 }
