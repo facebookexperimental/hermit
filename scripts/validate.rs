@@ -20730,8 +20730,11 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // 117. And run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name
         // (https://github.com/rrnewton/hermit/issues/4768): 118. And K9a-h's
         // main-stack maps test: 119. And the same K8-d dot-dot spellings
-        // test: 120, matching the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 120usize),
+        // test: 120. And the KVM default rustc link refusal, overlapping
+        // SCM_RIGHTS receipt refusal, hugetlbfs view refusal and unexchangeable
+        // robust word refusal tests, N4's smaps test and PRCTL phase 2's
+        // parent-death test: 126, matching the DAG pin in validation_dag_static.
+        ("privileged-only-test.cli_kvm", 126usize),
     ] {
         let step = privileged
             .steps
