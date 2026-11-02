@@ -469,7 +469,8 @@ async fn run_captured(physical: PhysicalRun, captured: &mut CapturedNativeOutput
 }
 
 async fn serve_provider(listener: OwnedFd, owner: Arc<NativeRunOwner>) -> io::Result<()> {
-    let listener = tokio::io::unix::AsyncFd::new(listener)?;
+    // SAFETY: the `AsyncFd` owns `listener`, which stays open until it is dropped.
+    let listener = unsafe { tokio::io::unix::AsyncFd::register(listener) }?;
     loop {
         let socket = loop {
             let mut ready = listener.readable().await?;
@@ -494,7 +495,8 @@ async fn serve_provider(listener: OwnedFd, owner: Arc<NativeRunOwner>) -> io::Re
             }
             return Err(error);
         };
-        let socket = tokio::io::unix::AsyncFd::new(socket)?;
+        // SAFETY: the `AsyncFd` owns `socket`, which stays open until it is dropped.
+        let socket = unsafe { tokio::io::unix::AsyncFd::register(socket) }?;
         // Keep readiness borrowed through the one-shot nonblocking transfer.
         // This accepted socket is discarded after serve; no retry clears it.
         let _ready = tokio::time::timeout(Duration::from_secs(5), socket.readable())
