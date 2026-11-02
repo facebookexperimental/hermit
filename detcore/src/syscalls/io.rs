@@ -1043,6 +1043,42 @@ fn socket_timestamp_messages(control: &[u8]) -> Vec<SocketTimestampMessage> {
     messages
 }
 
+/// Canonicalize the socket timestamps among the control messages a receive
+/// wrote: the first `written` bytes of `control`, its `msg_controllen` after
+/// the call. Returns how many of `control`'s bytes are the receive's, to be
+/// written back, or `None` where none holds a timestamp. Linux writes control
+/// messages one after another and leaves the rest of the buffer as the caller
+/// left it (`put_cmsg`, `____sys_recvmsg`), so bytes past `written` are the
+/// guest's own: they are never parsed or rewritten, even where they hold what
+/// reads as a timestamp message, and even where the buffer covers the
+/// caller's own header.
+fn canonicalize_written_timestamps(
+    control: &mut [u8],
+    written: usize,
+    now: LogicalTime,
+) -> Option<usize> {
+    let written = written.min(control.len());
+    let received = &mut control[..written];
+    if socket_timestamp_messages(received).is_empty() {
+        return None;
+    }
+    canonicalize_socket_timestamps(received, now);
+    Some(written)
+}
+
+/// The `msg_controllen` a receive wrote back to the guest `msghdr` at
+/// `header`, or 0 where it cannot be read back, so that nothing is taken as
+/// the receive's.
+fn written_control_length<T, G>(guest: &G, header: usize) -> usize
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    Addr::<usize>::from_raw(header + std::mem::offset_of!(Msghdr, msg_controllen))
+        .and_then(|length| guest.memory().read_value(length).ok())
+        .unwrap_or(0)
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-901)
 fn canonicalize_socket_timestamps(control: &mut [u8], now: LogicalTime) -> usize {
@@ -5415,17 +5451,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut control = vec![0; control_len];
         // Validate the output region before consuming a datagram.
         guest.memory().read_exact(control_address, &mut control)?;
+        let header = message_address.as_raw();
 
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
         let now = self.observe_socket_receive(guest, call.sockfd()).await?;
-        let mut control = vec![0; control_len];
+        // Only the control messages the receive wrote, msg_controllen bytes.
+        let written = written_control_length(guest, header);
+        let mut control = vec![0; written.min(control_len)];
         guest.memory().read_exact(control_address, &mut control)?;
-        if socket_timestamp_messages(&control).is_empty() {
+        let Some(written) = canonicalize_written_timestamps(&mut control, written, now) else {
             return Ok(result);
-        }
-
-        canonicalize_socket_timestamps(&mut control, now);
-        guest.memory().write_exact(control_address, &control)?;
+        };
+        guest
+            .memory()
+            .write_exact(control_address, &control[..written])?;
         Ok(result)
     }
 
@@ -5806,6 +5845,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             controls
         };
+        let entries = messages_address.as_raw();
 
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
         let delivered = usize::try_from(result).unwrap_or(0).min(controls.len());
@@ -5814,20 +5854,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let now = self.observe_socket_receive(guest, call.fd()).await?;
         let mut timestamped = Vec::new();
-        for (address, length) in controls.into_iter().take(delivered).flatten() {
+        for (index, control) in controls.into_iter().take(delivered).enumerate() {
+            let Some((address, capacity)) = control else {
+                continue;
+            };
+            // Only the control messages the receive wrote to this entry, its
+            // msg_controllen bytes; its msghdr begins the entry.
+            let written =
+                written_control_length(guest, entries + index * std::mem::size_of::<Mmsghdr>());
             let address: AddrMut<'_, u8> = AddrMut::from_raw(address).ok_or(Errno::EFAULT)?;
-            let mut bytes = vec![0; length];
+            let mut bytes = vec![0; written.min(capacity)];
             guest.memory().read_exact(address, &mut bytes)?;
-            if !socket_timestamp_messages(&bytes).is_empty() {
+            if let Some(written) = canonicalize_written_timestamps(&mut bytes, written, now) {
+                bytes.truncate(written);
                 timestamped.push((address, bytes));
             }
         }
-        if timestamped.is_empty() {
-            return Ok(result);
-        }
-
-        for (address, mut bytes) in timestamped {
-            canonicalize_socket_timestamps(&mut bytes, now);
+        for (address, bytes) in timestamped {
             guest.memory().write_exact(address, &bytes)?;
         }
         Ok(result)
@@ -6455,6 +6498,61 @@ mod tests {
         assert_eq!(timespec.tv_sec, 2);
         assert_eq!(timespec.tv_nsec, 345_678_901);
         assert_eq!(control[third_offset..], unrelated_message);
+    }
+
+    /// Only the control messages a receive wrote, its `msg_controllen` bytes,
+    /// are canonicalized and given back to write; a timestamp message past
+    /// them is the guest's own and stays as it was, as does a buffer whose
+    /// receive wrote none.
+    #[test]
+    fn timestamps_are_canonicalized_only_in_the_control_bytes_written() {
+        let header_len = cmsg_align(std::mem::size_of::<Cmsghdr>());
+        let message_len = header_len + std::mem::size_of::<libc::timeval>();
+        let second = cmsg_align(message_len);
+        let mut control = vec![0; second + cmsg_align(message_len)];
+        for offset in [0, second] {
+            assert!(write_control_value(
+                &mut control[offset..],
+                Cmsghdr {
+                    cmsg_len: message_len,
+                    cmsg_level: libc::SOL_SOCKET,
+                    cmsg_type: SCM_TIMESTAMP_OLD,
+                }
+            ));
+            assert!(write_control_value(
+                &mut control[offset + header_len..],
+                libc::timeval {
+                    tv_sec: 99,
+                    tv_usec: 88,
+                }
+            ));
+        }
+        let original = control.clone();
+        let now = LogicalTime::from_nanos(2_345_678_901);
+        let seconds = |control: &[u8], offset: usize| {
+            read_control_value::<libc::timeval>(&control[offset + header_len..])
+                .unwrap()
+                .tv_sec
+        };
+
+        // None written: nothing is the receive's.
+        assert_eq!(canonicalize_written_timestamps(&mut control, 0, now), None);
+        assert_eq!(control, original);
+        // The first message written: the second, past msg_controllen, stays.
+        assert_eq!(
+            canonicalize_written_timestamps(&mut control, second, now),
+            Some(second)
+        );
+        assert_eq!(seconds(&control, 0), 2);
+        assert_eq!(seconds(&control, second), 99);
+        assert_eq!(control[second..], original[second..]);
+        // Both written, and a msg_controllen past the buffer is held to it.
+        let mut control = original.clone();
+        assert_eq!(
+            canonicalize_written_timestamps(&mut control, usize::MAX, now),
+            Some(original.len())
+        );
+        assert_eq!((seconds(&control, 0), seconds(&control, second)), (2, 2));
     }
 
     #[test]
