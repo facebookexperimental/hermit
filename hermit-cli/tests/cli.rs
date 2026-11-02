@@ -63145,6 +63145,18 @@ fn run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux() {
         "init",
     ];
     let output = hermit(&args);
+    let log = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "kvm init did not stop with the policy's exit: {log}"
+    );
+    assert!(
+        log.contains("a descriptor's fdinfo of Hermit's own init, cannot be served"),
+        "kvm init: the refusal does not name its reason: {log}"
+    );
+}
+
 /// A fresh `--strict` run that uses binder is refused, with the policy
 /// exit, a message naming why, and the replay route: a binder call that waits
 /// for another process finishes when the host's kernel delivers its work, so
@@ -63164,11 +63176,6 @@ fn a_fresh_strict_run_refuses_binder_and_names_the_replay_route() {
     assert_eq!(
         output.status.code(),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
-        "kvm init did not stop with the policy's exit: {log}"
-    );
-    assert!(
-        log.contains("a descriptor's fdinfo of Hermit's own init, cannot be served"),
-        "kvm init: the refusal does not name its reason: {log}"
         "{log}"
     );
     assert!(
