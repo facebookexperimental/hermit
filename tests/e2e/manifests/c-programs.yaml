@@ -9238,6 +9238,78 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/seqpacket-two-writers
+    description: Two threads send records of different sizes, with MSG_EOR and one SCM_RIGHTS descriptor, on an AF_UNIX SOCK_SEQPACKET socketpair while a reader peeks with MSG_PEEK | MSG_TRUNC and reads into a short buffer, for tests/c/seqpacket_two_writers.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/seqpacket_two_writers.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -pthread
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: Not measured; the SOCK_SEQPACKET socketpair slice qualified ptrace and KVM
+          sabre: Not measured; the SOCK_SEQPACKET socketpair slice qualified ptrace and KVM
+          liteinst: Not measured; the SOCK_SEQPACKET socketpair slice qualified ptrace and KVM
+          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+        expected_stdout:
+          ptrace: "A0: whole 2, returned 2, bytes ok\nA1: whole 17, returned 16, MSG_TRUNC, bytes ok\nA2: whole 64, returned 16, MSG_TRUNC, bytes ok\nA3: whole 200, returned 16, MSG_TRUNC, bytes ok\nB0: whole 9, returned 9, bytes ok\nB1: whole 40, returned 16, MSG_TRUNC, bytes ok\nB2: whole 300, returned 16, MSG_TRUNC, bytes ok\nB3: whole 2, returned 2, bytes ok, passed descriptor reads \"through the passed pipe\" (24 bytes)\neach writer's records arrived in its own order: yes\nafter the writers: recv returns 0; writer process exited 0\n"
+          kvm: "A0: whole 2, returned 2, bytes ok\nA1: whole 17, returned 16, MSG_TRUNC, bytes ok\nA2: whole 64, returned 16, MSG_TRUNC, bytes ok\nA3: whole 200, returned 16, MSG_TRUNC, bytes ok\nB0: whole 9, returned 9, bytes ok\nB1: whole 40, returned 16, MSG_TRUNC, bytes ok\nB2: whole 300, returned 16, MSG_TRUNC, bytes ok\nB3: whole 2, returned 2, bytes ok, passed descriptor reads \"through the passed pipe\" (24 bytes)\neach writer's records arrived in its own order: yes\nafter the writers: recv returns 0; writer process exited 0\n"
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: standard output does not depend on the order the two writers'' records arrive in, by design; that order goes to standard error, which the cell does not observe, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: Standard output is independent of the arrival order by design; the order natively varies and goes to standard error
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-QUALIFIED: a ptrace recording of this guest cannot be replayed; the recorder keeps as many bytes as recv(MSG_PEEK | MSG_TRUNC) returns, the record''s whole length, and replay refuses more bytes than the buffer holds (https://github.com/rrnewton/hermit/issues/5028).'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The recorder keeps as many bytes as recv(MSG_TRUNC) returns, which can exceed the buffer, and replay then stops (https://github.com/rrnewton/hermit/issues/5028)
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/setitimer-determinism
     description: Strict verification for tests/c/setitimer_determinism.c
     lane: portable

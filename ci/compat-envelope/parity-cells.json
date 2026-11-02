@@ -8,59 +8,59 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 3095,
-      "applicable": 2257,
-      "selectable": 1766,
-      "population": 3030,
-      "population_candidate_selected": 1766,
+      "cells": 3105,
+      "applicable": 2259,
+      "selectable": 1768,
+      "population": 3040,
+      "population_candidate_selected": 1768,
       "population_candidate_not_selected": 475,
-      "population_candidate_disabled": 789
+      "population_candidate_disabled": 797
     },
     "by_backend": {
       "dbt": {
-        "cells": 619,
+        "cells": 621,
         "applicable": 560,
         "selectable": 555,
-        "population": 606,
+        "population": 608,
         "population_candidate_selected": 555,
         "population_candidate_not_selected": 2,
-        "population_candidate_disabled": 49
+        "population_candidate_disabled": 51
       },
       "in-guest-trap": {
-        "cells": 619,
+        "cells": 621,
         "applicable": 314,
         "selectable": 314,
-        "population": 606,
+        "population": 608,
         "population_candidate_selected": 314,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 292
+        "population_candidate_disabled": 294
       },
       "kvm": {
-        "cells": 619,
-        "applicable": 591,
-        "selectable": 582,
-        "population": 606,
-        "population_candidate_selected": 582,
+        "cells": 621,
+        "applicable": 593,
+        "selectable": 584,
+        "population": 608,
+        "population_candidate_selected": 584,
         "population_candidate_not_selected": 3,
         "population_candidate_disabled": 21
       },
       "liteinst": {
-        "cells": 619,
+        "cells": 621,
         "applicable": 315,
         "selectable": 315,
-        "population": 606,
+        "population": 608,
         "population_candidate_selected": 315,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 291
+        "population_candidate_disabled": 293
       },
       "sabre": {
-        "cells": 619,
+        "cells": 621,
         "applicable": 477,
         "selectable": 0,
-        "population": 606,
+        "population": 608,
         "population_candidate_selected": 0,
         "population_candidate_not_selected": 470,
-        "population_candidate_disabled": 136
+        "population_candidate_disabled": 138
       }
     }
   },
@@ -1220,6 +1220,11 @@
     {"test_id":"c-programs/sendfile-copy","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/sendfile-copy","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/sendfile-copy","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"c-programs/seqpacket-two-writers","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Not measured; the SOCK_SEQPACKET socketpair slice qualified ptrace and KVM"},
+    {"test_id":"c-programs/seqpacket-two-writers","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"c-programs/seqpacket-two-writers","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/seqpacket-two-writers","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Not measured; the SOCK_SEQPACKET socketpair slice qualified ptrace and KVM"},
+    {"test_id":"c-programs/seqpacket-two-writers","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Not measured; the SOCK_SEQPACKET socketpair slice qualified ptrace and KVM"},
     {"test_id":"c-programs/session-identity","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/session-identity","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/session-identity","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -2930,6 +2935,11 @@
     {"test_id":"language-runtimes/rust-hashmap-iteration","backend":"kvm","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"language-runtimes/rust-hashmap-iteration","backend":"liteinst","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"language-runtimes/rust-hashmap-iteration","backend":"sabre","category":"language-runtimes","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"language-runtimes/rustc-hello","backend":"dbt","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Not measured; the SOCK_SEQPACKET socketpair slice qualified ptrace and KVM"},
+    {"test_id":"language-runtimes/rustc-hello","backend":"in-guest-trap","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"language-runtimes/rustc-hello","backend":"kvm","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"language-runtimes/rustc-hello","backend":"liteinst","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: LiteInst multi-exec toolchain qualification must ratchet after the ptrace reference path"},
+    {"test_id":"language-runtimes/rustc-hello","backend":"sabre","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe multi-exec toolchain qualification must ratchet after the ptrace reference path"},
     {"test_id":"language-runtimes/tcl-rand-clock","backend":"dbt","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"language-runtimes/tcl-rand-clock","backend":"in-guest-trap","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
     {"test_id":"language-runtimes/tcl-rand-clock","backend":"kvm","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

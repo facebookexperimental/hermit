@@ -21596,6 +21596,99 @@ fn run_kvm_flock_is_a_named_refusal_where_ptrace_excludes() {
     );
 }
 
+/// rustc's default link: on ptrace it links and the program runs; on KVM it is
+/// refused by name. rustc links with its bundled rust-lld, which starts its
+/// worker threads and then maps its output file with
+/// mmap(MAP_SHARED | MAP_NORESERVE), and a KVM shared file view still needs
+/// one vCPU in its address space ("mapping publication: requires one stopped
+/// vCPU", https://github.com/rrnewton/reverie/issues/1108). The E2E cell
+/// language-runtimes/rustc-hello links single-threaded for that reason. This
+/// test keeps that record current: once KVM runs the program here, #1108 has
+/// moved, the cell should take the default link and this test should go.
+#[test]
+fn run_kvm_default_rustc_link_is_a_named_refusal_where_ptrace_links() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM default rustc link case: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    // The toolchain's own rustc rather than a rustup proxy, which would need
+    // a HOME that Hermit's minimal guest environment does not give it.
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .expect("run rustc --print sysroot");
+    assert!(
+        sysroot.status.success(),
+        "rustc --print sysroot failed\nstderr:\n{}",
+        String::from_utf8_lossy(&sysroot.stderr)
+    );
+    let sysroot = String::from_utf8(sysroot.stdout).expect("the sysroot should be UTF-8");
+    let rustc = Path::new(sysroot.trim()).join("bin/rustc");
+    assert!(rustc.is_file(), "no rustc binary at {}", rustc.display());
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let source = directory.path().join("hello.rs");
+    fs::write(
+        &source,
+        "fn main() {\n    println!(\"hello from rustc\");\n}\n",
+    )
+    .unwrap();
+    // The program and rustc's intermediate files go to the guest's own /tmp.
+    let command = format!(
+        "{} {} -o /tmp/hello && /tmp/hello",
+        shell_words::quote(rustc.to_str().expect("the rustc path should be UTF-8")),
+        shell_words::quote(source.to_str().expect("the source path should be UTF-8")),
+    );
+    for backend in ["ptrace", "kvm"] {
+        let backend_arg = format!("--backend={backend}");
+        let args = [
+            backend_arg.as_str(),
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            "/bin/sh",
+            "-c",
+            command.as_str(),
+        ];
+        let output = hermit(&args);
+        let stdout = stdout(&output);
+        let stderr = stderr(&output);
+        if backend == "ptrace" {
+            assert_success(&output, &args);
+            assert_eq!(stdout, "hello from rustc\n", "ptrace");
+            continue;
+        }
+        assert!(
+            !stdout.contains("hello from rustc"),
+            "KVM linked with a multi-threaded rust-lld and ran the program, so \
+             https://github.com/rrnewton/reverie/issues/1108 has moved: drop \
+             -C link-arg=-Wl,--threads=1 from tests/e2e/language-runtimes/rustc-hello.sh \
+             and retire this test\nstderr:\n{stderr}"
+        );
+        // KNOWN DEFECT (https://github.com/rrnewton/hermit/issues/5025): this
+        // refusal is a deliberate, named one (a SharedFileCapability), so the
+        // run should end as a policy refusal, HERMIT_POLICY_REFUSAL_EXIT (122).
+        // It exits 125 because is_policy_refusal does not yet recognize
+        // SharedFileCapability, which also backs internal guards. This
+        // assertion is meant to change to 122 when 5025 is fixed.
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_INTERNAL_FAILURE_EXIT),
+            "KVM must end the default rustc link with its named shared-file refusal, \
+             exit 125 until https://github.com/rrnewton/hermit/issues/5025 makes it a \
+             policy refusal (122)\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(
+                "unsupported KVM shared-file operation mapping publication: requires one \
+                 stopped vCPU"
+            ),
+            "the KVM run did not name the shared-file refusal on stderr\nstderr:\n{stderr}"
+        );
+    }
+}
+
 /// A ppoll, or with argv[3] "pselect6" a pselect6, whose temporary mask lets
 /// in a signal already pending under the thread's own mask. argv[1] is
 /// "caught" (SIGUSR1, with a handler) or "ignored" (SIGWINCH, ignored by

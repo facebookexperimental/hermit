@@ -45330,6 +45330,82 @@
       ],
       "test": "determinism-stress/thread-interleaving",
       "timeout_seconds": 180
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "c-programs/seqpacket-two-writers",
+      "timeout_seconds": 180
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/seqpacket-two-writers",
+      "timeout_seconds": 180
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "rustc",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "language-runtimes/rustc-hello",
+      "timeout_seconds": 180
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "rustc",
+        "cc"
+      ],
+      "test": "language-runtimes/rustc-hello",
+      "timeout_seconds": 180
     }
   ],
   "schema": 1

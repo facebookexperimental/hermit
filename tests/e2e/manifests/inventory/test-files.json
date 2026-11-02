@@ -2653,6 +2653,12 @@
       "why": "tests/c/sendfile_copy.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/c/seqpacket_two_writers.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and KVM; ci=true)",
+      "why": "tests/c/seqpacket_two_writers.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: two threads send records of different sizes with MSG_EOR, one carrying a pipe end in an SCM_RIGHTS message, on an AF_UNIX SOCK_SEQPACKET socketpair while the reader peeks with recv(MSG_PEEK | MSG_TRUNC) and reads into a 16-byte buffer, so each record must arrive whole, in its writer's order, truncated with MSG_TRUNC, and with its descriptor; standard output is independent of the arrival order and equals native output"
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/c/session_containment.c",
       "runner": "hermit-cli/tests/cli.rs",
@@ -4019,6 +4025,12 @@
       "path": "tests/e2e/language-runtimes/rust-hashmap-iteration.rs",
       "runner": "target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml",
       "why": "tests/e2e/language-runtimes/rust-hashmap-iteration.rs is owned by target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml: A Rust program the harness compiles with rustc -O; it exercises HashMap/HashSet RandomState iteration-order nondeterminism plus a BTreeMap cross-check, a file-I/O roundtrip, and std::time under strict verification"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/language-runtimes/rustc-hello.sh",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml",
+      "why": "tests/e2e/language-runtimes/rustc-hello.sh is owned by target/debug/test-harness via tests/e2e/manifests/language-runtimes.yaml: compiles and runs a small Rust program with rustc under Hermit; rustc starts its linker through the standard library's fork path, whose exec-error channel is a SOCK_SEQPACKET socketpair, and links single-threaded with its bundled rust-lld, which maps its output MAP_SHARED | MAP_NORESERVE (https://github.com/rrnewton/reverie/issues/1108)"
     },
     {
       "disposition": "manifest-test",

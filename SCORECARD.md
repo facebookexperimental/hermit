@@ -2,33 +2,33 @@
 
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. `./ci/compat-envelope/scorecard.rs check` verifies it.
 
-The count table includes all **11761** cells in the manifest; no row is omitted. A cell is **Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`. A cell is **Not selected by full** when it is in the manifest but absent from that plan. Selection is not a test result: a cell not selected by full may have passed, failed, produced no verdict, or never run. Of these cells, **2394** are selected by full, **1095** are not selected by full, and **8272** are **Not applicable**.
+The count table includes all **11799** cells in the manifest; no row is omitted. A cell is **Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`. A cell is **Not selected by full** when it is in the manifest but absent from that plan. Selection is not a test result: a cell not selected by full may have passed, failed, produced no verdict, or never run. Of these cells, **2398** are selected by full, **1095** are not selected by full, and **8306** are **Not applicable**.
 
-Every selected `verify` cell that does not declare the stripped comparator, and every seed in a selected `chaos` cell, runs the same backend twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and accepts a result only when the typed report says `verified=true`, `verdict=matched`, `bitwise_parity=true`, `strictness=canonical`, `compare_logs=true`, a named canonical `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped comparison when invoked directly and does not satisfy this regression plan. None of the **1824** selected `verify` cells declares the stripped comparator. These same-backend results do not establish cross-backend parity.
+Every selected `verify` cell that does not declare the stripped comparator, and every seed in a selected `chaos` cell, runs the same backend twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and accepts a result only when the typed report says `verified=true`, `verdict=matched`, `bitwise_parity=true`, `strictness=canonical`, `compare_logs=true`, a named canonical `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped comparison when invoked directly and does not satisfy this regression plan. None of the **1828** selected `verify` cells declares the stripped comparator. These same-backend results do not establish cross-backend parity.
 
 | Backend | Selected by full | Not selected by full | Not applicable | In the manifest |
 | --- | ---: | ---: | ---: | ---: |
-| `ptrace` | 1176 | 18 | 663 | 1857 |
-| `dbt` | 0 | 561 | 1296 | 1857 |
-| `kvm` | 587 | 5 | 1265 | 1857 |
-| `sabre` | 0 | 478 | 1379 | 1857 |
-| `liteinst` | 316 | 0 | 1541 | 1857 |
-| `in-guest-trap` | 315 | 0 | 1542 | 1857 |
-| `native` | 0 | 33 | 586 | 619 |
-| **Total** | **2394** | **1095** | **8272** | **11761** |
+| `ptrace` | 1178 | 18 | 667 | 1863 |
+| `dbt` | 0 | 561 | 1302 | 1863 |
+| `kvm` | 589 | 5 | 1269 | 1863 |
+| `sabre` | 0 | 478 | 1385 | 1863 |
+| `liteinst` | 316 | 0 | 1547 | 1863 |
+| `in-guest-trap` | 315 | 0 | 1548 | 1863 |
+| `native` | 0 | 33 | 588 | 621 |
+| **Total** | **2398** | **1095** | **8306** | **11799** |
 
 **Archived:** `sabre` (backend, archived 2026-10-25, nightly only) and `e9patch` (preprocessing with ptrace, not a backend, archived 2026-10-25, nightly only). They get no feature work and their tests left per-commit validation. An archived backend's cells that would be selected by full belong to the `archived-nightly` run type instead, so the table counts them as not selected by full, and the nightly pressure sweep runs them as red cells. `ci/manifest-plan/src/archived.rs` records what still runs per commit.
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
-Selected by full is **2394 of 11761**, which is **20.36%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Selected by full is **2398 of 11799**, which is **20.32%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
 
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `in-guest-trap`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
 
-⚠️ **8272 of those 11761 cells are NOT APPLICABLE** — their backend is not applicable for their mode, so they were never asked to run and cannot pass or fail. Over the 3489 cells that CAN run, selected by full is **68.62%**.
+⚠️ **8306 of those 11799 cells are NOT APPLICABLE** — their backend is not applicable for their mode, so they were never asked to run and cannot pass or fail. Over the 3493 cells that CAN run, selected by full is **68.65%**.
 
-⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 2394 cells selected by full measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
+⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 2398 cells selected by full measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
 
 ⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, without anything about the product changing.** Removing a backend whose cells are mostly not selected RAISES the reported figure; adding manifest cells that are not selected LOWERS it. Neither is progress. Before comparing this percentage against an earlier one, diff the two lists above: if they differ, the numbers are not comparable and the difference is not a result.
 
@@ -36,11 +36,11 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `in-guest-trap` | `native` | Selected by full | Not selected by full | Not applicable | In the manifest |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 606 / 619 | 0 / 619 | 587 / 619 | 0 / 619 | 316 / 619 | 315 / 619 | — | 1824 | 1056 | 834 | 3714 |
-| `replay` | 563 / 619 | 0 / 619 | 0 / 619 | 0 / 619 | 0 / 619 | 0 / 619 | — | 563 | 6 | 3145 | 3714 |
-| `chaos` | 7 / 619 | 0 / 619 | 0 / 619 | 0 / 619 | 0 / 619 | 0 / 619 | — | 7 | 0 | 3707 | 3714 |
-| `naked` | — | — | — | — | — | — | 0 / 619 | 0 | 33 | 586 | 619 |
-| **Total** | | | | | | | | **2394** | **1095** | **8272** | **11761** |
+| `verify` | 608 / 621 | 0 / 621 | 589 / 621 | 0 / 621 | 316 / 621 | 315 / 621 | — | 1828 | 1056 | 842 | 3726 |
+| `replay` | 563 / 621 | 0 / 621 | 0 / 621 | 0 / 621 | 0 / 621 | 0 / 621 | — | 563 | 6 | 3157 | 3726 |
+| `chaos` | 7 / 621 | 0 / 621 | 0 / 621 | 0 / 621 | 0 / 621 | 0 / 621 | — | 7 | 0 | 3719 | 3726 |
+| `naked` | — | — | — | — | — | — | 0 / 621 | 0 | 33 | 588 | 621 |
+| **Total** | | | | | | | | **2398** | **1095** | **8306** | **11799** |
 
 ## Ptrace by manifest category
 
@@ -50,19 +50,19 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `applications` | 7 / 7 | 6 / 7 | 0 / 7 | 13 | 21 |
 | `bin-c` | 2 / 2 | 1 / 2 | 0 / 2 | 3 | 6 |
-| `c-programs` | 298 / 300 | 261 / 300 | 3 / 300 | 562 | 900 |
+| `c-programs` | 299 / 301 | 261 / 301 | 3 / 301 | 563 | 903 |
 | `chaos-c` | 1 / 1 | 1 / 1 | 1 / 1 | 3 | 3 |
 | `compat` | 212 / 219 | 212 / 219 | 0 / 219 | 424 | 657 |
 | `data-handling` | 6 / 6 | 6 / 6 | 0 / 6 | 12 | 18 |
 | `debugger-c` | 1 / 1 | 1 / 1 | 0 / 1 | 2 | 3 |
 | `determinism-stress` | 6 / 6 | 6 / 6 | 2 / 6 | 14 | 18 |
 | `determinism-stress-c` | 11 / 11 | 11 / 11 | 1 / 11 | 23 | 33 |
-| `language-runtimes` | 20 / 21 | 19 / 21 | 0 / 21 | 39 | 63 |
+| `language-runtimes` | 21 / 22 | 19 / 22 | 0 / 22 | 40 | 66 |
 | `shared-futex-c` | 1 / 4 | 0 / 4 | 0 / 4 | 1 | 12 |
 | `system-utils` | 40 / 40 | 39 / 40 | 0 / 40 | 79 | 120 |
 | `util-c` | 1 / 1 | 0 / 1 | 0 / 1 | 1 | 3 |
 
-Ordinary full validation executes 2399 cells: the 2394 comparable compatibility cells selected by full above (including 7 chaos-mode race-exposure checks), and 5 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing selected cell is a regression, not permission to remove it from the plan.
+Ordinary full validation executes 2403 cells: the 2398 comparable compatibility cells selected by full above (including 7 chaos-mode race-exposure checks), and 5 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing selected cell is a regression, not permission to remove it from the plan.
 
 ### Selected custom commands outside the comparable denominator
 
