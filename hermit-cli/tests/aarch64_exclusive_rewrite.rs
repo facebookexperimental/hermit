@@ -46,7 +46,10 @@ fn host_libraries() -> Vec<PathBuf> {
 }
 
 /// Why `/dev/shm` cannot hold the guest here, if it cannot: a `noexec`
-/// mount runs nothing from it.
+/// mount runs nothing from it, and on btrfs or overlayfs the in-memory
+/// rewrite cannot prove a mapped file by its inode, so without
+/// `/proc/<pid>/map_files` (`CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`) it
+/// would write nothing there.
 fn shm_cannot_run_code() -> Option<String> {
     // SAFETY: an all-zero `statvfs` is a valid buffer.
     let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -54,7 +57,35 @@ fn shm_cannot_run_code() -> Option<String> {
     if unsafe { libc::statvfs(c"/dev/shm".as_ptr(), &mut fs) } != 0 {
         return Some(format!("/dev/shm: {}", std::io::Error::last_os_error()));
     }
-    (fs.f_flag & libc::ST_NOEXEC != 0).then(|| "/dev/shm is mounted noexec".to_owned())
+    if fs.f_flag & libc::ST_NOEXEC != 0 {
+        return Some("/dev/shm is mounted noexec".to_owned());
+    }
+    const BTRFS_SUPER_MAGIC: i64 = 0x9123_683e;
+    const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c_7630;
+    // SAFETY: an all-zero `statfs` is a valid buffer.
+    let mut kind: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a `statfs` buffer.
+    if unsafe { libc::statfs(c"/dev/shm".as_ptr(), &mut kind) } != 0 {
+        return Some(format!("/dev/shm: {}", std::io::Error::last_os_error()));
+    }
+    let unproven = [BTRFS_SUPER_MAGIC, OVERLAYFS_SUPER_MAGIC].contains(&(kind.f_type as i64));
+    (unproven && !map_files_open()).then(|| {
+        "/dev/shm is on btrfs or overlayfs, where the in-memory rewrite proves a mapped file \
+         only through /proc/<pid>/map_files, which this process cannot open"
+            .to_owned()
+    })
+}
+
+/// Whether this process can open its own `/proc/self/map_files` entries,
+/// which needs `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`.
+fn map_files_open() -> bool {
+    fs::read_to_string("/proc/self/maps")
+        .ok()
+        .and_then(|maps| {
+            let range = maps.lines().next()?.split_whitespace().next()?.to_owned();
+            Some(fs::File::open(format!("/proc/self/map_files/{range}")).is_ok())
+        })
+        .unwrap_or(false)
 }
 
 /// One file's counts in the summary's `exclusive_rewrites`.
@@ -75,11 +106,17 @@ fn rewrite_of(summary: &serde_json::Value, path: &Path) -> (u64, u64, u64) {
 /// across a page, is left by design, and an LSE-only libc has none. Where no
 /// loop is left anywhere, a run that counts store-exclusives (one that
 /// records preemptions) sees none fail.
+///
+/// It needs code it can run from `/dev/shm`, a C compiler (`cc`) and ptrace,
+/// so it is `#[ignore]`d: only a run that asks for it (`--run-ignored`)
+/// selects it, and one on a host whose `/dev/shm` is `noexec`, or is btrfs or
+/// overlayfs without `/proc/<pid>/map_files` access, fails here, naming that,
+/// instead of passing without checking anything or failing on its counts.
 #[test]
+#[ignore = "host-limited: runs the guest from /dev/shm and compiles it with cc; run with --run-ignored on an aarch64 host where both work (docs/TESTING_ENVIRONMENTS.md)"]
 fn the_in_memory_rewrite_replaces_a_guests_loop_and_it_still_counts() {
     if let Some(reason) = shm_cannot_run_code() {
-        eprintln!("skipped: {reason}");
-        return;
+        panic!("this host cannot run this test: {reason}");
     }
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
