@@ -517,7 +517,10 @@ async fn watch_one(
     // reaped is reported as readable too. The registration is dropped before
     // the entry is.
     {
-        let registration = AsyncFd::with_interest(Arc::clone(&pidfd), Interest::READABLE)?;
+        // SAFETY: the registration holds a clone of the `Arc<OwnedFd>`, so the
+        // descriptor stays open and unchanged until the registration drops it.
+        let registration =
+            unsafe { AsyncFd::register_with_interest(Arc::clone(&pidfd), Interest::READABLE) }?;
         let _ready = registration.readable().await?;
     }
     let entry = {

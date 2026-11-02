@@ -1129,9 +1129,11 @@ async fn receive_forwarded(
     generation: u64,
     mut stopped: tokio::sync::oneshot::Receiver<()>,
 ) {
-    let Ok(readiness) =
-        tokio::io::unix::AsyncFd::with_interest(watched, tokio::io::Interest::READABLE)
-    else {
+    // SAFETY: the `AsyncFd` takes ownership of the `OwnedFd`, so the descriptor
+    // stays open and unchanged until the `AsyncFd` drops it.
+    let Ok(readiness) = (unsafe {
+        tokio::io::unix::AsyncFd::register_with_interest(watched, tokio::io::Interest::READABLE)
+    }) else {
         // The next request starts it again; until then request-time drains
         // still take every record.
         let _ =
