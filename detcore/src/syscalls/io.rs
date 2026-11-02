@@ -5846,6 +5846,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             controls
         };
         let entries = messages_address.as_raw();
+        // Which writes Linux makes after each entry's control messages
+        // (`ReceiveGeometry::control_length_rewritten`), read before the call
+        // as the controls are.
+        let geometry = ReceiveGeometry::before(&guest.memory(), &Syscall::Recvmmsg(call));
 
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
         let delivered = usize::try_from(result).unwrap_or(0).min(controls.len());
@@ -5854,14 +5858,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let now = self.observe_socket_receive(guest, call.fd()).await?;
         let mut timestamped = Vec::new();
+        let mut unknown = Vec::new();
         for (index, control) in controls.into_iter().take(delivered).enumerate() {
             let Some((address, capacity)) = control else {
                 continue;
             };
             // Only the control messages the receive wrote to this entry, its
-            // msg_controllen bytes; its msghdr begins the entry.
+            // msg_controllen bytes; its msghdr begins the entry. Linux
+            // finishes each entry before the next and writes the timeout last
+            // (`do_recvmmsg`), so a later write of the batch can have replaced
+            // that length, or those bytes, by the time it returns, as a later
+            // entry's iovec over this entry's header does. Then they are not
+            // this entry's, and neither is anything read from them.
+            if geometry
+                .as_ref()
+                .is_none_or(|geometry| geometry.control_length_rewritten(delivered, index))
+            {
+                unknown.push(index);
+                continue;
+            }
             let written =
                 written_control_length(guest, entries + index * std::mem::size_of::<Mmsghdr>());
+            if geometry
+                .as_ref()
+                .is_none_or(|geometry| geometry.control_bytes_rewritten(delivered, index, written))
+            {
+                unknown.push(index);
+                continue;
+            }
             let address: AddrMut<'_, u8> = AddrMut::from_raw(address).ok_or(Errno::EFAULT)?;
             let mut bytes = vec![0; written.min(capacity)];
             guest.memory().read_exact(address, &mut bytes)?;
@@ -5869,6 +5893,35 @@ impl<T: RecordOrReplay> Detcore<T> {
                 bytes.truncate(written);
                 timestamped.push((address, bytes));
             }
+        }
+        if !unknown.is_empty() {
+            // The socket timestamps such an entry received, if any, are its
+            // host's: left as they are, they would differ between runs.
+            let refusal = format!(
+                "the socket timestamps entries {unknown:?} may have received cannot be found to \
+                 replace with logical time: a later write of the batch can have replaced their \
+                 msg_controllen or control data before it returned"
+            );
+            if self.cfg.panic_on_unsupported_syscalls {
+                // Named on stderr before the policy ends the run, as for an
+                // SCM_RIGHTS receipt (`Detcore::record_received_descriptors`).
+                let dettid = guest.thread_state().dettid;
+                crate::syscalls::helpers::report_refusal_reason(
+                    true,
+                    &format!("[dtid {dettid}] recvmmsg: {refusal}"),
+                );
+                // Only a fail-closed run asks: the batch has already run, so
+                // the errno a permissive run would get is never given.
+                return self
+                    .refuse_unserviceable_operation_because(
+                        guest,
+                        Sysno::recvmmsg,
+                        Errno::EOPNOTSUPP,
+                        &refusal,
+                    )
+                    .await;
+            }
+            tracing::warn!("[detcore] recvmmsg: {refusal}");
         }
         for (address, bytes) in timestamped {
             guest.memory().write_exact(address, &bytes)?;

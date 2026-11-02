@@ -9526,7 +9526,8 @@ fn run_kvm_an_scm_rights_receipt_over_its_own_header_is_a_named_refusal() {
 /// the receive, which may have installed one, went on unrefused. Each now
 /// counts as a send that may have carried descriptors, so a strict run ends
 /// at the receive as the named policy refusal (exit 122). This runs on
-/// ptrace: KVM does not implement sendmmsg.
+/// ptrace: KVM does not implement sendmmsg
+/// (https://github.com/rrnewton/reverie/issues/1237).
 #[test]
 fn an_scm_rights_receipt_after_an_unread_sendmmsg_is_a_named_refusal() {
     let guest = compiled_c_guest(
@@ -9589,6 +9590,131 @@ fn an_scm_rights_receipt_after_an_unread_sendmmsg_is_a_named_refusal() {
             "{mode}: the guest went on past the refused receipt"
         );
     }
+}
+
+/// A `recvmmsg` of two datagrams on a fresh `SOCK_DGRAM` socket pair with
+/// `SO_TIMESTAMPNS` and no descriptors in flight: entry 0 receives into a
+/// control buffer with room for one timestamp, and entry 1, with no control
+/// buffer, receives its eight zero bytes onto entry 0's `msg_controllen`.
+/// Linux finishes entry 0, then entry 1 (`do_recvmmsg`), so entry 0's
+/// timestamp message stays in its buffer while its `msg_controllen` reads 0.
+const RECVMMSG_CONTROL_LENGTH_ALIAS_GUEST: &str = r#"
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+
+int main(void) {
+  int pair[2];
+  int on = 1;
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) != 0 ||
+      setsockopt(pair[1], SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on)) != 0) {
+    perror("setup");
+    return 1;
+  }
+  const char zeros[8] = {0};
+  if (send(pair[0], "first!!!", 8, 0) != 8 || send(pair[0], zeros, 8, 0) != 8) {
+    perror("send");
+    return 2;
+  }
+  union {
+    char bytes[CMSG_SPACE(sizeof(struct timespec))];
+    struct cmsghdr align;
+  } control;
+  memset(&control, 0, sizeof(control));
+  char data[16];
+  struct mmsghdr entries[2];
+  memset(entries, 0, sizeof(entries));
+  struct iovec first = {.iov_base = data, .iov_len = sizeof(data)};
+  entries[0].msg_hdr.msg_iov = &first;
+  entries[0].msg_hdr.msg_iovlen = 1;
+  entries[0].msg_hdr.msg_control = control.bytes;
+  entries[0].msg_hdr.msg_controllen = sizeof(control.bytes);
+  struct iovec onto_length = {
+      .iov_base = &entries[0].msg_hdr.msg_controllen,
+      .iov_len = sizeof(entries[0].msg_hdr.msg_controllen),
+  };
+  entries[1].msg_hdr.msg_iov = &onto_length;
+  entries[1].msg_hdr.msg_iovlen = 1;
+  int count = recvmmsg(pair[1], entries, 2, 0, NULL);
+  struct cmsghdr* message = (struct cmsghdr*)control.bytes;
+  printf("recvmmsg returned %d; entry 0 msg_len %u, msg_controllen now %zu; entry 1 msg_len %u\n",
+         count, entries[0].msg_len, (size_t)entries[0].msg_hdr.msg_controllen,
+         entries[1].msg_len);
+  printf("entry 0's control buffer holds a timestamp message: %s\n",
+         message->cmsg_level == SOL_SOCKET && message->cmsg_type == SCM_TIMESTAMPNS &&
+                 message->cmsg_len == CMSG_LEN(sizeof(struct timespec))
+             ? "yes"
+             : "no");
+  return 0;
+}
+"#;
+
+fn recvmmsg_control_length_alias_guest() -> PathBuf {
+    let build_root = process_build_root("recvmmsg-control-length-alias");
+    fs::create_dir_all(&build_root).expect("failed to create the guest directory");
+    let source = build_root.join("recvmmsg_control_length_alias.c");
+    let guest = build_root.join("recvmmsg_control_length_alias");
+    if !guest.exists() {
+        fs::write(&source, RECVMMSG_CONTROL_LENGTH_ALIAS_GUEST).expect("failed to write the guest");
+        let compiled = Command::new("cc")
+            .args(["-O0", "-Wall", "-Wextra", "-Werror"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the guest");
+        assert!(compiled.status.success(), "{compiled:?}");
+    }
+    guest
+}
+
+/// [`RECVMMSG_CONTROL_LENGTH_ALIAS_GUEST`]: natively entry 0's timestamp
+/// message stays in its control buffer while a later entry's data overwrote
+/// its `msg_controllen` with 0. Detcore reads each entry's control length
+/// back after the batch, so it read 0 and left that host timestamp in place,
+/// which differed between runs. Such an entry's timestamps cannot be found,
+/// so a strict run now ends at the batch as the named policy refusal (exit
+/// 122). Detcore's handling is the same on every backend; this runs on
+/// ptrace.
+#[test]
+fn a_recvmmsg_entry_whose_control_length_a_later_entry_overwrote_is_a_named_refusal() {
+    let guest = recvmmsg_control_length_alias_guest();
+    let guest = guest.to_str().expect("guest path is UTF-8");
+    let native = Command::new(guest)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the guest natively");
+    assert!(native.status.success(), "natively: {native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "recvmmsg returned 2; entry 0 msg_len 8, msg_controllen now 0; entry 1 msg_len 8\n\
+         entry 0's control buffer holds a timestamp message: yes\n",
+        "natively"
+    );
+    let _guard = hermit_run_guard();
+    let args = ["run", "--strict", "--base-env=minimal", "--", guest];
+    let output = hermit(&args);
+    let refused_stdout = stdout(&output);
+    let refused_stderr = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "the batch must end the strict run as a policy refusal\nstdout:\n{refused_stdout}\nstderr:\n{refused_stderr}"
+    );
+    assert!(
+        refused_stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+            && refused_stderr.contains(
+                "recvmmsg: the socket timestamps entries [0] may have received cannot be found \
+                 to replace with logical time"
+            ),
+        "the run did not name the timestamp refusal on stderr\nstderr:\n{refused_stderr}"
+    );
+    assert_eq!(
+        refused_stdout, "",
+        "the guest went on past the refused batch"
+    );
 }
 
 /// A loopback address of this test process's own for
