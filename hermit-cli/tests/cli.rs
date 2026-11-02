@@ -21876,6 +21876,118 @@ fn run_kvm_default_rustc_link_is_a_named_refusal_where_ptrace_links() {
     }
 }
 
+/// A one-page `MAP_SHARED | MAP_NORESERVE` view of a hugetlbfs file, one huge
+/// page long (`memfd_create` with `MFD_HUGETLB`). Linux places the view at an
+/// address aligned to the huge page, and it occupies the whole huge page.
+const SHARED_HUGETLBFS_VIEW_GUEST: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/vfs.h>
+#include <unistd.h>
+
+int main(void) {
+  int fd = memfd_create("shared-hugetlbfs-view", MFD_CLOEXEC | MFD_HUGETLB);
+  if (fd < 0) {
+    printf("memfd_create: %s\n", strerror(errno));
+    return 1;
+  }
+  struct statfs filesystem;
+  if (fstatfs(fd, &filesystem) != 0) {
+    printf("fstatfs: %s\n", strerror(errno));
+    return 1;
+  }
+  long huge_page = filesystem.f_bsize;
+  if (ftruncate(fd, huge_page) != 0) {
+    printf("ftruncate: %s\n", strerror(errno));
+    return 1;
+  }
+  printf("created\n");
+  fflush(stdout);
+  void* view = mmap(NULL, 4096, PROT_READ, MAP_SHARED | MAP_NORESERVE, fd, 0);
+  if (view == MAP_FAILED) {
+    printf("mmap: %s\n", strerror(errno));
+    return 1;
+  }
+  printf("mapped, aligned to the huge page: %s\n",
+         (unsigned long)view % huge_page == 0 ? "yes" : "no");
+  return munmap(view, huge_page) == 0 ? 0 : 1;
+}
+"#;
+
+/// The guest above, compiled once per test process.
+fn shared_hugetlbfs_view_guest() -> PathBuf {
+    let build_root = process_build_root("shared-hugetlbfs-view");
+    fs::create_dir_all(&build_root).expect("failed to create the guest directory");
+    let source = build_root.join("shared_hugetlbfs_view.c");
+    let guest = build_root.join("shared_hugetlbfs_view");
+    if !guest.exists() {
+        fs::write(&source, SHARED_HUGETLBFS_VIEW_GUEST).expect("failed to write the guest");
+        let compiled = Command::new("cc")
+            .args(["-O0", "-Wall", "-Wextra", "-Werror"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the guest");
+        assert!(compiled.status.success(), "{compiled:?}");
+    }
+    guest
+}
+
+/// A shared view of a hugetlbfs file (`SHARED_HUGETLBFS_VIEW_GUEST`) maps
+/// natively and on ptrace, as Linux places it. KVM's provider maps views page
+/// by page at addresses it chooses, so it refuses this one by name before
+/// anything is mapped, and the run ends as that named policy refusal (exit
+/// 122), with the reason on stderr, where it used to end as an internal
+/// failure (exit 125).
+#[test]
+fn run_kvm_shared_hugetlbfs_view_is_a_named_refusal() {
+    if kvm_unavailable("run_kvm_shared_hugetlbfs_view_is_a_named_refusal") {
+        return;
+    }
+    let guest = shared_hugetlbfs_view_guest();
+    let guest = guest.to_str().expect("guest path is UTF-8");
+    let linux = "created\nmapped, aligned to the huge page: yes\n";
+    assert_eq!(native_stdout(Path::new(guest)), linux);
+    let _guard = hermit_run_guard();
+    for backend in ["ptrace", "kvm"] {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            guest,
+        ];
+        let output = hermit(&args);
+        let stdout = stdout(&output);
+        let stderr = stderr(&output);
+        if backend == "ptrace" {
+            assert_success(&output, &args);
+            assert_eq!(stdout, linux, "ptrace");
+            continue;
+        }
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "KVM must end the run with its named hugetlbfs refusal\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+                && stderr.contains(
+                    "unsupported KVM shared-file operation mmap: hugetlbfs file views need huge \
+                     page placement, length and reservation"
+                ),
+            "the KVM run did not name the hugetlbfs refusal on stderr\nstderr:\n{stderr}"
+        );
+        assert_eq!(stdout, "created\n", "KVM went on past the refused view");
+    }
+}
+
 /// A ppoll, or with argv[3] "pselect6" a pselect6, whose temporary mask lets
 /// in a signal already pending under the thread's own mask. argv[1] is
 /// "caught" (SIGUSR1, with a handler) or "ignored" (SIGWINCH, ignored by

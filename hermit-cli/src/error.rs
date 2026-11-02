@@ -193,8 +193,11 @@ fn is_policy_refusal(err: &Error) -> bool {
     // The KVM executor's refusals by name (`reverie_kvm::Error::is_named_refusal`,
     // decided by the failure's original cause beneath Reverie's wrappers): an
     // operation it declines because it cannot perform it faithfully, such as a
-    // read that would wait in the host. Every other KVM error stays a backend
-    // failure.
+    // read that would wait in the host, or a shared-file operation it does not
+    // implement (`Error::UnsupportedSharedFile`), such as a shared view of a
+    // hugetlbfs file. Every other KVM error stays a backend failure, among them
+    // `SharedFileCapability`, which also reports internal guards
+    // (https://github.com/rrnewton/hermit/issues/5025).
     #[cfg(target_arch = "x86_64")]
     fn is_kvm_named_refusal(cause: &(dyn std::error::Error + 'static)) -> bool {
         cause
