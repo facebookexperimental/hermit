@@ -137,7 +137,26 @@ fn run() -> Result<ExitCode, String> {
         let absolute = root.join(relative);
         let contents = std::fs::read_to_string(&absolute)
             .map_err(|error| format!("could not read {}: {error}", relative.display()))?;
+        // In Rust sources only the lines inside a rust-script `//! ```cargo`
+        // header are dependency declarations; test-fixture strings elsewhere
+        // in a .rs file (this checker carries several) are not pins.
+        let is_rust_source = relative.extension().is_some_and(|ext| ext == "rs");
+        let mut in_cargo_header = false;
         for (index, line) in contents.lines().enumerate() {
+            if is_rust_source {
+                let doc_line = line.trim().trim_start_matches('/').trim_start_matches('!').trim();
+                if doc_line == "```cargo" {
+                    in_cargo_header = true;
+                    continue;
+                }
+                if in_cargo_header && doc_line == "```" {
+                    in_cargo_header = false;
+                    continue;
+                }
+                if !in_cargo_header {
+                    continue;
+                }
+            }
             let Some((url, pin)) = extract(line) else {
                 continue;
             };
@@ -557,10 +576,18 @@ fn git_root() -> Result<PathBuf, String> {
     Ok(PathBuf::from(text.trim()))
 }
 
-/// Tracked Cargo metadata only. See the scope note in the module docs.
+/// Tracked Cargo metadata plus rust-script sources. A rust-script's
+/// `//! ```cargo` header is Cargo metadata too: it pins git dependencies
+/// (dagrun, in six scripts) exactly like a Cargo.toml, and a bump that moves
+/// only the manifests leaves the scripts compiling against the old revision
+/// (the 2026-11-02 validate.rs split: duplicate dagrun types, every full
+/// validate COULD-NOT-DETERMINE). Scanning every tracked .rs line with the
+/// same extractor is safe because a pin is only recognised when a git URL
+/// and a quoted rev/branch/tag share one line, which in Rust sources only
+/// dependency declarations do.
 fn tracked_cargo_metadata(root: &Path) -> Result<Vec<PathBuf>, String> {
     let output = Command::new("git")
-        .args(["ls-files", "-z", "--", "*Cargo.toml", "*Cargo.lock"])
+        .args(["ls-files", "-z", "--", "*Cargo.toml", "*Cargo.lock", "*.rs"])
         .current_dir(root)
         .output()
         .map_err(|error| format!("could not run git ls-files: {error}"))?;
