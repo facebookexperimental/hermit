@@ -16723,7 +16723,9 @@ const UNSAMPLEABLE_FIXTURE_RUN_TIMEOUT_SECONDS: i64 = 2700;
 /// excluded set or count, and an exact request for an excluded cell is still
 /// refused when it is planned.
 fn unsampleable_sample_self_test(root: &Path, scratch: &Path) -> Result<(), String> {
-    const SAMPLE: usize = 10;
+    // Sized so the drawn sample's declared occupancy fits the fixture bound
+    // at the current per-cell wall (180s); per-cell sampleability is unchanged.
+    const SAMPLE: usize = 4;
     let limit = UNSAMPLEABLE_FIXTURE_RUN_TIMEOUT_SECONDS;
     let checked = CheckedScorecard {
         root,

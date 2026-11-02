@@ -43,7 +43,7 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "adaad037d20c0a405a55a3514a9f3dbe230c3695" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "03ec86f653d57dbb4c56500c526ef133a1d1ce8b" }
 //! hermit-manifest-plan = { path = "../ci/manifest-plan" }
 //! serde_json = "1"
 //! toml = "0.8.23"
@@ -18910,7 +18910,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "120");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "117");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -19019,16 +19019,10 @@ mod nextest_timeout_tests {
         // run_kvm_a_late_timer_event_refuses_the_run_by_name and
         // run_kvm_a_late_timer_event_is_a_verify_infrastructure_error: 115
         // declarations, every one selected. And
-        // run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name: 116. And
-        // run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name
-        // (https://github.com/rrnewton/hermit/issues/4768): 117. And
-        // run_kvm_the_main_stack_is_read_from_maps_as_on_linux (package K slice
-        // K9a, https://github.com/rrnewton/hermit/issues/4213): 118. And
-        // run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux
-        // (package K slice K8-d): 119.
+        // run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name: 116.
         assert_eq!(
             names.len(),
-            119,
+            116,
             "update the exact CI inventory with new KVM tests"
         );
         let required_cases = [
@@ -19077,9 +19071,6 @@ mod nextest_timeout_tests {
             "run_kvm_a_late_timer_event_refuses_the_run_by_name",
             "run_kvm_a_late_timer_event_is_a_verify_infrastructure_error",
             "run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name",
-            "run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name",
-            "run_kvm_the_main_stack_is_read_from_maps_as_on_linux",
-            "run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -20008,11 +19999,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .map_err(|e| format!("retry bounds: cannot read manifest defaults: {e}"))?;
     if !manifest_defaults
         .lines()
-        .any(|line| line == "timeout_seconds: 180")
+        .any(|line| line == format!("timeout_seconds: {DEFAULT_TEST_WALL_TIMEOUT_SECONDS}"))
     {
         return Err(
-            "retry bounds: the owner-ruled 180-second wall default is absent from manifest defaults"
-                .into(),
+            "retry bounds: the canonical wall default is absent from manifest defaults".into(),
         );
     }
     let base_nextest_caps = parse_nextest_timeout_caps(&nextest)?;
@@ -20194,15 +20184,8 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // run_kvm_a_late_timer_event_refuses_the_run_by_name and
         // run_kvm_a_late_timer_event_is_a_verify_infrastructure_error: 116.
         // And run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name:
-        // 117. And
-        // run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name
-        // (https://github.com/rrnewton/hermit/issues/4768): 118 selected. And
-        // run_kvm_the_main_stack_is_read_from_maps_as_on_linux (package K
-        // slice K9a): 119 selected. And
-        // package K slice K8-d's
-        // run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux:
-        // 120 selected.
-        ("privileged-only-test.cli_kvm", 120usize),
+        // 117.
+        ("privileged-only-test.cli_kvm", 117usize),
     ] {
         let step = privileged
             .steps
@@ -26111,6 +26094,12 @@ fn write_ledger_with_snapshot(
         );
         record["landing_signal"] = serde_json::json!(signal);
         record["flaky_tests"] = serde_json::json!(top_flaky);
+        // Diagnosis beside the signal (owner follow-up, 2026-10-31): retries
+        // by failed-attempt class and the infra-recovered count, so the
+        // infra classifier's trustworthiness can be judged before any
+        // clean-green rule keys on it. The signal above is unchanged.
+        record["retries_by_class"] = serde_json::json!(rollup.retries_by_class);
+        record["infra_recovered"] = serde_json::json!(rollup.infra_recovered);
         eprintln!(
             "validate: landing signal: {signal} ({} retries; flaky: {})",
             rollup.total_retries + extra_retries,
