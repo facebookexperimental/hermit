@@ -3,9 +3,10 @@
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Known-gap ledgers. A ledger lists the tests a validation node runs and expects to fail, each
-//! with its tracking issue, so that a node can run a whole suite on a backend that does not pass
-//! all of it yet without counting a failure as a pass or hiding it.
+//! Known-gap ledgers. A ledger lists the tests of a suite that a validation node does not yet
+//! require to pass on its backend, each with its tracking issue: the tests it runs and expects to
+//! fail, and the tests it skips. So a node can run a suite on a backend that does not pass all of
+//! it yet without counting a failure as a pass or hiding it.
 //!
 //! The format and its readers:
 //! - `ci/kvm-gap-ledger.rs`. It is the node's runner, the static check, and the history gate that
@@ -18,6 +19,10 @@
 //!   [`LEDGER_ENV`] declaration from `validate.json` and the file as committed on main. A
 //!   `diagnostic_fail` row qualifies only if its structured-result `id` equals a row's [`Row::id`].
 //!   Do not change [`HEADER`] without telling that reader: the header is the schema's version.
+//!   Its parser predates [`Outcome::Skipped`] and refuses that outcome. It reads a ledger only for
+//!   a run that has diagnostic failures, which a ledger whose every row is skipped cannot produce;
+//!   a ledger that mixes skipped rows with rows the node runs needs that parser to accept them
+//!   first.
 //!
 //! # Format
 //!
@@ -30,8 +35,8 @@
 //! | `id` | The test's structured-result id, `<cargo package>::<test binary>$<test function>`, exactly as the node's results name it. Rows are sorted by it, byte order, with no duplicate. |
 //! | `gap` | The reason: a short gap code, no whitespace. The ledger's comments define each code. |
 //! | `issue` | The tracking issue or pull request, as a full GitHub URL. |
-//! | `outcome` | How the failing attempt must end: `failed`, or `cpu_timeout` (stopped by its CPU budget). |
-//! | `signature` | For `failed`, text the test's output must show ([`signature_matches`]) when the node runs it with `RUST_BACKTRACE=0`, so a panic prints std's `note: run with` line rather than a backtrace; it may hold spaces, not TABs, and writes a newline as `\n`, a backslash as `\\` and any run of digits as `<N>`. For `cpu_timeout`, `-`. |
+//! | `outcome` | How the failing attempt must end: `failed`, or `cpu_timeout` (stopped by its CPU budget). Or `skipped`: the node does not run the test at all, it leaves it out of the run by name, so there is no attempt. |
+//! | `signature` | For `failed`, text the test's output must show ([`signature_matches`]) when the node runs it with `RUST_BACKTRACE=0`, so a panic prints std's `note: run with` line rather than a backtrace; it may hold spaces, not TABs, and writes a newline as `\n`, a backslash as `\\` and any run of digits as `<N>`. For `cpu_timeout` and `skipped`, `-`. |
 //! | `approval` | `baseline` for a row present, unchanged, since the ledger's introduction; otherwise the full URL of a specific approving comment, review or commit. |
 //!
 //! # What may change, checked against history
@@ -43,6 +48,9 @@
 //!   introduction. A row added later, or whose outcome or signature changed, needs an approval URL
 //!   that a commit-message line binds to its id: `KVM-Gap-Approval: <URL> <id>`, in the commit
 //!   that added it or a later one. So the baseline can only shrink, and a swap is an addition.
+//!   Skipping a test is weaker than running it as a known gap (nothing then shows whether it still
+//!   fails), so turning a row skipped is such a change, and so is turning it back. Deleting a
+//!   skipped row needs nothing: its test becomes required, and the node runs it.
 //! - A test that leaves the required set needs approval too. Moving into the ledger is an
 //!   addition. Leaving the suite, or being `#[ignore]`d, needs `KVM-Required-Removal: <URL> <id>`.
 //!   A rename leaves under the old id.
@@ -152,28 +160,38 @@ pub fn required_tests(declaration: &Declaration) -> Option<u64> {
     crate::validation_dag_static::expected_nextest_count(declaration.node)
 }
 
-/// How a gap row's failing attempt must end.
+/// How a gap row's failing attempt must end, or that the node does not run it.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Outcome {
     /// An ordinary failure, whose output must contain the row's signature.
     Failed,
     /// Stopped by its per-test CPU budget.
     CpuTimeout,
+    /// Not run: the node leaves the test out of its run by name, so there is no attempt to judge.
+    Skipped,
 }
 
 impl Outcome {
-    /// The ledger's spelling, which is also dagrun's attempt-outcome spelling.
+    /// The ledger's spelling. For an outcome the node runs, it is also dagrun's attempt-outcome
+    /// spelling.
     pub fn value(self) -> &'static str {
         match self {
             Self::Failed => "failed",
             Self::CpuTimeout => "cpu_timeout",
+            Self::Skipped => "skipped",
         }
+    }
+
+    /// Whether the node runs a row with this outcome.
+    pub fn is_run(self) -> bool {
+        self != Self::Skipped
     }
 
     fn parse(value: &str) -> Option<Self> {
         match value {
             "failed" => Some(Self::Failed),
             "cpu_timeout" => Some(Self::CpuTimeout),
+            "skipped" => Some(Self::Skipped),
             _ => None,
         }
     }
@@ -361,13 +379,14 @@ pub fn parse(text: &str) -> Result<Vec<Row>, String> {
             ));
         }
         let outcome = Outcome::parse(outcome).ok_or_else(|| {
-            format!("line {number}: {id}: the outcome field must be failed or cpu_timeout, found {outcome:?}")
+            format!("line {number}: {id}: the outcome field must be failed, cpu_timeout or skipped, found {outcome:?}")
         })?;
         let signature = match (outcome, *signature) {
-            (Outcome::CpuTimeout, NO_SIGNATURE) => None,
-            (Outcome::CpuTimeout, other) => {
+            (Outcome::CpuTimeout | Outcome::Skipped, NO_SIGNATURE) => None,
+            (Outcome::CpuTimeout | Outcome::Skipped, other) => {
                 return Err(format!(
-                    "line {number}: {id}: a cpu_timeout row has no output to match, so its signature is {NO_SIGNATURE:?}, found {other:?}"
+                    "line {number}: {id}: a {} row has no output to match, so its signature is {NO_SIGNATURE:?}, found {other:?}",
+                    outcome.value()
                 ));
             }
             (Outcome::Failed, NO_SIGNATURE) => {
@@ -1103,13 +1122,22 @@ mod tests {
 
     const SUITE: &[&str] = &["a", "b", "c", "g", "proof"];
 
+    fn skipped(test: &str, approval: &str) -> String {
+        format!("pkg::suite${test}\tT2\t{ISSUE}\tskipped\t-\t{approval}")
+    }
+
     #[test]
     fn a_row_parses_with_every_field() {
         let rows = parse(&ledger(&[
             &failed("a", "baseline"),
             &format!("pkg::suite$b\tT2\t{ISSUE}\tcpu_timeout\t-\t{APPROVAL}"),
+            &skipped("c", APPROVAL),
         ]))
         .unwrap();
+        assert_eq!(rows[2].outcome, Outcome::Skipped);
+        assert_eq!(rows[2].signature, None);
+        assert!(!rows[2].outcome.is_run());
+        assert!(rows[0].outcome.is_run() && rows[1].outcome.is_run());
         assert_eq!(
             rows[0],
             Row {
@@ -1149,13 +1177,17 @@ mod tests {
             ),
             (
                 ledger(&[&format!("pkg::suite$a\tT2\t{ISSUE}\thang\tx\tbaseline")]),
-                "failed or cpu_timeout",
+                "failed, cpu_timeout or skipped",
             ),
             (
                 ledger(&[&format!(
                     "pkg::suite$a\tT2\t{ISSUE}\tcpu_timeout\tx\tbaseline"
                 )]),
                 "its signature is \"-\"",
+            ),
+            (
+                ledger(&[&format!("pkg::suite$a\tT2\t{ISSUE}\tskipped\tx\tbaseline")]),
+                "a skipped row has no output to match",
             ),
             (
                 ledger(&[&format!("pkg::suite$a\tT2\t{ISSUE}\tfailed\t-\tbaseline")]),
@@ -1356,6 +1388,64 @@ mod tests {
                 .violations
                 .is_empty()
         );
+    }
+
+    /// Skipping a known gap changes what its row excuses (the test is no longer run at all), so
+    /// it is an addition: refused as "baseline" or unbound, admitted with a bound approval. The
+    /// test stays out of the required set throughout, so no removal approval is owed. Deleting
+    /// the skipped row later needs nothing, and makes the test required again.
+    #[test]
+    fn a_skip_is_an_addition_and_its_deletion_a_promotion() {
+        let initial = version(
+            0,
+            &[failed("a", "baseline"), failed("g", "baseline")],
+            SUITE,
+        );
+        let as_baseline = [
+            initial.clone(),
+            version(
+                4,
+                &[failed("a", "baseline"), skipped("g", "baseline")],
+                SUITE,
+            ),
+        ];
+        let verdict = judge_history(&DECLARATION, &as_baseline, &[]);
+        assert_eq!(verdict.violations.len(), 1, "{:?}", verdict.violations);
+        assert!(
+            verdict.violations[0].starts_with("pkg::suite$g: its approval field says \"baseline\""),
+            "{:?}",
+            verdict.violations
+        );
+        let approved = [
+            initial.clone(),
+            version(4, &[failed("a", "baseline"), skipped("g", APPROVAL)], SUITE),
+        ];
+        let unbound = judge_history(&DECLARATION, &approved, &[]);
+        assert_eq!(unbound.violations.len(), 1, "{:?}", unbound.violations);
+        assert!(unbound.violations[0].contains("is bound to it by no commit message"));
+        let bound = [trailers(
+            4,
+            &format!("{GAP_APPROVAL_KEY} {APPROVAL} pkg::suite$g"),
+        )];
+        let verdict = judge_history(&DECLARATION, &approved, &bound);
+        assert!(verdict.violations.is_empty(), "{:?}", verdict.violations);
+        assert_eq!(
+            (
+                verdict.baseline_rows,
+                verdict.approved_rows,
+                verdict.required
+            ),
+            (1, 1, 3)
+        );
+        // Deleting the skipped row promotes its test, with no approval.
+        let promoted = [
+            initial,
+            version(4, &[failed("a", "baseline"), skipped("g", APPROVAL)], SUITE),
+            version(9, &[failed("a", "baseline")], SUITE),
+        ];
+        let verdict = judge_history(&DECLARATION, &promoted, &bound);
+        assert!(verdict.violations.is_empty(), "{:?}", verdict.violations);
+        assert_eq!(verdict.required, 4);
     }
 
     /// The review's made-up approval: a URL in the row and nothing binding it.
@@ -1662,25 +1752,25 @@ mod tests {
         assert!(rows.unwrap_err().contains("only escapes"));
     }
 
-    /// The deadline_slice_cap D and G signatures match those gaps' real failures on KVM, and not
-    /// nearby failures of the same tests.
+    /// A signature matches the real failure it was written for, and not nearby failures of the
+    /// same test: the D and G signatures of the deadline_slice_cap ledger, as they stood until
+    /// those rows were skipped on 2026-11-01, against those gaps' failures on KVM.
     #[test]
     fn the_d_and_g_signatures_match_only_their_gaps() {
-        let ledger_text = include_str!("../../../hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv");
-        let rows = parse(ledger_text).unwrap();
-        let signature = |test: &str| {
-            rows.iter()
-                .find(|row| row.id == format!("hermit-run::deadline_slice_cap${test}"))
-                .and_then(|row| row.signature.clone())
-                .unwrap()
-        };
-        let d = signature("itimer_a_private_descriptor_table_consumer_re_arms");
-        let g = signature("itimer_mixed_masks_keep_the_timer_running");
+        let d = r#""privfd" "5000"\nstatus: exit status: 122\nstdout:\n\nstderr:"#;
+        let g = r"\npositive=<N> samples=20 progress=<N>\n\nnote: run with";
+        for signature in [d, g] {
+            let row = format!(
+                "hermit-run::deadline_slice_cap$t\tD\t{ISSUE}\tfailed\t{signature}\tbaseline"
+            );
+            let parsed = parse(&ledger(&[&row])).unwrap();
+            assert_eq!(parsed[0].signature.as_deref(), Some(signature));
+        }
         // The failures recorded in the node's event stream: D at bc48233db5 in the pinned root (its failure became the clone refusal, exit 122), G at Hermit 7fc6645c6465.
         let d_failure = "\nthread 'itimer_a_private_descriptor_table_consumer_re_arms' (1270) panicked at hermit-cli/tests/deadline_slice_cap.rs:163:5:\nguest failed: HERMIT_EPOCH=\"2026-01-01T00:00:00Z\" \"timeout\" \"--kill-after=2s\" \"120s\" \"/src/target/validate/hermit\" \"--backend=kvm\" \"run\" \"--base-env=minimal\" \"--strict\" \"--epoch=2026-01-01T00:00:00Z\" \"--mount=type=tmpfs,target=/test\" \"--workdir=/test\" \"--\" \"/src/target/tmp/deadline-slice-cap-1269/itimer_coalesce\" \"privfd\" \"5000\"\nstatus: exit status: 122\nstdout:\n\nstderr:\n2026-11-01T00:59:59.862237Z ERROR detcore::syscalls::helpers: [dtid 3] clone refused by the backend: KVM cannot create a thread with a working directory or descriptor table of its own: CLONE_THREAD without CLONE_FS or CLONE_FILES (flags CloneFlags(CLONE_VM | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM), exit signal 0). No child was created.\n";
         let g_failure = "\nthread 'itimer_mixed_masks_keep_the_timer_running' (2952) panicked at hermit-cli/tests/deadline_slice_cap.rs:878:5:\npositive=3 samples=20 progress=19882\n\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
-        assert!(signature_matches(&d, d_failure), "{d}");
-        assert!(signature_matches(&g, g_failure), "{g}");
+        assert!(signature_matches(d, d_failure), "{d}");
+        assert!(signature_matches(g, g_failure), "{g}");
         // D: exit 122 with the refusal on stderr, another exit status, and output on stdout.
         for different in [
             d_failure.replace("\"privfd\" \"5000\"", "\"privfd2\" \"5000\""),
@@ -1688,7 +1778,7 @@ mod tests {
             d_failure.replace("stdout:\n\nstderr:", "stdout:\nhandled=1\n\nstderr:"),
             d_failure.replace("\"privfd\" \"5000\"", "\"private\" \"5000\""),
         ] {
-            assert!(!signature_matches(&d, &different), "{different}");
+            assert!(!signature_matches(d, &different), "{different}");
         }
         // G: the sample-count assertion, the native assertion, and a guest that failed and printed
         // the same line.
@@ -1697,7 +1787,7 @@ mod tests {
             g_failure.replace("\npositive=3", "\nnative: positive=0"),
             g_failure.replace("878:5:\npositive=3 samples=20 progress=19882\n\nnote:", "163:5:\nguest failed: \"x\"\nstatus: exit status: 1\nstdout:\npositive=3 samples=20 progress=19882\n\nstderr:\n\nnote:"),
         ] {
-            assert!(!signature_matches(&g, &different), "{different}");
+            assert!(!signature_matches(g, &different), "{different}");
         }
     }
 }

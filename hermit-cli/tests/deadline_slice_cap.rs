@@ -24,10 +24,11 @@
 //! `HERMIT_TEST_BACKEND` (see [`backend_option`]). The validation node
 //! privileged-test.deadline_slice_cap_kvm runs it on KVM, where every test must
 //! pass except those in `deadline_slice_cap.kvm-gaps.tsv`, the KVM gap ledger
-//! beside this file: each row names a known KVM gap and the issue tracking it,
-//! must still fail on KVM the way the row says, and never counts as a pass.
-//! [`capped_schedules_verify_bitwise`] also proves to that node that its runs
-//! were on KVM ([`BACKEND_PROOF_ENV`]).
+//! beside this file: each row names a known KVM gap and the issue tracking it.
+//! The node runs a row's test, which must still fail on KVM the way the row
+//! says and never counts as a pass, or, when the row says skipped, leaves it
+//! out of the KVM run. [`capped_schedules_verify_bitwise`] also proves to that
+//! node that its runs were on KVM ([`BACKEND_PROOF_ENV`]).
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;

@@ -4929,18 +4929,26 @@ fn render_known_gaps(nodes: &[KnownGapNode]) -> String {
     let total = nodes.iter().map(|node| node.rows.len()).sum::<usize>();
     let mut out = format!(
         "\n## Known gaps of validation nodes, outside every count above\n\n\
-Each row below is a test that a validation node runs and expects to FAIL on its backend: a known \
-gap, listed with its tracking issue in the node's known-gap ledger. These **{total}** rows are not \
-manifest cells, so they are in none of the counts or percentages above. Each one counts as a \
-failing test, never as a pass and never as not applicable. The node records it as \
-`diagnostic_fail` when it fails the way its row says, and fails outright when it passes (promote it \
-to required) or fails some other way. In a signature, `\\n` is a newline and `<N>` any run of \
-digits. The same rows, with their tracking URLs, are in `{KNOWN_GAPS}`.\n"
+Each row below is a test that a validation node does not yet require on its backend: a known \
+gap, listed with its tracking issue in the node's known-gap ledger. The node runs a known gap and \
+expects it to FAIL, or, when its row says skipped, leaves it out of the run by name. These \
+**{total}** rows are not manifest cells, so they are in none of the counts or percentages above. \
+Each one counts as a failing test, never as a pass and never as not applicable. The node records \
+a known gap it runs as `diagnostic_fail` when it fails the way its row says, and fails outright \
+when it passes (promote it to required) or fails some other way; a skipped one is not run, so \
+nothing shows whether it still fails until its row is deleted. In a signature, `\\n` is a newline \
+and `<N>` any run of digits. The same rows, with their tracking URLs, are in `{KNOWN_GAPS}`.\n"
     );
     for node in nodes {
+        let skipped = node.rows.iter().filter(|row| !row.outcome.is_run()).count();
+        let skipped = if skipped == 0 {
+            String::new()
+        } else {
+            format!(" ({skipped} skipped, not run)")
+        };
         out.push_str(&format!(
-            "\n### `{}` (`--backend={}`)\n\n**{}** required tests must pass; **{}** known gaps, from \
-`{}`:\n\n| Test | Gap | Tracking issue | Must fail with | Status |\n| --- | --- | --- | --- | --- |\n",
+            "\n### `{}` (`--backend={}`)\n\n**{}** required tests must pass; **{}** known gaps{skipped}, \
+from `{}`:\n\n| Test | Gap | Tracking issue | Must fail with | Status |\n| --- | --- | --- | --- | --- |\n",
             node.node,
             node.backend,
             node.required_tests,
@@ -4952,15 +4960,22 @@ digits. The same rows, with their tracking URLs, are in `{KNOWN_GAPS}`.\n"
                 .id
                 .split_once('$')
                 .map_or(row.id.as_str(), |(_, test)| test);
-            let expected = match &row.signature {
-                Some(signature) => format!(
-                    "output showing `{}`",
-                    signature.replace('|', "\\|").replace('`', "'")
+            let (expected, status) = match (&row.signature, row.outcome.is_run()) {
+                (Some(signature), _) => (
+                    format!(
+                        "output showing `{}`",
+                        signature.replace('|', "\\|").replace('`', "'")
+                    ),
+                    "failing (known gap)",
                 ),
-                None => "a stop by its CPU budget".to_string(),
+                (None, true) => (
+                    "a stop by its CPU budget".to_string(),
+                    "failing (known gap)",
+                ),
+                (None, false) => ("not run".to_string(), "skipped (known gap)"),
             };
             out.push_str(&format!(
-                "| `{test}` | {} | {} | {expected} | failing (known gap) |\n",
+                "| `{test}` | {} | {} | {expected} | {status} |\n",
                 row.gap, row.issue
             ));
         }
@@ -4972,7 +4987,7 @@ digits. The same rows, with their tracking URLs, are in `{KNOWN_GAPS}`.\n"
 fn encoded_known_gaps(nodes: &[KnownGapNode]) -> Result<String, String> {
     let value = serde_json::json!({
         "schema": 1,
-        "description": "Known gaps of validation nodes: tests a node runs and expects to fail, each with its tracking issue (ci/manifest-plan/src/known_gaps.rs). They are outside every E2E count and percentage. A known gap is a failing test: never a pass and never not applicable.",
+        "description": "Known gaps of validation nodes: tests a node does not yet require on its backend, each with its tracking issue (ci/manifest-plan/src/known_gaps.rs). The node runs a known gap and expects it to fail (status known-gap), or leaves it out of the run by name (status skipped). They are outside every E2E count and percentage. A known gap is a failing test: never a pass and never not applicable.",
         "generated_by": "./ci/compat-envelope/scorecard.rs update",
         "nodes": nodes.iter().map(|node| serde_json::json!({
             "node": node.node,
@@ -4985,7 +5000,7 @@ fn encoded_known_gaps(nodes: &[KnownGapNode]) -> Result<String, String> {
                 "issue": row.issue,
                 "outcome": row.outcome.value(),
                 "signature": row.signature,
-                "status": "known-gap",
+                "status": if row.outcome.is_run() { "known-gap" } else { "skipped" },
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
     });

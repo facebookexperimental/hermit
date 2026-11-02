@@ -4,10 +4,11 @@
 //!
 //! A ledger (for example `hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv`) lists the suite's
 //! known gaps on the node's backend: the tests that do not pass there yet, each with its tracking
-//! issue and the way it must fail. Every other test of the suite is required to pass, so a new
-//! test is required by default. `ci/manifest-plan/src/known_gaps.rs` defines the format, the
-//! declarations of the nodes that have a ledger, and the rules. The coordinator's four
-//! conditions hold as follows:
+//! issue and the way it must fail, or `skipped` when the node does not run it at all. Every other
+//! test of the suite is required to pass, so a new test is required by default.
+//! `ci/manifest-plan/src/known_gaps.rs` defines the format, the declarations of the nodes that
+//! have a ledger, and the rules. The coordinator's four conditions hold as follows, and a fifth
+//! covers the skipped rows:
 //!
 //! 1. A gap row never counts as a pass. The node runs it. A failure that matches the row's
 //!    outcome and signature is a non-blocking diagnostic failure (`KNOWN-KVM-GAP`, dagrun's
@@ -21,6 +22,11 @@
 //!    commit-message line.
 //! 4. A required test that fails, fails the node (`KVM-REQUIRED-FAIL`). Moving it into the ledger
 //!    is adding a row. Deleting it, or `#[ignore]`-ing it, needs an approval line too.
+//! 5. A skipped row is not run on the backend. The node prints `KVM-GAP-SKIPPED` for it and
+//!    leaves it out of the run by name, with a Nextest filter expression built from the ledger,
+//!    and it refuses a run that leaves out any other test or keeps a skipped one in. A skipped row
+//!    is never a pass, a failure or a diagnostic; it is filtered out. Turning a row skipped is
+//!    changing it, so it needs a bound approval; deleting a skipped row makes its test required.
 //!
 //! Subcommands:
 //! - `check` applies the static rules to a ledger and its suite's source. This script's unit
@@ -29,10 +35,10 @@
 //!   ([`hermit_manifest_plan::known_gaps::judge_history`]).
 //! - `run` is the node. It reads its ledger from `HERMIT_KNOWN_GAP_LEDGER`, which the DAG writes
 //!   from the declaration, and lists the suite with the prepared Nextest runner. It then runs every
-//!   test of the suite on the backend in one counted run, with no retry, and writes the node's
-//!   structured results to `DAGRUN_TEST_COUNTS_PATH`. Beside them it keeps the counted run's CPU
-//!   report (`.cpu.json`) and its event stream (`.events.jsonl`), which hold each failure's cause
-//!   and output.
+//!   test of the suite but the skipped rows on the backend in one counted run, with no retry, and
+//!   writes the node's structured results to `DAGRUN_TEST_COUNTS_PATH`. Beside them it keeps the
+//!   counted run's CPU report (`.cpu.json`) and its event stream (`.events.jsonl`), which hold
+//!   each failure's cause and output.
 //!
 //! ```cargo
 //! [dependencies]
@@ -82,13 +88,15 @@ fn usage() -> &'static str {
      line `KVM-Gap-Approval: URL ID` binds to it. Needs the whole first-parent history since\n      \
      the ledger's introduction and a working tree whose ledger and suite match HEAD.\n  \
      kvm-gap-ledger.rs run -- NEXTEST_ARGS...\n      \
-     The validation node. Reads its ledger from HERMIT_KNOWN_GAP_LEDGER, lists the suite with\n      \
-     NEXTEST_ARGS, runs every test once on the declared backend (HERMIT_TEST_BACKEND,\n      \
+     The validation node. Reads its ledger from HERMIT_KNOWN_GAP_LEDGER, prints KVM-GAP-SKIPPED\n      \
+     for each skipped row and leaves those tests out by name, lists the suite with NEXTEST_ARGS,\n      \
+     runs every other test once on the declared backend (HERMIT_TEST_BACKEND,\n      \
      NEXTEST_RETRIES=0) through ci/run-nextest-counted.sh, prints KNOWN-KVM-GAP for each gap\n      \
      row that failed as its row says, and writes the node's schema-4 structured results to\n      \
      DAGRUN_TEST_COUNTS_PATH. NEXTEST_EXPECTED_EXECUTED is the number of required tests.\n      \
+     NEXTEST_ARGS select the suite and carry no filter expression: the node chooses its tests.\n      \
      Exits 0 only when every required test passed, the backend-proof test proved the backend,\n      \
-     and every gap row failed as its row says.\n\n\
+     and every gap row it ran failed as its row says.\n\n\
      Exit status: 0 pass, 1 refused (a rule broken, or the node failed), 2 could not decide."
 }
 
@@ -417,7 +425,8 @@ fn history(root: &Path, ledger: Option<&str>) -> Result<bool, String> {
 ///
 /// That list is checked test by test against the suite's source (`tests`, from
 /// [`known_gaps::suite_tests`]): the same test names, each ignored on both sides or on neither, and
-/// every test that is not ignored selected. A test the source parser does not see (one a macro
+/// every test that is not ignored selected, except the ledger's skipped rows (`skipped`, test
+/// names), which must each be left out. A test the source parser does not see (one a macro
 /// generates, say), or one it reads differently, refuses the run. So the tests the run executes are
 /// exactly the ones the ledger, its required count and its history judge, and none can stand in
 /// for another.
@@ -425,6 +434,7 @@ fn listed_population(
     list: &serde_json::Value,
     declaration: &Declaration,
     tests: &BTreeMap<String, bool>,
+    skipped: &BTreeSet<String>,
 ) -> Result<BTreeSet<String>, String> {
     let binary = declaration
         .id_prefix
@@ -482,26 +492,33 @@ fn listed_population(
         .collect::<Vec<_>>();
     let filtered = listed
         .iter()
-        .filter(|(_, (ignored, selected))| !ignored && !selected)
+        .filter(|(test, (ignored, selected))| !ignored && !selected && !skipped.contains(*test))
+        .map(|(test, _)| test)
+        .collect::<Vec<_>>();
+    let skipped_kept = listed
+        .iter()
+        .filter(|(test, (_, selected))| *selected && skipped.contains(*test))
         .map(|(test, _)| test)
         .collect::<Vec<_>>();
     if !(only_listed.is_empty()
         && only_declared.is_empty()
         && ignored_apart.is_empty()
-        && filtered.is_empty())
+        && filtered.is_empty()
+        && skipped_kept.is_empty())
     {
         return Err(format!(
-            "Nextest's list of {binary} and its source {} disagree, so the run could execute other tests than the ledger judges. Listed but not declared: {}. Declared but not listed: {}. Ignored on one side only: {}. Not ignored but filtered out: {}",
+            "Nextest's list of {binary} and its source {} disagree, so the run could execute other tests than the ledger judges. Listed but not declared: {}. Declared but not listed: {}. Ignored on one side only: {}. Not ignored but filtered out: {}. Skipped rows selected anyway: {}",
             declaration.suite_source,
             names(only_listed),
             names(only_declared),
             names(ignored_apart),
-            names(filtered)
+            names(filtered),
+            names(skipped_kept)
         ));
     }
     let population = listed
         .iter()
-        .filter(|(_, (ignored, _))| !ignored)
+        .filter(|(_, (ignored, selected))| !ignored && *selected)
         .map(|(test, _)| format!("{}{test}", declaration.id_prefix))
         .collect::<BTreeSet<_>>();
     if population.is_empty() {
@@ -512,7 +529,8 @@ fn listed_population(
 
 /// Check the ledger against the population the run will execute and the node's pinned number of
 /// required tests; return the required tests. The backend-proof test must be in the population:
-/// without it nothing shows that the run was on the declared backend.
+/// without it nothing shows that the run was on the declared backend. Every gap row the node runs
+/// must be in it, and no skipped row may be.
 fn plan(
     declaration: &Declaration,
     rows: &[Row],
@@ -529,15 +547,28 @@ fn plan(
             declaration.backend
         ));
     }
-    let gaps = rows
-        .iter()
-        .map(|row| row.id.clone())
-        .collect::<BTreeSet<_>>();
+    let (run, not_run): (Vec<&Row>, Vec<&Row>) = rows.iter().partition(|row| row.outcome.is_run());
+    let ids = |rows: Vec<&Row>| {
+        rows.into_iter()
+            .map(|row| row.id.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    let (gaps, skipped) = (ids(run), ids(not_run));
     let unknown = gaps.difference(population).cloned().collect::<Vec<_>>();
     if !unknown.is_empty() {
         return Err(format!(
             "gap rows name tests the run would not execute: {}",
             unknown.join(", ")
+        ));
+    }
+    let kept = skipped
+        .intersection(population)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !kept.is_empty() {
+        return Err(format!(
+            "skipped rows name tests the run would execute: {}",
+            kept.join(", ")
         ));
     }
     let required = population
@@ -546,10 +577,11 @@ fn plan(
         .collect::<BTreeSet<_>>();
     if required.len() != expected_required {
         return Err(format!(
-            "the suite has {} tests and the ledger {} rows, so {} are required, but the node is pinned to {expected_required} (NEXTEST_EXPECTED_EXECUTED); a deleted row raises the pin, a new test raises it, and a new row needs a bound approval: update the pin with the change that moves it",
+            "the run executes {} tests, {} of them gap rows, so {} are required ({} skipped rows are not run), but the node is pinned to {expected_required} (NEXTEST_EXPECTED_EXECUTED); a deleted row raises the pin, a new test raises it, and a new row needs a bound approval: update the pin with the change that moves it",
             population.len(),
             gaps.len(),
-            required.len()
+            required.len(),
+            skipped.len()
         ));
     }
     Ok(required)
@@ -753,10 +785,14 @@ fn judge(
             ));
         }
     }
+    // A skipped row has no result: the run left it out, and the population check above refuses a
+    // result for any test outside the population.
     let gaps = rows
         .iter()
+        .filter(|row| row.outcome.is_run())
         .map(|row| (row.id.as_str(), row))
         .collect::<BTreeMap<_, _>>();
+    let skipped = rows.len() - gaps.len();
     let ledger = declaration.ledger;
     let backend = declaration.backend;
     let mut out = Vec::with_capacity(results.len());
@@ -861,6 +897,12 @@ fn judge(
                 let expected = match row.outcome {
                     Outcome::Failed => TestAttemptOutcome::Failed,
                     Outcome::CpuTimeout => TestAttemptOutcome::CpuTimeout,
+                    // `gaps` holds only the rows the node runs.
+                    Outcome::Skipped => {
+                        return Err(format!(
+                            "{id} is a skipped row, but the counted run reports a result for it"
+                        ));
+                    }
                 };
                 let output = evidence.outputs.get(&id).map(String::as_str).unwrap_or("");
                 let signature_shown = row
@@ -923,7 +965,7 @@ fn judge(
     }
     let ok = required_failed == 0 && gaps_wrong == 0 && gaps_passing == 0;
     lines.push(format!(
-        "{ledger} on --backend={backend}: {} required test(s), {required_passed} passed and {required_failed} failed; {} gap row(s), {gaps_known} failed as known (KNOWN-KVM-GAP, never counted as passes), {gaps_wrong} failed another way and {gaps_passing} passed; {}",
+        "{ledger} on --backend={backend}: {} required test(s), {required_passed} passed and {required_failed} failed; {} gap row(s) run, {gaps_known} failed as known (KNOWN-KVM-GAP, never counted as passes), {gaps_wrong} failed another way and {gaps_passing} passed; {skipped} skipped row(s) not run (KVM-GAP-SKIPPED); {}",
         required_passed + required_failed,
         gaps_known + gaps_wrong + gaps_passing,
         if ok { "PASS" } else { "FAIL" }
@@ -987,6 +1029,32 @@ fn nextest_list(root: &Path, nextest_args: &[String]) -> Result<serde_json::Valu
         .map_err(|error| format!("the Nextest list is not JSON: {error}"))
 }
 
+/// The Nextest filter expression that leaves the ledger's skipped rows out of the run, each named
+/// exactly by its test function, or `None` when no row is skipped.
+fn skip_filter(declaration: &Declaration, rows: &[Row]) -> Option<String> {
+    let tests = rows
+        .iter()
+        .filter(|row| !row.outcome.is_run())
+        .filter_map(|row| row.test(declaration.id_prefix))
+        .map(|test| format!("test(={test})"))
+        .collect::<Vec<_>>();
+    (!tests.is_empty()).then(|| format!("not ({})", tests.join(" | ")))
+}
+
+/// `nextest_args` with `-E filter` added before any `--`, after which Nextest passes arguments to
+/// the test binaries.
+fn with_filter(nextest_args: &[String], filter: Option<&str>) -> Vec<String> {
+    let mut args = nextest_args.to_vec();
+    if let Some(filter) = filter {
+        let at = args
+            .iter()
+            .position(|argument| argument == "--")
+            .unwrap_or(args.len());
+        args.splice(at..at, ["-E".to_string(), filter.to_string()]);
+    }
+    args
+}
+
 /// `path` with `suffix` appended to its file name.
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
@@ -1041,6 +1109,14 @@ fn run(nextest_args: &[String]) -> Result<bool, String> {
             "{argument}: this node runs every test exactly once; it sets NEXTEST_RETRIES=0 itself"
         ));
     }
+    if let Some(argument) = nextest_args.iter().find(|argument| {
+        matches!(argument.as_str(), "-E" | "--filter-expr")
+            || argument.starts_with("--filter-expr=")
+    }) {
+        return Err(format!(
+            "{argument}: this node chooses its tests itself, the whole suite less the ledger's skipped rows, which it leaves out with its own filter expression"
+        ));
+    }
     let ledger = env::var(known_gaps::LEDGER_ENV).map_err(|_| {
         format!(
             "{} is not set: the node's ledger comes from its environment, which ci/dag/validate.json declares",
@@ -1058,19 +1134,48 @@ fn run(nextest_args: &[String]) -> Result<bool, String> {
     if let Some(errors) = static_violations(declaration, &rows, &tests) {
         return Err(format!("{ledger} breaks its rules:\n{errors}"));
     }
+    let skipped = rows
+        .iter()
+        .filter(|row| !row.outcome.is_run())
+        .collect::<Vec<_>>();
     println!(
-        "kvm-gap-ledger: {ledger}: {} gap row(s) for {} on --backend={}",
+        "kvm-gap-ledger: {ledger}: {} gap row(s) for {} on --backend={}, {} of them skipped",
         rows.len(),
         declaration.node,
-        declaration.backend
+        declaration.backend,
+        skipped.len()
     );
+    for row in &skipped {
+        println!(
+            "KVM-GAP-SKIPPED {} {} {}: not run on --backend={} (approval {})",
+            row.id,
+            row.gap,
+            row.issue,
+            declaration.backend,
+            match &row.approval {
+                known_gaps::Approval::Baseline => known_gaps::BASELINE_APPROVAL,
+                known_gaps::Approval::Url(url) => url.as_str(),
+            }
+        );
+    }
+    let skipped_tests = skipped
+        .iter()
+        .filter_map(|row| row.test(declaration.id_prefix))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let nextest_args = with_filter(nextest_args, skip_filter(declaration, &rows).as_deref());
     let expected_required = env::var("NEXTEST_EXPECTED_EXECUTED")
         .map_err(|_| {
             "NEXTEST_EXPECTED_EXECUTED (the number of required tests) is not set".to_string()
         })?
         .parse::<usize>()
         .map_err(|error| format!("NEXTEST_EXPECTED_EXECUTED: {error}"))?;
-    let population = listed_population(&nextest_list(&root, nextest_args)?, declaration, &tests)?;
+    let population = listed_population(
+        &nextest_list(&root, &nextest_args)?,
+        declaration,
+        &tests,
+        &skipped_tests,
+    )?;
     plan(declaration, &rows, &population, expected_required)?;
     let scratch = env::temp_dir().join(format!(
         "kvm-gap-ledger-{}-{}",
@@ -1096,7 +1201,7 @@ fn run(nextest_args: &[String]) -> Result<bool, String> {
     // A fresh, empty proof: only this run's verified runs can fill it.
     fs::write(&paths.proof, "")
         .map_err(|error| format!("cannot create {}: {error}", paths.proof.display()))?;
-    let mut child = counted_run(&root, declaration, nextest_args, population.len(), &paths)
+    let mut child = counted_run(&root, declaration, &nextest_args, population.len(), &paths)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -1273,6 +1378,18 @@ mod tests {
         known_gaps::parse(&ledger_text(&[])).unwrap()
     }
 
+    /// A skipped row of the example suite, its test `test`.
+    fn skipped_row(test: &str) -> Row {
+        Row {
+            id: id(test),
+            gap: "C".into(),
+            issue: ISSUE.into(),
+            outcome: Outcome::Skipped,
+            signature: None,
+            approval: known_gaps::Approval::Baseline,
+        }
+    }
+
     fn population() -> BTreeSet<String> {
         ["a", "b", "g", "proof", "t2"]
             .iter()
@@ -1385,41 +1502,51 @@ mod tests {
         }
     }
 
-    /// The deadline_slice_cap ledger's rows name their gaps' issues: T2 is
-    /// https://github.com/rrnewton/hermit/issues/4954, the lettered gaps are
-    /// https://github.com/rrnewton/hermit/issues/4929.
+    /// The deadline_slice_cap ledger's rows name their gaps' issues. Its last six rows, the
+    /// lettered gaps of https://github.com/rrnewton/hermit/issues/4929, are skipped on KVM since
+    /// the owner's directive of 2026-11-01 (minibeads dh-j7ocf tracks the fix), each citing the
+    /// issue of its own gap.
     #[test]
     fn the_deadline_slice_cap_rows_name_their_issues() {
         let declaration =
             known_gaps::declaration_for_node("privileged-test.deadline_slice_cap_kvm").unwrap();
         let (rows, _) = read_declared(&repository(), declaration).unwrap();
-        // T2 (578b92a6af) promoted the 15 rows of issue 4954 that now pass;
-        // the five lettered rows of issue 4929 remain, plus the batch-28
-        // gaps (H, J) deselected 2026-10-31 under the approval recorded on
-        // issue 4929 (I was promoted back out at bf80a560a9's validate, J by
-        // the rest of T2's Hermit half, and H is that issue's gap F').
-        assert_eq!(rows.len(), 6);
-        for row in &rows {
-            let issue = if row.gap.starts_with("T2") {
-                "4954"
-            } else {
-                "4929"
-            };
+        let expected = [
+            (
+                "itimer_a_private_descriptor_table_consumer_re_arms",
+                "D",
+                4485,
+            ),
+            ("itimer_a_sigsuspend_loop_takes_every_expiry", "C", 5040),
+            (
+                "itimer_a_wait_mask_is_withdrawn_when_the_wait_returns",
+                "F'",
+                4995,
+            ),
+            (
+                "itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue",
+                "E",
+                4929,
+            ),
+            (
+                "itimer_generation_discard_follows_the_wait_mask",
+                "E+F'",
+                4995,
+            ),
+            ("itimer_mixed_masks_keep_the_timer_running", "G", 4929),
+        ];
+        assert_eq!(rows.len(), expected.len());
+        for (row, (test, gap, issue)) in rows.iter().zip(expected) {
+            assert_eq!(row.test(declaration.id_prefix), Some(test));
+            assert_eq!(row.gap, gap, "{}", row.id);
             assert_eq!(
                 row.issue,
                 format!("https://github.com/rrnewton/hermit/issues/{issue}"),
                 "{}",
                 row.id
             );
+            assert_eq!(row.outcome, Outcome::Skipped, "{}", row.id);
         }
-        // The one CpuTimeout row was a T2 row, promoted by 578b92a6af; the
-        // five remaining rows are all ordinary failures.
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.outcome == Outcome::CpuTimeout)
-                .count(),
-            0
-        );
     }
 
     #[test]
@@ -1442,10 +1569,12 @@ mod tests {
                 .map(|(name, ignored)| (name.to_string(), *ignored))
                 .collect::<BTreeMap<_, _>>()
         };
+        let none = BTreeSet::new();
         let error = listed_population(
             &list,
             &DECLARATION,
             &declared(&[("a", false), ("skipped", true), ("unselected", false)]),
+            &none,
         )
         .unwrap_err();
         assert!(
@@ -1460,7 +1589,8 @@ mod tests {
             listed_population(
                 &whole,
                 &DECLARATION,
-                &declared(&[("a", false), ("skipped", true)])
+                &declared(&[("a", false), ("skipped", true)]),
+                &none,
             )
             .unwrap(),
             [id("a")].into_iter().collect()
@@ -1469,9 +1599,152 @@ mod tests {
             &serde_json::json!({"rust-suites": {}}),
             &DECLARATION,
             &declared(&[("a", false)]),
+            &none,
         )
         .unwrap_err();
         assert!(error.contains("no test binary pkg::suite"), "{error}");
+    }
+
+    /// A skipped row must be left out of the run, and nothing else may be: the population is the
+    /// suite less its ignored tests and exactly the skipped rows.
+    #[test]
+    fn the_population_leaves_out_exactly_the_skipped_rows() {
+        let declared = [("a", false), ("proof", false), ("s", false)]
+            .iter()
+            .map(|(name, ignored)| (name.to_string(), *ignored))
+            .collect::<BTreeMap<_, _>>();
+        let skipped = ["s".to_string()].into_iter().collect::<BTreeSet<_>>();
+        let list = |s: &str, a: &str| {
+            serde_json::json!({"rust-suites": {"pkg::suite": {"testcases": {
+                "a": {"ignored": false, "filter-match": {"status": a}},
+                "proof": {"ignored": false, "filter-match": {"status": "matches"}},
+                "s": {"ignored": false, "filter-match": {"status": s}}
+            }}}})
+        };
+        assert_eq!(
+            listed_population(
+                &list("mismatch", "matches"),
+                &DECLARATION,
+                &declared,
+                &skipped
+            )
+            .unwrap(),
+            [id("a"), id("proof")].into_iter().collect()
+        );
+        // The filter did not leave the skipped row out.
+        let error = listed_population(
+            &list("matches", "matches"),
+            &DECLARATION,
+            &declared,
+            &skipped,
+        )
+        .unwrap_err();
+        assert!(error.contains("Skipped rows selected anyway: s"), "{error}");
+        // It left out a test that is not a skipped row.
+        let error = listed_population(
+            &list("mismatch", "mismatch"),
+            &DECLARATION,
+            &declared,
+            &skipped,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("Not ignored but filtered out: a."),
+            "{error}"
+        );
+        // Without the row, leaving s out is a narrowed run.
+        let error = listed_population(
+            &list("mismatch", "matches"),
+            &DECLARATION,
+            &declared,
+            &BTreeSet::new(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("Not ignored but filtered out: s."),
+            "{error}"
+        );
+    }
+
+    /// The filter names each skipped row exactly, and goes before the test-binary arguments.
+    #[test]
+    fn skipped_rows_are_left_out_by_an_exact_filter() {
+        let mut rows = rows();
+        assert_eq!(skip_filter(&DECLARATION, &rows), None);
+        let args = ["-p".to_string(), "pkg".to_string()];
+        assert_eq!(with_filter(&args, None), args);
+        rows.extend([skipped_row("s1"), skipped_row("s2")]);
+        let filter = skip_filter(&DECLARATION, &rows).unwrap();
+        assert_eq!(filter, "not (test(=s1) | test(=s2))");
+        assert_eq!(
+            with_filter(&args, Some(&filter)),
+            ["-p", "pkg", "-E", filter.as_str()]
+        );
+        let separated = [
+            "-p".to_string(),
+            "--".to_string(),
+            "--nocapture".to_string(),
+        ];
+        assert_eq!(
+            with_filter(&separated, Some(&filter)),
+            ["-p", "-E", filter.as_str(), "--", "--nocapture"]
+        );
+    }
+
+    /// The plan refuses a skipped row in the run, and does not count one as required.
+    #[test]
+    fn the_plan_keeps_skipped_rows_out_of_the_run_and_the_count() {
+        let mut rows = rows();
+        rows.push(skipped_row("s"));
+        // a, b and proof are required; g and t2 are run as gaps; s is not run.
+        assert_eq!(
+            plan(&DECLARATION, &rows, &population(), 3).unwrap().len(),
+            3
+        );
+        let error = plan(&DECLARATION, &rows, &population(), 4).unwrap_err();
+        assert!(error.contains("1 skipped rows are not run"), "{error}");
+        let mut with_s = population();
+        with_s.insert(id("s"));
+        let error = plan(&DECLARATION, &rows, &with_s, 3).unwrap_err();
+        assert!(
+            error.contains("skipped rows name tests the run would execute: pkg::suite$s"),
+            "{error}"
+        );
+    }
+
+    /// A run of a ledger with a skipped row: the row has no result, the node passes, and its
+    /// summary counts the row as not run.
+    #[test]
+    fn a_skipped_row_has_no_result_and_is_counted_as_not_run() {
+        let mut rows = rows();
+        rows.push(skipped_row("s"));
+        let run = expected_run();
+        let verdict = judge(
+            &DECLARATION,
+            &rows,
+            &population(),
+            &Evidence {
+                all: &run.all,
+                status: run.status,
+                ends: &run.ends,
+                outputs: &run.outputs,
+                proof: run.proof.as_deref(),
+            },
+        )
+        .unwrap();
+        assert!(verdict.ok, "{:?}", verdict.lines);
+        let results = verdict.results.results.as_ref().unwrap();
+        assert_eq!(results.len(), 5);
+        assert!(results.iter().all(|result| result.id != id("s")));
+        assert!(
+            verdict
+                .lines
+                .last()
+                .unwrap()
+                .contains("1 skipped row(s) not run (KVM-GAP-SKIPPED); PASS"),
+            "{:?}",
+            verdict.lines
+        );
     }
 
     /// The review's balanced substitution as Nextest would list it: the required test ignored and
@@ -1487,7 +1760,8 @@ mod tests {
             "proof": {"ignored": true, "filter-match": {"status": "matches"}},
             "replacement": {"ignored": false, "filter-match": {"status": "matches"}}
         }}}});
-        let error = listed_population(&substituted, &DECLARATION, &declared).unwrap_err();
+        let error =
+            listed_population(&substituted, &DECLARATION, &declared, &BTreeSet::new()).unwrap_err();
         assert!(
             error.contains("Listed but not declared: replacement"),
             "{error}"
@@ -1497,7 +1771,8 @@ mod tests {
         let missing = serde_json::json!({"rust-suites": {"pkg::suite": {"testcases": {
             "a": {"ignored": false, "filter-match": {"status": "matches"}}
         }}}});
-        let error = listed_population(&missing, &DECLARATION, &declared).unwrap_err();
+        let error =
+            listed_population(&missing, &DECLARATION, &declared, &BTreeSet::new()).unwrap_err();
         assert!(error.contains("Declared but not listed: proof"), "{error}");
     }
 
@@ -1689,7 +1964,7 @@ mod tests {
     }
 
     /// The counted run gets zero retries and the declared backend, and the node refuses an
-    /// argument that would ask for retries.
+    /// argument that would ask for retries, or a filter expression beside its own.
     #[test]
     fn the_counted_run_allows_no_retry() {
         for arguments in [["--retries", "2"].as_slice(), ["--retries=2"].as_slice()] {
@@ -1699,6 +1974,18 @@ mod tests {
                 .collect::<Vec<_>>();
             let error = run(&arguments).unwrap_err();
             assert!(error.contains("exactly once"), "{error}");
+        }
+        for arguments in [
+            ["-E", "all()"].as_slice(),
+            ["--filter-expr", "all()"].as_slice(),
+            ["--filter-expr=all()"].as_slice(),
+        ] {
+            let arguments = arguments
+                .iter()
+                .map(|argument| argument.to_string())
+                .collect::<Vec<_>>();
+            let error = run(&arguments).unwrap_err();
+            assert!(error.contains("chooses its tests itself"), "{error}");
         }
         let paths = RunPaths {
             all: "all.json".into(),

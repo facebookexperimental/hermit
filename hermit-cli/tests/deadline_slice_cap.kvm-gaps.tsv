@@ -1,24 +1,29 @@
 # Known-gap ledger of hermit-cli/tests/deadline_slice_cap.rs on KVM. ci/kvm-gap-ledger.rs reads it
-# for the validation node privileged-test.deadline_slice_cap_kvm, which runs the whole suite on
+# for the validation node privileged-test.deadline_slice_cap_kvm, which runs the suite on
 # --backend=kvm and names this file in its environment (HERMIT_KNOWN_GAP_LEDGER). The format is
 # documented in ci/manifest-plan/src/known_gaps.rs; the receipt qualifier and the scorecard read it.
 #
 # Every test of the suite that is NOT listed here must pass on KVM, so a new test is required on
-# KVM by default. A listed test is a known gap. The node still runs it, and it must fail exactly as
-# its row says: an ordinary failure whose output contains the signature, or a stop by the per-test
-# CPU budget. That failure is a non-blocking diagnostic failure (KNOWN-KVM-GAP), never a pass. A
-# listed test that passes, or fails some other way, fails the node. When a gap is fixed, delete its
-# row, raise the node's pinned count (privileged-test.deadline_slice_cap_kvm in
-# NEXTEST_EXPECTED_COUNTS), and run ./ci/sync-cell-config.sh to refresh the scorecard.
+# KVM by default. A listed test is a known gap, and its row's outcome says what the node does:
+# - failed or cpu_timeout: the node runs it, and it must fail exactly as its row says: an ordinary
+#   failure whose output contains the signature, or a stop by the per-test CPU budget. That
+#   failure is a non-blocking diagnostic failure (KNOWN-KVM-GAP), never a pass. A listed test that
+#   passes, or fails some other way, fails the node.
+# - skipped: the node does not run it. It prints KVM-GAP-SKIPPED for the row and leaves the test
+#   out of its run by name, so nothing shows whether the gap is still there.
+# When a gap is fixed, delete its row (the node then runs the test as a required one), raise the
+# node's pinned count (privileged-test.deadline_slice_cap_kvm in NEXTEST_EXPECTED_COUNTS), and run
+# ./ci/sync-cell-config.sh to refresh the scorecard.
 #
 # A signature is text the failure's output must show; in it \n is a newline, \\ a backslash and
-# <N> any run of digits.
+# <N> any run of digits. A cpu_timeout or skipped row has none: -.
 #
 # The ledger can only shrink; `make lint-checks` (lint-check-known-gap-ledgers) holds it to its
 # history. "baseline" marks a row present, unchanged, since the ledger was introduced, with the
 # coordinator's approval of 2026-10-30. A row added later, or one whose outcome or signature
-# changes, carries the full URL of a specific approving comment, review or commit in its approval
-# field, and its commit message binds that URL to the row with a line
+# changes (turning a row skipped included), carries the full URL of a specific approving comment,
+# review or commit in its approval field, and its commit message binds that URL to the row with a
+# line
 #     KVM-Gap-Approval: <URL> <id>
 # A required test that leaves the suite or is #[ignore]d needs the same with KVM-Required-Removal.
 # The check reads first parents only: put approval lines on commits that land by rebase, not on a
@@ -31,10 +36,24 @@
 # backend gives for them: a thread with a descriptor table of its own, and a ppoll whose temporary
 # mask would have to stay in place across a wait. The T2 rows of
 # https://github.com/rrnewton/hermit/issues/4954 left with KVM's preemption timer.
+#
+# SKIPPED ON KVM SINCE 2026-11-01: all six rows below, by the owner's directive of 2026-11-01,
+# 7:20 PM EST: "Just disable known-failing tests, but make sure a high-priority task is filed to
+# fix them." Until then the node ran them as diagnostics. They still run on ptrace, the suite's
+# other backend, where they pass. The fix is tracked at priority 1 in minibeads dh-j7ocf,
+# https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-j7ocf.md, which lists the six
+# with their causes and the fix plan; each row's issue field is the GitHub issue of its own gap.
+# Each row's approval is the coordinator's commit that filed dh-j7ocf under that directive.
 id	gap	issue	outcome	signature	approval
-hermit-run::deadline_slice_cap$itimer_a_private_descriptor_table_consumer_re_arms	D	https://github.com/rrnewton/hermit/issues/4929	failed	"privfd" "5000"\nstatus: exit status: 122\nstdout:\n\nstderr:	https://github.com/rrnewton/hermit/issues/4929#issuecomment-6552352070
-hermit-run::deadline_slice_cap$itimer_a_sigsuspend_loop_takes_every_expiry	C	https://github.com/rrnewton/hermit/issues/4929	failed	failed: deliveries=	baseline
-hermit-run::deadline_slice_cap$itimer_a_wait_mask_is_withdrawn_when_the_wait_returns	F'	https://github.com/rrnewton/hermit/issues/4929	failed	"stale" "ppoll_mask"\nstatus: exit status: 122	https://github.com/rrnewton/hermit/issues/4929#issuecomment-6552352070
-hermit-run::deadline_slice_cap$itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue	E	https://github.com/rrnewton/hermit/issues/4929	failed	failed: ignored_remaining_us=	baseline
-hermit-run::deadline_slice_cap$itimer_generation_discard_follows_the_wait_mask	E+F'	https://github.com/rrnewton/hermit/issues/4929	failed	failed: poll: result=0 first_us=	baseline
-hermit-run::deadline_slice_cap$itimer_mixed_masks_keep_the_timer_running	G	https://github.com/rrnewton/hermit/issues/4929	failed	\npositive=<N> samples=20 progress=<N>\n\nnote: run with	baseline
+# D: KVM refuses a thread clone without CLONE_FS|CLONE_FILES, a named refusal. Skipped on KVM; the fix is tracked in minibeads dh-j7ocf, https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-j7ocf.md
+hermit-run::deadline_slice_cap$itimer_a_private_descriptor_table_consumer_re_arms	D	https://github.com/rrnewton/hermit/issues/4485	skipped	-	https://github.com/rrnewton/dev-hermit-beads/commit/81d9a9e92e752b9ad45be0799cec1557ebdeb3b8
+# C: KVM's rt_sigsuspend does not sleep, so 1 of 20 deliveries arrives. Skipped on KVM; the fix is tracked in minibeads dh-j7ocf, https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-j7ocf.md
+hermit-run::deadline_slice_cap$itimer_a_sigsuspend_loop_takes_every_expiry	C	https://github.com/rrnewton/hermit/issues/5040	skipped	-	https://github.com/rrnewton/dev-hermit-beads/commit/81d9a9e92e752b9ad45be0799cec1557ebdeb3b8
+# F': KVM's masked ppoll cannot keep its mask across a wait, a named refusal. Skipped on KVM; the fix is tracked in minibeads dh-j7ocf, https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-j7ocf.md
+hermit-run::deadline_slice_cap$itimer_a_wait_mask_is_withdrawn_when_the_wait_returns	F'	https://github.com/rrnewton/hermit/issues/4995	skipped	-	https://github.com/rrnewton/dev-hermit-beads/commit/81d9a9e92e752b9ad45be0799cec1557ebdeb3b8
+# E: an ignored expiry is queued instead of discarded. Skipped on KVM; the fix is tracked in minibeads dh-j7ocf, https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-j7ocf.md
+hermit-run::deadline_slice_cap$itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue	E	https://github.com/rrnewton/hermit/issues/4929	skipped	-	https://github.com/rrnewton/dev-hermit-beads/commit/81d9a9e92e752b9ad45be0799cec1557ebdeb3b8
+# E+F': needs the ignored-expiry fix and a masked ppoll that waits. Skipped on KVM; the fix is tracked in minibeads dh-j7ocf, https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-j7ocf.md
+hermit-run::deadline_slice_cap$itimer_generation_discard_follows_the_wait_mask	E+F'	https://github.com/rrnewton/hermit/issues/4995	skipped	-	https://github.com/rrnewton/dev-hermit-beads/commit/81d9a9e92e752b9ad45be0799cec1557ebdeb3b8
+# G: the scheduler does not schedule the alarm's eligible recipient. Skipped on KVM; the fix is tracked in minibeads dh-j7ocf, https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-j7ocf.md
+hermit-run::deadline_slice_cap$itimer_mixed_masks_keep_the_timer_running	G	https://github.com/rrnewton/hermit/issues/4929	skipped	-	https://github.com/rrnewton/dev-hermit-beads/commit/81d9a9e92e752b9ad45be0799cec1557ebdeb3b8
