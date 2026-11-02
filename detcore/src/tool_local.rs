@@ -6064,6 +6064,34 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) exe: Option<Arc<crate::exec_record::ExecRecord>>,
 
+    /// The effective user and group ids Linux gives Detcore's virtual root at
+    /// the exec this thread has in flight, as Detcore decided them from the
+    /// image's set-id bits before the exec (`Detcore::exec_effective_ids`);
+    /// anything but (0, 0) is an exec Linux runs in secure-execution mode.
+    /// Taken at the new image's first callback, which compares it with the
+    /// image's own `AT_SECURE` (`crate::secure_exec::outcome`) and applies
+    /// `commit_creds`'s rule (`crate::commit_creds`), and dropped when the
+    /// exec fails. `None` where nothing decided it.
+    #[serde(skip)]
+    pub(crate) exec_effective_ids: Option<(u32, u32)>,
+
+    /// This thread's permitted capability set when its exec in flight
+    /// started, read with an injected `capget` only where Detcore then held a
+    /// parent-death signal for it (`holds_parent_death_signal`), the one thing
+    /// `commit_creds`'s comparison at the new image's first callback can
+    /// clear. Dropped when the exec fails.
+    #[serde(skip)]
+    pub(crate) exec_permitted_before: Option<u64>,
+
+    /// Whether Detcore holds a nonzero parent-death signal for this thread,
+    /// as the scheduler last answered it (`tool_global::parent_death_signal`,
+    /// through which every change to it goes). Only the thread itself changes
+    /// its own value (Linux's `pdeath_signal` is per task: arming, a
+    /// credential change and an exec are all the task's own acts, and a new
+    /// task starts with none), so the answer stays current between calls.
+    #[serde(skip)]
+    pub(crate) holds_parent_death_signal: bool,
+
     /// The identity of the descriptor table this thread's process holds:
     /// the one its thread-group leader holds now, which procfs reads for
     /// the process's descriptor links (`/proc/self/fd/N`, `/proc/<pid>/fd/N`,
@@ -6102,6 +6130,21 @@ pub struct ThreadState<T> {
 
     /// Parent process accounting notified when this process leader exits.
     pub(crate) parent_process_cpu_time: Option<Arc<Mutex<ProcessCpuTime>>>,
+
+    /// The process accounting that holds each child process's birth-owned
+    /// final-CPU publication (`ProcessCpuTime::child_cpu_publications`),
+    /// shared by every task in this process tree, as the guest clock is. A
+    /// child's publication starts in its creator's accounting
+    /// (`prepare_child_cpu_publication`). When an exit re-parents the child
+    /// (`Scheduler::reparent_orphans`), the process whose wait the scheduler
+    /// selects it for takes the publication over
+    /// (`adopt_child_cpu_publication`), and the child's exit records into
+    /// whichever accounting holds it then
+    /// (`record_exited_child_process_cpu_time`). Only the backends whose
+    /// waits Detcore completes from these publications (`emulates_child_waits`)
+    /// register children here.
+    #[serde(skip)]
+    pub(crate) child_cpu_owners: Arc<Mutex<BTreeMap<DetPid, Arc<Mutex<ProcessCpuTime>>>>>,
 
     /// Actual sequential KVM child's birth-owned publication capability.
     #[serde(skip)]
@@ -7046,7 +7089,14 @@ impl<T> ThreadState<T> {
 
     pub(crate) fn record_exited_child_process_cpu_time(&mut self, pid: DetPid) -> bool {
         self.account_process_cpu_time();
-        let Some(parent) = &self.parent_process_cpu_time else {
+        // The accounting that holds this process's publication now: a
+        // re-parented process's new parent took it over
+        // (`adopt_child_cpu_publication`). The registry stays locked through
+        // the record, so a takeover cannot pass between the lookup and it.
+        let owners = Arc::clone(&self.child_cpu_owners);
+        let owners = owners.lock().expect("child CPU owners mutex poisoned");
+        let holder = owners.get(&pid).cloned();
+        let Some(parent) = holder.as_ref().or(self.parent_process_cpu_time.as_ref()) else {
             return true;
         };
         let child = self
@@ -7068,6 +7118,8 @@ impl<T> ThreadState<T> {
             }
             parent.record_exited_child(pid, child);
         }
+        // No waker runs under the registry's lock either.
+        drop(owners);
         if let Some(publication) = &self.parent_cpu_publication {
             publication.finish(true);
         }
@@ -7079,11 +7131,16 @@ impl<T> ThreadState<T> {
     pub(crate) fn prepare_child_cpu_publication(&self, pid: DetPid) -> Arc<ChildCpuPublication> {
         let publication = ChildCpuPublication::pending();
         let previous = {
+            let mut owners = self
+                .child_cpu_owners
+                .lock()
+                .expect("child CPU owners mutex poisoned");
             let mut parent = self
                 .process_cpu_time
                 .lock()
                 .expect("process CPU time mutex poisoned");
             parent.prepare_child(pid);
+            owners.insert(pid, Arc::clone(&self.process_cpu_time));
             parent
                 .child_cpu_publications
                 .insert(pid, Arc::clone(&publication))
@@ -7094,7 +7151,46 @@ impl<T> ThreadState<T> {
         publication
     }
 
+    /// Take over `pid`'s final-CPU publication, and the snapshot already
+    /// recorded for it, from the accounting that holds it
+    /// (`child_cpu_owners`), when this process does not hold it: an exit
+    /// re-parented `pid` to this process, and the scheduler selected it for
+    /// this process's wait. Linux adds a reaped child's times to its reaper's
+    /// (`wait_task_zombie`), whoever created it. The choice of parent is the
+    /// scheduler's; this only moves the record to the waiting process.
+    fn adopt_child_cpu_publication(&self, pid: DetPid) {
+        let mut owners = self
+            .child_cpu_owners
+            .lock()
+            .expect("child CPU owners mutex poisoned");
+        let Some(holder) = owners.get(&pid).cloned() else {
+            return;
+        };
+        if Arc::ptr_eq(&holder, &self.process_cpu_time) {
+            return;
+        }
+        let (publication, snapshot) = {
+            let mut holder = holder.lock().expect("process CPU time mutex poisoned");
+            let Some(publication) = holder.child_cpu_publications.remove(&pid) else {
+                return;
+            };
+            (publication, holder.exited_children.remove(&pid))
+        };
+        {
+            let mut own = self
+                .process_cpu_time
+                .lock()
+                .expect("process CPU time mutex poisoned");
+            own.child_cpu_publications.insert(pid, publication);
+            if let Some(snapshot) = snapshot {
+                own.exited_children.insert(pid, snapshot);
+            }
+        }
+        owners.insert(pid, Arc::clone(&self.process_cpu_time));
+    }
+
     pub(crate) async fn wait_for_child_cpu_publication(&self, pid: DetPid) -> bool {
+        self.adopt_child_cpu_publication(pid);
         let publication = {
             let parent = self
                 .process_cpu_time
@@ -7147,6 +7243,18 @@ impl<T> ThreadState<T> {
                 None
             }
         };
+        if publication.is_some() {
+            let mut owners = self
+                .child_cpu_owners
+                .lock()
+                .expect("child CPU owners mutex poisoned");
+            if owners
+                .get(&pid)
+                .is_some_and(|holder| Arc::ptr_eq(holder, &self.process_cpu_time))
+            {
+                owners.remove(&pid);
+            }
+        }
         if let Some(publication) = publication {
             publication.finish(false);
         }
@@ -7216,6 +7324,9 @@ impl<T> ThreadState<T> {
             changed_root: Default::default(),
             fs_apart_from_leader: false,
             exe: None,
+            exec_effective_ids: None,
+            exec_permitted_before: None,
+            holds_parent_death_signal: false,
             process_files,
             posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
             resource_limits: Arc::new(Mutex::new(ResourceLimits::default())),
@@ -7223,6 +7334,7 @@ impl<T> ThreadState<T> {
             guest_clock: Arc::new(Mutex::new(GuestClock::default())),
             unix_connections: Default::default(),
             parent_process_cpu_time: None,
+            child_cpu_owners: Default::default(),
             parent_cpu_publication: None,
             restart_block: None,
             syscall_cwd: None,
@@ -10177,6 +10289,67 @@ mod timeslice_tests {
         assert!(!parent.wait_for_child_cpu_publication(child).await);
         assert!(!current_child.record_exited_child_process_cpu_time(child));
         assert!(!parent.has_exited_child_process_cpu_time(child));
+    }
+
+    /// An exit re-parents a child whose final-CPU publication its creator
+    /// holds; the reaper whose wait the scheduler selects it for takes the
+    /// publication over, with the snapshot an exited child already recorded,
+    /// and reaps the child's times into its own, as Linux's
+    /// `wait_task_zombie` adds them to the reaper's. A child that exits after
+    /// the takeover records into the reaper too.
+    #[tokio::test]
+    async fn a_reparented_childs_cpu_publication_moves_to_the_reaper_that_waits() {
+        use std::future::Future;
+        use std::task::Context;
+
+        let cfg = Config::default();
+        for exits_first in [true, false] {
+            let child = DetPid::from_raw(7);
+            let creator = ThreadState::new(DetPid::from_raw(5), &cfg, ());
+            let mut reaper = ThreadState::new(DetPid::from_raw(3), &cfg, ());
+            reaper.child_cpu_owners = Arc::clone(&creator.child_cpu_owners);
+            let token = creator.prepare_child_cpu_publication(child);
+            let mut orphan = ThreadState::new(child, &cfg, ());
+            orphan.child_cpu_owners = Arc::clone(&creator.child_cpu_owners);
+            orphan.parent_process_cpu_time = Some(Arc::clone(&creator.process_cpu_time));
+            orphan.parent_cpu_publication = Some(Arc::clone(&token));
+            orphan.process_cpu_time.lock().unwrap().snapshot = cpu_snapshot(10, 20, 3, 4);
+            if exits_first {
+                assert!(orphan.record_exited_child_process_cpu_time(child));
+                assert!(reaper.wait_for_child_cpu_publication(child).await);
+            } else {
+                let mut wait = Box::pin(reaper.wait_for_child_cpu_publication(child));
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                assert!(wait.as_mut().poll(&mut cx).is_pending());
+                assert!(orphan.record_exited_child_process_cpu_time(child));
+                assert!(wait.await);
+            }
+            assert!(
+                reaper.has_exited_child_process_cpu_time(child),
+                "{exits_first}"
+            );
+            {
+                let creator = creator.process_cpu_time.lock().unwrap();
+                assert!(!creator.child_cpu_publications.contains_key(&child));
+                assert!(!creator.exited_children.contains_key(&child));
+            }
+            let recorded = reaper.process_cpu_time.lock().unwrap().exited_children[&child];
+            assert!(recorded.user >= LogicalTime::from_nanos(10));
+            reaper.reap_child_process_cpu_time(child);
+            let after = reaper.process_cpu_time.lock().unwrap().snapshot;
+            assert_eq!(after.children_user, recorded.user + recorded.children_user);
+            assert_eq!(
+                after.children_system,
+                recorded.system + recorded.children_system
+            );
+            assert!(
+                !creator
+                    .child_cpu_owners
+                    .lock()
+                    .unwrap()
+                    .contains_key(&child)
+            );
+        }
     }
 
     fn nz(value: u64) -> Option<NonZeroU64> {

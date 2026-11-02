@@ -17,12 +17,14 @@
  * the processes below it instead of letting them reparent to init. That rewires
  * the process-reaping hierarchy, which Hermit's deterministic container owns
  * and models directly. On the backends whose wait model does not re-parent
- * orphans (SaBRe, KVM, DBT, LiteInst, in-guest-trap), Hermit refuses to let a
+ * orphans (SaBRe, DBT, LiteInst, in-guest-trap), Hermit refuses to let a
  * guest mutate or query the subreaper attribute: both prctl requests fail with
  * a deterministic ENOSYS. The ptrace backend supports them since
  * https://github.com/rrnewton/hermit/pull/4000, where Detcore re-parents
- * orphans to the subreaper; tests/c/child_subreaper_support.c covers that.
- * Outside Hermit the same calls succeed.
+ * orphans to the subreaper, and so does KVM, whose process signal control
+ * places each orphan where Detcore's re-parenting names;
+ * tests/c/child_subreaper_support.c covers both. Outside Hermit the same calls
+ * succeed.
  *
  * This contract asserts that refusal only -- PR_SET_CHILD_SUBREAPER and
  * PR_GET_CHILD_SUBREAPER must each return -1 with errno == ENOSYS. It never

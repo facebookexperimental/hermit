@@ -9,6 +9,7 @@
 //! scheduler daemon moves its queue entry; RPC handlers post bounded intents.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::VecDeque;
 
 use reverie::CallbackSignalSite;
@@ -301,6 +302,16 @@ pub(super) struct ParkedRequests {
     /// due time for the sleep's remaining time
     /// (https://github.com/rrnewton/hermit/issues/4931).
     pub(super) observed_timer_dequeues: BTreeMap<DetTid, ObservedTimerDequeue>,
+    /// The parent-death signals (a kernel sigset) Detcore published to each
+    /// live process through the control (`publish_parent_death_signal`),
+    /// which `select_parked_alarm` asks the backend's recipients for, beside
+    /// `SIGALRM`, so that one interrupts a parked wait as a timer's does.
+    /// Kept until the process's last thread leaves: a signal no longer
+    /// pending has no recipients.
+    pub published_parent_death_signals: BTreeMap<DetPid, u64>,
+    /// The exits whose orphans a placing backend has been asked to place
+    /// (`Scheduler::place_orphans_in_backend`), each once.
+    pub placed_exits: BTreeSet<ProcessGeneration>,
 }
 
 /// A timer expiration published through the control and not yet dequeued.
@@ -1296,9 +1307,85 @@ impl Scheduler {
         }
     }
 
+    /// Publishes a parent-death signal that Detcore decided where a thread
+    /// left (`Scheduler::deliver_parent_death_signals`), through the installed
+    /// control, at the drain that sends it (`flush_parent_death_signals`). It
+    /// goes to the whole child process as Linux's `forget_original_parent`
+    /// sends it, with `group_send_sig_info(SEND_SIG_NOINFO, PIDTYPE_TGID)`:
+    /// `SI_USER`, `si_pid` the thread group of the thread that left, and
+    /// `si_uid` that thread's real user ID, which is 0 for every guest task.
+    /// The publication commits under the scheduler lock at a fixed point of
+    /// the schedule, and a parked waiter it should interrupt is found as a
+    /// timer expiration's is, by the recipients the backend reports for the
+    /// pending signal (`select_parked_alarm`). A refused publication ends the
+    /// run as a backend failure; one that failed after committing is
+    /// forwarded (`flush_signal_failures`).
+    pub(super) fn publish_parent_death_signal(&mut self, pending: super::PendingParentDeathSignal) {
+        if let Err(failure) = self.try_publish_parent_death_signal(pending) {
+            tracing::error!(
+                "[scheduler] publishing parent-death signal {} to process {} failed: {:?}",
+                pending.signal,
+                pending.child,
+                failure
+            );
+            if let Some(wake) =
+                self.report_backend_failure_location(super::BackendFailureLocation {
+                    pid: reverie::Pid::from_raw(pending.child.as_raw()),
+                    tid: None,
+                    phase: "KVM parent-death signal publication",
+                })
+            {
+                self.parked.failure_wakes.push(wake);
+                self.parked.wake.try_put(());
+            }
+        }
+    }
+
+    fn try_publish_parent_death_signal(
+        &mut self,
+        pending: super::PendingParentDeathSignal,
+    ) -> Result<(), ProtocolFailure> {
+        let process = self.real_timers.process_identity(pending.child)?;
+        let control = self
+            .parked
+            .control
+            .clone()
+            .ok_or(ProtocolFailure::Identity)?;
+        let signo = pending.signal as libc::c_int;
+        let mut siginfo = [0; 128];
+        siginfo[..4].copy_from_slice(&signo.to_ne_bytes());
+        siginfo[8..12].copy_from_slice(&libc::SI_USER.to_ne_bytes());
+        // `si_pid` and `si_uid`, the fields of the kernel's `_kill` member.
+        siginfo[16..20].copy_from_slice(&pending.sender.as_raw().to_ne_bytes());
+        siginfo[20..24].copy_from_slice(&0_u32.to_ne_bytes());
+        let event = SignalEvent::new(signo, siginfo, SignalTarget::Process { pid: process.tgid })
+            .map_err(|_| ProtocolFailure::Identity)?;
+        match control.process.publish_parent_death_signal(process, event) {
+            ProcessSignalPublicationResult::Committed(_) => {}
+            ProcessSignalPublicationResult::FailedAfterCommit { .. } => {
+                self.parked.failures.push(process);
+            }
+            ProcessSignalPublicationResult::RejectedBeforeCommit(_) => {
+                return Err(ProtocolFailure::Identity);
+            }
+        }
+        *self
+            .parked
+            .published_parent_death_signals
+            .entry(pending.child)
+            .or_default() |= kernel_signal_bit(signo);
+        Ok(())
+    }
+
     /// Called by the daemon only after the quiescent due-event drain. Backend
     /// membership is intersected with ordered scheduler admission and actual
     /// operation capabilities; host callback arrival is never a tie breaker.
+    ///
+    /// The signals asked about are a process's `SIGALRM`, then, in signal
+    /// order, the parent-death signals Detcore published to it
+    /// (`published_parent_death_signals`): the backend reports the threads
+    /// that could take each one now, and the first eligible parked one, in
+    /// that order, is woken to take it.
     pub(super) fn select_parked_alarm(&mut self) -> Result<(), SelectionFailure> {
         let Some(control) = self.parked.control.clone() else {
             return Ok(());
@@ -1332,86 +1419,100 @@ impl Scheduler {
             {
                 continue;
             }
-            let recipients = control
-                .process
-                .alarm_recipients(process)
+            let published = self
+                .parked
+                .published_parent_death_signals
+                .get(&pid)
+                .copied()
+                .unwrap_or(0);
+            let signals = std::iter::once(libc::SIGALRM).chain((1..=31).filter(|signal| {
+                *signal != libc::SIGALRM && published & kernel_signal_bit(*signal) != 0
+            }));
+            'signals: for signal in signals {
+                let recipients = if signal == libc::SIGALRM {
+                    control.process.alarm_recipients(process)
+                } else {
+                    control.process.signal_recipients(process, signal)
+                }
                 .map_err(|_| process_failure(ProtocolFailure::Identity))?;
-            for recipient in recipients {
-                let tid = DetTid::from_raw(recipient.task.tid.as_raw());
-                let Some((mm, identity)) = self.real_timers.task_identity(pid, tid) else {
-                    continue;
-                };
-                if identity != recipient.task
-                    || !self.rpc_incarnation_matches(tid, mm)
-                    || self.thread_is_logically_killed(tid)
-                    || self.parked.permits.contains_key(&tid)
-                {
-                    continue;
-                }
-                let Some(turn) = self.next_turns.get(&tid) else {
-                    continue;
-                };
-                if turn.protocol.owner != NextTurnOwner::Ordinary {
-                    continue;
-                }
-                let Some(origin) = turn.protocol.origin else {
-                    continue;
-                };
-                let deadline = match origin.control {
-                    ControlCapability::ParkedWait { policy, .. } => match policy {
-                        ParkedWaitPolicy::NanosleepNoHandlerRestart { absolute_deadline } => {
-                            absolute_deadline
-                        }
-                        ParkedWaitPolicy::PauseNoHandlerRestart => LogicalTime::INDEFINITE,
-                    },
-                    ControlCapability::PolledRead { .. } => LogicalTime::INDEFINITE,
-                    ControlCapability::ChildWait { .. } => {
-                        let Some(Ok(resources)) = turn.req.try_read() else {
-                            continue;
-                        };
-                        let (parent, spec) = self
-                            .validate_child_wait_resources(tid, &resources)
-                            .map_err(|failure| SelectionFailure {
-                                pid,
-                                tid: Some(tid),
-                                failure,
-                            })?;
-                        self.validate_membership(tid, Some((parent, spec)))
-                            .map_err(|failure| SelectionFailure {
-                                pid,
-                                tid: Some(tid),
-                                failure,
-                            })?;
-                        // Selection and readiness are tested under the same
-                        // scheduler lock, before reserving/dequeuing a signal.
-                        // A ready child or ECHILD wins this wait's completion.
-                        if self.ready_child_wait(parent, spec).is_some()
-                            || !self.has_child_wait_target(parent, spec)
-                        {
-                            // A selector change can leave a blocked waiter
-                            // without a matching child. Admit its original
-                            // request so ordinary completion can actually win.
-                            if self.blocked.child_waiters.remove(&tid).is_some() {
-                                self.runqueue_push_back(tid);
-                            }
-                            continue;
-                        }
-                        LogicalTime::INDEFINITE
+                for recipient in recipients {
+                    let tid = DetTid::from_raw(recipient.task.tid.as_raw());
+                    let Some((mm, identity)) = self.real_timers.task_identity(pid, tid) else {
+                        continue;
+                    };
+                    if identity != recipient.task
+                        || !self.rpc_incarnation_matches(tid, mm)
+                        || self.thread_is_logically_killed(tid)
+                        || self.parked.permits.contains_key(&tid)
+                    {
+                        continue;
                     }
-                    _ => continue,
-                };
-                if deadline <= self.committed_time || turn.req.is_empty() || turn.resp.is_full() {
-                    continue;
+                    let Some(turn) = self.next_turns.get(&tid) else {
+                        continue;
+                    };
+                    if turn.protocol.owner != NextTurnOwner::Ordinary {
+                        continue;
+                    }
+                    let Some(origin) = turn.protocol.origin else {
+                        continue;
+                    };
+                    let deadline = match origin.control {
+                        ControlCapability::ParkedWait { policy, .. } => match policy {
+                            ParkedWaitPolicy::NanosleepNoHandlerRestart { absolute_deadline } => {
+                                absolute_deadline
+                            }
+                            ParkedWaitPolicy::PauseNoHandlerRestart => LogicalTime::INDEFINITE,
+                        },
+                        ControlCapability::PolledRead { .. } => LogicalTime::INDEFINITE,
+                        ControlCapability::ChildWait { .. } => {
+                            let Some(Ok(resources)) = turn.req.try_read() else {
+                                continue;
+                            };
+                            let (parent, spec) = self
+                                .validate_child_wait_resources(tid, &resources)
+                                .map_err(|failure| SelectionFailure {
+                                    pid,
+                                    tid: Some(tid),
+                                    failure,
+                                })?;
+                            self.validate_membership(tid, Some((parent, spec)))
+                                .map_err(|failure| SelectionFailure {
+                                    pid,
+                                    tid: Some(tid),
+                                    failure,
+                                })?;
+                            // Selection and readiness are tested under the same
+                            // scheduler lock, before reserving/dequeuing a signal.
+                            // A ready child or ECHILD wins this wait's completion.
+                            if self.ready_child_wait(parent, spec).is_some()
+                                || !self.has_child_wait_target(parent, spec)
+                            {
+                                // A selector change can leave a blocked waiter
+                                // without a matching child. Admit its original
+                                // request so ordinary completion can actually win.
+                                if self.blocked.child_waiters.remove(&tid).is_some() {
+                                    self.runqueue_push_back(tid);
+                                }
+                                continue;
+                            }
+                            LogicalTime::INDEFINITE
+                        }
+                        _ => continue,
+                    };
+                    if deadline <= self.committed_time || turn.req.is_empty() || turn.resp.is_full()
+                    {
+                        continue;
+                    }
+                    // Other wait families remain pending for their existing return
+                    // boundary; this does not claim that their interruption works.
+                    self.begin_alarm_observation(pid, tid, recipient.task)
+                        .map_err(|failure| SelectionFailure {
+                            pid,
+                            tid: Some(tid),
+                            failure,
+                        })?;
+                    break 'signals;
                 }
-                // Other wait families remain pending for their existing return
-                // boundary; this does not claim that their interruption works.
-                self.begin_alarm_observation(pid, tid, recipient.task)
-                    .map_err(|failure| SelectionFailure {
-                        pid,
-                        tid: Some(tid),
-                        failure,
-                    })?;
-                break;
             }
         }
         Ok(())

@@ -49585,11 +49585,29 @@ fn a_wait_for_a_child_that_cannot_exit_is_a_deadlock() {
 /// adopts, also when the thread is torn down by its process's exit_group. Its
 /// default action ends a paused child, and a caught one wakes the pause and
 /// runs its handler; `PR_GET_PDEATHSIG` reads it back, a forked child starts
-/// with none, and an invalid value leaves the armed one. A thread that execs
-/// survives as its process's leader, so its children are sent nothing. Before, the kernel sent it at a host-timed
-/// moment that Hermit held off the child's wait, so the run hung until the
-/// timeout (https://github.com/rrnewton/hermit/issues/4440). Each mode at L2
-/// (ptrace).
+/// with none, and an invalid value leaves the armed one. (A SIGKILL one is
+/// left out here: on ptrace the kernel sends it, at a moment host timing
+/// sets, and the child's death reaches Detcore then; KVM's test covers it.)
+/// A stop signal, a real-time signal and SIGCHLD are accepted and read back,
+/// as Linux accepts every signal from 1 to 64. A thread that execs survives
+/// as its process's leader, so its children are sent nothing. A creator
+/// thread's exit gives its children to the main thread, whose `__WNOTHREAD`
+/// wait reaps them, and a credential setter that moves an effective or
+/// filesystem id clears the signal (natively as root, under `podman
+/// unshare`). A set-group-ID exec is ordinary here: Hermit's namespace maps
+/// no other group, and outside it the ptrace guest has `no_new_privs`, which
+/// also keeps an exec from giving back a dropped capability. A
+/// child whose leader armed the signal and left while a worker lives on
+/// still gets it (Linux keeps the zombie leader on the thread list); each
+/// exit of an adopting subreaper sends it again, and so does the exit of the
+/// thread that became the parent when the creating thread left; a child
+/// waiting on a futex takes it there.
+/// Before, the kernel sent the signal at a host-timed moment that Hermit held
+/// off the child's wait, so the run hung until the timeout
+/// (https://github.com/rrnewton/hermit/issues/4440). The modes of the first
+/// list run at L2 (ptrace) with the guest's native output; the capexec modes
+/// pin a known divergence, and tightexec and tightcap a named refusal, as the
+/// comments below say.
 #[test]
 fn a_parent_death_signal_reaches_the_child_when_its_parent_thread_leaves() {
     let guest = parent_death_signal_guest().to_str().unwrap().to_owned();
@@ -49604,7 +49622,45 @@ fn a_parent_death_signal_reaches_the_child_when_its_parent_thread_leaves() {
             "invalid",
             "invalid: get 15 einval 1\ninvalid: child signal 15\n",
         ),
+        ("stop", "stop: rc 0 errno 0 armed 1\n"),
+        ("realtime", "realtime: rc 0 errno 0 armed 1\n"),
+        ("sigchld", "sigchld: rc 0 errno 0 armed 1\n"),
+        ("nothread", "nothread: child exit 7\n"),
+        ("setid", PARENT_DEATH_SETID_OUTPUT),
+        ("zombieleader", "zombieleader: child exit 7\n"),
+        ("resend", "resend: child exit 2\n"),
+        ("threadresend", "threadresend: child exit 2\n"),
+        ("futex", "futex: child signal 15\n"),
     ] {
+        assert_parent_death_mode_verifies(&[], &["--timeout", "60"], &guest, &[mode], expected);
+    }
+    // The ptrace guest has `no_new_privs`, so an exec gives back none of the
+    // capabilities it dropped (`cap_bprm_creds_from_file` keeps the permitted
+    // set within the old one) and the signal stays, as Linux keeps it for
+    // such a task; KVM's test and native root show the growth. A known gap
+    // is pinned here, so that this flips when it closes and the two modes
+    // move to the L2 list above: Linux clears `ADDR_NO_RANDOMIZE` at an exec
+    // that would gain capabilities, so the new image's layout is random and
+    // strict verification diverges. The pin is that divergence only: both
+    // runs' outputs are equal and the expected ones, and the first divergent
+    // record is a syscall whose two sides differ only in address-sized
+    // numbers, the new image's layout. (Which syscall depends on the guest's
+    // C library: glibc 2.34's first `arch_prctl`, whose buffer is on the
+    // stack, or glibc 2.42's first `brk` result, so the name is not pinned.)
+    // A host that randomizes no layout (`kernel.randomize_va_space` 0) cannot
+    // show the gap, so there the runs match.
+    let randomizes = !matches!(
+        fs::read_to_string("/proc/sys/kernel/randomize_va_space")
+            .as_deref()
+            .map(str::trim),
+        Ok("0")
+    );
+    let (expected_exit, expected_verdict) = if randomizes {
+        (hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT, "diverged")
+    } else {
+        (0, "matched")
+    };
+    for mode in ["capexec", "capexecall"] {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let verdict = directory.path().join("verify.json");
         let verdict_arg = format!("--verify-json={}", verdict.display());
@@ -49629,23 +49685,387 @@ fn a_parent_death_signal_reaches_the_child_when_its_parent_thread_leaves() {
             .expect("failed to read the guest's stdout");
         assert_eq!(
             status.and_then(|status| status.code()),
-            Some(0),
-            "{mode}: {stdout}\n{log}"
+            Some(expected_exit),
+            "{mode}: expected a {expected_verdict} run; has the layout gap closed? {log}"
         );
-        assert_eq!(stdout, expected, "{mode}: {log}");
+        assert_eq!(
+            stdout,
+            format!("{mode}: regained 0 armed 10 at_secure 0\n"),
+            "{mode}: {log}"
+        );
         let report: serde_json::Value = serde_json::from_slice(
             &fs::read(&verdict)
                 .unwrap_or_else(|error| panic!("{mode}: no verdict: {error}\n{log}")),
         )
         .unwrap_or_else(|error| panic!("{mode}: unreadable verdict: {error}"));
-        let compared = &report["compared_log_messages"];
+        assert_eq!(
+            report["verdict"], expected_verdict,
+            "{mode}: {report}\n{log}"
+        );
+        let outputs = &report["compared_outputs"];
         assert!(
-            report["bitwise_parity"] == true
-                && compared["left"].as_u64().is_some_and(|count| count > 0)
-                && compared["left"] == compared["right"],
-            "{mode}: no bitwise parity over equal, nonzero INFO counts: {report}\n{log}"
+            outputs["left"].is_object() && outputs["left"] == outputs["right"],
+            "{mode}: the two runs' outputs differ: {report}\n{log}"
+        );
+        if randomizes {
+            let left = report["first_divergent_left_message"]
+                .as_str()
+                .unwrap_or_default();
+            let right = report["first_divergent_right_message"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                left.contains("DETLOG [syscall]")
+                    && left != right
+                    && without_addresses(left) == without_addresses(right),
+                "{mode}: the first divergence is not the new image's layout:\n{left}\n{right}"
+            );
+        }
+    }
+    // An exec from a stack with no scratch free below the red zone, while
+    // Detcore holds the signal: Detcore cannot read the permitted set to
+    // apply `commit_creds`'s rule, so it refuses the exec by name rather than
+    // keep a signal Linux might clear, whether the exec would grow the set
+    // (tightcap) or not (tightexec). Natively they print "tightcap: regained
+    // 1 armed 0 at_secure 0" and "tightexec: armed 10". Only ptrace borrows
+    // this scratch from the guest's stack; KVM, DBT, SaBRe and the in-guest
+    // backends borrow it from the tool's own memory, so a tight guest stack
+    // cannot deny it there (KVM's test checks both modes' native output).
+    for mode in ["tightexec", "tightcap"] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "run",
+                "--strict",
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{mode}: {log}"
+        );
+        assert!(
+            log.contains("cannot read its permitted capability set"),
+            "{mode}: the refusal must name the unreadable permitted set:\n{log}"
         );
     }
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let image = set_group_id_copy(&guest, directory.path());
+    let image = image.to_str().unwrap();
+    // In Hermit's namespace the copy's group is the root's or unmapped, so
+    // Linux ignores its set-group-ID bit.
+    assert_parent_death_mode_verifies(
+        &[],
+        &["--timeout", "60"],
+        &guest,
+        &["secure-exec", image],
+        "secure-exec: armed 10 at_secure 0\n",
+    );
+    // Outside it the group is mapped, but the ptrace guest runs with
+    // `no_new_privs` (its `/proc/self/status` says so), which voids the bit.
+    let (status, log, stdout) = parent_death_secure_exec(&[], &guest, image, &[]);
+    assert_eq!(status, Some(0), "{log}");
+    assert_eq!(stdout, "secure-exec: armed 10 at_secure 0\n", "{log}");
+}
+
+/// `message` with each hexadecimal literal and each run of 12 to 15 decimal
+/// digits (a user-space address written in decimal) replaced by `ADDR`, so
+/// that two log records that differ only in the address space's layout
+/// compare equal. Other numbers, such as a nanosecond time, stay as they are.
+fn without_addresses(message: &str) -> String {
+    let bytes = message.as_bytes();
+    let mut kept = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit() {
+            kept.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let start = index;
+        if bytes[index] == b'0'
+            && bytes.get(index + 1) == Some(&b'x')
+            && bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit)
+        {
+            index += 2;
+            while bytes.get(index).is_some_and(u8::is_ascii_hexdigit) {
+                index += 1;
+            }
+            kept.extend_from_slice(b"ADDR");
+            continue;
+        }
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if (12..=15).contains(&(index - start)) {
+            kept.extend_from_slice(b"ADDR");
+        } else {
+            kept.extend_from_slice(&bytes[start..index]);
+        }
+    }
+    String::from_utf8(kept).expect("only ASCII digits were replaced")
+}
+
+/// `parent_death_signal setid`'s output as root gives it, natively under
+/// `podman unshare` and under Hermit's virtual root: a setter that moves an
+/// effective or filesystem id clears the parent-death signal
+/// (`commit_creds`), a move of the real id alone, `setuid(0)` and
+/// `setgroups` keep it.
+const PARENT_DEATH_SETID_OUTPUT: &str = "setid: setuid 0 setgid 0 setreuid 0 setregid 0 \
+     setresuid 0 setresgid 0 setfsuid 0 setfsgid 0 ruid 10 setuid0 10 groups 10\n";
+
+/// A set-group-ID copy of the parent-death guest in `directory`, whose group
+/// is not 0 (the runner's own, or 1 where the runner's is root's), so that
+/// where the namespace maps that group Linux runs an exec of it in
+/// secure-execution mode for a root caller.
+fn set_group_id_copy(guest: &str, directory: &Path) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let image = directory.join("setgid-image");
+    fs::copy(guest, &image).expect("failed to copy the parent-death guest");
+    if fs::metadata(&image).unwrap().gid() == 0 {
+        std::os::unix::fs::chown(&image, None, Some(1)).expect("failed to give the copy group 1");
+    }
+    fs::set_permissions(&image, fs::Permissions::from_mode(0o2755)).unwrap();
+    let metadata = fs::metadata(&image).unwrap();
+    assert!(
+        metadata.mode() & 0o2000 != 0 && metadata.gid() != 0,
+        "the copy is not set-group-ID with a group other than 0: {:o} {}",
+        metadata.mode(),
+        metadata.gid()
+    );
+    image
+}
+
+/// `parent_death_signal secure-exec IMAGE` without Hermit's namespaces
+/// (`--no-namespace`, which `--strict` refuses), with `backend_args` before
+/// `run` and `run_args` after it: its exit code, log and stdout.
+fn parent_death_secure_exec(
+    backend_args: &[&str],
+    guest: &str,
+    image: &str,
+    run_args: &[&str],
+) -> (Option<i32>, String, String) {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut args = backend_args.to_vec();
+    args.extend(["run", "--no-namespace", "--epoch=2026-01-01T00:00:00Z"]);
+    args.extend(run_args);
+    args.extend(["--", guest, "secure-exec", image]);
+    let (status, log) = run_with_deadline(
+        hermit_command(&args),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    (status.and_then(|status| status.code()), log, stdout)
+}
+
+/// Runs `parent_death_signal` with `mode_args` (its mode and the mode's
+/// arguments) under `--strict --verify --verify-strict`, with `backend_args`
+/// before `run` and `run_args` after it, and requires exit 0, stdout
+/// `expected`, and bitwise parity over equal, nonzero INFO counts (L2). The
+/// test's own deadline bounds every run.
+fn assert_parent_death_mode_verifies(
+    backend_args: &[&str],
+    run_args: &[&str],
+    guest: &str,
+    mode_args: &[&str],
+    expected: &str,
+) {
+    let mode = mode_args.join(" ");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let verdict_arg = format!("--verify-json={}", verdict.display());
+    let mut args = backend_args.to_vec();
+    args.extend([
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        verdict_arg.as_str(),
+    ]);
+    args.extend(run_args);
+    args.extend(["--", guest]);
+    args.extend(mode_args);
+    let (status, log) = run_with_deadline(
+        hermit_command(&args),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "{backend_args:?} {mode}: {stdout}\n{log}"
+    );
+    assert_eq!(stdout, expected, "{backend_args:?} {mode}: {log}");
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&verdict)
+            .unwrap_or_else(|error| panic!("{backend_args:?} {mode}: no verdict: {error}\n{log}")),
+    )
+    .unwrap_or_else(|error| panic!("{backend_args:?} {mode}: unreadable verdict: {error}"));
+    let compared = &report["compared_log_messages"];
+    assert!(
+        report["bitwise_parity"] == true
+            && compared["left"].as_u64().is_some_and(|count| count > 0)
+            && compared["left"] == compared["right"],
+        "{backend_args:?} {mode}: no bitwise parity over equal, nonzero INFO counts: \
+         {report}\n{log}"
+    );
+}
+
+/// On KVM a parent-death signal reaches the child as on Linux and on ptrace:
+/// Detcore decides it where the parent thread leaves, and KVM's process
+/// signal control publishes it to the whole child process, SIGKILL included,
+/// waking the child's pause; a middle process's orphan goes to the subreaper
+/// Detcore names; a creator thread's exit gives its children to the main
+/// thread, whose `__WNOTHREAD` wait reaps them; a credential setter that
+/// moves an effective or filesystem id clears the signal, and so does an
+/// ordinary exec that gives back a capability the task dropped; a zombie
+/// leader's signal is still sent; each exit of an adopting subreaper, or of
+/// the thread that became the parent, sends it again.
+/// Each mode at L2 (KVM), with the guest's native output. One known gap is
+/// pinned so that it cannot change unnoticed: a published signal does not end
+/// a futex wait, so a child waiting on a futex never takes it and the run
+/// ends as a deadlock under Hermit's model, where Linux ends the child with
+/// the signal. Some modes stay refused by name,
+/// ending the run with the policy-refusal status: a stop signal, a real-time
+/// signal and SIGCHLD, which KVM cannot send (its typed refusal
+/// `ParentDeathSignal`), an exec from a thread that does not lead its process
+/// (`NonLeaderExec`), and, outside Hermit's namespaces, an exec Linux runs in
+/// secure-execution mode, which KVM's loader does not do.
+#[test]
+fn run_kvm_a_parent_death_signal_reaches_the_child_as_on_linux() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping KVM parent-death signals: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = parent_death_signal_guest().to_str().unwrap().to_owned();
+    for (mode, expected) in [
+        ("term", "term: child signal 15\n"),
+        ("caught", "caught: child exit 7\n"),
+        ("kill", "kill: child signal 9\n"),
+        ("get", "get: 10, child 0\n"),
+        ("subreaper", "subreaper: child signal 15\n"),
+        ("group", "group: child signal 15\n"),
+        (
+            "invalid",
+            "invalid: get 15 einval 1\ninvalid: child signal 15\n",
+        ),
+        ("nothread", "nothread: child exit 7\n"),
+        ("setid", PARENT_DEATH_SETID_OUTPUT),
+        ("zombieleader", "zombieleader: child exit 7\n"),
+        ("resend", "resend: child exit 2\n"),
+        ("threadresend", "threadresend: child exit 2\n"),
+        // An ordinary exec by root gives back the capabilities the task
+        // dropped: the permitted set grows, so `commit_creds` clears the
+        // signal.
+        ("capexec", "capexec: regained 1 armed 0 at_secure 0\n"),
+        ("capexecall", "capexecall: regained 1 armed 0 at_secure 0\n"),
+        // Only ptrace borrows the scratch for Detcore's injected `capget`
+        // from the guest's stack; KVM borrows it from the tool's own page, so
+        // an exec from a stack with no room below the red zone still gets
+        // `commit_creds`'s rule: tightexec keeps the signal, and tightcap,
+        // which drops a capability first, has it cleared.
+        ("tightexec", "tightexec: armed 10\n"),
+        ("tightcap", "tightcap: regained 1 armed 0 at_secure 0\n"),
+    ] {
+        // KVM refuses `--timeout`, which it cannot enforce; the deadline
+        // bounds the run instead.
+        assert_parent_death_mode_verifies(&["--backend=kvm"], &[], &guest, &[mode], expected);
+    }
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let image = set_group_id_copy(&guest, directory.path());
+    let image = image.to_str().unwrap();
+    // In Hermit's namespace Linux ignores the copy's set-group-ID bit.
+    assert_parent_death_mode_verifies(
+        &["--backend=kvm"],
+        &[],
+        &guest,
+        &["secure-exec", image],
+        "secure-exec: armed 10 at_secure 0\n",
+    );
+    // Outside it Linux runs the exec in secure-execution mode, which KVM's
+    // loader does not do: the run ends by name, or, where unsupported
+    // operations are allowed, goes on with the parent-death signal cleared,
+    // as Linux clears it.
+    let (status, log, _) = parent_death_secure_exec(&["--backend=kvm"], &guest, image, &[]);
+    assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{log}");
+    assert!(log.contains("secure-execution mode"), "{log}");
+    let (status, log, stdout) = parent_death_secure_exec(
+        &["--backend=kvm"],
+        &guest,
+        image,
+        &["--allow-unsupported-syscalls"],
+    );
+    assert_eq!(status, Some(0), "{log}");
+    assert_eq!(stdout, "secure-exec: armed 0 at_secure 0\n", "{log}");
+    for (mode, reason) in [
+        ("stop", "KVM cannot send a stop signal"),
+        ("realtime", "KVM cannot send a real-time signal"),
+        ("sigchld", "KVM cannot send SIGCHLD"),
+        ("exec", "KVM nonleader exec is unsupported"),
+    ] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "--backend=kvm",
+                "run",
+                "--strict",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{mode}: {log}"
+        );
+        assert!(
+            log.contains(reason),
+            "{mode}: the refusal must name {reason:?}:\n{log}"
+        );
+    }
+    // The known gap: Linux prints "futex: child signal 15".
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--",
+            guest.as_str(),
+            "futex",
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+        "futex: {log}"
+    );
+    assert!(
+        log.contains("Deadlock under Hermit's model"),
+        "futex: the run must end as a deadlock under Hermit's model:\n{log}"
+    );
 }
 
 /// A parent waiting in `pause()` for a child's `SIGCHLD` returns from it, as

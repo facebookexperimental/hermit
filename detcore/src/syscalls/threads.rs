@@ -4730,6 +4730,43 @@ impl<T: RecordOrReplay> Detcore<T> {
             .then_some(record)
     }
 
+    /// The effective user and group ids Linux gives the guest at an exec of
+    /// `record` (`crate::secure_exec::effective_ids_for_virtual_root`;
+    /// anything but (0, 0) runs in secure-execution mode), from the image's
+    /// set-id bits as the guest's namespaces show them and the task's
+    /// `no_new_privs`. The flag is the kernel's, read from the task's status,
+    /// where guest threads are host tasks the tool can name; otherwise it is
+    /// Detcore's own record, in which no guest sets it (Detcore answers
+    /// `PR_SET_NO_NEW_PRIVS` with ENOSYS, `handle_prctl`). `None` where the
+    /// image or the flag cannot be read, as after a guest `chroot`
+    /// (`Self::exec_record_root`).
+    fn exec_effective_ids<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        record: Option<&crate::exec_record::ExecRecord>,
+    ) -> Option<(u32, u32)> {
+        let record = record?;
+        let root = self.exec_record_root(guest)?;
+        let image =
+            crate::secure_exec::set_id_image(&root.join(record.exe.strip_prefix("/").ok()?))?;
+        if !image.has_set_id_bits() {
+            return Some((0, 0));
+        }
+        let no_new_privs =
+            if crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend) {
+                let status =
+                    crate::util::raw_read_file(&self.guest_task_directory(guest)?.join("status"))
+                        .ok()?;
+                crate::secure_exec::no_new_privs(&status)?
+            } else {
+                false
+            };
+        Some(crate::secure_exec::effective_ids_for_virtual_root(
+            &image,
+            no_new_privs,
+        ))
+    }
+
     /// Execveat system call.  Doesn't return if successful.
     pub async fn handle_execveat<G: Guest<Self>>(
         &self,
@@ -4759,6 +4796,44 @@ impl<T: RecordOrReplay> Detcore<T> {
                 new_metadata.exec_blocking_overrides(),
             )
         };
+        // The permitted set before the exec, for `commit_creds`'s comparison
+        // at the new image's first callback (`Detcore::handle_post_exec`):
+        // read only where Detcore holds a parent-death signal for this task,
+        // the one thing the comparison can clear, and before anything
+        // prepares the exec, so that a refusal leaves it as it was. A set
+        // that cannot be read is refused by name
+        // (`commit_creds::UNREADABLE_PERMITTED_SET`). A borrowed scratch that
+        // could not be put back has had the failure policy applied already
+        // (`Detcore::inject_capget`), and its error returns as it is.
+        let permitted_before = if guest.thread_state().holds_parent_death_signal {
+            match Self::inject_permitted_capabilities(guest).await? {
+                Some(permitted) => Some(permitted),
+                None => {
+                    let reason = crate::commit_creds::UNREADABLE_PERMITTED_SET;
+                    crate::syscalls::helpers::report_refusal_reason(
+                        self.cfg.panic_on_unsupported_syscalls,
+                        &format!("[dtid {dettid}] execveat refused: {reason}"),
+                    );
+                    if !self.cfg.panic_on_unsupported_syscalls {
+                        crate::tool_global::report_unsupported_syscall(
+                            guest,
+                            syscalls::Sysno::execveat,
+                        )
+                        .await;
+                    }
+                    return self
+                        .refuse_unserviceable_operation_because(
+                            guest,
+                            syscalls::Sysno::execveat,
+                            Errno::EOPNOTSUPP,
+                            reason,
+                        )
+                        .await;
+                }
+            }
+        } else {
+            None
+        };
         // The close-on-exec descriptors this exec drops from the old table go
         // at the new image's first callback, if the exec succeeds
         // (`Detcore::release_exec_dropped_descriptors`).
@@ -4768,6 +4843,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(exe) => Some(exe),
             None => self.exec_image_without_procfs(guest, &call).await,
         };
+        // Decided before the exec, from the image as it is now, and compared
+        // with the new image's own `AT_SECURE` at its first callback.
+        guest.thread_state_mut().exec_effective_ids = self.exec_effective_ids(guest, exe.as_ref());
+        guest.thread_state_mut().exec_permitted_before = permitted_before;
 
         prepare_exec(
             guest,
@@ -4866,6 +4945,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         cancel_exec(guest).await;
+        // The old image runs on: no new image will compare the decision.
+        guest.thread_state_mut().exec_effective_ids = None;
+        guest.thread_state_mut().exec_permitted_before = None;
         for (open_file_id, port) in released_ports {
             self.restore_port_for_open_file(guest, open_file_id, port)
                 .await;

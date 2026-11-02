@@ -5848,6 +5848,12 @@ impl GlobalState {
                     .thread_tree
                     .set_child_subreaper(process, on),
             ),
+            GlobalRequest::ChildSubreaper(process) => R::ChildSubreaper(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .thread_tree
+                    .is_child_subreaper(process),
+            ),
             GlobalRequest::UnrecoverableShutdown => {
                 self.force_shutdown_with_error();
                 R::UnrecoverableShutdown(())
@@ -7746,7 +7752,9 @@ pub enum SignalScope {
 /// `Resources`: a change to another payload type defined elsewhere
 /// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 25;
+// 26 follows SP2's 25, whose variants come before this revision's
+// `ChildSubreaper` pair.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 26;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -8710,6 +8718,12 @@ pub enum GlobalRequest {
     /// The flock the model holds through this description, for a rendered
     /// fdinfo (`procfs::locks::LockLedger::flock_held_by`). Appended last.
     FlockHeldBy(OpenFileId),
+    /// Whether process `.0` is a child subreaper in Detcore's record
+    /// (`ThreadTree::is_child_subreaper`), for a
+    /// `prctl(PR_GET_CHILD_SUBREAPER)` on a backend that places orphans
+    /// where Detcore names (`places_orphans`) and holds no flag of its own.
+    /// Appended last.
+    ChildSubreaper(DetPid),
 }
 
 /// Responses from the global object
@@ -9098,6 +9112,8 @@ pub enum GlobalResponse {
     /// Whether the lock is exclusive, and the owner its line shows (the
     /// taker while the container's `/proc` lists it, else 0). Appended last.
     FlockHeldBy(Option<(bool, i64)>),
+    /// The answer to `GlobalRequest::ChildSubreaper`. Appended last.
+    ChildSubreaper(bool),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -11783,10 +11799,15 @@ where
     T: RecordOrReplay,
 {
     let response = send_and_update_time(guest, GlobalRequest::ParentDeathSignal(arm)).await;
-    match response.1 {
+    let signal = match response.1 {
         GlobalResponse::ParentDeathSignal(signal) => signal,
         _ => unreachable!(),
-    }
+    };
+    // Every change to the value goes through here, so the thread's own
+    // record of whether one is held stays current
+    // (`ThreadState::holds_parent_death_signal`).
+    guest.thread_state_mut().holds_parent_death_signal = signal != 0;
+    signal
 }
 
 /// The real-time signals (a kernel sigset) of `detpid`'s POSIX timers that
@@ -12241,6 +12262,20 @@ where
     let response = send_and_update_time(guest, GlobalRequest::SetChildSubreaper(process, on)).await;
     match response.1 {
         GlobalResponse::SetChildSubreaper(()) => {}
+        _ => unreachable!(),
+    }
+}
+
+/// Whether `process` is a child subreaper in Detcore's record, read in the
+/// caller's turn (`GlobalRequest::ChildSubreaper`).
+pub async fn child_subreaper<G, T>(guest: &mut G, process: DetPid) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::ChildSubreaper(process)).await;
+    match response.1 {
+        GlobalResponse::ChildSubreaper(on) => on,
         _ => unreachable!(),
     }
 }

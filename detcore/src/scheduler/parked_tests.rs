@@ -21,6 +21,12 @@ use reverie::ChildExitPublication;
 use reverie::ChildExitPublicationEffect;
 use reverie::ChildExitPublicationResult;
 use reverie::ExitStatus;
+use reverie::OrphanPlacement;
+use reverie::OrphanPlacementReceipt;
+use reverie::OrphanPlacementResult;
+use reverie::OrphanReaper;
+use reverie::PlacedOrphan;
+use reverie::PlacedOrphanEffect;
 use reverie::ProcessSignalControl;
 use reverie::ProcessSignalPublication;
 use reverie::ProcessSignalPublicationResult;
@@ -60,6 +66,26 @@ struct Backend {
     timer_publications: Mutex<Vec<(SignalProcessId, reverie::SignalEvent)>>,
     reject_child_publication: std::sync::atomic::AtomicBool,
     permits: Mutex<Vec<SignalDeliveryPermit>>,
+    /// Whether the Tool opted in to orphan placement.
+    orphan_placement_enabled: std::sync::atomic::AtomicBool,
+    /// Every `place_orphans` call, in order.
+    placements: Mutex<Vec<(SignalProcessId, Vec<OrphanPlacement>)>>,
+    /// Reapers that reap their children automatically in the backend's
+    /// records: a zombie placed with one is reaped at once.
+    auto_reaping_reapers: Mutex<Vec<SignalProcessId>>,
+    /// Refuse every placement before committing it.
+    reject_placement: std::sync::atomic::AtomicBool,
+    /// Report every live orphan as a zombie, a receipt that disagrees.
+    misreport_placement: std::sync::atomic::AtomicBool,
+    /// Children the backend holds for every exit, whatever Detcore names:
+    /// one it is not told about goes to the namespace init and is named in
+    /// the receipt after the placements, as LinuxEmu's does.
+    held_orphans: Mutex<Vec<SignalProcessId>>,
+    /// Every `publish_parent_death_signal` call, in order.
+    parent_death_publications: Mutex<Vec<(SignalProcessId, reverie::SignalEvent)>>,
+    /// The recipients `signal_recipients` reports for each signal other than
+    /// `SIGALRM`, whose recipients stay `recipients`.
+    signal_recipient_list: Mutex<Vec<(i32, SignalRecipient)>>,
 }
 impl std::fmt::Debug for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -150,10 +176,20 @@ impl ProcessSignalControl for Backend {
     fn signal_recipients(
         &self,
         process: SignalProcessId,
-        _: i32,
+        signal: i32,
     ) -> Result<Vec<SignalRecipient>, reverie::Errno> {
         if *self.fail_recipients.lock().unwrap() == Some(process) {
             return Err(reverie::Errno::EBADF);
+        }
+        if signal != libc::SIGALRM {
+            return Ok(self
+                .signal_recipient_list
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(listed, r)| *listed == signal && r.task.process == process)
+                .map(|(_, r)| *r)
+                .collect());
         }
         Ok(self
             .recipients
@@ -163,6 +199,87 @@ impl ProcessSignalControl for Backend {
             .filter(|r| r.task.process == process)
             .copied()
             .collect())
+    }
+    fn enable_orphan_placement(&self) -> Result<(), reverie::Errno> {
+        self.orphan_placement_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+    fn place_orphans(
+        &self,
+        exited: SignalProcessId,
+        placements: &[OrphanPlacement],
+    ) -> OrphanPlacementResult {
+        self.placements
+            .lock()
+            .unwrap()
+            .push((exited, placements.to_vec()));
+        if self
+            .reject_placement
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return OrphanPlacementResult::RejectedBeforeCommit(reverie::Errno::EINVAL);
+        }
+        // A child whose exit was published is a zombie in these records.
+        let exited_children: Vec<SignalProcessId> = self
+            .child_publications
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|completion| completion.child)
+            .collect();
+        let misreport = self
+            .misreport_placement
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut placed: Vec<PlacedOrphan> = placements
+            .iter()
+            .map(|placement| {
+                let zombie = misreport || exited_children.contains(&placement.child);
+                let effect = match placement.reaper {
+                    OrphanReaper::NamespaceInit => PlacedOrphanEffect::NamespaceInit,
+                    OrphanReaper::Process(_) if !zombie => PlacedOrphanEffect::Live,
+                    OrphanReaper::Process(reaper)
+                        if self.auto_reaping_reapers.lock().unwrap().contains(&reaper) =>
+                    {
+                        PlacedOrphanEffect::AutoReaped
+                    }
+                    OrphanReaper::Process(_) => {
+                        PlacedOrphanEffect::Zombie(ChildExitPublicationEffect::Queued)
+                    }
+                };
+                PlacedOrphan {
+                    child: placement.child,
+                    reaper: placement.reaper,
+                    effect,
+                }
+            })
+            .collect();
+        for child in self.held_orphans.lock().unwrap().iter() {
+            if !placements.iter().any(|placement| placement.child == *child) {
+                placed.push(PlacedOrphan {
+                    child: *child,
+                    reaper: OrphanReaper::NamespaceInit,
+                    effect: PlacedOrphanEffect::NamespaceInit,
+                });
+            }
+        }
+        OrphanPlacementResult::Committed(OrphanPlacementReceipt { exited, placed })
+    }
+    fn publish_parent_death_signal(
+        &self,
+        process: SignalProcessId,
+        event: reverie::SignalEvent,
+    ) -> ProcessSignalPublicationResult {
+        self.parent_death_publications
+            .lock()
+            .unwrap()
+            .push((process, event));
+        ProcessSignalPublicationResult::Committed(ProcessSignalPublication {
+            process,
+            pending_generation: 0,
+            coalesced: false,
+            disposition: reverie::ProcessAlarmSignalDisposition::DefaultFatal,
+        })
     }
     fn alarm_recipients(
         &self,
@@ -8042,4 +8159,474 @@ fn a_fresh_timer_publication_replaces_a_stale_identical_entry() {
     dispatch_posix_expiry(&mut s, tid, 20);
     let rows: Vec<_> = s.parked.timer_publications.iter().map(|p| p.due).collect();
     assert_eq!(rows, vec![at(20)]);
+}
+
+/// A scheduler for a backend that also places orphans where Detcore names
+/// and publishes the parent-death signals Detcore decides (KVM's
+/// `places_orphans` and `publishable_parent_death_signals`), with its control
+/// installed. Installing it opts in to the placement.
+fn placing_fixture() -> (Scheduler, Arc<Backend>) {
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        ..Config::default().with_backend(|backend| {
+            backend.provides_process_signal_control = true;
+            backend.emulates_child_waits = true;
+            backend.needs_killed_thread_rpc_cancellation = true;
+            backend.places_orphans = true;
+            backend.publishable_parent_death_signals =
+                BackendCapabilities::KVM.publishable_parent_death_signals;
+        })
+    });
+    let backend = Arc::new(Backend::default());
+    assert_eq!(
+        s.install_signal_control(
+            Some(BackendSignalControl {
+                process: backend.clone(),
+            }),
+            true,
+        )
+        .unwrap(),
+        BackendSignalControlMode::ToolControlled
+    );
+    assert!(
+        backend
+            .orphan_placement_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    (s, backend)
+}
+
+/// Ends process `pid`, whose only thread is `pid`, with an exit its grant
+/// fenced, through its terminal receipt, then completes what the backend
+/// reports after it: a child of a live parent's waitable exit publication, or
+/// a root's or a terminal parent's child's retirement.
+fn exit_process(s: Scheduler, pid: i32, status: i32) -> Scheduler {
+    let mut s = s;
+    let (tid, process) = (DetTid::from_raw(pid), DetPid::from_raw(pid));
+    let (mm, _) = s.real_timers.task_identity(process, tid).unwrap();
+    s.reserve_exit_boundary(tid, process, mm, true).unwrap();
+    let permit = s.parked.exit_fences[&tid].permit;
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: status << 8,
+        },
+    })
+    .unwrap();
+    let key = ProcessGeneration::from_backend(task(pid, pid).process);
+    let retirement = reverie::BackendProcessRetirement {
+        process: task(pid, pid).process,
+        status: ExitStatus::Exited(status),
+    };
+    if let Some(reservation) = s.parked.child_exit_reservations.get(&key).copied() {
+        let event = child_exit_event(
+            reservation.parent,
+            reservation.child,
+            ExitStatus::Exited(status),
+            true,
+        );
+        let scheduler = Arc::new(Mutex::new(s));
+        let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+            scheduler.clone(),
+            event,
+        ));
+        assert!(matches!(poll_child_exit(&mut publication), Poll::Pending));
+        assert!(matches!(
+            poll_child_exit(&mut publication),
+            Poll::Ready(Ok(()))
+        ));
+        drop(publication);
+        s = Arc::try_unwrap(scheduler).unwrap().into_inner().unwrap();
+    }
+    if s.parked.child_exit_reservations.contains_key(&key)
+        || s.parked.completed_child_exits.contains_key(&key)
+        || s.parked.process_retirements.contains_key(&key)
+    {
+        s.consume_process_retirement(retirement).unwrap();
+    }
+    s
+}
+
+/// On a placing backend (KVM), the exit of a process whose child lives on
+/// moves the backend's record of that orphan to the subreaper Detcore chose
+/// (`find_child_reaper`), at the exit's terminal receipt, in one call naming
+/// the exited process's exact generation; Detcore's own record moves the same
+/// way. The backend decides nothing.
+#[test]
+fn a_kvm_exit_places_its_live_orphan_with_detcores_subreaper() {
+    let (mut s, backend) = placing_fixture();
+    let _ = add(&mut s, 100, 100);
+    s.thread_tree
+        .set_child_subreaper(DetPid::from_raw(100), true);
+    let _ = add_process_child(&mut s, 100, 200);
+    let _ = add_process_child(&mut s, 200, 300);
+    let s = exit_process(s, 200, 3);
+    assert!(!s.backend_failed());
+    assert_eq!(
+        *backend.placements.lock().unwrap(),
+        vec![(
+            task(200, 200).process,
+            vec![OrphanPlacement {
+                child: task(300, 300).process,
+                reaper: OrphanReaper::Process(task(100, 100).process),
+            }],
+        )]
+    );
+    assert_eq!(
+        s.thread_tree.parent_process(&DetPid::from_raw(300)),
+        Some(DetPid::from_raw(100))
+    );
+}
+
+/// Without a subreaper among its ancestors, an orphan goes to the namespace
+/// init, in Detcore's record and, by name, in the backend's.
+#[test]
+fn a_kvm_orphan_without_a_subreaper_is_placed_with_the_namespace_init() {
+    let (mut s, backend) = placing_fixture();
+    let _ = add(&mut s, 100, 100);
+    let _ = add_process_child(&mut s, 100, 200);
+    let _ = add_process_child(&mut s, 200, 300);
+    let s = exit_process(s, 200, 3);
+    assert!(!s.backend_failed());
+    assert_eq!(
+        *backend.placements.lock().unwrap(),
+        vec![(
+            task(200, 200).process,
+            vec![OrphanPlacement {
+                child: task(300, 300).process,
+                reaper: OrphanReaper::NamespaceInit,
+            }],
+        )]
+    );
+    assert!(s.thread_tree.is_init_orphan(DetPid::from_raw(300)));
+}
+
+/// A zombie orphan (its exit published to its parent, not yet waited for) is
+/// placed with the subreaper, which can then wait for it: the backend
+/// announces it there, and Detcore's record makes it the subreaper's ready
+/// child.
+#[test]
+fn a_kvm_zombie_orphan_becomes_the_subreapers_waitable_child() {
+    let (mut s, backend) = placing_fixture();
+    let _ = add(&mut s, 100, 100);
+    s.thread_tree
+        .set_child_subreaper(DetPid::from_raw(100), true);
+    let _ = add_process_child(&mut s, 100, 200);
+    let _ = add_process_child(&mut s, 200, 300);
+    let s = exit_process(s, 300, 7);
+    let mut s = exit_process(s, 200, 3);
+    assert!(!s.backend_failed());
+    // The childless exit of 300 places nothing; 200's places 300.
+    assert_eq!(
+        backend
+            .placements
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(exited, placements)| (*exited, placements.len()))
+            .collect::<Vec<_>>(),
+        vec![(task(300, 300).process, 0), (task(200, 200).process, 1)]
+    );
+    let spec = crate::types::ChildWaitSpec {
+        selector: crate::types::ChildWaitSelector::Exact(DetPid::from_raw(300)),
+        owner: None,
+        exit_class: crate::types::ChildWaitExitClass::Sigchld,
+    };
+    assert_eq!(
+        s.ready_child_wait(DetPid::from_raw(100), spec),
+        Some(DetPid::from_raw(300))
+    );
+    assert!(s.consume_child_wait(DetPid::from_raw(100), DetPid::from_raw(300)));
+}
+
+/// A subreaper that reaps its children automatically (it ignores SIGCHLD)
+/// takes no zombie: the backend reaps it at once, and Detcore consumes its
+/// shadow status, so no wait can find it.
+#[test]
+fn a_kvm_zombie_orphan_of_an_auto_reaping_subreaper_is_consumed() {
+    let (mut s, backend) = placing_fixture();
+    let _ = add(&mut s, 100, 100);
+    s.thread_tree
+        .set_child_subreaper(DetPid::from_raw(100), true);
+    let _ = add_process_child(&mut s, 100, 200);
+    let _ = add_process_child(&mut s, 200, 300);
+    let mut s = exit_process(s, 300, 7);
+    s.thread_tree
+        .set_sigchld_disposition(DetPid::from_raw(100), true, false);
+    backend
+        .auto_reaping_reapers
+        .lock()
+        .unwrap()
+        .push(task(100, 100).process);
+    let s = exit_process(s, 200, 3);
+    assert!(!s.backend_failed());
+    assert_eq!(
+        backend
+            .placements
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(exited, placements)| (*exited, placements.len()))
+            .collect::<Vec<_>>(),
+        vec![(task(300, 300).process, 0), (task(200, 200).process, 1)]
+    );
+    assert_eq!(s.thread_tree.parent_process(&DetPid::from_raw(300)), None);
+    assert!(
+        !s.logically_exited_processes
+            .contains(&DetPid::from_raw(300))
+    );
+}
+
+/// Where Detcore decides no orphan for an exit, a placing backend is still
+/// asked, once, to place none: one that holds a child of that exit all the
+/// same names it in its receipt, and the run ends as a backend failure at
+/// that exit rather than leave the child with a parent Detcore does not
+/// know. An exit that leaves no child anywhere commits the empty placement
+/// and the run goes on, and a later removal of the same exit does not ask
+/// again.
+#[test]
+fn a_kvm_exit_with_held_children_that_detcore_did_not_place_ends_the_run() {
+    for held in [false, true] {
+        let (mut s, backend) = placing_fixture();
+        let _ = add(&mut s, 100, 100);
+        let _ = add_process_child(&mut s, 100, 200);
+        if held {
+            backend
+                .held_orphans
+                .lock()
+                .unwrap()
+                .push(task(300, 300).process);
+        }
+        let (tid, process) = (DetTid::from_raw(200), DetPid::from_raw(200));
+        let (mm, _) = s.real_timers.task_identity(process, tid).unwrap();
+        s.reserve_exit_boundary(tid, process, mm, true).unwrap();
+        let permit = s.parked.exit_fences[&tid].permit;
+        s.consume_signal_boundary(SignalBoundaryReceipt {
+            permit,
+            outcome: SignalBoundaryOutcome::Terminated {
+                group: true,
+                wait_status: 3 << 8,
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            *backend.placements.lock().unwrap(),
+            vec![(task(200, 200).process, vec![])],
+            "held {held}"
+        );
+        assert_eq!(s.backend_failed(), held);
+        s.reparent_orphans(process);
+        assert_eq!(backend.placements.lock().unwrap().len(), 1, "held {held}");
+    }
+}
+
+/// A placement the backend refuses, and a receipt that disagrees with
+/// Detcore's record (a live orphan reported as a zombie), end the run as a
+/// backend failure at the exit that made them.
+#[test]
+fn a_refused_or_disagreeing_kvm_placement_ends_the_run() {
+    for misreport in [false, true] {
+        let (mut s, backend) = placing_fixture();
+        let _ = add(&mut s, 100, 100);
+        s.thread_tree
+            .set_child_subreaper(DetPid::from_raw(100), true);
+        let _ = add_process_child(&mut s, 100, 200);
+        let _ = add_process_child(&mut s, 200, 300);
+        if misreport {
+            backend
+                .misreport_placement
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            backend
+                .reject_placement
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let (tid, process) = (DetTid::from_raw(200), DetPid::from_raw(200));
+        let (mm, _) = s.real_timers.task_identity(process, tid).unwrap();
+        s.reserve_exit_boundary(tid, process, mm, true).unwrap();
+        let permit = s.parked.exit_fences[&tid].permit;
+        s.consume_signal_boundary(SignalBoundaryReceipt {
+            permit,
+            outcome: SignalBoundaryOutcome::Terminated {
+                group: true,
+                wait_status: 3 << 8,
+            },
+        })
+        .unwrap();
+        assert_eq!(backend.placements.lock().unwrap().len(), 1, "{misreport}");
+        assert!(s.backend_failed(), "misreport {misreport}");
+    }
+}
+
+/// A parent-death signal whose parent thread leaves at its committed exit is
+/// published to the whole child process at the next drain, as Linux's
+/// `forget_original_parent` sends it: `SI_USER`, `si_pid` the leaving
+/// thread's process, `si_uid` 0. Nothing is sent to a host process, and the
+/// signal becomes one the parked-wait selection asks about.
+#[test]
+fn a_kvm_parent_death_signal_is_published_at_the_drain_after_its_parent_thread_leaves() {
+    let (mut s, backend) = placing_fixture();
+    let _ = add(&mut s, 100, 100);
+    let (creator, creator_mm, _) = add(&mut s, 100, 101);
+    let _ = add_process_child(&mut s, 101, 200);
+    s.set_parent_death_signal(DetTid::from_raw(200), libc::SIGTERM);
+    // The creator's exit was granted (`ResourceID::Exit`).
+    s.committed_exits.insert(creator);
+    s.reserve_exit_boundary(creator, DetPid::from_raw(100), creator_mm, false)
+        .unwrap();
+    let permit = s.parked.exit_fences[&creator].permit;
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: false,
+            wait_status: 0,
+        },
+    })
+    .unwrap();
+    assert!(backend.parent_death_publications.lock().unwrap().is_empty());
+    s.step2_drain_prefix_for_test();
+    assert!(!s.backend_failed());
+    assert_eq!(s.host_signal_attempts, 0);
+    assert!(
+        s.determinism_losses.is_empty(),
+        "{:?}",
+        s.determinism_losses
+    );
+    let published = backend.parent_death_publications.lock().unwrap();
+    let [(process, event)] = published.as_slice() else {
+        panic!("one parent-death publication expected, got {published:?}");
+    };
+    assert_eq!(*process, task(200, 200).process);
+    assert_eq!(event.signal(), libc::SIGTERM);
+    assert_eq!(
+        event.target(),
+        reverie::SignalTarget::Process {
+            pid: reverie::Pid::from_raw(200)
+        }
+    );
+    let info = event.siginfo();
+    let field = |at: usize| i32::from_ne_bytes(info[at..at + 4].try_into().unwrap());
+    assert_eq!(
+        (field(0), field(8), field(16), field(20)),
+        (libc::SIGTERM, libc::SI_USER, 100, 0)
+    );
+    assert_eq!(
+        s.parked.published_parent_death_signals[&DetPid::from_raw(200)],
+        kernel_signal_bit(libc::SIGTERM)
+    );
+    // The child's new parent-death parent is the process's leader.
+    assert_eq!(
+        s.thread_tree
+            .parent_death_parents
+            .get(&DetPid::from_raw(200)),
+        Some(&DetTid::from_raw(100))
+    );
+}
+
+/// A child parked in a wait the selection can interrupt is woken for a
+/// parent-death signal Detcore published, through the recipients the backend
+/// reports for that signal, as a timer's SIGALRM wakes it; one that was never
+/// published wakes nothing.
+#[test]
+fn a_published_parent_death_signal_wakes_a_parked_recipient() {
+    for published in [false, true] {
+        let (mut s, backend) = placing_fixture();
+        let _ = add(&mut s, 100, 100);
+        let (child, child_mm, child_site) = add_process_child(&mut s, 100, 200);
+        let response = sleep(&mut s, child, child_mm, child_site, 1_000_000);
+        backend.signal_recipient_list.lock().unwrap().push((
+            libc::SIGUSR1,
+            SignalRecipient {
+                task: task(200, 200),
+            },
+        ));
+        if published {
+            s.publish_parent_death_signal(super::PendingParentDeathSignal {
+                child: DetPid::from_raw(200),
+                signal: nix::sys::signal::Signal::SIGUSR1,
+                sender: DetPid::from_raw(100),
+            });
+        }
+        s.select_parked_alarm().unwrap();
+        assert!(!s.backend_failed());
+        if published {
+            let control = selected(&response);
+            assert_eq!(control.request.dettid, child);
+            assert_eq!(s.parked.permits[&child].task, task(200, 200));
+        } else {
+            assert!(response.try_read().is_none());
+            assert!(!s.parked.permits.contains_key(&child));
+        }
+    }
+}
+
+/// A process that a fatal signal ends at a delivery boundary Detcore
+/// permitted (no exit fence: the signal's default action) dies where the
+/// schedule ordered it, as at an `Exit` grant (`signal_boundary_deaths`): its
+/// orphan is placed with the subreaper Detcore chose, its child's
+/// parent-death signal is published at the next drain with the dying
+/// process as the sender, and neither records a determinism loss.
+#[test]
+fn a_kvm_death_at_a_permitted_signal_boundary_places_and_publishes_as_an_exit_does() {
+    let (mut s, backend) = placing_fixture();
+    let _ = add(&mut s, 100, 100);
+    s.thread_tree
+        .set_child_subreaper(DetPid::from_raw(100), true);
+    let _ = add_process_child(&mut s, 100, 200);
+    let _ = add_process_child(&mut s, 200, 300);
+    s.set_parent_death_signal(DetTid::from_raw(300), libc::SIGTERM);
+    // Process 200 holds the serial grant and takes SIGTERM's default action.
+    s.parked.running = Some(DetTid::from_raw(200));
+    let permit = s
+        .authorize_signal_boundary(task(200, 200))
+        .unwrap()
+        .unwrap();
+    let death = s
+        .consume_signal_boundary(SignalBoundaryReceipt {
+            permit,
+            outcome: SignalBoundaryOutcome::Terminated {
+                group: true,
+                wait_status: libc::SIGTERM,
+            },
+        })
+        .unwrap();
+    assert_eq!(
+        death.map(|death| death.process),
+        Some(DetPid::from_raw(200)),
+        "a death by a fatal signal"
+    );
+    assert!(
+        s.signal_boundary_deaths.is_empty(),
+        "the mark lasts only while the dying process's threads retire"
+    );
+    s.step2_drain_prefix_for_test();
+    assert!(!s.backend_failed());
+    assert!(
+        s.determinism_losses.is_empty(),
+        "{:?}",
+        s.determinism_losses
+    );
+    assert_eq!(
+        *backend.placements.lock().unwrap(),
+        vec![(
+            task(200, 200).process,
+            vec![OrphanPlacement {
+                child: task(300, 300).process,
+                reaper: OrphanReaper::Process(task(100, 100).process),
+            }],
+        )]
+    );
+    let published = backend.parent_death_publications.lock().unwrap();
+    let [(process, event)] = published.as_slice() else {
+        panic!("one parent-death publication expected, got {published:?}");
+    };
+    assert_eq!(*process, task(300, 300).process);
+    assert_eq!(event.signal(), libc::SIGTERM);
+    let info = event.siginfo();
+    let field = |at: usize| i32::from_ne_bytes(info[at..at + 4].try_into().unwrap());
+    assert_eq!(
+        (field(0), field(8), field(16), field(20)),
+        (libc::SIGTERM, libc::SI_USER, 200, 0)
+    );
 }

@@ -38,6 +38,7 @@
 
 pub mod access_trace;
 mod arch;
+mod commit_creds;
 mod config;
 mod consts;
 mod cpu_clock;
@@ -88,6 +89,7 @@ pub mod refused_signal_controls;
 mod reserved_input;
 mod resources;
 mod scheduler;
+mod secure_exec;
 mod shared_open_files;
 mod sigalrm_phase1;
 #[cfg(test)]
@@ -605,6 +607,11 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    // SIGKILL and SIGSTOP always take their default action: Linux refuses any
+    // other action for them (`do_sigaction`), so nothing is read.
+    if matches!(signal, libc::SIGKILL | libc::SIGSTOP) {
+        return true;
+    }
     let bit = crate::syscalls::kernel_sigset_bit(signal);
     match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal) {
         Some(copied) => (copied.caught | copied.ignored) & bit == 0,
@@ -623,6 +630,12 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    // SIGKILL and SIGSTOP never run a handler (`do_sigaction` refuses one), so
+    // nothing is read: on a backend whose callbacks see a SIGKILL (a
+    // published parent-death SIGKILL on KVM) the read would be refused.
+    if matches!(signal, libc::SIGKILL | libc::SIGSTOP) {
+        return false;
+    }
     let bit = crate::syscalls::kernel_sigset_bit(signal);
     match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal) {
         Some(copied) => copied.caught & bit != 0,
@@ -846,6 +859,41 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.cfg.container_mount_table.is_some(),
             !procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend),
         )
+    }
+
+    /// Linux's `commit_creds` clears the caller's parent-death signal when a
+    /// credential change moves its effective or filesystem user or group id,
+    /// or grows its permitted capabilities (`commit_creds::clears_parent_death`,
+    /// kernel/cred.c:406-413). The credential setters succeed here as no-ops
+    /// under the fixed virtual-root identity, so where the credentials a call
+    /// would commit (`CommittedCredentials::after_setter`) differ from the
+    /// virtual root's in one of those, Detcore clears the signal it holds for
+    /// the caller and disarms the backend's copy, which is nonzero only where
+    /// the backend holds a signal Detcore does not (a SIGKILL the ptrace
+    /// kernel keeps). A setter never grows the permitted set, so the decision
+    /// reads the call's arguments alone, in the caller's turn.
+    async fn reset_parent_death_on_credential_change<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+    ) {
+        let (sysno, args) = call.into_parts();
+        let root = commit_creds::CommittedCredentials::virtual_root(0);
+        let committed = root.after_setter(sysno, raw_syscall_args(args));
+        if !commit_creds::clears_parent_death(&root, &committed) {
+            return;
+        }
+        tool_global::parent_death_signal(guest, Some(0)).await;
+        let disarm = reverie::syscalls::Prctl::new()
+            .with_option(libc::PR_SET_PDEATHSIG)
+            .with_arg2(0);
+        if let Err(error) = guest.inject_with_retry(Syscall::from(disarm)).await {
+            warn!(
+                "[detcore, dtid {}] {sysno} moved an effective or filesystem id, but the \
+                 backend's parent-death signal could not be disarmed: {error}",
+                guest.thread_state().dettid
+            );
+        }
     }
 
     /// Give this image's descriptor table the session's answer to whether it
@@ -5241,6 +5289,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             || !clone_flags.contains(CloneFlags::CLONE_FS)),
                     // A new task runs its creator's image.
                     exe: pts.1.exe.clone(),
+                    // No exec is in flight in a new task.
+                    exec_effective_ids: None,
+                    exec_permitted_before: None,
+                    holds_parent_death_signal: false,
                     // POSIX timers are shared among threads of a process but are
                     // NOT inherited across fork(2). Share the table for a new
                     // thread (CLONE_THREAD); give a new process a fresh, empty
@@ -5279,6 +5331,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     } else {
                         Some(Arc::clone(&pts.1.process_cpu_time))
                     },
+                    // The whole process tree shares the record of who holds
+                    // each child's final-CPU publication.
+                    child_cpu_owners: Arc::clone(&pts.1.child_cpu_owners),
                     parent_cpu_publication: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
                         pts.1.parent_cpu_publication.clone()
                     } else if self.cfg.backend.emulates_child_waits
@@ -5695,6 +5750,106 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             None
         };
         tool_global::mark_past_first_execve(guest, unprepared_exe).await;
+        // Here, after `mark_past_first_execve`: its request re-publishes the
+        // execution authority the new image already owns
+        // (`Scheduler::publish_reserved_input_exec_authority`), which the
+        // exec's replacement of the native input generation withdrew, and the
+        // permitted-set read below injects a `capget`. Where Hermit chooses the
+        // guest's process ids (`GuestIds::Chosen`, which runs the backend's
+        // reserved-input facility), a native call without that authority is
+        // refused ("reserved-input native effect lacks an explicit background
+        // operation owner") and ends the run. The exec still owns its turn
+        // here, so the clearing below still precedes any parent's death.
+        // Linux's `commit_creds` at the exec (fs/exec.c:1263) clears the
+        // exec'ing task's parent-death signal under the rule a credential
+        // setter's follows (`commit_creds::clears_parent_death`): where the
+        // exec moves an effective id, as a set-id image does for Detcore's
+        // virtual root, or grows the permitted set, as an ordinary exec by
+        // root does when it restores capabilities the task had dropped. An
+        // exec in secure-execution mode clears it too (`begin_new_exec`,
+        // "Make sure parent cannot signal privileged process"), the mode the
+        // new image's `AT_SECURE` reports (`create_elf_tables` copies
+        // `bprm->secureexec`). Detcore decided the new effective ids before
+        // the exec (`Detcore::exec_effective_ids`), and read the permitted set
+        // then wherever it holds a signal the comparison could clear
+        // (`ThreadState::exec_permitted_before`); here it reads the new
+        // image's permitted set and compares the image's own `AT_SECURE`
+        // (`secure_exec::outcome`). The task is the survivor `reconnect_exec`
+        // bound under the leader's tid, which carries its own value
+        // (`transfer_exec_parent_death`); Detcore clears the value it holds
+        // while the exec still owns its turn, before any parent can die. A
+        // backend that ran a secure exec without secure-execution mode (its
+        // loader applies no set-id bits) leaves the new image with other
+        // credentials and another auxiliary vector than Linux's, so the run
+        // ends by name.
+        let effective_ids = guest.thread_state_mut().exec_effective_ids.take();
+        let permitted_before = guest.thread_state_mut().exec_permitted_before.take();
+        let commit_clears = match permitted_before {
+            Some(before) => {
+                let (euid, egid) = effective_ids.unwrap_or((0, 0));
+                let after = match Self::inject_permitted_capabilities(guest).await {
+                    Ok(Some(after)) => after,
+                    // Refused by name, as before the exec: a fail-closed run
+                    // ends here; one that allows unsupported operations goes
+                    // on with the signal kept and the reason in its log.
+                    Ok(None) => {
+                        let message =
+                            format!("unsupported: {}", commit_creds::UNREADABLE_PERMITTED_SET);
+                        error!("{message}");
+                        let _ = writeln!(crate::util::RetryingStderr, "{message}");
+                        if self.cfg.panic_on_unsupported_syscalls {
+                            tool_global::unrecoverable_shutdown(
+                                guest,
+                                detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+                            )
+                            .await;
+                        }
+                        before
+                    }
+                    // The borrowed scratch could not be put back: the failure
+                    // policy has been applied (`Detcore::inject_capget`), and
+                    // the callback's error ends the run, a recording included.
+                    Err(error) => return Err(error.into_errno().unwrap_or(Errno::EOPNOTSUPP)),
+                };
+                commit_creds::clears_parent_death(
+                    &commit_creds::CommittedCredentials::virtual_root(before),
+                    &commit_creds::CommittedCredentials {
+                        euid,
+                        egid,
+                        fsuid: euid,
+                        fsgid: egid,
+                        permitted: after,
+                    },
+                )
+            }
+            None => false,
+        };
+        let expected = effective_ids.map(|ids| ids != (0, 0));
+        match secure_exec::outcome(expected, guest.auxv().at_secure()) {
+            secure_exec::SecureExecOutcome::Ordinary => {
+                if commit_clears {
+                    tool_global::parent_death_signal(guest, Some(0)).await;
+                }
+            }
+            secure_exec::SecureExecOutcome::Secure => {
+                tool_global::parent_death_signal(guest, Some(0)).await;
+            }
+            secure_exec::SecureExecOutcome::Unsupported => {
+                tool_global::parent_death_signal(guest, Some(0)).await;
+                let message = "unsupported: an exec that Linux runs in secure-execution mode, \
+                               because the image's set-user-ID or set-group-ID bit changes the \
+                               effective ids; this backend ran it without that mode (AT_SECURE 0)";
+                error!("{message}");
+                let _ = writeln!(crate::util::RetryingStderr, "{message}");
+                if self.cfg.panic_on_unsupported_syscalls {
+                    tool_global::unrecoverable_shutdown(
+                        guest,
+                        detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+                    )
+                    .await;
+                }
+            }
+        }
         // The files the kernel opened for this exec, the image and its
         // program interpreter, join the run's host inputs (`host_inputs`).
         if guest.config().record_host_inputs {
@@ -6592,10 +6747,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // process gets for a permitted credential change (and the previous
                 // fs-id, virtual 0, for setfsuid/setfsgid). That lets privilege-
                 // dropping programs proceed instead of fail-closing and is identical
-                // across --verify and record/replay.
+                // across --verify and record/replay. A setter that moves an
+                // effective or filesystem id also clears the caller's
+                // parent-death signal, as Linux's `commit_creds` does
+                // (`Detcore::reset_parent_death_on_credential_change`).
                 SyscallClassification::Determinized
                     if is_credential_identity_noop_syscall(call.number()) =>
                 {
+                    self.reset_parent_death_on_credential_change(guest, &call)
+                        .await;
                     Ok(0)
                 }
                 // AUTONOMOUS-BOT-IMPLEMENTED

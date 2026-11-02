@@ -19,6 +19,10 @@ use reverie::BackendSignalControlMode;
 use reverie::ChildExitPublication;
 use reverie::ChildExitPublicationResult;
 use reverie::ExitStatus;
+use reverie::OrphanPlacement;
+use reverie::OrphanPlacementResult;
+use reverie::OrphanReaper;
+use reverie::PlacedOrphanEffect;
 use reverie::SignalBoundaryOutcome;
 use reverie::SignalBoundaryReceipt;
 use reverie::SignalDeliveryPermit;
@@ -288,6 +292,16 @@ impl Scheduler {
         {
             return Err(reverie::syscalls::Errno::EINVAL.into());
         }
+        // A backend that places orphans where Detcore names
+        // (`places_orphans`) holds each exit's children for that placement
+        // only once asked to, before it installs the control: from then on
+        // Detcore's re-parenting decides the parent its waits and `getppid`
+        // see (`Scheduler::reparent_orphans`). A backend that reports the
+        // capability but refuses the opt-in contradicts itself, which is
+        // refused rather than run with two parents for an orphan.
+        if self.backend.places_orphans {
+            control.process.enable_orphan_placement()?;
+        }
         self.parked.control = Some(control);
         Ok(BackendSignalControlMode::ToolControlled)
     }
@@ -366,6 +380,182 @@ impl Scheduler {
         self.parked.nonce = sequence;
         self.parked.permits.insert(tid, permit);
         Ok(Some(permit))
+    }
+
+    /// Carries out Detcore's re-parenting of `exited`'s orphans
+    /// (`Scheduler::reparent_orphans`) in the backend's records, which a
+    /// backend that emulates waits keeps (`places_orphans`): each of
+    /// `orphans`, a `(child, zombie)` pair in pid order, moves to `reaper`, or
+    /// to the namespace init where Detcore found no reaper
+    /// (`ProcessSignalControl::place_orphans`). Detcore made every decision
+    /// already; the backend only moves its family records and announces each
+    /// zombie to the reaper, and its receipt must report exactly what Detcore
+    /// decided. A zombie the reaper reaps at once (it ignores `SIGCHLD`, or
+    /// sets `SA_NOCLDWAIT`: `reaps_children_automatically`) leaves no status
+    /// to wait for, so its shadow is consumed here, as a non-waitable child
+    /// exit's is (`finish_child_exit_publication`). A refused placement, a
+    /// receipt that disagrees, or a failure after the backend committed it
+    /// (forwarded as a publication failure of the reaper) ends the run as a
+    /// backend failure, before any other turn.
+    pub(super) fn place_orphans_in_backend(
+        &mut self,
+        exited: DetPid,
+        reaper: Option<DetPid>,
+        orphans: &[(DetPid, bool)],
+    ) {
+        // A run whose backend already failed is ending; its records are not
+        // asked to change any more.
+        if self.backend_failed() {
+            return;
+        }
+        if let Err(failure) = self.try_place_orphans(exited, reaper, orphans) {
+            tracing::error!(
+                "[scheduler] the backend's placement of the orphans of exited process {} failed: {:?}",
+                exited,
+                failure
+            );
+            if let Some(wake) =
+                self.report_backend_failure_location(super::BackendFailureLocation {
+                    pid: reverie::Pid::from_raw(exited.as_raw()),
+                    tid: None,
+                    phase: "KVM orphan placement",
+                })
+            {
+                // GlobalTool and the daemon send these only after dropping the
+                // scheduler mutex (`flush_signal_failures`).
+                self.parked.failure_wakes.push(wake);
+            }
+        }
+    }
+
+    /// Asks a placing backend (`places_orphans`) to place no orphan of
+    /// `exited`, where Detcore decided none for that exit
+    /// (`Scheduler::reparent_orphans`), so that the backend's record cannot
+    /// silently disagree: the backend holds every child an exit leaves until
+    /// it is told where that child goes, and it sends a held child it was not
+    /// told about to the namespace init and names it in its receipt
+    /// (`ProcessSignalControl::place_orphans`), which `try_place_orphans`
+    /// then refuses as longer than Detcore's decision, ending the run as a
+    /// backend failure rather than leave the child with a parent Detcore does
+    /// not know. Once per exit (`placed_exits`), and only for an exit whose
+    /// final transition the backend has reported (`terminal_processes`):
+    /// before that report the backend holds nothing for it.
+    pub(super) fn place_no_orphans_in_backend(&mut self, exited: DetPid) {
+        if !self.backend.places_orphans || !self.signal_control_installed() {
+            return;
+        }
+        let Ok(identity) = self.real_timers.retained_process_identity(exited) else {
+            return;
+        };
+        let key = ProcessGeneration::from_backend(identity);
+        if !self.parked.terminal_processes.contains_key(&key)
+            || self.parked.placed_exits.contains(&key)
+        {
+            return;
+        }
+        self.place_orphans_in_backend(exited, None, &[]);
+    }
+
+    fn try_place_orphans(
+        &mut self,
+        exited: DetPid,
+        reaper: Option<DetPid>,
+        orphans: &[(DetPid, bool)],
+    ) -> Result<(), ProtocolFailure> {
+        let control = self
+            .parked
+            .control
+            .clone()
+            .ok_or(ProtocolFailure::Identity)?;
+        // The exited process and a zombie orphan were retired here or
+        // earlier; their numeric pids still name these generations, as a
+        // process is not replaced under its pid before it is reaped.
+        let exited_identity = self.real_timers.retained_process_identity(exited)?;
+        self.parked
+            .placed_exits
+            .insert(ProcessGeneration::from_backend(exited_identity));
+        let target = match reaper {
+            Some(reaper) => OrphanReaper::Process(self.real_timers.process_identity(reaper)?),
+            None => OrphanReaper::NamespaceInit,
+        };
+        let placements = orphans
+            .iter()
+            .map(|(child, _)| {
+                Ok(OrphanPlacement {
+                    child: self.real_timers.retained_process_identity(*child)?,
+                    reaper: target,
+                })
+            })
+            .collect::<Result<Vec<_>, ProtocolFailure>>()?;
+        let (receipt, failed_after_commit) =
+            match control.process.place_orphans(exited_identity, &placements) {
+                OrphanPlacementResult::Committed(receipt) => (receipt, false),
+                OrphanPlacementResult::FailedAfterCommit { receipt, .. } => (receipt, true),
+                OrphanPlacementResult::RejectedBeforeCommit(errno) => {
+                    return Err(match errno {
+                        reverie::syscalls::Errno::EAGAIN => ProtocolFailure::Phase,
+                        reverie::syscalls::Errno::ENOSYS => ProtocolFailure::Unsupported,
+                        _ => ProtocolFailure::Identity,
+                    });
+                }
+            };
+        if failed_after_commit && let OrphanReaper::Process(reaper) = target {
+            // The backend retains the failed announcement as the reaper's
+            // publication failure; forward it (`flush_signal_failures`).
+            self.parked.failures.push(reaper);
+        }
+        if receipt.exited == exited_identity && receipt.placed.len() > placements.len() {
+            let unplaced: Vec<i32> = receipt.placed[placements.len()..]
+                .iter()
+                .map(|placed| placed.child.tgid.as_raw())
+                .collect();
+            tracing::error!(
+                "[scheduler] the backend held children {:?} of exited process {} that Detcore did not place (it decided {} orphans): their parent would differ from Detcore's",
+                unplaced,
+                exited,
+                placements.len()
+            );
+        }
+        if receipt.exited != exited_identity || receipt.placed.len() != placements.len() {
+            return Err(ProtocolFailure::Identity);
+        }
+        let reaps_automatically =
+            reaper.is_some_and(|reaper| self.thread_tree.reaps_children_automatically(reaper));
+        for ((placement, (child, zombie)), placed) in
+            placements.iter().zip(orphans).zip(&receipt.placed)
+        {
+            if placed.child != placement.child || placed.reaper != placement.reaper {
+                return Err(ProtocolFailure::Identity);
+            }
+            let agrees = match (placement.reaper, *zombie, placed.effect) {
+                (OrphanReaper::NamespaceInit, _, PlacedOrphanEffect::NamespaceInit) => true,
+                (OrphanReaper::Process(_), false, PlacedOrphanEffect::Live) => true,
+                (OrphanReaper::Process(_), true, PlacedOrphanEffect::Zombie(_)) => {
+                    !reaps_automatically
+                }
+                (OrphanReaper::Process(_), true, PlacedOrphanEffect::AutoReaped) => {
+                    reaps_automatically
+                }
+                // Its announcement failed after the placement committed.
+                (OrphanReaper::Process(_), true, PlacedOrphanEffect::ZombieUnannounced) => {
+                    failed_after_commit
+                }
+                _ => false,
+            };
+            if !agrees {
+                return Err(ProtocolFailure::Identity);
+            }
+            if placed.effect == PlacedOrphanEffect::AutoReaped
+                && let Some(reaper) = reaper
+                && !self.consume_child_wait(reaper, *child)
+            {
+                return Err(ProtocolFailure::Identity);
+            }
+        }
+        if failed_after_commit {
+            return Err(ProtocolFailure::Phase);
+        }
+        Ok(())
     }
 
     fn final_exit_after_boundary(&mut self, tid: DetTid, process: DetPid, group: bool) -> bool {
@@ -1097,10 +1287,22 @@ impl Scheduler {
             turn.protocol.owner = NextTurnOwner::Ordinary;
         }
         retire.sort_unstable_by_key(|(target, _, _)| *target);
+        // A fatal signal that ends the process here was taken at a delivery
+        // boundary Detcore permitted, and this receipt is consumed before any
+        // other turn: a death the schedule ordered, as an `Exit` grant is.
+        // The retirements below decide its parent-death signals and its
+        // orphans' new parent as at such a grant (`signal_boundary_deaths`).
+        let signal_death = death.as_ref().map(|death| death.process);
+        if let Some(process) = signal_death {
+            self.signal_boundary_deaths.insert(process);
+        }
         for (target, pid, mm) in retire {
             // Existing deferred queue removals, pending-RPC cancellation,
             // clear-TID wakeups and physical-hook admission stay authoritative.
             self.logically_kill_thread(&target, &pid, mm);
+        }
+        if let Some(process) = signal_death {
+            self.signal_boundary_deaths.remove(&process);
         }
         if let Some(FinalProcessClass::DirectParentTerminal { parent }) = final_transition {
             // The backend classifies this as run-teardown state and never emits

@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 3115,
-      "applicable": 2264,
-      "selectable": 1773,
+      "applicable": 2266,
+      "selectable": 1775,
       "population": 3050,
-      "population_candidate_selected": 1773,
+      "population_candidate_selected": 1775,
       "population_candidate_not_selected": 475,
-      "population_candidate_disabled": 802
+      "population_candidate_disabled": 800
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 623,
-        "applicable": 598,
-        "selectable": 589,
+        "applicable": 600,
+        "selectable": 591,
         "population": 610,
-        "population_candidate_selected": 589,
+        "population_candidate_selected": 591,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 18
+        "population_candidate_disabled": 16
       },
       "liteinst": {
         "cells": 623,
@@ -172,7 +172,7 @@
     {"test_id":"c-programs/child-subreaper-refusal","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is disabled: The ptrace backend supports the subreaper prctls since https://github.com/rrnewton/hermit/pull/4000, because Detcore's wait model re-parents orphans there; c-programs/child-subreaper-support asserts that instead"},
     {"test_id":"c-programs/child-subreaper-support","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: DBT refuses the subreaper prctls with ENOSYS (c-programs/child-subreaper-refusal); Detcore does not track its process children"},
     {"test_id":"c-programs/child-subreaper-support","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: In-guest LiteInst refuses the subreaper prctls with ENOSYS (c-programs/child-subreaper-refusal); its asynchronous exits are outside the re-parenting wait model"},
-    {"test_id":"c-programs/child-subreaper-support","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM refuses the subreaper prctls with ENOSYS (c-programs/child-subreaper-refusal); it emulates child waits itself, without re-parenting"},
+    {"test_id":"c-programs/child-subreaper-support","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/child-subreaper-support","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: LiteInst refuses the subreaper prctls with ENOSYS (c-programs/child-subreaper-refusal); its asynchronous exits are outside the re-parenting wait model"},
     {"test_id":"c-programs/child-subreaper-support","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe refuses the subreaper prctls with ENOSYS (c-programs/child-subreaper-refusal); it reports physical process exits separately, outside the re-parenting wait model"},
     {"test_id":"c-programs/clock-adjtime-deterministic","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -917,7 +917,7 @@
     {"test_id":"c-programs/prctl-option-policy","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"c-programs/prctl-pdeathsig","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/prctl-pdeathsig","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/prctl-pdeathsig","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM ElfExecutor returns deterministic ENOSYS for prctl PR_SET_PDEATHSIG/PR_GET_PDEATHSIG; ptrace and DBT drive the full parent-death-signal state machine"},
+    {"test_id":"c-programs/prctl-pdeathsig","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/prctl-pdeathsig","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/prctl-pdeathsig","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"c-programs/pread64-nostdlib","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

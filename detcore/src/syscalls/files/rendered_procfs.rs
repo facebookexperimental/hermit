@@ -2489,6 +2489,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         })
     }
 
+    /// The calling thread's permitted capability set (its low 64 bits), as
+    /// an injected `capget` reports it ([`Self::inject_capget`]), for the
+    /// capability part of `commit_creds`'s rule at an exec
+    /// (`crate::commit_creds`).
+    pub(crate) async fn inject_permitted_capabilities<G: Guest<Self>>(
+        guest: &mut G,
+    ) -> Result<Option<u64>, Error> {
+        Self::inject_capget(guest, CapabilitySet::Permitted).await
+    }
+
     /// The effective and permitted capability sets (their low 64 bits) of
     /// the task the kernel numbers `pid` in the caller's PID namespace, or of
     /// the calling thread for 0, as `capget` reports them (`cap_capget`, no

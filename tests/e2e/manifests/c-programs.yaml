@@ -13058,12 +13058,12 @@ test:
         ci: true
         backends_enabled:
           - sabre
-          - kvm
           - dbt
           - liteinst
           - in-guest-trap
         backends_disabled:
           ptrace: The ptrace backend supports the subreaper prctls since https://github.com/rrnewton/hermit/pull/4000, because Detcore's wait model re-parents orphans there; c-programs/child-subreaper-support asserts that instead
+          kvm: KVM supports the subreaper prctls now that its process signal control places each exit's orphans where Detcore's re-parenting names (places_orphans); c-programs/child-subreaper-support asserts that instead
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -13129,13 +13129,14 @@ test:
       verify:
         ci:
           ptrace: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           sabre: SaBRe refuses the subreaper prctls with ENOSYS (c-programs/child-subreaper-refusal); it reports physical process exits separately, outside the re-parenting wait model
-          kvm: KVM refuses the subreaper prctls with ENOSYS (c-programs/child-subreaper-refusal); it emulates child waits itself, without re-parenting
           dbt: DBT refuses the subreaper prctls with ENOSYS (c-programs/child-subreaper-refusal); Detcore does not track its process children
           liteinst: LiteInst refuses the subreaper prctls with ENOSYS (c-programs/child-subreaper-refusal); its asynchronous exits are outside the re-parenting wait model
           in-guest-trap: In-guest LiteInst refuses the subreaper prctls with ENOSYS (c-programs/child-subreaper-refusal); its asynchronous exits are outside the re-parenting wait model
@@ -16074,12 +16075,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
           - sabre
           - dbt
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          kvm: KVM ElfExecutor returns deterministic ENOSYS for prctl PR_SET_PDEATHSIG/PR_GET_PDEATHSIG; ptrace and DBT drive the full parent-death-signal state machine
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled

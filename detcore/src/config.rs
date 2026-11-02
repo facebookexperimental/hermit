@@ -86,6 +86,12 @@ fn fingerprint_with_revision(base: &str, revision: u32) -> String {
 mod tests {
     use super::*;
 
+    /// Revisions reserved for a change that is not on this base yet, which
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: none now, since SP2's 25
+    /// (reserved as 22 with its record version) landed beneath PRCTL's 26,
+    /// with its row. Remove an entry when its change lands, with its row.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[];
+
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
     /// these appends a row and sets
@@ -203,6 +209,14 @@ mod tests {
         // made `GlobalResponse::FlockCancel` a unit answer) and whether it woke
         // other requests (SP2's third review round, still before any release).
         (25, "5c9d613c4fb323bd", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::ChildSubreaper` and `GlobalResponse::ChildSubreaper`:
+        // Detcore's record of the caller's subreaper flag, which answers
+        // `PR_GET_CHILD_SUBREAPER` on a backend that places orphans where
+        // Detcore names (PRCTL phase 2 of the kvm lane), after SP2's variants:
+        // revision 22 was reserved for SP2 while PRCTL's base lacked them, and
+        // the pair became 25 and 26, appended after main's 22 to 24, at their
+        // rebase onto batch5a (digests measured at this head, above SP2).
+        (26, "b5fc7394708905c9", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -285,9 +299,16 @@ mod tests {
         let resources = include_str!("resources.rs");
         let resources_digest = resources_definition_digest(resources);
         let revision = crate::tool_global::GLOBAL_RPC_REVISION;
+        let after = |revision: u32| {
+            let mut next = revision + 1;
+            while RESERVED_GLOBAL_RPC_REVISIONS.contains(&next) {
+                next += 1;
+            }
+            next
+        };
         let next = GLOBAL_RPC_REVISIONS
             .last()
-            .map_or(1, |(last, _, _)| last + 1);
+            .map_or(1, |(last, _, _)| after(*last));
         assert_eq!(
             GLOBAL_RPC_REVISIONS.last(),
             Some(&(revision, digest.as_str(), resources_digest.as_str())),
@@ -297,7 +318,11 @@ mod tests {
              that runtimes and coordinators from either side of the change refuse each other"
         );
         for pair in GLOBAL_RPC_REVISIONS.windows(2) {
-            assert_eq!(pair[1].0, pair[0].0 + 1, "revisions count up by one");
+            assert_eq!(
+                pair[1].0,
+                after(pair[0].0),
+                "revisions count up by one, skipping only a reserved revision"
+            );
             assert_ne!(
                 (pair[1].1, pair[1].2),
                 (pair[0].1, pair[0].2),

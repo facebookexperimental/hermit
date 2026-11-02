@@ -36,6 +36,7 @@ use crate::random::write_random_chunk;
 use crate::record_or_replay::RecordOrReplay;
 use crate::scheduler::HostTimedSignalScope;
 use crate::tool_global::SigalrmControl;
+use crate::tool_global::child_subreaper;
 use crate::tool_global::create_session;
 use crate::tool_global::record_host_timed_signals;
 use crate::tool_global::refuse_sigalrm;
@@ -100,10 +101,14 @@ fn seccomp_result(op: u32, flags: u32, has_args: bool) -> Result<i64, Errno> {
 
 /// Whether Detcore sends parent-death signals itself
 /// (https://github.com/rrnewton/hermit/issues/4440): only where a thread's
-/// exit reaches the scheduler in order (sequentialized threads) and the
-/// guest's tasks are host tasks it can signal (ptrace).
+/// exit reaches the scheduler in order (sequentialized threads), and the
+/// guest's tasks are host tasks it can signal (ptrace) or the backend
+/// publishes signals Detcore decides (a nonempty
+/// `publishable_parent_death_signals`, KVM's process signal control).
 fn delivers_parent_death_signal(config: &crate::config::Config) -> bool {
-    config.sequentialize_threads && config.backend.host_task_reads_reach_guest_threads
+    config.sequentialize_threads
+        && (config.backend.host_task_reads_reach_guest_threads
+            || config.backend.publishable_parent_death_signals != 0)
 }
 
 /// Whether Detcore holds parent-death signals itself, arming the kernel with
@@ -131,19 +136,25 @@ enum ParentDeathSignalRoute {
 
 /// Where `prctl(PR_SET_PDEATHSIG, signal)` goes, where Detcore holds
 /// parent-death signals (`holds`) and refuses the ones it cannot hold
-/// (`refuses_unheld`, an in-guest run's default route). Detcore holds 0 and
-/// every signal it sends itself ([`detcore_sends_parent_death_signal`]).
-/// SIGKILL keeps the kernel's path everywhere: it cannot be blocked or left
-/// pending, so the in-guest runtime's mask does not make it host-timed in the
-/// way the refusal is about (design section 16.32). Any other signal (SIGSTOP,
+/// (`refuses_unheld`, an in-guest run's default route), on a backend that
+/// publishes the signals in `published` for it (its declared set, empty
+/// where it publishes none). Detcore holds 0 and every
+/// signal it sends itself ([`detcore_sends_parent_death_signal`]). Elsewhere
+/// SIGKILL keeps the kernel's path: it cannot be blocked or left pending, so
+/// the in-guest runtime's mask does not make it host-timed in the way the
+/// refusal is about (design section 16.32). Any other signal (SIGSTOP,
 /// SIGALRM, a realtime signal) is refused where unheld signals are; a value
-/// above 64 always goes to the kernel, which refuses it with EINVAL.
+/// above 64 always goes to the kernel, which refuses it with EINVAL. On a
+/// publishing backend the signals outside its declared set take the
+/// backend's path, where the backend declines them (KVM with a typed refusal
+/// that ends a fail-closed run by name, `ParentDeathSignal`).
 fn parent_death_signal_route(
     signal: libc::c_ulong,
     holds: bool,
     refuses_unheld: bool,
+    published: u64,
 ) -> ParentDeathSignalRoute {
-    if holds && (signal == 0 || detcore_sends_parent_death_signal(signal)) {
+    if holds && (signal == 0 || detcore_sends_parent_death_signal(signal, published)) {
         ParentDeathSignalRoute::Hold
     } else if refuses_unheld
         && (1..=64).contains(&signal)
@@ -155,12 +166,36 @@ fn parent_death_signal_route(
     }
 }
 
-/// Whether parent-death signal `signal` is one Detcore sends itself: a
-/// standard signal (1 to 31) other than SIGKILL and SIGSTOP, which the
-/// kernel keeps acting on as before (a SIGKILL'd child is never counted as
-/// stuck, `Scheduler::child_is_stuck`), and SIGALRM, whose scheduler sends go
-/// to the process's alarm ledger.
-fn detcore_sends_parent_death_signal(signal: libc::c_ulong) -> bool {
+/// Whether parent-death signal `signal` is one Detcore sends itself.
+///
+/// Where the backend publishes none (`published` empty, so the guest's tasks
+/// are host tasks Detcore signals itself): a standard
+/// signal (1 to 31) other than SIGKILL and SIGSTOP, which the kernel keeps
+/// acting on as before (a SIGKILL'd child is never counted as stuck,
+/// `Scheduler::child_is_stuck`), and SIGALRM, whose scheduler sends go to the
+/// process's alarm ledger.
+///
+/// Where the backend publishes them (`published`, the set it declares in
+/// `BackendCapabilities::publishable_parent_death_signals`, bit `n - 1` for
+/// signal `n`): the standard signals in that set. Each other signal takes the
+/// backend's path, which refuses it by name. The backend decides what it can
+/// publish. Detcore's own delivery carries standard signals only: each
+/// pending send is one `Signal` (`PendingParentDeathSignal`), and the
+/// parked-wait selection asks the backend about signals 1 to 31
+/// (`Scheduler::select_parked_alarm`). So a real-time signal a backend
+/// declares is not held, which would leave it registered but never sent: it
+/// takes the backend's path and its refusal. KVM declares every standard signal except the stop
+/// signals and SIGCHLD: SIGKILL is in it (KVM queues it like any other, and
+/// it ends the process at its next delivery boundary), and so is SIGALRM
+/// (the publication puts it in the process's shared queue beside a
+/// controlled `ITIMER_REAL`'s copy, as Linux does); the stop signals are not
+/// (KVM has no stopped state), nor SIGCHLD (KVM's queues carry it only for a
+/// child's exit), nor the realtime signals (its process queue holds one
+/// event per standard signal and none of a realtime one).
+fn detcore_sends_parent_death_signal(signal: libc::c_ulong, published: u64) -> bool {
+    if published != 0 {
+        return (1..=31).contains(&signal) && published & (1_u64 << (signal - 1)) != 0;
+    }
     (1..=31).contains(&signal)
         && ![libc::SIGKILL, libc::SIGSTOP, libc::SIGALRM].contains(&(signal as libc::c_int))
 }
@@ -253,16 +288,18 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
 /// `deregister_thread` and re-parents there (`Scheduler::reparent_orphans`);
 /// without that, Detcore's record never learns the orphan moved while it still
 /// decides ECHILD. And on `backend`, its own record of children decides waits
-/// (`tracks_process_children`), the kernel rather than the backend performs
-/// them (`!emulates_child_waits`), and a process's exit reaches Detcore only
-/// after the kernel's `exit_notify` has re-parented its children (neither
-/// asynchronous nor separately reported physical exits), so the record agrees
-/// with the kernel. Today that is ptrace, and e9patch preprocessing run under
-/// ptrace, in a sequentialized run.
+/// (`tracks_process_children`), and a process's exit reaches Detcore only
+/// after its children have their new parent (neither asynchronous nor
+/// separately reported physical exits), so the record agrees with whoever
+/// performs the waits: the kernel, whose `exit_notify` re-parented them
+/// (`!emulates_child_waits`), or a backend that emulates the waits and
+/// places each orphan where Detcore names (`places_orphans`), in the same
+/// critical section of the exit. Today that is ptrace, e9patch preprocessing
+/// run under ptrace, and KVM, in a sequentialized run.
 fn models_child_subreapers(sequentialize_threads: bool, backend: &BackendCapabilities) -> bool {
     sequentialize_threads
         && backend.tracks_process_children
-        && !backend.emulates_child_waits
+        && (!backend.emulates_child_waits || backend.places_orphans)
         && !backend.process_exits_complete_asynchronously
         && !backend.reports_physical_process_exits
 }
@@ -670,6 +707,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     signal,
                     held,
                     guest.config().in_guest_refuses_host_timed_producers,
+                    guest.config().backend.publishable_parent_death_signals,
                 );
                 if route == ParentDeathSignalRoute::Refuse {
                     tracing::warn!(
@@ -715,7 +753,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if signal == libc::SIGKILL as libc::c_ulong {
                     crate::reserved_input::expose_global(guest, "kernel-parent-death-sigkill")?;
                 }
-                let result = self.passthrough(guest, call.into()).await?;
+                // A backend that cannot arm a valid signal declines it with
+                // the typed refusal `ParentDeathSignal` (KVM, for a stop
+                // signal, SIGCHLD or a real-time signal, which it cannot
+                // send). That ends a
+                // fail-closed run by name, instead of handing the guest an
+                // ENOSYS that Linux never gives for a signal from 1 to 64.
+                let result = self.passthrough(guest, call.into()).await;
+                let result = self
+                    .report_backend_refusal(
+                        guest,
+                        Sysno::prctl,
+                        reverie::UnsupportedOperation::ParentDeathSignal,
+                        result,
+                    )
+                    .await?;
                 if held {
                     crate::tool_global::parent_death_signal(guest, Some(0)).await;
                 }
@@ -749,7 +801,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let Some(process) = registered_process_of(guest, dettid).await else {
                     return Err(Errno::ENOSYS.into());
                 };
-                let result = guest.inject(call).await?;
+                // A backend that places orphans where Detcore names
+                // (`places_orphans`, KVM) holds no flag of its own: Detcore's
+                // record is the flag, and Linux's prctl answers 0 for any
+                // argument (`kernel/sys.c`).
+                let result = if guest.config().backend.places_orphans {
+                    0
+                } else {
+                    guest.inject(call).await?
+                };
                 set_child_subreaper(guest, process, call.arg2() != 0).await;
                 Ok(result)
             }
@@ -759,7 +819,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                     &guest.config().backend,
                 ) =>
             {
-                Ok(guest.inject(call).await?)
+                if !guest.config().backend.places_orphans {
+                    return Ok(guest.inject(call).await?);
+                }
+                // Linux writes the caller's process flag as an int
+                // (`put_user`), EFAULT where it cannot.
+                let dettid = guest.thread_state().dettid;
+                let Some(process) = registered_process_of(guest, dettid).await else {
+                    return Err(Errno::ENOSYS.into());
+                };
+                let flag = i32::from(child_subreaper(guest, process).await);
+                let target =
+                    AddrMut::<libc::c_int>::from_raw(call.arg2() as usize).ok_or(Errno::EFAULT)?;
+                guest
+                    .memory()
+                    .write_value(target, &flag)
+                    .map_err(|_| Errno::EFAULT)?;
+                Ok(0)
             }
             // PR_SET_NAME reaches the kernel, as before, and Detcore then
             // records the name the kernel took, which a rendered
@@ -1441,10 +1517,10 @@ mod tests {
     fn parent_death_signals_are_held_refused_or_the_kernels() {
         use ParentDeathSignalRoute::*;
         for signal in 0..=66_u64 {
-            let held = signal == 0 || detcore_sends_parent_death_signal(signal);
-            let in_guest = parent_death_signal_route(signal, true, true);
-            let ptrace = parent_death_signal_route(signal, true, false);
-            let other = parent_death_signal_route(signal, false, false);
+            let held = signal == 0 || detcore_sends_parent_death_signal(signal, 0);
+            let in_guest = parent_death_signal_route(signal, true, true, 0);
+            let ptrace = parent_death_signal_route(signal, true, false, 0);
+            let other = parent_death_signal_route(signal, false, false, 0);
             assert_eq!(other, Kernel, "{signal}");
             assert_eq!(ptrace, if held { Hold } else { Kernel }, "{signal}");
             let expected = if held {
@@ -1469,9 +1545,69 @@ mod tests {
             (65, Kernel),
         ] {
             assert_eq!(
-                parent_death_signal_route(signal as u64, true, true),
+                parent_death_signal_route(signal as u64, true, true, 0),
                 route,
                 "{signal}"
+            );
+        }
+    }
+
+    /// Where the backend publishes the signals Detcore decides, Detcore holds
+    /// 0 and the standard signals the backend declares. KVM declares every
+    /// standard signal but the stop signals and SIGCHLD, SIGKILL and SIGALRM
+    /// among them; the stop signals, SIGCHLD, the realtime signals and a
+    /// value above 64 take the backend's path, which refuses or rejects them.
+    /// A backend declaring another set gets its standard signals held, and
+    /// none of the real-time ones it declares, which Detcore's delivery
+    /// cannot carry.
+    #[test]
+    fn a_publishing_backend_holds_every_standard_signal_but_the_stop_signals_and_sigchld() {
+        use ParentDeathSignalRoute::*;
+        let kvm = BackendCapabilities::KVM.publishable_parent_death_signals;
+        let unsent = [
+            libc::SIGSTOP,
+            libc::SIGTSTP,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
+            libc::SIGCHLD,
+        ];
+        for signal in 0..=66_u64 {
+            let expected = if signal == 0
+                || ((1..=31).contains(&signal) && !unsent.contains(&(signal as i32)))
+            {
+                Hold
+            } else {
+                Kernel
+            };
+            assert_eq!(
+                parent_death_signal_route(signal, true, false, kvm),
+                expected,
+                "{signal}"
+            );
+            assert_eq!(
+                parent_death_signal_route(signal, false, false, kvm),
+                Kernel,
+                "{signal}: nothing is held where Detcore does not deliver"
+            );
+        }
+        for signal in [libc::SIGKILL, libc::SIGALRM, libc::SIGCONT, libc::SIGTERM] {
+            assert_eq!(
+                parent_death_signal_route(signal as u64, true, false, kvm),
+                Hold,
+                "{signal}"
+            );
+        }
+        let other = (1_u64 << (libc::SIGUSR1 - 1)) | (1_u64 << (40 - 1)) | (1_u64 << (64 - 1));
+        for signal in 0..=66_u64 {
+            let expected = if [0, libc::SIGUSR1 as u64].contains(&signal) {
+                Hold
+            } else {
+                Kernel
+            };
+            assert_eq!(
+                parent_death_signal_route(signal, true, false, other),
+                expected,
+                "{signal} of another backend's set"
             );
         }
     }
@@ -1507,6 +1643,20 @@ mod tests {
             ..in_guest
         };
         assert!(!holds_parent_death_signal(&off));
+        // KVM publishes the signals Detcore decides, in a sequentialized run.
+        let kvm = crate::config::Config {
+            sequentialize_threads: true,
+            backend: BackendCapabilities::KVM,
+            ..Default::default()
+        };
+        assert!(delivers_parent_death_signal(&kvm));
+        assert!(holds_parent_death_signal(&kvm));
+        let kvm_unsequentialized = crate::config::Config {
+            sequentialize_threads: false,
+            ..kvm
+        };
+        assert!(!delivers_parent_death_signal(&kvm_unsequentialized));
+        assert!(!holds_parent_death_signal(&kvm_unsequentialized));
     }
 
     mod group_mirror {
@@ -1982,14 +2132,20 @@ mod tests {
     }
 
     /// The subreaper prctls are admitted only where Detcore's record of
-    /// children decides waits and the kernel has re-parented by the time an
-    /// exit reaches Detcore: ptrace, and e9patch preprocessing under ptrace,
-    /// with threads sequentialized. Without sequentialization no exit reaches
-    /// the scheduler, nothing re-parents, and a subreaper's wait would see
-    /// ECHILD while its orphan lives, so the call keeps failing with ENOSYS.
+    /// children decides waits and the orphans have their new parent by the
+    /// time an exit reaches Detcore: ptrace, and e9patch preprocessing under
+    /// ptrace, where the kernel re-parented them, and KVM, which places each
+    /// one where Detcore names, with threads sequentialized. Without
+    /// sequentialization no exit reaches the scheduler, nothing re-parents,
+    /// and a subreaper's wait would see ECHILD while its orphan lives, so the
+    /// call keeps failing with ENOSYS.
     #[test]
     fn child_subreaper_prctls_are_admitted_only_where_detcore_models_them() {
-        for backend in [BackendCapabilities::PTRACE, BackendCapabilities::E9PATCH] {
+        for backend in [
+            BackendCapabilities::PTRACE,
+            BackendCapabilities::E9PATCH,
+            BackendCapabilities::KVM,
+        ] {
             assert!(models_child_subreapers(true, &backend), "{backend:?}");
             assert!(!models_child_subreapers(false, &backend), "{backend:?}");
         }
@@ -1997,7 +2153,6 @@ mod tests {
             BackendCapabilities::LITEINST_IN_GUEST,
             BackendCapabilities::SABRE,
             BackendCapabilities::DBT,
-            BackendCapabilities::KVM,
         ] {
             assert!(!models_child_subreapers(true, &backend), "{backend:?}");
             assert!(!models_child_subreapers(false, &backend), "{backend:?}");

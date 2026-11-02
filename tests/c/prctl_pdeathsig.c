@@ -23,10 +23,10 @@
  * set is a pure per-thread register with no host-derived state, so it is
  * deterministic across repeated runs and backends.
  *
- * ptrace and DBT drive the full state machine. KVM's ElfExecutor refuses a
- * nonzero PR_SET_PDEATHSIG with ENOSYS, so the KVM verify cell for
- * c-programs/prctl-pdeathsig in tests/e2e/manifests/c-programs.yaml is
- * disabled.
+ * Every backend drives the full state machine. On ptrace and KVM, Detcore
+ * holds the value itself and sends the signal when the parent thread leaves
+ * (on KVM through the backend's publication of it); tests/c/parent_death_signal.c
+ * covers that delivery.
  *
  * EMISSION CONTRACT: the fixture prints the signal number read back after each
  * set, not just a check count. The values are guest-chosen (SIGUSR1, then

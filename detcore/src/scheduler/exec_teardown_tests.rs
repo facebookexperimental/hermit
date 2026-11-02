@@ -250,7 +250,7 @@ fn exec_wait_owner_transfer_preserves_other_parents_and_creation_lineage() {
     assert!(tree.create_session(clone_parent_child));
     let before = tree.clone();
 
-    tree.transfer_exec_wait_owner(process, former, process);
+    tree.transfer_wait_owner(process, former, process);
 
     assert_eq!(tree.process_wait[&own_child].wait_owner, process);
     assert_eq!(tree.process_wait[&leader_child].wait_owner, process);

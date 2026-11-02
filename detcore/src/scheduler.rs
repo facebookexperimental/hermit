@@ -2041,7 +2041,13 @@ pub struct Scheduler {
     /// Parent-death signals decided where a thread left, sent at the next
     /// drain of the scheduler (`flush_parent_death_signals`), so that the
     /// send's wake never mutates the run queue during a selection.
-    pending_parent_death_signals: Vec<(DetPid, Signal)>,
+    pending_parent_death_signals: Vec<PendingParentDeathSignal>,
+
+    /// The processes a fatal signal is ending at a delivery boundary Detcore
+    /// permitted (`consume_signal_boundary`'s `SignalDeath`), while their
+    /// threads are retired: a death the schedule ordered, as an `Exit` grant
+    /// is, for `deliver_parent_death_signals` and `reparent_orphans`.
+    signal_boundary_deaths: BTreeSet<DetPid>,
 
     /// Tombstoned SaBRe threads whose final asynchronous deregistration statistics were merged.
     /// Logical exit-group teardown and physical exit cleanup are distinct events.
@@ -3188,8 +3194,9 @@ impl ThreadTree {
                 }
                 // Linux's real_parent: the creating thread, or with
                 // CLONE_PARENT the creator's own real parent, which
-                // `parent_death_parents` keeps current where `wait_owner` may
-                // name a thread that has since left.
+                // `parent_death_parents` keeps current as threads and
+                // processes leave (as `hand_off_thread_children` and
+                // `reparent_child` keep `wait_owner`).
                 let real_parent = if clone_parent {
                     self.parent_death_parents.get(&parent_process).copied()
                 } else {
@@ -3314,15 +3321,21 @@ impl ThreadTree {
         children
     }
 
-    /// Preserve a surviving exec task's children when Linux replaces its TID
-    /// with the process leader's. The creation tree remains historical; only
-    /// the current task identity used by `__WNOTHREAD` changes. Scope the move
-    /// to this effective parent so retained records from an older use of the
-    /// same raw TID and `CLONE_PARENT` children keep their own wait identities.
-    fn transfer_exec_wait_owner(&mut self, process: DetPid, former: DetTid, leader: DetTid) {
+    /// Give the children of `process` whose real parent thread is `former` to
+    /// its thread `heir`: where Linux replaces an exec'ing task's TID with the
+    /// process leader's (`exchange_tids`), and where a thread leaves while its
+    /// process lives on, so its children go to the live thread
+    /// `find_alive_thread` finds (`forget_original_parent`,
+    /// `Scheduler::hand_off_thread_children`). The creation tree remains
+    /// historical; only the current task identity used by `__WNOTHREAD`
+    /// changes, as no `reparent_leader` runs for a move within the thread
+    /// group: the process parent and exit signal stay. Scope the move to this
+    /// effective parent so retained records from an older use of the same raw
+    /// TID and `CLONE_PARENT` children keep their own wait identities.
+    fn transfer_wait_owner(&mut self, process: DetPid, former: DetTid, heir: DetTid) {
         for metadata in self.process_wait.values_mut() {
             if metadata.wait_parent == Some(process) && metadata.wait_owner == former {
-                metadata.wait_owner = leader;
+                metadata.wait_owner = heir;
             }
         }
     }
@@ -4461,6 +4474,20 @@ struct BackendFailureLocation {
     pid: reverie::Pid,
     tid: Option<reverie::Tid>,
     phase: &'static str,
+}
+
+/// A parent-death signal Detcore decided where a thread left
+/// (`Scheduler::deliver_parent_death_signals`), sent at the next drain
+/// (`Scheduler::flush_parent_death_signals`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingParentDeathSignal {
+    /// The child process it goes to, as a whole.
+    child: DetPid,
+    /// The signal its task armed.
+    signal: Signal,
+    /// The process of the thread that left: Linux's sender, whose thread
+    /// group id the signal's `si_pid` carries (`SEND_SIG_NOINFO`).
+    sender: DetPid,
 }
 
 /// Wait without manufacturing a normal scheduler request or response. The
@@ -5714,6 +5741,7 @@ impl Scheduler {
             exec_teardowns: Default::default(),
             parent_death_exec_survivor: None,
             pending_parent_death_signals: Vec::new(),
+            signal_boundary_deaths: BTreeSet::new(),
             deregistration_accounted: Default::default(),
             pending_physical_process_exits: Default::default(),
             namespace_zap_victims: Default::default(),
@@ -7140,6 +7168,7 @@ impl Scheduler {
         if last_of_process {
             self.shared_queue_scheduler_signals.remove(detpid);
             self.signal_curr_targets.remove(detpid);
+            self.parked.published_parent_death_signals.remove(detpid);
             // The generation stays, so that no publication older than one
             // already taken can bring dispositions back.
             if let Some(published) = self.published_dispositions.get_mut(detpid) {
@@ -7239,6 +7268,7 @@ impl Scheduler {
 
         if first_removal {
             let process = self.registered_process(*dtid).unwrap_or(*detpid);
+            self.hand_off_thread_children(*dtid, process);
             self.deliver_parent_death_signals(*dtid, process);
         }
 
@@ -7332,22 +7362,32 @@ impl Scheduler {
     /// when any thread exits (https://github.com/rrnewton/hermit/issues/4440):
     /// for each such child, in pid order, each of its live tasks that armed a
     /// parent-death signal (leader first, then by tid) has it sent to the
-    /// whole child process, through the scheduler's own send (`fire_alarm`)
-    /// at the next drain (`flush_parent_death_signals`), which wakes a wait
-    /// that admits it.
+    /// whole child process at the next drain (`flush_parent_death_signals`),
+    /// with `process` as its sender, through the scheduler's own send
+    /// (`fire_alarm`), which wakes a wait that admits it, or, on a backend that
+    /// publishes the signals Detcore decides (a nonempty
+    /// `publishable_parent_death_signals`, KVM), through that publication.
+    /// Detcore holds only the signals such a backend declares
+    /// (`detcore_sends_parent_death_signal`). This is where Detcore decides which
+    /// signals a thread's exit sends, to whom and in what order; the backend
+    /// only queues them.
     ///
     /// This runs where `logically_kill_thread` first removes `exited`. For an
     /// `exit` or `exit_group` with sequentialized threads that follows the
     /// scheduler-ordered `ResourceID::Exit` grant and precedes the next
     /// committed turn, as re-parenting does (`reparent_orphans`), so the send
     /// is as deterministic as that turn; so are the threads an exit_group or a
-    /// committed SIGKILL retires (their process's exit is granted) and those
-    /// an exec's edge retires (`parent_death_exec_survivor`). A thread that
-    /// died otherwise (a fatal signal) leaves at a moment host timing sets:
-    /// its children's signals are posted then, as the kernel posted them
-    /// before, and recorded as host-timed for their processes, so no gated
-    /// wait ends for them (https://github.com/rrnewton/hermit/issues/3146);
-    /// that is a determinism loss, named here.
+    /// committed SIGKILL retires (their process's exit is granted), those an
+    /// exec's edge retires (`parent_death_exec_survivor`), and those a fatal
+    /// signal ends at a delivery boundary Detcore permitted
+    /// (`signal_boundary_deaths`). A thread that died otherwise (a fatal
+    /// signal the host reports) leaves at a moment host timing sets: its
+    /// children's signals are posted then, as the kernel posted them before,
+    /// and recorded as host-timed for their processes, so no gated wait ends
+    /// for them (https://github.com/rrnewton/hermit/issues/3146); that is a
+    /// determinism loss, named here. A publishing backend has no host task to
+    /// post to, and reports every death at a permitted boundary, so its
+    /// signals are always published at the drain.
     fn deliver_parent_death_signals(&mut self, exited: DetTid, process: DetPid) {
         if let Some(refusal) = self.parent_death_firing_refusal(exited, process) {
             exit_on_scheduler_refusal(&refusal);
@@ -7368,12 +7408,24 @@ impl Scheduler {
                     );
                     continue;
                 };
-                if committed {
+                if committed || self.backend.publishable_parent_death_signals != 0 {
+                    if !committed {
+                        // Not reached by a death Detcore ordered; say so
+                        // rather than let verification compare it.
+                        self.note_determinism_loss(format!(
+                            "parent-death signal {signal} of process {child} was decided when thread {exited}, which died without an Exit grant, left (https://github.com/rrnewton/hermit/issues/4440)"
+                        ));
+                    }
                     info!(
                         "[scheduler] thread {} left: parent-death signal {} to process {}",
                         exited, signal, child
                     );
-                    self.pending_parent_death_signals.push((child, signal));
+                    self.pending_parent_death_signals
+                        .push(PendingParentDeathSignal {
+                            child,
+                            signal,
+                            sender: process,
+                        });
                 } else {
                     // A thread that left at a host-timed moment (a fatal
                     // signal) sends at that moment, as the kernel did before:
@@ -7417,10 +7469,22 @@ impl Scheduler {
             .collect()
     }
 
-    /// The parent-death signals Detcore holds for `child`'s live tasks, leader
-    /// first, then by tid.
+    /// The parent-death signals Detcore holds for the tasks on `child`'s
+    /// thread list, leader first, then by tid: its live tasks and, while any
+    /// of those lives, its leader even after the leader has left. Linux keeps
+    /// a leader that exits before its group's last thread as a zombie on the
+    /// thread list, with its `pdeath_signal` (`exit_notify` reaps only an
+    /// untraced non-leader at once, kernel/exit.c:757-763, unlinking it in
+    /// `__unhash_process`, kernel/exit.c:153), so `forget_original_parent`'s
+    /// `for_each_thread` still sends the zombie leader's signal
+    /// (kernel/exit.c:713-721, v6.17). A process with no live task holds
+    /// nothing.
     fn held_parent_death_signals(&self, child: DetPid) -> Vec<i32> {
         let mut tasks: Vec<DetTid> = self.live_process_threads(child).collect();
+        let leader = DetTid::from_raw(child.as_raw());
+        if !tasks.is_empty() && !tasks.contains(&leader) {
+            tasks.push(leader);
+        }
         tasks.sort_by_key(|tid| (tid.as_raw() != child.as_raw(), *tid));
         tasks
             .iter()
@@ -7433,6 +7497,7 @@ impl Scheduler {
     fn parent_death_exit_is_committed(&self, exited: DetTid, process: DetPid) -> bool {
         self.committed_exits.contains(&exited)
             || self.thread_tree.granted_exits.contains(&process)
+            || self.signal_boundary_deaths.contains(&process)
             || self
                 .parent_death_exec_survivor
                 .map(|(survivor_process, _)| survivor_process)
@@ -7480,14 +7545,42 @@ impl Scheduler {
     }
 
     /// Send the parent-death signals decided since the last drain
-    /// (`deliver_parent_death_signals`), in the order they were decided,
-    /// through the scheduler's own send (`fire_alarm`), at this drain, where
-    /// the run queue may change.
+    /// (`deliver_parent_death_signals`), in the order they were decided, at
+    /// this drain, where the run queue may change: through the scheduler's
+    /// own send (`fire_alarm`), or on a backend that publishes the signals
+    /// Detcore decides (a nonempty `publishable_parent_death_signals`)
+    /// through its process signal control (`publish_parent_death_signal`).
     fn flush_parent_death_signals(&mut self) {
-        for (process, signal) in std::mem::take(&mut self.pending_parent_death_signals) {
+        for pending in std::mem::take(&mut self.pending_parent_death_signals) {
+            if self.backend.publishable_parent_death_signals != 0 {
+                self.publish_parent_death_signal(pending);
+                continue;
+            }
+            let PendingParentDeathSignal { child, signal, .. } = pending;
             self.sending_parent_death = true;
-            self.fire_alarm(process, DetTid::from_raw(process.as_raw()), signal);
+            self.fire_alarm(child, DetTid::from_raw(child.as_raw()), signal);
             self.sending_parent_death = false;
+        }
+    }
+
+    /// Linux's `forget_original_parent` for a thread that leaves while its
+    /// process lives on: the children whose real parent thread is `exited`
+    /// (their `wait_owner`) move to the live thread `find_alive_thread` finds,
+    /// the heir `parent_death_heir` names, so that thread's `__WNOTHREAD` waits
+    /// find them and their exit notification prefers it (`complete_signal`
+    /// tries the parent thread first). A move within the thread group keeps
+    /// each child's process parent and exit signal, as Linux calls
+    /// `reparent_leader` only for a new parent in another thread group. When
+    /// the process's last thread leaves (or its exit is granted), the heir is
+    /// another process's thread and `reparent_orphans` moves the children
+    /// instead. This runs where the thread's parent-death children move,
+    /// at its first removal, so it is as ordered as that removal.
+    fn hand_off_thread_children(&mut self, exited: DetTid, process: DetPid) {
+        let Some(heir) = self.parent_death_heir(exited, process) else {
+            return;
+        };
+        if self.registered_process(heir) == Some(process) {
+            self.thread_tree.transfer_wait_owner(process, exited, heir);
         }
     }
 
@@ -7553,25 +7646,43 @@ impl Scheduler {
     ///
     /// Children are visited in pid order, so the waiters they wake join the
     /// run queue in an order that does not depend on hashing.
+    ///
+    /// This is where Detcore decides every orphan's new parent, for every
+    /// backend. On ptrace the kernel has already moved its own records the
+    /// same way (`exit_notify`). A backend that emulates waits keeps records
+    /// of its own instead, and if it places orphans where Detcore names
+    /// (`places_orphans`, KVM), the decision is carried out there in this
+    /// critical section (`place_orphans_in_backend`): until then the backend
+    /// holds the exit's children for the placement, so no other parent can
+    /// see them. Where Detcore decides no orphan, such a backend is asked to
+    /// place none (`place_no_orphans_in_backend`), which ends the run if it
+    /// holds a child all the same.
     fn reparent_orphans(&mut self, exited: DetPid) {
         let orphans = self.thread_tree.undecided_orphans_of(exited);
         if orphans.is_empty() {
+            self.place_no_orphans_in_backend(exited);
             return;
         }
         let reaper = self.find_child_reaper(exited);
         if let Some((reaper, _)) = reaper
             && !self.thread_tree.granted_exits.contains(&exited)
+            && !self.signal_boundary_deaths.contains(&exited)
         {
             // Without an Exit grant (SIGKILL, another fatal signal, a fault)
             // the parent's exit is recorded at its host-timed deregistration,
             // and so is this adoption
             // (https://github.com/rrnewton/hermit/issues/3994). Say so rather
             // than let verification compare a schedule that host timing chose.
+            // A fatal signal taken at a delivery boundary Detcore permitted is
+            // not such a death: its receipt is ordered by the schedule
+            // (`signal_boundary_deaths`).
             self.note_determinism_loss(format!(
                 "subreaper {reaper} adopted the orphans of process {exited}, which died without an Exit grant, at its host-timed deregistration (https://github.com/rrnewton/hermit/issues/3994)"
             ));
         }
+        let mut decided = Vec::with_capacity(orphans.len());
         for child in orphans {
+            decided.push((child, self.logically_exited_processes.contains(&child)));
             let Some((reaper, owner)) = reaper else {
                 debug!(
                     "[scheduler] orphan {} of exited process {} goes to the container init",
@@ -7598,6 +7709,14 @@ impl Scheduler {
                 }
                 self.wake_child_waiters(reaper, child);
             }
+        }
+        // A backend that keeps its own records of children and places each
+        // orphan where Detcore names (`places_orphans`, KVM) moves them now,
+        // in this critical section, before any thread can wait for an orphan
+        // or ask for its parent (`Scheduler::place_orphans_in_backend`).
+        if self.backend.places_orphans && self.signal_control_installed() {
+            let reaper = reaper.map(|(reaper, _)| reaper);
+            self.place_orphans_in_backend(exited, reaper, &decided);
         }
     }
 
@@ -7889,7 +8008,7 @@ impl Scheduler {
         }
 
         self.thread_tree
-            .transfer_exec_wait_owner(detpid, caller, new_leader);
+            .transfer_wait_owner(detpid, caller, new_leader);
         // The exec'ing thread survives as the leader, so its children keep
         // their parent, and its own parent-death signal goes with it.
         self.thread_tree
@@ -25600,6 +25719,62 @@ mod test {
         assert!(!tree.is_init_orphan(child));
         assert!(!tree.granted_exits.contains(&child));
         assert_eq!(tree.pid_ns_depth(child), 0);
+    }
+
+    /// A thread that leaves while its process lives on hands its children to
+    /// the live thread Linux's `find_alive_thread` finds, the leader first,
+    /// as `forget_original_parent` does: that thread's `__WNOTHREAD` wait
+    /// then finds them, and no wait names the thread that left. Each child
+    /// keeps its process parent and exit-signal class: a clone child is still
+    /// waited for with `__WCLONE`. Before, the wait still named the thread
+    /// that left and answered ECHILD.
+    #[test]
+    fn a_leaving_threads_children_go_to_the_live_thread_linux_finds() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let parent = DetPid::from_raw(100);
+        let creator = DetTid::from_raw(101);
+        let [child, clone_child] = [200, 300].map(DetPid::from_raw);
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, creator, false);
+        scheduler.thread_tree.add_child(creator, child, true);
+        scheduler.thread_tree.add_child_with_wait_metadata(
+            creator,
+            clone_child,
+            true,
+            false,
+            libc::SIGUSR1,
+        );
+        for tid in [parent, creator, child, clone_child] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let by = |owner, target, exit_class| ChildWaitSpec {
+            selector: ChildWaitSelector::Exact(target),
+            owner: Some(owner),
+            exit_class,
+        };
+        let sigchld = ChildWaitExitClass::Sigchld;
+        let clone = ChildWaitExitClass::Clone;
+        assert!(scheduler.has_child_wait_target(parent, by(creator, child, sigchld)));
+        assert!(!scheduler.has_child_wait_target(parent, by(parent, child, sigchld)));
+
+        // The creator's exit was granted; its process lives on.
+        scheduler.committed_exits.insert(creator);
+        scheduler.logically_kill_thread(&creator, &parent, MmId::initial(parent));
+
+        assert!(scheduler.has_child_wait_target(parent, by(parent, child, sigchld)));
+        assert!(!scheduler.has_child_wait_target(parent, by(creator, child, sigchld)));
+        assert!(scheduler.has_child_wait_target(parent, by(parent, clone_child, clone)));
+        assert!(!scheduler.has_child_wait_target(parent, by(parent, clone_child, sigchld)));
+        for (target, exit_signal) in [(child, libc::SIGCHLD), (clone_child, libc::SIGUSR1)] {
+            let metadata = scheduler.thread_tree.process_wait[&target];
+            assert_eq!(metadata.wait_parent, Some(parent));
+            assert_eq!(metadata.wait_owner, parent);
+            assert_eq!(metadata.exit_signal, exit_signal);
+            assert_eq!(
+                scheduler.thread_tree.parent_death_parents.get(&target),
+                Some(&parent)
+            );
+        }
     }
 
     /// When its parent's process exits, an orphan's wait parent becomes the
@@ -49054,6 +49229,56 @@ mod test {
         let mut scheduler = build(false);
         scheduler.set_parent_death_signal(child, libc::SIGUSR1);
         assert_eq!(scheduler.parent_death_firing_refusal(parent, process), None);
+    }
+
+    /// A child whose leader armed a parent-death signal and then left while
+    /// another of its threads lives on still has that signal sent when its
+    /// parent leaves, as Linux sends a zombie leader's (`exit_notify` keeps
+    /// it on the thread list; `forget_original_parent` walks that list). A
+    /// non-leader that left is released and sends nothing, and a child with
+    /// no live thread holds nothing. Before, the zombie leader's signal was
+    /// never sent.
+    #[test]
+    fn a_zombie_leaders_parent_death_signal_is_still_sent() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let parent = DetTid::from_raw(3);
+        let [leader, worker, other] = [5, 6, 7].map(DetTid::from_raw);
+        let child = DetPid::from_raw(5);
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, leader, true);
+        scheduler.thread_tree.add_child(leader, worker, false);
+        scheduler.thread_tree.add_child(leader, other, false);
+        for tid in [parent, leader, worker, other] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        scheduler.set_parent_death_signal(leader, libc::SIGUSR1);
+        scheduler.set_parent_death_signal(other, libc::SIGUSR2);
+        let both = vec![libc::SIGUSR1, libc::SIGUSR2];
+        assert_eq!(scheduler.held_parent_death_signals(child), both);
+        // The leader leaves; its process lives on as a zombie leader.
+        scheduler.next_turns.remove(&leader);
+        assert_eq!(scheduler.held_parent_death_signals(child), both);
+        // The parent's exit, granted, sends both, the leader's first.
+        scheduler.committed_exits.insert(parent);
+        scheduler.deliver_parent_death_signals(parent, DetPid::from_raw(3));
+        let sent: Vec<(DetPid, Signal)> = scheduler
+            .pending_parent_death_signals
+            .iter()
+            .map(|pending| (pending.child, pending.signal))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![(child, Signal::SIGUSR1), (child, Signal::SIGUSR2)]
+        );
+        // A non-leader that left is released: its signal goes with it.
+        scheduler.next_turns.remove(&other);
+        assert_eq!(
+            scheduler.held_parent_death_signals(child),
+            vec![libc::SIGUSR1]
+        );
+        // With no live thread the process is gone and holds nothing.
+        scheduler.next_turns.remove(&worker);
+        assert!(scheduler.held_parent_death_signals(child).is_empty());
     }
 
     /// A chain of child waits down to a held child is stuck: the root waits
