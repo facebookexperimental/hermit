@@ -53,14 +53,24 @@ const DETCORE_STACK_WRAPPER_NAME: &str = "hermit-detcore-stack-cpu";
 // 8x-CPU wall backstop (owner policy 2026-11-01: wall = 8x the CPU cap, capped at 600s; CPU caps stay <= 60s so 8x never reaches the cap); unrelated wall policies stay unchanged.
 // prior CPU timeouts remain censored, not successful old-cap completion samples.
 // Detcore allocator completed maximum 20.754169s: ceil(1.5 * max) = 32.
-const DETCORE_ALLOCATOR_CPU_SECONDS: u64 = 32;
-// The detcore allocator leaf now gets the same 8x-CPU wall backstop as the
+// That quiet-host calibration no longer covers full validates: the leaf
+// passes alone but inside full validates it repeatedly died on the 32s CPU
+// cap (exit 124 at 43.578s wall on b8a477b3 and 59.570s on d5c04a82, while
+// the same test completed at 55.194s wall in another full validate), so its
+// completion cost under that load is censored at 32. Following the
+// standalone conservative precedent below, the cap is ceil(1.5 * 32) = 48:
+// not a claim of 50% headroom over an observed completion under that load.
+// Uncensored diagnostics at b8a477b3 (validate profile, wrapper cgroup CPU)
+// complete at 8.43s quiet and 8.76-9.16s under pinned 8-core contention;
+// see ci/liteinst-fixture-cpu-budgets.md.
+const DETCORE_ALLOCATOR_CPU_SECONDS: u64 = 48;
+// The detcore allocator leaf gets the same 8x-CPU wall backstop as the
 // constructor and stacks identities: at 694f5df2 it passes alone (wall
-// 21.545s and 37.366s in admitted tight loops, CPU within the 32s cap) but
-// inside full validates the unchanged wall backstop kills it at 43.990s
-// (exit 124) while -j16 neighbours compete. The CPU cap is unchanged, so a
-// runaway still dies on CPU; the wall is a backstop derived from the CPU
-// budget, not a raised wall guess.
+// 21.545s and 37.366s in admitted tight loops, CPU within the old 32s cap)
+// but inside full validates the unchanged wall backstop killed it at
+// 43.990s (exit 124) while -j16 neighbours competed; the wall has since
+// been 8x the CPU cap, so a runaway still dies on CPU and the wall stays a
+// backstop derived from the CPU budget, not a raised wall guess.
 const DETCORE_ALLOCATOR_WALL_SECONDS: u64 = 8 * DETCORE_ALLOCATOR_CPU_SECONDS;
 // Detcore constructor completed maximum 36.113714s: ceil(1.5 * max) = 55.
 const DETCORE_CONSTRUCTOR_CPU_SECONDS: u64 = 55;
@@ -2174,7 +2184,7 @@ mod tests {
                 let expected = if identity == target {
                     Some((name, budget))
                 } else if identity == detcore_allocator_identity() {
-                    Some((DETCORE_ALLOCATOR_WRAPPER_NAME, "32000000"))
+                    Some((DETCORE_ALLOCATOR_WRAPPER_NAME, "48000000"))
                 } else if identity.package == "hermit-run"
                     && identity.binary == "hermit-run::liteinst_stacks"
                 {
@@ -2586,23 +2596,23 @@ mod tests {
             ) in [
                 (
                     1.0, 1.0, "22000000",
-                    ["32000000", "55000000", "33000000", "36000000", "51000000"],
-                    "180s", "440s", "408s", "256s", "264s", "288s",
+                    ["48000000", "55000000", "33000000", "36000000", "51000000"],
+                    "180s", "440s", "408s", "384s", "264s", "288s",
                 ),
                 (
                     1.25, 1.5, "28000000",
-                    ["40000000", "69000000", "42000000", "45000000", "64000000"],
-                    "270s", "660s", "612s", "384s", "396s", "432s",
+                    ["60000000", "69000000", "42000000", "45000000", "64000000"],
+                    "270s", "660s", "612s", "576s", "396s", "432s",
                 ),
                 (
                     0.01, 0.1, "1000000",
                     ["1000000", "1000000", "1000000", "1000000", "1000000"],
-                    "18s", "44s", "41s", "26s", "27s", "29s",
+                    "18s", "44s", "41s", "39s", "27s", "29s",
                 ),
                 (
                     1.0, 1.01, "22000000",
-                    ["32000000", "55000000", "33000000", "36000000", "51000000"],
-                    "182s", "445s", "413s", "259s", "267s", "291s",
+                    ["48000000", "55000000", "33000000", "36000000", "51000000"],
+                    "182s", "445s", "413s", "388s", "267s", "291s",
                 ),
             ] {
                 let rendered = scaled_config_with_allowances(
@@ -3304,8 +3314,8 @@ mod tests {
         let exact = "package(=hermit-run) & binary_id(=hermit-run::liteinst_allocator) & test(=genuine_detcore_leaf_keeps_scope_free_work_private)";
         let path = "/tmp/a path/it's-$(literal)-wrapper";
         for (multiplier, ordinary, detcore) in [
-            (1.0, "22000000", "32000000"),
-            (1.25, "28000000", "40000000"),
+            (1.0, "22000000", "48000000"),
+            (1.25, "28000000", "60000000"),
             (0.01, "1000000", "1000000"),
         ] {
             let rendered = scaled_config_with_allocator(
@@ -3381,7 +3391,7 @@ mod tests {
         let source =
             "[profile.default]\nslow-timeout = { period = \"57s\", terminate-after = 1 }\n";
         // The ordinary 22+2 fits 34. The admitted allocator carries its own
-        // 256s wall backstop (8x its 32s CPU cap), checked against its own CPU
+        // 384s wall backstop (8x its 48s CPU cap), checked against its own CPU
         // plus grace, so a short default wall no longer refuses it.
         let short = source.replace("57s", "34s");
         assert!(scaled_config(&short, 1.0, Some((Path::new("/fixture/wrapper"), 1.0))).is_ok());
@@ -3536,9 +3546,14 @@ mod tests {
                 .unwrap_err()
                 .contains("regular calibration cannot cover the hermit package")
         );
+        // The 32s formula bound over the quiet-host maximum (20_754_169us)
+        // was censored repeatedly inside full validates, so the cap is the
+        // conservative ceil(1.5 * 32) over that censored observation, not
+        // a formula bound over a completed maximum.
+        assert_eq!(DETCORE_ALLOCATOR_CPU_SECONDS, 48);
         assert_eq!(
-            DETCORE_ALLOCATOR_CPU_SECONDS,
-            timeouts::cpu_bound_from_p90_usec(20_754_169)
+            DETCORE_ALLOCATOR_WALL_SECONDS,
+            8 * DETCORE_ALLOCATOR_CPU_SECONDS
         );
     }
 }

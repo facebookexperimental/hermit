@@ -139,7 +139,7 @@ limit remains 22. There is no new binary-wide exemption.
 | A | `artifact::tests::observed_integrated_detcore_e8_tls_whole_recipes` | 0.007128–0.010894 | 0.044 | 22 | 22 |
 | A | `artifact::tests::refuses_new_or_unrecognized_guest_symbol_versions` | 0.001974–0.004821 | 0.038 | 22 | 22 |
 | A | `artifact::tests::unresolved_or_preemptible_indirect_calls_do_not_earn_a_path` | 0.034053–0.037996 | 0.046 | 22 | 22 |
-| A | `genuine_detcore_leaf_keeps_scope_free_work_private` | 19.446122–20.754169 | 26.942 | 31 | 32 |
+| A | `genuine_detcore_leaf_keeps_scope_free_work_private` | 19.446122–20.754169 | 26.942 | 31 | 48 |
 | A | `genuine_standalone_leaf_keeps_scope_free_work_private` | 14.124147–14.513757 | 21.057 | 33 | 33 |
 | A | `source_copy::gitless_standalone_compiler_sources` | 2.843885–3.071309 | 3.599 | 22 | 22 |
 | S | `artifact::tests::credits_exact_local_relative_got_route_and_direct_tailcall` | 2.399077–2.803949 | 2.935 | 22 | 22 |
@@ -158,9 +158,34 @@ limit remains 22. There is no new binary-wide exemption.
 | S | `stack_observation::tests::rejects_unprobed_and_readable_guards` | 0.001514–0.001745 | 0.012 | 22 | 22 |
 | S | `standalone_altstack_disabled_receives_no_owned_stack_credit` | 13.673469–14.474550 | 20.045 | 22 | 22 |
 
-The Detcore allocator cap is `ceil(1.5 * 20.754169) = 32`; the constructor cap
+The Detcore allocator cap was `ceil(1.5 * 20.754169) = 32`; the constructor cap
 is `ceil(1.5 * 26.386976) = 40`. The other ordinary tests' completed maxima
 still fit their existing 22-second cap with this margin.
+
+The 32-second Detcore allocator cap was censored repeatedly inside full
+validates: it died on CPU (exit 124) at 43.578s wall in the post-land validate
+of b8a477b3 and at 59.570s wall in the validate of d5c04a82, while the same
+test completed at 55.194s wall in the full validate of 8c465298, so the
+failure is load-dependent, not deterministic. Its completion cost under full
+validate load is unknown. The chosen 48 is the conservative
+`ceil(1.5 * 32)` allowance over the censored observation, not a claim of 50%
+headroom over an observed completion under that load; the wall backstop
+becomes 8 * 48 = 384, within the 600-second policy bound. Uncensored
+diagnostics at b8a477b3 (validate profile, selected single test through the
+CPU wrapper; CPU is the wrapper cgroup measure) completed as follows:
+
+| Diagnostic | CPU | Wall |
+| --- | ---: | ---: |
+| quiet, 1 attempt | 8.428 | 9.583 |
+| pinned 8-core contention, attempt 1 | 9.16 | 10.124 |
+| pinned 8-core contention, attempt 2 | 8.90 | 10.101 |
+| pinned 8-core contention, attempt 3 | 9.00 | 9.040 |
+| pinned 8-core contention, attempt 4 | 8.80 | 9.579 |
+| pinned 8-core contention, attempt 5 | 8.76 | 9.672 |
+
+The contended attempts ran with a diagnostic CPU multiplier so the samples
+are uncensored; they are not successes under the old 32-second cap in a full
+validate or runtime qualification of a newer source/pin.
 
 The callback test's completed canonical maximum, 21.060359, would yield 32.
 Its interrupted 22.359546 observation is larger. The chosen 34 is the
