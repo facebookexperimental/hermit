@@ -9594,7 +9594,8 @@ fn an_scm_rights_receipt_after_an_unread_sendmmsg_is_a_named_refusal() {
 
 /// Receives on a fresh `SOCK_DGRAM` socket pair with `SO_TIMESTAMPNS` (none
 /// in mode "recvmsg-own-header-quiet"), with no descriptors in flight, in the
-/// geometry its argument names, and prints what Linux left:
+/// geometry its argument names, and prints what Linux left (with entry 1's
+/// `msg_len` wherever a batch receives two):
 /// - "ordinary": a two-entry `recvmmsg`, each entry's data, control buffer
 ///   and name in places of their own;
 /// - "direct": entry 1's iovec on entry 0's `msg_controllen`, so entry 1's
@@ -9608,6 +9609,17 @@ fn an_scm_rights_receipt_after_an_unread_sendmmsg_is_a_named_refusal() {
 ///   and `msg_name` NULL, so Linux writes no `msg_namelen` into it;
 /// - "name-set": the same with `msg_name` set, so Linux writes `msg_namelen`
 ///   over the start of the timestamp message;
+/// - "no-control-alias": "direct" with no control buffer in entry 0, and
+///   "empty-control-alias" with a control buffer of capacity 0 there;
+/// - "namelen-rewrite": from an autobound sender, entry 1's `msg_name` on
+///   entry 0's `msg_controllen` with `msg_namelen` 0, and its iovec on its
+///   own `msg_namelen`, so its 4-byte datagram, 1, makes Linux copy one byte
+///   of the sender's address (`AF_UNIX`'s low byte) over the earlier control
+///   length; "unnamed-namelen-rewrite": the same with entry 1's `msg_name`
+///   NULL, so Linux neither reads that length nor copies a name;
+/// - "recvmsg-namelen-rewrite": a `recvmsg` from an autobound sender, its
+///   iovec on its own `msg_namelen` (0), so its datagram, 1, makes Linux
+///   copy one byte of the sender's address to its `msg_name`;
 /// - "recvmsg-own-header": a `recvmsg` whose control buffer, 24 bytes into
 ///   its own header, holds the `msg_controllen` and `msg_flags` Linux writes
 ///   after the timestamp message;
@@ -9618,6 +9630,7 @@ const RECEIVED_CONTROL_GEOMETRY_GUEST: &str = r#"
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
 
 static int is_timestamp(const void *at) {
@@ -9650,6 +9663,33 @@ int main(int argc, char **argv) {
     struct cmsghdr align;
   } controls[2];
   const char zeros[8] = {0};
+  const uint32_t one = 1;
+  // An autobound sender, so that its datagrams carry an address.
+  struct sockaddr_un autobind = {.sun_family = AF_UNIX};
+  if (strstr(mode, "namelen-rewrite") != NULL &&
+      bind(pair[0], (struct sockaddr *)&autobind, sizeof(sa_family_t)) != 0) {
+    perror("bind");
+    return 1;
+  }
+  if (strcmp(mode, "recvmsg-namelen-rewrite") == 0) {
+    if (send(pair[0], &one, sizeof(one), 0) != sizeof(one)) {
+      perror("send");
+      return 3;
+    }
+    iovecs[0] = (struct iovec){.iov_base = &message.msg_namelen, .iov_len = sizeof(one)};
+    message.msg_name = names[0];
+    message.msg_namelen = 0;
+    message.msg_iov = &iovecs[0];
+    message.msg_iovlen = 1;
+    message.msg_control = controls[0].bytes;
+    message.msg_controllen = sizeof(controls[0].bytes);
+    ssize_t received = recvmsg(pair[1], &message, 0);
+    printf("recvmsg returned %zd; msg_namelen now %u, the name's first byte %d\n", received,
+           (unsigned)message.msg_namelen, names[0][0]);
+    printf("the control buffer holds a timestamp message: %s\n",
+           is_timestamp(controls[0].bytes) ? "yes" : "no");
+    return 0;
+  }
   if (strncmp(mode, "recvmsg", 7) == 0) {
     if (send(pair[0], "datagram", 8, 0) != 8) {
       perror("send");
@@ -9685,6 +9725,19 @@ int main(int argc, char **argv) {
     }
   } else if (strcmp(mode, "direct") == 0) {
     iovecs[1].iov_base = &entries[0].msg_hdr.msg_controllen;
+  } else if (strcmp(mode, "no-control-alias") == 0 || strcmp(mode, "empty-control-alias") == 0) {
+    if (strcmp(mode, "no-control-alias") == 0) {
+      entries[0].msg_hdr.msg_control = NULL;
+    }
+    entries[0].msg_hdr.msg_controllen = 0;
+    iovecs[1].iov_base = &entries[0].msg_hdr.msg_controllen;
+  } else if (strcmp(mode, "namelen-rewrite") == 0 ||
+             strcmp(mode, "unnamed-namelen-rewrite") == 0) {
+    if (strcmp(mode, "namelen-rewrite") == 0) {
+      entries[1].msg_hdr.msg_name = &entries[0].msg_hdr.msg_controllen;
+    }
+    entries[1].msg_hdr.msg_namelen = 0;
+    iovecs[1] = (struct iovec){.iov_base = &entries[1].msg_hdr.msg_namelen, .iov_len = 4};
   } else if (strcmp(mode, "indirect") == 0) {
     iovecs[0] = (struct iovec){.iov_base = &iovecs[1].iov_base, .iov_len = 8};
   } else if (strcmp(mode, "later-header") == 0) {
@@ -9703,14 +9756,19 @@ int main(int argc, char **argv) {
   }
   void *first = strcmp(mode, "indirect") == 0 ? (void *)&entries[0].msg_hdr.msg_controllen
                                              : (void *)"datagram";
+  int rewrite = strstr(mode, "namelen-rewrite") != NULL;
   if (send(pair[0], strcmp(mode, "indirect") == 0 ? (const void *)&first : first, 8, 0) != 8 ||
-      send(pair[0], zeros, 8, 0) != 8) {
+      send(pair[0], rewrite ? (const void *)&one : (const void *)zeros, rewrite ? 4 : 8, 0) !=
+          (rewrite ? 4 : 8)) {
     perror("send");
     return 3;
   }
   int count = recvmmsg(pair[1], entries, vlen, 0, NULL);
   printf("recvmmsg returned %d; entry 0 msg_len %u, msg_controllen now %zu\n", count,
          entries[0].msg_len, (size_t)entries[0].msg_hdr.msg_controllen);
+  if (count == 2) {
+    printf("entry 1 msg_len %u\n", entries[1].msg_len);
+  }
   printf("entry 0's control buffer holds a timestamp message: %s\n",
          is_timestamp(checked) ? "yes" : "no");
   return 0;
@@ -9742,13 +9800,18 @@ fn received_control_geometry_guest() -> PathBuf {
 /// call, so it must refuse where a write the call makes after a message's
 /// control messages can replace them or the length naming them
 /// (`ReceiveGeometry::control_read_back_refused`). The aliasing batches
-/// (direct, indirect, a control buffer over a later header) refuse before
-/// they receive, a control buffer that a header field Linux writes after its
-/// control messages lands in (name-set, recvmsg-own-header) refuses after
-/// the call, and the rest run as natively: an ordinary batch, an own-header
-/// control buffer that no later write reaches (name-null), and one with no
-/// timestamp received (recvmsg-own-header-quiet). Detcore's handling is the
-/// same on every backend; this runs on ptrace.
+/// (direct, indirect, a control buffer over a later header) and every
+/// receive whose data or control messages can land on a `msg_namelen` Linux
+/// reads afterwards for the name's length (name-set, namelen-rewrite,
+/// recvmsg-namelen-rewrite) refuse before they receive, a control buffer
+/// that a header field Linux writes after its control messages lands in
+/// (recvmsg-own-header) refuses after the call, and the rest run as
+/// natively: an ordinary batch, the direct alias where entry 0 has no
+/// control buffer to read back (no-control-alias, empty-control-alias), data
+/// over a `msg_namelen` Linux does not read (unnamed-namelen-rewrite), an
+/// own-header control buffer that no later write reaches (name-null), and
+/// one with no timestamp received (recvmsg-own-header-quiet). Detcore's
+/// handling is the same on every backend; this runs on ptrace.
 #[test]
 fn received_control_messages_detcore_cannot_find_are_refused_by_name() {
     let guest = received_control_geometry_guest();
@@ -9762,15 +9825,55 @@ fn received_control_messages_detcore_cannot_find_are_refused_by_name() {
         )
     };
     let aliased = "recvmmsg returned 2; entry 0 msg_len 8, msg_controllen now 0\n\
+                   entry 1 msg_len 8\n\
                    entry 0's control buffer holds a timestamp message: yes\n";
     let cases = [
         (
             "ordinary",
             "recvmmsg returned 2; entry 0 msg_len 8, msg_controllen now 32\n\
+             entry 1 msg_len 8\n\
              entry 0's control buffer holds a timestamp message: yes\n",
             None,
         ),
         ("direct", aliased, Some(batch_refusal.to_owned())),
+        (
+            "no-control-alias",
+            "recvmmsg returned 2; entry 0 msg_len 8, msg_controllen now 0\n\
+             entry 1 msg_len 8\n\
+             entry 0's control buffer holds a timestamp message: no\n",
+            None,
+        ),
+        (
+            "empty-control-alias",
+            "recvmmsg returned 2; entry 0 msg_len 8, msg_controllen now 0\n\
+             entry 1 msg_len 8\n\
+             entry 0's control buffer holds a timestamp message: no\n",
+            None,
+        ),
+        (
+            "namelen-rewrite",
+            "recvmmsg returned 2; entry 0 msg_len 8, msg_controllen now 1\n\
+             entry 1 msg_len 4\n\
+             entry 0's control buffer holds a timestamp message: yes\n",
+            Some(batch_refusal.to_owned()),
+        ),
+        (
+            "unnamed-namelen-rewrite",
+            "recvmmsg returned 2; entry 0 msg_len 8, msg_controllen now 32\n\
+             entry 1 msg_len 4\n\
+             entry 0's control buffer holds a timestamp message: yes\n",
+            None,
+        ),
+        (
+            "recvmsg-namelen-rewrite",
+            "recvmsg returned 4; msg_namelen now 8, the name's first byte 1\n\
+             the control buffer holds a timestamp message: yes\n",
+            Some(
+                "recvmsg: the socket timestamps it may receive could not be found to replace \
+                 with logical time"
+                    .to_owned(),
+            ),
+        ),
         ("indirect", aliased, Some(batch_refusal.to_owned())),
         (
             "later-header",
@@ -9788,7 +9891,7 @@ fn received_control_messages_detcore_cannot_find_are_refused_by_name() {
             "name-set",
             "recvmmsg returned 1; entry 0 msg_len 8, msg_controllen now 32\n\
              entry 0's control buffer holds a timestamp message: no\n",
-            Some(own_refusal("recvmmsg")),
+            Some(batch_refusal.to_owned()),
         ),
         (
             "recvmsg-own-header",

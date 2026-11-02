@@ -944,6 +944,12 @@ const BATCH_CONTROL_GEOMETRY_REFUSAL: &str = "the socket timestamps its entries 
      not be found to replace with logical time: a write it makes for one entry can land on a \
      header, iovec array, msg_controllen or control buffer that is read after that write";
 
+/// Why a `recvmsg` is refused before it receives
+/// (`ReceiveGeometry::control_read_back_refused`, judged on its structures).
+const MESSAGE_CONTROL_GEOMETRY_REFUSAL: &str = "the socket timestamps it may receive could not \
+     be found to replace with logical time: its data or control messages can land on the \
+     msg_namelen that Linux reads afterwards for the name's length";
+
 /// Why a `recvmsg` or `recvmmsg` is refused after it received
 /// (`ReceiveGeometry::control_read_back_refused`, judged on the control
 /// extents it wrote).
@@ -5466,9 +5472,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest.memory().read_exact(control_address, &mut control)?;
         let header = message_address.as_raw();
         // Where Linux writes this message's name and header fields, which it
-        // does after its control messages
+        // does after its control messages, and whether it re-reads a
+        // msg_namelen its data or control messages can have changed
         // (`ReceiveGeometry::control_read_back_refused`).
         let geometry = ReceiveGeometry::before(&guest.memory(), &Syscall::Recvmsg(call));
+        if geometry
+            .as_ref()
+            .is_some_and(|geometry| geometry.control_read_back_refused(None))
+        {
+            let dettid = guest.thread_state().dettid;
+            crate::syscalls::helpers::report_refusal_reason(
+                self.cfg.panic_on_unsupported_syscalls,
+                &format!("[dtid {dettid}] recvmsg: {MESSAGE_CONTROL_GEOMETRY_REFUSAL}"),
+            );
+            return self
+                .refuse_unserviceable_operation_because(
+                    guest,
+                    Sysno::recvmsg,
+                    Errno::EOPNOTSUPP,
+                    MESSAGE_CONTROL_GEOMETRY_REFUSAL,
+                )
+                .await;
+        }
 
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
         let now = self.observe_socket_receive(guest, call.sockfd()).await?;

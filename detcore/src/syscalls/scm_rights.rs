@@ -1384,13 +1384,23 @@ impl ReceiveGeometry {
     /// | each later entry's `mmsghdr`, iovec array and    | the kernel, reaching  | rows 1 to 6 of an |
     /// | control buffer                                   | it; Detcore, after    | earlier entry     |
     /// | each earlier entry's `msg_controllen` and control| Detcore, after the    | rows 1 to 6 of a  |
-    /// | buffer                                           | call                  | later entry       |
-    /// | every entry's `msg_controllen` and control buffer| Detcore, after the    | the timeout       |
-    /// |                                                  | call                  |                   |
+    /// | buffer, where it has one                         | call                  | later entry       |
+    /// | every entry's `msg_controllen` and control       | Detcore, after the    | the timeout       |
+    /// | buffer, where it has one                         | call                  |                   |
+    /// | a message's own `msg_namelen`, where `msg_name`  | the kernel, for the   | rows 1 and 2 of   |
+    /// | is not NULL                                      | name's length         | that message      |
+    /// |                                                  | (`move_addr_to_user`) |                   |
     /// | a message's own control messages, the            | Detcore, after the    | rows 3 to 6 of    |
     /// | `msg_controllen` bytes the call wrote back       | call                  | that message      |
     ///
-    /// The first three rows of the second table depend only on the guest's
+    /// An entry has a control buffer where its `msg_control` is not NULL and
+    /// its `msg_controllen` before the call is not 0; Detcore reads back
+    /// neither its control messages nor its `msg_controllen` otherwise. Where
+    /// rows 1 and 2 cannot reach a message's own `msg_namelen`, Linux reads
+    /// the length the guest set, so the name it writes lies inside the region
+    /// row 3 names: `msg_name`, at most `msg_namelen` bytes.
+    ///
+    /// The first four rows of the second table depend only on the guest's
     /// structures, so they are judged before the call, with `extents` None,
     /// and their regions are whole control buffers: a refusal then receives
     /// nothing. A geometry read only in part (an iovec array that cannot be
@@ -1422,6 +1432,8 @@ impl ReceiveGeometry {
                 size_of::<usize>(),
             )
         };
+        // Where Detcore reads back an entry's control messages and length.
+        let controlled = |message: &&MessageInput| control(message).1 != 0;
         let writes = |message: &MessageInput| {
             let mut ranges: Vec<Range> = message.fields.segments.clone();
             ranges.push(control(message));
@@ -1446,15 +1458,31 @@ impl ReceiveGeometry {
                         .collect();
                     let earlier: Vec<Range> = self.messages[..index]
                         .iter()
+                        .filter(controlled)
                         .flat_map(|earlier| [length_field(earlier), control(earlier)])
                         .collect();
                     if meet(&written, &later) || meet(&written, &earlier) {
                         return true;
                     }
+                    if message.fields.name != 0 {
+                        let name_length = (
+                            message
+                                .header
+                                .0
+                                .saturating_add(std::mem::offset_of!(Msghdr, msg_namelen)),
+                            size_of::<libc::socklen_t>(),
+                        );
+                        let mut before_name = message.fields.segments.clone();
+                        before_name.push(control(message));
+                        if meet(&before_name, &[name_length]) {
+                            return true;
+                        }
+                    }
                 }
                 let every: Vec<Range> = self
                     .messages
                     .iter()
+                    .filter(controlled)
                     .flat_map(|message| [length_field(message), control(message)])
                     .collect();
                 self.timeout
@@ -4003,13 +4031,21 @@ mod tests {
     ///   entry's name buffer over an earlier control buffer, two entries
     ///   sharing one control buffer, and the timeout over a control buffer
     ///   each refuse before the call;
+    /// - without a control buffer (NULL, or a capacity of 0) an entry's
+    ///   msg_controllen is not read back, so a later entry's iovec over it,
+    ///   or the timeout over it, passes, where it refuses with one;
+    /// - an entry's iovec over its own msg_namelen refuses where msg_name is
+    ///   set, since Linux reads that length for the name only after the data,
+    ///   and passes where msg_name is NULL;
     /// - one entry with msg_name NULL and its control buffer 8 bytes into its
-    ///   own header passes both: Linux writes no msg_namelen then, and its
-    ///   other fields (40, 48, 56) lie past the buffer's 32 bytes; with
-    ///   msg_name set, its msg_namelen (8) lands inside, so the extent 32
-    ///   refuses after the call, and an empty extent does not;
+    ///   own header passes both: Linux neither reads nor writes msg_namelen
+    ///   then, and its other fields (40, 48, 56) lie past the buffer's 32
+    ///   bytes; with msg_name set, the buffer covers the msg_namelen Linux
+    ///   reads afterwards, so it refuses before the call;
     /// - a recvmsg whose control buffer covers its own msg_controllen refuses
-    ///   only with a nonempty extent.
+    ///   only with a nonempty extent, and one whose iovec covers its own
+    ///   msg_namelen refuses before the call where msg_name is set and passes
+    ///   where it is NULL.
     #[test]
     fn one_region_table_decides_where_detcore_can_find_received_control_messages() {
         let memory = LocalMemory::new();
@@ -4098,6 +4134,45 @@ mod tests {
         assert!(
             !batch(&mut vector, Some(at(224).cast_const().cast())).control_read_back_refused(None)
         );
+        // The timeout over entry 0's msg_controllen, then entry 1's data
+        // over it: each refuses while entry 0 has a control buffer, and
+        // passes without one, NULL or of capacity 0.
+        let length = (&raw const vector[0].msg_hdr.msg_controllen).cast::<Timespec>();
+        assert!(batch(&mut vector, Some(length)).control_read_back_refused(None));
+        iovecs[1] = libc::iovec {
+            iov_base: (&raw mut vector[0].msg_hdr.msg_controllen).cast(),
+            iov_len: size_of::<usize>(),
+        };
+        assert!(batch(&mut vector, None).control_read_back_refused(None));
+        for (storage, capacity) in [(std::ptr::null_mut(), 32), (at(64), 0)] {
+            vector[0].msg_hdr.msg_control = storage.cast();
+            vector[0].msg_hdr.msg_controllen = capacity;
+            let unread = batch(&mut vector, None);
+            assert!(!unread.control_read_back_refused(None), "{capacity}");
+            assert!(
+                !unread.control_read_back_refused(Some(&[0, 32])),
+                "{capacity}"
+            );
+            assert!(
+                !batch(&mut vector, Some(length)).control_read_back_refused(None),
+                "{capacity}"
+            );
+        }
+        vector[0].msg_hdr.msg_control = at(64).cast();
+        vector[0].msg_hdr.msg_controllen = 32;
+        // Entry 1's data over its own msg_namelen, read for the name only
+        // after the data: refused with msg_name set, not with it NULL.
+        iovecs[1] = libc::iovec {
+            iov_base: (&raw mut vector[1].msg_hdr.msg_namelen).cast(),
+            iov_len: size_of::<libc::socklen_t>(),
+        };
+        assert!(batch(&mut vector, None).control_read_back_refused(None));
+        vector[1].msg_hdr.msg_name = std::ptr::null_mut();
+        assert!(!batch(&mut vector, None).control_read_back_refused(None));
+        iovecs[1] = libc::iovec {
+            iov_base: at(16).cast(),
+            iov_len: 16,
+        };
 
         // One entry, its control buffer 8 bytes into its own header.
         // SAFETY: all-zero is a valid `mmsghdr`.
@@ -4124,9 +4199,7 @@ mod tests {
         one[0].msg_hdr.msg_name = at(192).cast();
         one[0].msg_hdr.msg_namelen = 16;
         let named = single(&mut one);
-        assert!(!named.control_read_back_refused(None));
-        assert!(named.control_read_back_refused(Some(&[32])));
-        assert!(!named.control_read_back_refused(Some(&[0])));
+        assert!(named.control_read_back_refused(None));
 
         // A recvmsg whose control buffer, 24 bytes into its own header,
         // covers its msg_controllen (40) and msg_flags (48).
@@ -4145,6 +4218,19 @@ mod tests {
         assert!(!own.control_read_back_refused(None));
         assert!(own.control_read_back_refused(Some(&[32])));
         assert!(!own.control_read_back_refused(Some(&[0])));
+        // A recvmsg's data over its own msg_namelen, which Linux reads for
+        // the name only after the data: refused before the call with
+        // msg_name set, not with it NULL.
+        message.msg_control = at(64).cast();
+        iovecs[3] = libc::iovec {
+            iov_base: (&raw mut message.msg_namelen).cast(),
+            iov_len: size_of::<libc::socklen_t>(),
+        };
+        let unnamed = ReceiveGeometry::before(&memory, &recvmsg_of(&mut message)).unwrap();
+        assert!(!unnamed.control_read_back_refused(None));
+        message.msg_name = at(192).cast();
+        let named = ReceiveGeometry::before(&memory, &recvmsg_of(&mut message)).unwrap();
+        assert!(named.control_read_back_refused(None));
         // The geometry read the iovecs through raw pointers.
         std::hint::black_box(&iovecs);
     }
