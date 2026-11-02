@@ -351,6 +351,10 @@ class CellTest(unittest.TestCase):
             "TEST_RESULT_ARTIFACT_ANNOTATIONS_DIR": str(annotations),
             "HERMIT_E2E_BUNDLE": str(self.bundle),
             "HERMIT_E2E_ROUTE": "local",
+            # A local KVM cell flocks one of the host's shared KVM slots; without a private
+            # slot directory the test waits behind every real KVM cell a concurrent validate
+            # runs, and times out once all 16 slots stay held.
+            "HERMIT_E2E_KVM_SLOT_DIR": str(self.tmp / "kvm-slots"),
             "FAKE_CALLS": str(self.calls),
             "FAKE_SLUG": "{}-{}-{}".format(cell_test.replace("/", "-"), cell_mode, backend),
         }
