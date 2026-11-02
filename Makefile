@@ -248,7 +248,8 @@ LINT_CHECK_TARGETS := \
     lint-check-guest-preload-gate \
     lint-check-reverie-dbt-budget \
     lint-check-conformance-test-counts \
-    lint-check-recount-pins
+    lint-check-recount-pins \
+    lint-check-no-sve
 .PHONY: lint-checks $(LINT_CHECK_TARGETS)
 lint-checks: $(LINT_CHECK_TARGETS) ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
 
@@ -420,6 +421,10 @@ lint-check-conformance-test-counts:
 
 lint-check-recount-pins:
 	python3 ./ci/test_recount_pins.py
+
+lint-check-no-sve:
+	rust-script --test ./scripts/check-no-sve.rs
+	./scripts/check-no-sve.rs /bin/true
 
 # The unit tests carried by rust-script entrypoints are their own CI node,
 # check.script_unit_tests, so they run beside lint-checks instead of inside its
