@@ -259,6 +259,19 @@ pub struct PreemptionRecord {
     /// times do not (analyze writes its trial schedules without them).
     /// `None`, which writes nothing, for every other run and for records
     /// written before the field existed.
+    ///
+    /// Reader contract: the mark is honoured by Hermit from the change that
+    /// added it. It is an optional setting outside the format counter
+    /// (`PREEMPTION_RECORD_FORMAT`), as `pipe_wake_latency` and
+    /// `chaos_timeslice` are, because a marked record can be of any format (a
+    /// schedule replay writes the format of the record it follows, and
+    /// analyze's trials the format of the recordings they splice), so an
+    /// older Hermit ignores it, as it ignores every field it does not know.
+    /// Such a reader replays a marked record as it replayed these records
+    /// before the mark existed: its `--max-timeslice` bound ends the long
+    /// recorded slices early, and the replay counts the events that then
+    /// desynchronize in its summary, as such replays did before the mark
+    /// existed. Replay these records with a Hermit that has the mark.
     uncapped_slices: Option<u64>,
     /// Actual callback expirations associated with existing priority-history rows.
     /// Absent in old/edited recordings; never inferred from time or branch counts.
