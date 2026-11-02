@@ -50,23 +50,23 @@ const STANDALONE_ALLOCATOR_WRAPPER_NAME: &str = "hermit-standalone-allocator-cpu
 const DETCORE_STACK_WRAPPER_NAME: &str = "hermit-detcore-stack-cpu";
 // Whole-attempt observations and all 24 fixture decisions are retained in
 // ci/liteinst-fixture-cpu-budgets.md. Every prepared stacks test has a separate
-// 3x-CPU wall backstop; unrelated wall policies stay unchanged.
+// 8x-CPU wall backstop (owner policy 2026-11-01: wall = 8x the CPU cap, capped at 600s; CPU caps stay <= 60s so 8x never reaches the cap); unrelated wall policies stay unchanged.
 // prior CPU timeouts remain censored, not successful old-cap completion samples.
 // Detcore allocator completed maximum 20.754169s: ceil(1.5 * max) = 32.
 const DETCORE_ALLOCATOR_CPU_SECONDS: u64 = 32;
-// The detcore allocator leaf now gets the same 3x-CPU wall backstop as the
+// The detcore allocator leaf now gets the same 8x-CPU wall backstop as the
 // constructor and stacks identities: at 694f5df2 it passes alone (wall
 // 21.545s and 37.366s in admitted tight loops, CPU within the 32s cap) but
 // inside full validates the unchanged wall backstop kills it at 43.990s
 // (exit 124) while -j16 neighbours compete. The CPU cap is unchanged, so a
 // runaway still dies on CPU; the wall is a backstop derived from the CPU
 // budget, not a raised wall guess.
-const DETCORE_ALLOCATOR_WALL_SECONDS: u64 = 3 * DETCORE_ALLOCATOR_CPU_SECONDS;
+const DETCORE_ALLOCATOR_WALL_SECONDS: u64 = 8 * DETCORE_ALLOCATOR_CPU_SECONDS;
 // Detcore constructor completed maximum 36.113714s: ceil(1.5 * max) = 55.
 const DETCORE_CONSTRUCTOR_CPU_SECONDS: u64 = 55;
 // Separately approved host-load backstop, not measured wall headroom.
 // The earlier f141 wall timeout remains a failed run.
-const DETCORE_CONSTRUCTOR_WALL_SECONDS: u64 = 3 * DETCORE_CONSTRUCTOR_CPU_SECONDS;
+const DETCORE_CONSTRUCTOR_WALL_SECONDS: u64 = 8 * DETCORE_CONSTRUCTOR_CPU_SECONDS;
 // Retained d7efd4cb/da86dfbe standalone diagnostic N=3 at CPU44/wall57:
 // 17.718674, 17.632669, 17.573148s. The completed-sample formula would give 27.
 // Use 33 conservatively after the concurrent CPU22 timeout at 22.799306s;
@@ -110,7 +110,7 @@ const CPU_PROFILE_V3_LOADER_WRAPPER_NAME: &str = "hermit-cpu-profile-v3-loader-c
 // 23.995 (35.5 s wall); c59f758a's then completed it at 4.86, and six
 // --only runs of the node at 9eb80258 at loads of 260 to 300 at 3.11 to 6.07.
 // ceil(1.5 * 23.995) = 36 covers that censored run with half again; the
-// completed-sample formula would give 26. Its wall backstop is three times
+// completed-sample formula would give 26. Its wall backstop is eight times
 // the cap, as for the liteinst_stacks identities: a host-load policy.
 const CPU_PROFILE_V3_LOADER_CPU_SECONDS: u64 = 36;
 const RR_THREAD_STRESS_WRAPPER_NAME: &str = "hermit-rr-thread-stress-cpu";
@@ -296,7 +296,7 @@ impl MeasuredCpuAllowance {
             binary: "hermit-run::liteinst_stacks",
             test,
             cpu_seconds,
-            wall_seconds: Some(3 * cpu_seconds),
+            wall_seconds: Some(8 * cpu_seconds),
         }
     }
 
@@ -333,7 +333,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::liteinst_allocator",
         test: "genuine_standalone_leaf_keeps_scope_free_work_private",
         cpu_seconds: STANDALONE_ALLOCATOR_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * STANDALONE_ALLOCATOR_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: RENDERED_PROCFS_WRAPPER_NAME,
@@ -341,7 +341,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::cli",
         test: "detcore_renders_its_procfs_files_on_dbt_as_on_ptrace",
         cpu_seconds: RENDERED_PROCFS_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * RENDERED_PROCFS_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_STACK_WRAPPER_NAME,
@@ -349,7 +349,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::liteinst_stacks",
         test: "genuine_detcore_reaches_fixed_guarded_callback_and_altstack",
         cpu_seconds: DETCORE_STACK_CPU_SECONDS,
-        wall_seconds: Some(3 * DETCORE_STACK_CPU_SECONDS),
+        wall_seconds: Some(8 * DETCORE_STACK_CPU_SECONDS),
     },
     MeasuredCpuAllowance::stack(
         "hermit-stack-exact-got-cpu",
@@ -422,7 +422,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::cli",
         test: "cpu_profile_v3_host_loader_sees_exactly_x86_64_v3",
         cpu_seconds: CPU_PROFILE_V3_LOADER_CPU_SECONDS,
-        wall_seconds: Some(3 * CPU_PROFILE_V3_LOADER_CPU_SECONDS),
+        wall_seconds: Some(8 * CPU_PROFILE_V3_LOADER_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: RR_THREAD_STRESS_WRAPPER_NAME,
@@ -430,7 +430,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::rr_suite",
         test: "rr_thread_stress",
         cpu_seconds: RR_THREAD_STRESS_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * RR_THREAD_STRESS_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: ESI_POLL_DEADLINE_TESTS[0].0,
@@ -438,7 +438,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::external_signal_interrupt",
         test: ESI_POLL_DEADLINE_TESTS[0].1,
         cpu_seconds: ESI_POLL_DEADLINE_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * ESI_POLL_DEADLINE_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: ESI_POLL_DEADLINE_TESTS[1].0,
@@ -446,7 +446,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::external_signal_interrupt",
         test: ESI_POLL_DEADLINE_TESTS[1].1,
         cpu_seconds: ESI_POLL_DEADLINE_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * ESI_POLL_DEADLINE_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: ESI_POLL_DEADLINE_TESTS[2].0,
@@ -454,7 +454,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::external_signal_interrupt",
         test: ESI_POLL_DEADLINE_TESTS[2].1,
         cpu_seconds: ESI_POLL_DEADLINE_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * ESI_POLL_DEADLINE_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: ESI_POLL_DEADLINE_TESTS[3].0,
@@ -462,7 +462,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::external_signal_interrupt",
         test: ESI_POLL_DEADLINE_TESTS[3].1,
         cpu_seconds: ESI_POLL_DEADLINE_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * ESI_POLL_DEADLINE_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: LIT_CHAOS_VERIFY_WRAPPER_NAME,
@@ -470,7 +470,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::lit",
         test: "lit_scheduler_strategies_chaos_verify",
         cpu_seconds: LIT_CHAOS_VERIFY_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * LIT_CHAOS_VERIFY_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: DBT_VIRTUAL_KERNEL_FILES_WRAPPER_NAME,
@@ -478,7 +478,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::cli",
         test: "detcore_fixes_the_virtual_kernel_files_on_dbt",
         cpu_seconds: DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: CPU_PROFILE_V3_GUEST_WRAPPER_NAME,
@@ -486,7 +486,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::cli",
         test: "cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity",
         cpu_seconds: CPU_PROFILE_V3_GUEST_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * CPU_PROFILE_V3_GUEST_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: PARITY_POST_PASS_NO_GUEST_WRAPPER_NAME,
@@ -494,7 +494,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-manifest-plan::bin/test-harness",
         test: "tests::the_parity_post_pass_changes_no_determinism_output_and_runs_no_guest",
         cpu_seconds: PARITY_POST_PASS_NO_GUEST_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * PARITY_POST_PASS_NO_GUEST_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: EPOLL_PWAIT2_STRICT_WRAPPER_NAME,
@@ -502,7 +502,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::epoll_determinism",
         test: "epoll_pwait2_polls_under_run_strict",
         cpu_seconds: EPOLL_PWAIT2_STRICT_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * EPOLL_PWAIT2_STRICT_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: EPOLL_PWAIT_MASK_WRAPPER_NAME,
@@ -510,7 +510,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::epoll_determinism",
         test: "epoll_pwait_sleeps_under_its_temporary_mask",
         cpu_seconds: EPOLL_PWAIT_MASK_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * EPOLL_PWAIT_MASK_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: LONE_BACKSTOP_WRAPPER_NAME,
@@ -518,7 +518,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::deadline_slice_cap",
         test: "skipped_slice_ends_survive_the_backstop",
         cpu_seconds: LONE_BACKSTOP_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * LONE_BACKSTOP_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: SIGNAL_PERMITS_WRAPPER_NAME,
@@ -526,7 +526,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::cli",
         test: "run_ptrace_signal_permits_are_per_thread",
         cpu_seconds: SIGNAL_PERMITS_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * SIGNAL_PERMITS_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: FULL_TABLE_IO_WRAPPER_NAME,
@@ -534,7 +534,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         binary: "hermit-run::cli",
         test: "another_processs_io_reads_with_a_full_descriptor_table_on_every_backend",
         cpu_seconds: FULL_TABLE_IO_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * FULL_TABLE_IO_CPU_SECONDS),
     },
 ];
 
@@ -1256,7 +1256,7 @@ fn resolve_budgets(
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
         println!(
-            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), lone-slice-end backstop ({LONE_BACKSTOP_CPU_SECONDS}s), ptrace signal permits ({SIGNAL_PERMITS_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. Every exact prepared selected liteinst_stacks identity, the Detcore allocator leaf, and the CPU-profile v3 host loader, gets a separate base wall backstop of three times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), lone-slice-end backstop ({LONE_BACKSTOP_CPU_SECONDS}s), ptrace signal permits ({SIGNAL_PERMITS_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. Every exact prepared selected liteinst_stacks identity, the Detcore allocator leaf, and the CPU-profile v3 host loader, gets a separate base wall backstop of eight times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
         );
         return Ok(());
     }
@@ -3018,7 +3018,7 @@ mod tests {
             "[profile.default]\nslow-timeout = { period = \"57s\", terminate-after = 1 }\n";
         // These standalone-allocator/procfs assertions and boundaries are unchanged.
         // (MEASURED_CPU_ALLOWANCES[0] is no longer unoverridden: it carries
-        // the 3x-CPU wall backstop, so it leaves this list.)
+        // the 8x-CPU wall backstop, so it leaves this list.)
         for (allowance, seconds, cutoff, first_pass, collision, separated, period) in [
             (MEASURED_CPU_ALLOWANCES[2], 33, 35, 36, 0.75, 0.8, "46s"),
             (MEASURED_CPU_ALLOWANCES[3], 36, 38, 39, 0.8, 0.85, "49s"),

@@ -1,3 +1,3 @@
 schema: 3
-timeout_seconds: 57
+timeout_seconds: 180
 cpu_timeout_seconds: 22

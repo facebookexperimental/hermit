@@ -15,12 +15,15 @@ failure-output = "immediate-final"
 success-output = "never"
 # Individual test processes use the owner-approved wall backstop derived from
 # the completing data-handling/dd-partial-transfers observation:
-# ceil(4 * 14.019s) = 57s. This remains alongside the manifest runner's CPU
-# budget because a wedged process can consume no CPU. Machine-specific wall
-# scaling from HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER and the per-execution CPU
-# budget/measurement wrapper are added to a temporary copy of this canonical file by
-# ci/run-nextest-counted.sh.
-slow-timeout = { period = "57s", terminate-after = 1, grace-period = "2s" }
+# Wall backstop only (owner policy 2026-11-01): the CPU budget is the tight
+# limit; this wall exists for a wedged process that consumes no CPU. Per-test
+# walls are 8x their CPU cap (capped at 600s); this global 180s is 8x the
+# 22s default CPU base, rounded up, so -j16 contention does not trip it
+# (audit: ai_docs/2026-11-01-timeout-audit).
+# Machine-specific wall scaling from HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER and
+# the per-execution CPU budget/measurement wrapper are added to a temporary
+# copy of this canonical file by ci/run-nextest-counted.sh.
+slow-timeout = { period = "180s", terminate-after = 1, grace-period = "2s" }
 global-timeout = "60m"
 
 [profile.ci]
