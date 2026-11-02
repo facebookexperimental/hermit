@@ -200,6 +200,7 @@ lint-parent-checks: ## The lint checker that needs the dev-hermit parent (CI nod
 LINT_CHECK_TARGETS := \
     lint-check-skill-discovery \
     lint-check-github-actions-triggers \
+    lint-check-runner-trust \
     lint-check-docs-pages-contract \
     lint-check-pre-push-submodule-diagnosis \
     lint-check-doc-bare-urls \
@@ -258,6 +259,9 @@ lint-check-skill-discovery:
 
 lint-check-github-actions-triggers:
 	./scripts/check-github-actions-triggers.rs
+
+lint-check-runner-trust:
+	./scripts/check-runner-trust.sh --self-test
 
 lint-check-docs-pages-contract:
 	./scripts/docs-pages-contract.rs

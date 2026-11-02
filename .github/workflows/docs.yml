@@ -83,6 +83,15 @@ jobs:
     timeout-minutes: 480
 
     steps:
+    - name: Guard — refuse untrusted actor on self-hosted runner
+      if: ${{ github.event_name == 'schedule' || inputs.rebuild_compatibility }}
+      env:
+        GUARD_ACTOR: ${{ github.actor }}
+      run: |
+        case "$GUARD_ACTOR" in
+          hermit-bot3|rrnewton) echo "runner-trust: actor $GUARD_ACTOR is allow-listed" ;;
+          *) echo "::error::runner-trust: actor '$GUARD_ACTOR' is not allow-listed for self-hosted runners (allowlist: hermit-bot3, rrnewton)"; exit 1 ;;
+        esac
     # Before any git command: the runner's user has git URL rewrites in its
     # global configuration that serve some GitHub URLs from stale local mirrors,
     # so git reads an empty global configuration file instead (not /dev/null,
@@ -122,6 +131,11 @@ jobs:
         # The publication gate compares the registry with every earlier version
         # so an already-public content-addressed path cannot disappear or change.
         fetch-depth: 0
+    - name: Guard — verify commit authors before running code
+      if: ${{ github.event_name == 'schedule' || inputs.rebuild_compatibility }}
+      env:
+        GITHUB_ACTOR: ${{ github.actor }}
+      run: bash scripts/check-runner-trust.sh
     - name: Check out the reviewed Hermit source pin
       # A dispatch on main must not race main moving past the reviewed pin:
       # read hermit_commit from the dispatched main commit's pin file and
