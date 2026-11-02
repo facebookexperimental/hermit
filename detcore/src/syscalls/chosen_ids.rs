@@ -462,7 +462,8 @@ impl AddedIdEvidence {
         {
             return None;
         }
-        let Clone3Read::Bytes(bytes) = read_clone_args(memory, tid, original) else {
+        let Clone3Read::Bytes(bytes) = read_clone_args(memory, FaultWitness::Unproven, original)
+        else {
             return None;
         };
         let mut original_args = [0; CLONE_ARGS_SIZE_VER2];
@@ -479,7 +480,8 @@ impl AddedIdEvidence {
             return None;
         }
         if chosen.guest_entries {
-            let original_entries = read_guest_set_tid(memory, tid, &original_args).ok()?;
+            let original_entries =
+                read_guest_set_tid(memory, FaultWitness::Unproven, &original_args).ok()?;
             if original_entries != chosen.set_tid[..depth] {
                 return None;
             }

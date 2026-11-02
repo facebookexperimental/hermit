@@ -14301,7 +14301,8 @@ impl RunOpts {
         mounts.extend(into_dev_shm);
         mounts.extend(private_tmp);
         mounts.extend(
-            private_mqueue(self.mount.iter().map(Mount::get_target))?.map(PlannedMount::hermit),
+            private_mqueue(self.mount.iter().map(|arg| arg.mount.get_target()))?
+                .map(PlannedMount::hermit),
         );
 
         Ok(PreparedMounts {
