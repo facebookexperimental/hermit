@@ -15,8 +15,9 @@ root. Config supplies full clean source revisions, independent
 checker sources, the private compiler/sysroot and source-authority inputs,
 inspection tools and finite symbolic DATA expectations. No prebuilt runtime or
 report can substitute for the actual source-owned archive and one-link
-transaction. Run the emitted recipe under the existing bounded runner; the
-producer does not supply a second runner.
+transaction. Run the emitted recipe through `run_pipeline.py`, which adapts it
+to the existing stock dagrun engine and the unchanged PID helper. It does not
+implement another scheduler or change the producer's qualification checks.
 
 The pipeline retains the original archive, section preparation, native,
 ordinary-gate, terminal, optional-use, source/member, mutation and cleanup
@@ -49,6 +50,73 @@ python3 -m unittest discover -s hermit-install/private-static/owned -p 'test_*.p
 
 These controls are not a replacement for the actual fresh source-owned build,
 link, emitted-code inspection and physical guest/cancellation checks.
+
+
+## Bounded producer launch
+
+First prepare the current config and pipeline binding using the commands above.
+The config's `paths.runner` and `digests.runner` identify the canonical
+`run_pipeline.py` file and its independently measured SHA256. The adapter and
+the stock dagrun binary have separate identities.
+
+Invoke the adapter with flags and actual observed paths and digests:
+
+```sh
+python3 H/hermit-install/private-static/run_pipeline.py \
+  --name private-package --recipe RECIPE --recipe-sha256 RECIPE_SHA \
+  --cpu-seconds 3600 --wall-seconds 3600 --source H --source-head H_HEAD \
+  --engine STOCK_DAGRUN --engine-sha256 ENGINE_SHA \
+  --engine-provenance STOCK_STAMP --engine-provenance-sha256 STAMP_SHA \
+  --pid-helper PID_HELPER \
+  --pid-helper-sha256 3c87bfa780d378b9e8313c904ae6fa91ae3e2e57de12275b340122a41c8cccbb \
+  --tmpdir PRIVATE_TMP --xdg-cache-home PRIVATE_CACHE --output-root EVIDENCE
+```
+
+`H` is the canonical final checkout named by the config. `STOCK_DAGRUN` is an
+already built stock binary selected by H's pinned `agent-utils`; passing its
+building launcher is not supported. `STOCK_STAMP` is that binary's normal
+`.provenance` file, with the stock `source_fp` and `binary_sha256` values. The
+adapter checks it against the existing source fingerprint helper and the
+pinned checkout. It neither creates a build attestation nor changes an old
+binary's expected checksum. `PID_HELPER` is the canonical existing
+`pid-bound-v2.py` source with the exact digest shown. The original stays
+unchanged; its identical snapshot runs beside fresh `a6-pids.json` evidence.
+No helper or private machine paths are vendored into this repository.
+
+`PRIVATE_TMP`, `PRIVATE_CACHE` and `EVIDENCE` must already exist. The run creates
+a fresh `EVIDENCE/private-package` directory. Cargo home and the sole canonical
+`H/target` come from the hashed config; they cannot be redirected by inherited
+build variables. The recipe supplies its existing argv, cwd, env and unset
+entries; there is no free-form extra-argument or environment flag.
+
+The one full-DAG step retains separate **3,600 CPU seconds and 3,600 wall
+seconds**, eight reserved CPUs, 16 GiB memory, zero swap and 512 tasks. The
+unchanged helper checks the live scope, reservation, affinity and memory
+events. The outer engine has the original 3,720-second reporting/teardown
+budget. `reservation_gib=24` is a projected **disk** allowance: before launch,
+available bytes minus 25,769,803,776 must be at least 537,000,000,000. During
+execution the same floor and 16 MiB engine-console cap are checked every two
+seconds. The disk observations use the canonical `H/target` filesystem, even
+when evidence is retained elsewhere. A breach sends TERM and then KILL after
+15 seconds. The emitted step keeps its explicit empty job flag and environment
+channels, so stock inner-width rendering preserves the payload arguments.
+Existing producer 64 MiB stream checks remain in their current owners.
+
+`launch.json` and `receipt.json` record source, adapter, engine/stamp, helper,
+recipe/binding/config and cache identities separately. Actual native
+exit/signal, guard failures, payload stdout/stderr, PID evidence and stock
+profile files are retained even when a run fails. Missing measurements remain
+missing. A successful host recipe is not a Ready token, a guest test result or
+a FULL validation receipt; DATA and runtime qualification retain their existing
+producer and consumer checks.
+
+Focused adapter controls use short native host commands, mocked disk observations
+and the pinned AU pure Python model (Python 3.10 or newer). They do not invoke
+stock dagrun, its PID helper or the private producer:
+
+```sh
+python3 -B -m unittest discover -s hermit-install/private-static -p test_run_pipeline.py
+```
 
 ## Explicit singleton verification
 
