@@ -1958,7 +1958,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds two
     // hermit-run units: 1331 + 2 = 1333, measured by the 216dbc929a full
     // validate.
-    ("test.hermit_unit", 1333),
+    // The podman database-lock wait (29fb0079a4) adds two hermit-run
+    // units (podman_store::tests::database_locked_matches_only_the_lock_diagnostic
+    // and lock_wait_refuses_once_the_budget_is_spent): 1333 + 2 = 1335,
+    // measured by musetrain's cd856249a9 full validate (1343 executed
+    // against the 1341 the old pin expected; both new units PASS).
+    ("test.hermit_unit", 1335),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6197,7 +6202,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same KVM vfork-child refusal unit: 1324 + 1 = 1325, measured by
     // nextest list.
     // Train 1 recount (same growth as test.hermit_unit): 1325 + 2 = 1327.
-    ("test.hermit_unit_on_host", 1327),
+    // The same two podman lock-wait units as test.hermit_unit (neither is
+    // in the hosted CPUID-faulting skip set): 1327 + 2 = 1329.
+    ("test.hermit_unit_on_host", 1329),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
