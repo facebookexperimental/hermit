@@ -5674,6 +5674,132 @@ mod tests {
             stderr: Vec::new(),
         });
         assert_eq!(missed, ["  Exit code 121 is not what we're looking for."]);
+    /// --minimize keeps the observed record and writes normalization only
+    /// for reading. Its timing report must still reject an opposite-outcome
+    /// slice-end replay before using that replay's diagnostic stack.
+    #[test]
+    fn minimized_timing_reports_check_slice_end_outcomes_on_the_original_record() {
+        use std::collections::BTreeMap;
+
+        use detcore::types::LogicalTime;
+
+        let dir = tempfile::tempdir().unwrap();
+        // The default search can fall back to prefix analysis after minimization.
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", "--minimize", "--", "/bin/true"]).unwrap();
+        options.tmp_dir = Some(dir.path().to_path_buf());
+        let with = events(&[5, 3, 3, 3, 7, 5]);
+        let without = events(&[5, 3, 3, 5, 7]);
+        let record = PreemptionRecord::from_vecs(&BTreeMap::from([
+            (
+                DetTid::from_raw(3),
+                vec![(LogicalTime::from_nanos(0), 4923)],
+            ),
+            (DetTid::from_raw(5), vec![(LogicalTime::from_nanos(0), 352)]),
+            (
+                DetTid::from_raw(7),
+                vec![(LogicalTime::from_nanos(0), 8111)],
+            ),
+        ]))
+        .with_schedule(with.clone())
+        .unwrap();
+        let recorded_path = dir.path().join("minimized.preempts");
+        record.write_to_disk(&recorded_path).unwrap();
+        let runopts = crate::run::RunOpts::try_parse_from(["hermit-run", "/bin/true"]).unwrap();
+        let mut minimized = RunData::from_minimize_output(
+            &options,
+            "minimized".to_owned(),
+            runopts,
+            record.clone(),
+            recorded_path.clone(),
+            dir.path().join("minimized.log"),
+        );
+        let (normalized_path, normalized) = minimized.write_normalized_preempts();
+        assert_ne!(
+            normalized.as_vecs(),
+            record.as_vecs(),
+            "normalization changes priorities"
+        );
+        assert_ne!(normalized_path, recorded_path);
+        assert_eq!(minimized.preempts_path_out(), recorded_path.as_path());
+        assert_eq!(minimized.preempts_out(), &record);
+        let mut endpoint = options.save_final_target_sched_events(minimized).unwrap();
+        let target = endpoint.preempts_out().clone();
+        assert_eq!(
+            target, record,
+            "the report starts from the record that met the target"
+        );
+        let deciding = Some(timing_report_stack(3, 0x20));
+        for (target_met, baseline_met, contradicted) in [
+            (true, false, None),
+            (false, false, Some("final_target_slice_end_for_stacktraces")),
+            (true, true, Some("final_baseline_slice_end_for_stacktraces")),
+        ] {
+            let result = options.report_timing_decision_with(
+                &target,
+                1,
+                NonZeroU64::new(200_000_000),
+                (true, &deciding),
+                (&without, Path::new("final_baseline_schedule.preempts")),
+                (
+                    |seen, len| {
+                        assert_eq!(seen, &record);
+                        assert_eq!(len, 2);
+                        Ok((
+                            CompletedScheduleTrial {
+                                target_met: true,
+                                schedule: with.clone(),
+                            },
+                            PathBuf::from("final_target_schedule.preempts"),
+                        ))
+                    },
+                    |runname, variant, len, position| {
+                        assert_eq!(variant.as_vecs(), record.as_vecs());
+                        assert_ne!(variant.as_vecs(), normalized.as_vecs());
+                        let (expected, end, met, ip, thread) = match runname {
+                            "final_target_next_for_stacktraces" => (&with, 4, true, 0x10, 7),
+                            "final_baseline_next_for_stacktraces" => (&without, 3, false, 0x10, 5),
+                            "final_target_slice_end_for_stacktraces" => {
+                                (&with, 3, target_met, 0x30, 3)
+                            }
+                            "final_baseline_slice_end_for_stacktraces" => {
+                                (&without, 2, baseline_met, 0x40, 3)
+                            }
+                            other => panic!("unexpected replay {other}"),
+                        };
+                        assert_eq!(variant.schedevents(), expected);
+                        assert_eq!((len, position), (end + 1, end));
+                        Ok((met, Some(timing_report_stack(thread, ip))))
+                    },
+                ),
+            );
+            match contradicted {
+                Some(replay) => {
+                    let error = result
+                        .expect_err("the minimized target does not exempt final replay outcomes")
+                        .to_string();
+                    assert!(
+                        error.contains(&format!("{replay} observed the opposite")),
+                        "{error}"
+                    );
+                }
+                None => {
+                    let report = result
+                        .unwrap()
+                        .expect("a repeated pair produces a timing report");
+                    assert_eq!(report.critical_event1.event_index, 3);
+                    assert_eq!(report.critical_event2.event_index, 2);
+                    assert!(same_frames(
+                        report.critical_event1.stack.as_ref().unwrap(),
+                        &timing_report_stack(3, 0x30)
+                    ));
+                    assert!(same_frames(
+                        report.critical_event2.stack.as_ref().unwrap(),
+                        &timing_report_stack(3, 0x40)
+                    ));
+                }
+            }
+        }
     }
 
     /// A report written before the deciding event was reported still reads.
