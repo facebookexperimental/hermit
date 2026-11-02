@@ -63626,25 +63626,11 @@ fn a_recording_whose_stream_cannot_be_written_in_full_is_refused() {
     );
 }
 
-/// Set where the binder tests must run: a host without a binder filesystem
-/// then fails them instead of skipping, as `HERMIT_REQUIRE_KVM` does for KVM.
-const HERMIT_REQUIRE_BINDERFS: &str = "HERMIT_REQUIRE_BINDERFS";
-
-/// Before a binder test skips because `reason`: fail instead where
-/// [`HERMIT_REQUIRE_BINDERFS`] is set, so a job that means to cover binder
-/// cannot silently stop.
-fn binderfs_skip_allowed(reason: &str) {
-    assert!(
-        std::env::var_os(HERMIT_REQUIRE_BINDERFS).is_none(),
-        "{HERMIT_REQUIRE_BINDERFS} is set, but {reason}, so the binder test cannot run"
-    );
-}
-
 /// Run the binder guest in `mode` on a private binderfs instance this test
 /// mounts in a user and mount namespace of its own, and return its output,
 /// or `None` where the kernel has no binder filesystem or will not mount one
-/// here: the test then skips, loudly, unless [`HERMIT_REQUIRE_BINDERFS`] is
-/// set. The run is bounded: the failures these tests pin are hangs.
+/// here, saying which. The run is bounded: the failures these tests pin are
+/// hangs.
 fn binder_guest_output(mode: &str) -> Option<Output> {
     binder_guest_output_with(mode, &[])
 }
@@ -63656,8 +63642,7 @@ fn binder_guest_output_with(mode: &str, hermit_args: &[&str]) -> Option<Output> 
         .lines()
         .any(|line| line.split_whitespace().last() == Some("binder"))
     {
-        binderfs_skip_allowed("this kernel has no binder filesystem");
-        eprintln!("skipping: this kernel has no binder filesystem (CONFIG_ANDROID_BINDERFS)");
+        eprintln!("no binder: this kernel has no binder filesystem (CONFIG_ANDROID_BINDERFS)");
         return None;
     }
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -63679,14 +63664,27 @@ fn binder_guest_output_with(mode: &str, hermit_args: &[&str]) -> Option<Output> 
     let label = format!("{command:?}");
     let output = hermit_test::hermit_output(&label, &mut command);
     if stdout(&output).contains("NO-BINDERFS") {
-        binderfs_skip_allowed("binderfs cannot be mounted in a user namespace here");
         eprintln!(
-            "skipping: binderfs cannot be mounted in a user namespace here: {}",
+            "no binder: binderfs cannot be mounted in a user namespace here: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         return None;
     }
     Some(output)
+}
+
+/// [`binder_guest_output`] for a binder test, which is ignored as
+/// host-limited (docs/TESTING_ENVIRONMENTS.md): a run that selects it on a
+/// host without a binder filesystem a user namespace may mount fails, naming
+/// that, rather than counting as a pass that never ran.
+fn binder_guest_output_on_a_capable_host(mode: &str) -> Output {
+    binder_guest_output(mode).unwrap_or_else(|| {
+        panic!(
+            "this binder test needs a binder filesystem (CONFIG_ANDROID_BINDERFS) that an \
+             unprivileged user and mount namespace may mount, which this host lacks (see the \
+             line above); it is ignored as host-limited, so run it only where that holds"
+        )
+    })
 }
 
 /// A descriptor one process sends another in a binder transaction is usable
@@ -63696,10 +63694,9 @@ fn binder_guest_output_with(mode: &str, hermit_args: &[&str]) -> Option<Output> 
 /// receiver's first read through it failed with EBADF. Both processes poll
 /// and read without blocking, so every binder call returns in its turn.
 #[test]
+#[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
 fn a_descriptor_received_in_a_binder_transaction_is_usable() {
-    let Some(output) = binder_guest_output("poll") else {
-        return;
-    };
+    let output = binder_guest_output_on_a_capable_host("poll");
     assert_success(&output, &["binder_fd_passing"]);
     let stdout = stdout(&output);
     assert!(
@@ -63716,10 +63713,9 @@ fn a_descriptor_received_in_a_binder_transaction_is_usable() {
 /// transaction. Before, Detcore classified it as returning on its own and ran
 /// it in the receiver's turn, so the sender never ran.
 #[test]
+#[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
 fn an_exhausted_binder_read_does_not_hold_the_guests_turn() {
-    let Some(output) = binder_guest_output("exhausted") else {
-        return;
-    };
+    let output = binder_guest_output_on_a_capable_host("exhausted");
     assert_success(&output, &["binder_fd_passing", "exhausted"]);
     let stdout = stdout(&output);
     assert!(
@@ -63735,10 +63731,9 @@ fn an_exhausted_binder_read_does_not_hold_the_guests_turn() {
 /// the run went on and the receiver's first use of the descriptor failed with
 /// EBADF, an answer Linux never gives.
 #[test]
+#[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
 fn a_descriptor_a_backgrounded_binder_read_delivers_is_refused_by_name() {
-    let Some(output) = binder_guest_output("block") else {
-        return;
-    };
+    let output = binder_guest_output_on_a_capable_host("block");
     assert_eq!(
         output.status.code(),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
@@ -63764,10 +63759,9 @@ fn a_descriptor_a_backgrounded_binder_read_delivers_is_refused_by_name() {
 /// chooses. A run that fails closed, the default, refuses it by name. Before,
 /// it ran with one warning, and nothing marked the run as host-timed.
 #[test]
+#[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
 fn a_binder_write_and_read_that_waits_is_refused_by_name() {
-    let Some(output) = binder_guest_output("writeread") else {
-        return;
-    };
+    let output = binder_guest_output_on_a_capable_host("writeread");
     assert_eq!(
         output.status.code(),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
@@ -66305,10 +66299,9 @@ fn a_strict_replay_of_a_record_with_readmissions_may_use_binder() {
 /// background path, so the other guest process runs and the pair completes;
 /// before, the first read held the turn and nothing else ever ran.
 #[test]
+#[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
 fn a_blocking_binder_read_does_not_hold_the_guests_turn() {
-    let Some(output) = binder_guest_output("ping") else {
-        return;
-    };
+    let output = binder_guest_output_on_a_capable_host("ping");
     assert_success(&output, &["binder_fd_passing", "ping"]);
     assert!(
         stdout(&output).starts_with("received transaction from pid "),
