@@ -5502,6 +5502,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     next_signal_announcement: 0,
                     consecutive_continuations: 0,
                     scheduler_grants: 0,
+                    host_timed_binder_loss_recorded: false,
 
                     end_of_timeslice: None,
                     replay_rcb_end: None,

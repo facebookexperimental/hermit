@@ -6496,6 +6496,13 @@ pub struct ThreadState<T> {
     /// its own awaits, so a grant among them ends the delivery window too.
     #[serde(default)]
     pub(crate) scheduler_grants: u64,
+    /// Whether this thread has recorded the determinism loss of a binder call
+    /// that ran an effect off the turn (`Detcore::admit_host_timed_binder_call`).
+    /// Kept per thread, so that each run that makes such a call records it:
+    /// a per-process latch would let a second run in the same Hermit process
+    /// go unmarked.
+    #[serde(default)]
+    pub(crate) host_timed_binder_loss_recorded: bool,
 
     /// Thread state associated with record/replay.
     pub record_or_replay: T,
@@ -7431,6 +7438,7 @@ impl<T> ThreadState<T> {
             next_signal_announcement: 0,
             consecutive_continuations: 0,
             scheduler_grants: 0,
+            host_timed_binder_loss_recorded: false,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
             last_replay_change_point: None,

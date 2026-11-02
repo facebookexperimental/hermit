@@ -14393,8 +14393,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// ([`Self::refuse_unserviceable_operation_because`]), and the guest's
     /// call never runs. A run that allows unsupported operations
     /// (`--allow-unsupported-syscalls`) lets the call go to the background,
-    /// warns once per process, and records a determinism loss, so
-    /// verification refuses to compare the run. Returns `None` to go on, or
+    /// warns once per Hermit process, and records a determinism loss at each
+    /// thread's first such call, so verification refuses to compare the run. Returns `None` to go on, or
     /// the result the refusal policy chose instead.
     async fn admit_host_timed_binder_call<G: Guest<Self>>(
         &self,
@@ -14428,12 +14428,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await
                 .map(Some);
         }
-        static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        // The warning is once per Hermit process; the loss is recorded by
+        // each thread's first such call, so every run that makes one records
+        // it, whatever ran before it in this process.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             warn!(
                 "[detcore] HERMIT_HOST_TIMED_BINDER: {reason}; --allow-unsupported-syscalls lets it \
                  run, and this run is recorded as nondeterministic"
             );
+        }
+        if !std::mem::replace(
+            &mut guest.thread_state_mut().host_timed_binder_loss_recorded,
+            true,
+        ) {
             crate::tool_global::report_determinism_loss(
                 guest,
                 format!("HERMIT_HOST_TIMED_BINDER: {reason}"),
@@ -21803,17 +21811,49 @@ mod inject_fstat_scratch {
                 .unwrap();
             assert_eq!(routed, (0, true), "{named}");
             assert_eq!(guest.injected, vec![Sysno::ioctl], "{named}");
-            losses.extend(guest.determinism_losses.lock().unwrap().drain(..));
+            // Each of these is a run of its own, and records its loss.
+            let recorded = guest.determinism_losses.lock().unwrap().clone();
+            assert_eq!(recorded.len(), 1, "{named}: {recorded:?}");
+            assert!(
+                recorded[0].starts_with(&format!("HERMIT_HOST_TIMED_BINDER: {named}")),
+                "{recorded:?}"
+            );
+            losses.extend(recorded);
         }
-        // The loss is reported once per tool process, by the first of these
-        // calls (no other test takes this path); each is host-timed all the
-        // same.
-        assert_eq!(losses.len(), 1, "{losses:?}");
-        assert!(
-            losses[0]
-                .starts_with("HERMIT_HOST_TIMED_BINDER: ioctl(BINDER_FREEZE) on descriptor 99"),
-            "{losses:?}"
-        );
+        assert_eq!(losses.len(), 2, "{losses:?}");
+    }
+
+    /// Every run that lets a binder call run its effect off the turn records
+    /// a determinism loss, though the warning is once per Hermit process: a
+    /// later run in the same process is not left unmarked. Within one thread
+    /// the loss is recorded once. Before, one per-process latch gated both,
+    /// so the second run here recorded nothing.
+    #[tokio::test]
+    async fn every_run_that_lets_a_binder_effect_run_off_the_turn_records_the_loss() {
+        let mut freeze = [7u32, 1, 100];
+        let argument = freeze.as_mut_ptr() as usize;
+        let request = crate::syscalls::binder::BINDER_FREEZE;
+        for run in ["first", "second"] {
+            let (_, mut guest) = ScriptedGuest::new(true, false);
+            guest.config.panic_on_unsupported_syscalls = false;
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+            for _ in 0..2 {
+                let call = syscalls::Ioctl::new()
+                    .with_fd(99)
+                    .with_request(syscalls::ioctl::Request::Other(request as usize, argument));
+                let routed = tool
+                    .run_binder_call(&mut guest, call, 99, request, argument)
+                    .await
+                    .unwrap();
+                assert_eq!(routed, (0, true), "{run}");
+            }
+            let recorded = guest.determinism_losses.lock().unwrap().clone();
+            assert_eq!(recorded.len(), 1, "{run} run: {recorded:?}");
+            assert!(
+                recorded[0].starts_with("HERMIT_HOST_TIMED_BINDER: ioctl(BINDER_FREEZE)"),
+                "{recorded:?}"
+            );
+        }
     }
 
     /// Where the run fails closed (the default, and always under `--strict`),
