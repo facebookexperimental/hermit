@@ -182,6 +182,7 @@ mod tests {
         // `ObservationFinish::InterruptForCaught`'s `dequeue`, which the
         // digest does not cover (https://github.com/rrnewton/hermit/issues/4931).
         (22, "a26a19716aa915db", "f013e36743d8d9e6"),
+        (23, "7c34f0ecd356155a", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
