@@ -19178,7 +19178,7 @@ mod nextest_timeout_tests {
                 grace_seconds: 2,
             }]
         );
-        assert!(manifest.lines().any(|line| line == "timeout_seconds: 57"));
+        assert!(manifest.lines().any(|line| line == "timeout_seconds: 180"));
         assert!(
             manifest
                 .lines()
@@ -20008,10 +20008,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .map_err(|e| format!("retry bounds: cannot read manifest defaults: {e}"))?;
     if !manifest_defaults
         .lines()
-        .any(|line| line == "timeout_seconds: 57")
+        .any(|line| line == "timeout_seconds: 180")
     {
         return Err(
-            "retry bounds: the owner-ruled 57-second wall default is absent from manifest defaults"
+            "retry bounds: the owner-ruled 180-second wall default is absent from manifest defaults"
                 .into(),
         );
     }
