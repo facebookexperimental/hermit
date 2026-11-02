@@ -3227,7 +3227,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // fdinfo (a_lock_or_fdinfo_alias_walk_follows_linuxs_lookup): 3360 + 1 =
     // 3361, measured by nextest list. K8-d's refusal of Hermit's init's fdinfo
     // (hermits_inits_fdinfo_is_refused_by_name): 3361 + 1 = 3362.
-    ("test.detcore_unit", 3362),
+    // The pipe retry identity regression adds one unit: 3362 + 1 = 3363,
+    // Measured 3363 by compiled nextest list at the integration head.
+    ("test.detcore_unit", 3363),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5764,7 +5766,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same six K9a-h units: 3354 + 6 = 3360, measured by nextest list.
     // The same K8-d walk unit: 3360 + 1 = 3361, measured by nextest list.
     // The same K8-d init-fdinfo unit: 3361 + 1 = 3362.
-    ("test.detcore_unit_on_host", 3362),
+    // The pipe retry identity regression adds one unit: 3362 + 1 = 3363,
+    // Measured 3363 by compiled nextest list at the integration head.
+    ("test.detcore_unit_on_host", 3363),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

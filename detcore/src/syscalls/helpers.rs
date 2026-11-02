@@ -1745,10 +1745,13 @@ impl GuestHeldPollProof {
         if self.targets.is_some() && Self::read_targets(guest, self.call) != self.targets {
             self.targets = None;
             Self::clear(resources);
-        } else if self.targets.is_none() && self.claimed {
+        } else if self.targets.is_none() && (self.claimed || resources.relies_on_guest_held_marks) {
             // A proof once lost (or never captured for a call that claimed
             // one) cannot be reacquired by a later refresh of the same
             // call's classification: restored operands do not restore it.
+            // Nor can a refresh manufacture mark-dependent authority for
+            // a call that never captured an identity. Non-mark authority,
+            // such as binary record/replay's internal-FD routing, is separate.
             Self::clear(resources);
         }
     }
@@ -3369,6 +3372,10 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
+    // Capture the same mark-dependent classification that the first retry
+    // will publish, before conversion or a resource request can yield. An
+    // ordinary internal pipe's routing alone does not request this capture.
+    refresh_guest_poll_state(guest, call0.into(), &mut rsrc);
     let mut guest_held = GuestHeldPollProof::capture(guest, call0.into(), &mut rsrc);
     // The signals the wait takes from the queue (rt_sigtimedwait's set).
     let consumed = call0.signals_consumed_by_wait(&guest.memory());
@@ -8807,6 +8814,15 @@ pub(crate) mod kernel_signal_wait_failures {
     /// pipe's writer; replacing the slot or poll operand can therefore make
     /// the next physical probe depend on input from outside the guest.
     async fn proof_requests(case: &str, kernel_wait: bool, masked_ppoll: bool) -> Vec<Resources> {
+        proof_requests_from(case, kernel_wait, masked_ppoll, false).await
+    }
+
+    async fn proof_requests_from(
+        case: &str,
+        kernel_wait: bool,
+        masked_ppoll: bool,
+        generic_fd_entry: bool,
+    ) -> Vec<Resources> {
         use std::os::fd::AsRawFd;
 
         let (mut guest, kernel) = WaitGuest::new(Pid::from_raw(3), 0);
@@ -8832,11 +8848,14 @@ pub(crate) mod kernel_signal_wait_failures {
                 .with_detfd(raw, |entry| entry.set_physically_nonblocking())
                 .unwrap();
         }
-        guest
-            .thread
-            .with_detfd(fd, |entry| entry.set_guest_held())
-            .unwrap();
-        if case == "dup-guest" {
+        let initially_held = !matches!(case, "unclaimed-dup" | "late-mark");
+        if initially_held {
+            guest
+                .thread
+                .with_detfd(fd, |entry| entry.set_guest_held())
+                .unwrap();
+        }
+        if matches!(case, "dup-guest" | "unclaimed-dup") {
             guest
                 .thread
                 .with_detfd(external_fd, |entry| entry.set_guest_held())
@@ -8859,7 +8878,7 @@ pub(crate) mod kernel_signal_wait_failures {
         let (change, restore) = match case {
             "same" => (ProofAction::None, ProofAction::None),
             "noop-dup" => (ProofAction::Dup { from: fd, to: fd }, ProofAction::None),
-            "dup" | "dup-guest" => (
+            "dup" | "dup-guest" | "unclaimed-dup" => (
                 ProofAction::Dup {
                     from: external_fd,
                     to: fd,
@@ -8880,6 +8899,7 @@ pub(crate) mod kernel_signal_wait_failures {
                 ProofAction::Mark { fd, held: false },
                 ProofAction::Mark { fd, held: true },
             ),
+            "late-mark" => (ProofAction::Mark { fd, held: true }, ProofAction::None),
             "unknown" => {
                 guest.thread.remove_fd(fd);
                 (ProofAction::None, ProofAction::None)
@@ -8893,8 +8913,10 @@ pub(crate) mod kernel_signal_wait_failures {
         guest.proof_script = Some(script.clone());
         let mut resources = Resources::new(guest.thread.dettid);
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
-        resources.polls_guest_state_only = true;
-        resources.relies_on_guest_held_marks = true;
+        if !generic_fd_entry {
+            resources.polls_guest_state_only = true;
+            resources.relies_on_guest_held_marks = true;
+        }
         // Match the real unmasked poll/ppoll producers. Readv's generic
         // retry helper itself supplies its restart errno and task identity.
         if kernel_wait || matches!(case, "operand" | "unknown") {
@@ -8906,7 +8928,28 @@ pub(crate) mod kernel_signal_wait_failures {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        let result = if masked_ppoll {
+        let mut byte = 0_u8;
+        let iov = libc::iovec {
+            iov_base: (&mut byte as *mut u8).cast(),
+            iov_len: 1,
+        };
+        let result = if generic_fd_entry {
+            let tool = Detcore {
+                detpid: guest.thread.detpid.unwrap(),
+                cfg: guest.config.clone(),
+                record_or_replay: crate::record_or_replay::NoopTool,
+            };
+            // The ordinary logically blocking pipe must enter through the
+            // production classifier, without a pre-armed resource request.
+            tool.execute_nonblockable_fd_syscall(
+                &mut guest,
+                syscalls::Readv::new()
+                    .with_fd(fd)
+                    .with_iov(Addr::from_raw(&iov as *const _ as usize))
+                    .with_len(1),
+            )
+            .await
+        } else if masked_ppoll {
             let tool = Detcore {
                 detpid: guest.thread.detpid.unwrap(),
                 cfg: guest.config.clone(),
@@ -8977,18 +9020,64 @@ pub(crate) mod kernel_signal_wait_failures {
                     .unwrap(),
                 original
             );
-            assert!(
-                guest
-                    .thread
-                    .with_detfd(fd, |entry| entry.is_guest_held())
-                    .unwrap()
-            );
+            if case == "unclaimed-dup" {
+                assert!(
+                    !guest
+                        .thread
+                        .with_detfd(fd, |entry| entry.is_guest_held())
+                        .unwrap()
+                );
+            } else {
+                assert!(
+                    guest
+                        .thread
+                        .with_detfd(fd, |entry| entry.is_guest_held())
+                        .unwrap()
+                );
+            }
             assert_eq!(
                 operands[0].fd, fd,
                 "restored operands cannot restore a lost proof"
             );
         }
         script.requests.clone()
+    }
+
+    #[tokio::test]
+    async fn a_pipe_readv_entry_retains_only_its_original_poll_identity() {
+        for case in [
+            "same",
+            "noop-dup",
+            "dup-guest",
+            "dup",
+            "mark",
+            "unclaimed-dup",
+            "late-mark",
+        ] {
+            let requests = proof_requests_from(case, false, false, true).await;
+            let initially_held = !matches!(case, "unclaimed-dup" | "late-mark");
+            let valid = matches!(case, "same" | "noop-dup");
+            for request in &requests[..2] {
+                assert_eq!(
+                    request.polls_guest_state_only, initially_held,
+                    "{case}: before replacement"
+                );
+                assert_eq!(
+                    request.relies_on_guest_held_marks, initially_held,
+                    "{case}: before replacement"
+                );
+            }
+            for request in &requests[2..] {
+                assert_eq!(
+                    crate::scheduler::request_reports_idle_deadlock_for_test(request.clone()),
+                    valid,
+                    "{case}, attempt {}: actual entry's terminal verdict",
+                    request.poll_attempt
+                );
+                assert_eq!(request.polls_guest_state_only, valid, "{case}");
+                assert_eq!(request.relies_on_guest_held_marks, valid, "{case}");
+            }
+        }
     }
 
     #[tokio::test]
