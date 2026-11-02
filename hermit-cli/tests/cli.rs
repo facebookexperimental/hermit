@@ -25712,15 +25712,27 @@ const WOKEN_POLL_BEHIND_CASES: [(&str, &str); 3] = [
     ),
 ];
 
-/// tests/c/alarm_receiver_reach.c's `mixedignterm` and the line it must print:
-/// `mixedignlate` with a POSIX timer's caught SIGTERM due at the same 10 ms,
-/// which only the waiter leaves unblocked. Where SIGALRM is ignored by the time
-/// it is delivered, SIGTERM's handler takes the EINTR. Natively the poll fails
-/// with EINTR in 10 of 10 runs, with both handlers run (8) or SIGTERM's alone
-/// (2), this line.
+/// tests/c/alarm_receiver_reach.c's `mixedignterm` and the line it must print
+/// on KVM: `mixedignlate` with a POSIX timer's caught SIGTERM due at the same
+/// 10 ms, which only the waiter leaves unblocked. Where SIGALRM is ignored by
+/// the time it is delivered, SIGTERM's handler takes the EINTR. Natively the
+/// poll fails with EINTR in 10 of 10 runs, with both handlers run (8) or
+/// SIGTERM's alone (2), this line. Ptrace prints the other native line
+/// ([`MIXED_IGNORE_TERM_PTRACE`]).
 const MIXED_IGNORE_TERM: (&str, &str) = (
     "mixedignterm",
     "mode=mixedignterm first=-1 errno=EINTR eintr=1 usr1=0 on_waiter=0 term=1\n",
+);
+
+/// The line ptrace prints for `mixedignterm` ([`MIXED_IGNORE_TERM`]): both
+/// handlers run, the native outcome of 8 in 10 runs. While only the waiter's
+/// poll and the leader's 10 ms sleep remain, ptrace's schedule moves global
+/// time ahead to the two expiries (`Scheduler::fast_forward_to_next_finite_deadline`),
+/// and the waiter takes SIGTERM and SIGALRM there, before the leader's sleep
+/// ends and it ignores SIGALRM.
+const MIXED_IGNORE_TERM_PTRACE: (&str, &str) = (
+    "mixedignterm",
+    "mode=mixedignterm first=-1 errno=EINTR eintr=1 usr1=1 on_waiter=1 term=1\n",
 );
 
 /// The modes of tests/c/alarm_receiver_reach.c in which a 50 ms alarm's
@@ -25897,7 +25909,8 @@ fn run_kvm_a_woken_poll_linux_would_end_otherwise_is_refused_by_name() {
 /// The ptrace half of `run_kvm_a_woken_poll_fails_with_eintr_when_any_handler_runs`,
 /// and of the refused and pinned KVM cases: `mixedpoll`, `mixedusr2`,
 /// `mixedshared`, `mixedlate`, `mixedbehind`, `mixedbehindnors`,
-/// `mixedtgkill` and `mixedignterm`, which ptrace runs as Linux does,
+/// `mixedtgkill` and `mixedignterm` (with both handlers run,
+/// [`MIXED_IGNORE_TERM_PTRACE`]), which ptrace runs as Linux does,
 /// `mixedignlate`, which ptrace prints as Linux does in 2 or 3 of 10 native
 /// runs (the leader's ignore discards the copy before the waiter takes it, and
 /// the poll restarts), and `mixedtgkillusr2`, whose poll fails with EINTR once,
@@ -25925,7 +25938,7 @@ fn a_woken_poll_fails_with_eintr_when_any_handler_runs() {
             "mixedignlate",
             "mode=mixedignlate first=1 errno=0 eintr=0 usr1=0 on_waiter=0\n",
         ),
-        MIXED_IGNORE_TERM,
+        MIXED_IGNORE_TERM_PTRACE,
         (
             "mixedtgkillusr2",
             "mode=mixedtgkillusr2 first=-1 errno=EINTR eintr=1 usr1=1 on_waiter=1 usr2=1\n",
@@ -26117,9 +26130,10 @@ fn restarted_poll_under_network_recording(backend: &[&str], mode: &str, port: Op
 /// dropped copy too, moved `curr_target` to B, and ran that handler on B. In
 /// `ignmoveblocked` the leader blocks SIGALRM, so the first copy is queued and
 /// its walk does move `curr_target` to B: the handler runs on B natively (10 of
-/// 10) and on KVM. Each must print the native line at bitwise parity. ptrace
-/// prints `handler_on=B` for `ignmove` at every revision, its own difference
-/// (https://github.com/rrnewton/hermit/issues/4991).
+/// 10) and on KVM. Each must print the native line at bitwise parity. ptrace's
+/// choice of thread for these copies differs from Linux's
+/// (https://github.com/rrnewton/hermit/issues/4991): it prints the native
+/// line for one of the two modes, and which one has changed with the schedule.
 #[test]
 fn run_kvm_an_ignored_posix_timer_signal_moves_no_receiver_walk() {
     if !Path::new("/dev/kvm").exists() {

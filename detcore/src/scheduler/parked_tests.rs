@@ -9349,6 +9349,11 @@ enum AlarmThread {
     /// As `Busy`, but its process ignores SIGUSR1: a copy Linux would have
     /// dropped as it was sent, which does not make it busy.
     IgnoredPending,
+    /// Parked in `pause` at a controlled site, SIGALRM unblocked, with
+    /// SIGUSR1, which it does not block either, pending for it alone: a state
+    /// Linux never holds, since the SIGUSR1 woke it; it is observed before
+    /// the receiver walk runs.
+    BusyPause,
     /// Queued to run in a masked `pselect6` whose temporary mask blocks
     /// SIGALRM, which its own mask does not.
     MaskedWait,
@@ -9364,9 +9369,12 @@ enum AlarmThread {
     FutexWait,
     /// A vfork parent waiting for its child; SIGALRM unblocked.
     VforkParent,
-    /// Polling `poll`, whose probe never takes a pending signal (no restart
-    /// marker; EINTR is the call's own errno); SIGALRM unblocked.
+    /// Polling `poll`, whose probe never takes a pending signal, with the
+    /// EINTR marker its request carries for the idle-poller diagnosis
+    /// (`Detcore::handle_internal_poll_until`); SIGALRM unblocked.
     PollPoller,
+    /// Polling an unmasked `ppoll`, marked as `poll` is; SIGALRM unblocked.
+    PpollPoller,
     /// Polling a receive, with the ERESTARTSYS marker; SIGALRM unblocked.
     RecvPoller,
     /// Polling `select`, whose probe takes a pending signal itself (the EINTR
@@ -9419,7 +9427,7 @@ fn choose_alarm_receiver(
         };
         let usr1 = 1 << (libc::SIGUSR1 - 1);
         let (pending, ignored) = match state {
-            AlarmThread::Busy => (usr1, 0),
+            AlarmThread::Busy | AlarmThread::BusyPause => (usr1, 0),
             AlarmThread::IgnoredPending => (usr1, usr1),
             _ => (0, 0),
         };
@@ -9442,7 +9450,9 @@ fn choose_alarm_receiver(
                 file_ordinary(&mut s, tid);
                 s.runqueue_push_back(tid);
             }
-            AlarmThread::Pause => parked.push((tid, parked_pause(&mut s, tid, mm, site))),
+            AlarmThread::Pause | AlarmThread::BusyPause => {
+                parked.push((tid, parked_pause(&mut s, tid, mm, site)))
+            }
             AlarmThread::MaskedWait => {
                 file_masked_pselect6(&mut s, tid, SIGALRM_BIT);
                 s.runqueue_push_back(tid);
@@ -9473,7 +9483,8 @@ fn choose_alarm_receiver(
                 file_ordinary(&mut s, tid);
                 s.vfork_barriers.insert(tid, None);
             }
-            AlarmThread::PollPoller => file_poller(&mut s, tid, "poll", None),
+            AlarmThread::PollPoller => file_poller(&mut s, tid, "poll", Some(Errno::EINTR)),
+            AlarmThread::PpollPoller => file_poller(&mut s, tid, "ppoll", Some(Errno::EINTR)),
             AlarmThread::RecvPoller => {
                 file_poller(&mut s, tid, "recvfrom", Some(Errno::ERESTARTSYS))
             }
@@ -9539,12 +9550,16 @@ fn alarm_action(
 /// it leaves unblocked is pending for it alone. Only that thread is acted
 /// on: queued to run, step 3 resumes it first; parked in a wait the
 /// observation can interrupt, it is observed; polling a call whose probe
-/// never takes a pending signal (`poll`, a receive, `rt_sigtimedwait`), it is
-/// woken and resumed first, as Linux's `signal_wake_up` ends its wait;
-/// polling `select` or `pselect6`, whose probe takes the signal under the
-/// call's own mask, nothing is done, and that probe takes the copy. No other
+/// never takes a pending signal (`poll`, an unmasked `ppoll`, a receive,
+/// `rt_sigtimedwait`), it is woken and resumed first, as Linux's
+/// `signal_wake_up` ends its wait, though a `poll`'s and a `ppoll`'s requests
+/// carry the EINTR marker as a `select`'s does; polling `select` or
+/// `pselect6`, whose probe takes the signal under the call's own mask,
+/// nothing is done, and that probe takes the copy. No other
 /// thread is acted on in its place, and a parked thread Linux does not wake
-/// is not observed. A thread waiting where Linux would interrupt the wait
+/// is not observed; where no thread wants the copy, a parked thread the walk
+/// passed over as busy, which Linux woke for its own signal, is. A thread
+/// waiting where Linux would interrupt the wait
 /// but this backend cannot (a futex wait, a call outside the schedule) is
 /// passed over, so the copy reaches a thread that can take it (the named KVM
 /// gap D1); a vfork parent, which Linux cannot wake either, is not, and the
@@ -9555,7 +9570,7 @@ fn alarm_action(
 fn one_receiver_choice_takes_a_published_alarm_as_complete_signal_chooses() {
     use AlarmThread::*;
     let t = DetTid::from_raw;
-    let cases: [ReceiverCase; 22] = [
+    let cases: [ReceiverCase; 28] = [
         (
             "a runnable leader that wants it, beside a parked sibling",
             &[Runnable, Pause],
@@ -9597,6 +9612,45 @@ fn one_receiver_choice_takes_a_published_alarm_as_complete_signal_chooses() {
             None,
             Some(t(102)),
             None,
+        ),
+        (
+            "a parked leader with its own signal pending, which Linux woke for \
+             that signal, is observed",
+            &[BusyPause],
+            None,
+            None,
+            Some(t(100)),
+        ),
+        (
+            "a parked sibling with its own signal pending is observed",
+            &[Blocks, BusyPause],
+            None,
+            None,
+            Some(t(101)),
+        ),
+        (
+            "a parked leader with its own signal pending is observed, not passed \
+             over for a parked sibling that wants the copy",
+            &[BusyPause, Pause],
+            None,
+            None,
+            Some(t(100)),
+        ),
+        (
+            "a parked leader with its own signal pending is observed, and no \
+             runnable sibling takes the copy in its place",
+            &[BusyPause, Runnable],
+            None,
+            None,
+            Some(t(100)),
+        ),
+        (
+            "a parked sibling with its own signal pending is observed first, \
+             beside a parked leader that wants the copy",
+            &[Pause, BusyPause],
+            None,
+            None,
+            Some(t(101)),
         ),
         (
             "an ignored pending signal does not make it busy",
@@ -9677,6 +9731,13 @@ fn one_receiver_choice_takes_a_published_alarm_as_complete_signal_chooses() {
             None,
         ),
         (
+            "a leader polling an unmasked ppoll is woken, not a parked sibling",
+            &[PpollPoller, Pause],
+            None,
+            Some(t(100)),
+            None,
+        ),
+        (
             "a leader polling a receive is woken, not a parked sibling",
             &[RecvPoller, Pause],
             None,
@@ -9711,6 +9772,42 @@ fn one_receiver_choice_takes_a_published_alarm_as_complete_signal_chooses() {
         assert_eq!(
             b.permits.lock().unwrap().len(),
             usize::from(observed.is_some()),
+            "{case}"
+        );
+        assert!(!s.backend_failed(), "{case}");
+    }
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (the Claude review of the
+/// slice's rebase onto C2, P2 and P3): a thread parked in `pause` whose own
+/// SIGUSR1 is pending is observed whether or not a SIGALRM is pending, since
+/// Linux's thread-directed send woke it (kernel/signal.c:946-961 and 1033 at
+/// v6.17), and `pause` returns at once with a signal pending (lines
+/// 4822-4829). A SIGUSR1 it blocks, or one its process ignores, which Linux
+/// drops as it is sent, leaves it asleep.
+#[test]
+fn a_parked_thread_with_its_own_signal_pending_is_observed_without_a_sigalrm() {
+    let usr1 = 1 << (libc::SIGUSR1 - 1);
+    for (case, blocked, ignored, observed) in [
+        ("unblocked and handled", 0, 0, true),
+        ("blocked", usr1, 0, false),
+        ("ignored", 0, usr1, false),
+    ] {
+        let (mut s, b) = fixture();
+        let (tid, mm, site) = add(&mut s, 100, 100);
+        report_signal_sets(
+            &b,
+            100,
+            100,
+            reverie::SignalSets::new(usr1, 0, blocked, ignored, usr1 & !ignored),
+        );
+        let response = parked_pause(&mut s, tid, mm, site);
+        s.committed_time = at(10);
+        s.select_parked_alarm().unwrap();
+        assert_eq!(response.try_read().is_some(), observed, "{case}");
+        assert_eq!(
+            b.permits.lock().unwrap().len(),
+            usize::from(observed),
             "{case}"
         );
         assert!(!s.backend_failed(), "{case}");

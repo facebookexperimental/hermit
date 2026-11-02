@@ -122,13 +122,14 @@ pub(super) enum AlarmReach {
     /// Parked in a wait the observation protocol interrupts (a `pause`, a
     /// `nanosleep`, a polled read, a child wait): it is observed.
     Parked,
-    /// Polling a call whose probe never ends for a pending signal (`poll`,
-    /// `epoll_wait`, a receive, `rt_sigtimedwait`): it is woken
-    /// (`Scheduler::wake_polling_alarm_receiver`).
+    /// Polling a call whose probe never ends for a pending signal (`poll`, an
+    /// unmasked `ppoll`, `epoll_wait`, a receive, `rt_sigtimedwait`): it is
+    /// woken (`Scheduler::wake_polling_alarm_receiver`).
     Poll,
     /// Polling a call whose probe takes a pending signal itself, under the
-    /// call's own temporary mask (`select`, `pselect6`: its request carries
-    /// the EINTR marker): its next probe takes the copy.
+    /// call's own temporary mask (`select`, `pselect6`, whose requests carry
+    /// the EINTR marker, as a `poll`'s and a `ppoll`'s also do): its next
+    /// probe takes the copy.
     TakesAtItsProbe,
     /// Queued to run with a request filed: step 3 resumes it first.
     Queued,
@@ -1535,6 +1536,13 @@ impl Scheduler {
     /// outside the schedule) is never chosen (`alarm_wants`, the named KVM
     /// gap D1).
     ///
+    /// Before any of this, a thread parked in a wait the observation can
+    /// interrupt that has a signal of its own pending, which it neither
+    /// blocks nor ignores, is observed, whether or not a SIGALRM is pending
+    /// (`observe_parked_thread_woken_by_its_own_signal`): Linux woke it when
+    /// that signal was sent, so it is in no wait the receiver walk could pass
+    /// over or choose.
+    ///
     /// Before this choice, the first eligible parked recipient by thread ID was
     /// observed even where Linux gives the copy to a runnable leader that
     /// wants it, which interrupted a parked sibling's wait that Linux leaves
@@ -1599,6 +1607,9 @@ impl Scheduler {
                 .values()
                 .any(|p| p.task.process == process && p.site.is_some())
             {
+                continue;
+            }
+            if self.observe_parked_thread_woken_by_its_own_signal(pid)? {
                 continue;
             }
             if self.select_alarm_receiver(&control, pid, process)? {
@@ -1722,6 +1733,73 @@ impl Scheduler {
             AlarmReach::TakesAtItsProbe | AlarmReach::VforkParent | AlarmReach::OutOfReach => {}
         }
         Ok(false)
+    }
+
+    /// Observe the first thread of `pid`, in thread-ID order, that is parked
+    /// in a wait the observation protocol can interrupt
+    /// (`parked_alarm_observable`: a `pause`, a `nanosleep` whose deadline is
+    /// ahead, a polled read, a child wait) and has a signal of its own
+    /// pending that it neither blocks nor ignores. Returns whether it began an
+    /// observation, which then admits no other one of the process in this
+    /// pass.
+    ///
+    /// Linux never leaves such a thread asleep. A thread-directed send names
+    /// its target, and `complete_signal` wakes it (`wants_signal`, then
+    /// `signal_wake_up`, kernel/signal.c:946-961 and 1033 at v6.17,
+    /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/signal.c?h=v6.17#n1033>),
+    /// which ends its interruptible wait; a thread that reaches `pause` with a
+    /// signal already pending returns at once (`sys_pause`, lines 4822-4829).
+    /// The woken thread dequeues its private queue before the shared one
+    /// (`dequeue_signal`, lines 618-640), so it takes that signal first, as
+    /// the observation delivers it. This backend does not wake a parked wait
+    /// for a thread-directed signal of its own accord, so without this the
+    /// thread slept until a pending SIGALRM's observation happened to reach
+    /// it, or for ever (<https://github.com/rrnewton/hermit/issues/4929>);
+    /// and it must not steer the SIGALRM receiver walk, which would pass it
+    /// over as busy and give every copy to a sibling Linux does not choose.
+    ///
+    /// Read at the quiesced point where the receiver is chosen, from the
+    /// scheduler's committed state and the one signal-state reader, as the
+    /// walk reads it (`alarm_wants`): a thread whose exit or exec is in flight
+    /// is not read (`reads_settled_signal_state`), and a temporary mask comes
+    /// from committed state (`controlled_temporary_mask`). An ignored pending
+    /// copy, which Linux would have dropped as it was sent, does not count.
+    fn observe_parked_thread_woken_by_its_own_signal(
+        &mut self,
+        pid: DetPid,
+    ) -> Result<bool, SelectionFailure> {
+        for tid in self.process_signal_targets(pid) {
+            let Some((_, task)) = self.real_timers.task_identity(pid, tid) else {
+                continue;
+            };
+            if !self.parked_alarm_observable(pid, tid, task)? || !self.has_own_signal_to_take(tid) {
+                continue;
+            }
+            self.begin_alarm_observation(pid, tid, task)
+                .map_err(|failure| SelectionFailure {
+                    pid,
+                    tid: Some(tid),
+                    failure,
+                })?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Whether `thread` has a signal pending for it alone that it neither
+    /// blocks nor ignores (Linux's `task_sigpending` after `prepare_signal`
+    /// dropped the ignored ones), read as `alarm_wants` reads a busy thread.
+    fn has_own_signal_to_take(&self, thread: DetTid) -> bool {
+        if !self.reads_settled_signal_state(thread) {
+            return false;
+        }
+        let Ok(temporary) = self.controlled_temporary_mask(thread) else {
+            return false;
+        };
+        self.read_guest_signal_state(thread).is_ok_and(|state| {
+            let mask = temporary.unwrap_or(state.blocked);
+            state.thread_pending & !mask & !state.ignored_at_generation() != 0
+        })
     }
 
     /// The thread Linux's `complete_signal` wakes for a SIGALRM in `pid`'s
@@ -1936,7 +2014,18 @@ impl Scheduler {
         {
             return AlarmReach::Queued;
         }
-        if request.signal_interrupt_errno() == Some(reverie::syscalls::Errno::EINTR.into_raw()) {
+        // A `poll` and an unmasked `ppoll` carry the EINTR marker too, as the
+        // errno a handler gives them, for the idle-poller diagnosis
+        // (`Scheduler::poller_may_run_external_handler`), but their probe
+        // never ends for a pending signal, so they are woken below. The
+        // request names its call (`Resources::fyi`). A `ppoll` under a
+        // temporary mask never polls here: the one backend that installs a
+        // control (KVM) reports no `supports_blocked_wait_signal_interruption`,
+        // so such a call that would block fails closed
+        // (`Detcore::handle_internal_ppoll`).
+        if request.signal_interrupt_errno() == Some(reverie::syscalls::Errno::EINTR.into_raw())
+            && matches!(request.fyi.as_str(), "select" | "pselect6")
+        {
             return AlarmReach::TakesAtItsProbe;
         }
         if request.blocked_signal_mask.is_some() || request.blocked_signal_mask_unknown {
