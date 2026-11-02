@@ -6592,6 +6592,17 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) restart_block: Option<crate::syscalls::helpers::RestartBlock>,
 
+    /// What a signal that ended this thread's current syscall's wait through
+    /// `ERESTARTSYS`'s protocol left for the return to user mode
+    /// (`syscalls::helpers::WokenWait`): set where the wait ended, settled by
+    /// the syscall handler's last step
+    /// (`syscalls::helpers::settle_woken_wait_at_return`), and checked
+    /// against the deliveries at that return
+    /// (`syscalls::helpers::check_woken_wait_delivery`). Each syscall starts
+    /// with it clear (`Detcore::handle_syscall_event`).
+    #[serde(skip)]
+    pub(crate) woken_wait: crate::syscalls::helpers::WokenWait,
+
     /// The calling thread's working directory in the guest's view, read for
     /// the syscall it is running where the tool cannot read it from host
     /// procfs (`procfs_inode::tool_can_read_guest_cwd`: KVM): its path where
@@ -7924,6 +7935,7 @@ impl<T> ThreadState<T> {
             child_cpu_owners: Default::default(),
             parent_cpu_publication: None,
             restart_block: None,
+            woken_wait: Default::default(),
             syscall_cwd: None,
             sigalrm_handled: false,
             signal_shadow: None,

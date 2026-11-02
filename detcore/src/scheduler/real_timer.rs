@@ -460,6 +460,35 @@ impl RealTimers {
         Ok(expiry)
     }
 
+    /// The expiry at `deadline` of `detpid`'s armed timer, which Linux
+    /// discards as it is generated: `it_real_fn` sends SIGALRM to the leader,
+    /// whose `prepare_signal` drops it (`sig_ignored`), and returns
+    /// `HRTIMER_NORESTART`, so the timer stays stopped until a shared-queue
+    /// SIGALRM dequeue restarts it (`posixtimer_rearm_itimer`)
+    /// (<https://github.com/rrnewton/hermit/issues/4929>). Nothing is
+    /// published: `Active { deadline }` becomes `Inactive { last_deadline:
+    /// deadline }` directly, with no publication recorded, and the next
+    /// acknowledged dequeue restarts it on its grid ([`Self::dequeue`],
+    /// [`Self::reconcile`]). Any other phase is refused, as for
+    /// [`Self::expire`].
+    pub fn discard_expiry(
+        &mut self,
+        detpid: DetPid,
+        deadline: LogicalTime,
+    ) -> Result<(), TimerFailure> {
+        let p = self
+            .processes
+            .get_mut(&detpid)
+            .ok_or(TimerFailure::Identity)?;
+        if p.retired || p.timer.phase != (RealTimerPhase::Active { deadline }) {
+            return Err(TimerFailure::InvalidPhase);
+        }
+        p.timer.phase = RealTimerPhase::Inactive {
+            last_deadline: deadline,
+        };
+        Ok(())
+    }
+
     pub fn publication(
         &mut self,
         expiry: ExpiryId,

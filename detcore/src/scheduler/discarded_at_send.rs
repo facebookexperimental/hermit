@@ -989,6 +989,45 @@ pub struct DiscardToken {
     pub generation: u64,
 }
 
+/// Linux's discard at generation (`sig_ignored`, kernel/signal.c at v6.17),
+/// given the named task's mask and its process's dispositions: `signal` is
+/// dropped as it is sent when `mask` leaves it unblocked and it is ignored
+/// (`SIG_IGN`, or a default-ignored signal with no handler,
+/// [`ignored_at_generation`]), or it is an uncaught `SIG_DFL` signal to a PID
+/// namespace's init (`pid_namespace_init`), except SIGKILL and SIGSTOP, which
+/// are forced unless the sender is inside that namespace
+/// (`from_inside_namespace`, `sig_task_ignored` with `force`). Real-time
+/// signals are not tracked (module docs) and are never discarded here.
+///
+/// The one rule every caller decides by: a send of the scheduler's or a
+/// guest's (`Scheduler::discarded_when_sent_to`), the traced `ITIMER_REAL`
+/// expiry (`Scheduler::leader_ignores_sigalrm`) and the controlled one
+/// (<https://github.com/rrnewton/hermit/issues/4929>). Each gathers its own
+/// inputs.
+pub(crate) fn discards_at_generation(
+    signal: i32,
+    mask: u64,
+    ignored: u64,
+    caught: u64,
+    pid_namespace_init: bool,
+    from_inside_namespace: bool,
+) -> bool {
+    let bit = kernel_signal_bit(signal) & STANDARD_SIGNALS;
+    if bit == 0 || mask & bit != 0 {
+        return false;
+    }
+    if ignored_at_generation(ignored, caught) & bit != 0 {
+        return true;
+    }
+    if !pid_namespace_init || caught & bit != 0 {
+        return false;
+    }
+    if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+        return from_inside_namespace;
+    }
+    true
+}
+
 impl Scheduler {
     /// Whether Linux discards `signal` sent now to the task `named`, which the
     /// sender names (`kill`'s pid, `tgkill`'s tid), from `sender` (`None`: the
@@ -1000,6 +1039,15 @@ impl Scheduler {
     /// with `force`). A state that cannot be read, or a task whose mask
     /// Detcore does not know (an exited leader), is not discarded, as before
     /// <https://github.com/rrnewton/hermit/issues/4293>.
+    ///
+    /// The state comes from the scheduler's one signal-state reader
+    /// (`signal_state_reader`): the kernel's `/proc` where guest thread IDs
+    /// name host tasks (`models_signal_targets`), and with a process signal
+    /// control installed, the control's run-scoped read
+    /// (<https://github.com/rrnewton/hermit/issues/4929>). Through the control,
+    /// a task whose exit or whose process's exec is in flight is not read
+    /// (`reads_settled_signal_state`), so it is not discarded either. The rule
+    /// itself is [`discards_at_generation`].
     pub(crate) fn discarded_when_sent_to(
         &self,
         named: DetTid,
@@ -1007,32 +1055,33 @@ impl Scheduler {
         sender: Option<DetTid>,
     ) -> bool {
         let bit = kernel_signal_bit(signal) & STANDARD_SIGNALS;
-        if !self.models_signal_targets || bit == 0 {
+        let through_control = self.reads_signal_state_through_control();
+        if !(self.models_signal_targets || through_control) || bit == 0 {
+            return false;
+        }
+        if through_control && !self.reads_settled_signal_state(named) {
             return false;
         }
         let Some(mask) = self.discard_mask(named, signal) else {
             return false;
         };
-        if mask & bit != 0 {
-            return false;
-        }
         let Some((ignored, caught)) = self.named_dispositions(named, signal) else {
             return false;
         };
-        if ignored_at_generation(ignored, caught) & bit != 0 {
-            return true;
-        }
         let process = self.thread_tree.process_of(named).unwrap_or(named);
-        if !self.thread_tree.is_pid_namespace_init(process) || caught & bit != 0 {
-            return false;
-        }
-        if signal == libc::SIGKILL || signal == libc::SIGSTOP {
-            // Forced only from an ancestor namespace.
-            return sender.is_some_and(|sender| {
-                self.thread_tree.pid_namespaces.namespace_of(sender) == Some(process)
-            });
-        }
-        true
+        // SIGKILL and SIGSTOP are forced onto a namespace init only from an
+        // ancestor namespace.
+        let from_inside_namespace = sender.is_some_and(|sender| {
+            self.thread_tree.pid_namespaces.namespace_of(sender) == Some(process)
+        });
+        discards_at_generation(
+            signal,
+            mask,
+            ignored,
+            caught,
+            self.thread_tree.is_pid_namespace_init(process),
+            from_inside_namespace,
+        )
     }
 
     /// The mask that decides whether `named` discards a signal sent now
@@ -1048,8 +1097,10 @@ impl Scheduler {
     ///    continuation turn (`continuation_masks`), likewise;
     /// 5. a filed `BlockingRtSigsuspend` request's temporary mask;
     /// 6. the mask `named` published, where it decides about `signal`, or
-    ///    else `SigBlk`, for a live thread stopped at a request
-    ///    (`blocked_mask_for`).
+    ///    else the one signal-state reader's mask for a live thread stopped at
+    ///    a request (`read_guest_signal_mask`): `SigBlk` without a process
+    ///    signal control, as `blocked_mask_for` reads it; with one, a masked
+    ///    call's temporary mask or the control's `blocked` set.
     pub(crate) fn discard_mask(&self, named: DetTid, signal: i32) -> Option<u64> {
         if let Some(saved) = self.saved_guest_sigmasks.get(&named) {
             return Some(*saved);
@@ -1072,7 +1123,16 @@ impl Scheduler {
         if !self.next_turns.contains_key(&named) {
             return None;
         }
-        self.blocked_mask_for(named, signal)
+        if let Some(mask) = self.published_mask_for(named, signal) {
+            tracing::trace!(
+                "[dtid {}] signal {} reads its published mask {:#x}",
+                named,
+                signal,
+                mask
+            );
+            return Some(mask);
+        }
+        self.read_guest_signal_mask(named)
     }
 
     /// The temporary mask of `dettid`'s filed `BlockingRtSigsuspend` request.
@@ -1111,19 +1171,14 @@ impl Scheduler {
         Some((state.ignored, state.caught))
     }
 
-    /// `named`'s signal state (dispositions, queues), read from the kernel, or
-    /// `None` for a task the scheduler does not know or cannot read.
+    /// `named`'s signal state (dispositions, queues), from the scheduler's one
+    /// signal-state reader (`read_guest_signal_state`), or `None` for a task
+    /// the scheduler does not know or cannot read.
     fn named_signal_state(&self, named: DetTid) -> Option<KernelSignalState> {
         if !self.next_turns.contains_key(&named) {
             return None;
         }
-        #[cfg(test)]
-        if let Some(state) = self.test_kernel_signal_states.get(&named) {
-            return Some(*state);
-        }
-        let process = self.thread_tree.process_of(named).unwrap_or(named);
-        self.guest_signal_state(named, process.as_raw(), named.as_raw())
-            .ok()
+        self.read_guest_signal_state(named).ok()
     }
 
     /// Whether `queue` holds a copy of `signal`, as the kernel shows it now
@@ -2414,5 +2469,68 @@ mod reported_alarm_tests {
         assert!(record.alarm_unreported.contains(&process));
         record.retire(QueueId::Process(process));
         assert!(!record.alarm_unreported.contains(&process));
+    }
+}
+
+#[cfg(test)]
+mod generation_rule_tests {
+    use super::*;
+
+    fn bit(signal: i32) -> u64 {
+        1 << (signal - 1)
+    }
+
+    /// The one rule (`discards_at_generation`) is Linux's `sig_ignored` for a
+    /// task that is not traced (v6.17 kernel/signal.c:84-125): a blocked
+    /// signal is never discarded; an unblocked one is when its action is
+    /// SIG_IGN, or SIG_DFL with a default action of ignore, and, at a PID
+    /// namespace's init (`SIGNAL_UNKILLABLE`), when its action is SIG_DFL,
+    /// except SIGKILL and SIGSTOP, which a sender outside the namespace
+    /// forces (`send_signal_locked`, lines 1189-1191). Real-time signals are
+    /// not tracked and never discarded here.
+    #[test]
+    fn the_generation_rule_is_sig_ignored() {
+        let (alrm, chld) = (bit(libc::SIGALRM), bit(libc::SIGCHLD));
+        let rule = discards_at_generation;
+        assert!(rule(libc::SIGALRM, 0, alrm, 0, false, false), "SIG_IGN");
+        assert!(!rule(libc::SIGALRM, alrm, alrm, 0, false, false), "blocked");
+        assert!(!rule(libc::SIGALRM, 0, 0, alrm, false, false), "handled");
+        assert!(
+            !rule(libc::SIGALRM, 0, 0, 0, false, false),
+            "SIG_DFL ends it"
+        );
+        assert!(
+            rule(libc::SIGCHLD, 0, 0, 0, false, false),
+            "SIG_DFL ignores it"
+        );
+        assert!(
+            !rule(libc::SIGCHLD, 0, 0, chld, false, false),
+            "SIGCHLD handled"
+        );
+        assert!(rule(libc::SIGALRM, 0, 0, 0, true, false), "init, SIG_DFL");
+        assert!(
+            !rule(libc::SIGALRM, 0, 0, alrm, true, false),
+            "init, handled"
+        );
+        assert!(
+            !rule(libc::SIGALRM, alrm, 0, 0, true, false),
+            "init, blocked"
+        );
+        assert!(
+            !rule(libc::SIGKILL, 0, 0, 0, true, false),
+            "init, SIGKILL from outside"
+        );
+        assert!(
+            rule(libc::SIGKILL, 0, 0, 0, true, true),
+            "init, SIGKILL from inside"
+        );
+        assert!(
+            !rule(libc::SIGKILL, 0, 0, 0, false, true),
+            "SIGKILL, not an init"
+        );
+        assert!(
+            !rule(libc::SIGRTMIN(), 0, u64::MAX, 0, false, false),
+            "real-time"
+        );
     }
 }

@@ -40,7 +40,7 @@
       ],
       "ledger": "hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv",
       "node": "privileged-test.deadline_slice_cap_kvm",
-      "required_tests": 40
+      "required_tests": 41
     }
   ],
   "schema": 1

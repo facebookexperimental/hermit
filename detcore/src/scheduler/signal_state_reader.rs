@@ -22,6 +22,24 @@
 //! The answer describes the moment of the call, so a caller asks only at a
 //! committed point where no guest thread holds the turn (the step-2 drain),
 //! as it reads `/proc` there on ptrace.
+//!
+//! Beside the reader, #4929 slice 2 keeps here what its timer decisions read
+//! (<https://github.com/rrnewton/hermit/issues/4929>): with a control
+//! installed, the temporary mask Linux holds installed for a thread, which the
+//! backend's `blocked` set does not hold ([`Scheduler::controlled_temporary_mask`]),
+//! the mask a decision reads ([`Scheduler::read_guest_signal_mask`]), and
+//! whether a thread's state is settled enough to read
+//! ([`Scheduler::reads_settled_signal_state`]). Every read happens where no
+//! guest thread runs: a timer expiry and a choice of receiver are made in the
+//! scheduler's maintenance, on a quiesced state, so the answer is a function
+//! of the schedule. An exiting task's retirement and an exec are ruled out
+//! from the scheduler's committed state before a read. An outstanding
+//! delivery permit cannot change the state at these points: a quiesced point
+//! waits for every thread's request, and a permit holder files its request
+//! only from its delivery hook, which the backend runs after it has dequeued
+//! the signal; the handler's mask is installed after that hook returns, in
+//! the holder's own `InboundSignal` turn, which the schedule orders after the
+//! read.
 
 use reverie::syscalls::Errno;
 
@@ -123,5 +141,169 @@ impl Scheduler {
             answer => answer,
         }?;
         Ok(KernelSignalState::from_backend_sets(&sets))
+    }
+}
+
+/// A thread's temporary mask is unknown (`Scheduler::controlled_temporary_mask`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TemporaryMaskUnknown;
+
+impl Scheduler {
+    /// Whether the reader takes a guest thread's state from the installed
+    /// process signal control (module docs), rather than from the host's
+    /// `/proc`.
+    pub(crate) fn reads_signal_state_through_control(&self) -> bool {
+        self.signal_control_installed()
+    }
+
+    /// `thread`'s signal state, from the one reader
+    /// ([`Self::guest_signal_state`]): the backend's sets where Detcore reads
+    /// them there, and otherwise host `/proc` of the thread in its process.
+    /// Unit tests on a backend that reads `/proc` script a thread's state
+    /// (`test_kernel_signal_states`); an unscripted one reads through
+    /// `read_kernel_signal_state`'s own test seam.
+    pub(crate) fn read_guest_signal_state(
+        &self,
+        thread: DetTid,
+    ) -> Result<KernelSignalState, Errno> {
+        #[cfg(test)]
+        if !reads_signal_state_from_backend(&self.backend)
+            && let Some(state) = self.test_kernel_signal_states.get(&thread)
+        {
+            return Ok(*state);
+        }
+        let process = self.thread_tree.process_of(thread).unwrap_or(thread);
+        self.guest_signal_state(thread, process.as_raw(), thread.as_raw())
+    }
+
+    /// `thread`'s mask as Linux's `blocked` holds it now, from the reader's
+    /// source, for a thread stopped at a request: the kernel's `SigBlk`
+    /// without a control (`read_thread_blocked_mask`, as before); with one,
+    /// the temporary mask Linux holds installed for it where there is one
+    /// (`controlled_temporary_mask`), and otherwise the control's `blocked`
+    /// set. `None` when it cannot be read and when the temporary mask is
+    /// unknown.
+    pub(crate) fn read_guest_signal_mask(&self, thread: DetTid) -> Option<u64> {
+        if !self.reads_signal_state_through_control() {
+            return self.read_thread_blocked_mask(thread);
+        }
+        match self.controlled_temporary_mask(thread) {
+            Ok(Some(mask)) => Some(mask),
+            Ok(None) => self
+                .read_guest_signal_state(thread)
+                .ok()
+                .map(|state| state.blocked),
+            Err(TemporaryMaskUnknown) => None,
+        }
+    }
+
+    /// With a control installed, the temporary mask Linux holds installed for
+    /// `thread` now, in place of its own (`set_user_sigmask`,
+    /// kernel/signal.c:3272-3288 at v6.17), which the control's `blocked` set
+    /// does not hold: `Ok(None)` where the thread's own mask applies.
+    ///
+    /// Read from the scheduler's committed state, or from a request the
+    /// thread filed in its own turn, never from one filed at a moment host
+    /// timing chooses (<https://github.com/rrnewton/hermit/issues/4929>):
+    /// - a thread running a call outside the schedule (`external_io_blockers`,
+    ///   `rt_sigsuspend_blockers`): the call's mask, recorded when the
+    ///   scheduler released it (`controlled_background_masks`), or else its
+    ///   own. Its request slot is empty while the call runs and then holds its
+    ///   rejoin, filed when host timing finishes the call, so the slot is not
+    ///   read. Its own mask cannot change meanwhile: a delivery needs a permit,
+    ///   which only the holder of the serial grant gets
+    ///   (`authorize_signal_boundary`);
+    /// - a thread readmitted with a rejoin request: the mask its readmission
+    ///   recorded (`BlockedPool::continuation_masks`), or else its own;
+    /// - any other thread: its filed request's temporary mask
+    ///   (`Resources::blocked_signal_mask`, which a controlled backend's
+    ///   probed call fills too), or else its own. `Err` where the request says
+    ///   the mask is unknown.
+    pub(crate) fn controlled_temporary_mask(
+        &self,
+        thread: DetTid,
+    ) -> Result<Option<u64>, TemporaryMaskUnknown> {
+        let known = |mask: Option<u64>| mask.map(Some).ok_or(TemporaryMaskUnknown);
+        if self.blocked.external_io_blockers.contains_key(&thread)
+            || self.blocked.rt_sigsuspend_blockers.contains_key(&thread)
+        {
+            return self
+                .blocked
+                .controlled_background_masks
+                .get(&thread)
+                .map_or(Ok(None), |mask| known(*mask));
+        }
+        let Some(Ok(request)) = self.next_turns.get(&thread).and_then(|t| t.req.try_read()) else {
+            return Ok(None);
+        };
+        if request.is_rejoin() {
+            return self
+                .blocked
+                .continuation_masks
+                .get(&thread)
+                .map_or(Ok(None), |mask| known(*mask));
+        }
+        if request.blocked_signal_mask_unknown {
+            return Err(TemporaryMaskUnknown);
+        }
+        Ok(request.blocked_signal_mask)
+    }
+
+    /// `request` as the scheduler's polling record prints it (the NONCOMMIT
+    /// SKIP line): as it is, except that with a control installed, a polled
+    /// call's temporary mask (`Resources::blocked_signal_mask` on a lone
+    /// `InternalIOPolling` resource, which the probed call files for this
+    /// reader, `handle_internal_pselect6`) is left out. The traced backend
+    /// hands the scheduler the same fact outside the request
+    /// (`publish_wait_mask`), so printing it made that record alone differ
+    /// from ptrace's in the canonical INFO stream, which lowered the
+    /// cross-backend parity credit of every cell with a masked `pselect6`
+    /// (<https://github.com/rrnewton/hermit/issues/4929>, review round 1).
+    /// The request itself, and every decision that reads it, keep the mask.
+    pub(crate) fn logged_polling_request<'a>(
+        &self,
+        request: &'a crate::resources::Resources,
+    ) -> std::borrow::Cow<'a, crate::resources::Resources> {
+        if self.reads_signal_state_through_control()
+            && request.blocked_signal_mask.is_some()
+            && request.resources.len() == 1
+            && request
+                .resources
+                .contains_key(&crate::resources::ResourceID::InternalIOPolling)
+        {
+            let mut printed = request.clone();
+            printed.blocked_signal_mask = None;
+            std::borrow::Cow::Owned(printed)
+        } else {
+            std::borrow::Cow::Borrowed(request)
+        }
+    }
+
+    /// Whether `thread` is in a state whose signal state the control answers
+    /// stably now (module docs): it is registered, its exit has not begun (no
+    /// exit fence, no logical kill, no filed exit request, no pending removal),
+    /// and no exec is tearing its process down. Read from the scheduler's
+    /// committed state alone, so a thread whose exit or exec is in flight is
+    /// treated as unreadable whatever host timing has done to it, rather than
+    /// read as gone or as changed at a moment host timing chooses.
+    pub(crate) fn reads_settled_signal_state(&self, thread: DetTid) -> bool {
+        let Some(process) = self.registered_process(thread) else {
+            return false;
+        };
+        self.next_turns.contains_key(&thread)
+            && !self.parked.exit_fences.contains_key(&thread)
+            && !self.thread_is_logically_killed(thread)
+            && !self.pending_run_queue_removals.contains_key(&thread)
+            && !self.exec_teardowns.contains_key(&process)
+            && !self.next_turns.get(&thread).is_some_and(|turn| {
+                turn.req.try_read().is_some_and(|request| {
+                    request.is_ok_and(|request| {
+                        request
+                            .resources
+                            .keys()
+                            .any(|rid| matches!(rid, crate::resources::ResourceID::Exit { .. }))
+                    })
+                })
+            })
     }
 }

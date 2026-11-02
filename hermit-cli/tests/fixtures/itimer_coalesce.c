@@ -68,6 +68,9 @@
  *       The leader waits in pause while a worker runs the storm loop.
  *   polling <period_us> <millions>
  *       The storm loop beside a sibling polling an empty pipe every 1 ms.
+ *   receiver <period_us>
+ *       A one-shot expiry while the leader computes and a sibling waits in
+ *       pause, both with SIGALRM unblocked: which thread runs the handler.
  *
  * Every wait is bounded; a missed bound prints outcome=INCONCLUSIVE.
  */
@@ -1093,6 +1096,53 @@ static int polling(int argc, char** argv) {
   return 0;
 }
 
+static volatile pid_t receiver_tid;
+static volatile sig_atomic_t sibling_woken;
+
+static void record_receiver(int signal) {
+  (void)signal;
+  receiver_tid = (pid_t)syscall(SYS_gettid);
+}
+
+static void* paused_sibling(void* arg) {
+  (void)arg;
+  for (;;) {
+    pause();
+    sibling_woken = 1;
+  }
+  return NULL;
+}
+
+/* The thread complete_signal chooses for the expiry: it tries the leader,
+ * which it_real_fn names, first, and a computing leader that leaves SIGALRM
+ * unblocked wants it, so the handler runs on the leader and the sibling's
+ * pause is not interrupted. The sleep lets the sibling reach pause first. */
+static int receiver(int argc, char** argv) {
+  if (argc != 3) {
+    return 2;
+  }
+  period_us = atol(argv[2]);
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = record_receiver;
+  sigaction(SIGALRM, &action, NULL);
+  pthread_t sibling;
+  pthread_create(&sibling, NULL, paused_sibling, NULL);
+  struct timespec settle = {0, 20000000};
+  nanosleep(&settle, NULL);
+  arm(period_us, 0);
+  long deadline = now_us() + 1000000 + period_us;
+  while (receiver_tid == 0 && now_us() < deadline) {
+    syscall(SYS_getppid);
+  }
+  if (receiver_tid == 0) {
+    printf("outcome=INCONCLUSIVE\n");
+    return 0;
+  }
+  printf("on_leader=%d sibling_woken=%d\n", receiver_tid == getpid(), (int)sibling_woken);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     return 2;
@@ -1159,6 +1209,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "polling") == 0) {
     return polling(argc, argv);
+  }
+  if (strcmp(argv[1], "receiver") == 0) {
+    return receiver(argc, argv);
   }
   return 2;
 }

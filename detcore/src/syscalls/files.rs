@@ -17105,10 +17105,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// the result; replay re-applies a successful option before later socket I/O,
     /// which remains mediated by Detcore's nonblocking scheduler paths.
     ///
-    /// Under record and replay a successful `SO_RCVTIMEO` also sets the
-    /// socket's modeled receive timeout (`DetFd::receive_timeout`), which a
-    /// blocking accept in turn waits by. The value is read before the call,
-    /// from the same guest memory in both phases.
+    /// A successful `SO_RCVTIMEO` also sets the socket's modeled receive
+    /// timeout (`DetFd::receive_timeout`), which a blocking accept in turn
+    /// waits by under record and replay, and which decides, in every mode,
+    /// whether a signal that interrupts a receive or an accept ends it with
+    /// EINTR (a finite timeout) or a restart (`interrupt_errno_at_entry`,
+    /// <https://github.com/rrnewton/hermit/issues/4929>). The value is read
+    /// before the call, from the same guest memory in both phases.
     pub async fn handle_setsockopt<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -17116,8 +17119,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         // TODO-HUMAN-REVIEW(PR-3908)
         const SO_RCVTIMEO_NEW: i32 = 66;
-        let receive_timeout = (self.accept_in_turn_enabled()
-            && call.level() == libc::SOL_SOCKET
+        let receive_timeout = (call.level() == libc::SOL_SOCKET
             && matches!(call.optname(), libc::SO_RCVTIMEO | SO_RCVTIMEO_NEW))
         .then(|| {
             // On x86_64 both forms take 16 bytes: seconds, then microseconds.

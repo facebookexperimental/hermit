@@ -30,6 +30,7 @@ use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
 
 use crate::fd::FdType;
+use crate::fd::ReceiveTimeout;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ExternalOpId;
 use crate::resources::Permission;
@@ -3028,6 +3029,13 @@ pub(crate) enum RestartCall {
     /// left (`Detcore::resume_kernel_poll`). Only x86_64 has `poll`.
     #[cfg(target_arch = "x86_64")]
     KernelPoll(syscalls::Poll, KernelPollDeadline),
+    /// A woken `poll` that ended with `ERESTARTSYS` on a backend that restarts
+    /// it by running the guest's own `poll` again (KVM,
+    /// `Detcore::keep_deadline_for_rerun`). Only that rerun takes the record,
+    /// the same call at the same address ([`RestartBlock::rerun_deadline`]);
+    /// `restart_syscall` never does. Only x86_64 has `poll`.
+    #[cfg(target_arch = "x86_64")]
+    PollRerun(syscalls::Poll),
     Futex(syscalls::Futex),
     /// A relative `nanosleep` or `clock_nanosleep` that ended for a claimed
     /// `SIGCHLD` (`syscalls::signal::SleepSignal::Claimed`).
@@ -3069,6 +3077,24 @@ impl RestartBlock {
     /// call itself.
     pub(crate) fn resumed_at(self, rip: u64) -> Option<Self> {
         (self.rip == rip).then_some(self)
+    }
+
+    /// The deadline a woken `poll` kept for its rerun
+    /// ([`RestartCall::PollRerun`]), if `call`, stopped at `rip`, is that rerun:
+    /// the same call at the same address. No other record is taken here, so
+    /// a record kept for the kernel's `restart_syscall` serves only that
+    /// restart: a program's own `poll` after `EINTR` waits its whole timeout
+    /// again, from its own call (`do_sys_poll`), and only `restart_syscall`
+    /// resumes the old end time (`do_restart_poll`).
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn rerun_deadline(
+        self,
+        rip: u64,
+        call: syscalls::Poll,
+    ) -> Option<Option<LogicalTime>> {
+        self.resumed_at(rip)
+            .filter(|block| block.call == RestartCall::PollRerun(call))
+            .map(|block| block.deadline)
     }
 }
 
@@ -3313,10 +3339,13 @@ where
 }
 
 /// The errno a polled call that would still wait returns when a signal ends
-/// the wait: the call's restart code (`NonblockableSyscall::signal_interrupt_errno`),
-/// except for a read that began on an inotify instance (`began_on`,
-/// `inotify_description_of`) that is nonblocking for the guest by now, which
-/// another thread's F_SETFL or FIONBIO made it while the read waited.
+/// the wait: the call's interrupt errno, read at its entry (`interrupt_errno`,
+/// `interrupt_errno_at_entry`: its restart code,
+/// `NonblockableSyscall::signal_interrupt_errno`, or EINTR for a receive with a
+/// finite receive timeout), except for a read that began on an inotify
+/// instance (`began_on`, `inotify_description_of`) that is nonblocking for the
+/// guest by now, which another thread's F_SETFL or FIONBIO made it while the
+/// read waited.
 /// `inotify_read` tests the file's current O_NONBLOCK before it looks for a
 /// pending signal, so Linux returns EAGAIN there
 /// (<https://github.com/torvalds/linux/blob/v6.17/fs/notify/inotify/inotify_user.c#L249-L299>).
@@ -3326,14 +3355,11 @@ where
 /// `progress_signal_interrupts`). What another thread puts at the
 /// descriptor's number while the read waits changes nothing: the
 /// description the read began on decides.
-fn interrupted_wait_errno<C>(began_on: Option<&crate::fd::DetFd>, call: C) -> Errno
-where
-    C: NonblockableSyscall,
-{
+fn interrupted_wait_errno(began_on: Option<&crate::fd::DetFd>, interrupt_errno: Errno) -> Errno {
     if began_on.is_some_and(crate::fd::DetFd::is_nonblocking) {
         Errno::EAGAIN
     } else {
-        call.signal_interrupt_errno()
+        interrupt_errno
     }
 }
 
@@ -3413,6 +3439,619 @@ where
             progress_signal_interrupts(guest, status).await
         }
         Some(CarriedSignal::Wake(_)) => Ok(!gated),
+    }
+}
+
+/// The errno a signal that ends `call` after it began returns, given the one
+/// its kind returns (`default`, its `signal_interrupt_errno` or
+/// `kernel_restart_errno`), read once, at the call's entry, and kept for the
+/// whole call however long it polls: a later `setsockopt` through an alias
+/// does not change it, as Linux reads the timeout once, when the call begins
+/// (`sock_rcvtimeo`: net/unix/af_unix.c:2951, net/ipv4/tcp.c:2635,
+/// net/core/datagram.c:294 and net/ipv4/inet_connection_sock.c:678 at
+/// v6.17).
+///
+/// A receive (`recvfrom`, `recvmsg`, `recvmmsg`, or `read` or `readv` on a
+/// socket) and an `accept` wait by the socket's receive timeout, and Linux
+/// ends one that a signal interrupts with `sock_intr_errno(timeo)`
+/// (include/net/sock.h:2627-2630; af_unix.c:3012-3013, tcp.c:2743-2744,
+/// datagram.c:127-128, which AF_UNIX's accept reaches through
+/// `skb_recv_datagram`, af_unix.c:1880, and inet_connection_sock.c:645):
+/// ERESTARTSYS for an untimed wait, which a handler with `SA_RESTART`
+/// restarts, but EINTR for a finite `SO_RCVTIMEO`, whatever the handler's
+/// flags. So such a call returns EINTR here
+/// (<https://github.com/rrnewton/hermit/issues/4929>, the Codex review of
+/// slice 2, round 2). The timeout is Detcore's model of the description's
+/// `SO_RCVTIMEO` (`DetFd::receive_timeout`), which every alias Detcore
+/// tracks shares; every other call keeps `default`
+/// (`receive_interrupt_errno`).
+fn interrupt_errno_at_entry<T, G, C>(guest: &G, call: &C, default: Errno) -> Errno
+where
+    C: NonblockableSyscall + Into<Syscall>,
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let timeout = receive_timeout_fd((*call).into()).and_then(|fd| {
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| {
+                matches!(detfd.ty(), FdType::Socket).then(|| detfd.receive_timeout())
+            })
+            .ok()
+            .flatten()
+    });
+    receive_interrupt_errno(default, timeout)
+}
+
+/// The descriptor whose receive timeout, if it is a socket, bounds
+/// `syscall`'s wait: a receive's (`recvfrom`, `recvmsg`, `recvmmsg`, `read`,
+/// `readv`) or an accept's. `None` for every other call.
+fn receive_timeout_fd(syscall: Syscall) -> Option<i32> {
+    match syscall {
+        Syscall::Recvfrom(_)
+        | Syscall::Recvmsg(_)
+        | Syscall::Recvmmsg(_)
+        | Syscall::Read(_)
+        | Syscall::Readv(_)
+        | Syscall::Accept(_)
+        | Syscall::Accept4(_) => get_fd(syscall),
+        _ => None,
+    }
+}
+
+/// [`interrupt_errno_at_entry`]'s rule: a call that would end with
+/// ERESTARTSYS ends with EINTR when it waits by a socket's finite receive
+/// timeout (`socket_timeout`, `None` for any other call). An `Immediate`
+/// timeout never waits, and an `Unknown` one keeps the untimed call's
+/// ERESTARTSYS.
+fn receive_interrupt_errno(default: Errno, socket_timeout: Option<ReceiveTimeout>) -> Errno {
+    match (default, socket_timeout) {
+        (Errno::ERESTARTSYS, Some(ReceiveTimeout::After(_))) => Errno::EINTR,
+        _ => default,
+    }
+}
+
+/// Whether `call`, woken by a signal while it would still block, ends the way
+/// Linux ends it only through [`woken_poll_errno`]: a `poll` or an unmasked
+/// `ppoll`, whose Linux interrupt is a restart code (`ERESTARTNOHAND`, or
+/// `ERESTART_RESTARTBLOCK` for a `poll` with a deadline;
+/// [`NonblockableSyscall::kernel_restart_errno`]), on a backend with a process
+/// signal control (KVM), which restarts a call only through `ERESTARTSYS`'s
+/// protocol and refuses Linux's other restart codes
+/// (<https://github.com/rrnewton/hermit/issues/4929>). Every other call, and
+/// every other backend, keeps its interrupt errno.
+fn restarts_without_a_handler_through_erestartsys<T, G, C>(guest: &G, call: &C) -> bool
+where
+    C: NonblockableSyscall,
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    woken_call_ends_through_erestartsys(
+        guest.config().backend.provides_process_signal_control,
+        call,
+    )
+}
+
+/// [`restarts_without_a_handler_through_erestartsys`], given whether the
+/// backend has a process signal control.
+fn woken_call_ends_through_erestartsys<C: NonblockableSyscall>(
+    signal_control: bool,
+    call: &C,
+) -> bool {
+    signal_control
+        && call.signal_interrupt_errno() == Errno::EINTR
+        && matches!(
+            call.kernel_restart_errno(),
+            Errno::ERESTARTNOHAND | Errno::ERESTART_RESTARTBLOCK
+        )
+}
+
+/// The errno a `poll` or an unmasked `ppoll` returns when a signal woke it and
+/// it would still block, on a backend that restarts a call only through
+/// `ERESTARTSYS` ([`restarts_without_a_handler_through_erestartsys`]); the
+/// network trace's wait on a recorded socket ends the same way there
+/// (`Detcore::network_wait`).
+///
+/// Linux ends such a call with a restart code (`do_poll`'s `-ERESTARTNOHAND`,
+/// fs/select.c:929-934 at v6.17, which `poll` keeps as `-ERESTART_RESTARTBLOCK`
+/// with its end time, 1076-1090) and settles it at the return to user mode,
+/// from what that return delivers: `get_signal` drops each ignored copy it
+/// dequeues and goes on (kernel/signal.c:2931-2932), and the first handler
+/// it reaches turns the restart code into `EINTR`, whether or not the handler
+/// has `SA_RESTART` (arch/x86/kernel/signal.c:266-270); with no handler the
+/// call is restarted (344-357). That return delivers every signal pending for
+/// the thread, in its own queue or its process's, that its mask leaves
+/// unblocked, not only the one that woke it, and `get_signal` takes them one
+/// after another under the signal lock, so no other thread takes a copy
+/// between two of its dequeues.
+///
+/// This backend's return delivers the same signals in the same order
+/// (reverie-linuxemu `next_matching`), but each through a Tool callback whose
+/// turn can hand the thread to the scheduler, so other threads run between two
+/// of its deliveries and can take a copy from the process's queue in between:
+/// an ignored copy's turn let another thread take the caught copy behind it,
+/// and the call returned `EINTR` with no handler run (the Codex review of
+/// <https://github.com/rrnewton/hermit/issues/4929>, round 4). Only the first
+/// delivery comes before any such turn. So the answer is decided from that one
+/// signal ([`woken_poll_errno_from_sets`]): `EINTR` when it has a handler,
+/// which then runs with that result, and `ERESTARTSYS` otherwise, which leaves
+/// every later delivery to the backend's `ERESTARTSYS` protocol, applied at the
+/// delivery itself: a handler without `SA_RESTART` then gets `EINTR`, and no
+/// handler at all a restart. Two outcomes of that protocol are not Linux's,
+/// and each delivery of the return is checked for them
+/// ([`check_woken_wait_delivery`], the Codex review of round 5): a handler
+/// with `SA_RESTART` for a signal pending behind the first, which restarts the
+/// call where Linux fails it with `EINTR`; and an `EINTR` whose handler a
+/// sibling removed during the delivery's turn, with no other handler left at
+/// that return, which leaves the call failed with no handler run. Either
+/// refuses the run by name. A handler without `SA_RESTART` behind a first
+/// signal with no handler gets `EINTR` from the protocol, as on Linux, and
+/// the record kept for the call's rerun is dropped then.
+///
+/// It is answered twice. Here, where the wait ends, for what observes the
+/// call's result before its return (the DETLOG result line, the restart
+/// record, the posthook trace); and again at the return itself, by
+/// [`settle_woken_wait_at_return`], the syscall handler's last step, from the
+/// sets as they stand after its last await, which is the answer the backend
+/// gets: the handler's later awaits can let other threads run. A backend that
+/// does not report the sets is answered here alone, as before, from the woken
+/// signals' actions (`wait_signal_disposition`, [`woken_poll_errno_for`]).
+pub(crate) async fn woken_poll_errno<T, G>(
+    guest: &mut G,
+    status: ResumeStatus,
+) -> Result<Errno, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if let Ok(sets) = guest.signal_sets(guest.tid()) {
+        guest.thread_state_mut().woken_wait = WokenWait::Poll;
+        return Ok(woken_poll_errno_from_sets(sets));
+    }
+    let mut stack = guest.stack().await;
+    let mask_addr = stack.reserve::<KernelSigset>();
+    let action_addr = stack.reserve::<KernelSigaction>();
+    let _guard = stack.commit()?;
+    let query = syscalls::RtSigprocmask::new()
+        .with_how(libc::SIG_BLOCK)
+        .with_set(None)
+        .with_oldset(Some(mask_addr.cast()))
+        .with_sigsetsize(KERNEL_SIGSET_SIZE);
+    guest.inject_with_retry(query).await?;
+    let mask: KernelSigset = guest.memory().read_value(mask_addr)?;
+    let disposition = wait_signal_disposition(guest, status, &mask, action_addr, true).await?;
+    Ok(woken_poll_errno_for(disposition))
+}
+
+/// [`woken_poll_errno`]'s answer from the thread's signal sets: `EINTR` when the
+/// first signal the return delivers ([`first_delivered`]) has a handler
+/// (`SigCgt`), and `ERESTARTSYS` when it has none (it is ignored, or at a
+/// default action) or nothing is pending that the mask leaves unblocked.
+fn woken_poll_errno_from_sets(sets: reverie::SignalSets) -> Errno {
+    match first_delivered(sets) {
+        Some(signal) if sets.caught & kernel_sigset_bit(signal) != 0 => Errno::EINTR,
+        _ => Errno::ERESTARTSYS,
+    }
+}
+
+/// The signal a return to user mode with the thread's signal sets `sets`
+/// dequeues first, as Linux's `dequeue_signal` takes it: from the thread's own
+/// queue before its process's (kernel/signal.c:634-639 at v6.12), and in each
+/// a synchronous signal first, then the lowest number (`next_signal`,
+/// 196-218), among those its mask leaves unblocked
+/// (`KernelSignalState::next_dequeued`). The KVM backend selects in that order
+/// (reverie-linuxemu `take_signal_event_locked`, `next_matching`). `None` when
+/// nothing is pending that the mask leaves unblocked.
+fn first_delivered(sets: reverie::SignalSets) -> Option<i32> {
+    let state = KernelSignalState {
+        thread_pending: sets.pending,
+        shared_pending: sets.shared_pending,
+        ..KernelSignalState::default()
+    };
+    state.next_dequeued(sets.blocked).map(|(signal, _)| signal)
+}
+
+/// What a signal that ended the current syscall's wait leaves for the return
+/// to user mode, on a backend that restarts a call only through
+/// `ERESTARTSYS`'s protocol (KVM): `ThreadState::woken_wait`.
+///
+/// That protocol settles the call at each delivery of the return: a handler
+/// without `SA_RESTART` gets `EINTR`, one with `SA_RESTART` restarts the call,
+/// and no handler at all restarts it too. A woken `poll` must instead fail
+/// with `EINTR` whenever a handler runs, and restart only when none does
+/// (Linux's `ERESTARTNOHAND`, which reverie-kvm refuses). Detcore cannot tell
+/// the backend which; it chooses the errno once, at the return
+/// ([`settle_woken_wait_at_return`]), and checks each delivery of that return
+/// against the choice ([`check_woken_wait_delivery`]), refusing the run by
+/// name where the backend would give a result Linux never gives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WokenWait {
+    /// The current syscall's wait was not ended that way.
+    #[default]
+    None,
+    /// A woken `poll`, unmasked `ppoll`, or wait on a recorded socket,
+    /// answered where its wait ended ([`woken_poll_errno`]).
+    Poll,
+    /// A blocking send on a recorded socket that a wake with nothing sent and
+    /// only ignored copies to deliver ended with `ERESTARTSYS`
+    /// (`Detcore::network_send_wait`).
+    Send,
+    /// The settlement at the return, which its deliveries are checked against.
+    Settled(SettledWait),
+}
+
+/// The settlement of a woken wait at its return ([`WokenWait::Settled`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SettledWait {
+    /// A recorded send ([`WokenWait::Send`]); otherwise a poll.
+    send: bool,
+    /// The call, whose number the deliveries at its return report in
+    /// `orig_rax`, where a delivery anywhere else reports `-1` or another call.
+    sysno: Sysno,
+    /// The errno the backend got: `EINTR`, or `ERESTARTSYS`.
+    errno: Errno,
+    /// The signals pending for the thread at the settlement that its mask left
+    /// unblocked: one of them is already there when Linux's return runs, and
+    /// cannot have come after it.
+    pending: u64,
+    /// Whether a delivery at the return ran a handler: the first frame decides
+    /// the call's result, and later ones stack on its handler.
+    handler_seen: bool,
+}
+
+/// What [`settle_woken_wait_at_return`] decided.
+#[derive(Debug)]
+pub(crate) enum Settlement {
+    /// Return this result.
+    Return(Result<i64, Error>),
+    /// End the run with this named refusal, which the caller prints.
+    Refuse(String),
+}
+
+/// Settles the errno of a syscall `sysno` whose woken wait
+/// ([`WokenWait::Poll`] or [`WokenWait::Send`]) ended it, as the syscall
+/// handler's last step (`Detcore::handle_syscall_event`), from the thread's
+/// signal sets as they stand there, and returns `res` with it, or a refusal.
+///
+/// On KVM the return is committed here. This is a plain function, called
+/// after the handler's last await, and the backend dequeues the first signal
+/// its return delivers before it makes any Tool callback there: reverie-kvm's
+/// syscall return selects it (`filter_one_pending_signal_with_tool`) before
+/// calling `handle_signal_event`, and a timer request due at the return runs
+/// its callback first only for a call that made no Tool callback, which this
+/// one did. So no scheduling point separates the read below from that
+/// dequeue, and the signal found first here is the one dequeued first there.
+/// (Only KVM ends a wait this way; on ptrace the kernel settles it.)
+///
+/// - A poll: the answer given where the wait ended can be stale by now: the
+///   handler's later awaits (a slice end at its post-hook, a schedule trace)
+///   can let other threads run, and take or send a signal. It is decided again
+///   ([`woken_poll_errno_from_sets`]); where the two differ, the delivery's
+///   record of the result (`ThreadState::delivery_interruption`) follows the
+///   new one, while the DETLOG result line and the posthook trace, already
+///   written, keep the old one (DEBUG names the change). Where the answer is
+///   `EINTR`, a handler runs at this return and the call is not run again, so
+///   the deadline kept for that run is dropped (`Detcore::keep_deadline_for_rerun`).
+/// - A recorded send: its `ERESTARTSYS` is admitted again, after the last
+///   scheduling point: a signal with an effect may have come during the
+///   handler's later awaits, or a disposition may have changed, and then the
+///   network record's refusal applies (`Detcore::network_send_wait`).
+///
+/// Either way the settlement is kept for the deliveries of the return
+/// ([`check_woken_wait_delivery`]). Any other result, and a call that did not
+/// end that way, is returned unchanged.
+pub(crate) fn settle_woken_wait_at_return<T, G>(
+    guest: &mut G,
+    sysno: Sysno,
+    res: Result<i64, Error>,
+) -> Settlement
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let send = match std::mem::take(&mut guest.thread_state_mut().woken_wait) {
+        WokenWait::Poll => false,
+        WokenWait::Send => true,
+        WokenWait::None | WokenWait::Settled(_) => return Settlement::Return(res),
+    };
+    let answered = match &res {
+        Err(Error::Errno(errno)) if matches!(*errno, Errno::EINTR | Errno::ERESTARTSYS) => *errno,
+        _ => return Settlement::Return(res),
+    };
+    let Ok(sets) = guest.signal_sets(guest.tid()) else {
+        return Settlement::Return(res);
+    };
+    let settled = if send {
+        if delivers_a_signal_with_an_effect(sets) {
+            return Settlement::Refuse(crate::syscalls::network_trace::send_interruption_refusal());
+        }
+        answered
+    } else {
+        let settled = woken_poll_errno_from_sets(sets);
+        if settled != answered {
+            tracing::debug!(
+                "[dtid {}] {} settles at its return with {} where its wait ended with {}: the \
+                 first signal the return delivers is {}",
+                guest.thread_state().dettid,
+                sysno,
+                settled,
+                answered,
+                first_delivered(sets)
+                    .map_or_else(|| "none".to_string(), |signal| signal.to_string()),
+            );
+            if let Some(reverie::Interruption::Return { syscall, .. }) =
+                guest.thread_state().delivery_interruption
+            {
+                guest.thread_state_mut().delivery_interruption =
+                    Some(reverie::Interruption::Return {
+                        syscall,
+                        result: -i64::from(settled.into_raw()),
+                    });
+            }
+        }
+        if settled == Errno::EINTR {
+            guest.thread_state_mut().restart_block = None;
+        }
+        settled
+    };
+    guest.thread_state_mut().woken_wait = WokenWait::Settled(SettledWait {
+        send,
+        sysno,
+        errno: settled,
+        pending: (sets.pending | sets.shared_pending) & !sets.blocked,
+        handler_seen: false,
+    });
+    Settlement::Return(Err(settled.into()))
+}
+
+/// Whether a return to user mode with the thread's signal sets `sets` would
+/// deliver a signal with an effect: one its mask leaves unblocked, pending for
+/// it or its process, that is neither ignored nor ignored by default, so that
+/// a handler runs, or a default action ends or stops the process. Linux's
+/// `get_signal` drops the others without a trace (kernel/signal.c:2815-2816
+/// and 2830-2831 at v6.12), and a call they interrupted is made again
+/// (`Detcore::network_send_wait`).
+pub(crate) fn delivers_a_signal_with_an_effect(sets: reverie::SignalSets) -> bool {
+    let deliverable = (sets.pending | sets.shared_pending) & !sets.blocked;
+    deliverable & !crate::syscalls::threads::ignored_at_generation(sets.ignored, sets.caught) != 0
+}
+
+/// Checks a delivery of `signal` (`delivered`: whether Detcore let the backend
+/// deliver it) against the settlement of the woken wait it returns from
+/// ([`WokenWait::Settled`]), after the last scheduling point of the delivery's
+/// callback (`Detcore::handle_signal_event`), and returns the named refusal if
+/// the backend would now give a result Linux never gives. The disposition read
+/// here is the one the backend applies: after the callback returns, the
+/// backend reads it (`signal_disposition`) and builds the frame with no Tool
+/// callback in between, and it takes the next pending signal before any
+/// await. Only the deliveries at that return are checked (their registers
+/// name the call in `orig_rax`), and only until one runs a handler, whose
+/// frame decides the call's result.
+///
+/// - A poll settled `EINTR`, whose return ends with no handler run: the last
+///   delivery at that return, after which no signal the thread's mask leaves
+///   unblocked is pending for it or its process, runs no handler, and no
+///   earlier one did. A sibling ignored the signal during its delivery's turn
+///   (or Detcore dropped the copy). The backend leaves the `EINTR` with no
+///   handler run, while Linux, which takes the action under the signal lock,
+///   either runs the handler or, finding the signal ignored, restarts the
+///   call. Refused. While another signal is pending, the backend takes it next,
+///   at the same return, so the check is made again at its delivery: one with
+///   a handler gets the `EINTR`, as Linux's return that finds it does.
+/// - A poll settled `ERESTARTSYS` (its first signal had no handler), whose
+///   delivery runs a handler with `SA_RESTART` while a signal that was already
+///   pending at the settlement, with a handler, is that signal or is still
+///   pending: the backend restarts the call after the handler, while Linux,
+///   whose return finds that signal with the first, fails it with `EINTR`.
+///   Refused. Signals are matched by number, not by copy: a later copy of a
+///   signal that was pending at the settlement, which came after another
+///   thread took that copy during an earlier delivery's turn, is taken for it
+///   and refused, where Linux's next pass of the return would restart the
+///   call after its handler. A handler without `SA_RESTART` gets `EINTR`, as on
+///   Linux, and the record kept for the call's rerun
+///   (`RestartCall::PollRerun`) is dropped then, so the program's next `poll`
+///   waits its whole timeout; a handler with `SA_RESTART` for a signal that
+///   came after the settlement, during an earlier delivery's turn, when no
+///   signal pending at the settlement with a handler is left, restarts the
+///   call after it, as Linux's next pass of the return does once the first
+///   restarted it.
+/// - A recorded send settled `ERESTARTSYS`, whose delivery runs a handler
+///   without `SA_RESTART`: the send would fail with `EINTR`, which the network
+///   record does not model (`Detcore::network_send_wait`). Refused; with
+///   `SA_RESTART` the send is made again, as recorded and replayed.
+pub(crate) async fn check_woken_wait_delivery<T, G>(
+    guest: &mut G,
+    signal: i32,
+    delivered: bool,
+) -> Option<String>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let WokenWait::Settled(mut settled) = guest.thread_state().woken_wait else {
+        return None;
+    };
+    if settled.handler_seen {
+        return None;
+    }
+    if guest.regs().await.orig_rax as i64 != settled.sysno as i64 {
+        return None;
+    }
+    let sets = guest.signal_sets(guest.tid()).ok();
+    let delivery = WokenDelivery::new(signal, delivered, sets);
+    settled.handler_seen = delivery.runs_handler;
+    guest.thread_state_mut().woken_wait = WokenWait::Settled(settled);
+    let sa_restart = if delivery.needs_restart_flag(&settled) {
+        caught_action_flags(guest, signal)
+            .await
+            .ok()
+            .map(|flags| flags & libc::SA_RESTART as u64 != 0)
+    } else {
+        None
+    };
+    if delivery.fails_with_eintr(&settled, sa_restart) {
+        // The backend fails the call with EINTR at this handler's frame, so the
+        // program's next `poll` is its own and waits its whole timeout: the
+        // record kept for a rerun is not taken (`keep_deadline_for_rerun`).
+        #[cfg(target_arch = "x86_64")]
+        if matches!(
+            guest.thread_state().restart_block,
+            Some(RestartBlock {
+                call: RestartCall::PollRerun(_),
+                ..
+            })
+        ) {
+            guest.thread_state_mut().restart_block = None;
+        }
+    }
+    let refusal = delivery.refusal(&settled, sa_restart)?;
+    tracing::error!(
+        "[dtid {}] signal {} at the return of a woken {} settled with {}: {:?}",
+        guest.thread_state().dettid,
+        signal,
+        settled.sysno,
+        settled.errno,
+        refusal
+    );
+    Some(refusal.message(settled.sysno, signal))
+}
+
+/// A delivery at the return of a woken wait ([`check_woken_wait_delivery`]).
+#[derive(Clone, Copy, Debug)]
+struct WokenDelivery {
+    /// The signal's bit in a signal set.
+    bit: u64,
+    /// The delivery runs a handler: Detcore let the backend deliver it, and
+    /// the signal is caught now.
+    runs_handler: bool,
+    /// The delivery ends the process: Detcore let the backend deliver it, and
+    /// its default action ends the process.
+    ends_process: bool,
+    /// The signals still pending for the thread or its process that its mask
+    /// leaves unblocked, after this delivery's dequeue: the backend takes the
+    /// next of them at the same return.
+    remaining: u64,
+    /// The signals with a handler now.
+    caught: u64,
+}
+
+/// A delivery at the return of a woken wait that the backend would settle as
+/// Linux never does ([`check_woken_wait_delivery`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WokenRefusal {
+    /// A poll settled `EINTR`, whose return ends with no handler run.
+    EintrWithoutHandler,
+    /// A poll settled `ERESTARTSYS`, whose first handler has `SA_RESTART`
+    /// while a signal pending at the settlement, with a handler, is its own
+    /// or still pending.
+    RestartAfterHandler,
+    /// A recorded send, whose first handler has no `SA_RESTART`.
+    SendEintr,
+}
+
+impl WokenDelivery {
+    /// The delivery of `signal`, which Detcore let the backend deliver if
+    /// `delivered`, under the thread's signal sets `sets` (`None`: unread), as
+    /// they stand after the delivery's dequeue.
+    fn new(signal: i32, delivered: bool, sets: Option<reverie::SignalSets>) -> Self {
+        let bit = kernel_sigset_bit(signal);
+        Self {
+            bit,
+            runs_handler: delivered && sets.is_some_and(|sets| sets.caught & bit != 0),
+            ends_process: delivered
+                && sets.is_some_and(|sets| {
+                    crate::syscalls::threads::default_action_ends_process(
+                        sets.ignored,
+                        sets.caught,
+                        signal,
+                    )
+                }),
+            remaining: sets.map_or(0, |sets| {
+                (sets.pending | sets.shared_pending) & !sets.blocked
+            }),
+            caught: sets.map_or(0, |sets| sets.caught),
+        }
+    }
+
+    /// Whether [`Self::refusal`] or [`Self::fails_with_eintr`] needs the
+    /// handler's `SA_RESTART`: a handler runs at a return settled
+    /// `ERESTARTSYS`.
+    fn needs_restart_flag(&self, settled: &SettledWait) -> bool {
+        self.runs_handler && (settled.send || settled.errno == Errno::ERESTARTSYS)
+    }
+
+    /// Whether the backend fails a poll settled `ERESTARTSYS` with `EINTR` at
+    /// this delivery: its handler has no `SA_RESTART` (`None`: unread, taken
+    /// as none).
+    fn fails_with_eintr(&self, settled: &SettledWait, sa_restart: Option<bool>) -> bool {
+        !settled.send
+            && settled.errno == Errno::ERESTARTSYS
+            && self.runs_handler
+            && sa_restart != Some(true)
+    }
+
+    /// The refusal this delivery calls for, if any, as
+    /// [`check_woken_wait_delivery`] describes, given its handler's
+    /// `SA_RESTART` (`None`: unread, which refuses).
+    fn refusal(&self, settled: &SettledWait, sa_restart: Option<bool>) -> Option<WokenRefusal> {
+        if settled.send {
+            return (self.runs_handler && sa_restart != Some(true))
+                .then_some(WokenRefusal::SendEintr);
+        }
+        match settled.errno {
+            Errno::EINTR if !self.runs_handler && !self.ends_process && self.remaining == 0 => {
+                Some(WokenRefusal::EintrWithoutHandler)
+            }
+            Errno::ERESTARTSYS
+                if self.runs_handler
+                    && (settled.pending & self.bit != 0
+                        || settled.pending & self.remaining & self.caught != 0)
+                    && sa_restart != Some(false) =>
+            {
+                Some(WokenRefusal::RestartAfterHandler)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl WokenRefusal {
+    /// The refusal as printed, for call `sysno` and signal `signal`.
+    fn message(self, sysno: Sysno, signal: i32) -> String {
+        match self {
+            WokenRefusal::EintrWithoutHandler => format!(
+                "hermit: unsupported on the KVM backend: a {sysno} that a signal woke returned \
+                 EINTR, which only a handler gives it, but its return ended with signal {signal} \
+                 delivered with no handler and no handler run (another thread ignored the \
+                 signal while it was being delivered); Linux either runs a handler or, finding \
+                 none, restarts the call, and KVM cannot restart it once EINTR is chosen; \
+                 refusing the run rather than failing the call with no handler run \
+                 (https://github.com/rrnewton/hermit/issues/4929)"
+            ),
+            WokenRefusal::RestartAfterHandler => format!(
+                "hermit: unsupported on the KVM backend: a {sysno} that a signal woke would be \
+                 restarted after the handler of signal {signal}, which has SA_RESTART, while a \
+                 signal with a handler was pending behind a signal with no handler when the call \
+                 returned; Linux fails the call with EINTR whenever a handler interrupts it, and \
+                 KVM restarts a call only through ERESTARTSYS, which SA_RESTART restarts; \
+                 refusing the run rather than restarting the call \
+                 (https://github.com/rrnewton/hermit/issues/4929)"
+            ),
+            WokenRefusal::SendEintr => crate::syscalls::network_trace::send_interruption_refusal(),
+        }
+    }
+}
+
+/// [`woken_poll_errno`]'s answer for the woken signals' `disposition`, on a
+/// backend that does not report the signal sets: `EINTR` only for a handler
+/// with `SA_RESTART` (`WaitSignalDisposition::Restart`), which `ERESTARTSYS`
+/// would restart; `ERESTARTSYS` for a handler without it, a fatal default, an
+/// ignored copy, or none (`None`).
+fn woken_poll_errno_for(disposition: Option<WaitSignalDisposition>) -> Errno {
+    if matches!(disposition, Some(WaitSignalDisposition::Restart)) {
+        Errno::EINTR
+    } else {
+        Errno::ERESTARTSYS
     }
 }
 
@@ -3507,8 +4146,11 @@ where
     // every later pending read while inject_with_retry kept polling. Two
     // such signals could also replace one another in the single held slot
     // (https://github.com/rrnewton/hermit/issues/4273, stage 2).
-    let mut turn_wait = checks_at_turn
-        .then(|| KernelSignalWait::new(guest, 0, false, call.signal_interrupt_errno()));
+    // The errno a signal that ends this call returns, read at its entry
+    // (`interrupt_errno_at_entry`).
+    let interrupt_errno = interrupt_errno_at_entry(guest, &call0, call0.signal_interrupt_errno());
+    let mut turn_wait =
+        checks_at_turn.then(|| KernelSignalWait::new(guest, 0, false, interrupt_errno));
     let mut published = PublishedWaitMask::default();
 
     let result: Result<i64, Error> = loop {
@@ -3776,12 +4418,20 @@ where
             };
         let signaled = signaled || carried_ends;
         if signaled && call.syscall_would_have_blocked(syscall_result) {
-            let errno = interrupted_wait_errno(began_on.as_ref(), call);
+            let errno = interrupted_wait_errno(began_on.as_ref(), interrupt_errno);
             tracing::trace!(
                 "retry_nonblocking_syscall: interrupted by signal while {} would block: {:?}",
                 call.display(&guest.memory()),
                 errno
             );
+            if restarts_without_a_handler_through_erestartsys(guest, &call) {
+                // The probe's scratch is not used again: the call ends here.
+                drop(maybe_stackguard.take());
+                break match woken_poll_errno(guest, resumed.clone()).await {
+                    Ok(errno) => Err(errno.into()),
+                    Err(error) => Err(error),
+                };
+            }
             break Err(errno.into());
         }
         // Under the gate the wait ends here, where it would block (as
@@ -3789,7 +4439,9 @@ where
         // before it parked or one whose commit woke it.
         if gated && call.syscall_would_have_blocked(syscall_result) {
             match gated_wait_ends(guest, None) {
-                Ok(true) => break Err(interrupted_wait_errno(began_on.as_ref(), call).into()),
+                Ok(true) => {
+                    break Err(interrupted_wait_errno(began_on.as_ref(), interrupt_errno).into());
+                }
                 Ok(false) => {}
                 Err(error) => break Err(error),
             }
@@ -5043,11 +5695,14 @@ where
     G: Guest<Detcore<T>>,
 {
     let mut guest_held = GuestHeldPollProof::capture(guest, call0.into(), &mut rsrc);
+    // The restart code of this call, read at its entry
+    // (`interrupt_errno_at_entry`).
+    let restart_errno = interrupt_errno_at_entry(guest, &call0, call0.kernel_restart_errno());
     let mut signals = KernelSignalWait::new(
         guest,
         call0.signals_consumed_by_wait(&guest.memory()),
         call0.restart_keeps_deadline(),
-        call0.kernel_restart_errno(),
+        restart_errno,
     )
     .with_deadline(maybe_timeout.is_some())
     .with_wait_mask(wait_mask);
@@ -5143,7 +5798,7 @@ where
                 }
                 Ok((true, state)) => {
                     deliver_under_wait_mask = signals.interrupts_only_under_wait_mask(&state);
-                    let errno = call0.kernel_restart_errno();
+                    let errno = restart_errno;
                     tracing::trace!(
                         "retry_nonblocking_syscall: pending signals interrupt {}: {:?}",
                         call.display(&guest.memory()),
@@ -5182,7 +5837,7 @@ where
             break res;
         }
         if interrupt_after_probe {
-            let errno = call0.kernel_restart_errno();
+            let errno = restart_errno;
             tracing::trace!(
                 "retry_nonblocking_syscall: a committed signal interrupts {}: {:?}",
                 call.display(&guest.memory()),
@@ -5196,7 +5851,7 @@ where
                 Ok((false, _)) => {}
                 Ok((true, state)) => {
                     deliver_under_wait_mask = signals.interrupts_only_under_wait_mask(&state);
-                    let errno = call0.kernel_restart_errno();
+                    let errno = restart_errno;
                     tracing::trace!(
                         "retry_nonblocking_syscall: pending signals interrupt {}: {:?}",
                         call.display(&guest.memory()),
@@ -7597,6 +8252,240 @@ mod tests {
         assert!(!Read::new().reads_error_queue());
     }
 
+    /// <https://github.com/rrnewton/hermit/issues/4929> (review round 2,
+    /// finding A): on a backend with a process signal control, a woken `poll`
+    /// or unmasked `ppoll`, whose Linux interrupt is a restart code, ends
+    /// through ERESTARTSYS, which the backend restarts when no handler runs,
+    /// unless a handler with SA_RESTART catches the signal, which ERESTARTSYS
+    /// would restart and Linux never does: that gets EINTR. Every other call,
+    /// and every other backend, keeps its interrupt errno.
+    #[test]
+    fn a_woken_poll_restarts_through_erestartsys_where_linux_restarts_it() {
+        let poll = reverie::syscalls::Poll::new().with_timeout(-1);
+        let timed_poll = reverie::syscalls::Poll::new().with_timeout(100);
+        let ppoll = reverie::syscalls::Ppoll::new();
+        for control in [true, false] {
+            assert_eq!(woken_call_ends_through_erestartsys(control, &poll), control);
+            assert_eq!(
+                woken_call_ends_through_erestartsys(control, &timed_poll),
+                control
+            );
+            assert_eq!(
+                woken_call_ends_through_erestartsys(control, &ppoll),
+                control
+            );
+            assert!(!woken_call_ends_through_erestartsys(
+                control,
+                &reverie::syscalls::EpollWait::new()
+            ));
+            assert!(!woken_call_ends_through_erestartsys(
+                control,
+                &reverie::syscalls::RtSigtimedwait::new()
+            ));
+            assert!(!woken_call_ends_through_erestartsys(
+                control,
+                &reverie::syscalls::Read::new()
+            ));
+        }
+        assert_eq!(
+            woken_poll_errno_for(Some(WaitSignalDisposition::Restart)),
+            Errno::EINTR
+        );
+        assert_eq!(
+            woken_poll_errno_for(Some(WaitSignalDisposition::Interrupt)),
+            Errno::ERESTARTSYS
+        );
+        assert_eq!(woken_poll_errno_for(None), Errno::ERESTARTSYS);
+    }
+
+    /// <https://github.com/rrnewton/hermit/issues/4929> (the Codex review of
+    /// slice 2, rounds 3 and 4): a woken `poll` is settled by the first signal
+    /// its return to user mode delivers, in Linux's dequeue order: the
+    /// thread's own queue before its process's, and in each a synchronous
+    /// signal first, then the lowest number, outside its mask. EINTR when that
+    /// one has a handler, whatever its SA_RESTART, and ERESTARTSYS otherwise,
+    /// whichever signal woke it. A caught signal behind an ignored one does
+    /// not decide it: the ignored copy's delivery can hand the thread to the
+    /// scheduler, and another thread can take the caught copy first, so the
+    /// backend's ERESTARTSYS protocol settles it at its own delivery.
+    #[test]
+    fn a_woken_poll_is_settled_by_the_signals_its_return_delivers() {
+        let bit = |signal: i32| 1u64 << (signal - 1);
+        let alrm = bit(libc::SIGALRM);
+        let usr1 = bit(libc::SIGUSR1);
+        let term = bit(libc::SIGTERM);
+        let hup = bit(libc::SIGHUP);
+        let segv = bit(libc::SIGSEGV);
+        let sets_of = reverie::SignalSets::new;
+        for (label, sets, errno) in [
+            // Codex's shared probe: an ignored SIGUSR1 comes first, and the
+            // caught SIGALRM behind it is left to the backend's protocol: a
+            // sibling may take it during the SIGUSR1 delivery's turn.
+            (
+                "ignored first, caught behind",
+                sets_of(0, alrm | usr1, 0, usr1, alrm),
+                Errno::ERESTARTSYS,
+            ),
+            // The thread's own queue comes first: its ignored SIGTERM before
+            // the process's caught SIGUSR1, whose number is lower.
+            (
+                "own queue first",
+                sets_of(term, usr1, 0, term, usr1),
+                Errno::ERESTARTSYS,
+            ),
+            // And its caught SIGTERM before the process's ignored SIGHUP.
+            (
+                "own queue first, caught",
+                sets_of(term, hup, 0, hup, term),
+                Errno::EINTR,
+            ),
+            // A synchronous signal comes before a lower number.
+            (
+                "synchronous first",
+                sets_of(0, hup | segv, 0, segv, hup),
+                Errno::ERESTARTSYS,
+            ),
+            // A blocked signal is not dequeued: the caught one after it is.
+            (
+                "blocked one skipped",
+                sets_of(0, alrm | usr1, usr1, usr1, alrm),
+                Errno::EINTR,
+            ),
+            // An ignored SIGALRM woke it, and a caught SIGUSR1 waits in the
+            // process's queue: that handler runs at the return.
+            (
+                "mixed",
+                sets_of(0, alrm | usr1, 0, alrm, usr1),
+                Errno::EINTR,
+            ),
+            // The same with SIGUSR1 in the thread's own queue.
+            (
+                "mixed, own queue",
+                sets_of(usr1, alrm, 0, alrm, usr1),
+                Errno::EINTR,
+            ),
+            // A caught copy alone.
+            ("caught", sets_of(0, alrm, 0, 0, alrm), Errno::EINTR),
+            // The ignored copy alone is dropped, and the call restarts.
+            (
+                "ignored",
+                sets_of(0, alrm, 0, alrm, usr1),
+                Errno::ERESTARTSYS,
+            ),
+            // The caught copy it was woken for was taken by another thread
+            // first: nothing is delivered, and the call restarts.
+            (
+                "taken",
+                sets_of(0, 0, 0, 0, alrm | usr1),
+                Errno::ERESTARTSYS,
+            ),
+            // A caught signal its mask blocks stays pending.
+            (
+                "blocked",
+                sets_of(0, alrm | usr1, usr1, alrm, usr1),
+                Errno::ERESTARTSYS,
+            ),
+            // A default action runs no handler: it ends the process, or the
+            // copy is dropped and the call restarts.
+            (
+                "default",
+                sets_of(0, bit(libc::SIGTERM), 0, 0, usr1),
+                Errno::ERESTARTSYS,
+            ),
+        ] {
+            assert_eq!(woken_poll_errno_from_sets(sets), errno, "{label}");
+        }
+    }
+
+    /// <https://github.com/rrnewton/hermit/issues/4929> (the Codex review of
+    /// slice 2, round 2): a receive or an accept on a socket with a finite
+    /// `SO_RCVTIMEO` ends with EINTR, whatever its handler's `SA_RESTART`, as
+    /// Linux's `sock_intr_errno` ends it; an untimed one keeps ERESTARTSYS,
+    /// which `SA_RESTART` restarts; every other call keeps its errno.
+    #[test]
+    fn a_wait_by_a_finite_receive_timeout_is_interrupted_with_eintr() {
+        use reverie::syscalls;
+        let second = ReceiveTimeout::After(std::time::Duration::from_secs(1));
+        for (label, syscall, fd) in [
+            (
+                "recvfrom",
+                Syscall::from(syscalls::Recvfrom::new().with_fd(3)),
+                Some(3),
+            ),
+            (
+                "recvmsg",
+                Syscall::from(syscalls::Recvmsg::new().with_sockfd(4)),
+                Some(4),
+            ),
+            (
+                "recvmmsg",
+                Syscall::from(syscalls::Recvmmsg::new().with_fd(5)),
+                Some(5),
+            ),
+            (
+                "read",
+                Syscall::from(syscalls::Read::new().with_fd(6)),
+                Some(6),
+            ),
+            (
+                "readv",
+                Syscall::from(syscalls::Readv::new().with_fd(7)),
+                Some(7),
+            ),
+            (
+                "accept",
+                Syscall::from(syscalls::Accept::new().with_sockfd(8)),
+                Some(8),
+            ),
+            (
+                "accept4",
+                Syscall::from(syscalls::Accept4::new().with_sockfd(9)),
+                Some(9),
+            ),
+            (
+                "write",
+                Syscall::from(syscalls::Write::new().with_fd(3)),
+                None,
+            ),
+            (
+                "sendto",
+                Syscall::from(syscalls::Sendto::new().with_fd(3)),
+                None,
+            ),
+            ("poll", Syscall::from(syscalls::Poll::new()), None),
+        ] {
+            assert_eq!(receive_timeout_fd(syscall), fd, "{label}");
+        }
+        for (default, timeout, expected) in [
+            (Errno::ERESTARTSYS, Some(second), Errno::EINTR),
+            (
+                Errno::ERESTARTSYS,
+                Some(ReceiveTimeout::None),
+                Errno::ERESTARTSYS,
+            ),
+            (
+                Errno::ERESTARTSYS,
+                Some(ReceiveTimeout::Immediate),
+                Errno::ERESTARTSYS,
+            ),
+            (
+                Errno::ERESTARTSYS,
+                Some(ReceiveTimeout::Unknown),
+                Errno::ERESTARTSYS,
+            ),
+            (Errno::ERESTARTSYS, None, Errno::ERESTARTSYS),
+            (Errno::ERESTARTNOHAND, Some(second), Errno::ERESTARTNOHAND),
+            (Errno::EINTR, Some(second), Errno::EINTR),
+            (Errno::EINTR, None, Errno::EINTR),
+        ] {
+            assert_eq!(
+                receive_interrupt_errno(default, timeout),
+                expected,
+                "{default:?} {timeout:?}"
+            );
+        }
+    }
+
     #[test]
     fn signal_interruption_errno_matches_linux_restart_policy() {
         // x86_64 only: aarch64 has no poll or epoll_wait, only ppoll and
@@ -7795,6 +8684,41 @@ mod tests {
         // A restart_syscall anywhere else is the guest's own call.
         assert_eq!(block.resumed_at(0x4000_1236), None);
         assert_eq!(block.resumed_at(0x4000_1232), None);
+    }
+
+    /// <https://github.com/rrnewton/hermit/issues/4929> (the Claude review of
+    /// slice 2, round 6, finding 1): a `poll` takes only the record a woken
+    /// `poll` kept for its own rerun (`RestartCall::PollRerun`), at the same
+    /// address with the same arguments. The record a `poll` interrupted by
+    /// `ERESTART_RESTARTBLOCK` keeps for the kernel's `restart_syscall`
+    /// (`RestartCall::Poll`) is not taken: a program's own retry after a
+    /// handler's EINTR is a new call, which Linux gives its whole timeout
+    /// again, and one that took that record ended at the first call's end
+    /// time on ptrace.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_poll_takes_only_the_record_kept_for_its_rerun() {
+        let poll = reverie::syscalls::Poll::new()
+            .with_nfds(1)
+            .with_timeout(100);
+        let deadline = Some(LogicalTime::from_nanos(100_000_000));
+        let record = |call| RestartBlock {
+            rip: 0x4000_1234,
+            deadline,
+            call,
+        };
+        let rerun = record(RestartCall::PollRerun(poll));
+        assert_eq!(rerun.rerun_deadline(0x4000_1234, poll), Some(deadline));
+        // Another address or other arguments make another call.
+        assert_eq!(rerun.rerun_deadline(0x4000_1236, poll), None);
+        assert_eq!(
+            rerun.rerun_deadline(0x4000_1234, poll.with_timeout(200)),
+            None
+        );
+        // The record kept for the kernel's restart serves only that restart.
+        let restart = record(RestartCall::Poll(poll));
+        assert_eq!(restart.rerun_deadline(0x4000_1234, poll), None);
+        assert_eq!(restart.resumed_at(0x4000_1234), Some(restart));
     }
 
     #[test]
@@ -8024,6 +8948,8 @@ pub(crate) mod kernel_signal_wait_failures {
         arena: Box<[u64; ARENA_WORDS]>,
         kernel: Kernel,
         proof_script: Option<Arc<Mutex<ProofScript>>>,
+        /// The signal sets `Guest::signal_sets` reports, where it reports any.
+        sets: Option<reverie::SignalSets>,
     }
 
     impl WaitGuest {
@@ -8045,6 +8971,7 @@ pub(crate) mod kernel_signal_wait_failures {
                 arena: Box::new([u64::MAX; ARENA_WORDS]),
                 kernel: kernel.clone(),
                 proof_script: None,
+                sets: None,
             };
             (guest, kernel)
         }
@@ -8289,11 +9216,14 @@ pub(crate) mod kernel_signal_wait_failures {
         assert!(inotify_read.is_some());
         assert!(pipe_read.is_none(), "only an inotify read is bound");
         assert_eq!(
-            interrupted_wait_errno(inotify_read.as_ref(), read(inotify)),
+            interrupted_wait_errno(
+                inotify_read.as_ref(),
+                read(inotify).signal_interrupt_errno()
+            ),
             Errno::ERESTARTSYS
         );
         assert_eq!(
-            interrupted_wait_errno(pipe_read.as_ref(), read(pipe)),
+            interrupted_wait_errno(pipe_read.as_ref(), read(pipe).signal_interrupt_errno()),
             Errno::ERESTARTSYS
         );
         for fd in [inotify, pipe] {
@@ -8303,18 +9233,23 @@ pub(crate) mod kernel_signal_wait_failures {
                 .unwrap();
         }
         assert_eq!(
-            interrupted_wait_errno(inotify_read.as_ref(), read(inotify)),
+            interrupted_wait_errno(
+                inotify_read.as_ref(),
+                read(inotify).signal_interrupt_errno()
+            ),
             Errno::EAGAIN
         );
         assert_eq!(
             interrupted_wait_errno(
                 inotify_read.as_ref(),
-                syscalls::Readv::new().with_fd(inotify)
+                syscalls::Readv::new()
+                    .with_fd(inotify)
+                    .signal_interrupt_errno()
             ),
             Errno::EAGAIN
         );
         assert_eq!(
-            interrupted_wait_errno(pipe_read.as_ref(), read(pipe)),
+            interrupted_wait_errno(pipe_read.as_ref(), read(pipe).signal_interrupt_errno()),
             Errno::ERESTARTSYS
         );
         // A sibling's dup2 points the pipe read's number at the nonblocking
@@ -8325,7 +9260,7 @@ pub(crate) mod kernel_signal_wait_failures {
             .dup_fd(inotify, pipe, nix::fcntl::OFlag::empty())
             .unwrap();
         assert_eq!(
-            interrupted_wait_errno(pipe_read.as_ref(), read(pipe)),
+            interrupted_wait_errno(pipe_read.as_ref(), read(pipe).signal_interrupt_errno()),
             Errno::ERESTARTSYS
         );
         assert!(inotify_description_of(&guest, read(pipe)).is_some());
@@ -8879,10 +9814,14 @@ pub(crate) mod kernel_signal_wait_failures {
         fn memory(&self) -> Self::Memory {
             LocalMemory::new()
         }
-        /// The fake kernel's sets, as a backend that delivers signals itself
-        /// reports them (`provides_process_signal_control`, KVM here); every
-        /// other backend reports nothing, as the trait's default.
+        /// The test's own `sets` where it installed any; otherwise the fake
+        /// kernel's sets, as a backend that delivers signals itself reports them
+        /// (`provides_process_signal_control`, KVM here); every other backend
+        /// reports nothing, as the trait's default.
         fn signal_sets(&self, tid: Pid) -> Result<reverie::SignalSets, reverie::FactError> {
+            if let Some(sets) = self.sets {
+                return Ok(sets);
+            }
             if !self.config.backend.provides_process_signal_control {
                 return Err(reverie::FactError::NotProvided);
             }
@@ -11664,6 +12603,396 @@ pub(crate) mod kernel_signal_wait_failures {
             unblocking.stop_verdict(&before, libc::SIGUSR2),
             StopVerdict::End(Errno::ERESTARTNOHAND)
         );
+    }
+
+    /// <https://github.com/rrnewton/hermit/issues/4929> (the Codex review of
+    /// slice 2, round 4, finding A): the errno a woken `poll` answered where
+    /// its wait ended is settled again at the handler's last step, from the
+    /// signal sets as they stand there, and that answer is what the call
+    /// returns. Between the two, other threads may have run and taken the
+    /// caught copy (EINTR becomes ERESTARTSYS, and the deadline kept for the
+    /// rerun stays), or sent one (ERESTARTSYS becomes EINTR, the kept deadline
+    /// is dropped, and the delivery's record of the result follows). A call
+    /// that did not end that way, a result that is not one of the two, or
+    /// sets the backend does not report, leave the result as it is.
+    #[test]
+    fn a_woken_wait_is_settled_again_at_its_return() {
+        let bit = |signal: i32| 1u64 << (signal - 1);
+        let alrm = bit(libc::SIGALRM);
+        let caught_copy = reverie::SignalSets::new(0, alrm, 0, 0, alrm);
+        let taken = reverie::SignalSets::new(0, 0, 0, 0, alrm);
+        let kept = || RestartBlock {
+            rip: 0x1234,
+            deadline: Some(LogicalTime::from_nanos(4567)),
+            call: RestartCall::PollRerun(reverie::syscalls::Poll::new().with_timeout(100)),
+        };
+        let erestartsys = || Err::<i64, Error>(Errno::ERESTARTSYS.into());
+        let eintr = || Err::<i64, Error>(Errno::EINTR.into());
+        let errno_of = |res: &Result<i64, Error>| match res {
+            Err(Error::Errno(errno)) => Some(*errno),
+            _ => None,
+        };
+        for (label, flagged, sets, res, settled, keeps_restart) in [
+            (
+                "sent",
+                true,
+                Some(caught_copy),
+                erestartsys(),
+                Some(Errno::EINTR),
+                false,
+            ),
+            (
+                "taken",
+                true,
+                Some(taken),
+                eintr(),
+                Some(Errno::ERESTARTSYS),
+                true,
+            ),
+            (
+                "unchanged",
+                true,
+                Some(caught_copy),
+                eintr(),
+                Some(Errno::EINTR),
+                false,
+            ),
+            (
+                "not flagged",
+                false,
+                Some(caught_copy),
+                erestartsys(),
+                Some(Errno::ERESTARTSYS),
+                true,
+            ),
+            (
+                "no sets",
+                true,
+                None,
+                erestartsys(),
+                Some(Errno::ERESTARTSYS),
+                true,
+            ),
+            ("a result", true, Some(caught_copy), Ok(1), None, true),
+        ] {
+            let (mut guest, _) = WaitGuest::live(guest_mask());
+            guest.sets = sets;
+            guest.thread.woken_wait = if flagged {
+                WokenWait::Poll
+            } else {
+                WokenWait::None
+            };
+            guest.thread.restart_block = Some(kept());
+            guest.thread.delivery_interruption = Some(reverie::Interruption::Return {
+                syscall: Sysno::poll as i64,
+                result: errno_of(&res).map_or(1, |errno| -i64::from(errno.into_raw())),
+            });
+            let Settlement::Return(res) = settle_woken_wait_at_return(&mut guest, Sysno::poll, res)
+            else {
+                panic!("{label}: a poll's settlement refused");
+            };
+            assert_eq!(errno_of(&res), settled, "{label}");
+            // Kept for the return's deliveries only where it was settled.
+            assert_eq!(
+                matches!(guest.thread.woken_wait, WokenWait::Settled(_)),
+                flagged && sets.is_some() && settled.is_some(),
+                "{label}"
+            );
+            assert_eq!(
+                guest.thread.restart_block.is_some(),
+                keeps_restart,
+                "{label}"
+            );
+            if let Some(settled) = settled {
+                assert_eq!(
+                    guest.thread.delivery_interruption,
+                    Some(reverie::Interruption::Return {
+                        syscall: Sysno::poll as i64,
+                        result: -i64::from(settled.into_raw()),
+                    }),
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    /// A recorded send's ERESTARTSYS is admitted again at its return: a
+    /// signal with an effect there refuses the run, and only ignored copies
+    /// keep the restart, settled for the return's deliveries.
+    #[test]
+    fn a_recorded_sends_restart_is_admitted_again_at_its_return() {
+        let alrm = 1u64 << (libc::SIGALRM - 1);
+        for (label, sets, refused) in [
+            (
+                "ignored",
+                reverie::SignalSets::new(0, alrm, 0, alrm, 0),
+                false,
+            ),
+            (
+                "caught",
+                reverie::SignalSets::new(0, alrm, 0, 0, alrm),
+                true,
+            ),
+            ("default", reverie::SignalSets::new(0, alrm, 0, 0, 0), true),
+        ] {
+            let (mut guest, _) = WaitGuest::live(guest_mask());
+            guest.sets = Some(sets);
+            guest.thread.woken_wait = WokenWait::Send;
+            let settlement = settle_woken_wait_at_return(
+                &mut guest,
+                Sysno::sendto,
+                Err(Errno::ERESTARTSYS.into()),
+            );
+            assert_eq!(
+                matches!(settlement, Settlement::Refuse(_)),
+                refused,
+                "{label}"
+            );
+            assert_eq!(
+                matches!(guest.thread.woken_wait, WokenWait::Settled(_)),
+                !refused,
+                "{label}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod woken_return_tests {
+    use super::*;
+
+    fn bit(signal: i32) -> u64 {
+        1u64 << (signal - 1)
+    }
+
+    fn settled(send: bool, errno: Errno, pending: u64) -> SettledWait {
+        SettledWait {
+            send,
+            sysno: if send { Sysno::sendto } else { Sysno::poll },
+            errno,
+            pending,
+            handler_seen: false,
+        }
+    }
+
+    /// <https://github.com/rrnewton/hermit/issues/4929> (the Codex review of
+    /// slice 2, round 5, findings 1 and 2, Claude's round-5 finding 1, and
+    /// both round-6 reviews): each delivery at the return of a woken wait is
+    /// checked against its settlement, and refused where the backend would
+    /// settle the call as Linux never does. A poll settled EINTR is refused at
+    /// the delivery that ends its return with no handler run: one that runs no
+    /// handler (a sibling ignored the signal during the delivery's turn) and
+    /// after which nothing the mask leaves unblocked is pending, not while
+    /// another signal is left for the return to deliver next, and not when the
+    /// default action ends the process. A poll settled ERESTARTSYS whose
+    /// handler has SA_RESTART is refused while a signal that was pending at
+    /// the settlement, behind the one with no handler, with a handler, is that
+    /// signal or still pending; without SA_RESTART the backend's protocol fails
+    /// the call with EINTR, which drops the record kept for its rerun, and for
+    /// a signal that came later, with no such signal left, it restarts the
+    /// call. A recorded send settled ERESTARTSYS is refused for a handler
+    /// without SA_RESTART, which would fail it with EINTR. An unread flag
+    /// refuses, and is taken as no SA_RESTART for the record.
+    #[test]
+    fn each_delivery_at_a_woken_return_is_checked_against_its_settlement() {
+        let alrm = bit(libc::SIGALRM);
+        let usr1 = bit(libc::SIGUSR1);
+        let term = bit(libc::SIGTERM);
+        // SignalSets::new(pending, shared_pending, blocked, ignored, caught).
+        let caught = reverie::SignalSets::new(0, 0, 0, usr1, alrm);
+        let ignored_now = reverie::SignalSets::new(0, 0, 0, usr1 | alrm, 0);
+        let handler_left = reverie::SignalSets::new(0, term, 0, usr1 | alrm, term);
+        let fatal_left = reverie::SignalSets::new(0, term, 0, usr1 | alrm, 0);
+        let ignored_left = reverie::SignalSets::new(usr1, 0, 0, usr1 | alrm, 0);
+        let blocked_left = reverie::SignalSets::new(0, term, term, usr1 | alrm, term);
+        let default_now = reverie::SignalSets::new(0, 0, 0, usr1, 0);
+        let pending_handler_left = reverie::SignalSets::new(0, term, 0, usr1, alrm | term);
+        let pending_handler_taken = reverie::SignalSets::new(0, 0, 0, usr1, alrm | term);
+        use WokenRefusal::*;
+        for (label, settled, delivered, sets, sa_restart, refusal, eintr) in [
+            // A poll settled EINTR.
+            (
+                "eintr, handler",
+                settled(false, Errno::EINTR, alrm),
+                true,
+                caught,
+                None,
+                None,
+                false,
+            ),
+            (
+                "eintr, ignored meanwhile, nothing left",
+                settled(false, Errno::EINTR, alrm),
+                true,
+                ignored_now,
+                None,
+                Some(EintrWithoutHandler),
+                false,
+            ),
+            (
+                "eintr, ignored meanwhile, a handler left",
+                settled(false, Errno::EINTR, alrm),
+                true,
+                handler_left,
+                None,
+                None,
+                false,
+            ),
+            (
+                "eintr, ignored meanwhile, a fatal default left",
+                settled(false, Errno::EINTR, alrm),
+                true,
+                fatal_left,
+                None,
+                None,
+                false,
+            ),
+            (
+                "eintr, ignored meanwhile, an ignored copy left",
+                settled(false, Errno::EINTR, alrm),
+                true,
+                ignored_left,
+                None,
+                None,
+                false,
+            ),
+            (
+                "eintr, ignored meanwhile, only a blocked handler left",
+                settled(false, Errno::EINTR, alrm),
+                true,
+                blocked_left,
+                None,
+                Some(EintrWithoutHandler),
+                false,
+            ),
+            (
+                "eintr, dropped",
+                settled(false, Errno::EINTR, alrm),
+                false,
+                caught,
+                None,
+                Some(EintrWithoutHandler),
+                false,
+            ),
+            (
+                "eintr, the default ends the process",
+                settled(false, Errno::EINTR, alrm),
+                true,
+                default_now,
+                None,
+                None,
+                false,
+            ),
+            // A poll settled ERESTARTSYS.
+            (
+                "erestartsys, SA_RESTART, pending",
+                settled(false, Errno::ERESTARTSYS, usr1 | alrm),
+                true,
+                caught,
+                Some(true),
+                Some(RestartAfterHandler),
+                false,
+            ),
+            (
+                "erestartsys, no SA_RESTART, pending",
+                settled(false, Errno::ERESTARTSYS, usr1 | alrm),
+                true,
+                caught,
+                Some(false),
+                None,
+                true,
+            ),
+            (
+                "erestartsys, SA_RESTART, came later",
+                settled(false, Errno::ERESTARTSYS, usr1),
+                true,
+                caught,
+                Some(true),
+                None,
+                false,
+            ),
+            (
+                "erestartsys, SA_RESTART, came later, a pending handler left",
+                settled(false, Errno::ERESTARTSYS, usr1 | term),
+                true,
+                pending_handler_left,
+                Some(true),
+                Some(RestartAfterHandler),
+                false,
+            ),
+            (
+                "erestartsys, SA_RESTART, came later, the pending handler taken",
+                settled(false, Errno::ERESTARTSYS, usr1 | term),
+                true,
+                pending_handler_taken,
+                Some(true),
+                None,
+                false,
+            ),
+            (
+                "erestartsys, no SA_RESTART, came later",
+                settled(false, Errno::ERESTARTSYS, usr1),
+                true,
+                caught,
+                Some(false),
+                None,
+                true,
+            ),
+            (
+                "erestartsys, flag unread",
+                settled(false, Errno::ERESTARTSYS, usr1 | alrm),
+                true,
+                caught,
+                None,
+                Some(RestartAfterHandler),
+                true,
+            ),
+            (
+                "erestartsys, ignored",
+                settled(false, Errno::ERESTARTSYS, usr1 | alrm),
+                true,
+                ignored_now,
+                None,
+                None,
+                false,
+            ),
+            // A recorded send.
+            (
+                "send, no SA_RESTART",
+                settled(true, Errno::ERESTARTSYS, usr1),
+                true,
+                caught,
+                Some(false),
+                Some(SendEintr),
+                false,
+            ),
+            (
+                "send, SA_RESTART",
+                settled(true, Errno::ERESTARTSYS, usr1),
+                true,
+                caught,
+                Some(true),
+                None,
+                false,
+            ),
+            (
+                "send, ignored",
+                settled(true, Errno::ERESTARTSYS, usr1),
+                true,
+                ignored_now,
+                None,
+                None,
+                false,
+            ),
+        ] {
+            let delivery = WokenDelivery::new(libc::SIGALRM, delivered, Some(sets));
+            assert_eq!(delivery.refusal(&settled, sa_restart), refusal, "{label}");
+            assert_eq!(
+                delivery.fails_with_eintr(&settled, sa_restart),
+                eintr,
+                "{label}"
+            );
+        }
     }
 }
 

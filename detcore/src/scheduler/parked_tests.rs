@@ -39,6 +39,7 @@ use reverie::SignalTaskIdentity;
 
 use super::parked::*;
 use super::real_timer::TimerFailure;
+use super::signal_state_reader::TemporaryMaskUnknown;
 use super::*;
 use crate::config::SchedHeuristic;
 use crate::tool_global::SigalrmControl;
@@ -89,6 +90,12 @@ struct Backend {
     /// The signal sets `signal_sets` reports, per thread ID; a thread with
     /// none is not reported (`NotProvided`).
     signal_sets: Mutex<std::collections::BTreeMap<i32, reverie::SignalSets>>,
+    /// Each task's signal sets as `signal_sets` reports them, by exact task
+    /// lifetime (#4929 slice 2's tests); asked before `signal_sets`.
+    task_signal_sets: Mutex<Vec<(SignalTaskIdentity, reverie::SignalSets)>>,
+    /// Whether `publish_alarm` reports its copy coalesced with one the
+    /// shared queue already held.
+    coalesce_alarm: std::sync::atomic::AtomicBool,
 }
 impl std::fmt::Debug for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -113,7 +120,10 @@ impl ProcessSignalControl for Backend {
         let receipt = ProcessSignalPublication {
             process,
             pending_generation: 0,
-            coalesced: self.coalesce.load(std::sync::atomic::Ordering::Relaxed),
+            coalesced: self.coalesce.load(std::sync::atomic::Ordering::Relaxed)
+                || self
+                    .coalesce_alarm
+                    .load(std::sync::atomic::Ordering::Relaxed),
             disposition: reverie::ProcessAlarmSignalDisposition::Caught,
         };
         if self
@@ -133,14 +143,31 @@ impl ProcessSignalControl for Backend {
         process: SignalProcessId,
         event: reverie::SignalEvent,
     ) -> ProcessSignalPublicationResult {
+        let alarm = event.signal() == libc::SIGALRM;
         self.timer_publications
             .lock()
             .unwrap()
             .push((process, event));
+        // A SIGALRM copy is pending for the threads `recipients_on_alarm`
+        // names, as `publish_alarm`'s is, and is coalesced as it is.
+        let mut coalesced = false;
+        if alarm {
+            let (now, later): (Vec<_>, Vec<_>) = self
+                .recipients_on_alarm
+                .lock()
+                .unwrap()
+                .drain(..)
+                .partition(|r| r.task.process == process);
+            *self.recipients_on_alarm.lock().unwrap() = later;
+            self.recipients.lock().unwrap().extend(now);
+            coalesced = self
+                .coalesce_alarm
+                .load(std::sync::atomic::Ordering::Relaxed);
+        }
         ProcessSignalPublicationResult::Committed(ProcessSignalPublication {
             process,
             pending_generation: 0,
-            coalesced: self.coalesce.load(std::sync::atomic::Ordering::Relaxed),
+            coalesced: coalesced || self.coalesce.load(std::sync::atomic::Ordering::Relaxed),
             disposition: reverie::ProcessAlarmSignalDisposition::Caught,
         })
     }
@@ -304,6 +331,16 @@ impl ProcessSignalControl for Backend {
         &self,
         task: SignalTaskIdentity,
     ) -> Result<reverie::SignalSets, reverie::FactError> {
+        if let Some(sets) = self
+            .task_signal_sets
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(reported, _)| *reported == task)
+            .map(|(_, sets)| *sets)
+        {
+            return Ok(sets);
+        }
         self.signal_sets
             .lock()
             .unwrap()
@@ -9073,4 +9110,1426 @@ fn a_scheduler_send_under_a_signal_control_without_a_publication_is_refused() {
             .refusal_for_test()
             .is_some_and(|refusal| refusal.contains("sigchld-decision-mismatch"))
     );
+}
+
+/// SIGALRM's bit in a signal set.
+const SIGALRM_BIT: u64 = 1 << (libc::SIGALRM - 1);
+
+/// Reports `sets` for task (`pid`, `tid`) through the fake control's
+/// `signal_sets`.
+fn report_signal_sets(b: &Backend, pid: i32, tid: i32, sets: reverie::SignalSets) {
+    b.task_signal_sets.lock().unwrap().push((task(pid, tid), sets));
+}
+
+/// Files an ordinary request for `tid`, one that has nothing to do with
+/// signals.
+fn file_ordinary(s: &mut Scheduler, tid: DetTid) {
+    s.next_turns[&tid].req.put(Ok(Resources::new(tid)));
+}
+
+/// Files `tid`'s polled `pselect6` whose temporary mask is `mask`, as
+/// `handle_internal_pselect6` files it where the backend controls the
+/// guest's signals: the request carries the mask, and the EINTR marker.
+fn file_masked_pselect6(s: &mut Scheduler, tid: DetTid, mask: u64) {
+    let mut r = Resources::new(tid);
+    r.insert(ResourceID::InternalIOPolling, Permission::W);
+    r.fyi("pselect6");
+    r.blocked_signal_mask = Some(mask);
+    r.set_signal_interrupt_errno(Errno::EINTR);
+    s.next_turns[&tid].req.put(Ok(r));
+}
+
+/// Files `tid`'s retry of a call polled by `retry_nonblocking_syscall_helper`
+/// (`fyi`, with the restart marker `marker`, if any) and queues it as a
+/// poller, as step 4 defers a retry that is not ready.
+fn file_poller(s: &mut Scheduler, tid: DetTid, fyi: &str, marker: Option<Errno>) {
+    let mut r = Resources::new(tid);
+    r.insert(ResourceID::InternalIOPolling, Permission::W);
+    r.fyi(fyi);
+    r.poll_attempt = 1;
+    if let Some(errno) = marker {
+        r.set_signal_interrupt_errno(errno);
+    }
+    s.next_turns[&tid].req.put(Ok(r));
+    s.run_queue.push_poller(tid, DEFAULT_PRIORITY, 1);
+}
+
+/// Files `tid`'s `exit` (not `exit_group`) from process 100.
+fn file_exit(s: &mut Scheduler, tid: DetTid, mm: MmId) {
+    let mut r = Resources::new(tid);
+    r.insert(
+        ResourceID::Exit {
+            group: false,
+            process: DetPid::from_raw(100),
+            mm,
+        },
+        Permission::W,
+    );
+    s.next_turns[&tid].req.put(Ok(r));
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (E): a controlled
+/// `ITIMER_REAL` expiry is decided at generation, as Linux decides it.
+/// `it_real_fn` sends SIGALRM to the leader, and `prepare_signal` drops it
+/// (`sig_ignored`) when the leader's mask leaves it unblocked and its action
+/// is SIG_IGN: nothing is queued, so nothing is published, and the timer
+/// stays stopped (`HRTIMER_NORESTART`). The mask is the one Linux's `blocked`
+/// holds: a masked wait's temporary mask, from its filed request, where the
+/// control's own set holds the thread's own mask. A blocked signal, a handled
+/// or a default one, and a leader whose state the scheduler does not read
+/// (its exit filed, or nothing reported) are published, as before.
+#[test]
+fn a_controlled_expiry_the_leader_ignores_is_discarded_at_generation() {
+    #[derive(Clone, Copy)]
+    enum Filed {
+        Ordinary,
+        Masked(u64),
+        Exit,
+    }
+    // (case, the leader's (blocked, ignored, caught) if reported, its filed
+    // request, whether the expiry is discarded)
+    let cases = [
+        (
+            "SIG_IGN, unblocked",
+            Some((0, SIGALRM_BIT, 0)),
+            Filed::Ordinary,
+            true,
+        ),
+        (
+            "SIG_IGN, blocked",
+            Some((SIGALRM_BIT, SIGALRM_BIT, 0)),
+            Filed::Ordinary,
+            false,
+        ),
+        (
+            "handled, unblocked",
+            Some((0, 0, SIGALRM_BIT)),
+            Filed::Ordinary,
+            false,
+        ),
+        (
+            "SIG_DFL, unblocked",
+            Some((0, 0, 0)),
+            Filed::Ordinary,
+            false,
+        ),
+        (
+            "SIG_IGN, unblocked, a wait's temporary mask blocks it",
+            Some((0, SIGALRM_BIT, 0)),
+            Filed::Masked(SIGALRM_BIT),
+            false,
+        ),
+        (
+            "SIG_IGN, blocked, a wait's temporary mask admits it",
+            Some((SIGALRM_BIT, SIGALRM_BIT, 0)),
+            Filed::Masked(0),
+            true,
+        ),
+        (
+            "SIG_IGN, unblocked, its exit filed",
+            Some((0, SIGALRM_BIT, 0)),
+            Filed::Exit,
+            false,
+        ),
+        ("nothing reported", None, Filed::Ordinary, false),
+    ];
+    for (case, sets, filed, discarded) in cases {
+        let (mut s, b) = fixture();
+        let (leader, mm, _) = add(&mut s, 100, 100);
+        if let Some((blocked, ignored, caught)) = sets {
+            report_signal_sets(
+                &b,
+                100,
+                100,
+                reverie::SignalSets::new(0, 0, blocked, ignored, caught),
+            );
+        }
+        match filed {
+            Filed::Ordinary => file_ordinary(&mut s, leader),
+            Filed::Masked(mask) => file_masked_pselect6(&mut s, leader, mask),
+            Filed::Exit => file_exit(&mut s, leader, mm),
+        }
+        s.replace_real_timer(
+            leader,
+            leader,
+            at(0),
+            at(100_000),
+            at(100_000),
+            Signal::SIGALRM,
+        )
+        .unwrap();
+        s.committed_time = at(100_000);
+        assert!(s.step2b_process_timed(&committed_clock(&s)), "{case}");
+        assert!(!s.backend_failed(), "{case}");
+        assert_eq!(
+            b.publications.lock().unwrap().len(),
+            usize::from(!discarded),
+            "{case}"
+        );
+        // Stopped either way: published, the timer waits for its copy's
+        // dequeue; discarded, for any shared-queue SIGALRM's.
+        assert_eq!(
+            s.real_timers
+                .snapshot(leader, at(100_001))
+                .unwrap()
+                .remaining,
+            at(0),
+            "{case}"
+        );
+        assert!(s.blocked.timed_waiters.is_empty(), "{case}");
+    }
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (E): a timer whose expiry
+/// was discarded at generation stays stopped until a SIGALRM is taken from
+/// the process's shared queue, whoever sent it (`dequeue_signal` restarts
+/// it for any such copy, v6.17 kernel/signal.c:632-636), here one the
+/// guest's own `kill` sent; it then restarts on its grid. No reconcile point
+/// restarts it before that dequeue.
+#[test]
+fn a_discarded_expiry_waits_for_a_shared_queue_dequeue_to_restart() {
+    let (mut s, b) = fixture();
+    let (leader, _, _) = add(&mut s, 100, 100);
+    report_signal_sets(
+        &b,
+        100,
+        100,
+        reverie::SignalSets::new(0, 0, 0, SIGALRM_BIT, 0),
+    );
+    file_ordinary(&mut s, leader);
+    s.replace_real_timer(
+        leader,
+        leader,
+        at(0),
+        at(100_000),
+        at(100_000),
+        Signal::SIGALRM,
+    )
+    .unwrap();
+    s.committed_time = at(100_000);
+    assert!(s.step2b_process_timed(&committed_clock(&s)));
+    assert!(b.publications.lock().unwrap().is_empty());
+    s.committed_time = at(250_000);
+    s.reconcile_inactive_alarms(s.committed_time);
+    assert_eq!(s.reconcile_alarm(leader, s.committed_time), None);
+    assert!(s.blocked.timed_waiters.is_empty());
+    assert_eq!(
+        s.apply_signal_dequeue(leader, leader, kill_alarm_dequeue_of(100, 1)),
+        Ok(super::real_timer::DequeueAck::Applied { sequence: 1 })
+    );
+    s.committed_time = at(350_000);
+    s.reconcile_inactive_alarms(s.committed_time);
+    assert_eq!(s.blocked.timed_waiters.next_deadline(), Some(at(400_000)));
+    assert_eq!(
+        s.real_timers
+            .snapshot(leader, at(350_000))
+            .unwrap()
+            .remaining,
+        at(50_000)
+    );
+    assert!(b.publications.lock().unwrap().is_empty());
+    assert!(!s.backend_failed());
+}
+
+/// A thread of process 100 in one of the states that the choice of the
+/// thread to take a published SIGALRM distinguishes
+/// (`Scheduler::alarm_receiver`). Every thread's process has a SIGALRM
+/// handler.
+#[derive(Clone, Copy, Debug)]
+enum AlarmThread {
+    /// Queued to run with an ordinary request; SIGALRM unblocked.
+    Runnable,
+    /// Parked in `pause` at a controlled site; SIGALRM unblocked.
+    Pause,
+    /// Queued to run; its mask blocks SIGALRM.
+    Blocks,
+    /// Queued to run; SIGALRM unblocked, but SIGUSR1, which it does not
+    /// block either, is pending for it alone (`task_sigpending`).
+    Busy,
+    /// As `Busy`, but its process ignores SIGUSR1: a copy Linux would have
+    /// dropped as it was sent, which does not make it busy.
+    IgnoredPending,
+    /// Queued to run in a masked `pselect6` whose temporary mask blocks
+    /// SIGALRM, which its own mask does not.
+    MaskedWait,
+    /// Queued to run in a masked `pselect6` whose temporary mask admits
+    /// SIGALRM, which its own mask blocks.
+    MaskedWaitAdmits,
+    /// Polling in `rt_sigtimedwait` for SIGALRM, which its own mask blocks.
+    Sigtimedwait,
+    /// Queued to run with its exit filed; SIGALRM unblocked.
+    Exiting,
+    /// Parked in a futex wait, which the observation cannot interrupt;
+    /// SIGALRM unblocked.
+    FutexWait,
+    /// A vfork parent waiting for its child; SIGALRM unblocked.
+    VforkParent,
+    /// Polling `poll`, whose probe never takes a pending signal (no restart
+    /// marker; EINTR is the call's own errno); SIGALRM unblocked.
+    PollPoller,
+    /// Polling a receive, with the ERESTARTSYS marker; SIGALRM unblocked.
+    RecvPoller,
+    /// Polling `select`, whose probe takes a pending signal itself (the EINTR
+    /// marker); SIGALRM unblocked.
+    SelectPoller,
+    /// Readmitted with its rejoin request, which says its temporary mask
+    /// admits SIGALRM, while its readmission recorded one that blocks it
+    /// (`continuation_masks`); its own mask does not block it either.
+    RejoinedUnderBlockingMask,
+    /// Running a call outside the schedule (`external_io_blockers`), whose
+    /// rejoin, filed when host timing finished the call, says its temporary
+    /// mask is unknown; SIGALRM unblocked.
+    OutsideWithUnknownRejoin,
+}
+
+/// Each `Pause` thread of `choose_alarm_receiver` and its response.
+type ParkedResponses = Vec<(DetTid, Ivar<SchedResponse>)>;
+
+/// One case of the receiver choice: its name, the threads, `curr_target`, the
+/// thread step 3 resumes first, and the thread observed.
+type ReceiverCase = (
+    &'static str,
+    &'static [AlarmThread],
+    Option<i32>,
+    Option<DetTid>,
+    Option<DetTid>,
+);
+
+/// Process 100 with one thread per entry of `threads` (TIDs 100, 101, ...;
+/// the first is the leader), each in its state, and a SIGALRM pending in its
+/// shared queue, for which the backend reports each thread whose own mask
+/// leaves it unblocked as a recipient. `curr_target` is the process's
+/// `signal->curr_target`, the leader when `None`. Returns the scheduler
+/// after one `select_parked_alarm`, the backend, and each `Pause` thread's
+/// response.
+fn choose_alarm_receiver(
+    threads: &[AlarmThread],
+    curr_target: Option<i32>,
+) -> (Scheduler, Arc<Backend>, ParkedResponses) {
+    let (mut s, b) = fixture();
+    let mut parked = Vec::new();
+    for (i, state) in threads.iter().enumerate() {
+        let raw = 100 + i32::try_from(i).unwrap();
+        let (tid, mm, site) = add(&mut s, 100, raw);
+        let own_mask = match state {
+            AlarmThread::Blocks | AlarmThread::MaskedWaitAdmits | AlarmThread::Sigtimedwait => {
+                SIGALRM_BIT
+            }
+            _ => 0,
+        };
+        let usr1 = 1 << (libc::SIGUSR1 - 1);
+        let (pending, ignored) = match state {
+            AlarmThread::Busy => (usr1, 0),
+            AlarmThread::IgnoredPending => (usr1, usr1),
+            _ => (0, 0),
+        };
+        report_signal_sets(
+            &b,
+            100,
+            raw,
+            reverie::SignalSets::new(pending, SIGALRM_BIT, own_mask, ignored, SIGALRM_BIT),
+        );
+        if own_mask == 0 {
+            b.recipients.lock().unwrap().push(SignalRecipient {
+                task: task(100, raw),
+            });
+        }
+        match state {
+            AlarmThread::Runnable
+            | AlarmThread::Blocks
+            | AlarmThread::Busy
+            | AlarmThread::IgnoredPending => {
+                file_ordinary(&mut s, tid);
+                s.runqueue_push_back(tid);
+            }
+            AlarmThread::Pause => parked.push((tid, parked_pause(&mut s, tid, mm, site))),
+            AlarmThread::MaskedWait => {
+                file_masked_pselect6(&mut s, tid, SIGALRM_BIT);
+                s.runqueue_push_back(tid);
+            }
+            AlarmThread::MaskedWaitAdmits => {
+                file_masked_pselect6(&mut s, tid, 0);
+                s.runqueue_push_back(tid);
+            }
+            AlarmThread::Sigtimedwait => {
+                let mut r = Resources::new(tid);
+                r.insert(ResourceID::InternalIOPolling, Permission::W);
+                r.fyi("rt_sigtimedwait");
+                r.poll_attempt = 1;
+                s.next_turns[&tid].req.put(Ok(r));
+                assert!(s.set_sigtimedwait_set(tid, Some(SIGALRM_BIT)));
+                s.run_queue.push_poller(tid, DEFAULT_PRIORITY, 1);
+            }
+            AlarmThread::Exiting => {
+                file_exit(&mut s, tid, mm);
+                s.runqueue_push_back(tid);
+            }
+            AlarmThread::FutexWait => {
+                let mut r = Resources::new(tid);
+                r.insert(ResourceID::FutexWait, Permission::W);
+                s.next_turns[&tid].req.put(Ok(r));
+            }
+            AlarmThread::VforkParent => {
+                file_ordinary(&mut s, tid);
+                s.vfork_barriers.insert(tid, None);
+            }
+            AlarmThread::PollPoller => file_poller(&mut s, tid, "poll", None),
+            AlarmThread::RecvPoller => {
+                file_poller(&mut s, tid, "recvfrom", Some(Errno::ERESTARTSYS))
+            }
+            AlarmThread::SelectPoller => file_poller(&mut s, tid, "select", Some(Errno::EINTR)),
+            AlarmThread::RejoinedUnderBlockingMask => {
+                let mut r = Resources::new(tid);
+                r.insert(
+                    ResourceID::BlockedExternalContinue(ExternalOpId::new(tid, 1)),
+                    Permission::RW,
+                );
+                r.blocked_signal_mask = Some(0);
+                s.next_turns[&tid].req.put(Ok(r));
+                s.blocked.continuation_masks.insert(tid, Some(SIGALRM_BIT));
+                s.runqueue_push_back(tid);
+            }
+            AlarmThread::OutsideWithUnknownRejoin => {
+                s.blocked
+                    .external_io_blockers
+                    .insert(tid, ExternalOpId::new(tid, 1));
+                let mut r = Resources::new(tid);
+                r.insert(
+                    ResourceID::BlockedExternalContinue(ExternalOpId::new(tid, 1)),
+                    Permission::RW,
+                );
+                r.blocked_signal_mask_unknown = true;
+                s.next_turns[&tid].req.put(Ok(r));
+            }
+        }
+    }
+    if let Some(target) = curr_target {
+        s.signal_curr_targets
+            .insert(DetPid::from_raw(100), DetTid::from_raw(target));
+    }
+    s.committed_time = at(10);
+    s.select_parked_alarm().unwrap();
+    (s, b, parked)
+}
+
+/// The thread step 3 resumes first for the pending SIGALRM, and the parked
+/// thread observed for it.
+fn alarm_action(
+    s: &Scheduler,
+    parked: &[(DetTid, Ivar<SchedResponse>)],
+) -> (Option<DetTid>, Option<DetTid>) {
+    let observed = parked
+        .iter()
+        .find(|(_, response)| response.try_read().is_some())
+        .map(|(tid, response)| {
+            selected(response);
+            *tid
+        });
+    (s.first_alarm_taker(), observed)
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (G): one choice of the
+/// thread that takes a published SIGALRM, runnable or parked, by Linux's
+/// `complete_signal` (v6.17 kernel/signal.c:963-997): the leader, which the
+/// expiry names, if it wants the signal, and otherwise the first thread that
+/// does, walking from `curr_target`. A thread wants it (`wants_signal`,
+/// lines 946-961) when its mask leaves it unblocked (a wait's temporary
+/// mask where it has one; the set an `rt_sigtimedwait` waits for is
+/// unblocked, lines 3776-3777), its exit is not filed, and no other signal
+/// it leaves unblocked is pending for it alone. Only that thread is acted
+/// on: queued to run, step 3 resumes it first; parked in a wait the
+/// observation can interrupt, it is observed; polling a call whose probe
+/// never takes a pending signal (`poll`, a receive, `rt_sigtimedwait`), it is
+/// woken and resumed first, as Linux's `signal_wake_up` ends its wait;
+/// polling `select` or `pselect6`, whose probe takes the signal under the
+/// call's own mask, nothing is done, and that probe takes the copy. No other
+/// thread is acted on in its place, and a parked thread Linux does not wake
+/// is not observed. A thread waiting where Linux would interrupt the wait
+/// but this backend cannot (a futex wait, a call outside the schedule) is
+/// passed over, so the copy reaches a thread that can take it (the named KVM
+/// gap D1); a vfork parent, which Linux cannot wake either, is not, and the
+/// copy waits for it. A mask comes from committed state or from a request
+/// the thread filed in its own turn: a rejoin's own mask fields, and
+/// anything filed by a thread outside the schedule, are never read.
+#[test]
+fn one_receiver_choice_takes_a_published_alarm_as_complete_signal_chooses() {
+    use AlarmThread::*;
+    let t = DetTid::from_raw;
+    let cases: [ReceiverCase; 22] = [
+        (
+            "a runnable leader that wants it, beside a parked sibling",
+            &[Runnable, Pause],
+            None,
+            Some(t(100)),
+            None,
+        ),
+        (
+            "a parked leader that wants it, beside a runnable sibling",
+            &[Pause, Runnable],
+            None,
+            None,
+            Some(t(100)),
+        ),
+        (
+            "the walk from the leader",
+            &[Blocks, Runnable, Pause],
+            None,
+            Some(t(101)),
+            None,
+        ),
+        (
+            "the walk from curr_target",
+            &[Blocks, Runnable, Pause],
+            Some(102),
+            None,
+            Some(t(102)),
+        ),
+        (
+            "the only parked thread that wants it",
+            &[Blocks, Pause],
+            None,
+            None,
+            Some(t(101)),
+        ),
+        (
+            "a busy thread is passed over",
+            &[Blocks, Busy, Runnable],
+            None,
+            Some(t(102)),
+            None,
+        ),
+        (
+            "an ignored pending signal does not make it busy",
+            &[Blocks, IgnoredPending, Runnable],
+            None,
+            Some(t(101)),
+            None,
+        ),
+        (
+            "a wait's temporary mask blocks it",
+            &[Blocks, MaskedWait, Runnable],
+            None,
+            Some(t(102)),
+            None,
+        ),
+        (
+            "a wait's temporary mask admits it",
+            &[Blocks, MaskedWaitAdmits, Runnable],
+            None,
+            None,
+            None,
+        ),
+        (
+            "rt_sigtimedwait waits for it, and is woken to take it",
+            &[Blocks, Sigtimedwait, Runnable],
+            None,
+            Some(t(101)),
+            None,
+        ),
+        (
+            "an exiting leader is passed over",
+            &[Exiting, Runnable],
+            None,
+            Some(t(101)),
+            None,
+        ),
+        (
+            "the only thread that wants it is busy",
+            &[Blocks, Busy],
+            None,
+            None,
+            None,
+        ),
+        (
+            "every thread blocks it",
+            &[Blocks, Blocks],
+            None,
+            None,
+            None,
+        ),
+        ("one thread, which blocks it", &[Blocks], None, None, None),
+        (
+            "a leader in a futex wait is passed over",
+            &[FutexWait, Pause],
+            None,
+            None,
+            Some(t(101)),
+        ),
+        (
+            "a leader alone in a futex wait",
+            &[FutexWait],
+            None,
+            None,
+            None,
+        ),
+        (
+            "a vfork parent leader is chosen, and the copy waits for it",
+            &[VforkParent, Runnable],
+            None,
+            None,
+            None,
+        ),
+        (
+            "a leader polling poll is woken, not a parked sibling",
+            &[PollPoller, Pause],
+            None,
+            Some(t(100)),
+            None,
+        ),
+        (
+            "a leader polling a receive is woken, not a parked sibling",
+            &[RecvPoller, Pause],
+            None,
+            Some(t(100)),
+            None,
+        ),
+        (
+            "a leader polling select takes it at its own probe",
+            &[SelectPoller, Pause],
+            None,
+            None,
+            None,
+        ),
+        (
+            "a rejoin is read by the mask its readmission recorded",
+            &[RejoinedUnderBlockingMask, Runnable],
+            None,
+            Some(t(101)),
+            None,
+        ),
+        (
+            "a thread outside the schedule is passed over, its rejoin unread",
+            &[OutsideWithUnknownRejoin, Pause],
+            None,
+            None,
+            Some(t(101)),
+        ),
+    ];
+    for (case, threads, curr_target, taker, observed) in cases {
+        let (s, b, parked) = choose_alarm_receiver(threads, curr_target);
+        assert_eq!(alarm_action(&s, &parked), (taker, observed), "{case}");
+        assert_eq!(
+            b.permits.lock().unwrap().len(),
+            usize::from(observed.is_some()),
+            "{case}"
+        );
+        assert!(!s.backend_failed(), "{case}");
+    }
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (G): Linux's
+/// `complete_signal` runs once per generated copy and moves `curr_target` to
+/// the thread its walk chose (v6.17 kernel/signal.c:996): here the expiry's
+/// publication, with the leader blocking SIGALRM, moves it to the worker. The
+/// leader's own choice moves nothing (line 974), and nor does a copy the
+/// shared queue already held, which `legacy_queue` keeps from reaching
+/// `complete_signal` (lines 1063-1064).
+#[test]
+fn a_published_expiry_moves_curr_target_to_the_walks_choice() {
+    for (leader_blocks, coalesced, moved) in [
+        (true, false, Some(101)),
+        (false, false, None),
+        (true, true, None),
+    ] {
+        let (mut s, b) = fixture();
+        let (leader, _, _) = add(&mut s, 100, 100);
+        let (worker, _, _) = add(&mut s, 100, 101);
+        for (raw, tid) in [(100, leader), (101, worker)] {
+            let blocked = if raw == 100 && leader_blocks {
+                SIGALRM_BIT
+            } else {
+                0
+            };
+            report_signal_sets(
+                &b,
+                100,
+                raw,
+                reverie::SignalSets::new(0, 0, blocked, 0, SIGALRM_BIT),
+            );
+            file_ordinary(&mut s, tid);
+            s.runqueue_push_back(tid);
+            if blocked == 0 {
+                b.recipients_on_alarm.lock().unwrap().push(SignalRecipient {
+                    task: task(100, raw),
+                });
+            }
+        }
+        b.coalesce_alarm
+            .store(coalesced, std::sync::atomic::Ordering::Relaxed);
+        s.replace_real_timer(
+            leader,
+            leader,
+            at(0),
+            at(100_000),
+            at(100_000),
+            Signal::SIGALRM,
+        )
+        .unwrap();
+        s.committed_time = at(100_000);
+        assert!(s.step2b_process_timed(&committed_clock(&s)));
+        assert_eq!(b.publications.lock().unwrap().len(), 1);
+        assert_eq!(
+            s.signal_curr_targets.get(&DetPid::from_raw(100)).copied(),
+            moved.map(DetTid::from_raw),
+            "leader blocks {leader_blocks}, coalesced {coalesced}"
+        );
+        assert!(!s.backend_failed());
+    }
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (the Claude review of slice
+/// 2, round 3, finding 1): a POSIX timer's SIGALRM goes through Linux's
+/// `complete_signal` as an `ITIMER_REAL` copy does (`posixtimer_queue_sigqueue`,
+/// kernel/signal.c:1943-1953 at v6.17): its publication moves `curr_target` to
+/// the walk's choice, here the worker, as the leader blocks SIGALRM. A copy
+/// the queue already held chooses nothing (the timer counts an overrun, lines
+/// 2061-2064), and nor does a timer with another signal, which no SIGALRM
+/// receiver choice serves. And (the Claude review of slice 2, round 4,
+/// finding B) a copy the leader leaves unblocked and ignores is dropped when
+/// it is sent (`send_sigqueue` -> `prepare_signal` -> `sig_ignored`,
+/// kernel/signal.c:1966-2030 and 104-123 at v6.12): it is not published and
+/// `curr_target` does not move, for SIGALRM as for any other signal; an
+/// ignored copy the leader blocks is queued, and chooses as a caught one does.
+#[test]
+fn a_published_posix_timer_sigalrm_moves_curr_target_to_the_walks_choice() {
+    const IGNORED: bool = true;
+    const BLOCKED: bool = true;
+    for (signal, coalesced, leader_ignores, leader_blocks, published, moved) in [
+        (Signal::SIGALRM, false, !IGNORED, BLOCKED, 1, Some(101)),
+        (Signal::SIGALRM, true, !IGNORED, BLOCKED, 1, None),
+        (Signal::SIGUSR1, false, !IGNORED, BLOCKED, 1, None),
+        (Signal::SIGALRM, false, IGNORED, !BLOCKED, 0, None),
+        (Signal::SIGUSR1, false, IGNORED, !BLOCKED, 0, None),
+        (Signal::SIGALRM, false, IGNORED, BLOCKED, 1, Some(101)),
+    ] {
+        let bit = 1u64 << (signal as i32 - 1);
+        let (mut s, b) = fixture();
+        let (leader, _, _) = add(&mut s, 100, 100);
+        let (worker, _, _) = add(&mut s, 100, 101);
+        for (raw, tid) in [(100, leader), (101, worker)] {
+            let blocked = if raw == 100 && leader_blocks { bit } else { 0 };
+            let (ignored, caught) = if leader_ignores { (bit, 0) } else { (0, bit) };
+            report_signal_sets(
+                &b,
+                100,
+                raw,
+                reverie::SignalSets::new(0, 0, blocked, ignored, caught),
+            );
+            file_ordinary(&mut s, tid);
+            s.runqueue_push_back(tid);
+            if blocked == 0 {
+                b.recipients_on_alarm.lock().unwrap().push(SignalRecipient {
+                    task: task(100, raw),
+                });
+            }
+        }
+        b.coalesce_alarm
+            .store(coalesced, std::sync::atomic::Ordering::Relaxed);
+        s.dispatch_timed_signal(
+            at(100_000),
+            timed_waiters::SignalTimerId::Posix(DetPid::from_raw(100), 3),
+            timed_waiters::SignalTarget::Process(leader),
+            timed_waiters::TimerSignal::Send(signal),
+            true,
+            at(100_000),
+        );
+        let row = format!(
+            "{signal:?}, coalesced {coalesced}, leader ignores {leader_ignores}, blocks {leader_blocks}"
+        );
+        assert_eq!(
+            b.timer_publications.lock().unwrap().len(),
+            published,
+            "{row}"
+        );
+        assert!(b.publications.lock().unwrap().is_empty(), "{row}");
+        assert_eq!(
+            s.signal_curr_targets.get(&DetPid::from_raw(100)).copied(),
+            moved.map(DetTid::from_raw),
+            "{row}"
+        );
+        assert!(!s.backend_failed(), "{row}");
+    }
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (the Claude review of slice
+/// 2, round 3, finding 2): a thread running a call outside the schedule is
+/// never busy for the receiver walk. The backend can post a signal to it alone
+/// when host timing completes that call (SIGPIPE for a write that fails with
+/// EPIPE), so its pending set is not a function of the schedule. Linux's rule
+/// gives it the copy whether or not such a signal is pending, which decides
+/// the D1 record and the fatal refusal, and the backend's rule passes it over
+/// (D1) either way.
+#[test]
+fn a_thread_outside_the_schedule_is_never_busy_for_the_receiver_walk() {
+    let pid = DetPid::from_raw(100);
+    let sigpipe = 1u64 << (libc::SIGPIPE - 1);
+    for pending in [0, sigpipe] {
+        let (s, b, _) = choose_alarm_receiver(
+            &[AlarmThread::OutsideWithUnknownRejoin, AlarmThread::Blocks],
+            None,
+        );
+        replace_signal_sets(
+            &b,
+            100,
+            100,
+            reverie::SignalSets::new(pending, SIGALRM_BIT, 0, 0, SIGALRM_BIT),
+        );
+        let recipients = b
+            .alarm_recipients(task(100, 100).process)
+            .expect("recipients");
+        assert_eq!(
+            s.alarm_receiver_and_walk(pid, &recipients, AlarmReachRule::Linux)
+                .0,
+            Some(DetTid::from_raw(100)),
+            "pending {pending:#x}"
+        );
+        assert_eq!(
+            s.alarm_receiver(pid, &recipients),
+            None,
+            "pending {pending:#x}"
+        );
+    }
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (G): step 3 resumes the
+/// thread chosen to take a pending SIGALRM before the run queue's own order,
+/// and only while the copy waits: once the copy is taken, the next selection
+/// pass chooses nothing and the queue's order decides again. Without a
+/// process signal control (ptrace) no thread is ever chosen.
+#[test]
+fn step3_resumes_the_alarm_receiver_first_only_while_the_copy_waits() {
+    let (mut s, b, _) = choose_alarm_receiver(&[AlarmThread::Blocks, AlarmThread::Runnable], None);
+    assert_eq!(s.step3_peek().unwrap().0, DetTid::from_raw(101));
+    s.run_queue.undo_tentative_pop();
+    b.recipients.lock().unwrap().clear();
+    s.select_parked_alarm().unwrap();
+    assert_eq!(s.first_alarm_taker(), None);
+    assert_eq!(s.step3_peek().unwrap().0, DetTid::from_raw(100));
+    s.run_queue.undo_tentative_pop();
+
+    let (mut s, b) = fixture_with_control(false);
+    for raw in [100, 101] {
+        let (tid, _, _) = add(&mut s, 100, raw);
+        file_ordinary(&mut s, tid);
+        s.runqueue_push_back(tid);
+    }
+    b.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 101),
+    });
+    s.select_parked_alarm().unwrap();
+    assert_eq!(s.first_alarm_taker(), None);
+    assert_eq!(s.step3_peek().unwrap().0, DetTid::from_raw(100));
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (review round 1, F3): with
+/// a process signal control installed, the polling record leaves a probed
+/// call's temporary mask out of the request it prints, as ptrace's request
+/// does not hold it, while the request keeps it for the reader. A kernel
+/// wait's mask, and every request where no control is installed, print as
+/// before. Mutation: printing the request as it is (the probed text names
+/// `blocked_signal_mask`).
+#[test]
+fn the_polling_record_prints_a_probed_mask_as_ptrace_does() {
+    for installed in [true, false] {
+        let (mut s, _) = fixture_with_control(installed);
+        let (tid, _, _) = add(&mut s, 100, 100);
+        file_masked_pselect6(&mut s, tid, SIGALRM_BIT);
+        let probed = s.next_turns[&tid]
+            .req
+            .try_read()
+            .expect("filed")
+            .expect("a request");
+        assert_eq!(probed.blocked_signal_mask, Some(SIGALRM_BIT));
+        let printed = format!("{:?}", s.logged_polling_request(&probed));
+        assert_eq!(
+            printed.contains("blocked_signal_mask"),
+            !installed,
+            "control installed {installed}: {printed}"
+        );
+        let mut kernel_wait = Resources::new(tid);
+        kernel_wait.insert(
+            ResourceID::BlockingExternalIO(ExternalOpId::new(tid, 1)),
+            Permission::RW,
+        );
+        kernel_wait.blocked_signal_mask = Some(SIGALRM_BIT);
+        assert!(
+            format!("{:?}", s.logged_polling_request(&kernel_wait)).contains("blocked_signal_mask"),
+            "control installed {installed}"
+        );
+    }
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (review round 1, F5): the
+/// mask of a thread running a call outside the schedule is read from
+/// committed state, never from its request slot, which is empty while the
+/// call runs and then holds the rejoin host timing files. The scheduler
+/// records a background call's temporary mask, or an unknown one, as it
+/// releases the call (`controlled_background_masks`), and the reader takes
+/// that, or else the thread's own mask from the control, whatever rejoin is
+/// filed later; readmitted with that rejoin, the thread is read by the mask
+/// its readmission recorded (`continuation_masks`), not by the rejoin's own
+/// fields. Mutations: reading the request slot of a thread outside the
+/// schedule (the answer moves when the rejoin is filed); not recording the
+/// call's mask (the temporary and unknown cases read the own mask).
+#[test]
+fn a_thread_outside_the_schedule_is_read_from_committed_state() {
+    let own = 1 << (libc::SIGUSR2 - 1);
+    for (case, blocked, unknown, want) in [
+        ("own mask", None, false, Ok(None)),
+        (
+            "temporary mask",
+            Some(SIGALRM_BIT),
+            false,
+            Ok(Some(SIGALRM_BIT)),
+        ),
+        ("unknown mask", None, true, Err(TemporaryMaskUnknown)),
+    ] {
+        let (mut s, b) = fixture();
+        let (tid, _, _) = add(&mut s, 100, 100);
+        report_signal_sets(
+            &b,
+            100,
+            100,
+            reverie::SignalSets::new(0, 0, own, 0, SIGALRM_BIT),
+        );
+        let op = ExternalOpId::new(tid, 1);
+        let mut call = Resources::new(tid);
+        call.insert(ResourceID::BlockingExternalIO(op), Permission::RW);
+        call.blocked_signal_mask = blocked;
+        call.blocked_signal_mask_unknown = unknown;
+        s.next_turns[&tid].req.put(Ok(call));
+        s.runqueue_push_back(tid);
+        assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+        assert!(
+            s.block_for_one_resource(
+                tid,
+                &ResourceID::BlockingExternalIO(op),
+                &Permission::RW,
+                None,
+                blocked,
+                &Ivar::new()
+            )
+            .is_err(),
+            "{case}"
+        );
+        assert!(s.blocked.external_io_blockers.contains_key(&tid), "{case}");
+        let read = |s: &Scheduler| {
+            (
+                s.controlled_temporary_mask(tid),
+                s.read_guest_signal_mask(tid),
+            )
+        };
+        let expected = (
+            want,
+            match want {
+                Ok(Some(mask)) => Some(mask),
+                Ok(None) => Some(own),
+                Err(_) => None,
+            },
+        );
+        assert_eq!(read(&s), expected, "{case}: running");
+        let mut rejoin = Resources::new(tid);
+        rejoin.insert(ResourceID::BlockedExternalContinue(op), Permission::RW);
+        rejoin.blocked_signal_mask = Some(0);
+        rejoin.blocked_signal_mask_unknown = !unknown;
+        s.next_turns.get_mut(&tid).unwrap().req = Ivar::full(Ok(rejoin));
+        assert_eq!(read(&s), expected, "{case}: its rejoin filed");
+        s.blocked.external_io_blockers.remove(&tid);
+        s.blocked.controlled_background_masks.remove(&tid);
+        s.blocked.continuation_masks.insert(tid, Some(SIGALRM_BIT));
+        s.runqueue_push_back(tid);
+        assert_eq!(
+            read(&s),
+            (Ok(Some(SIGALRM_BIT)), Some(SIGALRM_BIT)),
+            "{case}: readmitted"
+        );
+    }
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (review round 1, F1): a
+/// receiver polling a call whose probe never takes a pending signal (`poll`,
+/// `epoll_wait`, a receive) is woken as the scheduler wakes a polling thread
+/// for a signal it sends (`wake_signaled_guest`): its filed retry is replaced
+/// by the signal, which its turn answers `Signaled`, so its call returns for
+/// it, and it is queued at the front as a thread that runs its turn, and
+/// resumed first. Before, nothing was done for it and no other thread was
+/// chosen: the copy stayed pending while the poller probed for ever. Not
+/// while the alarm priority serves another process: woken then, it would
+/// wait behind the run queue's own choice, so it keeps polling until then.
+#[test]
+fn a_polling_receiver_is_woken_for_the_copy_and_resumed_first() {
+    let (s, _, _) = choose_alarm_receiver(&[AlarmThread::PollPoller, AlarmThread::Pause], None);
+    let leader = DetTid::from_raw(100);
+    let request = s.next_turns[&leader]
+        .req
+        .try_read()
+        .expect("the woken poller's request")
+        .expect("a filed request");
+    assert_eq!(request.resources.len(), 1, "{request:?}");
+    assert!(
+        request
+            .resources
+            .contains_key(&ResourceID::InboundSignal(SigWrapper(libc::SIGALRM))),
+        "{request:?}"
+    );
+    assert!(s.run_queue.contains_non_polling_tid(leader));
+    assert_eq!(s.first_alarm_taker(), Some(leader));
+    assert!(!s.backend_failed());
+
+    let (mut s, b) = fixture();
+    let (leader, _, _) = add(&mut s, 100, 100);
+    report_signal_sets(
+        &b,
+        100,
+        100,
+        reverie::SignalSets::new(0, SIGALRM_BIT, 0, 0, SIGALRM_BIT),
+    );
+    b.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 100),
+    });
+    file_poller(&mut s, leader, "epoll_wait", None);
+    s.parked.alarm_priority_served = Some(DetPid::from_raw(200));
+    s.select_parked_alarm().unwrap();
+    let request = s.next_turns[&leader]
+        .req
+        .try_read()
+        .expect("the poller's request")
+        .expect("a filed request");
+    assert!(
+        request
+            .resources
+            .contains_key(&ResourceID::InternalIOPolling),
+        "woken while the alarm priority served another process: {request:?}"
+    );
+    assert!(!s.run_queue.contains_non_polling_tid(leader));
+    assert_eq!(s.first_alarm_taker(), None);
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (review round 1, Codex
+/// P1): step 3 never makes two grants by alarm priority for different
+/// processes without a choice of the run queue's own between them. Here two
+/// processes each have a queued taker, and every grant takes its own
+/// process's copy and makes the other process's copy pending, as two
+/// recurring timers that fall due again within each other's grants do; a
+/// third process has a runnable worker and no timer. Alarm priority alone
+/// alternated the two takers at every selection and the worker never ran;
+/// with the bound the worker runs within every four selections, and each
+/// taker still runs at every fourth, so neither the signals' owners nor
+/// their expiries change. The bound holds for one process too (the Codex
+/// review of slice 2, round 2, P1): its taker whose copy falls due again at
+/// once waits for one choice of the run queue's own, and is then resumed by
+/// alarm priority.
+#[test]
+fn alarm_priority_leaves_room_for_the_run_queues_own_choice() {
+    let (mut s, b) = fixture();
+    let mut threads = Vec::new();
+    for pid in [100, 200, 300] {
+        let (tid, _, _) = add(&mut s, pid, pid);
+        report_signal_sets(
+            &b,
+            pid,
+            pid,
+            reverie::SignalSets::new(0, SIGALRM_BIT, 0, 0, SIGALRM_BIT),
+        );
+        file_ordinary(&mut s, tid);
+        s.runqueue_push_back(tid);
+        threads.push(tid);
+    }
+    let worker = threads[2];
+    let pending = |b: &Backend, pids: &[i32]| {
+        *b.recipients.lock().unwrap() = pids
+            .iter()
+            .map(|pid| SignalRecipient {
+                task: task(*pid, *pid),
+            })
+            .collect();
+    };
+    pending(&b, &[100, 200]);
+    let mut selections = Vec::new();
+    for _ in 0..16 {
+        s.select_parked_alarm().unwrap();
+        let served = s.parked.alarm_priority_served;
+        let (tid, _, _) = s.step3_peek().unwrap();
+        let by_alarm = s.parked.alarm_priority_served.is_some() && tid != worker;
+        assert!(
+            !(by_alarm && served.is_some_and(|served| served.as_raw() != tid.as_raw())),
+            "two processes served in a row: {selections:?}"
+        );
+        s.run_queue.commit_tentative_pop();
+        s.runqueue_push_back(tid);
+        // The grant takes its process's copy and makes the others' pending.
+        match tid.as_raw() {
+            100 => pending(&b, &[200]),
+            200 => pending(&b, &[100]),
+            _ => {}
+        }
+        selections.push((tid, by_alarm));
+    }
+    for window in selections.windows(4) {
+        assert!(
+            window.iter().any(|(tid, _)| *tid == worker),
+            "the worker waited four selections: {selections:?}"
+        );
+    }
+    for taker in [threads[0], threads[1]] {
+        assert!(
+            selections.iter().filter(|(tid, _)| *tid == taker).count() >= 4,
+            "{selections:?}"
+        );
+    }
+
+    // The same process again: its next copy, pending before any other
+    // process's, waits for one choice of the run queue's own.
+    let (mut s, b) = fixture();
+    for raw in [100, 101] {
+        let (tid, _, _) = add(&mut s, 100, raw);
+        report_signal_sets(
+            &b,
+            100,
+            raw,
+            reverie::SignalSets::new(
+                0,
+                SIGALRM_BIT,
+                if raw == 100 { SIGALRM_BIT } else { 0 },
+                0,
+                SIGALRM_BIT,
+            ),
+        );
+        file_ordinary(&mut s, tid);
+        s.runqueue_push_back(tid);
+    }
+    pending(&b, &[]);
+    b.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 101),
+    });
+    s.parked.alarm_priority_served = Some(DetPid::from_raw(100));
+    s.select_parked_alarm().unwrap();
+    assert_eq!(
+        s.parked.alarm_takers.get(&DetPid::from_raw(100)),
+        Some(&DetTid::from_raw(101))
+    );
+    assert_eq!(s.first_alarm_taker(), None);
+    assert_eq!(s.step3_peek().unwrap().0, DetTid::from_raw(100));
+    assert_eq!(s.parked.alarm_priority_served, None);
+    s.run_queue.commit_tentative_pop();
+    s.runqueue_push_back(DetTid::from_raw(100));
+    s.select_parked_alarm().unwrap();
+    assert_eq!(s.step3_peek().unwrap().0, DetTid::from_raw(101));
+    assert_eq!(s.parked.alarm_priority_served, Some(DetPid::from_raw(100)));
+    assert!(!s.backend_failed());
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (the Codex review of
+/// slice 2, round 2, P1): a periodic POSIX timer rearms whether or not its
+/// copy was taken, so its process's SIGALRM is pending again after every
+/// grant, here for ever. The taker (the leader) wants it and a worker of the
+/// same process blocks it. The alarm priority used to resume the taker again
+/// at every selection, and the worker never ran (tests/c/alarm_receiver_reach.c's
+/// `posixspin`: 6 iterations on KVM, 390 at the base, 88,283 natively); now
+/// the run queue's own choice comes between any two grants, so the worker
+/// runs at every other selection, and the taker at the others.
+#[test]
+fn a_rearming_timer_leaves_its_own_process_worker_room() {
+    let (mut s, b) = fixture();
+    for raw in [100, 101] {
+        let (tid, _, _) = add(&mut s, 100, raw);
+        report_signal_sets(
+            &b,
+            100,
+            raw,
+            reverie::SignalSets::new(
+                0,
+                SIGALRM_BIT,
+                if raw == 101 { SIGALRM_BIT } else { 0 },
+                0,
+                SIGALRM_BIT,
+            ),
+        );
+        file_ordinary(&mut s, tid);
+        s.runqueue_push_back(tid);
+    }
+    b.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 100),
+    });
+    let mut selections = Vec::new();
+    for _ in 0..12 {
+        s.select_parked_alarm().unwrap();
+        let (tid, _, _) = s.step3_peek().unwrap();
+        s.run_queue.commit_tentative_pop();
+        s.runqueue_push_back(tid);
+        selections.push(tid.as_raw());
+    }
+    assert_eq!(
+        selections,
+        [100, 101, 100, 101, 100, 101, 100, 101, 100, 101, 100, 101],
+        "{selections:?}"
+    );
+    assert!(!s.backend_failed());
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (the Codex review of
+/// slice 2, round 2, P1): the alarm priority serves neither a signal
+/// delivery that does not continue its thread's own `rt_sigreturn`, which
+/// waits its place behind the other runnable threads by design (after
+/// `MAX_SIGRETURN_CONTINUATIONS` deliveries in a row, or a stop that ended the
+/// slice), nor a `sched_yield`, by which the thread gave its turn away.
+/// Serving either put a handler that its timer kept busy first again at
+/// every selection. A poller woken for the copy is served
+/// (`a_polling_receiver_is_woken_for_the_copy_and_resumed_first`), and so is
+/// the request that ended a slice whose time ran out: a thread that computes
+/// between calls ends its turns only so.
+#[test]
+fn alarm_priority_serves_no_unmarked_delivery_and_no_yield() {
+    let mut delivery = Resources::new(DetTid::from_raw(101));
+    delivery.insert(
+        ResourceID::InboundSignal(SigWrapper(libc::SIGALRM)),
+        Permission::W,
+    );
+    let mut sched_yield = Resources::new(DetTid::from_raw(101));
+    sched_yield.insert(ResourceID::SchedYield, Permission::W);
+    let mut continuation = delivery.clone();
+    continuation.continues_sigreturn = true;
+    let mut slice_end = Resources::new(DetTid::from_raw(101));
+    slice_end.insert(
+        ResourceID::SleepUntil(LogicalTime::from_nanos(0)),
+        Permission::W,
+    );
+    slice_end.slice_expired = true;
+    for (label, request, served) in [
+        ("an unmarked delivery", delivery, false),
+        ("a sched_yield", sched_yield, false),
+        ("an expired slice", slice_end, true),
+        ("a sigreturn continuation", continuation, true),
+        (
+            "an ordinary request",
+            Resources::new(DetTid::from_raw(101)),
+            true,
+        ),
+    ] {
+        let (mut s, b) = fixture();
+        for raw in [100, 101] {
+            let (tid, _, _) = add(&mut s, 100, raw);
+            report_signal_sets(
+                &b,
+                100,
+                raw,
+                reverie::SignalSets::new(
+                    0,
+                    SIGALRM_BIT,
+                    if raw == 100 { SIGALRM_BIT } else { 0 },
+                    0,
+                    SIGALRM_BIT,
+                ),
+            );
+            s.runqueue_push_back(tid);
+        }
+        file_ordinary(&mut s, DetTid::from_raw(100));
+        s.next_turns[&DetTid::from_raw(101)]
+            .req
+            .put(Ok(request.clone()));
+        b.recipients.lock().unwrap().push(SignalRecipient {
+            task: task(100, 101),
+        });
+        s.select_parked_alarm().unwrap();
+        assert_eq!(
+            s.parked.alarm_takers.get(&DetPid::from_raw(100)),
+            Some(&DetTid::from_raw(101)),
+            "{label}"
+        );
+        let expected = if served { 101 } else { 100 };
+        assert_eq!(
+            s.first_alarm_taker(),
+            served.then(|| DetTid::from_raw(101)),
+            "{label}"
+        );
+        assert_eq!(s.step3_peek().unwrap().0.as_raw(), expected, "{label}");
+        assert_eq!(
+            s.parked.alarm_priority_served,
+            served.then(|| DetPid::from_raw(100)),
+            "{label}"
+        );
+        assert!(!s.backend_failed(), "{label}");
+    }
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (review round 1): a
+/// delivery that continues its thread's own `rt_sigreturn` goes before an
+/// alarm taker, as Linux makes that delivery on the same return to user mode.
+/// Run between the two, another process's grant advanced time far enough
+/// that the returning thread's own timer fell due again before every return,
+/// and neither process ran its own code again (the cross-process form of
+/// https://github.com/rrnewton/hermit/issues/4505's livelock, measured with
+/// tests/c/alarm_receiver_reach.c's `twotimers` mode). The taker keeps its
+/// priority and goes first once no continuation waits.
+#[test]
+fn a_sigreturn_continuation_goes_before_an_alarm_taker() {
+    let (mut s, b) = fixture();
+    let (taker, _, _) = add(&mut s, 100, 100);
+    report_signal_sets(
+        &b,
+        100,
+        100,
+        reverie::SignalSets::new(0, SIGALRM_BIT, 0, 0, SIGALRM_BIT),
+    );
+    b.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 100),
+    });
+    file_ordinary(&mut s, taker);
+    s.runqueue_push_back(taker);
+    let (returning, _, _) = add(&mut s, 200, 200);
+    report_signal_sets(
+        &b,
+        200,
+        200,
+        reverie::SignalSets::new(0, 0, 0, 0, SIGALRM_BIT),
+    );
+    let mut delivery = Resources::new(returning);
+    delivery.insert(
+        ResourceID::InboundSignal(SigWrapper(libc::SIGALRM)),
+        Permission::W,
+    );
+    delivery.continues_sigreturn = true;
+    s.next_turns[&returning].req.put(Ok(delivery));
+    s.sigreturn_continuations.insert(returning);
+    s.runqueue_push_back(returning);
+    s.select_parked_alarm().unwrap();
+    assert_eq!(s.first_alarm_taker(), Some(taker));
+    assert_eq!(s.step3_peek().unwrap().0, returning);
+    assert_eq!(s.parked.alarm_priority_served, None);
+    s.run_queue.commit_tentative_pop();
+    s.sigreturn_continuations.remove(&returning);
+    s.select_parked_alarm().unwrap();
+    assert_eq!(s.step3_peek().unwrap().0, taker);
+    assert_eq!(s.parked.alarm_priority_served, Some(DetPid::from_raw(100)));
+    assert!(!s.backend_failed());
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (review round 2, finding
+/// B): D1 follows the backend's capability, not the backend. Once the backend
+/// can interrupt a blocked wait for a signal (N8a's
+/// `supports_blocked_wait_signal_interruption`), the choice counts the waiter
+/// as Linux does, so turning the capability on retires the pass-over.
+#[test]
+fn the_d1_pass_over_follows_the_blocked_wait_capability() {
+    use AlarmThread::*;
+    let t = DetTid::from_raw;
+    for (threads, without, with) in [
+        (&[FutexWait, Pause][..], Some(t(101)), Some(t(100))),
+        (&[FutexWait][..], None, Some(t(100))),
+        (
+            &[OutsideWithUnknownRejoin, Runnable][..],
+            Some(t(101)),
+            Some(t(100)),
+        ),
+    ] {
+        let (mut s, b, _) = choose_alarm_receiver(threads, None);
+        let recipients = b
+            .alarm_recipients(task(100, 100).process)
+            .expect("recipients");
+        let pid = DetPid::from_raw(100);
+        assert!(s.passes_over_waits_it_cannot_interrupt(), "{threads:?}");
+        assert_eq!(s.alarm_receiver(pid, &recipients), without, "{threads:?}");
+        s.backend.supports_blocked_wait_signal_interruption = true;
+        assert!(!s.passes_over_waits_it_cannot_interrupt(), "{threads:?}");
+        assert_eq!(s.alarm_receiver(pid, &recipients), with, "{threads:?}");
+        assert_eq!(
+            s.alarm_receiver_and_walk(pid, &recipients, AlarmReachRule::Linux)
+                .0,
+            with,
+            "{threads:?}"
+        );
+    }
+}
+
+/// Replaces the signal sets the mock control reports for `pid`'s `tid`.
+fn replace_signal_sets(b: &Backend, pid: i32, tid: i32, sets: reverie::SignalSets) {
+    let mut reported = b.task_signal_sets.lock().unwrap();
+    reported.retain(|(identity, _)| *identity != task(pid, tid));
+    reported.push((task(pid, tid), sets));
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (review round 2, finding
+/// B): a new SIGALRM copy whose action is the default, which ends the
+/// process, and which D1 leaves with no receiver (the only thread that wants
+/// it waits in a futex wait), is refused by name: Linux ends the process at
+/// once, whatever that thread waits in, and the copy would otherwise wait for
+/// the wait to end. A copy a handler catches, or one the process ignores, is
+/// not refused.
+#[test]
+fn a_fatal_alarm_that_d1_leaves_without_a_receiver_is_refused_by_name() {
+    let t = DetTid::from_raw;
+    let (s, b, _) = choose_alarm_receiver(&[AlarmThread::FutexWait], None);
+    let pid = DetPid::from_raw(100);
+    let recipients = b
+        .alarm_recipients(task(100, 100).process)
+        .expect("recipients");
+    assert_eq!(s.alarm_receiver(pid, &recipients), None);
+    assert_eq!(
+        s.alarm_receiver_and_walk(pid, &recipients, AlarmReachRule::Linux)
+            .0,
+        Some(t(100))
+    );
+    // The fixture's handler.
+    assert_eq!(s.fatal_alarm_refusal(pid, t(100)), None);
+    replace_signal_sets(
+        &b,
+        100,
+        100,
+        reverie::SignalSets::new(0, SIGALRM_BIT, 0, SIGALRM_BIT, 0),
+    );
+    assert_eq!(s.fatal_alarm_refusal(pid, t(100)), None);
+    replace_signal_sets(
+        &b,
+        100,
+        100,
+        reverie::SignalSets::new(0, SIGALRM_BIT, 0, 0, 0),
+    );
+    let refusal = s
+        .fatal_alarm_refusal(pid, t(100))
+        .expect("a fatal default copy is refused");
+    assert!(
+        refusal.contains("refusing the run rather than delaying it")
+            && refusal.contains("KVM gap D1 until N8a"),
+        "{refusal}"
+    );
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (D1, accepted as a named
+/// KVM gap until N8a): Linux's choice counts a thread waiting where it
+/// interrupts the wait but this backend cannot (a futex wait), and the
+/// backend's choice passes over it, so that a thread that can take the copy
+/// does. The two choices are computed apart, the second only to name the
+/// difference at DEBUG (`note_alarm_generation`).
+#[test]
+fn the_linux_choice_differs_from_the_backends_only_by_the_named_gap() {
+    use AlarmThread::*;
+    let t = DetTid::from_raw;
+    for (threads, linux, backend) in [
+        (&[FutexWait, Pause][..], Some(t(100)), Some(t(101))),
+        (&[FutexWait][..], Some(t(100)), None),
+        (
+            &[OutsideWithUnknownRejoin, Runnable][..],
+            Some(t(100)),
+            Some(t(101)),
+        ),
+        (&[Runnable, Pause][..], Some(t(100)), Some(t(100))),
+        (
+            &[Blocks, FutexWait, Runnable][..],
+            Some(t(101)),
+            Some(t(102)),
+        ),
+    ] {
+        let (s, b, _) = choose_alarm_receiver(threads, None);
+        let recipients = b
+            .alarm_recipients(task(100, 100).process)
+            .expect("recipients");
+        let pid = DetPid::from_raw(100);
+        assert_eq!(
+            s.alarm_receiver_and_walk(pid, &recipients, AlarmReachRule::Linux)
+                .0,
+            linux,
+            "{threads:?}"
+        );
+        assert_eq!(s.alarm_receiver(pid, &recipients), backend, "{threads:?}");
+    }
 }

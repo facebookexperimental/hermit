@@ -340,6 +340,7 @@ static SIGNAL_PERMITS_PER_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GROUP_EXIT_SIGNAL_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PARKED_WAIT_THEN_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PARKED_READ_SIGNAL_THEN_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static ALARM_RECEIVER_REACH_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_SPINNER_AND_NEW_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_DESYNC_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(target_arch = "x86_64")]
@@ -3643,6 +3644,32 @@ fn branch_free_race_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "branch-free-race guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn alarm_receiver_reach_guest() -> &'static Path {
+    ALARM_RECEIVER_REACH_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("alarm-receiver-reach");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the alarm-receiver-reach guest directory");
+        let guest = build_root.join("alarm_receiver_reach");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/alarm_receiver_reach.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the alarm-receiver-reach guest");
+        assert!(
+            output.status.success(),
+            "alarm-receiver-reach guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -25180,16 +25207,16 @@ fn run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec() {
     }
 }
 
-/// tests/c/parked_read_signal_then_exec.c on KVM: a parked pipe read that an
-/// ignored real-timer SIGALRM is observed in and resumes, then a sibling's
-/// SIGUSR2 wakes before the read's next turn; the read restarts, completes
-/// when the sibling writes, and the reader execs. The signal wake replaced
-/// the read's request, and the parked ownership of the replaced request
-/// outlived it. Once Detcore let reverie-kvm skip the empty signal boundary
-/// after the restart, nothing removed that ownership, and the exec was
-/// refused ("KVM parked signal protocol failed ... Identity"): the run printed
-/// only the first line, and the image after exec never ran. The scheduler now
-/// retires that ownership when it replaces the request
+/// tests/c/parked_read_signal_then_exec.c on KVM: a parked pipe read during
+/// which an ignored real-timer SIGALRM expires, then a sibling's SIGUSR2
+/// wakes before the read's next turn; the read restarts, completes when the
+/// sibling writes, and the reader execs. The signal wake replaced the read's
+/// request, and the parked ownership of the replaced request outlived it.
+/// Once Detcore let reverie-kvm skip the empty signal boundary after the
+/// restart, nothing removed that ownership, and the exec was refused ("KVM
+/// parked signal protocol failed ... Identity"): the run printed only the
+/// first line, and the image after exec never ran. The scheduler now retires
+/// that ownership when it replaces the request
 /// (`retire_replaced_parked_request`). Each run must print Linux's two lines
 /// and reach bitwise parity with INFO messages compared.
 ///
@@ -25200,6 +25227,17 @@ fn run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec() {
 /// SIGUSR2 with SA_RESTART, so the wake, its replacement of the parked
 /// request and the restart still happen, and the path under test is checked
 /// there.
+///
+/// The reader is the leader and leaves the ignored SIGALRM unblocked, so
+/// Linux discards the expiry as it is generated, and so does KVM since
+/// https://github.com/rrnewton/hermit/issues/4929; before, KVM queued the
+/// copy, observed the read for it and resumed the same wait, and this test
+/// required that observation. The state the observation left, a resumed
+/// read the scheduler owns, cannot arise for this leader under Linux's
+/// rules; the `nonleader` modes below build it, and the unit tests
+/// (`a_signal_replacing_a_resumed_parked_read_leaves_no_ownership_after_its_grant`
+/// and its neighbours in scheduler::parked_tests) keep covering its
+/// retirement.
 #[test]
 fn run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec() {
     if kvm_unavailable("run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec") {
@@ -25250,13 +25288,13 @@ fn run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec() {
         }
 
         // The run took the path under test, read from its INFO log: while the
-        // reader's first one-byte `read` is still in flight, the alarm is
-        // handled (only a parked observation reaches a thread inside a call).
+        // reader's first one-byte `read` is still in flight, the expiry is
+        // discarded at generation, with no SIGALRM taken inside the read.
         // With SIGUSR2 caught, the SIGUSR2 wake then replaces the read's
         // request (its `WaitidSignals` grant), and the read returns
         // ERESTARTSYS to be restarted. With it blocked, nothing wakes the
         // read, which returns the byte. A schedule that avoided the
-        // observation or the replacement would no longer cover it.
+        // replacement would no longer cover it.
         let mut args = vec![
             "--log=info",
             "--backend=kvm",
@@ -25282,11 +25320,21 @@ fn run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec() {
                 .iter()
                 .position(|line| line.contains("finish syscall") && is_read(line))
                 .expect("the reader's first read finishes in the INFO log");
-        let observed = lines[start..finish]
+        let discarded = lines[start..finish]
             .iter()
-            .position(|line| line.contains("handling inbound signal (#0) SIGALRM"))
-            .expect("the alarm was not observed inside the read");
-        let woken = lines[start + observed..finish]
+            .position(|line| {
+                line.contains(
+                    "SIGALRM expired while its leader ignores it; discarded at generation",
+                )
+            })
+            .expect("the ignored expiry was not discarded at generation inside the read");
+        assert!(
+            !lines[start..finish]
+                .iter()
+                .any(|line| line.contains("handling inbound signal (#0) SIGALRM")),
+            "{mode:?}: a SIGALRM was taken inside the read, where Linux discards the expiry"
+        );
+        let woken = lines[start + discarded..finish]
             .iter()
             .any(|line| line.contains("WaitidSignals([SigWrapper(12)])"));
         if mode.is_some() {
@@ -25297,7 +25345,7 @@ fn run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec() {
             );
             assert!(
                 woken,
-                "the SIGUSR2 wake did not replace the read's request after the observation"
+                "the SIGUSR2 wake did not replace the read's request after the discard"
             );
         } else {
             assert!(
@@ -25308,6 +25356,1456 @@ fn run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec() {
             assert!(!woken, "the blocked SIGUSR2 woke the read");
         }
     }
+}
+
+/// tests/c/parked_read_signal_then_exec.c's `nonleader` modes on KVM
+/// (<https://github.com/rrnewton/hermit/issues/4929>, review round 1): the
+/// end-to-end witness that the leader case above lost when KVM began
+/// discarding the leader's ignored expiry at generation, as Linux does. Here
+/// a second thread reads, and the main thread blocks SIGALRM before it arms
+/// the timer, so Linux keeps the expiry (the main thread, which `it_real_fn`
+/// names, blocks it: `sig_ignored`, kernel/signal.c:113-114 at v6.17) and
+/// wakes the reader, the one thread that wants it (`complete_signal`). On KVM
+/// the scheduler observes the reader's parked read for the copy, which is
+/// ignored, so the read resumes the same wait under the ownership the
+/// observation left.
+///
+/// In `nonleader-caught` the worker's SIGUSR2, which the reader catches with
+/// SA_RESTART, then replaces that request with a signal wake, which must
+/// retire that ownership (`retire_replaced_parked_request`). Its INFO log
+/// must show the observation inside the read before the wake that replaced
+/// it, and its parked-module DEBUG record the retirement: KVM refuses an exec
+/// by any thread but the leader, and a thread's exit retires what it owns, so
+/// no exec can witness a stale ownership left on this reader. In `nonleader`
+/// the reader blocks SIGUSR2, which since SIGSHARE S2 wakes no KVM read, as on
+/// ptrace: the read resumes after the observation and returns the byte.
+/// Each run must print Linux's two lines at bitwise parity, with INFO
+/// messages compared.
+#[test]
+fn run_kvm_a_signal_ending_a_resumed_parked_read_retires_its_ownership() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM resumed-parked-read case: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = parked_read_signal_then_exec_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    for (mode, expected) in [
+        (
+            "nonleader",
+            "read: n=1 byte=x\nafter: usr2 pending=0 blocked=1 alrm pending=0\n",
+        ),
+        (
+            "nonleader-caught",
+            "read: n=1 byte=x handled=1\nafter: usr2 pending=0 blocked=0 alrm pending=0\n",
+        ),
+    ] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report = directory.path().join("verify.json");
+        let report_arg = report.to_str().expect("report path should be UTF-8");
+        let args = [
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_arg,
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{mode}");
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(verdict["bitwise_parity"], true, "{mode}: {verdict}");
+        for side in ["left", "right"] {
+            assert!(
+                verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+                "{mode}: no INFO messages compared: {verdict}"
+            );
+        }
+
+        let args = [
+            "--log=info",
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--",
+            guest,
+            mode,
+        ];
+        let mut command = hermit_command(&args);
+        command.env("RUST_LOG", "detcore::scheduler::parked=debug");
+        let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+        assert_success(&output, &args);
+        let log = stderr(&output);
+        let lines: Vec<&str> = log.lines().collect();
+        let is_read = |line: &str| line.contains("read(3, ") && line.contains(", 1) = ");
+        let start = lines
+            .iter()
+            .position(|line| line.contains("inbound syscall: read(3, ") && is_read(line))
+            .expect("the reader's one-byte read is in the INFO log");
+        let finish = start
+            + lines[start..]
+                .iter()
+                .position(|line| line.contains("finish syscall") && is_read(line))
+                .expect("the reader's first read finishes in the INFO log");
+        assert!(
+            !lines[start..finish]
+                .iter()
+                .any(|line| line.contains("discarded at generation")),
+            "{mode}: the expiry the main thread blocks was discarded"
+        );
+        let observed = start
+            + lines[start..finish]
+                .iter()
+                .position(|line| line.contains("handling inbound signal (#0) SIGALRM"))
+                .expect("the alarm was not observed inside the read");
+        let woken = lines[observed..finish]
+            .iter()
+            .any(|line| line.contains("WaitidSignals([SigWrapper(12)])"));
+        if mode == "nonleader-caught" {
+            assert!(
+                lines[finish].contains("Err(Errno(ERESTARTSYS))"),
+                "the first read was not restarted: {}",
+                lines[finish]
+            );
+            let retired = observed
+                + lines[observed..finish]
+                    .iter()
+                    .position(|line| {
+                        line.contains(
+                            "retired the waiting parked ownership of the request a substitute \
+                             replaced",
+                        )
+                    })
+                    .expect("the wake did not retire the resumed read's parked ownership");
+            assert!(
+                lines[retired..finish]
+                    .iter()
+                    .any(|line| line.contains("WaitidSignals([SigWrapper(12)])")),
+                "the SIGUSR2 wake did not replace the read's request after the observation"
+            );
+        } else {
+            assert!(!woken, "{mode}: the blocked SIGUSR2 woke the read");
+        }
+    }
+}
+
+/// Runs tests/c/alarm_receiver_reach.c in `mode` on `backend` (empty for
+/// ptrace) under `run --strict --verify --verify-strict`, checks bitwise
+/// parity with INFO messages compared, and returns its standard output.
+fn alarm_receiver_reach_at_l2(backend: &[&str], mode: &str) -> String {
+    let _guard = hermit_run_guard();
+    let guest = alarm_receiver_reach_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("verify.json");
+    let report_arg = report.to_str().expect("report path should be UTF-8");
+    let mut args: Vec<&str> = backend.to_vec();
+    args.extend([
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report_arg,
+        "--",
+        guest,
+        mode,
+    ]);
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("strict verification wrote no verdict"))
+            .expect("strict verification verdict is valid JSON");
+    assert_eq!(verdict["bitwise_parity"], true, "{mode}: {verdict}");
+    for side in ["left", "right"] {
+        assert!(
+            verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+            "{mode}: no INFO messages compared: {verdict}"
+        );
+    }
+    stdout(&output)
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (review round 1, F1): when
+/// the thread Linux's `complete_signal` chooses for a real-timer SIGALRM, the
+/// leader, which the expiry names, polls a call whose probe never takes a
+/// pending signal (`poll`, `epoll_wait`, a receive), KVM wakes it as Linux's
+/// `signal_wake_up` does (kernel/signal.c:1032 at v6.17): the call fails with
+/// EINTR and the handler runs on the leader, not on the sibling parked in
+/// `pause`. `select`, whose probe takes the signal itself, does the same. With
+/// no other thread the handler still runs, and at SIGALRM's default action
+/// (the `alarm()` watchdog) the process dies of the signal, as Linux ends it
+/// at generation (lines 999-1026). Before, the copy was stranded on the poller
+/// and each of these runs but `select`'s hung; before slice 2, the sibling
+/// took the handler, and the three runs with no sibling hung. Each handled
+/// mode must print Linux's line at bitwise parity, and in each fatal mode
+/// Hermit must die of SIGALRM, as the guest did, in two runs (`--verify`
+/// refuses a run whose guest dies of a signal).
+#[test]
+fn run_kvm_a_polling_alarm_receiver_is_woken_as_linux_wakes_it() {
+    use std::os::unix::process::ExitStatusExt;
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM polling-receiver cases: /dev/kvm is unavailable");
+        return;
+    }
+    for mode in ["poll", "epoll", "recv", "select", "lonepoll", "loneepoll"] {
+        assert_eq!(
+            alarm_receiver_reach_at_l2(&["--backend=kvm"], mode),
+            format!("mode={mode} on_leader=1 eintr=1 n=1\n"),
+            "{mode}"
+        );
+    }
+    let _guard = hermit_run_guard();
+    let guest = alarm_receiver_reach_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    for mode in ["dflepoll", "lonedfl"] {
+        let args = [
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--",
+            guest,
+            mode,
+        ];
+        for run in 0..2 {
+            let output = hermit(&args);
+            assert_eq!(
+                output.status.signal(),
+                Some(libc::SIGALRM),
+                "{mode} run {run}: {output:?}"
+            );
+            assert_eq!(stdout(&output), "", "{mode} run {run}");
+        }
+    }
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (review round 2, finding
+/// A): a woken `poll` or `ppoll` whose signal no handler takes restarts, as on
+/// Linux. There `do_poll` returns -ERESTARTNOHAND (fs/select.c:929-934 at
+/// v6.17), which restarts the call when no handler runs
+/// (arch/x86/kernel/signal.c:344-357) and becomes EINTR when one does, with
+/// or without SA_RESTART (lines 266-270). tests/c/alarm_receiver_reach.c's
+/// `ign*` modes queue an ignored SIGALRM (the leader blocks it) and wake a
+/// second thread waiting in the call: natively, `poll` and `ppoll` return the
+/// byte with no EINTR, `igntpoll`'s restarted poll keeps its end time, and
+/// `epoll_wait` fails with EINTR, which Linux returns for any signal
+/// (fs/eventpoll.c:2069-2070). In `ignperiodic` the timer is periodic: the
+/// waiter's dequeue of each copy restarts it (`dequeue_signal`,
+/// kernel/signal.c:629-636), so it still runs, with no copy pending, when the
+/// leader looks. `rstpoll`'s handler has SA_RESTART, and its poll still fails
+/// with EINTR. Before this, KVM returned EINTR for each restarting mode. Each
+/// must print the native line at bitwise parity.
+#[test]
+fn run_kvm_a_woken_poller_restarts_when_no_handler_runs() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM woken-poller restart cases: /dev/kvm is unavailable");
+        return;
+    }
+    for (mode, expected) in [
+        ("ignpoll", "mode=ignpoll eintr=0 n=1\n"),
+        ("ignppoll", "mode=ignppoll eintr=0 n=1\n"),
+        ("ignepoll", "mode=ignepoll eintr=1 n=1\n"),
+        ("igntpoll", "mode=igntpoll eintr=0 n=0 within_timeout=1\n"),
+        (
+            "ignperiodic",
+            "mode=ignperiodic running=1 pending=0 eintr=0 n=1\n",
+        ),
+        ("rstpoll", "mode=rstpoll on_leader=1 eintr=1 n=1\n"),
+    ] {
+        assert_eq!(
+            alarm_receiver_reach_at_l2(&["--backend=kvm"], mode),
+            expected,
+            "{mode}"
+        );
+    }
+}
+
+/// The ptrace control of `run_kvm_a_woken_poller_restarts_when_no_handler_runs`:
+/// the restarting modes, which ptrace runs as Linux does.
+#[test]
+fn a_woken_poller_restarts_when_no_handler_runs() {
+    for (mode, expected) in [
+        ("ignpoll", "mode=ignpoll eintr=0 n=1\n"),
+        ("ignppoll", "mode=ignppoll eintr=0 n=1\n"),
+        ("igntpoll", "mode=igntpoll eintr=0 n=0 within_timeout=1\n"),
+    ] {
+        assert_eq!(alarm_receiver_reach_at_l2(&[], mode), expected, "{mode}");
+    }
+}
+
+/// The mixed modes of tests/c/alarm_receiver_reach.c and the line native
+/// Linux prints for each. In `mixedshared` the waiter and the leader race for
+/// the caught copy natively, and either line is Linux's: in 10 native runs the
+/// waiter took it in 8 (its poll fails with EINTR) and the leader in 2 (the
+/// waiter's poll is restarted); the line here is the leader's, which ptrace
+/// prints. What Linux never prints is EINTR with the handler on the leader.
+const MIXED_PENDING_CASES: [(&str, &str); 4] = [
+    (
+        "mixedpoll",
+        "mode=mixedpoll first=-1 errno=EINTR eintr=1 usr1=1 on_waiter=1\n",
+    ),
+    (
+        "mixedtaken",
+        "mode=mixedtaken first=1 errno=0 eintr=0 usr1=1 on_waiter=0\n",
+    ),
+    (
+        "mixedusr2",
+        "mode=mixedusr2 first=-1 errno=EINTR eintr=1 usr1=1 on_waiter=1\n",
+    ),
+    (
+        "mixedshared",
+        "mode=mixedshared first=1 errno=0 eintr=0 usr1=1 on_waiter=0\n",
+    ),
+];
+
+/// tests/c/alarm_receiver_reach.c's `mixedlate` and the line native Linux
+/// prints for it: the POSIX timer's SIGUSR1 falls due 1 ms after the ignored
+/// SIGALRM restarted the waiter's poll, and its handler interrupts the
+/// restarted poll.
+const MIXED_LATE: (&str, &str) = (
+    "mixedlate",
+    "mode=mixedlate first=-1 errno=EINTR eintr=1 usr1=1 on_waiter=1\n",
+);
+
+/// The modes of tests/c/alarm_receiver_reach.c whose woken poll, on KVM, finds
+/// a caught SIGALRM pending behind an ignored SIGUSR1 at its return (no other
+/// thread can take the SIGALRM), and the line native Linux prints for each (10
+/// of 10 native runs each): the handler interrupts the poll, which fails with
+/// EINTR, with or without SA_RESTART. In `mixedbehind` the SIGUSR1 comes from
+/// a POSIX timer, which KVM does not wake the poll for
+/// (https://github.com/rrnewton/hermit/issues/4995), while Linux wakes the
+/// poll for it first, drops it, and restarts the poll; the handler has
+/// SA_RESTART; `mixedbehindnors` is the same without SA_RESTART; in
+/// `mixedtgkill` it is a `tgkill` to the waiter, which Linux discards when it
+/// is sent and KVM keeps for its return (the Codex review of round 5).
+const WOKEN_POLL_BEHIND_CASES: [(&str, &str); 3] = [
+    (
+        "mixedbehind",
+        "mode=mixedbehind first=-1 errno=EINTR eintr=1 usr1=1 on_waiter=1\n",
+    ),
+    (
+        "mixedbehindnors",
+        "mode=mixedbehindnors first=-1 errno=EINTR eintr=1 usr1=1 on_waiter=1\n",
+    ),
+    (
+        "mixedtgkill",
+        "mode=mixedtgkill first=-1 errno=EINTR eintr=1 usr1=1 on_waiter=1\n",
+    ),
+];
+
+/// tests/c/alarm_receiver_reach.c's `mixedignterm` and the line it must print:
+/// `mixedignlate` with a POSIX timer's caught SIGTERM due at the same 10 ms,
+/// which only the waiter leaves unblocked. Where SIGALRM is ignored by the time
+/// it is delivered, SIGTERM's handler takes the EINTR. Natively the poll fails
+/// with EINTR in 10 of 10 runs, with both handlers run (8) or SIGTERM's alone
+/// (2), this line.
+const MIXED_IGNORE_TERM: (&str, &str) = (
+    "mixedignterm",
+    "mode=mixedignterm first=-1 errno=EINTR eintr=1 usr1=0 on_waiter=0 term=1\n",
+);
+
+/// The modes of tests/c/alarm_receiver_reach.c in which a 50 ms alarm's
+/// handler, which only counts, interrupts a 100 ms `poll` that the program then
+/// retries on EINTR, and the line each must print: the retry is a new call,
+/// which waits its whole timeout, so the loop ends about 150 ms after the
+/// arming (10 of 10 native runs each, with the guest built against glibc
+/// 2.42). `pollretry` uses libc's `poll()`, `pollretryraw` the raw system call
+/// with zeros in its unused argument registers; the others run the raw loop
+/// in a second thread while the leader blocks SIGALRM, with an ignored SIGUSR1
+/// from a POSIX timer pending ahead of SIGALRM on KVM (`retrybehind`), a
+/// `tgkill` copy KVM keeps (`retrytgkill`), or none (`retryalone`).
+const POLL_RETRY_CASES: [&str; 5] = [
+    "pollretry",
+    "pollretryraw",
+    "retryalone",
+    "retrybehind",
+    "retrytgkill",
+];
+
+/// The line [`POLL_RETRY_CASES`]' `mode` must print.
+fn poll_retry_line(mode: &str) -> String {
+    format!("mode={mode} n=0 eintr=1 handled=1 on_waiter=1 elapsed=150\n")
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (the Codex review of
+/// slice 2, rounds 3 and 4): a woken `poll` is settled by what its return to
+/// user mode delivers, not by the signal it was woken for. Linux's
+/// `get_signal` dequeues the signals pending for the thread that its mask
+/// leaves unblocked, in order and under the signal lock: it drops each
+/// ignored copy and stops at the first handler, which turns do_poll's
+/// -ERESTARTNOHAND (fs/select.c:929-934 at v6.17) into EINTR, SA_RESTART or
+/// not (arch/x86/kernel/signal.c:266-270); with no handler the poll restarts
+/// (lines 344-357). In tests/c/alarm_receiver_reach.c's `mixedpoll` an ignored
+/// SIGALRM and a SIGUSR1 whose handler has SA_RESTART are both pending for the
+/// waiter: the handler runs and the poll fails with EINTR. KVM settled the
+/// poll by the ignored SIGALRM alone, ran the handler, and restarted the poll.
+/// In `mixedtaken` the running leader takes SIGUSR1 first, so the waiter is
+/// woken for the ignored copy alone and restarts: a copy another thread took
+/// does not count. `mixedusr2` and `mixedshared` are Codex's round-4 probes:
+/// the leader unblocks the caught signal as the 10 ms expiry falls due. In
+/// `mixedusr2` the caught SIGUSR2 is the first signal the waiter's return
+/// delivers, and its poll fails with EINTR. In `mixedshared` the ignored
+/// SIGUSR1 comes first and the caught SIGALRM behind it: KVM's delivery of the
+/// SIGUSR1 has a turn of its own, in which the leader took the SIGALRM, and
+/// the waiter's poll, which KVM had already settled from both, failed with
+/// EINTR with no handler run, which Linux never does. KVM now decides from the
+/// first signal the return delivers, at the end of the syscall's handler, and
+/// leaves the rest to the backend's ERESTARTSYS protocol. And
+/// `mixedbehindnors`, where the caught SIGALRM behind the ignored copy has no
+/// SA_RESTART, gets EINTR from that protocol, as on Linux. In `mixedignterm`
+/// the leader ignores SIGALRM while the waiter's delivery of it has its turn,
+/// and SIGTERM, pending behind it, takes the EINTR with its handler (the
+/// Claude and Codex reviews of round 6, which found this refused). Each must
+/// print the native line at bitwise parity. (`mixedlate`, which KVM cannot match yet,
+/// is pinned apart: `run_kvm_a_late_posix_timer_signal_waits_for_the_polls_return_until_4995`;
+/// the combinations KVM refuses are in
+/// `run_kvm_a_woken_poll_linux_would_end_otherwise_is_refused_by_name`.)
+#[test]
+fn run_kvm_a_woken_poll_fails_with_eintr_when_any_handler_runs() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM mixed-signal poll cases: /dev/kvm is unavailable");
+        return;
+    }
+    for (mode, expected) in MIXED_PENDING_CASES
+        .into_iter()
+        .chain([WOKEN_POLL_BEHIND_CASES[1], MIXED_IGNORE_TERM])
+    {
+        assert_eq!(
+            alarm_receiver_reach_at_l2(&["--backend=kvm"], mode),
+            expected,
+            "{mode}"
+        );
+    }
+}
+
+/// A known parity failure, pinned until
+/// https://github.com/rrnewton/hermit/issues/4995 is fixed: KVM never wakes a
+/// polling thread for a POSIX timer's signal other than SIGALRM. In
+/// tests/c/alarm_receiver_reach.c's `mixedlate` the timer's SIGUSR1 falls due
+/// 1 ms after an ignored SIGALRM restarted the waiter's poll; natively (10 of
+/// 10 runs) and on ptrace its handler interrupts the restarted poll, which
+/// fails with EINTR (`MIXED_LATE`). On KVM the SIGUSR1 waits until the poll
+/// returns the byte, and its handler runs then. This holds KVM's line at
+/// bitwise parity, apart from Linux's, so a fix of 4995 fails it, and it must
+/// then be folded into `run_kvm_a_woken_poll_fails_with_eintr_when_any_handler_runs`.
+#[test]
+fn run_kvm_a_late_posix_timer_signal_waits_for_the_polls_return_until_4995() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM late POSIX-timer pin: /dev/kvm is unavailable");
+        return;
+    }
+    let (mode, linux) = MIXED_LATE;
+    let kvm = "mode=mixedlate first=1 errno=0 eintr=0 usr1=1 on_waiter=1\n";
+    assert_ne!(kvm, linux);
+    assert_eq!(alarm_receiver_reach_at_l2(&["--backend=kvm"], mode), kvm);
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (the Codex review of
+/// slice 2, round 5, findings 1 and 2, and Claude's round-5 finding 1): where
+/// KVM's restart protocol would settle a woken `poll` as Linux never does, the
+/// run is refused by name at the delivery that would do it. In
+/// `mixedbehind` and `mixedtgkill` (`WOKEN_POLL_BEHIND_CASES`) a caught
+/// SIGALRM with SA_RESTART is pending behind an ignored SIGUSR1 at the
+/// waiter's return: KVM settles the poll ERESTARTSYS from the first signal,
+/// and its protocol would restart the poll after the handler, where Linux
+/// fails it with EINTR (the round-5 head printed `first=1 errno=0 eintr=0
+/// usr1=1 on_waiter=1` for both). In `mixedignlate` the leader ignores
+/// SIGALRM while the waiter's delivery of it, which settled the poll EINTR,
+/// has its turn: the backend drops the copy and leaves EINTR with no handler
+/// run (the round-5 head printed `first=-1 errno=EINTR eintr=1 usr1=0
+/// on_waiter=0`), where Linux either runs the handler or, seeing the signal
+/// ignored, restarts the poll (natively `first=-1 errno=EINTR eintr=1 usr1=1
+/// on_waiter=1` in 7 and 8 of two sets of 10 runs, `first=1 errno=0 eintr=0
+/// usr1=0 on_waiter=0` in the other 3 and 2); nothing else with a handler is
+/// left at that return, which is the last of its deliveries. In
+/// `mixedtgkillusr2` (the Codex review of round 6) the leader sends the waiter
+/// a SIGUSR2 with SA_RESTART during the ignored copy's delivery, which the
+/// waiter's own queue gives ahead of the pending SIGALRM: its handler would
+/// restart the poll, where Linux's return finds SIGALRM and fails it with
+/// EINTR (natively `first=-1 errno=EINTR` in 10 of 10 runs; 3d1d780c printed
+/// `first=1 errno=0 eintr=0 usr1=1 on_waiter=1 usr2=1`). Each must be refused
+/// by name, with the policy refusal's status; `mixedbehindnors`, whose handler
+/// has no SA_RESTART, and `mixedignterm`, whose return still delivers
+/// SIGTERM's handler, are not refused
+/// (`run_kvm_a_woken_poll_fails_with_eintr_when_any_handler_runs`).
+#[test]
+fn run_kvm_a_woken_poll_linux_would_end_otherwise_is_refused_by_name() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM woken-poll refusal cases: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = alarm_receiver_reach_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let restart = "which has SA_RESTART, while a signal with a handler was pending behind a \
+                   signal with no handler when the call returned";
+    for (mode, refusal) in [
+        (WOKEN_POLL_BEHIND_CASES[0].0, restart),
+        (WOKEN_POLL_BEHIND_CASES[2].0, restart),
+        ("mixedtgkillusr2", restart),
+        (
+            "mixedignlate",
+            "but its return ended with signal 14 delivered with no handler and no handler run",
+        ),
+    ] {
+        let args = [
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "{mode}: {output:?}"
+        );
+        let stderr = stderr(&output);
+        assert!(
+            stderr.contains("hermit: unsupported on the KVM backend: a poll that a signal woke")
+                && stderr.contains(refusal),
+            "{mode}: {output:?}"
+        );
+        assert_eq!(stdout(&output), "", "{mode}");
+    }
+}
+
+/// The ptrace half of `run_kvm_a_woken_poll_fails_with_eintr_when_any_handler_runs`,
+/// and of the refused and pinned KVM cases: `mixedpoll`, `mixedusr2`,
+/// `mixedshared`, `mixedlate`, `mixedbehind`, `mixedbehindnors`,
+/// `mixedtgkill` and `mixedignterm`, which ptrace runs as Linux does,
+/// `mixedignlate`, which ptrace prints as Linux does in 2 or 3 of 10 native
+/// runs (the leader's ignore discards the copy before the waiter takes it, and
+/// the poll restarts), and `mixedtgkillusr2`, whose poll fails with EINTR once,
+/// as in 2 of 10 native runs (in the other 8 the waiter's next poll gets
+/// SIGUSR2's EINTR too). Not
+/// `mixedtaken`: ptrace gives that POSIX timer's SIGUSR1 to the waiting
+/// thread, not to the running leader, which Linux's `complete_signal` chooses
+/// (kernel/signal.c:973-974 at v6.17), so the waiter's poll fails with EINTR
+/// there. That is ptrace's own, older, difference: ptrace leaves the choice of
+/// thread for a timer's process-directed signal to the host kernel, which
+/// finds every guest thread stopped
+/// (https://github.com/rrnewton/hermit/issues/4991).
+#[test]
+fn a_woken_poll_fails_with_eintr_when_any_handler_runs() {
+    for (mode, expected) in [
+        MIXED_PENDING_CASES[0],
+        MIXED_PENDING_CASES[2],
+        MIXED_PENDING_CASES[3],
+        MIXED_LATE,
+    ]
+    .into_iter()
+    .chain(WOKEN_POLL_BEHIND_CASES)
+    .chain([
+        (
+            "mixedignlate",
+            "mode=mixedignlate first=1 errno=0 eintr=0 usr1=0 on_waiter=0\n",
+        ),
+        MIXED_IGNORE_TERM,
+        (
+            "mixedtgkillusr2",
+            "mode=mixedtgkillusr2 first=-1 errno=EINTR eintr=1 usr1=1 on_waiter=1 usr2=1\n",
+        ),
+    ]) {
+        assert_eq!(alarm_receiver_reach_at_l2(&[], mode), expected, "{mode}");
+    }
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (the Claude review of
+/// slice 2, round 6, finding 1): a program that retries a timed `poll` after
+/// a handler's EINTR makes a new call, which Linux gives its whole timeout
+/// again (`do_sys_poll`, fs/select.c at v6.12); only the kernel's
+/// `restart_syscall` resumes the old end time (`do_restart_poll`). From this
+/// change's second round to 3d1d780c, Detcore took the record a `poll`
+/// interrupted by ERESTART_RESTARTBLOCK keeps for that restart for any later
+/// `poll` at the same address with the same arguments, so on ptrace the retry
+/// ended at the first call's end time: `elapsed=100` where Linux, Hermit main
+/// and the slice's base print `elapsed=150`. glibc 2.41 and later pass zeros
+/// in `poll()`'s unused argument registers, as the raw call here does, so
+/// such a retry matches. Each of [`POLL_RETRY_CASES`] must print the native
+/// line at bitwise parity on ptrace; the KVM half is
+/// `run_kvm_a_retried_timed_poll_waits_its_whole_timeout`.
+#[test]
+fn a_retried_timed_poll_waits_its_whole_timeout() {
+    for mode in POLL_RETRY_CASES {
+        assert_eq!(
+            alarm_receiver_reach_at_l2(&[], mode),
+            poll_retry_line(mode),
+            "{mode}"
+        );
+    }
+}
+
+/// The KVM half of `a_retried_timed_poll_waits_its_whole_timeout`. On KVM a
+/// woken `poll` that restarts keeps its end time in a record only its rerun
+/// takes, and a handler without SA_RESTART that fails it with EINTR at a later
+/// delivery of its return drops that record: in `retrybehind` and
+/// `retrytgkill` the ignored SIGUSR1 comes first at the return, and 3d1d780c's
+/// retry ended at the first call's end time (`elapsed=100`). Each of
+/// [`POLL_RETRY_CASES`] must print the native line at bitwise parity.
+#[test]
+fn run_kvm_a_retried_timed_poll_waits_its_whole_timeout() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM retried-poll cases: /dev/kvm is unavailable");
+        return;
+    }
+    for mode in POLL_RETRY_CASES {
+        assert_eq!(
+            alarm_receiver_reach_at_l2(&["--backend=kvm"], mode),
+            poll_retry_line(mode),
+            "{mode}"
+        );
+    }
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (the Codex review of
+/// slice 2, round 3, finding 2): under network recording or replay
+/// (`--record-networking`, `--replay-networking`) every `poll` goes through
+/// the network trace's dispatch, whose fallback for a poll naming no recorded
+/// socket dropped the restart record. `igntpoll`'s poll, restarted on KVM once
+/// the ignored SIGALRM woke it, then waited its whole 100 ms timeout again,
+/// 31 ms past the end the first call had; natively it ends at that end. The
+/// trace's own wait on a recorded socket (`igntchannel`, a TCP peer on the
+/// loopback that sends nothing) failed with EINTR for that ignored copy
+/// instead, and its retry waited the whole timeout again, since the change
+/// that let the scheduler's SIGALRM receiver wake it; base KVM, which never
+/// woke it, printed the native line. Each must print the native line when
+/// recorded and when replayed: `igntpoll` here and in
+/// `a_restarted_poll_keeps_its_deadline_under_network_recording` on ptrace,
+/// `igntchannel` on KVM only (ptrace's recorded-socket wait fails with EINTR
+/// for an ignored copy, at Hermit main too:
+/// https://github.com/rrnewton/hermit/issues/4992). `--record-networking` cannot be combined
+/// with `--verify`, so each recording is one strict run; its replay is
+/// checked at bitwise parity.
+#[test]
+fn run_kvm_a_restarted_poll_keeps_its_deadline_under_network_recording() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM network-recording restart case: /dev/kvm is unavailable");
+        return;
+    }
+    restarted_poll_under_network_recording(&["--backend=kvm"], "igntpoll", None);
+    // The recorded socket's peer: a loopback listener that accepts the
+    // recording's connection and sends nothing. The replay does not connect.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback listener");
+    let port = listener
+        .local_addr()
+        .expect("the listener's address")
+        .port()
+        .to_string();
+    listener
+        .set_nonblocking(true)
+        .expect("make the loopback listener nonblocking");
+    let peer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return Some(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() > deadline {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => return None,
+            }
+        }
+    });
+    restarted_poll_under_network_recording(&["--backend=kvm"], "igntchannel", Some(&port));
+    let accepted = peer.join().expect("the loopback peer panicked");
+    assert!(accepted.is_some(), "the recording never connected");
+}
+
+/// The ptrace half of
+/// `run_kvm_a_restarted_poll_keeps_its_deadline_under_network_recording`,
+/// for `igntpoll`, where the kernel's own restart block keeps the end.
+#[test]
+fn a_restarted_poll_keeps_its_deadline_under_network_recording() {
+    restarted_poll_under_network_recording(&[], "igntpoll", None);
+}
+
+/// Records `mode` (with `port` as its argument, if any) under
+/// `--record-networking` on `backend` (empty for ptrace), then replays the
+/// trace under `--replay-networking` at bitwise parity, and requires the
+/// native line from both.
+fn restarted_poll_under_network_recording(backend: &[&str], mode: &str, port: Option<&str>) {
+    let _guard = hermit_run_guard();
+    let guest = alarm_receiver_reach_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let data = directory.path().join("data");
+    let trace = directory.path().join(format!("{mode}.trace"));
+    let report = directory.path().join("verify.json");
+    let record = format!("--record-networking={}", trace.display());
+    let replay = format!("--replay-networking={}", trace.display());
+    let report_arg = format!("--verify-json={}", report.display());
+    let legs: [&[&str]; 2] = [
+        &[record.as_str()],
+        &[
+            replay.as_str(),
+            "--verify",
+            "--verify-strict",
+            report_arg.as_str(),
+        ],
+    ];
+    for networking in legs {
+        let mut args: Vec<&str> = backend.to_vec();
+        args.extend([
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+        ]);
+        args.extend(networking);
+        args.extend(["--", guest, mode]);
+        args.extend(port);
+        let mut command = hermit_command(&args);
+        command.env("HERMIT_DATA_DIR", &data);
+        let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            format!("mode={mode} eintr=0 n=0 within_timeout=1\n"),
+            "{args:?}"
+        );
+    }
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("the replay wrote no verdict"))
+            .expect("the replay's verdict is valid JSON");
+    assert_eq!(verdict["bitwise_parity"], true, "{mode}: {verdict}");
+    for side in ["left", "right"] {
+        assert!(
+            verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+            "{mode}: no INFO messages compared: {verdict}"
+        );
+    }
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (the Claude review of
+/// slice 2, round 4, finding B): Linux drops a POSIX timer's signal that the
+/// leader leaves unblocked and ignores before it chooses a thread for it
+/// (`send_sigqueue` -> `prepare_signal` -> `sig_ignored`, kernel/signal.c:1966-2030
+/// and 104-123 at v6.12), so the process's `curr_target` stays where it was.
+/// In tests/c/alarm_receiver_reach.c's `ignmove` such a SIGALRM falls due
+/// while the leader waits on a futex word, which KVM passes over (D1), and the
+/// handler of a later SIGALRM runs natively on A (10 of 10 runs), which the
+/// walk from the leader reaches first. KVM ran the receiver choice for the
+/// dropped copy too, moved `curr_target` to B, and ran that handler on B. In
+/// `ignmoveblocked` the leader blocks SIGALRM, so the first copy is queued and
+/// its walk does move `curr_target` to B: the handler runs on B natively (10 of
+/// 10) and on KVM. Each must print the native line at bitwise parity. ptrace
+/// prints `handler_on=B` for `ignmove` at every revision, its own difference
+/// (https://github.com/rrnewton/hermit/issues/4991).
+#[test]
+fn run_kvm_an_ignored_posix_timer_signal_moves_no_receiver_walk() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM ignored POSIX-timer walk cases: /dev/kvm is unavailable");
+        return;
+    }
+    for (mode, expected) in [
+        ("ignmove", "mode=ignmove handler_on=A eintr_a=1 eintr_b=0\n"),
+        (
+            "ignmoveblocked",
+            "mode=ignmoveblocked handler_on=B eintr_a=0 eintr_b=1\n",
+        ),
+    ] {
+        assert_eq!(
+            alarm_receiver_reach_at_l2(&["--backend=kvm"], mode),
+            expected,
+            "{mode}"
+        );
+    }
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (the Claude review of
+/// slice 2, round 4, finding 2, and Codex): a blocking send on a recorded
+/// socket (`--record-networking`) that waits for room, and a SIGALRM that the
+/// scheduler wakes it for. In tests/c/alarm_receiver_reach.c's `sendign` the
+/// copy is ignored (the leader blocks it, so it is queued and wakes the
+/// sender): natively the send stops waiting with nothing sent, the copy is
+/// dropped and the send is made again (`sk_stream_wait_memory`,
+/// net/core/stream.c:137-138 at v6.12; arch/x86/kernel/signal.c:344-357), and
+/// it returns its byte once the peer reads. KVM refused that run by name; it
+/// must now record it, and replay it at bitwise parity, with the native line.
+/// In `sendcaught` a handler takes the copy and the native send fails with
+/// EINTR, which the network record does not model: the recording must be
+/// refused by name, with the policy refusal's status. In `sendlate` the copy is
+/// ignored when the sender is woken, and a handler without SA_RESTART takes
+/// SIGALRM's place during the delivery's turn (natively the send restarts and
+/// returns its byte in 3 of 3 runs, or fails with EINTR if the handler comes
+/// first): KVM's admission of the restart at the wait was stale by then, and
+/// the round-5 head recorded the send failing with EINTR, a recording whose
+/// replay then sent bytes past its end (the Codex review of round 5, finding
+/// 3). The recording must be refused by name, as for `sendcaught`.
+#[test]
+fn run_kvm_a_recorded_send_restarts_for_an_ignored_alarm_and_refuses_a_caught_one() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM recorded-send cases: /dev/kvm is unavailable");
+        return;
+    }
+    // Each peer starts once the run guard is held, so its accept deadline
+    // runs while the recording does.
+    let _guard = hermit_run_guard();
+    let (port, peer) = slow_loopback_peer(std::time::Duration::from_secs(3));
+    blocked_send_under_network_recording(&port);
+    let drained = peer.join().expect("the loopback peer panicked");
+    assert!(
+        drained.is_some_and(|drained| drained > 0),
+        "the recording sent nothing: {drained:?}"
+    );
+
+    let guest = alarm_receiver_reach_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    for mode in ["sendcaught", "sendlate"] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let record = format!(
+            "--record-networking={}",
+            directory.path().join(format!("{mode}.trace")).display()
+        );
+        let (port, peer) = slow_loopback_peer(std::time::Duration::from_secs(3));
+        let args = [
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            record.as_str(),
+            "--",
+            guest,
+            mode,
+            port.as_str(),
+        ];
+        let mut command = hermit_command(&args);
+        command.env("HERMIT_DATA_DIR", directory.path().join("data"));
+        let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "{mode}: {output:?}"
+        );
+        assert!(
+            stderr(&output).contains(
+                "network record does not model a signal interrupting a send that waits for \
+                 buffer space"
+            ),
+            "{mode}: {output:?}"
+        );
+        assert_eq!(stdout(&output), "", "{mode}");
+        let _ = peer.join().expect("the loopback peer panicked");
+    }
+}
+
+/// Records tests/c/alarm_receiver_reach.c's `sendign` with the peer at
+/// 127.0.0.1:`port` under `--record-networking` on KVM, then replays the trace
+/// under `--replay-networking` at bitwise parity, and requires the native line
+/// from both. The caller holds the run guard.
+fn blocked_send_under_network_recording(port: &str) {
+    let guest = alarm_receiver_reach_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let data = directory.path().join("data");
+    let trace = directory.path().join("sendign.trace");
+    let report = directory.path().join("verify.json");
+    let record = format!("--record-networking={}", trace.display());
+    let replay = format!("--replay-networking={}", trace.display());
+    let report_arg = format!("--verify-json={}", report.display());
+    let legs: [&[&str]; 2] = [
+        &[record.as_str()],
+        &[
+            replay.as_str(),
+            "--verify",
+            "--verify-strict",
+            report_arg.as_str(),
+        ],
+    ];
+    for networking in legs {
+        let mut args = vec![
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+        ];
+        args.extend(networking);
+        args.extend(["--", guest, "sendign", port]);
+        let mut command = hermit_command(&args);
+        command.env("HERMIT_DATA_DIR", &data);
+        let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            "mode=sendign n=1 errno=0 handled=0\n",
+            "{args:?}"
+        );
+    }
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("the replay wrote no verdict"))
+            .expect("the replay's verdict is valid JSON");
+    assert_eq!(verdict["bitwise_parity"], true, "sendign: {verdict}");
+    for side in ["left", "right"] {
+        assert!(
+            verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+            "sendign: no INFO messages compared: {verdict}"
+        );
+    }
+}
+
+/// A loopback TCP peer for tests/c/alarm_receiver_reach.c's `send*` modes. It
+/// accepts one connection, with a small receive buffer, so the window a sender
+/// can fill is small; reads nothing for `quiet`, so a blocking send waits for
+/// room meanwhile; then reads until end of file. Returns its port, and a
+/// handle that yields how many bytes it read, or `None` if nothing connected
+/// within 60 s.
+fn slow_loopback_peer(
+    quiet: std::time::Duration,
+) -> (String, std::thread::JoinHandle<Option<usize>>) {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback listener");
+    let small: libc::c_int = 4096;
+    // SAFETY: the listener's socket, and a c_int option of its own size. An
+    // accepted socket takes its receive buffer from the listener.
+    let set = unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&raw const small).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(set, 0, "set the listener's receive buffer");
+    let port = listener
+        .local_addr()
+        .expect("the listener's address")
+        .port()
+        .to_string();
+    listener
+        .set_nonblocking(true)
+        .expect("make the loopback listener nonblocking");
+    let peer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() > deadline {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => return None,
+            }
+        };
+        std::thread::sleep(quiet);
+        stream.set_nonblocking(false).ok()?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .ok()?;
+        let mut drained = 0;
+        let mut buffer = [0u8; 65536];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => return Some(drained),
+                Ok(read) => drained += read,
+            }
+        }
+    });
+    (port, peer)
+}
+
+/// The receive and accept modes of tests/c/alarm_receiver_reach.c and the
+/// line native Linux prints for each.
+const TIMED_RECEIVE_CASES: [(&str, &str); 8] = [
+    ("rcvtimeo", "mode=rcvtimeo first=-1 errno=EINTR\n"),
+    ("rcvtimeorst", "mode=rcvtimeorst first=-1 errno=EINTR\n"),
+    ("rcvuntimed", "mode=rcvuntimed first=-1 errno=EINTR\n"),
+    ("rcvuntimedrst", "mode=rcvuntimedrst first=1 errno=0\n"),
+    ("rcvpartial", "mode=rcvpartial first=3 errno=0\n"),
+    ("rcvalias", "mode=rcvalias first=1 errno=0\n"),
+    ("acctimeo", "mode=acctimeo first=-1 errno=EINTR\n"),
+    ("accuntimed", "mode=accuntimed first=-1 errno=EINTR\n"),
+];
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (the Codex review of
+/// slice 2, round 2, P1): a receive interrupted by a handled signal fails with
+/// EINTR when its socket has a finite SO_RCVTIMEO, whatever the handler's
+/// SA_RESTART, and restarts under SA_RESTART when it has none: Linux reads the
+/// timeout once, at the call's start (net/unix/af_unix.c:2951 at v6.17), and
+/// `sock_intr_errno` (include/net/sock.h:2627-2630) gives -EINTR for a finite
+/// one and -ERESTARTSYS for none (af_unix.c:3012-3013). A receive that has
+/// copied bytes returns them (line 3126). An accept waits by the same timeout
+/// (`skb_recv_datagram`, af_unix.c:1880). tests/c/alarm_receiver_reach.c's
+/// `rcv*` modes cover each class, a partial transfer, and a timeout set
+/// through a dup of the socket while the untimed receive waits, which must
+/// not change the class it began with; its `acc*` modes, a timed accept under
+/// SA_RESTART and an untimed one without. Before this, KVM and ptrace
+/// restarted `rcvtimeorst` and read the handler's byte, and restarted
+/// `acctimeo`'s accept, which then waited for ever. Each must print the
+/// native line at bitwise parity.
+#[test]
+fn run_kvm_a_timed_receive_fails_with_eintr_whatever_its_restart_flag() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM timed-receive cases: /dev/kvm is unavailable");
+        return;
+    }
+    for (mode, expected) in TIMED_RECEIVE_CASES {
+        assert_eq!(
+            alarm_receiver_reach_at_l2(&["--backend=kvm"], mode),
+            expected,
+            "{mode}"
+        );
+    }
+}
+
+/// The ptrace half of `run_kvm_a_timed_receive_fails_with_eintr_whatever_its_restart_flag`.
+#[test]
+fn a_timed_receive_fails_with_eintr_whatever_its_restart_flag() {
+    for (mode, expected) in TIMED_RECEIVE_CASES {
+        assert_eq!(alarm_receiver_reach_at_l2(&[], mode), expected, "{mode}");
+    }
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (the Codex review of
+/// slice 2, round 3, finding 5): under ptrace record and replay a blocking
+/// receive on a socketpair is polled through the recorder, and reaches the
+/// receive class this slice set: an interrupted receive on a socket with a
+/// finite SO_RCVTIMEO fails with EINTR whatever the handler's SA_RESTART
+/// (`rcvtimeorst`), and an untimed one still restarts under SA_RESTART and
+/// reads the handler's byte (`rcvuntimedrst`), as Linux's `sock_intr_errno`
+/// gives (include/net/sock.h:2627-2630 at v6.17). Each must record and replay
+/// with the native line of `TIMED_RECEIVE_CASES`, and the replay must match the
+/// recording under the canonical comparison (`--verify-strict`), with INFO
+/// messages compared on both sides.
+#[test]
+fn a_timed_socketpair_receive_records_and_replays_as_on_linux() {
+    let _guard = hermit_run_guard();
+    let guest = alarm_receiver_reach_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    for (mode, expected) in [TIMED_RECEIVE_CASES[1], TIMED_RECEIVE_CASES[3]] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report = directory.path().join("verify.json");
+        let report_arg = format!("--verify-json={}", report.display());
+        let data_arg = format!("--data-dir={}", directory.path().join("data").display());
+        let args = [
+            "record",
+            "start",
+            "--strict",
+            "--base-env=minimal",
+            "--verify",
+            "--verify-strict",
+            report_arg.as_str(),
+            data_arg.as_str(),
+            "--",
+            guest,
+            mode,
+        ];
+        let mut command = hermit_command(&args);
+        command.env("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH);
+        let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{mode}");
+        assert!(
+            stderr(&output).contains("Success: replay matched recording."),
+            "{mode}: the replay must match the recording: {output:?}"
+        );
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).expect("record --verify wrote no verdict"))
+                .expect("record --verify verdict is valid JSON");
+        assert_eq!(verdict["bitwise_parity"], true, "{mode}: {verdict}");
+        assert_eq!(
+            verdict["comparison"]["strictness"], "canonical",
+            "{mode}: {verdict}"
+        );
+        for side in ["left", "right"] {
+            assert!(
+                verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+                "{mode}: no INFO messages compared: {verdict}"
+            );
+        }
+    }
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (review round 2, finding
+/// B, and the Codex review's sole-futex P1): with SIGALRM at its default
+/// action (the `alarm()` watchdog), Linux ends the process at the expiry,
+/// whatever its threads wait in (`complete_signal`'s fatal path,
+/// kernel/signal.c:999-1027 at v6.17). In tests/c/alarm_receiver_reach.c's
+/// `dfljoin` modes the only thread that wants the signal, the main thread,
+/// waits in `pthread_join`, and in `dflfutex` the only thread waits on a futex
+/// word; KVM cannot interrupt either wait until N8a (D1), and in `dfljoin`
+/// the worker blocks the signal, so KVM has no thread to end the process
+/// through. The copy used to wait: `dfljoin` printed all 100 lines and died
+/// after them, `dfljoinforever` never ended, and `dflfutex` ended as a model
+/// deadlock (exit 121). Now each run is refused by name at the expiry, naming
+/// the unsupported interruption. The `p*` modes take the same expiry from a
+/// POSIX timer (`timer_create`, SIGEV_SIGNAL), whose signal Linux gives a
+/// thread the same way (`posixtimer_queue_sigqueue` calls `complete_signal`,
+/// lines 1943-1953): they behaved as the others did before them, here too,
+/// until the Claude review of slice 2's round 3 (finding 1).
+/// `dflfutexblocked`'s thread blocks the signal, so Linux keeps the copy
+/// pending and the timed wait runs out: no refusal; nor for its POSIX-timer
+/// twin, `pdflfutexblocked`.
+#[test]
+fn run_kvm_a_fatal_alarm_that_d1_passes_over_is_refused_by_name() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM fatal-alarm refusal cases: /dev/kvm is unavailable");
+        return;
+    }
+    for mode in ["dflfutexblocked", "pdflfutexblocked"] {
+        assert_eq!(
+            alarm_receiver_reach_at_l2(&["--backend=kvm"], mode),
+            "futex: timed out\n",
+            "{mode}"
+        );
+    }
+    let _guard = hermit_run_guard();
+    let guest = alarm_receiver_reach_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    for mode in FATAL_ALARM_MODES {
+        let args = [
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{mode}: {output:?}"
+        );
+        let refusal = stderr(&output);
+        assert!(
+            refusal.contains("unsupported on the KVM backend: interrupting a futex wait")
+                && refusal.contains("refusing the run rather than delaying it"),
+            "{mode}: {output:?}"
+        );
+        let printed = stdout(&output);
+        let ticks = printed
+            .lines()
+            .filter(|line| line.starts_with("tick "))
+            .count();
+        assert!(ticks < 100, "{mode}: {ticks} lines before the refusal");
+        assert!(
+            !printed.contains("joined: not killed") && !printed.contains("futex:"),
+            "{mode}: {printed}"
+        );
+    }
+}
+
+/// The modes of tests/c/alarm_receiver_reach.c in which a default-action
+/// SIGALRM, from `ITIMER_REAL` or from a POSIX timer (`p*`), falls due while
+/// the only thread that wants it waits in a futex wait.
+const FATAL_ALARM_MODES: [&str; 6] = [
+    "dfljoin",
+    "dfljoinforever",
+    "dflfutex",
+    "pdfljoin",
+    "pdfljoinforever",
+    "pdflfutex",
+];
+
+/// The ptrace control of `run_kvm_a_fatal_alarm_that_d1_passes_over_is_refused_by_name`:
+/// the process dies of SIGALRM at the expiry, as on Linux, and the blocked
+/// negative case's timed wait runs out.
+#[test]
+fn a_fatal_alarm_ends_a_joining_process_at_the_expiry() {
+    use std::os::unix::process::ExitStatusExt;
+    for mode in ["dflfutexblocked", "pdflfutexblocked"] {
+        assert_eq!(
+            alarm_receiver_reach_at_l2(&[], mode),
+            "futex: timed out\n",
+            "{mode}"
+        );
+    }
+    let _guard = hermit_run_guard();
+    let guest = alarm_receiver_reach_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    for mode in FATAL_ALARM_MODES {
+        let args = [
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGALRM),
+            "{mode}: {output:?}"
+        );
+        let ticks = stdout(&output)
+            .lines()
+            .filter(|line| line.starts_with("tick "))
+            .count();
+        assert!(ticks < 100, "{mode}: {ticks} lines before SIGALRM");
+    }
+}
+
+/// D1 (<https://github.com/rrnewton/hermit/issues/4929>; accepted as a named
+/// KVM gap until N8a): tests/c/alarm_receiver_reach.c's `join` mode, in which
+/// the main thread waits in `pthread_join` (a futex wait) for a worker that
+/// makes system calls until the SIGALRM handler sets a flag. Linux wakes the
+/// main thread, which the expiry names and which wants the signal, so the
+/// handler runs there and the run prints `on_leader=1` (`complete_signal`,
+/// kernel/signal.c:963-997 at v6.17). KVM cannot interrupt a futex wait for a
+/// signal until N8a (`supports_blocked_wait_signal_interruption`), so its
+/// receiver choice passes the main thread over and the handler runs on the
+/// worker: `on_leader=0`. This pins that behaviour at bitwise parity, so that
+/// N8a changes it deliberately, here and in
+/// `kvm_alarm_reaches_a_futex_waiting_main_thread_after_n8a`
+/// (docs/ARCHITECTURE.md, pending the owner's approval). The difference is never
+/// silent: the parked module's DEBUG names it for the copy, the main thread
+/// (dtid 3) as Linux's receiver and the worker (dtid 5) as KVM's. Not INFO,
+/// which `--verify-strict` and the cross-backend parity pass compare. `pjoin`
+/// takes the expiry from a POSIX timer (`timer_create`, SIGEV_SIGNAL), which
+/// Linux gives a thread the same way (`posixtimer_queue_sigqueue` calls
+/// `complete_signal`, kernel/signal.c:1943-1953): the same pass-over, and the
+/// same record, which its copy lacked until the Claude review of slice 2's
+/// round 3 (finding 1).
+#[test]
+fn run_kvm_a_futex_waiting_main_thread_is_passed_over_until_n8a() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM futex-waiting receiver case: /dev/kvm is unavailable");
+        return;
+    }
+    for mode in ["join", "pjoin"] {
+        assert_eq!(
+            alarm_receiver_reach_at_l2(&["--backend=kvm"], mode),
+            format!("mode={mode} on_leader=0 eintr=0 n=0\n")
+        );
+    }
+    let _guard = hermit_run_guard();
+    let guest = alarm_receiver_reach_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    for mode in ["join", "pjoin"] {
+        let args = [
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--",
+            guest,
+            mode,
+        ];
+        let mut command = hermit_command(&args);
+        command.env("RUST_LOG", "detcore::scheduler::parked=debug");
+        let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+        assert_success(&output, &args);
+        let named: Vec<String> = stderr(&output)
+            .lines()
+            .filter(|line| line.contains("KVM gap D1 until N8a"))
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            matches!(named.as_slice(), [line] if line.contains("[dtid 3] SIGALRM for process 3 goes to dtid 5")),
+            "{mode}: {named:?}"
+        );
+    }
+}
+
+/// The N8a flip of `run_kvm_a_futex_waiting_main_thread_is_passed_over_until_n8a`:
+/// Linux's result, which KVM reaches only once it can interrupt a futex wait
+/// for a signal. Remove the `ignore`, and that test, together with D1's
+/// item in docs/ARCHITECTURE.md (pending the owner's approval).
+#[test]
+#[ignore = "N8a: KVM cannot interrupt a futex wait for a signal until supports_blocked_wait_signal_interruption holds there, so D1 passes the waiting main thread over (https://github.com/rrnewton/hermit/issues/4929)"]
+fn kvm_alarm_reaches_a_futex_waiting_main_thread_after_n8a() {
+    assert!(Path::new("/dev/kvm").exists(), "N8a's flip needs /dev/kvm");
+    for mode in ["join", "pjoin"] {
+        assert_eq!(
+            alarm_receiver_reach_at_l2(&["--backend=kvm"], mode),
+            format!("mode={mode} on_leader=1 eintr=0 n=0\n")
+        );
+    }
+}
+
+/// The ptrace control of `run_kvm_a_futex_waiting_main_thread_is_passed_over_until_n8a`:
+/// ptrace wakes the main thread waiting in `pthread_join` for the copy, as
+/// Linux does, from `ITIMER_REAL` (`join`) and from a POSIX timer (`pjoin`).
+#[test]
+fn a_joining_main_thread_takes_the_alarm_as_on_linux() {
+    for mode in ["join", "pjoin"] {
+        assert_eq!(
+            alarm_receiver_reach_at_l2(&[], mode),
+            format!("mode={mode} on_leader=1 eintr=0 n=0\n"),
+            "{mode}"
+        );
+    }
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (review round 1, Codex P1):
+/// two processes with recurring 100 us real timers and handlers, and a third
+/// that only makes 50 system calls (tests/c/alarm_receiver_reach.c's
+/// `twotimers` mode). Each timer process records, once it has taken 300
+/// deliveries, whether the third had finished; on Linux it always has. On KVM
+/// the timer processes' takers once ran first at every selection, and a
+/// delivery that continued a handler's `rt_sigreturn` waited behind the other
+/// process's taker, so the timers fell due again before every return: the run
+/// hung. It must print Linux's line at bitwise parity, here on KVM and in
+/// `recurring_alarms_leave_room_for_a_runnable_worker` on ptrace.
+#[test]
+fn run_kvm_recurring_alarms_leave_room_for_a_runnable_worker() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM recurring-alarm case: /dev/kvm is unavailable");
+        return;
+    }
+    assert_eq!(
+        alarm_receiver_reach_at_l2(&["--backend=kvm"], "twotimers"),
+        "twotimers: worker finished first: 1 1\n"
+    );
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (the Codex review of
+/// slice 2, round 2, P1): a periodic 100 us POSIX timer (`timer_create`,
+/// SIGEV_SIGNAL, SIGALRM) rearms whether or not its copy was taken, so a copy
+/// is pending again at every handler return. In tests/c/alarm_receiver_reach.c's
+/// `posixspin` mode the main thread takes them while it spins on `getppid`,
+/// and three workers that block SIGALRM count their iterations until 300
+/// deliveries. The alarm priority used to put the main thread first again
+/// after every delivery chain, and the workers made 6 iterations; base KVM,
+/// with no alarm priority, made 390. The priority now never serves a delivery
+/// that is not a sigreturn continuation, nor a yield: the workers must make at
+/// least 100. Its third bound, a choice of the run queue's own between any two
+/// grants by alarm priority, is not what this floor checks: no end-to-end
+/// shape tried depends on it, and it is unit-tested only
+/// (`alarm_priority_leaves_room_for_the_run_queues_own_choice`).
+///
+/// One strict run, not a verified pair: the main thread's first turn runs the
+/// whole default slice, 200 ms of virtual time, about 708,000 `getppid` calls,
+/// before the first copy is delivered, and a pair took 25 CPU-seconds on KVM,
+/// past the counted runner's 22 CPU-second cap. Its bitwise parity is measured
+/// apart, in the L2 runs recorded for the change; the same rule is checked at
+/// bitwise parity on every run in
+/// `run_kvm_a_posix_timer_handler_leaves_room_for_every_worker`. In
+/// `posixpoll` the main thread waits in `poll(-1)` instead, and must be woken
+/// for each copy: base KVM never woke it, and the run never ended. Its pair is
+/// cheap, and is verified at bitwise parity.
+#[test]
+fn run_kvm_a_posix_timer_handler_leaves_room_for_workers() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM POSIX-timer liveness case: /dev/kvm is unavailable");
+        return;
+    }
+    let printed = alarm_receiver_reach_at_l2(&["--backend=kvm"], "posixpoll");
+    let (total, _) = posix_worker_progress("posixpoll", &printed);
+    assert!(total >= 20, "posixpoll: {printed:?}");
+    let _guard = hermit_run_guard();
+    let guest = alarm_receiver_reach_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let args = [
+        "--backend=kvm",
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--",
+        guest,
+        "posixspin",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let printed = stdout(&output);
+    let (total, _) = posix_worker_progress("posixspin", &printed);
+    assert!(total >= 100, "posixspin: {printed:?}");
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4929> (the Codex review of
+/// slice 2, round 3, finding 4): the verified pair of
+/// `run_kvm_a_posix_timer_handler_leaves_room_for_workers`'s rule, on every
+/// run. tests/c/alarm_receiver_reach.c's `posixspin200` is `posixspin` with a
+/// `sched_yield` after every 20,000 `getppid` calls, which ends the main
+/// thread's turn, until 200 deliveries: the copies that fell due in a stretch
+/// still come one handler after another, and the continuation limit still
+/// cuts each chain short so the run queue chooses between them, but the run
+/// costs about 2 CPU-seconds for the pair. Each of the three workers must make
+/// progress, and the three at least 30 iterations together, counted from the
+/// moment the timer is armed (the Codex review of round 4: the iterations a
+/// worker makes at start-up are no progress past the deliveries): the head
+/// makes 39, the least of them 13; with the alarm priority serving deliveries
+/// that do not continue a handler's `rt_sigreturn`, as it did before, 11
+/// (least 3); with the continuation limit raised from 32 to 255, 18 (least
+/// 6); and a worker that makes no iteration once the timer is armed gives a
+/// least of 0, where its start-up iterations alone used to give 1. The pair
+/// must match at bitwise parity.
+#[test]
+fn run_kvm_a_posix_timer_handler_leaves_room_for_every_worker() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM POSIX-timer fairness case: /dev/kvm is unavailable");
+        return;
+    }
+    let printed = alarm_receiver_reach_at_l2(&["--backend=kvm"], "posixspin200");
+    let (total, least) = posix_worker_progress("posixspin200", &printed);
+    assert!(
+        total >= 30 && least.is_some_and(|least| least > 0),
+        "posixspin200: {printed:?}"
+    );
+}
+
+/// The workers' total progress, and the least progress of any one where
+/// printed, from a `posix*` mode's line of tests/c/alarm_receiver_reach.c.
+fn posix_worker_progress(mode: &str, printed: &str) -> (u64, Option<u64>) {
+    let number = |text: &str| -> u64 {
+        text.parse()
+            .unwrap_or_else(|_| panic!("{mode}: unexpected output: {printed:?}"))
+    };
+    let rest = printed
+        .trim()
+        .strip_prefix(&format!("{mode}: worker progress before disarm "))
+        .unwrap_or_else(|| panic!("{mode}: unexpected output: {printed:?}"));
+    match rest.split_once(", least ") {
+        Some((total, least)) => (number(total), Some(number(least))),
+        None => (number(rest), None),
+    }
+}
+
+/// The ptrace half of `run_kvm_recurring_alarms_leave_room_for_a_runnable_worker`.
+#[test]
+fn recurring_alarms_leave_room_for_a_runnable_worker() {
+    assert_eq!(
+        alarm_receiver_reach_at_l2(&[], "twotimers"),
+        "twotimers: worker finished first: 1 1\n"
+    );
 }
 
 /// Runs tests/c/chaos_spinner_and_new_thread.c under `--chaos --sched-seed=7`

@@ -58,6 +58,10 @@ https://github.com/rrnewton/hermit/issues/4659.
    One opt-in is approved (owner, 2026-10-15): with `--allow-unsupported-syscalls`
    the run prints the same named refusal and then returns the errno to the
    guest instead of stopping. Without the flag, the run stops.
+   One named semantic gap runs on instead of stopping, until N8a: KVM's
+   SIGALRM receiver passes over a thread waiting where KVM cannot interrupt
+   the wait, and a fatal SIGALRM that this would leave with no receiver is
+   refused by name (D1, below; awaiting the owner's approval).
    Checked by: not yet enforced; see https://github.com/rrnewton/hermit/issues/4485.
 7. **Interchangeability is shown by tests.** The Reverie-level
    native-comparison conformance test runs the same tool on every backend and
@@ -77,6 +81,72 @@ guest sees. Add an item only with the owner's approval and a written reason.
   and re-entry); building and popping the signal frame on the vCPU stack for
   `rt_sigreturn`, while Detcore decides which signal is delivered with which
   mask.
+
+### Pending the owner's approval
+
+One item is not VM mechanics but a named gap in Linux semantics, scoped to one
+decision and retired by one change. It is listed here, not among the approved
+exceptions above, until the owner decides:
+
+- **kvm, D1 (until N8a; awaiting the owner's approval):** when the thread
+  Linux's `complete_signal` would choose to take a timer's SIGALRM (the expiry
+  of an `ITIMER_REAL`, as `alarm()` arms, or of a POSIX timer created with
+  `timer_create` and SIGEV_SIGNAL) waits where KVM cannot interrupt the wait
+  for a signal, KVM's receiver choice passes it over and the copy goes to the
+  next thread that wants it. Such a wait is a futex wait (`pthread_join`,
+  `pthread_cond_wait`, `sem_wait`, a mutex), a call running outside the
+  schedule, or any other wait outside the run queue that the parked-signal
+  observation does not cover (`AlarmReach::OutOfReach`). The pass-over is keyed
+  on the backend's `supports_blocked_wait_signal_interruption`, which KVM
+  lacks. Passing the thread over keeps the run going; choosing it would leave
+  the copy pending, and a program whose handler is what ends the wait would
+  never finish.
+  Consequences:
+  - the handler may run on another thread than on Linux, for example on a
+    worker while the main thread waits in `pthread_join`, so its thread
+    identity, its thread-local state and the code it interrupts differ;
+  - results can differ: a `sem_wait` that Linux ends with -1 and `EINTR`, in
+    a program whose handler posts the semaphore, returns 0 on KVM; glibc's
+    `pthread_join`, `pthread_cond_wait` and mutex waits retry after an
+    interrupted futex wait, so theirs do not;
+  - when a timer expires while SIGALRM is at its default action, which ends
+    the process, the copy is never left pending because the pass-over took
+    away the thread Linux would give it to: where Linux's choice finds a
+    thread and the pass-over leaves none (a lone thread in a futex wait, or a
+    `pthread_join` whose worker blocks SIGALRM), the run is refused at the
+    expiry with a message naming the interruption KVM lacks
+    ([ERROR_CATALOG.md](ERROR_CATALOG.md)), where Linux ends the process at
+    once. An `alarm()` watchdog over a `pthread_join` would otherwise fire
+    only once the join returned, or never, and a lone futex waiter's would
+    end the run as a model deadlock. The check is made at the expiry alone:
+    a copy that a handler would take then, which waits for such a thread
+    because no other thread takes it, is not checked again if the action is
+    later reset to the default: it then stays pending, a fatal signal, as
+    long as that wait lasts, where Linux would have run the handler at the
+    expiry;
+  - of the fatal copies the check lets through, one is still delayed: where
+    the pass-over leaves it to a vfork parent, it waits there for the vfork
+    to end, while Linux, which chooses the waiter, ends the process at once.
+  DEBUG names every passed-over copy, with Linux's receiver beside KVM's. A
+  copy Linux drops when it is sent, one the leader ignores and leaves
+  unblocked, is not queued on KVM either while the leader is alive, and is
+  passed over by no one (an exited leader's mask is not read, a gap that
+  predates this change; see `Scheduler::discarded_when_sent_to`).
+  Not part of D1, and not named by it: a thread in a child wait (`wait4`,
+  `waitid`) is not among the threads KVM reports as able to take SIGALRM, so
+  no choice reaches it, and the wait runs to the child's exit where Linux ends
+  it with `EINTR`; that pre-existing KVM gap is
+  https://github.com/rrnewton/hermit/issues/4985.
+  `run_kvm_a_futex_waiting_main_thread_is_passed_over_until_n8a` pins the
+  pass-over and `run_kvm_a_fatal_alarm_that_d1_passes_over_is_refused_by_name`
+  the refusal; `kvm_alarm_reaches_a_futex_waiting_main_thread_after_n8a`,
+  ignored until then, holds Linux's result. Retired by N8a: once KVM
+  interrupts such a wait for a signal and declares
+  `supports_blocked_wait_signal_interruption`, the choice counts the waiter as
+  Linux does (the pin test fails until it is flipped), and N8a's interruption
+  takes the copy there. Accepted by the coordinator's decision of 2026-10-30
+  (https://github.com/rrnewton/hermit/issues/4929); awaiting the owner's
+  approval, which an approved exception requires.
 
 ## System overview
 

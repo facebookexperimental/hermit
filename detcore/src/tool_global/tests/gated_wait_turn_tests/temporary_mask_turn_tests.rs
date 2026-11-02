@@ -1110,6 +1110,7 @@ async fn poll_retries_refresh_guest_held_authority_after_a_parked_fd_replacement
                                 .with_fds(AddrMut::from_raw(memory.at(FormMemory::SET)))
                                 .with_nfds(1)
                                 .with_timeout(-1),
+                            None,
                         )
                         .await
                     }

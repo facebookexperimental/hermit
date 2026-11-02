@@ -1371,13 +1371,18 @@ fn remaining_poll_millis(now: Instant, end: Instant) -> i32 {
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// poll syscall (MAYHANG)
+    ///
+    /// `restart` is the record the thread's previous syscall kept for its
+    /// restart, if any: a woken `poll` that runs again after `ERESTARTSYS`
+    /// keeps its deadline there (`keep_deadline_for_rerun`). Only such a
+    /// rerun record is taken here.
     // TODO-HUMAN-REVIEW(PR-1023): Review zero-timeout poll scheduling across backends.
     #[cfg(target_arch = "x86_64")]
-    pub async fn handle_poll<G: Guest<Self>>(
+    pub(crate) async fn handle_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
-
         call: syscalls::Poll,
+        restart: Option<crate::syscalls::helpers::RestartBlock>,
     ) -> Result<i64, Error> {
         if self.cfg.sequentialize_threads && call.timeout() == 0 {
             // This cannot block, but still yield a scheduler turn so a polling thread cannot
@@ -1404,6 +1409,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             let deadline = kernel_poll_deadline(&call, self.cfg.recordreplay_modes);
             Ok(self.handle_external_poll(guest, call, deadline).await?)
         } else {
+            // A woken `poll` that runs again after `ERESTARTSYS` waits until the
+            // deadline it kept, not for its whole timeout again. Only that
+            // rerun's record is taken (`RestartBlock::rerun_deadline`): a
+            // record kept for the kernel's `restart_syscall` is not, so a
+            // program's own retry after EINTR waits its whole timeout.
+            if let Some(block) = restart {
+                let rip = crate::arch::instruction_pointer(&guest.regs().await);
+                if let Some(deadline) = block.rerun_deadline(rip, call) {
+                    return self.handle_internal_poll_until(guest, call, deadline).await;
+                }
+            }
             // TODO:
             // if is-external-poll { self.handle_external_poll(guest, call) }
             self.handle_internal_poll(guest, call).await
@@ -2029,6 +2045,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         resources.poll_deadline = poll_deadline_for(guest, deadline);
         if gated {
             resources.blocked_signal_mask = sigmask;
+        } else if self.cfg.backend.provides_process_signal_control && self.cfg.sequentialize_threads
+        {
+            // Where the backend controls the guest's signals (KVM), its
+            // `blocked` set between probes is the thread's own mask, while
+            // Linux's is the call's for the whole call (`set_user_sigmask`).
+            // The scheduler reads the call's from this request where it
+            // decides by the thread's mask: a SIGALRM expiry's discard at
+            // generation and the choice of the thread that takes it
+            // (`signal_state_reader`, https://github.com/rrnewton/hermit/issues/4929).
+            // The scheduler's records leave it out of the request they print,
+            // so the canonical INFO stream reads the same here as on ptrace
+            // (`Scheduler::logged_polling_request`).
+            resources.blocked_signal_mask =
+                sigmask.map(crate::syscalls::signal::kernel_installed_signal_mask);
         }
         // Keep the request metadata accurate, but do not make it eligible for
         // the scheduler's ERESTARTSYS wakeup. A cross-task signal must first be
@@ -3639,7 +3669,51 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.polls_guest_state_only = rsrc.relies_on_guest_held_marks;
         let result = retry_nonblocking_syscall_with_timeout(guest, call, rsrc, deadline).await;
         keep_restart_block(guest, &result, RestartCall::Poll(call), deadline).await;
+        self.keep_deadline_for_rerun(guest, &result, call, deadline)
+            .await;
         result
+    }
+
+    /// Where a signal woke this `poll` and no handler ran, Linux restarts it
+    /// through its restart block, which keeps the call's end time
+    /// (`do_restart_poll`; fs/select.c:1076-1090 at v6.17). A backend with a
+    /// process signal control (KVM) restarts it by running the guest's own
+    /// `poll` again after `ERESTARTSYS` (`woken_poll_errno`), with the timeout
+    /// the guest passed, so the deadline is kept here, in the thread's restart
+    /// record, as a rerun record (`RestartCall::PollRerun`), for that next run
+    /// of the same call at the same address ([`Self::handle_poll`], or
+    /// `network_poll` under network recording or replay, which passes the
+    /// record on; neither takes a record of any other kind), which then ends
+    /// when the first would have
+    /// (<https://github.com/rrnewton/hermit/issues/4929>). Any other syscall
+    /// first discards the record, as it discards one kept for
+    /// `restart_syscall`. A call whose errno is settled again at its return
+    /// keeps the record whichever errno it ends with here. The settling drops
+    /// it where it decides EINTR (`syscalls::helpers::settle_woken_wait_at_return`),
+    /// and so does a delivery at that return whose handler the backend fails
+    /// the call with EINTR for, a handler without `SA_RESTART`
+    /// (`syscalls::helpers::check_woken_wait_delivery`): the program's next
+    /// `poll` is then its own, and waits its whole timeout.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) async fn keep_deadline_for_rerun<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        result: &Result<i64, Error>,
+        call: syscalls::Poll,
+        deadline: Option<LogicalTime>,
+    ) {
+        if self.cfg.backend.provides_process_signal_control
+            && deadline.is_some()
+            && (guest.thread_state().woken_wait == crate::syscalls::helpers::WokenWait::Poll
+                || matches!(result, Err(Error::Errno(errno)) if *errno == Errno::ERESTARTSYS))
+        {
+            let rip = crate::arch::instruction_pointer(&guest.regs().await);
+            guest.thread_state_mut().restart_block = Some(crate::syscalls::helpers::RestartBlock {
+                rip,
+                deadline,
+                call: RestartCall::PollRerun(call),
+            });
+        }
     }
 
     /// Handle a poll syscall that deponds on external, nondeterminstic IO.

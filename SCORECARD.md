@@ -84,7 +84,7 @@ Each row below is a test that a validation node does not yet require on its back
 
 ### `privileged-test.deadline_slice_cap_kvm` (`--backend=kvm`)
 
-**40** required tests must pass; **4** known gaps (4 skipped, not run), from `hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv`:
+**41** required tests must pass; **4** known gaps (4 skipped, not run), from `hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv`:
 
 | Test | Gap | Tracking issue | Must fail with | Status |
 | --- | --- | --- | --- | --- |

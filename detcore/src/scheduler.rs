@@ -710,6 +710,18 @@ pub struct BlockedPool {
     /// An entry lives exactly as long as the thread's blocking-pool entry.
     pub out_of_scheduler_masks: BTreeMap<DetTid, Option<u64>>,
 
+    /// Where a process signal control is installed (KVM), the temporary mask
+    /// of each call in `external_io_blockers` or `rt_sigsuspend_blockers`
+    /// that runs under one, recorded when the scheduler released the call:
+    /// the request's `Resources::blocked_signal_mask`, or `None` where the
+    /// request said the mask is unknown. A call under the thread's own mask
+    /// has no entry. The signal state reader takes the mask from here while
+    /// the thread runs outside the schedule, whose filed request is empty or
+    /// a rejoin host timing filed (`Scheduler::controlled_temporary_mask`,
+    /// <https://github.com/rrnewton/hermit/issues/4929>). An entry lives
+    /// exactly as long as the thread's blocking-pool entry.
+    pub controlled_background_masks: BTreeMap<DetTid, Option<u64>>,
+
     /// The mask a thread readmitted from a blocking pool is stopped under
     /// until its continuation turn is granted, when a signal ended its call:
     /// the call's temporary mask (`pselect6`, `ppoll`, `epoll_pwait`), which
@@ -10238,6 +10250,7 @@ impl Scheduler {
         self.blocked.replay_log_served.remove(dtid);
         let _ = self.blocked.rt_sigsuspend_blockers.remove(dtid);
         let _ = self.blocked.out_of_scheduler_masks.remove(dtid);
+        let _ = self.blocked.controlled_background_masks.remove(dtid);
         let _ = self.blocked.continuation_masks.remove(dtid);
         let _ = self.background_entry_barriers.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
@@ -16344,6 +16357,7 @@ impl Scheduler {
     /// so readers take the kernel's `SigBlk`, which is then the guest's own.
     fn keep_mask_for_continuation(&mut self, dtid: DetTid) {
         let _ = self.blocked.out_of_scheduler_masks.remove(&dtid);
+        let _ = self.blocked.controlled_background_masks.remove(&dtid);
         let filed = self
             .next_turns
             .get(&dtid)
@@ -18596,10 +18610,52 @@ impl Scheduler {
             // the shared queue for the first thread that resumes and does not
             // block it (`process_signal_takers`).
             let process_taker = self.first_process_signal_taker();
-            let next_dtid = match self
-                .queued_group_exit_decider()
+            // So does the thread Linux's `complete_signal` chooses for a
+            // SIGALRM pending in its process's shared queue, where a process
+            // signal control is installed (`alarm_takers`,
+            // https://github.com/rrnewton/hermit/issues/4929), with three
+            // bounds. Linux wakes the receiver; it does not run it ahead of
+            // every other runnable thread, nor between another thread's
+            // `rt_sigreturn` and the delivery that return makes. So it never
+            // makes two grants without a choice of the run queue's own
+            // between, for the same process or another
+            // (`alarm_priority_available`): two processes whose recurring
+            // timers fall due again within each other's grants otherwise
+            // alternated their takers for ever, and a process whose POSIX
+            // timer rearms whether or not its copy was taken kept its own
+            // taker first, while a runnable thread never ran (the Codex
+            // reviews of 4929 slice 2, P1). It never serves a delivery that
+            // does not continue its thread's own `rt_sigreturn`, which waits
+            // behind the other runnable threads by design, nor a
+            // `sched_yield` (`takes_alarm_priority`). And it waits while a
+            // delivery continues its thread's own `rt_sigreturn`
+            // (`first_sigreturn_continuation`): run between the two, another
+            // process's grant advanced time far enough that the returning
+            // thread's own timer fell due again before every return, and
+            // neither process ran its own code again
+            // (https://github.com/rrnewton/hermit/issues/4505's livelock,
+            // across processes).
+            // Asked only while a taker exists: a run with no process signal
+            // control (ptrace) never has one, and selects as before.
+            let alarm_taker = if self.parked.alarm_takers.is_empty()
+                || self.first_sigreturn_continuation().is_some()
+            {
+                None
+            } else {
+                self.first_alarm_taker_entry()
+            };
+            let decider = self.queued_group_exit_decider();
+            let by_alarm = decider.is_none() && taker.is_none() && process_taker.is_none();
+            let alarm_taker = alarm_taker.map(|(pid, thread)| {
+                if by_alarm {
+                    self.parked.alarm_priority_served = Some(pid);
+                }
+                thread
+            });
+            let next_dtid = match decider
                 .or(taker)
                 .or(process_taker)
+                .or(alarm_taker)
                 .or(gated_child)
             {
                 Some(child) => self
@@ -18620,10 +18676,15 @@ impl Scheduler {
                         .run_queue
                         .tentative_pop_tid(thread)
                         .expect("selected thread disappeared from run queue"),
-                    None => self.run_queue.tentative_pop_next().expect("impossible"),
+                    None => {
+                        self.parked.alarm_priority_served = None;
+                        self.run_queue.tentative_pop_next().expect("impossible")
+                    }
                 },
             };
             self.replay_prehook_callers.remove(&next_dtid);
+            // A woken poller's substituted delivery is served once.
+            self.parked.alarm_woken.remove(&next_dtid);
             let nextturn = self.next_turns.get(&next_dtid).unwrap_or_else(|| {
                 panic!(
                 "[sched-step3] internal error: dettid {} queued but missing entry in next_turns",
@@ -18771,7 +18832,9 @@ impl Scheduler {
             // The thread is polling and hasn't been "remade" as runnable yet.
             info!(
                 "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, SKIP dettid {} polling resource {:?}",
-                self.turn, dettid, rs
+                self.turn,
+                dettid,
+                self.logged_polling_request(rs)
             );
             // Requeue the thread as a poller
             let popped = self.run_queue.commit_tentative_pop();
@@ -19042,6 +19105,26 @@ impl Scheduler {
                     .models_signal_targets
                     .then(|| self.read_thread_blocked_mask(dettid))
                     .flatten();
+                // Where a process signal control is installed, a call's temporary
+                // mask, read from its request while the thread is still
+                // stopped at it (`controlled_background_masks`).
+                let controlled_background_mask = self
+                    .signal_control_installed()
+                    .then(|| {
+                        let unknown = self
+                            .next_turns
+                            .get(&dettid)
+                            .and_then(|turn| turn.req.try_read())
+                            .is_some_and(|request| {
+                                request.is_ok_and(|request| request.blocked_signal_mask_unknown)
+                            });
+                        if unknown {
+                            Some(None)
+                        } else {
+                            blocked_signal_mask.map(Some)
+                        }
+                    })
+                    .flatten();
                 let sleeping_mask = if self.models_signal_targets {
                     Some(blocked_signal_mask.or(own_mask))
                 } else if self.in_guest_signal_delivery {
@@ -19083,6 +19166,11 @@ impl Scheduler {
                 assert!(old.is_none(), "thread started a second external operation");
                 self.background_call_processes
                     .insert(self.sigchld_process(dettid));
+                if let Some(mask) = controlled_background_mask {
+                    self.blocked
+                        .controlled_background_masks
+                        .insert(dettid, mask);
+                }
                 if let Some(mask) = sleeping_mask {
                     self.blocked.out_of_scheduler_masks.insert(dettid, mask);
                     let descriptors = !matches!(rid, ResourceID::BlockingRtSigsuspend(_));

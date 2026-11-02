@@ -881,6 +881,23 @@ fn itimer_mixed_masks_keep_the_timer_running() {
     assert!(field(&native, "positive") >= 1, "native: {native}");
 }
 
+/// The thread Linux's `complete_signal` gives an expiry: it tries the
+/// leader, which `it_real_fn` names, first, and a computing leader that
+/// leaves SIGALRM unblocked wants it, so the handler runs on the leader and a
+/// sibling waiting in `pause` with SIGALRM unblocked is not woken
+/// (https://github.com/rrnewton/hermit/issues/4929).
+#[test]
+fn itimer_the_leader_takes_the_expiry_before_a_paused_sibling() {
+    let guest = fixture(&ITIMER_COALESCE, "itimer_coalesce");
+    for stdout in [
+        run_strict(guest, &["receiver", "5000"], &[]).0,
+        run_native(&["receiver", "50000"]),
+    ] {
+        assert_eq!(field(&stdout, "on_leader"), 1, "{stdout}");
+        assert_eq!(field(&stdout, "sibling_woken"), 0, "{stdout}");
+    }
+}
+
 /// SIG_IGN set while SIGALRM is blocked: the expiry queues, and unblocking
 /// dequeues and discards the ignored copy, which restarts the timer.
 #[test]

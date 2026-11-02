@@ -1439,6 +1439,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Ends the run with the named refusal `refusal` of a woken wait's return
+    /// (`settle_woken_wait_at_return`, `check_woken_wait_delivery`), printed
+    /// as it is, with the policy refusal's status, as `Detcore::network_refuse`
+    /// ends one.
+    async fn refuse_at_woken_return<G: Guest<Self>>(guest: &mut G, refusal: &str) -> ! {
+        tracing::error!("[dtid {}] {}", guest.thread_state().dettid, refusal);
+        eprintln!("{refusal}");
+        unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT).await
+    }
+
     /// The completion of a syscall that can resume the guest (a result or an
     /// errno, not a backend failure): in a process that handles SIGALRM, a due
     /// entry is delivered here, where Linux would deliver a signal that became
@@ -1800,6 +1810,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             #[cfg(target_arch = "x86_64")]
             syscalls::helpers::RestartCall::KernelPoll(poll, deadline) => {
                 self.resume_kernel_poll(guest, poll, deadline, call).await
+            }
+            // A woken poll's rerun record serves only that rerun
+            // (`RestartBlock::rerun_deadline`), never the kernel's restart.
+            #[cfg(target_arch = "x86_64")]
+            syscalls::helpers::RestartCall::PollRerun(_) => {
+                self.handle_unsupported_syscall(guest, call, dettid, panic_on_unsupported_syscalls)
+                    .await
             }
             syscalls::helpers::RestartCall::Futex(futex) => {
                 self.handle_futex_from(
@@ -5131,6 +5148,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             post_crash::note_delivery(guest, signal as i32).await;
             crate::syscalls::signal_shadow::check_and_record_delivery(guest, signal as i32).await;
         }
+        // After the callback's last scheduling point: a delivery at the
+        // return of a woken wait, checked against its settlement.
+        if let Some(refusal) = crate::syscalls::helpers::check_woken_wait_delivery(
+            guest,
+            signal as i32,
+            delivered.is_some(),
+        )
+        .await
+        {
+            Self::refuse_at_woken_return(guest, &refusal).await
+        }
         Ok(delivered.map(|_| signal))
     }
 
@@ -5151,6 +5179,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // dispositions applies the delivery (`handle_signal_event`).
             post_crash::note_delivery(guest, signal).await;
             crate::syscalls::signal_shadow::check_and_record_delivery(guest, signal).await;
+        }
+        if let Some(refusal) =
+            crate::syscalls::helpers::check_woken_wait_delivery(guest, signal, delivered.is_some())
+                .await
+        {
+            Self::refuse_at_woken_return(guest, &refusal).await
         }
         Ok(delivered.map(|signal| signal.raw()))
     }
@@ -5784,6 +5818,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                     // A new thread has made no syscall yet.
                     restart_block: None,
+                    woken_wait: Default::default(),
                     syscall_cwd: None,
                     // A fork child inherits its parent's signal dispositions.
                     sigalrm_handled: pts.1.sigalrm_handled,
@@ -6582,6 +6617,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // so the record a wait kept for it lives only until then
             // (`handle_restart_syscall`).
             let restart_block = guest.thread_state_mut().restart_block.take();
+            // Only this call's own woken wait is settled at its return
+            // (`settle_woken_wait_at_return`, below), and checked against the
+            // deliveries there (`check_woken_wait_delivery`).
+            guest.thread_state_mut().woken_wait = Default::default();
             // A working directory read for the previous syscall may be stale by
             // now (`ThreadState::syscall_cwd`).
             guest.thread_state_mut().syscall_cwd = None;
@@ -6941,9 +6980,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     }
                     result
                 }
-                // Outbound TCP channels under a network trace mode; never with no mode.
+                // Outbound TCP channels under a network trace mode; never with no
+                // mode. In its own box, allocated only under a network trace
+                // mode, since it carries the restart record into `poll` and its
+                // wait on a recorded socket (`syscall_hot_path_tests` bounds this
+                // handler's future).
                 _ if self.network_trace_owns(guest, &call) => {
-                    self.handle_network_trace_syscall(guest, call).await
+                    Box::pin(self.handle_network_trace_syscall(guest, call, restart_block)).await
                 }
                 // Rseq is not type-safe in the pinned Reverie revision. Dispatch by Sysno so a
                 // future typed representation preserves this explicit policy.
@@ -7753,7 +7796,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     Syscall::Getdents64(s) => self.handle_getdents64(guest, s).await,
 
                     #[cfg(target_arch = "x86_64")]
-                    Syscall::Poll(s) => self.handle_poll(guest, s).await,
+                    Syscall::Poll(s) => self.handle_poll(guest, s, restart_block).await,
                     // AUTONOMOUS-BOT-IMPLEMENTED
                     // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
                     Syscall::Pselect6(s) => self.handle_pselect6(guest, s).await,
@@ -8366,7 +8409,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .await;
 
             // Signal phase 1, step I4: a due SIGALRM entry is delivered here.
-            self.complete_syscall(guest, res).await
+            let res = self.complete_syscall(guest, res).await;
+            // The last step, after every await of this handler: a call a signal
+            // woke settles its errno from what the backend's return to user mode
+            // delivers, with no scheduling point between this read and that
+            // return on KVM (`settle_woken_wait_at_return`); a refusal ends the
+            // run instead.
+            match crate::syscalls::helpers::settle_woken_wait_at_return(guest, call.number(), res) {
+                crate::syscalls::helpers::Settlement::Return(res) => res,
+                // Boxed: a rare, terminal path, kept out of every syscall's
+                // future (`hot_path_futures_stay_small`).
+                crate::syscalls::helpers::Settlement::Refuse(refusal) => {
+                    Box::pin(Self::refuse_at_woken_return(guest, &refusal)).await
+                }
+            }
         })
         .await;
         // Every return in the body above has finished decoder/copyout and its

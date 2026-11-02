@@ -150,20 +150,29 @@ impl Scheduler {
     /// when the process is a guest namespace init (`sig_task_ignored` discards
     /// that for a `SIGNAL_UNKILLABLE` task), and the leader's committed mask
     /// does not block it. `None` when the leader's state cannot be read.
+    ///
+    /// The rule is the one every discard at generation is decided by
+    /// (`discarded_at_send::discards_at_generation`,
+    /// <https://github.com/rrnewton/hermit/issues/4929>); the inputs are the
+    /// ones this traced model has always read: the leader's state through
+    /// `read_sleeper_signal_state`, and its mask as Detcore saved it while a
+    /// private mask is installed.
     fn leader_ignores_sigalrm(&self, process: DetPid) -> Option<bool> {
         let leader = DetTid::from_raw(process.as_raw());
         let state = self.read_sleeper_signal_state(leader).ok()?;
-        let bit = sigalrm_bit();
         let mask = self
             .saved_guest_sigmasks
             .get(&leader)
             .copied()
             .unwrap_or(state.blocked);
-        let sig_ign = state.ignored & bit != 0;
-        let sig_dfl_init = self.thread_tree.is_pid_namespace_init(process)
-            && state.ignored & bit == 0
-            && state.caught & bit == 0;
-        Some((sig_ign || sig_dfl_init) && mask & bit == 0)
+        Some(super::discarded_at_send::discards_at_generation(
+            libc::SIGALRM,
+            mask,
+            state.ignored,
+            state.caught,
+            self.thread_tree.is_pid_namespace_init(process),
+            false,
+        ))
     }
 
     /// Fire the expiry at `deadline` of `process`'s `ITIMER_REAL`, which
