@@ -467,6 +467,7 @@ fn kvm_named_refusals_are_policy_refusals_and_other_errors_stay_failures() {
     let recording_failed = || detcore::BackendFailureCleanup {
         scheduler: Ok(()),
         preemption_recording: Err("recording control".to_owned()),
+        summary: Ok(()),
     };
     let refusals: [fn() -> reverie_kvm::Error; 3] = [
         || reverie_kvm::Error::PotentiallyBlockingZeroRead { fd: 3 },

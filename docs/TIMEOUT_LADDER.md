@@ -427,6 +427,11 @@ PARTIAL: --timeout=2 (seconds of wall-clock time) stopped the run before the gue
 The JSON carries the bound as `"run_timeout_secs": 2`. A run whose guest
 exited first keeps its complete summary without the bound, even when the
 deadline fires during Hermit's own cleanup after that.
+For an annotated-priority replay, the partial summary retains
+`HERMIT_CALLBACK_CHECKPOINT_INCOMPLETE` with each thread's remaining checkpoint
+count and first unconsumed row, in its text and JSON `desync_descrip`. It does
+not certify that replay finished: a finished run with those checkpoints still
+refuses, and any callback mismatches already observed remain in the summary.
 The scheduler's turns, recorded events and virtual time are the run's as it
 stood at the deadline, and the syscall and timeslice counts include the threads
 the deadline killed, from their exit reports. A `--record-preemptions-to`

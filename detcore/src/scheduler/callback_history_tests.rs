@@ -310,6 +310,15 @@ mod callback_history_scheduler_tests {
             scheduler.callback_checkpoint_mismatch(t, &point, hard, &actual);
             assert_eq!(format!("{:?}", scheduler.replayer), before);
             assert_eq!((scheduler.turn, scheduler.committed_time), (turn, time));
+            let (stopped, _) = scheduler
+                .generate_stopped_run_summary_for_log(None)
+                .unwrap();
+            assert_eq!(stopped.schedevent_desynced, 0);
+            assert_eq!(stopped.schedevent_replayed, 0);
+            let stopped_text = stopped.desync_descrip.unwrap();
+            assert!(stopped_text.contains("DESYNC callback checkpoint"));
+            assert!(stopped_text.contains(if hard { "(hard)" } else { "(soft)" }));
+            assert!(!stopped_text.contains("DESYNC incomplete callback history"));
             let summary = scheduler.generate_partial_run_summary(None).unwrap();
             assert_eq!(summary.schedevent_desynced, 0);
             assert_eq!(summary.schedevent_replayed, 0);
@@ -630,6 +639,61 @@ mod callback_history_scheduler_tests {
         );
         let error = s.generate_partial_run_summary(None).unwrap_err();
         assert!(error.is::<crate::PriorityHistoryRefusal>(), "{error:#}");
+    }
+
+    /// A timeout can stop a qualified annotated replay before its next
+    /// checkpoint. Its summary keeps the unconsumed suffix, while claiming
+    /// that the same replay finished remains a typed refusal.
+    #[test]
+    fn stopped_annotated_priority_replay_keeps_its_incomplete_history_in_the_summary() {
+        let config = Config {
+            annotated_priority_replay: true,
+            sequentialize_threads: true,
+            backend: reverie::BackendCapabilities::PTRACE,
+            ..Config::default()
+        };
+        assert_eq!(config.annotated_priority_replay_unqualified(), None);
+        let t = tid(3);
+        let mut s = Scheduler::new(&config);
+        s.install_priority_checkpoints(&checkpoints(&[(t, 0, 10), (t, 2, 30)]))
+            .unwrap();
+        s.acknowledge_priority_row(t, &row_request(t, 0, Some(10)))
+            .unwrap();
+        let checkpoints_before = s.callback_checkpoints.clone();
+        let rows_before = s.priority_rows.clone();
+        let time_before = s.committed_time;
+        let refusal = s.priority_history_incomplete().unwrap();
+        assert!(refusal.starts_with("HERMIT_CALLBACK_CHECKPOINT_INCOMPLETE"));
+        assert!(refusal.contains("dtid 3: 1 unconsumed from row 2"));
+
+        let (summary, info_description) = s.generate_stopped_run_summary_for_log(None).unwrap();
+        assert_eq!(
+            summary.desync_descrip.as_deref(),
+            Some(format!("{refusal}\n").as_str())
+        );
+        assert_eq!(summary.schedevent_desynced, 0);
+        assert!(summary.to_string().contains(&refusal));
+        assert!(
+            summary
+                .info(info_description.as_deref())
+                .to_string()
+                .contains(&refusal)
+        );
+        assert_eq!(
+            serde_json::to_value(&summary).unwrap()["desync_descrip"],
+            format!("{refusal}\n")
+        );
+        assert_eq!(s.callback_checkpoints, checkpoints_before);
+        assert_eq!(s.priority_rows, rows_before);
+        assert_eq!(s.committed_time, time_before);
+
+        let error = s.generate_partial_run_summary(None).unwrap_err();
+        assert!(error.is::<crate::PriorityHistoryRefusal>(), "{error:#}");
+        assert_eq!(
+            error.to_string(),
+            format!("terminal replay refusal: {refusal}")
+        );
+        assert_eq!(s.callback_checkpoints, checkpoints_before);
     }
 
     /// An annotated history replays from its first row only at a thread's

@@ -2335,8 +2335,8 @@ impl GlobalState {
     /// (`RunSummary::run_timeout_secs`), and the summary is printed or logged,
     /// and written to `print_summary_to_json_file` with the backend's
     /// `dispatch_stats`, as [`Self::clean_up_with_dispatch_stats`] does for a
-    /// finished run. A panicked scheduler, or a poisoned scheduler or clock
-    /// lock, leaves no summary. The partial recording is flushed after the
+    /// finished run. A panicked scheduler, or a poisoned lock used by the
+    /// summary, leaves no summary. The partial recording is flushed after the
     /// summary describes it, so a write error stays the run's recording
     /// error.
     pub async fn clean_up_after_run_timeout(
@@ -2406,11 +2406,25 @@ impl GlobalState {
     /// The summary of a run its deadline stopped, reported as `clean_up`
     /// reports a finished run's.
     fn report_partial_summary(&self, request: PartialSummary<'_>) -> Result<(), String> {
-        // A handler that panicked while holding either lock leaves state no
-        // summary should be built from, and must not panic the cleanup that
-        // flushes the recording.
+        // A handler that panicked while holding summary state leaves no
+        // trustworthy summary, and must not panic the cleanup that flushes
+        // the recording. Every guest task and the scheduler have stopped.
         if self.sched.is_poisoned() || self.global_time.is_poisoned() {
             return Err("a scheduler or clock lock was poisoned".to_owned());
+        }
+        if self.syscall_observation_gaps.is_poisoned() {
+            return Err("the syscall observation-gap lock was poisoned".to_owned());
+        }
+        if self
+            .replay_host_inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.is_poisoned())
+        {
+            return Err("the replay host-input lock was poisoned".to_owned());
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.store_exclusive.is_poisoned() {
+            return Err("the store-exclusive lock was poisoned".to_owned());
         }
         let (mut summary, info_reprio_descrip) = self
             .run_summary_for_log(Scheduler::generate_stopped_run_summary_for_log)
@@ -14746,6 +14760,191 @@ mod tests {
         assert!(cleanup.preemption_recording.is_err());
         assert_eq!(cleanup.summary, Ok(()));
         assert!(second_summary.exists());
+    }
+
+    /// Refusing a partial summary whose inputs were poisoned must still
+    /// consume and flush the recording, including returning a write error.
+    /// Each lock is poisoned independently; the healthy row still reports.
+    #[tokio::test]
+    async fn a_poisoned_summary_lock_does_not_prevent_timeout_recording_cleanup() {
+        #[derive(Clone, Copy, Debug)]
+        enum SummaryLock {
+            Healthy,
+            SyscallObservationGaps,
+            ReplayHostInputs,
+            #[cfg(target_arch = "aarch64")]
+            StoreExclusive,
+        }
+
+        fn poison<T>(lock: &Mutex<T>) {
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = lock.lock().unwrap();
+                panic!("poison a partial-summary input");
+            }));
+            assert!(panic.is_err());
+            assert!(lock.is_poisoned());
+        }
+
+        for (which, expected_error) in [
+            (SummaryLock::Healthy, None),
+            (
+                SummaryLock::SyscallObservationGaps,
+                Some("the syscall observation-gap lock was poisoned"),
+            ),
+            (
+                SummaryLock::ReplayHostInputs,
+                Some("the replay host-input lock was poisoned"),
+            ),
+            #[cfg(target_arch = "aarch64")]
+            (
+                SummaryLock::StoreExclusive,
+                Some("the store-exclusive lock was poisoned"),
+            ),
+        ] {
+            for writable in [true, false] {
+                let directory = tempfile::tempdir().unwrap();
+                let blocker = directory.path().join("not-a-directory");
+                std::fs::write(&blocker, b"keep this file").unwrap();
+                let recording = if writable {
+                    directory.path().join("recording.json")
+                } else {
+                    blocker.join("recording.json")
+                };
+                let summary_json = directory.path().join("summary.json");
+                let (_config, mut state, tid, _) = cancellation_test_state_with_config(Config {
+                    sequentialize_threads: true,
+                    record_preemptions_to: Some(recording.clone()),
+                    record_host_inputs: true,
+                    ..Config::default()
+                });
+                state.replay_host_inputs = Some(Mutex::new(
+                    crate::host_inputs::ReplayHostInputs::new(Default::default()),
+                ));
+                let mut writer = crate::preemptions::PreemptionWriter::new(Some(recording.clone()));
+                writer.register_thread(tid, DEFAULT_PRIORITY);
+                writer.insert_reprioritization(
+                    tid,
+                    LogicalTime::from_nanos(100),
+                    10,
+                    DEFAULT_PRIORITY,
+                    20,
+                );
+                state.sched.lock().unwrap().preemption_writer = Some(writer);
+                assert!(!recording.exists());
+                match which {
+                    SummaryLock::Healthy => {}
+                    SummaryLock::SyscallObservationGaps => poison(&state.syscall_observation_gaps),
+                    SummaryLock::ReplayHostInputs => {
+                        poison(state.replay_host_inputs.as_ref().unwrap());
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    SummaryLock::StoreExclusive => poison(&state.store_exclusive),
+                }
+
+                let cleanup = state
+                    .clean_up_after_run_timeout(2, false, Some(&summary_json), None)
+                    .await;
+                assert!(cleanup.scheduler.is_ok(), "{which:?}, writable={writable}");
+                assert_eq!(
+                    cleanup.summary,
+                    expected_error.map_or(Ok(()), |error| Err(error.to_owned())),
+                    "{which:?}, writable={writable}"
+                );
+                if expected_error.is_some() {
+                    assert!(!summary_json.exists(), "{which:?}");
+                } else {
+                    let summary: detcore_model::summary::RunSummary =
+                        serde_json::from_slice(&std::fs::read(&summary_json).unwrap()).unwrap();
+                    assert_eq!(summary.run_timeout_secs, Some(2));
+                    assert!(summary.syscall_histogram.is_some());
+                }
+                if writable {
+                    assert_eq!(cleanup.preemption_recording, Ok(()), "{which:?}");
+                    let recorded: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&recording).unwrap()).unwrap();
+                    assert_eq!(
+                        recorded["per_thread"][tid.to_string()]["prio_changes"],
+                        serde_json::json!([[100, DEFAULT_PRIORITY]]),
+                        "{which:?}"
+                    );
+                    assert_eq!(recorded["host_inputs"]["files"], serde_json::json!([]));
+                } else {
+                    let error = cleanup.preemption_recording.unwrap_err();
+                    assert!(error.contains(&recording.display().to_string()), "{error}");
+                    assert!(!recording.exists());
+                    assert_eq!(std::fs::read(&blocker).unwrap(), b"keep this file");
+                }
+            }
+        }
+    }
+
+    /// Exercise the timeout cleanup route with an admitted annotated record:
+    /// its unconsumed checkpoint must not suppress the requested JSON report.
+    /// The same state still refuses a claim that replay finished.
+    #[tokio::test]
+    async fn a_timed_out_annotated_priority_replay_writes_its_partial_summary() {
+        use crate::preemptions::callback_history::Origin;
+        use crate::preemptions::callback_history::Site;
+        use crate::slice_boundary::callbacks::Callback;
+
+        let directory = tempfile::tempdir().unwrap();
+        let recording = directory.path().join("annotated.json");
+        let summary_json = directory.path().join("summary.json");
+        let tid = DetTid::from_raw(17);
+        let mut writer = crate::preemptions::PreemptionWriter::new(Some(recording.clone()));
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_schedevent(SchedEvent::branches(tid, 10));
+        writer.insert_reprioritization(tid, LogicalTime::from_nanos(100), 10, DEFAULT_PRIORITY, 20);
+        writer.insert_callback_checkpoint(
+            tid,
+            Origin {
+                callback: Callback::PmuTimer,
+                site: Site::Prehook,
+                progress: 10,
+                last_op: Some(crate::types::Op::Branch),
+                time: LogicalTime::from_nanos(100),
+                rcbs: 10,
+            },
+        );
+        writer.flush().unwrap();
+
+        let (config, state, _, _) = cancellation_test_state_with_config(Config {
+            annotated_priority_replay: true,
+            replay_preemptions_from: Some(recording),
+            sequentialize_threads: true,
+            backend: reverie::BackendCapabilities::PTRACE,
+            ..Config::default()
+        });
+        assert_eq!(config.annotated_priority_replay_unqualified(), None);
+        let refusal = {
+            let mut scheduler = state.sched.lock().unwrap();
+            let refusal = scheduler.priority_history_incomplete().unwrap();
+            assert!(refusal.contains("dtid 17: 1 unconsumed from row 0"));
+            let error = scheduler.generate_partial_run_summary(None).unwrap_err();
+            assert!(error.is::<crate::PriorityHistoryRefusal>(), "{error:#}");
+            assert_eq!(
+                error.to_string(),
+                format!("terminal replay refusal: {refusal}")
+            );
+            refusal
+        };
+
+        let cleanup = state
+            .clean_up_after_run_timeout(2, false, Some(&summary_json), None)
+            .await;
+        assert!(cleanup.scheduler.is_ok());
+        assert_eq!(cleanup.preemption_recording, Ok(()));
+        assert_eq!(cleanup.summary, Ok(()));
+        let summary: detcore_model::summary::RunSummary =
+            serde_json::from_slice(&std::fs::read(&summary_json).unwrap()).unwrap();
+        assert_eq!(summary.run_timeout_secs, Some(2));
+        assert_eq!(
+            summary.desync_descrip.as_deref(),
+            Some(format!("{refusal}\n").as_str())
+        );
+        assert_eq!(summary.schedevent_desynced, 0);
+        assert!(summary.to_string().starts_with("PARTIAL: --timeout=2"));
+        assert!(summary.to_string().contains(&refusal));
     }
 
     #[test]

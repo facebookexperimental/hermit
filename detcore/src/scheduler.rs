@@ -21919,10 +21919,17 @@ impl Scheduler {
             TerminalOutcome::to_fields(self.terminal_outcome);
 
         // After the record is flushed and each thread's DESYNC line is
-        // logged above: the re-recorded history survives as evidence, and the
-        // run still ends as a refusal, not a summary.
+        // logged above, a finished run must still refuse an incomplete
+        // annotated replay. A deadline-stopped run may have an unconsumed
+        // suffix: retain its diagnostic in the partial report instead of
+        // withholding that report or claiming replay completed.
         if let Some(refusal) = self.priority_history_incomplete() {
-            return Err(crate::PriorityHistoryRefusal(refusal).into());
+            if end == RunEnd::Finished {
+                return Err(crate::PriorityHistoryRefusal(refusal).into());
+            }
+            desync_descrip
+                .get_or_insert_with(String::new)
+                .push_str(&format!("{refusal}\n"));
         }
 
         Ok((

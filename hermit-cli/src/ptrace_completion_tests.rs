@@ -790,6 +790,74 @@ fn mid_startup_timeout_retains_original_waiter_and_resources() {
 
 include!("ptrace_random_failure_tests.rs");
 
+/// The output-capturing API must identify a child adopted by its tracer as
+/// orphaned, just as the ordinary CLI timeout does. The isolated process acts
+/// as a subreaper, giving adoption the same parent identity as namespace init.
+#[test]
+fn captured_output_timeout_names_the_orphan_after_its_root_exits() {
+    isolated(
+        "captured_output_timeout_names_the_orphan_after_its_root_exits",
+        || {
+            use std::os::unix::ffi::OsStrExt;
+
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+            let directory = tempfile::tempdir().unwrap();
+            let fifo = directory.path().join("never-written");
+            let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+            let mut command = reverie::process::Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "printf 'before-orphan\\n'; exec /bin/cat \"$1\" & exit 0",
+                    "orphan-capture",
+                ])
+                .arg(&fifo);
+            let mut config = detcore::Config {
+                sequentialize_threads: true,
+                deterministic_io: true,
+                has_uts_namespace: false,
+                notice_host_network_abstract_binds: false,
+                max_timeslice: None,
+                ..Default::default()
+            };
+            config.validate();
+            let error = crate::run_with_output_backend_timeout(
+                command,
+                config,
+                false,
+                &None,
+                crate::Backend::Ptrace,
+                Some(Duration::from_secs(1)),
+            )
+            .unwrap_err();
+            let failure = error
+                .downcast_ref::<HermitPtraceFailure>()
+                .unwrap_or_else(|| panic!("expected completed timeout cleanup: {error:#}"));
+            assert_eq!(failure.kind(), FailureKind::RunTimeout);
+            let captured = failure.failure().captured_prefix().unwrap();
+            assert_eq!(captured.stdout(), b"before-orphan\n");
+            let primary = failure.failure().primary();
+            let reverie::Error::Tool(primary) = primary else {
+                panic!("expected timeout tool failure: {primary:?}");
+            };
+            let timeout = primary.downcast_ref::<GuestTimedOut>().unwrap();
+            assert_eq!(timeout.limit, Duration::from_secs(1));
+            let survivors = timeout.survivors.as_deref().unwrap();
+            assert!(
+                survivors.contains("1 guest process was still running: pid ")
+                    && survivors.contains("\"cat\"")
+                    && survivors.contains(&format!(
+                        "parent {}, orphaned: its parent exited",
+                        std::process::id()
+                    ))
+                    && survivors.contains(" in openat"),
+                "captured-output timeout lost the adopted child's identity: {survivors}"
+            );
+        },
+    );
+}
+
 #[test]
 fn terminal_result_releases_owned_future_and_keeps_concurrent_caller_alive() {
     isolated(
