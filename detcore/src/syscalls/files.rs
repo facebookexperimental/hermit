@@ -1158,11 +1158,31 @@ fn is_pure_read(flags: OFlag) -> bool {
 }
 
 /// Whether an open with `flags` gives a descriptor its holder can read:
-/// any access mode but `O_WRONLY`, whatever the creation and truncation
-/// flags (`O_RDWR`, and `O_RDONLY` with `O_CREAT` or `O_TRUNC`, read too;
-/// open(2)). An `O_PATH` descriptor reads nothing.
+/// access mode `O_RDONLY` or `O_RDWR`, whatever the creation and truncation
+/// flags (`O_RDONLY` with `O_CREAT` or `O_TRUNC` reads too; open(2)). The
+/// reserved access mode 3 does not: Linux checks read and write permission
+/// for it (`ACC_MODE`, include/linux/fs.h:3889 at v6.16, read by
+/// `build_open_flags`, fs/open.c:1243) but gives the file neither
+/// `FMODE_READ` nor `FMODE_WRITE` (`OPEN_FMODE`, include/linux/fs.h:3890,
+/// set in fs/file_table.c:175), so its descriptor can be neither read nor
+/// written. An `O_PATH` descriptor reads nothing either.
 fn opens_readable(flags: OFlag) -> bool {
-    !flags.contains(OFlag::O_PATH) && flags.bits() & libc::O_ACCMODE != libc::O_WRONLY
+    !flags.contains(OFlag::O_PATH)
+        && matches!(
+            flags.bits() & libc::O_ACCMODE,
+            libc::O_RDONLY | libc::O_RDWR
+        )
+}
+
+/// Whether an open with `flags` can change the file it names: access mode
+/// `O_WRONLY` or `O_RDWR`, or `O_CREAT` or `O_TRUNC`. A bare access mode 3
+/// open reads and writes nothing ([`opens_readable`]).
+fn opens_to_change(flags: OFlag) -> bool {
+    !flags.contains(OFlag::O_PATH)
+        && (matches!(
+            flags.bits() & libc::O_ACCMODE,
+            libc::O_WRONLY | libc::O_RDWR
+        ) || flags.intersects(OFlag::O_CREAT | OFlag::O_TRUNC))
 }
 
 /// What `property_reached_live` found about a descriptor.
@@ -5760,7 +5780,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let in_area = property_area_name(&snapshot.guest_dir, path);
         let pure_read = is_pure_read(call.flags());
         if !pure_read {
-            if in_area.is_some() {
+            if in_area.is_some() && opens_to_change(call.flags()) {
                 self.note_property_write(path);
             }
             if !opens_readable(call.flags()) {
@@ -6406,7 +6426,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                             LiveCheck::NotLive => None,
                         }
                     }
-                    None if self.cfg.property_snapshot.is_some() => {
+                    None if self.cfg.property_snapshot.is_some()
+                        && opens_to_change(call.flags()) =>
+                    {
                         // A write-only open of a live property file by any
                         // name runs as it is; say so once.
                         if let LiveCheck::Live(_) =

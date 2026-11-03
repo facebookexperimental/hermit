@@ -360,3 +360,49 @@ fn a_readable_create_open_of_a_copied_property_file_is_refused() {
     });
     panic!("the run was not refused");
 }
+
+/// In a fail-closed run, an open of a copied property file with the
+/// reserved access mode 3 runs as natively: Linux checks read and write
+/// permission for it but opens a descriptor that can be neither read nor
+/// written (`OPEN_FMODE`), so it reads no live bytes and is not refused.
+/// Its read fails with `EBADF`, as natively.
+#[test]
+fn an_access_mode_3_open_of_a_copied_property_file_runs_as_natively() {
+    let area = area();
+    let file = area.live.path().join("u:object_r:test_prop:s0");
+    let native = |path: &Path| -> (bool, Option<i32>) {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; the descriptor is closed below.
+        let fd = unsafe { libc::open(path.as_ptr(), 3) };
+        if fd < 0 {
+            return (false, std::io::Error::last_os_error().raw_os_error());
+        }
+        let mut bytes = [0_u8; 4];
+        // SAFETY: `fd` is open and `bytes` is writable for its length.
+        let read = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+        let errno = (read < 0)
+            .then(|| std::io::Error::last_os_error().raw_os_error())
+            .flatten();
+        // SAFETY: the descriptor opened above.
+        unsafe { libc::close(fd) };
+        (true, errno)
+    };
+    assert_eq!(native(&file), (true, Some(libc::EBADF)), "natively");
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        panic_on_unsupported_syscalls: true,
+        shutdown_on_unsupported_syscall: true,
+        property_snapshot: Some(area.snapshot.clone()),
+        ..Default::default()
+    };
+    let guest = move || {
+        assert_eq!(native(&file), (true, Some(libc::EBADF)), "under Hermit");
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        guest,
+        config,
+        detcore_testutils::expect_success,
+    );
+}
