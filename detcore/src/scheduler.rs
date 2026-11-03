@@ -17863,17 +17863,9 @@ impl Scheduler {
                 .as_ref()
                 .map(|writer| writer.reprioritization_count(dettid));
             let answer = self.perform_priority_changepoint(dettid, priority, *time, *rcbs, epochs);
-            // A callback expiry commits a real priority change. Under a
-            // raw schedule replay that does not record logical priorities
-            // its row is kept out of the record, so the record's priority
-            // history is incomplete even if the run then finishes exactly
-            // with its guide: mark it now, stickily, rather than let exact
-            // global completion certify it.
-            if self.has_schedule_replay() && !self.record_logical_replay_priorities {
-                if let Some(writer) = &mut self.preemption_writer {
-                    writer.mark_replay_departed(self.recorded_event_count);
-                }
-            }
+            // (The expiry's row omission is marked centrally in
+            // `perform_priority_changepoint`, for every priority decision
+            // a raw schedule replay takes without recording it.)
             // Only onto the row this change point wrote: one kept out of the
             // record (`report_stale_replay_change_point`) has none.
             if !self.has_schedule_replay()
@@ -18958,6 +18950,18 @@ impl Scheduler {
         // exactly the omission the exhaustion mark names: this run has
         // continued past its schedule, so its record is not exact.
         self.mark_past_schedule_departure();
+
+        // Every priority decision this shared producer takes under a raw
+        // schedule replay that records no logical priorities — an
+        // ordinary slice-end change point just as much as a callback
+        // expiry — writes no row below, so the record's priority history
+        // omits a real decision even if the run then finishes exactly
+        // with its guide. Mark it here, stickily, for all of them.
+        if self.has_schedule_replay() && !self.record_logical_replay_priorities {
+            if let Some(writer) = &mut self.preemption_writer {
+                writer.mark_replay_departed(self.recorded_event_count);
+            }
+        }
 
         // The global event this change point comes at, for a record that has
         // to leave it out (`PreemptionWriter::mark_replay_departed`).
@@ -27094,6 +27098,53 @@ mod test {
         let record: crate::preemptions::PreemptionRecord = serde_json::from_str(&written).unwrap();
         assert_eq!(record.replay_departed_at(), Some(2));
         assert!(record.require_faithful_replay().is_err());
+    }
+
+    /// An ordinary (unannotated) priority change point under a raw
+    /// schedule replay writes no priority row either, so it marks the
+    /// record at the shared producer even when the run then finishes
+    /// exactly with its guide — the same omission as a callback expiry,
+    /// through the ordinary request path.
+    #[test]
+    fn an_ordinary_changepoint_under_a_raw_schedule_replay_marks_the_record() {
+        let foreground = DetTid::from_raw(3);
+        let first = SchedEvent::syscall(foreground, Sysno::getpid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(10_000));
+        let last = SchedEvent::syscall(foreground, Sysno::getppid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(20_000));
+        let mut sched = Scheduler::new(&Config::default());
+        sched.record_logical_replay_priorities = false;
+        sched.preemption_writer = Some(PreemptionWriter::new(None));
+        sched.replayer = Some(Replayer::new(vec![first.clone(), last.clone()]));
+        register_known_thread(&mut sched, foreground);
+        sched
+            .priorities
+            .insert(foreground, runqueue::FIRST_PRIORITY);
+        sched.runqueue_push_back(foreground);
+        assert_eq!(sched.run_queue.tentative_pop_next(), Some(foreground));
+        let _ = sched.consume_schedevent(&first);
+        sched.record_event(&first);
+        // The ordinary request path (no callback annotation).
+        assert!(
+            sched
+                .perform_priority_changepoint(
+                    foreground,
+                    DEFAULT_PRIORITY,
+                    LogicalTime::from_nanos(15_000),
+                    0,
+                    &[]
+                )
+                .is_err()
+        );
+        // Finish exactly with the guide.
+        let _ = sched.consume_schedevent(&last);
+        assert!(sched.replay_priorities_released);
+        sched.record_event(&last);
+        let written = sched.preemption_writer.take().unwrap().into_string();
+        let record: crate::preemptions::PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert!(record.replay_departed_at().is_some());
+        assert!(record.require_faithful_replay().is_err());
+        assert_eq!(record.into_global().len(), 2);
     }
 
     fn plain_replay_with_writer(events: Vec<SchedEvent>) -> Scheduler {

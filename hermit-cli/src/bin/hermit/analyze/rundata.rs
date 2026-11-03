@@ -807,6 +807,15 @@ impl RunData {
 
     pub fn with_schedule_replay_from(mut self, path: PathBuf) -> Self {
         self.runopts.det_opts.det_config.replay_schedule_from = Some(path);
+        // A schedule-replay trial follows its guide, and its recording
+        // must hold the priorities it takes: it records logical
+        // priorities (no chaos draw, no scheduling heuristic), so the
+        // record it writes is complete rather than omitting every
+        // priority decision of the replay. The search runs, which do
+        // not replay a schedule, keep the baseline's chaos.
+        self.runopts.det_opts.det_config.chaos = false;
+        self.runopts.det_opts.det_config.sched_heuristic =
+            detcore_model::config::SchedHeuristic::None;
         self
     }
 
