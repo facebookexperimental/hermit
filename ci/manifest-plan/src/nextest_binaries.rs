@@ -3997,7 +3997,10 @@ mod tests {
             changed_context_fields(&resolved, Some(&actual)),
             "available_cpus, source_clean",
         );
-        assert_eq!(changed_context_fields(&resolved, None), "context now absent");
+        assert_eq!(
+            changed_context_fields(&resolved, None),
+            "context now absent"
+        );
     }
 
     #[test]
