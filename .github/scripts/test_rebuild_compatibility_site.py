@@ -788,6 +788,36 @@ class HostedAdapterTests(unittest.TestCase):
         self.assertEqual(printed["parent_commit"], "a" * 40)
         self.assertEqual(printed["hermit_commit"], "b" * 40)
 
+    def test_pinned_adapter_still_knows_the_dispatched_pin(self):
+        # B2 layout: the workflow runs the WORKSPACE adapter (the
+        # dispatched commit's) with --builder-config naming the
+        # dispatched pin.  The pin checkout's older adapter is never on
+        # that command line — its --builder-config incompatibility is
+        # irrelevant because the checkout moved to a sibling worktree
+        # (_pin_source), not over the workspace.  This exercises the
+        # exact command line the workflow uses, from the workspace.
+        saved = copy.deepcopy(self.config)
+        saved_pin = self.root / "website-builder-pin.json"
+        saved_pin.write_text(json.dumps(saved))
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                SCRIPT,
+                "source-config",
+                "--builder-config",
+                str(saved_pin),
+            ],
+            cwd=SCRIPT.parents[2],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        printed = json.loads(result.stdout)
+        self.assertEqual(printed["parent_commit"], saved["parent_commit"])
+        self.assertEqual(printed["hermit_commit"], saved["hermit_commit"])
+
     def test_saved_adapter_layout_runs_against_an_older_workspace(self):
         # B1 regression: the workflow snapshots the dispatched commit's
         # adapter tree and runs THAT after the pin checkout moved the

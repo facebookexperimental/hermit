@@ -136,49 +136,45 @@ jobs:
       env:
         GITHUB_ACTOR: ${{ github.actor }}
       run: bash scripts/check-runner-trust.sh
-    - name: Save the dispatched adapter and pin
-      # The adapter and the publisher state it resolves through ROOT must
-      # run from the DISPATCHED commit: after the pin checkout the
-      # workspace script is the pin's older adapter, which does not know
-      # the flags the workflow passes (it would exit 2 before reading any
-      # pin).  Snapshot the adapter tree the adapter itself loads from
-      # (.github/scripts/ adapter + publisher helper, the two JSON files,
-      # scripts/) under RUNNER_TEMP in the same relative layout, so
-      # ROOT = parents[2] of the saved adapter resolves inside the
-      # snapshot, and invoke that copy everywhere below.  The pin in
-      # force is then the dispatched main commit's, never the one
-      # recorded at hermit_commit (which lagged one generation and
-      # refused runs 41537071693 and 41666103898).
+    - name: Save the dispatched builder pin
+      # The workspace stays at the DISPATCHED commit for the whole job;
+      # only the builder source moves, into its own checkout.  So the
+      # pin file is saved (not the adapter tree) before anything reads
+      # it: source-config and rebuild are told this exact pin, never the
+      # older one recorded at hermit_commit inside the pin checkout
+      # (which lagged one generation and refused runs 41537071693 and
+      # 41666103898).  Running the workspace adapter also keeps the
+      # publisher's append-only history gate inside this full-history
+      # repository; running it from a snapshot outside the repository
+      # refused there, or silently compared against 0 historical
+      # versions inside an enclosing checkout.
       if: github.event_name == 'schedule' || inputs.rebuild_compatibility
       run: |
         set -euo pipefail
-        saved="$RUNNER_TEMP/dispatched"
-        rm -rf "$saved"
-        mkdir -p "$saved/.github/scripts" "$saved/scripts"
-        cp .github/scripts/rebuild-compatibility-site.py \
-           .github/scripts/publish-compatibility-site.py \
-           "$saved/.github/scripts/"
         cp .github/compatibility-site-builder.json \
-           .github/compatibility-site-releases.json \
-           "$saved/.github/"
-        cp -R scripts/. "$saved/scripts/"
-        cp "$saved/.github/compatibility-site-builder.json" \
           "$RUNNER_TEMP/website-builder-pin.json"
     - name: Check out the reviewed Hermit source pin
-      # A dispatch on main must not race main moving past the reviewed pin:
-      # read hermit_commit from the saved dispatched pin and check out
-      # exactly that commit, so every later step (adapter, source pin,
-      # rustdoc) runs at the pin by construction.  The pin must exist in
-      # this full-history checkout, or the rebuild refuses here instead
-      # of comparing a moved main checkout to the pin.
+      # A dispatch on main must not race main moving past the reviewed
+      # pin.  The reviewed Hermit sources (the metadata checkout the
+      # rebuild verifies, and the tree cargo doc builds) live in their
+      # own worktree at _pin_source; the workspace itself stays at the
+      # dispatched commit, so the adapter, publisher, registry and full
+      # history in force are the dispatched commit's.  The pin must
+      # exist in this full-history checkout, or the rebuild refuses here
+      # instead of comparing a moved checkout to the pin.
       if: github.event_name == 'schedule' || inputs.rebuild_compatibility
       run: |
         set -euo pipefail
         pin=$(jq -er '.hermit_commit | select(type == "string" and test("^[0-9a-f]{40}$"))' \
           "$RUNNER_TEMP/website-builder-pin.json")
         git cat-file -e "$pin^{commit}"
-        git checkout --quiet --detach "$pin"
-        [[ $(git rev-parse 'HEAD^{commit}') == "$pin" ]]
+        # A leftover worktree at the same path (a failed earlier run on
+        # a persistent self-hosted workspace) must not change which
+        # commit is checked out; prune registrations first.
+        rm -rf _pin_source
+        git worktree prune
+        git worktree add --detach _pin_source "$pin"
+        [[ $(git -C _pin_source rev-parse 'HEAD^{commit}') == "$pin" ]]
     - name: Initialize dagrun submodule
       run: git submodule update --init --depth 1 -- agent-utils
     - name: Check nightly source access and pins
@@ -198,12 +194,12 @@ jobs:
           echo "::error::Nightly rebuild needs COMPATIBILITY_SOURCE_DEPLOY_KEY: a read-only deploy key for rrnewton/dev-hermit. No old archive was rebuilt."
           exit 1
         fi
-        python3 "$RUNNER_TEMP/dispatched/.github/scripts/rebuild-compatibility-site.py" source-config \
+        python3 .github/scripts/rebuild-compatibility-site.py source-config \
           --builder-config "$RUNNER_TEMP/website-builder-pin.json" > "$RUNNER_TEMP/website-source.json"
         jq -r '"parent_commit=" + .parent_commit, "hermit_commit=" + .hermit_commit' \
           "$RUNNER_TEMP/website-source.json" >> "$GITHUB_OUTPUT"
         # Capture public data before the authenticated full-history P fetch.
-        python3 "$RUNNER_TEMP/dispatched/.github/scripts/rebuild-compatibility-site.py" capture-ledger > "$RUNNER_TEMP/website-ledger.json"
+        python3 .github/scripts/rebuild-compatibility-site.py capture-ledger > "$RUNNER_TEMP/website-ledger.json"
         jq -r '"ledger_commit=" + .commit' "$RUNNER_TEMP/website-ledger.json" >> "$GITHUB_OUTPUT"
     - name: Check out reviewed website builder
       if: github.event_name == 'schedule' || inputs.rebuild_compatibility
@@ -441,7 +437,7 @@ jobs:
       run: |
         set -euo pipefail
         timeout --signal=TERM --kill-after=30s 21600s \
-          python3 -B "$RUNNER_TEMP/dispatched/.github/scripts/rebuild-compatibility-site.py" rebuild \
+          python3 -B .github/scripts/rebuild-compatibility-site.py rebuild \
           --builder-parent "$GITHUB_WORKSPACE/_website_source" \
           --scratch "${COMPATIBILITY_SCRATCH_PARENT:-$RUNNER_TEMP}/compatibility-nightly-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
           --receipt "$RUNNER_TEMP/compatibility-rebuild.json" \
@@ -519,9 +515,19 @@ jobs:
       # site is deployed (see the last step). The validation DAG's
       # Documentation node remains the gate for documentation lints.
       continue-on-error: true
-      run: cargo doc --workspace --no-deps
+      working-directory: ${{ (github.event_name == 'schedule' || inputs.rebuild_compatibility) && '_pin_source' || '.' }}
+      run: |
+        cargo doc --workspace --no-deps
+        # Deploy reads ./target/doc from the workspace; on rebuild runs
+        # the docs were built in the pin worktree, so copy them over.
+        if [[ "$PWD" == *_pin_source ]]; then
+          rm -rf "$GITHUB_WORKSPACE/target/doc"
+          mkdir -p "$GITHUB_WORKSPACE/target"
+          cp -R target/doc "$GITHUB_WORKSPACE/target/doc"
+        fi
     - name: Build documentation without the lint gate
       if: steps.rustdoc.outcome == 'failure'
+      working-directory: ${{ (github.event_name == 'schedule' || inputs.rebuild_compatibility) && '_pin_source' || '.' }}
       env:
         RUSTFLAGS: -C link-arg=-llzma
         RUSTDOCFLAGS: ""
@@ -529,6 +535,11 @@ jobs:
         set -euo pipefail
         echo '::warning::cargo doc failed under -D warnings. Rebuilding the documentation without -D warnings so the website still deploys; the job fails after deployment.'
         cargo doc --workspace --no-deps
+        if [[ "$PWD" == *_pin_source ]]; then
+          rm -rf "$GITHUB_WORKSPACE/target/doc"
+          mkdir -p "$GITHUB_WORKSPACE/target"
+          cp -R target/doc "$GITHUB_WORKSPACE/target/doc"
+        fi
     - name: Add Hermetic Infra landing page
       run: |
         install -m 0644 docs/site/index.html target/doc/index.html
@@ -546,32 +557,15 @@ jobs:
         set -euo pipefail
         umask 077
 
-        # On rebuild runs the snapshots come from the dispatched commit
-        # (see "Save the dispatched adapter and pin"); on the plain docs
-        # dispatch they were never saved, so snapshot the workspace
-        # (which is the dispatched commit there) first.  Either way the
-        # publisher and registry that run are the dispatched commit's.
-        if [[ ! -d "$RUNNER_TEMP/dispatched" ]]; then
-          saved="$RUNNER_TEMP/dispatched"
-          mkdir -p "$saved/.github/scripts" "$saved/scripts"
-          cp .github/scripts/rebuild-compatibility-site.py \
-             .github/scripts/publish-compatibility-site.py \
-             "$saved/.github/scripts/"
-          cp .github/compatibility-site-builder.json \
-             .github/compatibility-site-releases.json \
-             "$saved/.github/"
-          cp -R scripts/. "$saved/scripts/"
-        fi
-
         scratch=$(mktemp -d)
         trap 'rm -rf -- "$scratch"' EXIT
-        pins="$RUNNER_TEMP/dispatched/.github/compatibility-site-releases.json"
+        pins=.github/compatibility-site-releases.json
         archives="$scratch/archives"
         pin_rows="$scratch/pins"
         releases="$scratch/releases"
         mkdir "$archives" "$pin_rows" "$releases"
 
-        python3 "$RUNNER_TEMP/dispatched/.github/scripts/publish-compatibility-site.py" validate "$pins" .
+        python3 .github/scripts/publish-compatibility-site.py validate "$pins" .
 
         # Scheduled rebuilds and manual immutable handoffs share the same
         # digest/history gates. Neither starts Hermit validation or PR tests.
@@ -604,9 +598,9 @@ jobs:
         fi
         # Select the exact superset without losing committed or served pins.
         # Equal maps preserve served latest; an explicit asset owns that choice.
-        python3 "$RUNNER_TEMP/dispatched/.github/scripts/publish-compatibility-site.py" select-registry \
+        python3 .github/scripts/publish-compatibility-site.py select-registry \
           "${selection[@]}" > "$candidate"
-        python3 "$RUNNER_TEMP/dispatched/.github/scripts/publish-compatibility-site.py" validate-update \
+        python3 .github/scripts/publish-compatibility-site.py validate-update \
           "$candidate" "$pins" . "$previous"
         pins="$candidate"
 
@@ -656,8 +650,8 @@ jobs:
         # the builder config's retention rule are downloaded and served. The
         # others stay published as release assets and listed in releases.json.
         retained="$scratch/retained.txt"
-        python3 "$RUNNER_TEMP/dispatched/.github/scripts/publish-compatibility-site.py" retain \
-          "$pins" "$releases" "$RUNNER_TEMP/dispatched/.github/compatibility-site-builder.json" > "$retained"
+        python3 .github/scripts/publish-compatibility-site.py retain \
+          "$pins" "$releases" .github/compatibility-site-builder.json > "$retained"
         while read -r index identity <&3; do
           asset=$(jq -er '.asset' "$pin_rows/$index.json")
           asset_id=$(< "$pin_rows/$index.asset")
@@ -667,13 +661,13 @@ jobs:
             "repos/$release_repository/releases/assets/$asset_id" \
             > "$archive"
 
-          python3 "$RUNNER_TEMP/dispatched/.github/scripts/publish-compatibility-site.py" extract "$archive" \
+          python3 .github/scripts/publish-compatibility-site.py extract "$archive" \
             "target/doc/compatibility/$identity" "$pins" "$index"
         done 3< "$retained"
 
-        python3 "$RUNNER_TEMP/dispatched/.github/scripts/publish-compatibility-site.py" \
+        python3 .github/scripts/publish-compatibility-site.py \
           finalize "$pins" target/doc/compatibility "$releases" \
-          "$RUNNER_TEMP/dispatched/.github/compatibility-site-builder.json"
+          .github/compatibility-site-builder.json
     - name: Deploy to GitHub Pages
       # Only publish from the canonical branch, not from manual dispatch on a
       # feature branch.
@@ -688,7 +682,7 @@ jobs:
       if: github.event_name == 'schedule' || inputs.rebuild_compatibility
       timeout-minutes: 11
       run: |
-        python3 -B "$RUNNER_TEMP/dispatched/.github/scripts/rebuild-compatibility-site.py" verify-public \
+        python3 -B .github/scripts/rebuild-compatibility-site.py verify-public \
           --receipt "$RUNNER_TEMP/compatibility-rebuild.json"
         echo 'Nine ordinary public files (manifest, page, CSS, JavaScript and browser data) match this rebuild.' >> "$GITHUB_STEP_SUMMARY"
     - name: Retain exact website source and deployment receipt
