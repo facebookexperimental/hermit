@@ -288,6 +288,7 @@ static SCM_RIGHTS_OVERLAPPING_RECEIPT_GUEST: OnceLock<PathBuf> = OnceLock::new()
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_TIME_CLOCKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static YIELD_BESIDE_COMPUTE_NOLIBC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROC_CPU_TIMES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DATAGRAM_READ_SHUTDOWN_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1363,6 +1364,43 @@ fn futex_c_guest(cell: &'static OnceLock<PathBuf>, name: &str) -> &'static Path 
         assert!(
             output.status.success(),
             "{name} guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// tests/c/yield_beside_compute_nolibc.c, built static with no libc, so a run
+/// of it has no dynamic loader.
+fn yield_beside_compute_nolibc_guest() -> &'static Path {
+    YIELD_BESIDE_COMPUTE_NOLIBC_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("yield-beside-compute-nolibc");
+        fs::create_dir_all(&build_root).expect("failed to create the static guest directory");
+        let guest = build_root.join("yield_beside_compute_nolibc");
+        let output = Command::new("cc")
+            .args([
+                "-O1",
+                "-static",
+                "-nostdlib",
+                "-fno-stack-protector",
+                "-fno-pie",
+                "-no-pie",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+            ])
+            .arg(repository.join("tests/c/yield_beside_compute_nolibc.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the static guest");
+        assert!(
+            output.status.success(),
+            "yield_beside_compute_nolibc guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -27591,6 +27629,69 @@ fn a_schedule_replay_of_a_pipe_reader_whose_writers_exited_is_no_deadlock() {
         let summary: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
         assert_eq!(summary["schedevent_desynced"], 0, "seed {seed}: {summary}");
+    }
+}
+
+/// A schedule replay keeps the clock of a thread that yields beside a
+/// computing one. The static guest, with no libc and no dynamic loader, has
+/// its main task call sched_yield, compute briefly and read CLOCK_MONOTONIC,
+/// 100 times, while a second task made by a raw clone computes; it prints a
+/// digest of the main task's clock reads. Each recording, at an explicit
+/// --max-timeslice of 100 us and of 400 us and without --chaos, has the
+/// main task's prehook switch to the computing task carry that task's
+/// timer-ended slice length, and must replay with no desync and the same
+/// output. Giving the switching thread no slice there, so that it keeps the
+/// deadline it had before its yield, ended slices its recording did not
+/// have: the main task's last clock read came 9.5 ms late at 100 us, with no
+/// desync, and the replay at 400 us desynchronized 25 events. Needs the PMU,
+/// so it runs in privileged-test.pmu_cli_cases.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_one() {
+    let program = yield_beside_compute_nolibc_guest()
+        .to_str()
+        .expect("static guest path should be UTF-8");
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for max_timeslice in ["100000", "400000"] {
+        let record = dir.path().join(format!("{max_timeslice}.json"));
+        let summary = dir.path().join(format!("{max_timeslice}.summary.json"));
+        let bound = format!("--max-timeslice={max_timeslice}");
+        let record_arg = format!("--record-preemptions-to={}", record.display());
+        let replay_arg = format!("--replay-schedule-from={}", record.display());
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let run = |extra: &[&str]| {
+            let mut args = vec![
+                "run",
+                "--strict",
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--seed=1",
+                bound.as_str(),
+            ];
+            args.extend_from_slice(extra);
+            args.extend(["--", program, "100", "300", "3000000"]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            stdout(&output)
+        };
+        let recorded = run(&[record_arg.as_str()]);
+        assert!(
+            recorded.starts_with("second=")
+                && recorded.contains("\nmain=")
+                && recorded.contains("\nlast_ns="),
+            "{max_timeslice}: {recorded}"
+        );
+        assert_eq!(
+            run(&[replay_arg.as_str(), summary_arg.as_str()]),
+            recorded,
+            "--max-timeslice={max_timeslice}: the replay moved the yielding task's clock"
+        );
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+        assert_eq!(
+            summary["schedevent_desynced"], 0,
+            "--max-timeslice={max_timeslice}: {summary}"
+        );
     }
 }
 

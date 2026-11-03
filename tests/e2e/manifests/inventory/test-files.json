@@ -3596,6 +3596,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/yield_beside_compute_nolibc.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/yield_beside_compute_nolibc.c is owned by hermit-cli/tests/cli.rs: a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_one builds it static with no libc and no dynamic loader, records its schedule at an explicit --max-timeslice of 100 us and of 400 us, and requires the replay to have no desync and the same stdout, which carries a digest of the yielding task's clock reads (review of https://github.com/rrnewton/hermit/pull/4747); it remains a guest fixture because a generic manifest cannot compare a schedule replay's output with its recording's."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/yield_loop_wait.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/yield_loop_wait.c is owned by hermit-cli/tests/cli.rs: The integration tests a_yield_loop_waiting_for_a_finished_call_completes_under_chaos, a_yield_loop_waiting_for_a_finished_call_verifies_under_chaos and a_yield_loop_beside_a_signal_or_alarm_wait_completes run this guest under run --strict: a sched_yield loop waiting for main's sigsuspend must complete with the same output in repeated chaos runs, beside a periodic timer or an idle signal thread too, verify at bitwise parity, and complete when the wait needs the yielder or an alarm (https://github.com/rrnewton/hermit/issues/4234); a generic manifest cannot assert repeated-run equality, the verify verdict or these modes."
