@@ -464,6 +464,7 @@ pub fn find_racing_accesses(
     let truncated = !notes.is_empty();
     notes.extend(finder.backward_edge_notes());
     notes.extend(finder.uncounted_kill_notes());
+    notes.extend(finder.unresolved_group_kill_notes());
 
     let victims = finder.victims(outcome_thread);
     let pairs = finder.flipped_pairs(&victims.ranked);
@@ -941,6 +942,13 @@ const TEED: &str = "a tee(2) copied its bytes without consuming them, so a read 
                     bytes than the writes' offsets give";
 const VMSPLICED: &str = "the trace has a vmsplice(2), which puts bytes in a pipe without a write \
                          the trace records";
+const PACKET: &str = "it may be a packet pipe (pipe2 with O_DIRECT, or a status flag change by \
+                      fcntl F_SETFL), whose reads discard the rest of a packet";
+const LARGE_WRITE: &str = "a write to it may be larger than PIPE_BUF, which the pipe need not take \
+                           whole: other writers' bytes can come between its parts";
+/// The largest pipe write POSIX keeps atomic, 4096 bytes on Linux
+/// (`PIPE_BUF`, include/uapi/linux/limits.h).
+const PIPE_BUF: u64 = 4096;
 
 /// What [`data_edges`] derives from one trace.
 struct DataEdges {
@@ -968,12 +976,22 @@ struct DataEdges {
 /// through it.
 ///
 /// The replay also assumes that every byte in a created pipe came from a
-/// traced write and that every traced read consumed what it returned. Two
-/// calls break that: tee(2) copies a pipe's bytes without consuming them
-/// (Detcore records its input as a read), and vmsplice(2) puts bytes in a
-/// pipe without a write the trace records (its operand is not traced). So a
-/// pipe a tee touches gives no edge ([`TEED`]), and while the trace has any
-/// vmsplice no pipe does ([`VMSPLICED`]).
+/// traced write, in one piece at the write's entry, and that every traced
+/// read consumed exactly what it returned. Some pipes break that, and give
+/// no edge:
+/// - A pipe a tee touches ([`TEED`]): tee(2) copies a pipe's bytes without
+///   consuming them, and Detcore records its input as a read.
+/// - Every pipe while the trace has a vmsplice ([`VMSPLICED`]): vmsplice(2)
+///   puts bytes in a pipe without a write the trace records.
+/// - A packet pipe ([`PACKET`]): a read of one discards the rest of the
+///   packet it reads from (`pipe_read`, fs/pipe.c#n337 at v6.9). A pipe is
+///   taken as one when pipe2 made it with O_DIRECT, or when a successful
+///   fcntl F_SETFL changed the status flags of one of its ends.
+/// - A pipe written by a call that may be larger than PIPE_BUF
+///   ([`LARGE_WRITE`], [`may_exceed_pipe_buf`]): Linux keeps only a write of
+///   at most PIPE_BUF bytes whole (pipe(7)), and Detcore's blocking pipe
+///   write can put a larger one in in parts while other writers run,
+///   recording one result.
 fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
     let (steps, mut untracked) = channel_steps(syscalls);
     // The ends a pipe or socketpair call returned. An Open note alone is not
@@ -1002,6 +1020,37 @@ fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
         })
         .collect();
     let vmspliced = syscalls.iter().any(|sys| sys.sysno == Sysno::vmsplice);
+    // The open files of a packet pipe's ends: both ends pipe2 made with
+    // O_DIRECT, and the end a successful F_SETFL changed.
+    let packet_files: BTreeSet<OpenFileId> = syscalls
+        .iter()
+        .filter(|sys| sys.result.is_some_and(|r| r >= 0))
+        .filter(|sys| match sys.sysno {
+            Sysno::pipe2 => sys.args[1] & libc::O_DIRECT as u64 != 0,
+            Sysno::fcntl => sys.args[1] == libc::F_SETFL as u64,
+            _ => false,
+        })
+        .flat_map(|sys| &sys.accesses)
+        .filter_map(|access| match access {
+            Access::Fd {
+                open_file: Some(open_file),
+                ..
+            } => Some(*open_file),
+            _ => None,
+        })
+        .collect();
+    let packet: BTreeSet<ChannelId> = steps
+        .iter()
+        .filter(|step| packet_files.contains(&step.open_file))
+        .map(|step| step.id)
+        .collect();
+    let large: BTreeSet<ChannelId> = steps
+        .iter()
+        .filter(|step| {
+            step.write && step.kind == ChannelKind::Pipe && may_exceed_pipe_buf(step.sys)
+        })
+        .map(|step| step.id)
+        .collect();
     for step in &steps {
         let why = if !matches!(step.id, ChannelId::Pair(first) if opened.contains(&first)) {
             PREDATES_TRACE
@@ -1009,6 +1058,10 @@ fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
             TEED
         } else if vmspliced && step.kind == ChannelKind::Pipe {
             VMSPLICED
+        } else if packet.contains(&step.id) {
+            PACKET
+        } else if large.contains(&step.id) {
+            LARGE_WRITE
         } else {
             continue;
         };
@@ -1018,6 +1071,27 @@ fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
     }
     let edges = replay_channels(&steps, &mut untracked);
     DataEdges { edges, untracked }
+}
+
+/// Whether `sys`, a call that wrote to a pipe, may have put its bytes in in
+/// more than one part. A write or a splice may when its length argument is
+/// over PIPE_BUF. The trace does not hold a writev's requested length (it
+/// is in the guest's iovecs), so a writev or pwritev2 counts when it
+/// returned more than PIPE_BUF bytes, or when it waited: its return is not
+/// the event right after its entry. Detcore's blocking write puts in a
+/// second part only after it waited for room, and a writev cut short by a
+/// signal after a first part also waited. Any other call counts when it
+/// returned more than PIPE_BUF bytes.
+fn may_exceed_pipe_buf(sys: &SyscallRecord) -> bool {
+    let returned_more = sys.result.is_some_and(|r| r as u64 > PIPE_BUF);
+    match sys.sysno {
+        Sysno::write => sys.args[2] > PIPE_BUF,
+        Sysno::splice => sys.args[4] > PIPE_BUF,
+        Sysno::writev | Sysno::pwritev2 => {
+            returned_more || sys.post.is_none_or(|post| post > sys.pre + 1)
+        }
+        _ => returned_more,
+    }
 }
 
 /// Whether `sysno` returns two connected descriptors, the calls Detcore names
@@ -1290,12 +1364,7 @@ impl<'a> Finder<'a> {
     ) -> Self {
         let target = Run::new(target);
         let baseline = Run::new(baseline);
-        let processes = target
-            .syscalls
-            .iter()
-            .chain(&baseline.syscalls)
-            .map(|sys| (sys.tid, sys.pid))
-            .collect();
+        let processes = thread_processes(target.syscalls.iter().chain(&baseline.syscalls));
         // A call that entered before the decision did so in both runs alike
         // (the window lemma); where its arguments still differ they point
         // outside the guest's control (the container's first execve gets
@@ -1315,6 +1384,37 @@ impl<'a> Finder<'a> {
             decision,
             end,
         }
+    }
+
+    /// One note per SIGKILL in the window that tgkill or tkill aimed at a
+    /// thread whose process neither trace shows ([`thread_processes`]): it
+    /// is taken as ending that thread alone, which can miss pairs with the
+    /// rest of its thread group, and the result says so.
+    fn unresolved_group_kill_notes(&self) -> Vec<String> {
+        self.in_window()
+            .filter(|kill| !kill.target.result.is_some_and(|r| r < 0))
+            .flat_map(|kill| {
+                kill.target
+                    .accesses
+                    .iter()
+                    .filter_map(move |access| match access {
+                        Access::Lifetime {
+                            target: Task::Thread(tid),
+                            op: LifetimeOp::Signal { signo },
+                        } if *signo == libc::SIGKILL && !self.processes.contains_key(tid) => {
+                            Some(format!(
+                                "{} at event {} ends the whole thread group of thread {tid}, but \
+                             neither trace shows that thread's process (no call of it and no \
+                             creation of it), so it is taken as ending that thread alone: pairs \
+                             with the rest of its group can be missing.",
+                                call_text(kill.target),
+                                kill.target.pre
+                            ))
+                        }
+                        _ => None,
+                    })
+            })
+            .collect()
     }
 
     /// One note per kill in the window that sent another signal than
@@ -2698,6 +2798,37 @@ fn flip<'a>(
         resource: conflict.resource,
         slot: conflict.slot,
     })
+}
+
+/// Each thread's process, as `calls` show it: the process of every thread
+/// that made a call, and of every thread a successful clone with
+/// CLONE_THREAD created (the creator's), so that a thread that never makes a
+/// call still has one. A new process's first thread has the process's ID.
+fn thread_processes<'a>(
+    calls: impl Iterator<Item = &'a &'a SyscallRecord>,
+) -> BTreeMap<DetTid, DetPid> {
+    let mut processes = BTreeMap::new();
+    for sys in calls {
+        processes.insert(sys.tid, sys.pid);
+        for access in &sys.accesses {
+            match access {
+                Access::Lifetime {
+                    target: Task::Thread(tid),
+                    op: LifetimeOp::Create,
+                } => {
+                    processes.entry(*tid).or_insert(sys.pid);
+                }
+                Access::Lifetime {
+                    target: Task::Process(pid),
+                    op: LifetimeOp::Create,
+                } => {
+                    processes.entry(*pid).or_insert(*pid);
+                }
+                _ => {}
+            }
+        }
+    }
+    processes
 }
 
 /// How the victim conflicts with another call.
@@ -4311,6 +4442,280 @@ mod tests {
         let data = data_edges(&calls.iter().collect::<Vec<_>>());
         assert_eq!(data.edges.len(), 1, "{:?}", data.edges);
         assert!(data.untracked.is_empty(), "{:?}", data.untracked);
+    }
+
+    /// A read of a packet pipe discards the rest of the packet it reads from:
+    /// after W1 writes an 8-byte packet, R1 reads 4 and the kernel drops the
+    /// other 4, so after W2 writes 4, R2's 4 bytes are W2's, yet the byte
+    /// offsets give them to W1. A pipe pipe2 made with O_DIRECT, or whose
+    /// end a successful F_SETFL changed, gives no edge and is named; an
+    /// ordinary pipe with the same calls keeps its edges. The records have
+    /// the shape the access trace test
+    /// `the_trace_shows_what_leaves_a_pipes_data_edges_out` (tests/cli.rs)
+    /// checks in a real run.
+    #[test]
+    fn a_packet_pipe_gives_no_edge() {
+        let write = |pre, tid, len| {
+            call(
+                pre,
+                tid,
+                1,
+                Sysno::write,
+                &[4, 0x1000, len],
+                Some(len as i64),
+                vec![pipe(file(7, 2), ChannelOp::Write)],
+            )
+        };
+        let read = |pre| {
+            call(
+                pre,
+                9,
+                1,
+                Sysno::read,
+                &[3, 0x2000, 4],
+                Some(4),
+                vec![pipe(file(7, 1), ChannelOp::Read)],
+            )
+        };
+        let made = |flags: u64| {
+            call(
+                1,
+                7,
+                0,
+                Sysno::pipe2,
+                &[0x3000, flags],
+                Some(0),
+                vec![
+                    fd(3, Some(file(7, 1)), opened("pipe")),
+                    fd(4, Some(file(7, 2)), opened("pipe")),
+                ],
+            )
+        };
+        let setfl = call(
+            5,
+            7,
+            2,
+            Sysno::fcntl,
+            &[4, libc::F_SETFL as u64, libc::O_NONBLOCK as u64],
+            Some(0),
+            vec![fd(4, Some(file(7, 2)), FdOp::Use)],
+        );
+        let key = ChannelKey::Shared(ChannelId::Pair(file(7, 1)));
+        for calls in [
+            vec![
+                made(libc::O_DIRECT as u64),
+                write(10, 7, 8),
+                read(12),
+                write(14, 8, 4),
+                read(16),
+            ],
+            vec![
+                made(0),
+                setfl.clone(),
+                write(10, 7, 8),
+                read(12),
+                write(14, 8, 4),
+                read(16),
+            ],
+        ] {
+            let data = data_edges(&calls.iter().collect::<Vec<_>>());
+            assert_eq!(data.edges, Vec::new());
+            assert_eq!(data.untracked.get(&key).map(|u| u.why), Some(PACKET));
+        }
+        // An ordinary pipe: W1's 8 bytes reach both reads.
+        let calls = [
+            made(0),
+            write(10, 7, 8),
+            read(12),
+            write(14, 8, 4),
+            read(16),
+        ];
+        let data = data_edges(&calls.iter().collect::<Vec<_>>());
+        assert!(data.untracked.is_empty(), "{:?}", data.untracked);
+        assert_eq!(data.edges.len(), 2, "{:?}", data.edges);
+        // A failed F_SETFL changed nothing.
+        let mut failed = setfl;
+        failed.result = Some(-(libc::EBADF as i64));
+        let calls = [
+            made(0),
+            failed,
+            write(10, 7, 8),
+            read(12),
+            write(14, 8, 4),
+            read(16),
+        ];
+        assert!(
+            data_edges(&calls.iter().collect::<Vec<_>>())
+                .untracked
+                .is_empty()
+        );
+    }
+
+    /// Linux keeps a pipe write whole only up to PIPE_BUF bytes, and
+    /// Detcore's blocking pipe write puts a larger one in in parts while
+    /// other writers run, recording one result. With a pipe of capacity C,
+    /// W1 asks for more than 2C and puts in C, R1 drains C, W2 writes 4 and
+    /// R2 reads them, and only then does W1 go on: R2's bytes are W2's,
+    /// while the offsets credit them to W1's single record. A pipe with a
+    /// write that may exceed PIPE_BUF gives no edge and is named: a write by
+    /// its length, a writev (whose length the trace does not hold) by what it
+    /// returned or by having waited. One whose writes all fit keeps its edges.
+    #[test]
+    fn a_pipe_write_larger_than_pipe_buf_gives_no_edge() {
+        let c: u64 = 65536;
+        let write = |pre, tid, sysno, len: u64| {
+            call(
+                pre,
+                tid,
+                1,
+                sysno,
+                &[4, 0x1000, len],
+                Some(len as i64),
+                vec![pipe(file(7, 2), ChannelOp::Write)],
+            )
+        };
+        let read = |pre, nth, len: u64| {
+            call(
+                pre,
+                9,
+                nth,
+                Sysno::read,
+                &[3, 0x2000, len],
+                Some(len as i64),
+                vec![pipe(file(7, 1), ChannelOp::Read)],
+            )
+        };
+        // A writev that waited: its return is not the event after its entry.
+        let waited = |len: u64| {
+            let mut sys = write(10, 7, Sysno::writev, len);
+            sys.post = Some(15);
+            sys
+        };
+        let key = ChannelKey::Shared(ChannelId::Pair(file(7, 1)));
+        let first_writes = [
+            write(10, 7, Sysno::write, 2 * c + 1),
+            write(10, 7, Sysno::write, PIPE_BUF + 1),
+            write(10, 7, Sysno::writev, PIPE_BUF + 1),
+            waited(8),
+        ];
+        for first in first_writes {
+            let len = first.result.unwrap() as u64;
+            let what = format!("{} of {len}", first.sysno);
+            let calls = [
+                creates(1, [file(7, 1), file(7, 2)]),
+                first,
+                read(16, 1, len.min(c)),
+                write(18, 8, Sysno::write, 4),
+                read(20, 2, 4),
+            ];
+            let data = data_edges(&calls.iter().collect::<Vec<_>>());
+            assert_eq!(data.edges, Vec::new(), "{what}");
+            assert_eq!(
+                data.untracked.get(&key).map(|u| u.why),
+                Some(LARGE_WRITE),
+                "{what}"
+            );
+        }
+        // Every write at most PIPE_BUF, and the writev did not wait: each
+        // read is ordered after its write.
+        for first in [
+            write(10, 7, Sysno::write, PIPE_BUF),
+            write(10, 7, Sysno::writev, 8),
+        ] {
+            let len = first.result.unwrap() as u64;
+            let calls = [
+                creates(1, [file(7, 1), file(7, 2)]),
+                first,
+                read(16, 1, len),
+                write(18, 8, Sysno::write, 4),
+                read(20, 2, 4),
+            ];
+            let data = data_edges(&calls.iter().collect::<Vec<_>>());
+            assert!(data.untracked.is_empty(), "{:?}", data.untracked);
+            assert_eq!(data.edges.len(), 2, "{:?}", data.edges);
+        }
+    }
+
+    /// A thread can be killed before it makes a call: thread 5 of process 5
+    /// creates thread 6 with clone(CLONE_THREAD) and thread 6 only computes.
+    /// A tgkill(5, 6, SIGKILL) still ends thread 5, which the creation shows
+    /// is in thread 6's process, so the wait it ends is the kill's racing
+    /// access. A thread neither trace shows the process of is taken as
+    /// ending alone, with a note.
+    #[test]
+    fn a_sigkill_through_tgkill_reaches_a_group_member_that_made_no_call() {
+        let wait = |post: Option<EventIndex>| {
+            let mut sys = call(
+                95,
+                5,
+                50,
+                Sysno::futex,
+                &[0x6000, 137, 0, 0x7000, 0, 0xffff_ffff],
+                post.map(|_| ETIMEDOUT),
+                vec![futex(FutexOp::Wait)],
+            );
+            sys.pid = DetPid::from_raw(5);
+            sys.post = post;
+            sys
+        };
+        let clone = || {
+            let mut sys = call(
+                90,
+                5,
+                49,
+                Sysno::clone,
+                &[(libc::CLONE_VM | libc::CLONE_THREAD | libc::CLONE_SIGHAND) as u64],
+                Some(6),
+                vec![Access::Lifetime {
+                    target: Task::Thread(t(6)),
+                    op: LifetimeOp::Create,
+                }],
+            );
+            sys.pid = DetPid::from_raw(5);
+            sys
+        };
+        let tgkill = |pre, tid: u64| {
+            call(
+                pre,
+                3,
+                60,
+                Sysno::tgkill,
+                &[5, tid, 9],
+                Some(0),
+                vec![Access::Lifetime {
+                    target: Task::Thread(t(tid as i32)),
+                    op: LifetimeOp::Signal { signo: 9 },
+                }],
+            )
+        };
+        let target = trace(vec![clone(), wait(Some(101)), tgkill(103, 6)]);
+        let baseline = trace(vec![clone(), wait(None), tgkill(101, 6)]);
+        let r = find(&target, &baseline, Some(3));
+        assert_eq!(r.status, RaceStatus::Found, "{}", r.reason);
+        assert_eq!(
+            r.resource,
+            Some(ResourceText {
+                kind: ResourceKind::Lifetime,
+                text: "process 5".to_string()
+            })
+        );
+        assert!(
+            r.notes.iter().all(|note| !note.contains("thread group")),
+            "{:?}",
+            r.notes
+        );
+        // Thread 7 neither makes a call nor is created in the traces.
+        let target = trace(vec![wait(Some(101)), tgkill(103, 7)]);
+        let baseline = trace(vec![wait(None), tgkill(101, 7)]);
+        let r = find(&target, &baseline, Some(3));
+        assert!(
+            r.notes.iter().any(
+                |note| note.contains("ends the whole thread group of thread 7")
+                    && note.contains("taken as ending that thread alone")
+            ),
+            "{:?}",
+            r.notes
+        );
     }
 
     /// A SIGKILL sent through tgkill names one thread but ends its whole

@@ -43,6 +43,9 @@ struct Guests {
     /// `tests/fixtures/access_trace_mix.c`: two threads race over a mutex, a
     /// pipe, a file, a mapping, a timer, a signal and a child.
     mix: PathBuf,
+    /// `tests/fixtures/access_trace_pipes.c`: a packet pipe, an F_SETFL and
+    /// a write larger than a pipe.
+    pipes: PathBuf,
     /// One supplied cache input shared by every compared run, if the host
     /// has a cache. The default container makes a new copy for each run,
     /// whose inode and mtime differ in the recorded host-input metadata.
@@ -94,6 +97,11 @@ fn guests() -> &'static Guests {
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/access_trace_mix.c"),
                 &["-O0", "-g", "-pthread", "-D_GNU_SOURCE"],
                 "mix",
+            ),
+            pipes: compile(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/access_trace_pipes.c"),
+                &["-O0", "-g", "-D_GNU_SOURCE"],
+                "pipes",
             ),
             ld_so_cache,
             ping_pong: compile(
@@ -268,6 +276,102 @@ fn syscalls(trace: &AccessTrace) -> impl Iterator<Item = &SyscallRecord> {
         TraceRecord::Syscall(syscall) => Some(syscall),
         _ => None,
     })
+}
+
+/// The records analyze's race finder reads to leave a pipe's data edges out
+/// (`races::data_edges`), from a real run of
+/// tests/fixtures/access_trace_pipes.c. pipe2 with O_DIRECT keeps the flag
+/// in its second argument and notes both ends it made, and the packet
+/// pipe's second read gets the second write's bytes (the guest says so):
+/// the first read dropped the rest of the first packet. A successful fcntl
+/// F_SETFL notes the open file of the end it changed. A write larger than
+/// the pipe, which a child drains while it blocks, is one record with its
+/// whole length and result, though it went in in parts; it waited, so its
+/// return is not the event after its entry, while each small write's is.
+#[test]
+fn the_trace_shows_what_leaves_a_pipes_data_edges_out() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let traced = run_traced(&guests().pipes, directory.path(), "traced", None, Some(0));
+    let stdout = String::from_utf8_lossy(&traced.output.stdout);
+    assert!(stdout.contains("packet pipe second read: BBBB"), "{stdout}");
+    let trace = traced.trace.expect("traced run");
+    let calls: Vec<&SyscallRecord> = syscalls(&trace).collect();
+    let ends = |call: &SyscallRecord| -> Vec<_> {
+        call.accesses
+            .iter()
+            .filter_map(|access| match access {
+                Access::Fd {
+                    open_file: Some(open_file),
+                    op: FdOp::Open { .. },
+                    ..
+                } => Some(*open_file),
+                _ => None,
+            })
+            .collect()
+    };
+    let pipes: Vec<&&SyscallRecord> = calls
+        .iter()
+        .filter(|call| call.sysno.name() == "pipe2" && call.result == Some(0))
+        .collect();
+    assert_eq!(pipes.len(), 3, "{pipes:?}");
+    assert_ne!(
+        pipes[0].args[1] & libc::O_DIRECT as u64,
+        0,
+        "{:?}",
+        pipes[0]
+    );
+    assert_eq!(
+        pipes[1].args[1] & libc::O_DIRECT as u64,
+        0,
+        "{:?}",
+        pipes[1]
+    );
+    for pipe in &pipes {
+        assert_eq!(ends(pipe).len(), 2, "{pipe:?}");
+    }
+    let setfl = calls
+        .iter()
+        .find(|call| call.sysno.name() == "fcntl" && call.args[1] == libc::F_SETFL as u64)
+        .expect("the trace has the F_SETFL");
+    assert_eq!(setfl.result, Some(0));
+    assert!(
+        setfl.accesses.iter().any(|access| matches!(
+            access,
+            Access::Fd { open_file: Some(open_file), op: FdOp::Use, .. }
+                if ends(pipes[1]).contains(open_file)
+        )),
+        "{setfl:?}"
+    );
+    let size = 3 * 65536;
+    let large: Vec<&&SyscallRecord> = calls
+        .iter()
+        .filter(|call| call.sysno.name() == "write" && call.args[2] == size)
+        .collect();
+    assert_eq!(large.len(), 1, "{large:?}");
+    assert_eq!(large[0].result, Some(size as i64));
+    // It waited for room, so its return is not the event after its entry;
+    // the small writes, which did not wait, return at the next event.
+    assert!(
+        large[0].post.is_some_and(|post| post > large[0].pre + 1),
+        "{:?}",
+        large[0]
+    );
+    for small in calls
+        .iter()
+        .filter(|call| call.sysno.name() == "write" && call.args[2] <= 8 && call.args[0] == 4)
+    {
+        assert_eq!(small.post, Some(small.pre + 1), "{small:?}");
+    }
+    assert!(
+        large[0].accesses.iter().any(|access| matches!(
+            access,
+            Access::Channel { id: Some(ChannelId::Pair(first)), .. }
+                if ends(pipes[2]).first() == Some(first)
+        )),
+        "{:?}",
+        large[0]
+    );
 }
 
 /// The trace changes nothing a run shows, whether the run follows a
