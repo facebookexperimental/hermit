@@ -1242,9 +1242,20 @@ impl PreemptionRecord {
     }
 
     /// Leave only the per-thread preemption records, not the global schedule.
+    /// Rows that hold an instruction offset are then rows alone, as
+    /// [`Self::clone_preemptions_only`] leaves them: they say so
+    /// (`rows_alone`), state [`INSTRUCTION_OFFSET_ROWS_FORMAT`] and keep no
+    /// jumps of global time, which index the schedule trace they no longer
+    /// hold. A record of a format this Hermit does not read keeps its format
+    /// as stated, for `validate_format` to refuse.
     pub fn preemptions_only(&mut self) {
         self.forget_run_points();
         self.global.clear();
+        if self.rows_carry_instruction_offsets() && reads_format(self.format_version) {
+            self.format_version = Some(INSTRUCTION_OFFSET_ROWS_FORMAT);
+            self.rows_alone = true;
+            self.time_skips = None;
+        }
     }
 
     /// Make a copy just of the preemptions (cheap) rather than the whole schedule trace (expensive)
@@ -3583,6 +3594,7 @@ mod tests {
 
         let mut in_place = offsets.clone();
         in_place.preemptions_only();
+        assert_eq!(in_place, offsets.clone_preemptions_only());
         for (what, record) in [
             ("the run's record", offsets.clone()),
             ("its rows alone", offsets.clone_preemptions_only()),
