@@ -282,6 +282,15 @@ function run_nextest {
         fi
     fi
 
+    # A schema-5 node gets a fresh skip sidecar for this run: test helpers
+    # append one HERMIT-TEST-SKIP line per runtime skip to it, and the
+    # result writer classifies those rows from it after the run.
+    local skip_file=
+    if [[ ${HERMIT_NEXTEST_RESULTS_SCHEMA:-} == 5 ]]; then
+        skip_file=$(mktemp "${TMPDIR:-/tmp}/hermit-test-skips.XXXXXX") || return $?
+        export HERMIT_TEST_SKIP_FILE="$skip_file"
+    fi
+
     set +e
     # nextest's stderr remains presentation. The versioned stdout event stream
     # is the only input to the aggregate count and per-test result adapter.
@@ -306,6 +315,10 @@ function run_nextest {
         (unset NEXTEST_EXPECTED_EXECUTED; \
             emit_libtest_count "$events_log" "$status" "$attempts" "$binary_map" \
             "$cpu_report") || count_status=$?
+    fi
+    if [[ -n $skip_file ]]; then
+        rm -f "$skip_file"
+        unset HERMIT_TEST_SKIP_FILE
     fi
     # Publication cannot erase a failure that the actual test runner observed.
     if ((status != 0)); then
@@ -351,6 +364,36 @@ with open(sys.argv[1], encoding="utf-8") as source:
     ],
     }
 PYEOF
+
+    printf 'HERMIT-TEST-SKIP: passes\tno /dev/kvm on this host\n' \
+        >"$scratch/skips.txt"
+    got=$(HERMIT_NEXTEST_RESULTS_SCHEMA=5 HERMIT_TEST_SKIP_FILE="$scratch/skips.txt" \
+        DAGRUN_TEST_COUNTS_PATH="$scratch/skip-counts.json" \
+        emit_libtest_count "$scratch/events.jsonl" 0)
+    expected=$'running 2 tests\ntest result: ok. 1 passed; 0 failed; 1 skipped; 0 ignored; 7 filtered out'
+    [[ $got == "$expected" ]] || return 1
+    python3 - "$scratch/skip-counts.json" <<'PYEOF' || return 1
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+assert report["schema"] == 5
+assert report["executed_tests"] == 2
+rows = {row["id"]: row for row in report["results"]}
+assert rows["suite$passes"]["result"] == "skip"
+assert rows["suite$passes"]["skip_reason"] == "no /dev/kvm on this host"
+assert rows["suite$recovers"]["result"] == "pass"
+PYEOF
+
+    status=0
+    HERMIT_TEST_SKIP_FILE="$scratch/skips.txt" \
+        DAGRUN_TEST_COUNTS_PATH="$scratch/no-optin-counts.json" \
+        emit_libtest_count "$scratch/events.jsonl" 0 \
+        >/dev/null 2>"$scratch/no-optin.stderr" || status=$?
+    [[ $status == 2 ]] || return 1
+    grep -q 'not opted into schema 5' "$scratch/no-optin.stderr" || return 1
+    [[ ! -e $scratch/no-optin-counts.json ]] || return 1
 
     sed 's/"filtered_out":7/"filtered_out":11/' \
         "$scratch/events.jsonl" >"$scratch/mutated-events.jsonl"
@@ -599,7 +642,7 @@ PYEOF
     HERMIT_NEXTEST_EVENTS_PATH='' configured_events_path >/dev/null 2>&1 || status=$?
     [[ $status == 2 ]] || return 1
 
-    printf 'run-nextest-counted: self-test PASS (typed counts, executed failure, zero-terminal launch failure, CPU reconciliation, refusal controls, event retention)\n'
+    printf 'run-nextest-counted: self-test PASS (typed counts, executed failure, zero-terminal launch failure, CPU reconciliation, refusal controls, event retention, skip classification)\n'
 }
 
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then

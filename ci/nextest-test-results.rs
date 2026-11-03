@@ -3,7 +3,7 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "b5ec1702c191b4d0bffea8f167044a5904e0752f" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "04f9841fae4f6bba5656650ac316a68ada457071" }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
 //! sha2 = "0.10"
@@ -15,6 +15,8 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
+use dagrun::TestAttemptOutcome;
+use dagrun::TestAttemptResult;
 use dagrun::TestResult;
 use dagrun::TestResults;
 use dagrun::TestResultsWriteError;
@@ -584,8 +586,207 @@ impl std::fmt::Display for ProducerError {
     }
 }
 
-fn publish_with_recovery(report: &TestResults, path: &Path) -> Result<(), ProducerError> {
-    match report.write_current_typed(path) {
+/// One runtime-skip marker a test helper appended to the run's sidecar file.
+///
+/// The line format is `HERMIT-TEST-SKIP: <test-name>\t<reason>`: the bare test
+/// name the helper's caller passed (the parser matches it against the terminal
+/// row's test path), a tab, and the nonempty reason on the same line.
+#[derive(Debug, Eq, PartialEq)]
+struct SkipMarker {
+    name: String,
+    reason: String,
+}
+
+const SKIP_MARKER_PREFIX: &str = "HERMIT-TEST-SKIP: ";
+/// One append must stay under PIPE_BUF so parallel test processes cannot
+/// interleave entries in the shared sidecar.
+const SKIP_MARKER_MAX_BYTES: usize = 4096;
+
+fn parse_skip_sidecar(bytes: &[u8]) -> Result<Vec<SkipMarker>, String> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !bytes.ends_with(b"\n") {
+        return Err(
+            "nextest-test-results: skip sidecar ends in a truncated line; refusing to guess"
+                .into(),
+        );
+    }
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        format!("nextest-test-results: skip sidecar is not UTF-8: {error}")
+    })?;
+    let mut markers: Vec<SkipMarker> = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line_number = index + 1;
+        if line.len() + 1 > SKIP_MARKER_MAX_BYTES {
+            return Err(format!(
+                "nextest-test-results: skip sidecar line {line_number} exceeds {SKIP_MARKER_MAX_BYTES} bytes"
+            ));
+        }
+        let entry = line.strip_prefix(SKIP_MARKER_PREFIX).ok_or_else(|| {
+            format!(
+                "nextest-test-results: skip sidecar line {line_number} lacks the {SKIP_MARKER_PREFIX:?} prefix"
+            )
+        })?;
+        let (name, reason) = entry.split_once('\t').ok_or_else(|| {
+            format!(
+                "nextest-test-results: skip sidecar line {line_number} has no tab before its reason"
+            )
+        })?;
+        if name.is_empty() || name.trim() != name {
+            return Err(format!(
+                "nextest-test-results: skip sidecar line {line_number} has an empty or untrimmed test name"
+            ));
+        }
+        if reason.is_empty() || reason.trim() != reason {
+            return Err(format!(
+                "nextest-test-results: skip sidecar line {line_number} has an empty or untrimmed reason"
+            ));
+        }
+        if markers.iter().any(|marker: &SkipMarker| marker.name == name) {
+            return Err(format!(
+                "nextest-test-results: skip sidecar names test {name:?} twice; refusing to guess"
+            ));
+        }
+        markers.push(SkipMarker {
+            name: name.to_string(),
+            reason: reason.to_string(),
+        });
+    }
+    Ok(markers)
+}
+
+/// The skip markers for this run, when the runner wired the sidecar channel.
+///
+/// `HERMIT_TEST_SKIP_FILE` is set by `run-nextest-counted.sh` only for a node
+/// that opted into schema 5 (`HERMIT_NEXTEST_RESULTS_SCHEMA=5`). An unset
+/// variable means the channel is off and there is nothing to read.
+fn read_skip_markers() -> Result<Vec<SkipMarker>, ProducerError> {
+    let path = match env::var("HERMIT_TEST_SKIP_FILE") {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => return Ok(Vec::new()),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("nextest-test-results HERMIT_TEST_SKIP_FILE is not UTF-8".into());
+        }
+    };
+    if path.is_empty() {
+        return Err("nextest-test-results HERMIT_TEST_SKIP_FILE must not be empty".into());
+    }
+    let bytes = fs::read(&path).map_err(|error| {
+        format!("nextest-test-results: cannot read skip sidecar {path}: {error}")
+    })?;
+    Ok(parse_skip_sidecar(&bytes)?)
+}
+
+/// Whether this node opted into schema-5 structured results.
+fn schema_5_opted_in() -> Result<bool, ProducerError> {
+    match env::var("HERMIT_NEXTEST_RESULTS_SCHEMA") {
+        Ok(value) if value == "5" => Ok(true),
+        Ok(value) => Err(format!(
+            "nextest-test-results: HERMIT_NEXTEST_RESULTS_SCHEMA must be 5 when set, got {value:?}"
+        )
+        .into()),
+        Err(env::VarError::NotPresent) => Ok(false),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("nextest-test-results HERMIT_NEXTEST_RESULTS_SCHEMA is not UTF-8".into())
+        }
+    }
+}
+
+/// Synthesize classified attempts for one terminal row.
+///
+/// The event stream reports only the terminal outcome and the attempt count;
+/// nextest retries only failures, so attempts before the terminal one failed.
+fn classified_attempts(result: &TestResult) -> Result<Vec<TestAttemptResult>, String> {
+    let mut attempts = Vec::new();
+    for attempt in 1..result.attempts {
+        attempts.push(TestAttemptResult::new(
+            attempt,
+            TestAttemptOutcome::Failed,
+            Some(format!(
+                "nextest attempt {attempt} of {} failed before the terminal attempt",
+                result.attempts
+            )),
+        )?);
+    }
+    let terminal = if result.passed {
+        TestAttemptResult::new(result.attempts, TestAttemptOutcome::Passed, None)?
+    } else {
+        TestAttemptResult::new(
+            result.attempts,
+            TestAttemptOutcome::Failed,
+            Some("nextest reported this test failed".into()),
+        )?
+    };
+    attempts.push(terminal);
+    Ok(attempts)
+}
+
+/// Classify sidecar-marked rows as skips and give every row classified
+/// attempts, as schema 5 requires. A marker naming a test with no terminal
+/// row, more than one row, or a failed row refuses the report: a skip can
+/// never launder a failure, and a marker without a started test is a
+/// harness bug.
+fn apply_skip_markers(
+    results: Vec<TestResult>,
+    markers: &[SkipMarker],
+) -> Result<Vec<TestResult>, String> {
+    let mut results = results;
+    for marker in markers {
+        let matches: Vec<usize> = results
+            .iter()
+            .enumerate()
+            .filter(|(_, result)| {
+                let test = result.id.rsplit_once('$').map_or(result.id.as_str(), |(_, test)| test);
+                test == marker.name || test.ends_with(&format!("::{}", marker.name))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let [index] = matches.as_slice() else {
+            return Err(format!(
+                "nextest-test-results: skip marker for {:?} matches {} terminal row(s); refusing to guess",
+                marker.name,
+                matches.len()
+            ));
+        };
+        let row = &results[*index];
+        if !row.passed {
+            return Err(format!(
+                "nextest-test-results: skip marker for {:?} names a test that did not pass; a skip cannot launder a failure",
+                marker.name
+            ));
+        }
+        let mut attempts = classified_attempts(row)?;
+        let terminal = attempts.pop().expect("classified_attempts is nonempty");
+        debug_assert_eq!(terminal.outcome, TestAttemptOutcome::Passed);
+        attempts.push(TestAttemptResult::new(
+            row.attempts,
+            TestAttemptOutcome::Skipped,
+            Some(marker.reason.clone()),
+        )?);
+        results[*index] = TestResult::skipped(row.id.clone(), attempts, marker.reason.clone())?;
+    }
+    for result in &mut results {
+        if result.attempt_results.is_none() {
+            result.attempt_results = Some(classified_attempts(result)?);
+        }
+    }
+    Ok(results)
+}
+
+fn publish_with_recovery(
+    report: &TestResults,
+    path: &Path,
+    schema_5: bool,
+) -> Result<(), ProducerError> {
+    let write = |target: &Path| {
+        if schema_5 {
+            report.write_skipped_typed(target)
+        } else {
+            report.write_current_typed(target)
+        }
+    };
+    match write(path) {
         Ok(()) => Ok(()),
         Err(primary @ TestResultsWriteError::Invalid(_)) => {
             Err(ProducerError::Publication(primary))
@@ -594,7 +795,7 @@ fn publish_with_recovery(report: &TestResults, path: &Path) -> Result<(), Produc
             primary @ (TestResultsWriteError::Write { .. } | TestResultsWriteError::Publish { .. }),
         ) => {
             let recovery = structured_test_results_recovery_path(path);
-            match report.write_current_typed(&recovery) {
+            match write(&recovery) {
                 Ok(()) => Err(ProducerError::Publication(primary)),
                 Err(recovery) => Err(ProducerError::PublicationRecovery { primary, recovery }),
             }
@@ -663,16 +864,13 @@ fn run() -> Result<(), ProducerError> {
         );
     }
     let parsed = parse_events(Path::new(&events))?;
-    let passed = u64::try_from(parsed.results.iter().filter(|result| result.passed).count())
-        .map_err(|_| "nextest-test-results: passed result count does not fit u64".to_string())?;
-    let failed = parsed
-        .executed_tests
-        .checked_sub(passed)
-        .ok_or_else(|| "nextest-test-results: passed count exceeds executed count".to_string())?;
-    if status == 0 && failed != 0 {
-        return Err(format!(
-            "nextest-test-results: successful nextest status disagrees with {failed} failed typed result(s)"
-        ).into());
+    let schema_5 = schema_5_opted_in()?;
+    let markers = read_skip_markers()?;
+    if !markers.is_empty() && !schema_5 {
+        return Err(
+            "nextest-test-results: skip markers were recorded but this node has not opted into schema 5 (HERMIT_NEXTEST_RESULTS_SCHEMA=5); refusing to fold them into passes"
+                .into(),
+        );
     }
     let cpu_report = match (attempt_records, binary_map, cpu_report) {
         (Some(records), Some(binary_map), Some(output)) => {
@@ -683,8 +881,29 @@ fn run() -> Result<(), ProducerError> {
         (None, None, None) => None,
         _ => unreachable!("argument pairing was checked above"),
     };
-    let report =
-        TestResults::current(parsed.executed_tests, parsed.filtered_tests, parsed.results)?;
+    let results = if schema_5 {
+        apply_skip_markers(parsed.results, &markers)?
+    } else {
+        parsed.results
+    };
+    let passed = u64::try_from(results.iter().filter(|result| result.passed).count())
+        .map_err(|_| "nextest-test-results: passed result count does not fit u64".to_string())?;
+    let skipped = u64::try_from(results.iter().filter(|result| result.is_skipped()).count())
+        .map_err(|_| "nextest-test-results: skipped result count does not fit u64".to_string())?;
+    let failed = parsed
+        .executed_tests
+        .checked_sub(passed + skipped)
+        .ok_or_else(|| "nextest-test-results: passed count exceeds executed count".to_string())?;
+    if status == 0 && failed != 0 {
+        return Err(format!(
+            "nextest-test-results: successful nextest status disagrees with {failed} failed typed result(s)"
+        ).into());
+    }
+    let report = if schema_5 {
+        TestResults::skipped(parsed.executed_tests, parsed.filtered_tests, results)?
+    } else {
+        TestResults::current(parsed.executed_tests, parsed.filtered_tests, results)?
+    };
     if let Some(expected) = match env::var("NEXTEST_EXPECTED_EXECUTED") {
         Ok(value) => Some(parse_u64(value, "NEXTEST_EXPECTED_EXECUTED")?),
         Err(env::VarError::NotPresent) => None,
@@ -710,7 +929,7 @@ fn run() -> Result<(), ProducerError> {
         }
     }
     if output != "-" {
-        publish_with_recovery(&report, Path::new(&output))?;
+        publish_with_recovery(&report, Path::new(&output), schema_5)?;
     }
     if let Some((cpu_report, output)) = cpu_report {
         if output != "-" {
@@ -718,14 +937,19 @@ fn run() -> Result<(), ProducerError> {
         }
     }
     println!("running {} tests", report.executed_tests);
+    let skipped_summary = if skipped > 0 {
+        format!("; {skipped} skipped")
+    } else {
+        String::new()
+    };
     if status == 0 {
         println!(
-            "test result: ok. {passed} passed; 0 failed; 0 ignored; {} filtered out",
+            "test result: ok. {passed} passed; 0 failed{skipped_summary}; 0 ignored; {} filtered out",
             report.filtered_tests
         );
     } else {
         println!(
-            "test result: FAILED. {passed} passed; {failed} failed; 0 ignored; {} filtered out",
+            "test result: FAILED. {passed} passed; {failed} failed{skipped_summary}; 0 ignored; {} filtered out",
             report.filtered_tests
         );
     }
@@ -798,12 +1022,12 @@ mod tests {
         )
         .unwrap();
         let expected = scratch.0.join("expected.json");
-        publish_with_recovery(&report, &expected).unwrap();
+        publish_with_recovery(&report, &expected, false).unwrap();
         assert!(!structured_test_results_recovery_path(&expected).exists());
 
         let primary = scratch.0.join("primary.json");
         fs::create_dir(&primary).unwrap();
-        let error = publish_with_recovery(&report, &primary).unwrap_err();
+        let error = publish_with_recovery(&report, &primary, false).unwrap_err();
         assert_eq!(error.exit_code(), 75);
         match error {
             ProducerError::Publication(TestResultsWriteError::Publish { path, .. }) => {
@@ -820,6 +1044,90 @@ mod tests {
     }
 
     #[test]
+    fn skip_sidecar_parses_markers_and_refuses_malformed_lines() {
+        assert_eq!(parse_skip_sidecar(b"").unwrap(), Vec::new());
+        assert_eq!(
+            parse_skip_sidecar(b"HERMIT-TEST-SKIP: run_kvm_case\tno /dev/kvm on this host\n")
+                .unwrap(),
+            vec![SkipMarker {
+                name: "run_kvm_case".into(),
+                reason: "no /dev/kvm on this host".into(),
+            }]
+        );
+        // A truncated final line, a duplicate, a missing tab, an empty
+        // reason, and an overlong line each refuse rather than guess.
+        assert!(parse_skip_sidecar(b"HERMIT-TEST-SKIP: a\tb").is_err());
+        assert!(parse_skip_sidecar(
+            b"HERMIT-TEST-SKIP: a\tb\nHERMIT-TEST-SKIP: a\tc\n"
+        )
+        .is_err());
+        assert!(parse_skip_sidecar(b"HERMIT-TEST-SKIP: a b\n").is_err());
+        assert!(parse_skip_sidecar(b"HERMIT-TEST-SKIP: a\t\n").is_err());
+        assert!(parse_skip_sidecar(b"a\tb\n").is_err());
+        let overlong = format!("HERMIT-TEST-SKIP: a\t{}\n", "x".repeat(4096));
+        assert!(parse_skip_sidecar(overlong.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn skip_markers_classify_ok_rows_and_refuse_the_rest() {
+        let rows = vec![
+            TestResult::new("suite$skips".into(), true, 1).unwrap(),
+            TestResult::new("suite$runs".into(), true, 2).unwrap(),
+            TestResult::new("suite$fails".into(), false, 1).unwrap(),
+        ];
+        let marker = SkipMarker {
+            name: "skips".into(),
+            reason: "no /dev/kvm on this host".into(),
+        };
+        let classified = apply_skip_markers(rows.clone(), &[marker]).unwrap();
+        assert!(classified[0].is_skipped());
+        assert_eq!(
+            classified[0].skip_reason.as_deref(),
+            Some("no /dev/kvm on this host")
+        );
+        assert!(classified[1].passed);
+        // Every row carries classified attempts at schema 5.
+        assert!(classified.iter().all(|row| row.attempt_results.is_some()));
+        let report = TestResults::skipped(3, 0, classified).unwrap();
+        let scratch = Scratch::new();
+        let path = scratch.0.join("skipped.json");
+        publish_with_recovery(&report, &path, true).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            TestResults::from_declared_schema_json_slice(&bytes, 5).unwrap(),
+            report
+        );
+
+        // A marker for a failed test, an absent test, or two rows sharing
+        // one test name each refuse.
+        let launder = SkipMarker {
+            name: "fails".into(),
+            reason: "no /dev/kvm on this host".into(),
+        };
+        assert!(apply_skip_markers(rows.clone(), &[launder])
+            .unwrap_err()
+            .contains("launder"));
+        let absent = SkipMarker {
+            name: "never_ran".into(),
+            reason: "no /dev/kvm on this host".into(),
+        };
+        assert!(apply_skip_markers(rows.clone(), &[absent])
+            .unwrap_err()
+            .contains("matches 0"));
+        let ambiguous_rows = vec![
+            TestResult::new("alpha::tool$case".into(), true, 1).unwrap(),
+            TestResult::new("beta::tool$case".into(), true, 1).unwrap(),
+        ];
+        let ambiguous = SkipMarker {
+            name: "case".into(),
+            reason: "no /dev/kvm on this host".into(),
+        };
+        assert!(apply_skip_markers(ambiguous_rows, &[ambiguous])
+            .unwrap_err()
+            .contains("matches 2"));
+    }
+
+    #[test]
     fn recovery_failure_reports_both_errors_without_weakening_status() {
         let scratch = Scratch::new();
         let report = TestResults::current(
@@ -831,7 +1139,7 @@ mod tests {
         let primary = scratch.0.join("primary.json");
         fs::create_dir(&primary).unwrap();
         fs::create_dir(structured_test_results_recovery_path(&primary)).unwrap();
-        let error = publish_with_recovery(&report, &primary).unwrap_err();
+        let error = publish_with_recovery(&report, &primary, false).unwrap_err();
         assert_eq!(error.exit_code(), 75);
         assert!(matches!(error, ProducerError::PublicationRecovery { .. }));
         let message = error.to_string();
@@ -853,8 +1161,9 @@ mod tests {
             executed_tests: 2,
             filtered_tests: 0,
             results: Some(vec![TestResult::new("suite$case".into(), true, 1).unwrap()]),
+            selection: None,
         };
-        let error = publish_with_recovery(&invalid, &primary).unwrap_err();
+        let error = publish_with_recovery(&invalid, &primary, false).unwrap_err();
         assert_eq!(error.exit_code(), 2);
         assert!(matches!(
             error,

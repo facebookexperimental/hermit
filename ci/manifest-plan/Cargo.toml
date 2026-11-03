@@ -7,7 +7,7 @@ default-run = "hermit-manifest-plan"
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
-dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "b5ec1702c191b4d0bffea8f167044a5904e0752f" }
+dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "04f9841fae4f6bba5656650ac316a68ada457071" }
 detcore-model = { version = "0.5.4", path = "../../detcore-model" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"

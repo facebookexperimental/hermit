@@ -43,7 +43,7 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "b5ec1702c191b4d0bffea8f167044a5904e0752f" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "04f9841fae4f6bba5656650ac316a68ada457071" }
 //! hermit-manifest-plan = { path = "../ci/manifest-plan" }
 //! serde_json = "1"
 //! toml = "0.8.23"
@@ -27182,6 +27182,9 @@ fn nextest_test_observations(
                 // failed-test listing only if its node failed, and a node fails
                 // only on blocking rows, so it is not reported as the cause.
                 diagnostic: _,
+                // A runtime skip likewise keeps `passed: false` without being
+                // a failure; the skip listing is a separate surface.
+                skip_reason: _,
             } = result;
             let Ok(inner_attempts) = usize::try_from(*inner_attempts) else {
                 errors.push(format!(
