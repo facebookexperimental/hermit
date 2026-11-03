@@ -443,17 +443,20 @@ mod tests {
             );
         }
         // The build ID read from memory equals the one the binary on disk
-        // carries, parsed independently.
+        // carries, parsed independently. A binary built without a GNU
+        // build ID (the validate profile's test binaries are one) falls
+        // back to the file identity, exactly as `HostKey::current` does.
         use object::Object;
         let exe = fs::File::open(std::env::current_exe().unwrap()).unwrap();
         let cache = object::read::ReadCache::new(exe);
         let parsed = object::File::parse(&cache).unwrap();
-        let on_disk = parsed
-            .build_id()
-            .unwrap()
-            .expect("the test binary has a GNU build ID");
-        let hex: String = on_disk.iter().map(|byte| format!("{byte:02x}")).collect();
-        assert_eq!(host.hermit_binary, hex);
+        match parsed.build_id().unwrap() {
+            Some(on_disk) => {
+                let hex: String = on_disk.iter().map(|byte| format!("{byte:02x}")).collect();
+                assert_eq!(host.hermit_binary, hex);
+            }
+            None => assert_eq!(host.hermit_binary, binary_identity()),
+        }
     }
 
     #[test]
