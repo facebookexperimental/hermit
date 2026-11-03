@@ -550,7 +550,7 @@ fn every_validation_derives_the_seeded_maximum_afresh() {
 fn seeded_replays_and_baseline_keep_a_minimum_above_the_default() {
     const ONE_RCB: u64 = 300_000_000;
     let mut run = parse(
-        Backend::Ptrace,
+        Case::PTRACE,
         &[SEEDED[0], SEEDED[1], "--clock-multiplier=30000000"],
     );
     run.validate_args_with_perf_support(true).unwrap();
