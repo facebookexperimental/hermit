@@ -249,8 +249,14 @@ impl PostCrashState {
     }
 
     /// `child`, a new process, was created by a thread of `creator`: it
-    /// belongs to its creator's crashes, armed or switched.
+    /// belongs to its creator's crashes, armed or switched. A genuine
+    /// creation starts with fresh membership: Linux reuses freed process
+    /// IDs, and the ID's previous process may have switched or belonged to
+    /// an armed crash's lineage; the new process inherits only its actual
+    /// creator's state.
     pub fn process_created(&mut self, creator: DetPid, child: DetPid) {
+        self.crashed.remove(&child);
+        self.lineage.remove(&child);
         if self.crashed.contains(&creator) {
             self.crashed.insert(child);
         }
@@ -810,6 +816,43 @@ mod tests {
             step(&mut state, 6, 3, PostCrashEvent::Exec, 12),
             (None, None)
         );
+    }
+
+    /// A process ID Linux reuses starts with fresh membership: the ID's
+    /// previous process switched, and the healthy replacement, created by
+    /// an unrelated process, takes no bound; its own crash then switches
+    /// for itself.
+    #[test]
+    fn a_reused_process_id_starts_with_fresh_switched_membership() {
+        let mut state = on();
+        step(&mut state, 4, 3, delivered(SEGV, true), 7);
+        assert_eq!(state.bound_for(pid(3)), NonZeroU64::new(BOUND));
+        state.process_created(pid(1), pid(3));
+        assert_eq!(state.bound_for(pid(3)), None, "the replacement is healthy");
+        let (answer, taken) = step(&mut state, 3, 3, delivered(ABRT, true), 9);
+        assert_eq!(answer, NonZeroU64::new(BOUND));
+        assert_eq!(taken.unwrap().dtid, tid(3), "its own crash switches");
+        assert_eq!(state.switches().len(), 2);
+    }
+
+    /// The same for armed lineage: a process created into an armed crash's
+    /// lineage whose ID is later reused by an unrelated creation belongs
+    /// to no crash, so its exec takes no switch; a creation by the armed
+    /// process itself still joins the lineage.
+    #[test]
+    fn a_reused_process_id_starts_with_fresh_armed_lineage() {
+        let mut state = on();
+        step(&mut state, 5, 3, delivered(ABRT, false), 10);
+        state.process_created(pid(3), pid(20));
+        state.process_created(pid(1), pid(20));
+        assert_eq!(
+            step(&mut state, 20, 20, PostCrashEvent::Exec, 12),
+            (None, None),
+            "the replacement's exec takes no switch"
+        );
+        state.process_created(pid(3), pid(21));
+        let (_, taken) = step(&mut state, 21, 21, PostCrashEvent::Exec, 13);
+        assert_eq!(taken.unwrap().dtid, tid(5), "the lineage still switches");
     }
 
     /// With two threads of one process armed, the switch names the lower

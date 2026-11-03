@@ -47,6 +47,8 @@ fn run_scenario_if_inner() {
         Ok("sent_segv_handler_execs") => sent_segv_handler_execs(),
         Ok("handler_waits_while_sibling_execs") => handler_waits_while_sibling_execs(),
         Ok("handler_unblocks_then_sibling_execs") => handler_unblocks_then_sibling_execs(),
+        Ok("killed_handler_then_descendant_execs") => killed_handler_then_descendant_execs(),
+        Ok("exited_leader_then_descendant_execs") => exited_leader_then_descendant_execs(),
         Ok("pending_realtime_handler_execs") => pending_realtime_handler_execs(),
         #[cfg(target_arch = "x86_64")]
         Ok("recovered_then_rdtsc_until_sibling_execs") => {
@@ -59,6 +61,218 @@ fn run_scenario_if_inner() {
         Err(_) => return,
     }
     std::process::exit(0);
+}
+
+
+/// Release pipe shared by the two terminal-edge scenarios: a descendant
+/// created inside an armed handler reads one byte before it execs, and the
+/// byte is written only after the armed thread has ended.
+static RELEASE: [std::sync::atomic::AtomicI32; 2] = [
+    std::sync::atomic::AtomicI32::new(-1),
+    std::sync::atomic::AtomicI32::new(-1),
+];
+/// Readiness pipe of the same scenarios: the handler writes one byte once
+/// its descendant exists.
+static READY: [std::sync::atomic::AtomicI32; 2] = [
+    std::sync::atomic::AtomicI32::new(-1),
+    std::sync::atomic::AtomicI32::new(-1),
+];
+
+fn make_pipes() {
+    use std::sync::atomic::Ordering;
+    for pair in [&RELEASE, &READY] {
+        let mut fds = [0; 2];
+        // SAFETY: creates two pipes in this scenario process.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        pair[0].store(fds[0], Ordering::SeqCst);
+        pair[1].store(fds[1], Ordering::SeqCst);
+    }
+}
+
+/// In the descendant: wait for the release byte, then exec `true`.
+fn descendant_waits_then_execs() -> ! {
+    use std::sync::atomic::Ordering;
+    let mut byte = 0u8;
+    // SAFETY: reads one byte from the release pipe this process created.
+    let read = unsafe {
+        libc::read(
+            RELEASE[0].load(Ordering::SeqCst),
+            &mut byte as *mut u8 as *mut libc::c_void,
+            1,
+        )
+    };
+    assert_eq!(read, 1);
+    // Say the exec is next: the orphan's new parent (the guest init) reaps
+    // it, so the harness cannot wait for it; the exec itself is what the
+    // run records.
+    let mut done = b'D';
+    // SAFETY: writes one byte to the readiness pipe.
+    unsafe {
+        libc::write(
+            READY[1].load(Ordering::SeqCst),
+            &mut done as *mut u8 as *const libc::c_void,
+            1,
+        );
+    }
+    // SAFETY: replaces this descendant with /bin/true.
+    unsafe {
+        let path = c"/bin/true";
+        let argv = [path.as_ptr(), std::ptr::null()];
+        let envp = [std::ptr::null()];
+        libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        libc::_exit(127);
+    }
+}
+
+/// The armed handler of the killed-handler scenario: fork the descendant,
+/// say it exists, and wait for it (the kill lands in this wait).
+extern "C" fn killed_handler(_: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    // SAFETY: async-signal-safe calls only; this process is single-threaded
+    // here apart from the handler itself.
+    unsafe {
+        let child = libc::fork();
+        if child == 0 {
+            descendant_waits_then_execs();
+        }
+        let mut byte = b'R';
+        libc::write(
+            READY[1].load(Ordering::SeqCst),
+            &mut byte as *mut u8 as *const libc::c_void,
+            1,
+        );
+        let mut status = 0;
+        libc::waitpid(child, &mut status, 0);
+        libc::_exit(0);
+    }
+}
+
+/// Trial A catches SIGABRT and forks a descendant inside its handler; the
+/// harness (this process) kills and reaps A, then releases the descendant
+/// to exec. The handler has ended, so the descendant's exec takes no
+/// switch.
+fn killed_handler_then_descendant_execs() {
+    make_pipes();
+    // SAFETY: forks the trial; the parent orchestrates and reaps.
+    unsafe {
+        let trial = libc::fork();
+        assert!(trial >= 0);
+        if trial == 0 {
+            libc::signal(libc::SIGABRT, killed_handler as *const () as libc::sighandler_t);
+            libc::raise(libc::SIGABRT);
+            libc::_exit(127);
+        }
+        let mut byte = 0u8;
+        assert_eq!(
+            libc::read(
+                READY[0].load(std::sync::atomic::Ordering::SeqCst),
+                &mut byte as *mut u8 as *mut libc::c_void,
+                1
+            ),
+            1,
+            "the handler forked its descendant"
+        );
+        assert_eq!(libc::kill(trial, libc::SIGKILL), 0);
+        let mut status = 0;
+        assert_eq!(libc::waitpid(trial, &mut status, 0), trial);
+        assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL);
+        let mut go = b'G';
+        assert_eq!(
+            libc::write(
+                RELEASE[1].load(std::sync::atomic::Ordering::SeqCst),
+                &mut go as *mut u8 as *const libc::c_void,
+                1
+            ),
+            1
+        );
+        // The orphan is re-parented to the guest init, which reaps it;
+        // the descendant says its exec is next, and that exec is what the
+        // run records.
+        let mut done = 0u8;
+        assert_eq!(
+            libc::read(
+                READY[0].load(std::sync::atomic::Ordering::SeqCst),
+                &mut done as *mut u8 as *mut libc::c_void,
+                1
+            ),
+            1,
+            "the descendant reached its exec"
+        );
+        assert_eq!(done, b'D');
+    }
+}
+
+/// The armed leader of the exited-leader scenario: fork the descendant,
+/// say it exists, then end this thread with the raw exit syscall, from
+/// inside the handler.
+extern "C" fn exiting_handler(_: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    // SAFETY: async-signal-safe calls only.
+    unsafe {
+        let child = libc::fork();
+        if child == 0 {
+            descendant_waits_then_execs();
+        }
+        let mut byte = b'R';
+        libc::write(
+            READY[1].load(Ordering::SeqCst),
+            &mut byte as *mut u8 as *const libc::c_void,
+            1,
+        );
+        libc::syscall(libc::SYS_exit, 0);
+        libc::_exit(127);
+    }
+}
+
+/// The group leader catches SIGABRT and forks a descendant inside its
+/// handler, then takes raw `SYS_exit` while a sibling thread remains. The
+/// sibling releases the descendant to exec; the leader's handler has
+/// ended, so the exec takes no switch.
+fn exited_leader_then_descendant_execs() {
+    use std::sync::atomic::Ordering;
+    make_pipes();
+    let sibling = std::thread::spawn(|| {
+        let mut byte = 0u8;
+        // SAFETY: reads the readiness byte, then releases the descendant
+        // and reaps it; the leader is gone by its own exit above.
+        unsafe {
+            assert_eq!(
+                libc::read(
+                    READY[0].load(Ordering::SeqCst),
+                    &mut byte as *mut u8 as *mut libc::c_void,
+                    1
+                ),
+                1,
+                "the handler forked its descendant"
+            );
+            // Give the leader its turns to take its exit before releasing.
+            for _ in 0..200 {
+                libc::sched_yield();
+            }
+            let mut go = b'G';
+            assert_eq!(
+                libc::write(
+                    RELEASE[1].load(Ordering::SeqCst),
+                    &mut go as *mut u8 as *const libc::c_void,
+                    1
+                ),
+                1
+            );
+            let mut status = 0;
+            let done = libc::waitpid(-1, &mut status, 0);
+            assert!(done > 0, "the descendant is reaped");
+            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+            // The leader ended its own thread by raw exit, so no thread
+            // remains to return from the scenario: end the process here.
+            libc::exit(0);
+        }
+    });
+    // SAFETY: installs the handler and raises the crash on the leader.
+    unsafe {
+        libc::signal(libc::SIGABRT, exiting_handler as *const () as libc::sighandler_t);
+        libc::raise(libc::SIGABRT);
+    }
+    sibling.join().unwrap();
 }
 
 fn spin() -> u64 {
@@ -249,6 +463,38 @@ fn a_fault_the_handler_resolves_does_not_switch() {
         Some(200_000_000),
     );
     assert_eq!(record.switch, None);
+    assert_eq!(record.bound, Some(200_000_000));
+}
+
+
+/// A descendant created inside an armed handler whose thread the harness
+/// then kills: the handler has ended at the kill, so the descendant's
+/// later exec takes no switch.
+#[test]
+fn a_killed_handlers_descendant_exec_takes_no_switch() {
+    run_scenario_if_inner();
+    let record = recorded(
+        "a_killed_handlers_descendant_exec_takes_no_switch",
+        "killed_handler_then_descendant_execs",
+        Some(200_000_000),
+    );
+    assert_eq!(record.switch, None);
+    assert!(record.switches.is_empty());
+    assert_eq!(record.bound, Some(200_000_000));
+}
+
+/// The same where the armed thread is the group leader and ends by raw
+/// `SYS_exit` while a sibling remains.
+#[test]
+fn an_exited_leaders_descendant_exec_takes_no_switch() {
+    run_scenario_if_inner();
+    let record = recorded(
+        "an_exited_leaders_descendant_exec_takes_no_switch",
+        "exited_leader_then_descendant_execs",
+        Some(200_000_000),
+    );
+    assert_eq!(record.switch, None);
+    assert!(record.switches.is_empty());
     assert_eq!(record.bound, Some(200_000_000));
 }
 

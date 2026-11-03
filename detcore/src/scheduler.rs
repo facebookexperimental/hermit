@@ -7277,6 +7277,13 @@ impl Scheduler {
         self.chaos_had_turn.remove(dtid);
         self.chaos_first_turn_waits.remove(dtid);
         self.retire_sigalrm_thread(*dtid, *detpid);
+        // A logically killed thread is at its terminal edge now, not at its
+        // later deregistration: a committed kill's receipt and an early
+        // leader exit (which comes through here) both retire it here, so an
+        // armed crash of its dies with it and no descendant's later exec
+        // takes a switch for a handler that has ended. A successful exec
+        // keeps its thread and never comes through here.
+        self.post_crash.forget(*dtid);
         // A thread that leaves may close the last descriptor of a pipe end a
         // poller waits on (`retired_at`).
         self.progress_epoch += 1;
