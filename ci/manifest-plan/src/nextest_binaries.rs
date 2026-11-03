@@ -26,7 +26,10 @@ use sha2::Sha256;
 
 pub const SELECTION_ENV: &str = "NEXTEST_PREPARED_BUILD_SELECTION";
 pub const REQUIRED_ENV: &str = "HERMIT_PREPARED_NEXTEST_REQUIRED";
-const RECORD_SCHEMA: u32 = 5;
+/// Version 6 added `prepared_for` and `cargo_profile`, which `assert` reads to
+/// refuse a record built in the wrong Cargo profile (see
+/// [`check_prepared_cargo_profile`]).
+const RECORD_SCHEMA: u32 = 6;
 pub const PROJECT_ENV: &str = "HERMIT_NEXTEST_PROJECT";
 pub const GUESTS_ENV: &str = "HERMIT_PREPARED_CARGO_GUESTS";
 pub const LIT_GUESTS_ENV: &str = "HERMIT_PREPARED_LIT_GUESTS";
@@ -400,6 +403,11 @@ struct PreparedRecord {
     lit_guests: Vec<FileIdentity>,
     record_workloads: Option<RecordWorkloads>,
     cpu_wrapper: CpuWrapperRecord,
+    /// The graph profile whose `prepare` wrote this record.
+    prepared_for: String,
+    /// The Cargo profile that built every recorded executable, as
+    /// [`recorded_cargo_profile`] names it.
+    cargo_profile: String,
 }
 
 /// A neutral second Cargo project consumes an already-produced core tool
@@ -1192,6 +1200,15 @@ impl LockedArtifacts {
     }
 
     fn current(&self) -> Result<PreparedRecord, String> {
+        serde_json::from_value(self.current_value()?).map_err(|e| {
+            format!(
+                "invalid prepared record {}: {e}",
+                self.root.join("current.json").display()
+            )
+        })
+    }
+
+    fn current_value(&self) -> Result<Value, String> {
         let path = self.root.join("current.json");
         let _: FileIdentity = file_identity(&path, false)?;
         serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
@@ -1715,6 +1732,124 @@ pub fn cargo_profile_for(graph_profile: &str) -> Option<&'static str> {
     }
 }
 
+/// The Cargo profile `prepare` builds a graph profile's executables in: the
+/// profile's own [`cargo_profile_for`], except that a neutral second Cargo
+/// project always lists its selections in Cargo's default test profile.
+fn build_cargo_profile(graph_profile: &str, project: bool) -> Option<&'static str> {
+    if project {
+        None
+    } else {
+        cargo_profile_for(graph_profile)
+    }
+}
+
+/// The name a prepared record gives the Cargo profile that built it.
+/// `--cargo-profile` absent means Cargo's default test profile, whose
+/// executables are under `target/debug`; the record calls that `dev`.
+pub fn recorded_cargo_profile(cargo_profile: Option<&str>) -> &str {
+    cargo_profile.unwrap_or("dev")
+}
+
+/// Refuse a prepared record that `assert` must not accept for `producer`.
+///
+/// `record` is the raw prepared record (`target/ci/nextest-binaries/current.json`)
+/// and `producer` the graph profile whose `prepare` the asserting lane depends on.
+/// The record must name the Cargo profile `prepare producer` builds in. The
+/// shared record is rewritten by whichever producer ran last, so a focused lane's
+/// `prepare privileged` (dev profile) can leave a dev record behind for a later
+/// full-lane consumer that expects validate-profile executables; every
+/// selection is still present, so only the profile tells them apart.
+///
+/// A record older than schema 6 names no profile and is refused rather than
+/// guessed from its executable paths: a path under `target/<dir>/` names a Cargo
+/// output directory, not a profile (the default test profile writes
+/// `target/debug`, and a custom target directory moves the prefix), and the
+/// remedy, rerunning the producer, costs only that producer's run.
+///
+/// `selections` is the asserted selection profile and `producer_nodes` the
+/// graph nodes that run `prepare producer`; both only shape the message.
+pub fn check_prepared_cargo_profile(
+    record: &Value,
+    selections: &str,
+    producer: &str,
+    project: bool,
+    producer_nodes: &[String],
+) -> Result<(), String> {
+    let expected = recorded_cargo_profile(build_cargo_profile(producer, project));
+    let command = if selections == producer {
+        format!("assert {selections}")
+    } else {
+        format!("assert {selections} --prepared-by {producer}")
+    };
+    let remedy = if producer_nodes.is_empty() {
+        format!(
+            "Rerun `./ci/nextest-binaries.rs prepare {producer}` in this checkout after the {producer} lane's build, then rerun this step."
+        )
+    } else {
+        format!(
+            "Rerun the {producer} lane's producer ({}), which runs `./ci/nextest-binaries.rs prepare {producer}`, or run that command in this checkout after the lane's build, then rerun this step.",
+            producer_nodes.join(", ")
+        )
+    };
+    let schema = record.get("schema").and_then(Value::as_u64);
+    if schema != Some(u64::from(RECORD_SCHEMA)) {
+        let found = schema.map_or_else(
+            || "has no schema".to_string(),
+            |schema| format!("is schema {schema}"),
+        );
+        return Err(format!(
+            "{command} refused: the prepared record {found}, not schema {RECORD_SCHEMA}, so it does not name the Cargo profile that built its executables, and the {producer} lane expects Cargo profile {expected}. {remedy}"
+        ));
+    }
+    let named = |key: &str| {
+        record
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{command} refused: the prepared record has no {key}. {remedy}"))
+    };
+    let found = named("cargo_profile")?;
+    let prepared_for = named("prepared_for")?;
+    if found != expected {
+        return Err(format!(
+            "{command} refused: the prepared executables were built in Cargo profile {found} by `prepare {prepared_for}`, but the {producer} lane expects Cargo profile {expected}. The record is shared, and another lane's producer rewrote it after the {producer} lane's. {remedy}"
+        ));
+    }
+    Ok(())
+}
+
+/// The graph nodes in `producer`'s lane that run `prepare producer`, read from
+/// the committed graph for an `assert` refusal message. A graph that cannot be
+/// read yields no names; the refusal then names only the command.
+fn producer_nodes(root: &Path, producer: &str) -> Vec<String> {
+    let graph_path = match project(root) {
+        Ok(Some(project)) => project.graph.path,
+        Ok(None) => root.join("ci/dag/validate.json"),
+        Err(_) => return vec![],
+    };
+    let Some(graph) = fs::read_to_string(graph_path)
+        .ok()
+        .and_then(|graph| dagrun::io::dag_from_json(&graph).ok())
+    else {
+        return vec![];
+    };
+    let Ok(selected) = dagrun::select_steps_by_labels(&graph, &[producer.into()]) else {
+        return vec![];
+    };
+    let marker = format!("./ci/nextest-binaries.rs prepare {producer}");
+    selected
+        .steps
+        .iter()
+        .filter(|step| {
+            step.cmd.match_indices(&marker).any(|(at, _)| {
+                !step.cmd[at + marker.len()..]
+                    .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            })
+        })
+        .map(|step| step.tag())
+        .collect()
+}
+
 /// Whether `prepare` compiles this profile's selections as one unified listing.
 ///
 /// Only the validate-profile graph profiles do: their producers build the whole
@@ -2070,11 +2205,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     let selections = profile_selections(&root, profile)?;
     // Each extension selection is listed in its own Cargo project. Core
     // workspace union/installer requirements remain the unchanged core path.
-    let cargo_profile = if prepared_project.is_some() {
-        None
-    } else {
-        cargo_profile_for(profile)
-    };
+    let cargo_profile = build_cargo_profile(profile, prepared_project.is_some());
     let artifacts = LockedArtifacts::open(&root, true)?;
     let generation = artifacts.root.join(format!(
         "generation-{}-{}",
@@ -2306,6 +2437,8 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         lit_guests,
         record_workloads,
         cpu_wrapper,
+        prepared_for: profile.to_string(),
+        cargo_profile: recorded_cargo_profile(cargo_profile).to_string(),
     };
     let checked_cargo = verify_record(&root, &record)?;
     for selection in record.selections.values() {
@@ -2325,7 +2458,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     // inputs still match, since earlier Cargo commands may have changed them.
     fs::rename(staging, artifacts.root.join("current.json")).map_err(|e| e.to_string())?;
     eprintln!(
-        "prepared-nextest: published {} selections, {} hermit_modes Cargo guests, {} lit guests and {} record workloads for {profile}",
+        "prepared-nextest: published {} selections, {} hermit_modes Cargo guests, {} lit guests and {} record workloads for {profile} in Cargo profile {}",
         record.selections.len(),
         record.guests.len(),
         record.lit_guests.len(),
@@ -2333,6 +2466,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
             .record_workloads
             .as_ref()
             .map_or(0, |w| w.workloads.len()),
+        record.cargo_profile,
     );
     Ok(())
 }
@@ -2468,9 +2602,24 @@ pub fn run(
     Ok(exit_code(status))
 }
 
-pub fn assert_profile(root: &Path, profile: &str) -> Result<(), String> {
+/// Verify that the prepared record holds `profile`'s selections, unchanged, as
+/// built by `producer`'s `prepare` (by default `profile`'s own) in the Cargo
+/// profile that producer builds in.
+pub fn assert_profile(root: &Path, profile: &str, producer: Option<&str>) -> Result<(), String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
+    let producer = producer.unwrap_or(profile);
+    // Refuse an unknown producer before reading the record.
+    profile_selections(&root, producer)?;
     let artifacts = LockedArtifacts::open(&root, false)?;
+    // Read the profile from the raw record first: a record from before schema
+    // 6 does not deserialize, and its refusal must still say what to rerun.
+    check_prepared_cargo_profile(
+        &artifacts.current_value()?,
+        profile,
+        producer,
+        project(&root)?.is_some(),
+        &producer_nodes(&root, producer),
+    )?;
     let record = artifacts.current()?;
     let cargo = verify_record(&root, &record)?;
     for args in profile_selections(&root, profile)?.values() {
@@ -2943,6 +3092,8 @@ mod tests {
                     lit_guests: vec![],
                     record_workloads: None,
                     cpu_wrapper,
+                    prepared_for: "fixture".into(),
+                    cargo_profile: "dev".into(),
                 },
                 args,
             )

@@ -141,6 +141,17 @@ stale, ambiguous, or wrong-target artifacts cause refusal; a consumer never
 falls back to compiling them. The actual Cargo target directory is retained,
 including a configured `CARGO_TARGET_DIR`; no guessed target remap is applied.
 
+The record also names the graph profile that prepared it and the Cargo profile
+that built its executables (`validate` for `full` and `hosted-portable`, `dev`
+for every other profile). There is one record per target directory, and the last
+producer to run replaces it, so a focused lane's `prepare privileged` leaves
+dev-profile executables behind for any later consumer. `ci/nextest-binaries.rs
+assert PROFILE [--prepared-by PRODUCER]` therefore refuses a record built in a
+Cargo profile other than the one `prepare PRODUCER` uses, naming both profiles
+and the producer node to rerun. The full lane's privileged barrier runs `assert
+privileged --prepared-by full`. A record from before record schema 6 names no
+Cargo profile and is refused rather than inferred from executable paths.
+
 For an explicit local prepared run, first prepare a graph profile, then invoke
 `ci/nextest-binaries.rs run` or `list` with the same Cargo selectors and desired
 Nextest filters. `--profile ci` remains a Nextest runtime setting. Unsupported

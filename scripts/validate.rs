@@ -224,7 +224,8 @@ const INTEGRATION_ARTIFACT_WRAPPER: &str =
 // portable while its value says full is the same defect one layer down.
 const NEXTEST_FULL_PREPARE_COMMAND: &str =
     "./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target";
-const NEXTEST_PRIVILEGED_ASSERT_COMMAND: &str = "./ci/nextest-binaries.rs assert privileged";
+const NEXTEST_PRIVILEGED_ASSERT_COMMAND: &str =
+    "./ci/nextest-binaries.rs assert privileged --prepared-by full";
 const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore-tests tests_misc)" || exit 1"#;
 
 fn integration_artifact_producer(step: &Step) -> &'static str {
@@ -13193,7 +13194,7 @@ const EXPECTED_SHARED_INTEGRATION_TESTS: [(&str, &[&str]); 3] = [
 // one-build change of 2026-09-30 it relinked the shared cli and hermit_modes
 // integration binaries, which a consumer could be executing; since then it
 // only verifies the binaries build.workspace_in_pinned_root prepared
-// (`nextest-binaries.rs assert privileged`), so excluding it from the
+// (`nextest-binaries.rs assert privileged --prepared-by full`), so excluding it from the
 // consumers only made every privileged test wait behind `test.cli`.
 //
 // For the same reason, since 2026-10-16 two cli consumers hold no token:
@@ -33858,6 +33859,35 @@ printf finalized >target/finalized
             privileged.status.success(),
             "{}",
             String::from_utf8_lossy(&privileged.stderr)
+        );
+        // The full lane's barrier must refuse this dev-profile record although
+        // it holds every privileged selection. The record is shared and the
+        // last producer to run replaces it; on 2026-11-03 the barrier accepted
+        // it and privileged-test.cli_kvm ran dev binaries at about 5x the CPU.
+        let privileged_before = std::fs::read_to_string(&privileged_log).unwrap();
+        let refused = run_build(
+            &consumer.cmd,
+            privileged_root.path(),
+            &privileged_bin,
+            &privileged_log,
+            "current",
+        );
+        let refusal = String::from_utf8_lossy(&refused.stderr);
+        assert!(!refused.status.success(), "{refusal}");
+        assert!(
+            refusal.contains(
+                "assert privileged --prepared-by full refused: the prepared executables were built in Cargo profile dev by `prepare privileged`, but the full lane expects Cargo profile validate"
+            ),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("producer (build.workspace_in_pinned_root)"),
+            "{refusal}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&privileged_log).unwrap(),
+            privileged_before,
+            "the refusal must not compile a replacement"
         );
         let privileged_selections =
             hermit_manifest_plan::nextest_binaries::profile_selections(repository, "privileged")
