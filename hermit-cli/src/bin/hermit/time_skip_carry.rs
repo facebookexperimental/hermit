@@ -101,16 +101,21 @@ fn shared_events(left: &[u64], right: &[u64]) -> usize {
 
 impl TimeSkipSources {
     /// Remember `record`. One that made no jump counts as much as one that
-    /// did: a trial that repeats it furthest makes no jump either. Its format
-    /// counts below the background-starts format
-    /// (`detcore::preemptions::format_without_background_starts`): that format
-    /// and the one below it share their timing rules and differ only in a
-    /// list of starts no spliced trial keeps, so a recording that notes its
-    /// starts and the re-record of its schedule replay share one format here.
+    /// did: a trial that repeats it furthest makes no jump either. It counts
+    /// by its timing format (`PreemptionRecord::timing_format`), below the
+    /// instruction-offset and background-starts formats
+    /// (`detcore::preemptions::format_without_instruction_offsets`,
+    /// `detcore::preemptions::format_without_background_starts`): those
+    /// formats and the one below them share their timing rules. A trial
+    /// whose rows hold offsets states the offsets' format again when it is
+    /// written (`PreemptionRecord::with_format`), and the starts differ only
+    /// in a list no spliced trial keeps, so a recording with offsets or noted
+    /// starts, the re-record of its schedule replay and a trial's record
+    /// without either share one format here.
     pub fn remember(&mut self, record: &PreemptionRecord) {
         self.formats
             .insert(detcore::preemptions::format_without_background_starts(
-                record.format_version(),
+                detcore::preemptions::format_without_instruction_offsets(record.timing_format()),
             ));
         let source = Source {
             prefix_hashes: prefix_hashes(record.schedevents()),
@@ -124,7 +129,8 @@ impl TimeSkipSources {
     }
 
     /// The single timing format all sources share, or the current format
-    /// below the background-starts format before any source is read
+    /// below the instruction-offset and background-starts formats before any
+    /// source is read
     /// (`remember`). There is no proved conversion between
     /// legacy, format 2 and format 3 charging rules, even when a selected
     /// prefix comes from just one of the sources.
@@ -139,9 +145,11 @@ impl TimeSkipSources {
                 .collect::<Vec<_>>()
         );
         Ok(self.formats.first().copied().unwrap_or(
-            detcore::preemptions::format_without_background_starts(Some(
-                detcore::preemptions::PREEMPTION_RECORD_FORMAT,
-            )),
+            detcore::preemptions::format_without_background_starts(
+                detcore::preemptions::format_without_instruction_offsets(Some(
+                    detcore::preemptions::PREEMPTION_RECORD_FORMAT,
+                )),
+            ),
         ))
     }
 
@@ -350,13 +358,55 @@ mod tests {
     #[test]
     fn a_trial_refuses_mixed_timing_formats() {
         let mut sources = TimeSkipSources::default();
-        let current = detcore::preemptions::format_without_background_starts(Some(
-            detcore::preemptions::PREEMPTION_RECORD_FORMAT,
-        ));
+        let current = detcore::preemptions::format_without_background_starts(
+            detcore::preemptions::format_without_instruction_offsets(Some(
+                detcore::preemptions::PREEMPTION_RECORD_FORMAT,
+            )),
+        );
         assert_eq!(sources.trial_format().unwrap(), current);
         sources.remember(&PreemptionRecord::from_sched_events(events(&[3])).with_current_format());
         assert_eq!(sources.trial_format().unwrap(), current);
         sources.remember(&PreemptionRecord::from_sched_events(events(&[5])));
+        let error = sources.trial_format().unwrap_err();
+        assert!(error.to_string().contains("different timing formats"));
+    }
+
+    /// A source counts by its timing format
+    /// (`PreemptionRecord::timing_format`): rows alone in the
+    /// instruction-offset format count as format 1, as the same rows without
+    /// an offset do, not as the format below it a schedule of that format
+    /// counts as.
+    #[test]
+    fn a_source_of_rows_alone_with_instruction_offsets_counts_as_format_one() {
+        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
+        use detcore::preemptions::InstructionOffset;
+        use detcore::preemptions::PreemptionWriter;
+        let tid = DetTid::from_raw(3);
+        let rows = |offset: Option<InstructionOffset>| {
+            let mut writer = PreemptionWriter::new(None)
+                .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT));
+            writer.register_thread(tid, 1000);
+            writer.insert_reprioritization(tid, LogicalTime::from_nanos(10), 18, 1000, 5, offset);
+            writer.insert_schedevent(SchedEvent::branches(tid, 20));
+            serde_json::from_str::<PreemptionRecord>(&writer.into_string()).unwrap()
+        };
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let schedule = rows(Some(offset));
+        assert_eq!(
+            schedule.format_version(),
+            Some(INSTRUCTION_OFFSET_ROWS_FORMAT)
+        );
+        let alone = schedule.clone_preemptions_only();
+        assert_eq!(alone.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+        let mut sources = TimeSkipSources::default();
+        sources.remember(&alone);
+        assert_eq!(sources.trial_format().unwrap(), None);
+        sources.remember(&rows(None).clone_preemptions_only());
+        assert_eq!(sources.trial_format().unwrap(), None);
+        sources.remember(&schedule);
         let error = sources.trial_format().unwrap_err();
         assert!(error.to_string().contains("different timing formats"));
     }

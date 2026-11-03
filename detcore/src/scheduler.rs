@@ -5672,7 +5672,10 @@ impl Scheduler {
                 } else {
                     TimeSkipMode::Legacy
                 };
-                replayed_format = Some(recording.format_version());
+                // The rules the replay runs by are the record's timing rules
+                // (`PreemptionRecord::timing_format`): rows alone in the
+                // instruction-offset format follow format 1's.
+                replayed_format = Some(recording.timing_format());
                 charge_replayed_switch_ins = recording.charges_replayed_switch_ins();
                 match recording {
                     Recording::Legacy(record) => {
@@ -25841,7 +25844,11 @@ mod test {
 
     /// A format-3 record makes its replay charge replayed switch-ins, and the
     /// replay writes format 3 again; a format-2 record's replay charges none
-    /// and writes format 2, the rules it ran by.
+    /// and writes format 2, the rules it ran by. Rows alone in the
+    /// instruction-offset format follow format 1's rules
+    /// (`PreemptionRecord::timing_format`): their replay charges none, makes
+    /// only the legacy jumps, and writes format 1, as the same rows without
+    /// an offset do.
     #[test]
     fn a_replay_charges_switch_ins_by_its_records_format() {
         let dir = tempfile::tempdir().unwrap();
@@ -25864,6 +25871,52 @@ mod test {
         };
         assert_eq!(replay(3), (true, Some(3)));
         assert_eq!(replay(2), (false, Some(2)));
+
+        let rows_alone = |offset: Option<crate::preemptions::InstructionOffset>| {
+            let tid = DetTid::from_raw(3);
+            let mut writer = crate::preemptions::PreemptionWriter::new(None)
+                .with_format(Some(crate::preemptions::PREEMPTION_RECORD_FORMAT));
+            writer.register_thread(tid, DEFAULT_PRIORITY);
+            writer.insert_reprioritization(
+                tid,
+                LogicalTime::from_nanos(10),
+                18,
+                DEFAULT_PRIORITY,
+                5,
+                offset,
+            );
+            // Rows alone, as `clone_preemptions_only` leaves them: format 4
+            // with the offset, no format without.
+            let rows =
+                serde_json::from_str::<crate::preemptions::PreemptionRecord>(&writer.into_string())
+                    .unwrap()
+                    .clone_preemptions_only();
+            assert_eq!(
+                rows.format_version(),
+                offset.map(|_| crate::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT)
+            );
+            let path = dir.path().join("rows.json");
+            std::fs::write(&path, rows.to_string()).unwrap();
+            let mut sched = Scheduler::new(&Config {
+                replay_schedule_from: Some(path),
+                record_preemptions: true,
+                ..Config::default()
+            });
+            let written: crate::preemptions::PreemptionRecord =
+                serde_json::from_str(&sched.preemption_writer.take().unwrap().into_string())
+                    .unwrap();
+            (
+                sched.charge_replayed_switch_ins,
+                sched.time_skip_mode == TimeSkipMode::Legacy,
+                written.format_version(),
+            )
+        };
+        let offset = crate::preemptions::InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        assert_eq!(rows_alone(Some(offset)), (false, true, None));
+        assert_eq!(rows_alone(None), rows_alone(Some(offset)));
     }
 
     /// A schedule replay notes no background starts, so its re-record of a

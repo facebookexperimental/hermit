@@ -541,15 +541,27 @@ impl Recording {
     }
 
     /// Whether the recording lists every jump of global time its run made
-    /// (`PreemptionRecord::lists_its_time_skips`).
+    /// (`PreemptionRecord::lists_its_time_skips`), by its timing format
+    /// ([`Self::timing_format`]).
     pub fn lists_its_time_skips(&self) -> bool {
-        self.metadata().lists_its_time_skips()
+        super::lists_time_skips_in(self.timing_format())
     }
 
     /// Whether a replay of this recording charges a replayed switch-in under
-    /// which guest code runs (`PreemptionRecord::charges_replayed_switch_ins`).
+    /// which guest code runs (`PreemptionRecord::charges_replayed_switch_ins`),
+    /// by its timing format ([`Self::timing_format`]).
     pub fn charges_replayed_switch_ins(&self) -> bool {
-        self.metadata().charges_replayed_switch_ins()
+        super::charges_replayed_switch_ins_in(self.timing_format())
+    }
+
+    /// The format whose timing rules the recording follows
+    /// (`PreemptionRecord::timing_format`). A slice-boundary recording keeps
+    /// its schedule trace in its boundary stream, not in its rows' record.
+    pub fn timing_format(&self) -> Option<u32> {
+        match self {
+            Self::Legacy(record) => record.timing_format(),
+            Self::Boundaries(record) => record.preemptions.timing_format_with(true),
+        }
     }
 
     /// The recording's format (`PreemptionRecord::format_version`).

@@ -207,6 +207,13 @@ was armed for and `k` (straight-line code can return to an address without a
 conditional branch, so the step count, not an address, names the point), and
 `--replay-preemptions-from` arms the same timer. A written record omits the
 offsets when it has none, so a record made without the option is unchanged.
+A record whose rows hold one states `"format_version": 4`
+(`INSTRUCTION_OFFSET_ROWS_FORMAT`), which a Hermit that predates the offsets
+refuses by name rather than replaying those slices to their branch targets;
+every copy and edit of such rows keeps it, and this Hermit refuses offset rows
+in an older format. Rows alone in format 4, without a schedule trace, follow
+format 1's timing rules: they claim no list of jumps of global time and no
+switch-in charges.
 Schedule traces do not carry the offsets: `--replay-schedule-from`,
 `--strict-schedule-boundaries`, `hermit analyze` and `hermit bisect` refuse
 the option and records that use it.
