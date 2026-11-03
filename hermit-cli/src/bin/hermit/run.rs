@@ -1632,10 +1632,7 @@ pub struct RunOpts {
     /// those reads reaches the virtual clock, a preemption point or the guest). Every input must be
     /// on the command line: a strict run without `--epoch` (or `HERMIT_EPOCH`, or a replayed
     /// recording that supplies it), or with `--seed-from=SystemRandom`, is refused before the
-    /// guest starts rather than drawing that input from the host. A run whose precise timers
-    /// preempted a thread past its programmed branch count (a skid overshoot) is refused at the
-    /// end (exit 122); without `--strict` it finishes with one warning, unless it replays a
-    /// recorded schedule, which it then no longer reproduces.
+    /// guest starts rather than drawing that input from the host.
     #[clap(
         long,
         conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io", "strace_only"]
@@ -1679,9 +1676,8 @@ pub struct RunOpts {
     ///
     /// A precise timer event is programmed to interrupt the guest this many branches before its
     /// target, and the guest is then single-stepped onto the target. A larger margin makes it
-    /// less likely that a late interrupt lands past the target (an overshoot, which `--strict`,
-    /// `--verify` and a replay refuse and any other run reports in one warning), and costs more
-    /// single steps per delivered event. Any override also turns off the
+    /// less likely that a late interrupt lands past the target (an overshoot, which refuses the
+    /// run), and costs more single steps per delivered event. Any override also turns off the
     /// two-stage arming Reverie otherwise uses for long events, which changes the cost but not
     /// where an event is delivered.
     ///
@@ -5803,42 +5799,6 @@ fn timeslice_flags_parse_and_round_trip() {
             .is_err(),
         "--target-timeslice-syscalls-only must require --target-timeslice"
     );
-}
-
-/// Only `--strict` and a replay refuse a run whose precise timers report a
-/// skid overshoot (exit 122): the overshoot breaks the reproduction each
-/// promises. Any other run, a recording included, keeps its result and
-/// warns.
-#[test]
-fn only_strict_runs_and_replays_refuse_a_skid_overshoot() {
-    for (argv, policy) in [
-        (
-            &["fakehermit", "--strict", "fakeprog"][..],
-            hermit::SkidOvershootPolicy::Refuse,
-        ),
-        (
-            &["fakehermit", "--replay-preemptions-from=/tmp/p", "fakeprog"][..],
-            hermit::SkidOvershootPolicy::Refuse,
-        ),
-        (
-            &["fakehermit", "--replay-schedule-from=/tmp/p", "fakeprog"][..],
-            hermit::SkidOvershootPolicy::Refuse,
-        ),
-        (
-            &["fakehermit", "fakeprog"][..],
-            hermit::SkidOvershootPolicy::Warn,
-        ),
-        (
-            &["fakehermit", "--record-preemptions-to=/tmp/p", "fakeprog"][..],
-            hermit::SkidOvershootPolicy::Warn,
-        ),
-    ] {
-        assert_eq!(
-            RunOpts::parse_from(argv).skid_overshoot_policy(),
-            policy,
-            "{argv:?}"
-        );
-    }
 }
 
 #[test]
@@ -16355,7 +16315,6 @@ impl RunOpts {
         // line; a caller that captures the output (analyze) keeps the output,
         // whose status is the outcome's, with the outcome that says the guest
         // did not exit with it.
-        let skid_overshoots = self.skid_overshoot_policy();
         if capture_output {
             hermit::SchedulerEndedRun::output_of(hermit::run_with_output_backend_timeout(
                 command,
@@ -16364,7 +16323,6 @@ impl RunOpts {
                 &summary_json,
                 backend,
                 timeout,
-                skid_overshoots,
             ))
             .map(|(out, outcome)| (out.status, Some(out), outcome))
         } else {
@@ -16375,31 +16333,8 @@ impl RunOpts {
                 &summary_json,
                 backend,
                 timeout,
-                skid_overshoots,
             )
             .map(|status| (status, None, None))
-        }
-    }
-
-    /// What a run without `--verify` does when its precise PMU timers report
-    /// a skid overshoot: a preemption point moved by interrupt latency.
-    /// `--strict` promises a run that its seed reproduces, and a replay
-    /// (`--replay-preemptions-from`, `--replay-schedule-from`) one that
-    /// follows the recorded schedule; the overshoot breaks either promise,
-    /// so they refuse the result (exit 122). Any other run keeps its outcome
-    /// and its recording, which holds the observed preemption point, and
-    /// warns: without `--strict` Hermit already runs with inputs it does not
-    /// reproduce, such as an epoch from the host clock. Verification refuses
-    /// either way, since it compares runs for determinism.
-    fn skid_overshoot_policy(&self) -> hermit::SkidOvershootPolicy {
-        let config = &self.det_opts.det_config;
-        if self.strict
-            || config.replay_preemptions_from.is_some()
-            || config.replay_schedule_from.is_some()
-        {
-            hermit::SkidOvershootPolicy::Refuse
-        } else {
-            hermit::SkidOvershootPolicy::Warn
         }
     }
 

@@ -8747,7 +8747,7 @@ mod rcb_overshoot_tests {
     /// The prehook's report of an event its thread `tid` ran past: due at
     /// `rcb_target`, found at `clock_value`. That the two sites name the same
     /// target for one event is what the CLI test
-    /// `a_skid_overshoot_without_strict_warns_and_keeps_the_guest_status`
+    /// `a_skid_overshoot_without_strict_is_refused_and_counted_in_the_summary`
     /// checks against a real run.
     fn detcore_reports(tid: i32, rcb_target: u64, clock_value: u64) {
         report_rcb_overshoot(
