@@ -159,9 +159,9 @@ struct Footprints {
 impl Footprints {
     fn load(path: &Path) -> Footprints {
         let raw = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", path.display())));
+            .unwrap_or_else(|e| fail_load(path, &format!("cannot read: {e}")));
         let v: Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| fail(&format!("invalid JSON in {}: {e}", path.display())));
+            .unwrap_or_else(|e| fail_load(path, &format!("invalid JSON: {e}")));
 
         let groups = v["groups"]
             .as_object()
@@ -255,9 +255,9 @@ struct Dag {
 impl Dag {
     fn load(path: &Path) -> Dag {
         let raw = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", path.display())));
+            .unwrap_or_else(|e| fail_load(path, &format!("cannot read: {e}")));
         let v: Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| fail(&format!("invalid JSON in {}: {e}", path.display())));
+            .unwrap_or_else(|e| fail_load(path, &format!("invalid JSON: {e}")));
         let mut all_nodes = BTreeSet::new();
         let mut deps = BTreeMap::new();
         for s in v["steps"].as_array().unwrap_or(&vec![]) {
@@ -347,9 +347,9 @@ struct Shards {
 impl Shards {
     fn load(path: &Path) -> Shards {
         let raw = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", path.display())));
+            .unwrap_or_else(|e| fail_load(path, &format!("cannot read: {e}")));
         let v: Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| fail(&format!("invalid JSON in {}: {e}", path.display())));
+            .unwrap_or_else(|e| fail_load(path, &format!("invalid JSON: {e}")));
         let parse = |key: &str| -> Vec<Shard> {
             v[key]
                 .as_array()
@@ -386,9 +386,9 @@ struct Plan {
 impl Plan {
     fn load(path: &Path) -> Plan {
         let raw = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", path.display())));
+            .unwrap_or_else(|e| fail_load(path, &format!("cannot read: {e}")));
         let v: Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| fail(&format!("invalid JSON in {}: {e}", path.display())));
+            .unwrap_or_else(|e| fail_load(path, &format!("invalid JSON: {e}")));
         let cells = v["cells"]
             .as_array()
             .map(|arr| {
@@ -816,7 +816,105 @@ fn derive_run_plan(sel: &Selection, shards: &Shards, plan: &Plan, dag: &Dag) -> 
 // ---------------------------------------------------------------------------
 
 fn fail(msg: &str) -> ! {
+    // Once the output format is known, every refusal (not just file-load
+    // failures: schema errors such as an unknown footprint group too)
+    // emits the full-selection record first, so no failure path can be
+    // read downstream as an empty selection.
+    if let Some(format) = FORMAT.get() {
+        emit_full_selection_record(format);
+    }
     eprintln!("select-tests: {msg}");
+    std::process::exit(2);
+}
+
+/// Output format chosen on the command line, recorded before any input file
+/// is loaded so a load failure can still answer in that format.
+static FORMAT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The machine-readable record that means "run everything". Emitted on a
+/// load failure so a consumer that reads only stdout (or `$GITHUB_OUTPUT`)
+/// and ignores the exit code receives `full`, never an empty selection it
+/// could mistake for "run nothing". The selection payload fields are null
+/// (not empty lists) and `load_failed` is true, so the record cannot be
+/// ingested as a real selection that happens to contain zero nodes.
+/// `human` has no machine record: the stderr refusal is the record.
+fn full_selection_record(format: &str) -> Option<String> {
+    match format {
+        "json" => Some(
+            serde_json::json!({
+                "decision": "full",
+                "skip": false,
+                "full": true,
+                "load_failed": true,
+                "node_count": null,
+                "nodes": null,
+                "shards": null,
+                "shard_matrix": null,
+                "cell_matrix": null,
+                "cell_count": null,
+                "cells": null,
+                "backends": [],
+                "e2e_all": true,
+                "backend_rules": [],
+                "backend_lanes": [],
+                "build": { "debug": true, "dbt": true, "aux": true },
+                "reasons": ["select-tests: an input file failed to load; failing safe to full"],
+            })
+            .to_string(),
+        ),
+        "github" => Some(
+            "decision=full\nskip=false\nfull=true\nload_failed=true\nnode_count=\nnodes=\n\
+             shard_count=\ncell_count=\nbuild_debug=true\nbuild_dbt=true\nbuild_aux=true\n\
+             backends=\nbackend_rules=\nshard_matrix=\ncell_matrix=\n"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// Emit `full_selection_record` for `format` to the channel that format's
+/// consumers read (stdout, or `$GITHUB_OUTPUT` for `github`).
+fn emit_full_selection_record(format: &str) {
+    let Some(record) = full_selection_record(format) else {
+        return;
+    };
+    if format == "github" {
+        match std::env::var("GITHUB_OUTPUT") {
+            Ok(path) => {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let _ = f.write_all(record.as_bytes());
+                    return;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    println!("{record}");
+}
+
+/// Refuse a run whose input files cannot be loaded. The exit code stays 2
+/// (an explicit refusal), but a full-selection record is emitted first, so
+/// the failure can never be read downstream as "no selection": a consumer
+/// that honours the exit code stops, and one that reads only the record
+/// runs the full suite.
+fn fail_load(path: &Path, detail: &str) -> ! {
+    let format = FORMAT.get().map_or("human", String::as_str);
+    emit_full_selection_record(format);
+    eprintln!(
+        "select-tests: cannot load {}: {detail}",
+        path.display()
+    );
+    eprintln!(
+        "select-tests: remedy: fix the file, or regenerate it with \
+         `cargo run -p hermit-manifest-plan --bin generate-validation-dag -- --write ci/dag/validate.json`; \
+         refusing (exit 2), with a full-selection record emitted so this refusal cannot be \
+         mistaken for an empty selection"
+    );
     std::process::exit(2);
 }
 
@@ -1109,6 +1207,7 @@ fn main() {
         }
     }
 
+    let _ = FORMAT.set(format.clone());
     let root = repo_root();
     let fp = Footprints::load(&root.join("ci/test-footprints.json"));
     let dag = Dag::load(&root.join("ci/dag/validate.json"));
@@ -2736,6 +2835,75 @@ fn reverie_pin_query_bracket(check: &mut impl FnMut(&str, bool)) {
     );
 }
 
+/// End-to-end load-failure runs: spawn this binary in a throwaway git
+/// repo whose input files are broken, and require exit 2 plus the
+/// full-selection record (never an empty stdout a consumer could read as
+/// "no selection"). One case breaks the DAG JSON; the other parses but
+/// fails schema expansion (an unknown footprint group).
+fn load_failure_e2e_bracket(check: &mut dyn FnMut(&str, bool)) {
+    use std::io::Write;
+    let exe = std::env::current_exe().expect("current exe");
+    let run_case = |name: &str, footprints: &str, dag: &str| -> (bool, bool) {
+        let dir = std::env::temp_dir().join(format!(
+            "select-tests-load-failure-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ci/dag")).expect("fixture dirs");
+        std::fs::write(dir.join("ci/test-footprints.json"), footprints).expect("footprints");
+        std::fs::write(dir.join("ci/dag/validate.json"), dag).expect("dag");
+        std::fs::write(dir.join("ci/portable-shards.json"), "{}").expect("shards");
+        std::fs::write(dir.join("ci/expected-e2e-plan.json"), "{}").expect("plan");
+        let init = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .output()
+            .expect("git init");
+        if !init.status.success() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return (false, false);
+        }
+        let mut child = Command::new(&exe)
+            .args(["--files", "-", "--format", "json"])
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn selector");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(b"detcore/src/lib.rs\n")
+            .ok();
+        let out = child.wait_with_output().expect("wait");
+        let _ = std::fs::remove_dir_all(&dir);
+        let refused = out.status.code() == Some(2);
+        let record: Option<Value> = serde_json::from_slice(&out.stdout).ok();
+        let full_record = record.is_some_and(|v| {
+            v["decision"] == "full" && v["load_failed"] == true && v["nodes"].is_null()
+        });
+        (refused, full_record)
+    };
+    let (refused, full_record) = run_case("invalid-json", "{}", "{not json");
+    check("e2e invalid validate.json refuses (exit 2)", refused);
+    check(
+        "e2e invalid validate.json emits the full record, not an empty selection",
+        full_record,
+    );
+    let (refused, full_record) = run_case(
+        "unknown-group",
+        r#"{"footprints": [{"paths": ["detcore/**"], "nodes": ["@NOPE"]}]}"#,
+        r#"{"steps": []}"#,
+    );
+    check("e2e unknown footprint group refuses (exit 2)", refused);
+    check(
+        "e2e unknown footprint group emits the full record, not an empty selection",
+        full_record,
+    );
+}
+
 fn self_test() {
     let mut failures = 0;
     let mut total = 0;
@@ -2928,6 +3096,36 @@ fn self_test() {
                 .reasons
                 .iter()
                 .any(|reason| reason.contains("absent from validate.json")),
+    );
+
+    // --- load-failure record: a refusal must never read as "no selection" ---
+    let json_record = full_selection_record("json").expect("json record");
+    let parsed: Value = serde_json::from_str(&json_record).expect("record parses");
+    check(
+        "load failure json record is a full selection",
+        parsed["decision"] == "full" && parsed["full"] == true && parsed["skip"] == false,
+    );
+    check(
+        "load failure json record cannot be ingested as an empty selection",
+        parsed["load_failed"] == true
+            && parsed["nodes"].is_null()
+            && parsed["shards"].is_null()
+            && parsed["cells"].is_null()
+            && parsed["shard_matrix"].is_null()
+            && parsed["cell_matrix"].is_null(),
+    );
+    let github_record = full_selection_record("github").expect("github record");
+    check(
+        "load failure github record is a full selection",
+        github_record.contains("decision=full")
+            && github_record.contains("full=true")
+            && github_record.contains("skip=false")
+            && github_record.contains("load_failed=true"),
+    );
+    load_failure_e2e_bracket(&mut check);
+    check(
+        "load failure human format has no machine record",
+        full_selection_record("human").is_none(),
     );
 
     historical_selection_bracket(&root, &mut check);
