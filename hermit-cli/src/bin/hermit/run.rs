@@ -5434,6 +5434,119 @@ fn untrap_passthrough_syscalls_is_an_opt_in_refused_where_its_calls_are_counted(
     assert!(message.contains("RCB time"), "{message}");
 }
 
+/// A preemption record holds a callback for each trapped call the recorded run
+/// made, `getppid` among them, with its charge and its preemption point. With
+/// `--untrap-passthrough-syscalls` those calls never reach Detcore, so a replay
+/// of the record would place its checkpoints and priority changes at other
+/// guest progress. Validation refuses such a replay, and recording one, before
+/// the guest runs, whether the options come from the command line, a
+/// `--config` file or a `--from` manifest. Without the flag each route accepts
+/// the same record, so the refusal is the flag's.
+#[test]
+fn untrap_passthrough_syscalls_refuses_preemption_records_by_every_route() {
+    use clap::CommandFactory as _;
+    use detcore::types::DetTid;
+    use detcore::types::SchedEvent;
+    use detcore::types::SyscallPhase;
+    use reverie::syscalls::Sysno;
+
+    let directory = tempfile::tempdir().unwrap();
+    let record = directory.path().join("preemptions.json");
+    let thread = DetTid::from_raw(3);
+    detcore::preemptions::PreemptionRecord::from_sched_events(vec![
+        SchedEvent::syscall(thread, Sysno::getppid, SyscallPhase::Prehook),
+        SchedEvent::syscall(thread, Sysno::getppid, SyscallPhase::Posthook),
+    ])
+    .write_to_disk(&record)
+    .unwrap();
+    let record = record.to_str().expect("record path is UTF-8").to_owned();
+
+    // Validates `hermit run ARGS -- /bin/true`, expanded as `main` expands a
+    // `--config` or `--from` before parsing.
+    let validate = |run: &[&str]| -> Result<(), Error> {
+        let argv: Vec<std::ffi::OsString> = ["hermit", "run"]
+            .iter()
+            .chain(run)
+            .chain(&["--", "/bin/true"])
+            .map(std::ffi::OsString::from)
+            .collect();
+        let argv = crate::run_config::expand_argv(&crate::Args::command(), &argv)?.unwrap_or(argv);
+        let matches = crate::Args::command().try_get_matches_from(&argv)?;
+        let mut args = crate::args_from_matches_with_clock(&matches, || {
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_767_225_600)
+        })?;
+        let crate::Subcommand::Run(run) = &mut args.command else {
+            panic!("{argv:?} is not a `run` command");
+        };
+        run.validate_args_with_perf_support(true)
+    };
+    let refused = |run: &[&str], route: &str| {
+        let message = format!("{:#}", validate(run).expect_err(route));
+        assert!(
+            message.contains("--untrap-passthrough-syscalls")
+                && message.contains("preemption record"),
+            "{route}: {message}"
+        );
+    };
+
+    let replay = format!("--replay-preemptions-from={record}");
+    validate(&[replay.as_str()]).expect("the record replays without the flag");
+    refused(
+        &["--untrap-passthrough-syscalls", replay.as_str()],
+        "command line, --replay-preemptions-from",
+    );
+    validate(&["--record-preemptions"]).expect("a run records preemptions without the flag");
+    refused(
+        &["--untrap-passthrough-syscalls", "--record-preemptions"],
+        "command line, --record-preemptions",
+    );
+
+    let config = |untrap: bool| {
+        let path = directory.path().join(format!("run-{untrap}.yaml"));
+        std::fs::write(
+            &path,
+            format!(
+                "schema: {}\nrun:\n  replay-preemptions-from: {record}\n  \
+                 untrap-passthrough-syscalls: {untrap}\n",
+                crate::run_config::SCHEMA
+            ),
+        )
+        .unwrap();
+        path.to_str().expect("config path is UTF-8").to_owned()
+    };
+    let (with, without) = (config(true), config(false));
+    validate(&["--config", without.as_str()]).expect("the config replays without the flag");
+    refused(&["--config", with.as_str()], "--config");
+
+    let manifest = |config: &str, name: &str| {
+        let loaded = crate::run_config::read(Path::new(config)).unwrap();
+        let (global, run) = crate::run_config::to_manifest_parts(&loaded).unwrap();
+        let manifest = crate::manifest::Manifest::new(
+            hermit::Id::unique(),
+            crate::manifest::Kind::InputsOnly,
+            crate::manifest::Command {
+                program: Some("/bin/true".to_owned()),
+                args: Vec::new(),
+                cwd: None,
+            },
+            crate::manifest::Inputs {
+                global,
+                run,
+                host_drawn: Default::default(),
+            },
+        );
+        let at = directory
+            .path()
+            .join(name)
+            .join(crate::manifest::MANIFEST_NAME);
+        crate::manifest::write(&at, &manifest).unwrap();
+        at.parent().unwrap().to_str().unwrap().to_owned()
+    };
+    let (with, without) = (manifest(&with, "untrapped"), manifest(&without, "trapped"));
+    validate(&["--from", without.as_str()]).expect("the manifest replays without the flag");
+    refused(&["--from", with.as_str()], "--from");
+}
+
 #[test]
 fn passthru_optimization_requires_explicit_compatibility_opt_out() {
     let mut ro = RunOpts::parse_from([
@@ -13236,9 +13349,16 @@ impl RunOpts {
                     "a backend other than ptrace, whose syscall interception it has not been \
                      checked against",
                 )
-            } else if config.record_preemptions_to.is_some()
+            } else if config.record_preemptions
+                || config.record_preemptions_to.is_some()
+                || config.replay_preemptions_from.is_some()
                 || config.replay_schedule_from.is_some()
             {
+                // Recording one, or replaying one: a record made without the
+                // flag holds the untrapped calls' callbacks, their charges and
+                // their preemption points, which a replay with it never
+                // reaches, so its checkpoints and priority changes would land
+                // at different guest progress.
                 Some("a preemption record, whose callback history counts the calls it untraps")
             } else if self.happens_before.is_some() {
                 Some("--happens-before, whose syscall anchors count the calls it untraps")

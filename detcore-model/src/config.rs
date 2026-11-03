@@ -772,7 +772,8 @@ pub struct Config {
     /// DETLOG line, is not counted in the run summary, and is not a point where the thread's
     /// timeslice can end, so the run's virtual clock, schedule and log differ from a run
     /// without this flag, the same in every run with it. Off by default; refused under
-    /// --strict, which promises that Detcore observes every syscall, and without RCB time.
+    /// --strict, which promises that Detcore observes every syscall, without RCB time, and
+    /// with a preemption record to write or replay, whose callback history counts these calls.
     #[serde(default)]
     #[clap(long)]
     pub untrap_passthrough_syscalls: bool,
