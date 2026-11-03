@@ -178,6 +178,66 @@ pub use finalization::FinalizationFailure;
 pub use finalization::PriorityHistoryRefusal;
 pub use finalization::ReplayDepartureError;
 pub use finalization::TerminalReplayRefusal;
+
+/// Why a run cannot leave the pass-through syscalls untrapped
+/// (`Config::untrap_passthrough_syscalls`, `--untrap-passthrough-syscalls`),
+/// whatever launched it ([`untrap_passthrough_admission`]): a policy refusal
+/// made before the guest starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UntrapPassthroughRefusal {
+    /// The run records or replays a preemption record, whose callback
+    /// history counts the calls the mode untraps.
+    PreemptionRecord,
+    /// The run has no RCB time (`Config::use_rcb_time`): no preemption
+    /// timer, or `no_rcb_time`. Syscall charges are then the only progress
+    /// of virtual time and trapped syscalls the only points where a thread
+    /// yields, so a loop on the untrapped calls would never yield or let
+    /// virtual time advance.
+    NoRcbTime,
+}
+
+impl std::fmt::Display for UntrapPassthroughRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::PreemptionRecord => {
+                "--untrap-passthrough-syscalls cannot be combined with a preemption record, \
+                 whose callback history counts the calls it untraps"
+            }
+            Self::NoRcbTime => {
+                "--untrap-passthrough-syscalls needs the preemption timer and RCB time (not \
+                 --max-timeslice=disabled, --no-rcb-time, or a host without usable \
+                 performance counters): without them a loop on the calls it untraps would \
+                 never yield or let virtual time advance"
+            }
+        })
+    }
+}
+
+impl std::error::Error for UntrapPassthroughRefusal {}
+
+/// The prerequisites of `Config::untrap_passthrough_syscalls` that the
+/// configuration itself decides: no preemption record, recorded or
+/// replayed, and RCB time. Every launch reaches it through Detcore's
+/// `facility_admission`, the library entry points (`hermit::run`,
+/// `hermit::run_with_output` and the rest) as well as `hermit run`, whose
+/// validation asks it too so that its options are refused by name before
+/// any launch. A configuration without the mode is always admitted.
+pub fn untrap_passthrough_admission(config: &Config) -> Result<(), UntrapPassthroughRefusal> {
+    if !config.untrap_passthrough_syscalls {
+        return Ok(());
+    }
+    if config.record_preemptions
+        || config.record_preemptions_to.is_some()
+        || config.replay_preemptions_from.is_some()
+        || config.replay_schedule_from.is_some()
+    {
+        return Err(UntrapPassthroughRefusal::PreemptionRecord);
+    }
+    if !config.use_rcb_time() {
+        return Err(UntrapPassthroughRefusal::NoRcbTime);
+    }
+    Ok(())
+}
 pub use finalization::combine_finalization;
 pub use pidfd_self::PidfdSelfQualificationRefusal;
 #[cfg(test)]
@@ -4433,6 +4493,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // This is an operational pre-start hook. subscriptions and the
         // capability queries remain pure, including when called by another
         // Tool to decide whether its own guarantees hold.
+        //
+        // `subscriptions` leaves the untrapped calls out whenever the mode is
+        // on, so its prerequisites are checked here, where every launch
+        // passes, and not only by `hermit run`'s validation.
+        untrap_passthrough_admission(config)
+            .map_err(|refusal| reverie::Error::Tool(anyhow::Error::new(refusal)))?;
         if let Err(refusal) =
             crate::record_or_replay::require_chosen_input_stream(config, T::stream_role())
         {
@@ -8719,6 +8785,67 @@ mod subscription_tests {
                 "passthru_opt allowed {syscall} to bypass Detcore's thread-exit state"
             );
         }
+    }
+
+    /// The mode's configuration prerequisites are checked where every launch
+    /// passes (`facility_admission`): without RCB time, or with a preemption
+    /// record recorded or replayed, it is refused before the guest starts;
+    /// with RCB time and no record it is admitted, as is any configuration
+    /// without the mode.
+    #[test]
+    fn facility_admission_refuses_untrapping_without_its_prerequisites() {
+        let qualified = Config {
+            untrap_passthrough_syscalls: true,
+            sequentialize_threads: true,
+            max_timeslice: std::num::NonZeroU64::new(10_000),
+            ..Config::default()
+        };
+        assert!(qualified.use_rcb_time());
+        assert_eq!(untrap_passthrough_admission(&qualified), Ok(()));
+        <Detcore as Tool>::facility_admission(&qualified).unwrap();
+        let refused = |config: Config, refusal: UntrapPassthroughRefusal| {
+            assert_eq!(untrap_passthrough_admission(&config), Err(refusal));
+            match <Detcore as Tool>::facility_admission(&config) {
+                Err(reverie::Error::Tool(error)) => assert_eq!(
+                    error.downcast_ref::<UntrapPassthroughRefusal>(),
+                    Some(&refusal)
+                ),
+                other => panic!("{config:?}: {other:?}"),
+            }
+            let without = Config {
+                untrap_passthrough_syscalls: false,
+                ..config
+            };
+            assert_eq!(untrap_passthrough_admission(&without), Ok(()));
+        };
+        refused(
+            Config {
+                max_timeslice: None,
+                ..qualified.clone()
+            },
+            UntrapPassthroughRefusal::NoRcbTime,
+        );
+        refused(
+            Config {
+                no_rcb_time: true,
+                ..qualified.clone()
+            },
+            UntrapPassthroughRefusal::NoRcbTime,
+        );
+        refused(
+            Config {
+                record_preemptions: true,
+                ..qualified.clone()
+            },
+            UntrapPassthroughRefusal::PreemptionRecord,
+        );
+        refused(
+            Config {
+                replay_schedule_from: Some(std::path::PathBuf::from("/nonexistent")),
+                ..qualified
+            },
+            UntrapPassthroughRefusal::PreemptionRecord,
+        );
     }
 
     /// `--untrap-passthrough-syscalls` unsubscribes exactly its list, and a

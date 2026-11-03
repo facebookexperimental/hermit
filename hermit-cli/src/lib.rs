@@ -5540,6 +5540,84 @@ mod tests {
 
     static SKID_OVERSHOOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// `untrap_passthrough_syscalls` leaves seven calls untrapped, which is
+    /// safe only with RCB time and without a preemption record. The public
+    /// library entry points refuse it otherwise, before the guest starts, as
+    /// `hermit run` does: the rule is checked in Detcore's
+    /// `facility_admission`, which every launch passes. A timerless
+    /// configuration and a recording one are each refused through both
+    /// `run` and `run_with_output`, as a policy refusal naming
+    /// `UntrapPassthroughRefusal`, and the guest's marker file is never
+    /// written. The control, the same mode with RCB time and no record, is
+    /// admitted by that check.
+    #[test]
+    fn the_library_entry_points_refuse_untrapping_without_its_prerequisites() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("guest-started");
+        let command = || {
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg("touch \"$0\"")
+                .arg(marker.as_os_str());
+            command
+        };
+        let timerless = DetConfig {
+            untrap_passthrough_syscalls: true,
+            sequentialize_threads: true,
+            max_timeslice: None,
+            ..Default::default()
+        };
+        let qualified = DetConfig {
+            max_timeslice: std::num::NonZeroU64::new(10_000),
+            ..timerless.clone()
+        };
+        let recording = DetConfig {
+            record_preemptions: true,
+            ..qualified.clone()
+        };
+        let names = |error: &Error, refusal: detcore::UntrapPassthroughRefusal| {
+            error.chain().any(|cause| {
+                cause.downcast_ref::<detcore::UntrapPassthroughRefusal>() == Some(&refusal)
+                    || matches!(
+                        cause.downcast_ref::<reverie::Error>(),
+                        Some(reverie::Error::Tool(inner))
+                            if inner.downcast_ref::<detcore::UntrapPassthroughRefusal>()
+                                == Some(&refusal)
+                    )
+            })
+        };
+        for (config, refusal) in [
+            (timerless, detcore::UntrapPassthroughRefusal::NoRcbTime),
+            (
+                recording,
+                detcore::UntrapPassthroughRefusal::PreemptionRecord,
+            ),
+        ] {
+            let through_run = run(command(), config.clone(), false, &None)
+                .expect_err("run admitted the untrapped calls without their prerequisites");
+            let through_output = run_with_output(command(), config, false, &None).expect_err(
+                "run_with_output admitted the untrapped calls without their prerequisites",
+            );
+            for (route, error) in [("run", through_run), ("run_with_output", through_output)] {
+                assert!(names(&error, refusal), "{route}: {error:#}");
+                assert!(
+                    format!("{error:#}").contains(&refusal.to_string()),
+                    "{route}: {error:#}"
+                );
+                assert_eq!(
+                    SerializableError::from(error).kind(),
+                    FailureKind::PolicyRefusal,
+                    "{route}"
+                );
+                assert!(!marker.exists(), "{route}: the guest started");
+            }
+        }
+        assert_eq!(detcore::untrap_passthrough_admission(&qualified), Ok(()));
+        <detcore::Detcore as reverie::Tool>::facility_admission(&qualified)
+            .expect("the mode with RCB time and no record is admitted");
+    }
+
     /// The standard streams a launch hands a KVM guest are grouped by the
     /// descriptors themselves, not by this process's fds 0-2: a stdin that is
     /// a file of its own (a reserved stdin distinct from the output streams)

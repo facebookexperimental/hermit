@@ -5394,7 +5394,11 @@ fn untrap_passthrough_syscalls_is_an_opt_in_refused_where_its_calls_are_counted(
             Some(Backend::Kvm),
             "backend other than ptrace",
         ),
-        (None, Some(Backend::E9patch), "backend other than ptrace"),
+        (
+            Some("--max-timeslice=disabled"),
+            Some(Backend::Liteinst),
+            "backend other than ptrace",
+        ),
         (
             Some("--record-preemptions-to=/tmp/p"),
             None,
@@ -5470,12 +5474,13 @@ fn untrap_passthrough_syscalls_refuses_preemption_records_by_every_route() {
             .chain(&["--", "/bin/true"])
             .map(std::ffi::OsString::from)
             .collect();
-        let argv = crate::run_config::expand_argv(&crate::Args::command(), &argv)?.unwrap_or(argv);
-        let matches = crate::Args::command().try_get_matches_from(&argv)?;
-        let mut args = crate::args_from_matches_with_clock(&matches, || {
+        let argv = crate::app::run_config::expand_argv(&crate::app::Args::command(), &argv)?
+            .unwrap_or(argv);
+        let matches = crate::app::Args::command().try_get_matches_from(&argv)?;
+        let mut args = crate::app::args_from_matches_with_clock(&matches, || {
             std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_767_225_600)
         })?;
-        let crate::Subcommand::Run(run) = &mut args.command else {
+        let crate::app::Subcommand::Run(run) = &mut args.command else {
             panic!("{argv:?} is not a `run` command");
         };
         run.validate_args_with_perf_support(true)
@@ -5508,7 +5513,7 @@ fn untrap_passthrough_syscalls_refuses_preemption_records_by_every_route() {
             format!(
                 "schema: {}\nrun:\n  replay-preemptions-from: {record}\n  \
                  untrap-passthrough-syscalls: {untrap}\n",
-                crate::run_config::SCHEMA
+                crate::app::run_config::SCHEMA
             ),
         )
         .unwrap();
@@ -5519,17 +5524,17 @@ fn untrap_passthrough_syscalls_refuses_preemption_records_by_every_route() {
     refused(&["--config", with.as_str()], "--config");
 
     let manifest = |config: &str, name: &str| {
-        let loaded = crate::run_config::read(Path::new(config)).unwrap();
-        let (global, run) = crate::run_config::to_manifest_parts(&loaded).unwrap();
-        let manifest = crate::manifest::Manifest::new(
+        let loaded = crate::app::run_config::read(Path::new(config)).unwrap();
+        let (global, run) = crate::app::run_config::to_manifest_parts(&loaded).unwrap();
+        let manifest = crate::app::manifest::Manifest::new(
             hermit::Id::unique(),
-            crate::manifest::Kind::InputsOnly,
-            crate::manifest::Command {
+            crate::app::manifest::Kind::InputsOnly,
+            crate::app::manifest::Command {
                 program: Some("/bin/true".to_owned()),
                 args: Vec::new(),
                 cwd: None,
             },
-            crate::manifest::Inputs {
+            crate::app::manifest::Inputs {
                 global,
                 run,
                 host_drawn: Default::default(),
@@ -5538,8 +5543,8 @@ fn untrap_passthrough_syscalls_refuses_preemption_records_by_every_route() {
         let at = directory
             .path()
             .join(name)
-            .join(crate::manifest::MANIFEST_NAME);
-        crate::manifest::write(&at, &manifest).unwrap();
+            .join(crate::app::manifest::MANIFEST_NAME);
+        crate::app::manifest::write(&at, &manifest).unwrap();
         at.parent().unwrap().to_str().unwrap().to_owned()
     };
     let (with, without) = (manifest(&with, "untrapped"), manifest(&without, "trapped"));
@@ -13349,17 +13354,16 @@ impl RunOpts {
                     "a backend other than ptrace, whose syscall interception it has not been \
                      checked against",
                 )
-            } else if config.record_preemptions
-                || config.record_preemptions_to.is_some()
-                || config.replay_preemptions_from.is_some()
-                || config.replay_schedule_from.is_some()
+            } else if let Err(refusal @ detcore::UntrapPassthroughRefusal::PreemptionRecord) =
+                detcore::untrap_passthrough_admission(config)
             {
                 // Recording one, or replaying one: a record made without the
                 // flag holds the untrapped calls' callbacks, their charges and
                 // their preemption points, which a replay with it never
                 // reaches, so its checkpoints and priority changes would land
-                // at different guest progress.
-                Some("a preemption record, whose callback history counts the calls it untraps")
+                // at different guest progress. The rule and its message are
+                // Detcore's, which every launch checks again.
+                return Err(Error::new(refusal));
             } else if self.happens_before.is_some() {
                 Some("--happens-before, whose syscall anchors count the calls it untraps")
             } else if self.verify_run.is_some() {
@@ -13494,15 +13498,11 @@ impl RunOpts {
         // are the only progress of virtual time and trapped syscalls the only
         // points where a thread yields, so a loop on the calls this untraps
         // would never yield or let virtual time advance. Checked once a host
-        // without usable performance counters has turned the timer off.
-        if config.untrap_passthrough_syscalls && !config.use_rcb_time() {
-            anyhow::bail!(
-                "--untrap-passthrough-syscalls needs the preemption timer and RCB time \
-                 (not --max-timeslice=disabled, --no-rcb-time, or a host without usable \
-                 performance counters): without them a loop on the calls it untraps would \
-                 never yield or let virtual time advance"
-            );
-        }
+        // without usable performance counters has turned the timer off. The
+        // rule and its message are Detcore's
+        // (`detcore::untrap_passthrough_admission`), which every launch,
+        // the library's included, checks again in `facility_admission`.
+        detcore::untrap_passthrough_admission(config).map_err(Error::new)?;
 
         // `--chaos-timeslice-draw=run` draws from the effective scheduler seed,
         // which `--seed-from` has just settled, unless a replayed record gave

@@ -170,6 +170,7 @@ fn is_policy_refusal(err: &Error) -> bool {
             || cause.is::<detcore::PidfdSelfQualificationRefusal>()
             || cause.is::<detcore::TerminalReplayRefusal>()
             || cause.is::<detcore::PriorityHistoryRefusal>()
+            || cause.is::<detcore::UntrapPassthroughRefusal>()
             || cause.is::<detcore::ReplayDepartureError>()
             || cause.is::<reverie_ptrace::UntracedStubSyscall>()
             || is_chosen_root_id_taken(cause)
