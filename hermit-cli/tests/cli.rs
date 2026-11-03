@@ -36681,6 +36681,7 @@ fn a_skid_overshoot_without_strict_is_refused_and_counted_in_the_summary() {
         stderr.contains("HERMIT_SKID_OVERSHOOT"),
         "the skid injector did not induce an overshoot; this test is measuring nothing:\n{stderr}"
     );
+    // EXIT-CLASS: hermit
     assert_eq!(
         output.status.code(),
         Some(122),
