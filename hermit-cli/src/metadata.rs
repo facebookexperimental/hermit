@@ -969,7 +969,15 @@ impl RecordVersion {
 // quiescence beside busy threads, would replay with an earlier
 // re-admission and fall out of step. It is refused here.
 // https://github.com/rrnewton/hermit/pull/4627
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19c);
+// 0x19c -> 0x19d (HIGHEST_SHIPPED+1 at the rebase onto main 0220dd85,
+// after PR 4627 took 0x19c): an Mmap event of a MAP_SHARED file mapping
+// names the mapped file
+// (device, inode, offset) and the mapped descriptor's access mode. Replay
+// maps every shared mapping of one file as a view of one backing, opened
+// with that access mode, instead of making separate anonymous copies. An
+// older reader cannot decode the new field, and an older recording has no
+// identity with which to restore sharing, so it is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19d);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -994,7 +1002,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19c);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19c;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19d;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

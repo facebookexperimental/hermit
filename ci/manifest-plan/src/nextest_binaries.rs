@@ -3222,7 +3222,13 @@ mod tests {
         let population = record_workloads::consume_prepared(true, Some(&raw))
             .unwrap()
             .unwrap();
-        assert_eq!(population.len(), 75);
+        assert_eq!(population.len(), 76);
+        assert!(
+            population
+                .iter()
+                .any(|workload| workload.name == "c_record_replay_shared_mappings"),
+            "the shared-mapping workload must reach the prepared consumer"
+        );
         assert_eq!(
             population.iter().map(|w| w.name).collect::<BTreeSet<_>>(),
             record_workloads::names().collect()

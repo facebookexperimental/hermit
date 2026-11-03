@@ -69,6 +69,7 @@ use reverie::syscalls::Socketpair;
 
 use super::Replayer;
 use crate::event::MadviseRefill;
+use crate::event::MmapEvent;
 use crate::event::SharedMapping;
 
 const PAGE_SIZE: usize = 4096;
@@ -82,6 +83,19 @@ pub(super) const SHARED_MAPPING_REFUSAL: &str = "replay refused: replay cannot m
 
 fn refuse(step: &str, error: impl Display) -> ! {
     panic!("{SHARED_MAPPING_REFUSAL}: {step}: {error}")
+}
+
+/// Failed mappings retain their recorded errno. A successful shared mapping
+/// must name its file before replay can create any mapping in the guest.
+fn replay_mmap_event(event: Result<MmapEvent, Errno>, flags: MapFlags) -> Result<MmapEvent, Errno> {
+    let event = event?;
+    if flags.contains(MapFlags::MAP_SHARED) && event.shared.is_none() {
+        refuse(
+            "read recorded sharing identity",
+            "the successful mmap event has none",
+        );
+    }
+    Ok(event)
 }
 
 /// A file by device and inode.
@@ -772,7 +786,7 @@ impl Replayer {
         }
 
         // Get the event. We need to know what pointer to use for the map.
-        let event = next_event!(guest, Mmap)?;
+        let event = replay_mmap_event(next_event!(guest, Mmap), flags)?;
 
         // This is safe since we only record non-NULL pointers.
         let addr = unsafe { AddrMut::<u8>::from_raw_unchecked(event.addr) };
@@ -1343,6 +1357,76 @@ mod tests {
     use std::os::unix::fs::OpenOptionsExt;
 
     use super::*;
+
+    #[test]
+    fn a_successful_shared_mmap_requires_a_recorded_identity() {
+        for flags in [
+            MapFlags::MAP_SHARED,
+            MapFlags::from_bits_retain(libc::MAP_SHARED_VALIDATE),
+        ] {
+            let refusal = std::panic::catch_unwind(|| {
+                replay_mmap_event(
+                    Ok(MmapEvent {
+                        addr: 0x1000,
+                        buf: vec![7],
+                        shared: None,
+                    }),
+                    flags,
+                )
+            })
+            .expect_err("a successful shared mmap without identity must refuse replay");
+            let message = refusal.downcast_ref::<String>().unwrap();
+            assert!(message.starts_with(SHARED_MAPPING_REFUSAL), "{message}");
+            assert!(
+                message.contains("read recorded sharing identity"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_mmap_keeps_its_recorded_errno_before_identity_validation() {
+        for flags in [
+            MapFlags::MAP_PRIVATE,
+            MapFlags::MAP_SHARED,
+            MapFlags::from_bits_retain(libc::MAP_SHARED_VALIDATE),
+        ] {
+            for errno in [Errno::EINVAL, Errno::EBADF, Errno::EACCES] {
+                assert_eq!(replay_mmap_event(Err(errno), flags).unwrap_err(), errno);
+            }
+        }
+    }
+
+    #[test]
+    fn private_and_identified_shared_mmap_events_keep_their_recorded_data() {
+        let identity = SharedMapping {
+            device: 1,
+            inode: 42,
+            offset: 4096,
+            access: libc::O_RDONLY,
+        };
+        for (flags, shared) in [
+            (MapFlags::MAP_PRIVATE, None),
+            (MapFlags::MAP_SHARED, Some(identity)),
+            (
+                MapFlags::from_bits_retain(libc::MAP_SHARED_VALIDATE),
+                Some(identity),
+            ),
+        ] {
+            let event = replay_mmap_event(
+                Ok(MmapEvent {
+                    addr: 0x1000,
+                    buf: vec![7, 8, 9],
+                    shared,
+                }),
+                flags,
+            )
+            .unwrap();
+            assert_eq!(event.addr, 0x1000);
+            assert_eq!(event.buf, [7, 8, 9]);
+            assert_eq!(event.shared, shared);
+        }
+    }
 
     /// `/proc/<pid>/maps` names a file by its device, in hexadecimal
     /// `major:minor`, and its inode; anonymous memory has inode 0.

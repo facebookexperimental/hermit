@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::io;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
@@ -202,15 +203,56 @@ fn read_readable_runs(mem: &std::fs::File, start: usize, end: usize) -> Vec<(usi
 /// the mapping's `offset` in it, and the descriptor's access mode.
 /// `/proc/<tid>` shows that thread's own descriptor table, which is not the
 /// leader's for a thread cloned without `CLONE_FILES`.
-fn shared_mapping(tid: i32, fd: i32, offset: i64) -> Option<SharedMapping> {
-    let metadata = std::fs::metadata(format!("/proc/{tid}/fd/{fd}")).ok()?;
-    let fdinfo = std::fs::read_to_string(format!("/proc/{tid}/fdinfo/{fd}")).ok()?;
-    Some(SharedMapping {
+fn shared_mapping(
+    flags: MapFlags,
+    tid: i32,
+    fd: i32,
+    offset: i64,
+) -> io::Result<Option<SharedMapping>> {
+    shared_mapping_with(flags, tid, fd, offset, |path| std::fs::read_to_string(path))
+}
+
+fn shared_mapping_with(
+    flags: MapFlags,
+    tid: i32,
+    fd: i32,
+    offset: i64,
+    read_fdinfo: impl FnOnce(&str) -> io::Result<String>,
+) -> io::Result<Option<SharedMapping>> {
+    if !flags.contains(MapFlags::MAP_SHARED) {
+        return Ok(None);
+    }
+    let metadata = std::fs::metadata(format!("/proc/{tid}/fd/{fd}"))?;
+    let fdinfo = read_fdinfo(&format!("/proc/{tid}/fdinfo/{fd}"))?;
+    Ok(Some(SharedMapping {
         device: metadata.dev(),
         inode: metadata.ino(),
-        offset: u64::try_from(offset).ok()?,
-        access: descriptor_access(&fdinfo)?,
-    })
+        offset: u64::try_from(offset)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
+        access: descriptor_access(&fdinfo).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fdinfo has no valid access flags",
+            )
+        })?,
+    }))
+}
+
+/// A failed mmap needs no sharing identity. A successful one cannot be
+/// recorded without it: returning the capture error to the guest would hide
+/// its live mapping, and writing `None` would let replay replace shared pages
+/// with a private copy.
+fn captured_mmap_result(
+    result: Result<i64, Errno>,
+    shared: io::Result<Option<SharedMapping>>,
+) -> Result<(i64, Option<SharedMapping>), Errno> {
+    let addr = result?;
+    let shared = shared.unwrap_or_else(|error| {
+        panic!(
+            "Cannot record MAP_SHARED mmap: cannot capture file identity and access mode: {error}"
+        )
+    });
+    Ok((addr, shared))
 }
 
 /// The access mode in a `/proc/<pid>/fdinfo/<fd>` listing: the `O_ACCMODE`
@@ -238,11 +280,12 @@ impl Recorder {
         let len = syscall.len();
         // Read before the call: the descriptor names the same file then, and a
         // sibling thread could not have closed it, as the call holds the turn.
-        let shared = if syscall.flags().contains(MapFlags::MAP_SHARED) {
-            shared_mapping(guest.tid().as_raw(), syscall.fd(), syscall.offset())
-        } else {
-            None
-        };
+        let shared = shared_mapping(
+            syscall.flags(),
+            guest.tid().as_raw(),
+            syscall.fd(),
+            syscall.offset(),
+        );
 
         // Do the injection. We need to record the pointer the mapping is at and
         // all of the bytes contained in the mapping. This is very inefficient
@@ -252,8 +295,8 @@ impl Recorder {
 
         self.record_event(
             guest,
-            match result {
-                Ok(addr) => {
+            match captured_mmap_result(result, shared) {
+                Ok((addr, shared)) => {
                     let addr = Addr::from_raw(addr as usize).ok_or(Errno::EINVAL)?;
 
                     // NOTE: We can't use `read_exact` here to slurp up the
@@ -365,6 +408,94 @@ impl Recorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failed_fdinfo_capture(file: &std::fs::File) -> io::Result<Option<SharedMapping>> {
+        let tid = std::process::id() as i32;
+        let fd = file.as_raw_fd();
+        let mut read_attempted = false;
+        let capture = shared_mapping_with(MapFlags::MAP_SHARED, tid, fd, 0, |path| {
+            assert_eq!(path, format!("/proc/{tid}/fdinfo/{fd}"));
+            read_attempted = true;
+            Err(io::Error::from_raw_os_error(libc::EMFILE))
+        });
+        assert!(read_attempted, "metadata must succeed before fdinfo fails");
+        assert_eq!(
+            capture.as_ref().unwrap_err().raw_os_error(),
+            Some(libc::EMFILE)
+        );
+        capture
+    }
+
+    /// A tracer can run out of descriptors while the guest's mmap succeeds.
+    /// The capture error must reach the actual result-to-event boundary.
+    #[test]
+    #[should_panic(
+        expected = "Cannot record MAP_SHARED mmap: cannot capture file identity and access mode"
+    )]
+    fn a_successful_shared_mmap_refuses_a_failed_fdinfo_capture() {
+        let file = tempfile::tempfile().unwrap();
+        let capture = failed_fdinfo_capture(&file);
+        let _ = captured_mmap_result(Ok(0x1000), capture);
+    }
+
+    #[test]
+    fn a_failed_mmap_keeps_its_errno_when_fdinfo_capture_fails() {
+        let file = tempfile::tempfile().unwrap();
+        for errno in [Errno::EINVAL, Errno::EBADF, Errno::EACCES] {
+            let capture = failed_fdinfo_capture(&file);
+            assert_eq!(captured_mmap_result(Err(errno), capture), Err(errno));
+        }
+    }
+
+    #[test]
+    fn private_mmaps_do_not_read_shared_file_identity() {
+        let capture = shared_mapping_with(MapFlags::MAP_PRIVATE, -1, -1, 0, |_| {
+            panic!("a private mapping must not read fdinfo")
+        });
+        assert_eq!(
+            captured_mmap_result(Ok(0x1000), capture),
+            Ok((0x1000, None))
+        );
+    }
+
+    #[test]
+    fn shared_mmaps_keep_the_captured_identity_and_access() {
+        let file = tempfile::tempfile().unwrap();
+        let metadata = file.metadata().unwrap();
+        let expected = SharedMapping {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            offset: 4096,
+            access: libc::O_RDWR,
+        };
+        for flags in [
+            MapFlags::MAP_SHARED,
+            MapFlags::from_bits_retain(libc::MAP_SHARED_VALIDATE),
+        ] {
+            let capture = shared_mapping(flags, std::process::id() as i32, file.as_raw_fd(), 4096);
+            assert_eq!(
+                captured_mmap_result(Ok(0x1000), capture),
+                Ok((0x1000, Some(expected)))
+            );
+        }
+    }
+
+    #[test]
+    fn shared_mmap_capture_reports_missing_identity_and_invalid_access() {
+        let tid = std::process::id() as i32;
+        let missing = shared_mapping_with(MapFlags::MAP_SHARED, tid, -1, 0, |_| {
+            panic!("a missing descriptor must fail before fdinfo is read")
+        });
+        assert_eq!(missing.unwrap_err().raw_os_error(), Some(libc::ENOENT));
+        let file = tempfile::tempfile().unwrap();
+        for fdinfo in ["pos:\t0\n", "flags:\tinvalid\n"] {
+            let capture =
+                shared_mapping_with(MapFlags::MAP_SHARED, tid, file.as_raw_fd(), 0, |_| {
+                    Ok(fdinfo.to_owned())
+                });
+            assert_eq!(capture.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
+    }
 
     /// fdinfo's `flags:` line is octal; its `O_ACCMODE` bits are the access
     /// mode, whatever else (`O_CLOEXEC`, `O_LARGEFILE`) is set.

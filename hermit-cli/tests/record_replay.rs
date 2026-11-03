@@ -5627,6 +5627,65 @@ fn record_replay_shares_memory_between_mappings_of_one_memfd() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// Exercise the admission gate with a current recording whose metadata is
+/// retagged as 0x199, before mmap events carried shared file identities. This
+/// tests version refusal, not decoding of an authentic older event stream.
+#[test]
+fn shared_mapping_replay_refuses_metadata_retagged_as_0x199() {
+    let _guard = hermit_record_lock();
+    let data = tempfile::tempdir().expect("create shared-mapping recording directory");
+    let expected = b"overlap: high sees from low\noverlap: low sees from high\n";
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=off",
+            "record",
+            "start",
+            "--record-timeout=30",
+            "--data-dir",
+        ])
+        .arg(data.path())
+        .arg("--")
+        .arg(&workload("c_record_replay_shared_mappings").path)
+        .arg("overlap");
+    let recorded = command_output(record, "shared-mapping version-gate recording");
+    assert_eq!(recorded.stdout, expected);
+    let replay_command = || {
+        let mut replay = Command::new("timeout");
+        replay
+            .args(["--kill-after=5s", "45s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log=off", "replay", "--autopilot", "--data-dir"])
+            .arg(data.path());
+        replay
+    };
+    let replayed = command_output(replay_command(), "current shared-mapping recording replay");
+    assert_eq!(replayed.stdout, expected);
+
+    let recording_id = fs::read_to_string(data.path().join("last")).expect("recording ID");
+    let metadata_path = data.path().join(recording_id.trim()).join("metadata.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).expect("read metadata"))
+            .expect("parse metadata");
+    assert_eq!(metadata["version"], 0x19b, "RECORD_VERSION moved");
+    metadata["version"] = serde_json::json!(0x199);
+    fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    let mut replay = replay_command();
+    let refused = hermit_test::hermit_output(&format!("{replay:?}"), &mut replay);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success(),
+        "0x199 metadata was accepted: {stderr}"
+    );
+    assert!(stderr.contains("Version mismatch"), "{stderr}");
+    assert!(
+        refused.stdout.is_empty(),
+        "guest ran before version refusal"
+    );
+}
+
 /// The replay of `tests/c/record_replay_shared_mappings.c` in `mode`, which
 /// both phases must print as `expected`, as a native run prints it. Replay
 /// backs each recorded shared file with one file of its own and maps every
