@@ -227,15 +227,15 @@ The schedule trace carries them too. The timer's own batch of branches
 (`Op::Branch`, followed by the `Op::OtherInstructions` event that names the
 address the steps stopped at) holds the same `(rcb_target, k)` in
 `SchedEvent::instruction_offset`, and the recording that writes an offset
-states `"format_version": 5` (`INSTRUCTION_OFFSET_FORMAT`), the next number
-on the record-format counter (`PREEMPTION_RECORD_FORMAT`) after format 4, a
+states `"format_version": 7` (`INSTRUCTION_OFFSET_FORMAT`), the next number
+on the record-format counter (`PREEMPTION_RECORD_FORMAT`) after format 6, a
 record whose rows alone hold offsets; one without offsets states the newest
 format below both, with no offset field. An edit keeps the format of the
-record it edits. A Hermit that reads format 4 but not 5 refuses such a record
+record it edits. A Hermit that reads format 6 but not 7 refuses such a record
 by name rather than replaying its schedule trace without the offsets, and a
-format-4 record, rows alone or a schedule whose trace holds no offset, is a
+format-6 record, rows alone or a schedule whose trace holds no offset, is a
 plan only `--replay-preemptions-from` arms: `--replay-schedule-from` refuses
-it. Minimization's records hold rows alone and so state format 4 when a row
+it. Minimization's records hold rows alone and so state format 6 when a row
 keeps an offset. The format
 is one monotone counter: format N holds every feature numbered N or lower,
 and a Hermit reads a record without a format and every format from 2 up to its
@@ -258,7 +258,7 @@ through every schedule they build, splice, minimize or write; their trials
 that replay a record draw none of their own, and when the analysis carries
 offsets its schedule replays run without chaos (and so it refuses chaos
 slowdown). A record whose rows hold offsets but
-whose schedule trace does not (format 4: written by a Hermit whose schedule
+whose schedule trace does not (format 6: written by a Hermit whose schedule
 traces did not hold them, or rows alone) still replays with `--replay-preemptions-from`; `--replay-schedule-from`,
 `hermit analyze` and `hermit bisect` refuse it, as `--strict-schedule-boundaries`
 refuses the option.

@@ -422,7 +422,6 @@ mod tests {
     #[test]
     fn a_trial_shares_the_timing_format_of_a_recording_with_instruction_offsets() {
         use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
-        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         let offset = InstructionOffset {
             rcb_target: 18,
@@ -434,15 +433,19 @@ mod tests {
         .with_current_format();
         assert_eq!(with.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
         let without = PreemptionRecord::from_sched_events(events(&[3])).with_current_format();
+        // Built from events, it notes no background starts.
         assert_eq!(
             without.format_version(),
-            Some(INSTRUCTION_OFFSET_ROWS_FORMAT - 1)
+            Some(detcore::preemptions::BACKGROUND_STARTS_FORMAT - 1)
         );
         let mut sources = TimeSkipSources::default();
         sources.remember(&with);
         sources.remember(&without);
         let trial = sources.trial_format().unwrap();
-        assert_eq!(trial, Some(INSTRUCTION_OFFSET_ROWS_FORMAT - 1));
+        assert_eq!(
+            trial,
+            Some(detcore::preemptions::BACKGROUND_STARTS_FORMAT - 1)
+        );
         assert_eq!(
             PreemptionRecord::from_sched_events(events(&[5]))
                 .with_format(trial)

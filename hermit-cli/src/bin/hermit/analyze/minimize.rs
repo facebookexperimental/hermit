@@ -428,9 +428,9 @@ mod tests {
     /// holds rows alone and claims no timing format, from a source with jumps
     /// of global time with or without instruction offsets: format 2 and every
     /// later one claim a complete list of jumps, which rows alone do not hold.
-    /// One whose rows keep an offset states format 4
+    /// One whose rows keep an offset states format 6
     /// (`INSTRUCTION_OFFSET_ROWS_FORMAT`), which a Hermit that predates the
-    /// offsets (formats 1 to 3) refuses by name rather than replaying the
+    /// offsets (formats 1 to 5) refuses by name rather than replaying the
     /// rows without them, and whose rows-only timing is format 1's
     /// (`PreemptionRecord::timing_format`); one without states none, as
     /// before. Its rows keep their exact branch targets and offsets. Each written
@@ -499,7 +499,9 @@ mod tests {
                 Some(if with_offsets {
                     INSTRUCTION_OFFSET_FORMAT
                 } else {
-                    INSTRUCTION_OFFSET_ROWS_FORMAT - 1
+                    // A writer that notes no background starts states the
+                    // format below theirs.
+                    detcore::preemptions::BACKGROUND_STARTS_FORMAT - 1
                 })
             );
             source.write_to_disk(&preempts_path).unwrap();
@@ -546,10 +548,10 @@ mod tests {
                     keeps_offset.then_some(INSTRUCTION_OFFSET_ROWS_FORMAT),
                     "{label}"
                 );
-                // Formats 1 to 3, all a Hermit before the offsets reads.
+                // Formats 1 to 4, all a Hermit before the offsets reads.
                 let read_before_offsets = written
                     .format_version()
-                    .is_none_or(|format| (2..=3).contains(&format));
+                    .is_none_or(|format| (2..INSTRUCTION_OFFSET_ROWS_FORMAT).contains(&format));
                 assert_eq!(read_before_offsets, !keeps_offset, "{label}");
                 assert_eq!(written.timing_format(), None, "{label}");
                 assert!(!written.lists_its_time_skips(), "{label}");

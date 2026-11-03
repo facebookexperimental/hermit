@@ -2507,8 +2507,8 @@ mod tests {
     /// its recorded end stopped the whole analysis with Detcore's "Cannot
     /// set end of timeslice" panic (exit 101).
     /// A prefix trial of a recording whose schedule trace holds instruction
-    /// offsets (format 5), written by the real trial writer
-    /// (`write_trial_record`) and read back, keeps format 5 and its timing at
+    /// offsets (format 7), written by the real trial writer
+    /// (`write_trial_record`) and read back, keeps format 7 and its timing at
     /// every length: with no event, with the offset batch and with all, with
     /// and without a jump of global time at event zero, it lists its jumps
     /// (complete, so no list means none was taken), keeps the one at event
@@ -2605,18 +2605,18 @@ mod tests {
         }
     }
 
-    /// Rows copied alone (`clone_preemptions_only`: format 4, marked as rows
-    /// alone) and restated in format 5 (`with_format`) keep the mark, so they
+    /// Rows copied alone (`clone_preemptions_only`: format 6, marked as rows
+    /// alone) and restated in format 7 (`with_format`) keep the mark, so they
     /// hold rows only whatever format they state. Through a full decode and
     /// the real trial writer (`write_trial_record`, which keeps the format of
     /// a record whose rows hold offsets), the full record's reader and the
     /// settings reader both say rows only, and the schedule replay guard and
     /// analyze's input check refuse the written file, as any rows-only
-    /// record. The marked rows in format 4 and the complete format-5
+    /// record. The marked rows in format 6 and the complete format-7
     /// recording they came from are the controls: rows only, and recorded
     /// with offsets, which both admit.
     #[test]
-    fn rows_alone_restated_in_format_five_still_hold_rows_only() {
+    fn rows_alone_restated_in_the_trace_offsets_format_still_hold_rows_only() {
         use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
         use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
@@ -2665,7 +2665,7 @@ mod tests {
             ("the complete recording", &source, RecordedOffsets::Recorded),
             ("its rows alone", &rows, RecordedOffsets::RowsOnly),
             (
-                "its rows alone in format 5",
+                "its rows alone in format 7",
                 &restated,
                 RecordedOffsets::RowsOnly,
             ),
@@ -2758,7 +2758,7 @@ mod tests {
         assert_eq!(current.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
         assert!(current.rows_carry_instruction_offsets());
         // The same rows in a record written by a Hermit whose schedule traces
-        // did not hold offsets: format 4, no event offset.
+        // did not hold offsets: format 6, no event offset.
         let mut legacy = serde_json::to_value(&current).unwrap();
         legacy["format_version"] =
             serde_json::json!(detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT);
@@ -2832,7 +2832,6 @@ mod tests {
     #[test]
     fn a_trial_of_a_recording_with_instruction_offsets_keeps_its_own_jumps() {
         use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
-        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::types::DetTid;
 
@@ -2858,7 +2857,11 @@ mod tests {
         };
         let s = recording(None, 1000);
         let t = recording(Some(offset), 2000);
-        assert_eq!(s.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT - 1));
+        // Built from events, it notes no background starts.
+        assert_eq!(
+            s.format_version(),
+            Some(detcore::preemptions::BACKGROUND_STARTS_FORMAT - 1)
+        );
         assert_eq!(t.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("trial.json");
@@ -2874,7 +2877,7 @@ mod tests {
             }
             for (source, format, target) in [
                 (&t, INSTRUCTION_OFFSET_FORMAT, 2000),
-                (&s, INSTRUCTION_OFFSET_ROWS_FORMAT - 1, 1000),
+                (&s, detcore::preemptions::BACKGROUND_STARTS_FORMAT - 1, 1000),
             ] {
                 options
                     .write_trial_record(source.schedule_prefix(2), &output)
