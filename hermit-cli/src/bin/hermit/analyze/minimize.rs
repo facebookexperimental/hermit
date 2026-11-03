@@ -519,11 +519,11 @@ mod tests {
             let options =
                 AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
                     .unwrap();
-            let trial = crate::analyze::rundata::RunData::get_raw_runopts(&options);
+            let trial = crate::app::analyze::rundata::RunData::get_raw_runopts(&options);
             let mut schedule_replay = trial.det_opts.det_config.clone();
             schedule_replay.chaos = false;
             let guard = |recorded, schedule| {
-                crate::run::instruction_offset_replay_refusal(
+                crate::app::run::instruction_offset_replay_refusal(
                     recorded,
                     schedule,
                     false,
@@ -618,7 +618,7 @@ mod tests {
                 let error = fed_back.unwrap_err();
                 assert!(
                     error
-                        .downcast_ref::<crate::container::PolicyRefusal>()
+                        .downcast_ref::<crate::app::container::PolicyRefusal>()
                         .is_some()
                         && format!("{error:#}").contains(
                             "its schedule trace does not record the instruction offsets its rows \
