@@ -90,6 +90,8 @@ struct RawRecord {
     rewrite_exclusives_in_memory: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     rows_alone: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    background_starts_unnoted: bool,
 }
 
 // The INFO comparison projection: RawRecord's exact serialization except the

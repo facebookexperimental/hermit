@@ -211,7 +211,13 @@ A record whose rows hold one states `"format_version": 6`
 (`INSTRUCTION_OFFSET_ROWS_FORMAT`), which a Hermit that predates the offsets
 refuses by name rather than replaying those slices to their branch targets;
 every copy and edit of such rows keeps it, and this Hermit refuses offset rows
-in an older format. Rows copied alone, without the schedule trace and the
+in an older format. A record that drops the background starts its run noted
+(a shorter schedule prefix, an edit, the re-record of a schedule replay) goes
+below format 4 when it holds no offsets; with offset rows it keeps format 5
+and says `"background_starts_unnoted": true`, so that no reader takes the
+number for a claim to note every start, and a Hermit that reads only formats
+1 to 5 still refuses it by number. Either way it drops its `"stopless"`
+marks, which only a record that notes its starts holds. Rows copied alone, without the schedule trace and the
 jumps of global time of their run (`"rows_alone": true`), follow format 1's
 timing rules: they claim no list of jumps of global time and no switch-in
 charges. A schedule whose trace is only empty, such as a prefix of no events,
