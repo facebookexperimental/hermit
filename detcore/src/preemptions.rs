@@ -384,8 +384,10 @@ pub struct TimeSkip {
 }
 
 /// Read only the readmissions stored in a preemption record file, as
-/// [`read_recorded_rng_seed`] reads the guest random seed. `Some` list,
-/// possibly empty, comes from a record whose run logged its readmissions;
+/// [`read_recorded_rng_seed`] reads the guest random seed, whatever the
+/// record's format, as every loader keeps them
+/// (`PreemptionRecord::validate_contents`). `Some` list, possibly empty,
+/// comes from a record whose run logged its readmissions;
 /// `None` means the record predates the field, was synthesized or edited in
 /// memory, or cannot be read at all: a replay that cannot read its record is
 /// refused by the reader that needs the whole record, with a message about
@@ -683,11 +685,11 @@ impl PreemptionRecord {
             let mut record = source.clone();
             record.global.clear();
             record.per_thread.clear();
-            // The mixed order is neither source's, so it keeps no background
-            // starts, and its format goes below theirs, as an edit's does
-            // (`forget_run_points`).
-            record.background_starts.clear();
-            record.format_version = format_without_background_starts(record.format_version);
+            // The mixed order is neither source's, so it keeps none of their
+            // run's points: no readmissions, whose turns belong to an order the
+            // result never ran, and no background starts, and its format goes
+            // below theirs, as an edit's does.
+            record.forget_run_points();
             record
         };
         let mut record = metadata(self);
@@ -1259,6 +1261,14 @@ impl PreemptionRecord {
                  the format {BACKGROUND_STARTS_FORMAT} that notes them",
                 self.format_version.unwrap_or(1)
             ));
+        }
+        // A record's readmissions are kept as stored, whatever its format
+        // (main's schedule replays re-record them in format 3), and every
+        // loader refuses the same ones: those a replay could not walk once,
+        // in order (`read_recorded_rejoins` reads only this field, by the
+        // same rule).
+        if let Some(rejoins) = &self.rejoins {
+            crate::scheduler::rejoin_log::ordered(rejoins)?;
         }
         self.validate_callback_checkpoints()?;
         self.validate_histories()
@@ -1973,6 +1983,49 @@ mod tests {
                 .format_version(),
             Some(PREEMPTION_RECORD_FORMAT)
         );
+    }
+
+    /// A mixed interpolation keeps no readmissions: their turns name points
+    /// of an event order the result never ran, so its replay would readmit
+    /// calls where neither endpoint's run did. Two endpoints with the same
+    /// log and different event orders give a mixed record with none, as an
+    /// edit does (`forget_run_points`), and selecting an endpoint's exact
+    /// order keeps that record whole, its log included.
+    #[test]
+    fn a_mixed_interpolation_keeps_no_readmissions() {
+        let (tid, other_tid) = (DetTid::from_raw(3), DetTid::from_raw(5));
+        let events = |order: &[(DetTid, u32)]| -> Vec<SchedEvent> {
+            order
+                .iter()
+                .map(|&(tid, count)| SchedEvent::branches(tid, count))
+                .collect()
+        };
+        let log = vec![crate::scheduler::rejoin_log::Rejoin {
+            turn: 2,
+            wakes: 0,
+            calls: vec![(tid, 1)],
+            popped: Some(Vec::new()),
+        }];
+        let source = |order: &[(DetTid, u32)]| {
+            let mut record = PreemptionRecord::from_sched_events(events(order));
+            record.format_version = Some(SWITCH_IN_CHARGE_FORMAT);
+            record.rejoins = Some(log.clone());
+            record.validate().unwrap();
+            record
+        };
+        let a = source(&[(tid, 10), (other_tid, 20), (tid, 30)]);
+        let b = source(&[(other_tid, 20), (tid, 10), (tid, 30)]);
+        let mixed = a
+            .interpolate_events(&b, events(&[(tid, 10), (tid, 30), (other_tid, 20)]))
+            .unwrap();
+        assert_eq!(mixed.rejoins, None);
+        for (endpoint, record) in [(&a, a.clone()), (&b, b.clone())] {
+            let exact = a
+                .interpolate_events(&b, endpoint.schedevents().to_vec())
+                .unwrap();
+            assert_eq!(exact.rejoins, Some(log.clone()));
+            assert_eq!(exact, record);
+        }
     }
 
     /// The starts cap lowers only a format this Hermit reads at or above
@@ -2909,6 +2962,89 @@ mod tests {
         }
     }
 
+    /// Every loader of a preemption record reads the same readmissions from
+    /// the same bytes, whatever the record's format: the scheduler's
+    /// (`read_recorded_rejoins`), the replay and editing reader
+    /// (`Recording::decode`, `PreemptionReader::try_new`), the reader analyze,
+    /// minimize and split-branches use (`PreemptionReader::new`), and
+    /// bisect's (`serde_json` then `validate`). The records are shaped as
+    /// main's writer at `fcd62385f` writes them: a schedule replay's
+    /// re-record, which states format 3 and keeps its readmissions; a record
+    /// from a writer that states no format, whose list starts empty; and a
+    /// run's own, format 4. A record whose readmissions go backwards is
+    /// refused by every one of them.
+    #[test]
+    fn every_loader_reads_the_same_readmissions_from_the_same_bytes() {
+        use crate::scheduler::rejoin_log::Rejoin;
+        let rejoin = r#"{"turn":4,"wakes":0,"calls":[[3,1]],"popped":[]}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "format-3 re-record",
+                format!(
+                    r#"{{"per_thread":{{}},"global":[],"format_version":3,"rejoins":[{rejoin}]}}"#
+                ),
+                Some(1),
+            ),
+            (
+                "unformatted",
+                r#"{"per_thread":{},"global":[],"rejoins":[]}"#.to_string(),
+                Some(0),
+            ),
+            (
+                "format 4",
+                format!(
+                    r#"{{"per_thread":{{}},"global":[],"format_version":4,"rejoins":[{rejoin}]}}"#
+                ),
+                Some(1),
+            ),
+            (
+                "legacy",
+                r#"{"per_thread":{},"global":[]}"#.to_string(),
+                None,
+            ),
+        ];
+        for (name, text, count) in cases {
+            let path = dir.path().join("record.json");
+            std::fs::write(&path, &text).unwrap();
+            let scheduler = read_recorded_rejoins(&path).unwrap();
+            let boundary_recording::Recording::Legacy(decoded) =
+                boundary_recording::Recording::decode(text.as_bytes()).unwrap()
+            else {
+                panic!("{name}: not a legacy record");
+            };
+            let editor = PreemptionReader::try_new(&path).unwrap().into_inner();
+            let analyze = PreemptionReader::new(&path).into_inner();
+            let bisect: PreemptionRecord = serde_json::from_str(&text).unwrap();
+            bisect.validate().unwrap();
+            let all: [(&str, Option<Vec<Rejoin>>); 5] = [
+                ("read_recorded_rejoins", scheduler),
+                ("Recording::decode", decoded.rejoins),
+                ("PreemptionReader::try_new", editor.rejoins),
+                ("PreemptionReader::new", analyze.rejoins),
+                ("serde_json and validate", bisect.rejoins),
+            ];
+            for (loader, rejoins) in &all {
+                assert_eq!(rejoins.as_ref().map(Vec::len), count, "{name}: {loader}");
+                assert_eq!(rejoins, &all[0].1, "{name}: {loader}");
+            }
+        }
+        let backwards = r#"{"per_thread":{},"global":[],"format_version":3,"rejoins":[{"turn":9,"wakes":0,"calls":[]},{"turn":4,"wakes":0,"calls":[]}]}"#;
+        let path = dir.path().join("backwards.json");
+        std::fs::write(&path, backwards).unwrap();
+        assert!(read_recorded_rejoins(&path).is_err());
+        assert!(boundary_recording::Recording::decode(backwards.as_bytes()).is_err());
+        assert!(PreemptionReader::try_new(&path).is_err());
+        let bisect: PreemptionRecord = serde_json::from_str(backwards).unwrap();
+        assert!(
+            bisect
+                .validate()
+                .is_err_and(|error| error.contains("readmissions out of order")),
+            "{:?}",
+            bisect.validate()
+        );
+    }
+
     /// The readmissions of backgrounded calls name points of the recorded
     /// run, as the callback checkpoints do: a prefix of the whole schedule
     /// keeps them, and a shorter one drops them, so its replay readmits a
@@ -3613,6 +3749,28 @@ impl PreemptionWriter {
     /// can readmit it at the same turn (`crate::scheduler::rejoin_log`).
     pub(crate) fn push_rejoin(&mut self, rejoin: crate::scheduler::rejoin_log::Rejoin) {
         self.inner.rejoins.get_or_insert_with(Vec::new).push(rejoin);
+    }
+
+    /// Mark this record as written by a preemption replay that stopped
+    /// following its record's readmissions, first at global event count
+    /// `event` ([`PreemptionRecord::replay_departed_at`]): from there it
+    /// readmitted finished calls by host timing, so this record is not an
+    /// exact record of a run that followed its source. Warns once, naming the
+    /// file, so nobody replays it as one.
+    pub(crate) fn mark_replay_left_its_readmissions(&mut self, event: u64) {
+        if self.inner.replay_departed_at.is_some() {
+            return;
+        }
+        self.inner.replay_departed_at = Some(event);
+        if let Some(dest) = &self.dest {
+            tracing::warn!(
+                "the preemption record {} was written by a replay that stopped following its \
+                 source's readmissions at event {}; replay_departed_at preserves that \
+                 provenance and faithful replay refuses it",
+                dest.display(),
+                event
+            );
+        }
     }
 
     /// Stamp the record with the current format: the run records its

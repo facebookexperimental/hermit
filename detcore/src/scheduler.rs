@@ -1670,6 +1670,12 @@ pub struct Scheduler {
     /// Whether a recorded jump of global time that the replay cannot make as
     /// recorded stops the run, as `--die-on-desync` stops it for an event.
     die_on_time_skip_desync: bool,
+    /// Which flag, if any, makes leaving a replayed preemption record's
+    /// readmissions stop the run (`leave_replayed_record`): `--die-on-desync`,
+    /// as it stops the run for an event, or `--strict`
+    /// (`Config::strict_binder`, which only `hermit run --strict` sets),
+    /// whose replay must follow its record to succeed.
+    die_on_rejoin_desync: Option<&'static str>,
     /// How many recorded jumps of global time the replay could not make as
     /// recorded.
     time_skip_desyncs: u64,
@@ -4017,11 +4023,9 @@ async fn sched_loop_inner(
                 if let Some(refusal) = sched.unreplayed_rejoins() {
                     if sched.rejoin_from_preemption_record {
                         // A preemption replay that ends early has left its
-                        // record; it is not refused (see `refuse_rejoin`).
-                        tracing::warn!(
-                            "[scheduler] the replay left its record: {}",
-                            refusal.reason
-                        );
+                        // record: it is not refused (see `refuse_rejoin`),
+                        // but leaves it as any other departure does.
+                        sched.leave_replayed_record(refusal.reason);
                     } else {
                         drop(sched);
                         exit_on_scheduler_refusal(&refusal);
@@ -5285,11 +5289,28 @@ fn notes_background_starts(cfg: &Config) -> bool {
     cfg.replay_schedule_from.is_none() && !cfg.strict_schedule_boundaries
 }
 
+/// Which flag makes leaving a replayed record's readmissions end the run
+/// (`Scheduler::leave_replayed_record`): `--strict` (`Config::strict_binder`,
+/// set by `hermit run --strict` alone), whose replay may not succeed after
+/// taking a host-timed readmission, whether or not `--die-on-desync` is
+/// given, else `--die-on-desync`.
+fn rejoin_desync_ends_the_run(cfg: &Config) -> Option<&'static str> {
+    if cfg.strict_binder {
+        Some("--strict")
+    } else if cfg.die_on_desync {
+        Some("--die-on-desync")
+    } else {
+        None
+    }
+}
+
 /// The readmissions a replayed preemption record carries, for a run that
 /// replays one (`--replay-preemptions-from`, `--replay-schedule-from`; the
 /// first when both name a record). `None` when the run replays no record, or
-/// the record stores no entry (an empty list, or none at all), which replays
-/// as before.
+/// the record stores none (it predates them, or was built or edited in
+/// memory), which replays as before. An empty list is kept: its recording
+/// readmitted no backgrounded call, so the replay readmits none either, to
+/// its end (`step2c_run_replay_rejoin`).
 fn replayed_rejoins(cfg: &Config) -> Option<std::collections::VecDeque<Rejoin>> {
     let path = cfg
         .replay_preemptions_from
@@ -5300,9 +5321,7 @@ fn replayed_rejoins(cfg: &Config) -> Option<std::collections::VecDeque<Rejoin>> 
             reason: format!("the record's readmissions cannot be read ({err})"),
         })
     });
-    rejoins
-        .filter(|rejoins| !rejoins.is_empty())
-        .map(Into::into)
+    rejoins.map(Into::into)
 }
 
 impl Scheduler {
@@ -5772,6 +5791,7 @@ impl Scheduler {
             pending_time_skip: None,
             time_skip_mode,
             die_on_time_skip_desync: cfg.die_on_desync,
+            die_on_rejoin_desync: rejoin_desync_ends_the_run(cfg),
             time_skip_desyncs: 0,
             charge_replayed_switch_ins,
             switch_in_committed_at: None,
@@ -16631,7 +16651,7 @@ impl Scheduler {
                         next.turn,
                         Self::REJOIN_STALL_VALVE.as_secs()
                     );
-                    return self.refuse_rejoin(reason);
+                    return self.refuse_rejoin_at_the_valve(reason);
                 }
                 trace!(
                     "[step2] waiting at turn {} for the logged readmission of {:?}",
@@ -16667,7 +16687,7 @@ impl Scheduler {
                 None => "none".to_string(),
             }
         );
-        self.refuse_rejoin(reason)
+        self.refuse_rejoin_at_the_valve(reason)
     }
 
     /// `hermit run` replaying a preemption record that stores readmissions
@@ -16733,8 +16753,7 @@ impl Scheduler {
                         self.next_logged_readmission()
                     );
                     self.replay_gated_since = None;
-                    self.leave_replayed_record(reason);
-                    return Err(SkipTurn);
+                    return self.refuse_rejoin_at_the_valve(reason);
                 }
             } else {
                 self.replay_gated_since = None;
@@ -16763,8 +16782,7 @@ impl Scheduler {
                     self.turn
                 );
                 self.replay_exhausted_since = None;
-                self.leave_replayed_record(reason);
-                return Err(SkipTurn);
+                return self.refuse_rejoin_at_the_valve(reason);
             }
         } else {
             self.replay_exhausted_since = None;
@@ -16837,24 +16855,52 @@ impl Scheduler {
     }
 
     /// A replayed preemption record's readmissions cannot be followed any
-    /// further (`reason` names the readmission and the point): warn once, and
-    /// readmit finished calls from here as a fresh run does.
+    /// further (`reason` names the readmission and the point). Under
+    /// `--die-on-desync` or `--strict` the run ends here, as it does at a
+    /// schedule desync (`rejoin_desync_ends_the_run`).
+    /// Otherwise it warns once, and readmits finished calls from here as a
+    /// fresh run does, which host timing decides: so the run records a
+    /// determinism loss (verification refuses to compare it) and marks the
+    /// record it writes, if any, as departed from its source
+    /// (`replay_departed_at`, which faithful replay refuses). A replay stalled
+    /// at a readmission for `REJOIN_STALL_VALVE` does not come here: it is
+    /// refused (`refuse_rejoin_at_the_valve`).
     fn leave_replayed_record(&mut self, reason: String) {
         tracing::warn!(
             "[step2] stopped following the replayed record's readmissions: {reason}; \
              from here a finished background call is readmitted as in a fresh run"
         );
-        // Leaving the readmissions is a desync like a schedule one, and
-        // `--die-on-desync` ends the run at it the same way.
-        if self
-            .replayer
-            .as_ref()
-            .is_some_and(|replayer| replayer.die_on_desync)
-        {
+        if let Some(flag) = self.die_on_rejoin_desync {
+            eprintln!(
+                "Replay mode desynchronized from trace, bailing out ({flag}): \
+                 HERMIT_REPLAY_LEFT_READMISSIONS: {reason}"
+            );
             immediate_fatal_exit();
         }
+        if let Some(writer) = self.preemption_writer.as_mut() {
+            writer.mark_replay_left_its_readmissions(self.recorded_event_count);
+        }
+        self.note_determinism_loss(format!(
+            "HERMIT_REPLAY_LEFT_READMISSIONS: the replay stopped following its record's \
+             readmissions ({reason}) and readmitted later calls by host timing"
+        ));
         self.rejoin_replay = None;
         self.rejoin_stalled_since = None;
+    }
+
+    /// A replay of a rejoin log that has waited `REJOIN_STALL_VALVE` of host
+    /// time where its log says it must wait, for calls to finish or for work
+    /// to appear (`reason` names the point): refuse the run, `hermit replay`
+    /// and a replayed preemption record alike. Going on would readmit by host
+    /// timing what the log orders, and a run that cannot follow its log is a
+    /// failure, not a run that happens to finish.
+    fn refuse_rejoin_at_the_valve(&mut self, reason: String) -> Result<(), SkipTurn> {
+        if self.rejoin_refusal.is_none() {
+            let refusal = RejoinRefusal { reason };
+            tracing::error!("[step2] {}", refusal);
+            self.rejoin_refusal = Some(refusal);
+        }
+        Err(SkipTurn)
     }
 
     /// Record a `RejoinRefusal` for the scheduler loop to end the run with.
@@ -32707,11 +32753,12 @@ mod test {
 
     /// A replay off its record, where only a readmission could move the
     /// point and a finished call is parked that the record does not readmit
-    /// there, waits out the valve and then goes on as a fresh run, rather than
-    /// leaving the call parked for good (only an indefinite deadline pending)
-    /// or ending the run as a deadlock (a finished `rt_sigsuspend` alone).
+    /// there, waits out the valve and is then refused, rather than leaving
+    /// the call parked for good (only an indefinite deadline pending), ending
+    /// the run as a deadlock (a finished `rt_sigsuspend` alone), or going on
+    /// as a fresh run would, by host timing.
     #[test]
-    fn a_preemption_replay_off_its_record_leaves_it_where_nothing_else_moves() {
+    fn a_preemption_replay_off_its_record_is_refused_where_nothing_else_moves() {
         let (mut indefinite, op_id) = run_replay_ahead_of_its_record(true);
         indefinite
             .blocked
@@ -32734,10 +32781,9 @@ mod test {
             scheduler.rejoin_stalled_since =
                 std::time::Instant::now().checked_sub(Scheduler::REJOIN_STALL_VALVE);
             assert!(scheduler.step2c_process_io_blockers().is_err(), "{name}");
-            assert!(scheduler.rejoin_replay.is_none(), "{name}");
-            assert!(scheduler.rejoin_refusal.is_none(), "{name}");
-            assert!(scheduler.step2c_process_io_blockers().is_ok(), "{name}");
-            assert!(scheduler.run_queue.contains_tid(op_id.tid), "{name}");
+            assert!(scheduler.rejoin_refusal.is_some(), "{name}");
+            assert!(scheduler.rejoin_replay.is_some(), "{name}");
+            assert!(!scheduler.run_queue.contains_tid(op_id.tid), "{name}");
         }
     }
 
@@ -32779,8 +32825,9 @@ mod test {
 
     /// A preemption replay whose record does not readmit a vfork parent where
     /// step 2a rejoins it has left its record: the parent rejoins there, as
-    /// in a fresh run, and the record logs it there. `hermit replay` instead
-    /// leaves the parent parked for step2c, which refuses
+    /// in a fresh run, and the record logs it there, marked as departed from
+    /// its source, and the run records a determinism loss. `hermit replay`
+    /// instead leaves the parent parked for step2c, which refuses
     /// (`replay_applies_a_vfork_parents_rejoin_at_step2a`).
     #[test]
     fn a_preemption_replay_off_its_record_at_step2a_rejoins_the_vfork_parent() {
@@ -32802,10 +32849,22 @@ mod test {
         assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
         assert_rejoined(&scheduler, op_id.tid);
         assert!(scheduler.rejoin_replay.is_none());
+        assert!(
+            scheduler
+                .determinism_losses
+                .iter()
+                .any(|loss| loss.starts_with("HERMIT_REPLAY_LEFT_READMISSIONS")),
+            "{:?}",
+            scheduler.determinism_losses
+        );
         let record: serde_json::Value =
             serde_json::from_str(&scheduler.preemption_writer.take().unwrap().into_string())
                 .unwrap();
-        let rejoins: Vec<Rejoin> = serde_json::from_value(record["rejoins"].clone()).unwrap();
+        // A departed record is written inside the incomplete-record envelope.
+        let envelope = &record["incomplete_preemption_record"];
+        assert!(envelope["replay_departed_at"].is_u64(), "{record}");
+        let rejoins: Vec<Rejoin> =
+            serde_json::from_value(envelope["record"]["rejoins"].clone()).unwrap();
         assert_eq!(
             rejoins,
             vec![Rejoin {
@@ -32821,11 +32880,10 @@ mod test {
     /// commits nothing but a SIGCHLD taker's or group-exit decider's turn
     /// until it is readmitted), a preemption replay whose record does not
     /// readmit it at this point, because its next readmission is later or it
-    /// has none left, waits; once the point has not moved for the valve, it
-    /// leaves its record and readmits the child as a fresh run would, rather
-    /// than freezing.
+    /// has none left, waits; once the point has not moved for the valve, it is
+    /// refused, rather than freezing or readmitting the child by host timing.
     #[test]
-    fn a_preemption_replay_off_its_record_does_not_freeze_on_a_gated_vfork_child() {
+    fn a_preemption_replay_off_its_record_is_refused_rather_than_frozen_on_a_gated_vfork_child() {
         let parent = DetTid::from_raw(7);
         let child = ExternalOpId::new(DetTid::from_raw(25), 4);
         for log in [
@@ -32858,19 +32916,18 @@ mod test {
                     .unwrap(),
             ));
             assert!(scheduler.step2c_process_io_blockers().is_err(), "{log:?}");
-            assert!(scheduler.rejoin_replay.is_none(), "{log:?}");
-            assert!(scheduler.rejoin_refusal.is_none(), "{log:?}");
-            assert!(scheduler.step2c_process_io_blockers().is_ok(), "{log:?}");
-            assert!(scheduler.run_queue.contains_tid(child.tid), "{log:?}");
+            assert!(scheduler.rejoin_refusal.is_some(), "{log:?}");
+            assert!(scheduler.rejoin_replay.is_some(), "{log:?}");
+            assert!(!scheduler.run_queue.contains_tid(child.tid), "{log:?}");
         }
     }
 
     /// A preemption replay whose record has no readmission left lets queued
     /// pollers run while a finished call stays parked, as its recording did
-    /// if it ended with the call still out; past the valve it leaves its
-    /// record and readmits the call, rather than parking it for good.
+    /// if it ended with the call still out; past the valve it is refused,
+    /// rather than parking the call for good or readmitting it by host timing.
     #[test]
-    fn a_preemption_replay_past_its_last_readmission_parks_a_finished_call_only_up_to_the_valve() {
+    fn a_preemption_replay_past_its_last_readmission_parks_a_finished_call_up_to_the_valve() {
         let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
         let mut scheduler = run_rejoin_fixture(op_id, true, true);
         scheduler.rejoin_from_preemption_record = true;
@@ -32888,10 +32945,226 @@ mod test {
         scheduler.replay_exhausted_since =
             std::time::Instant::now().checked_sub(Scheduler::REJOIN_STALL_VALVE);
         assert!(scheduler.step2c_process_io_blockers().is_err());
-        assert!(scheduler.rejoin_replay.is_none());
-        assert!(scheduler.rejoin_refusal.is_none());
-        assert!(scheduler.step2c_process_io_blockers().is_ok());
-        assert!(scheduler.run_queue.contains_tid(op_id.tid));
+        assert!(scheduler.rejoin_refusal.is_some());
+        assert!(!scheduler.run_queue.contains_tid(op_id.tid));
+    }
+
+    /// A record whose run logged readmissions and made none stores an empty
+    /// list, and the scheduler a replay of it makes keeps that list: the
+    /// replay readmits no backgrounded call, to its end, however early the
+    /// host finishes one, because its recording readmitted none. A finished
+    /// call stays parked, and a replay that cannot move on without it is
+    /// refused at the valve rather than readmitting it by host timing. Before,
+    /// the loader read the empty list as no list, and the replay readmitted
+    /// such a call when it found it finished, as a fresh run does. Driven
+    /// from the record file through `Scheduler::new`, as a replay loads it.
+    #[test]
+    fn a_record_that_logged_no_readmission_holds_every_finished_call_to_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        let writer = PreemptionWriter::new(Some(path.clone()));
+        let text = writer.into_string();
+        assert!(text.contains(r#""rejoins":[]"#), "{text}");
+        std::fs::write(&path, &text).unwrap();
+        assert_eq!(
+            crate::preemptions::read_recorded_rejoins(&path).unwrap(),
+            Some(Vec::new())
+        );
+        let replay = Config {
+            sequentialize_threads: true,
+            replay_preemptions_from: Some(path.clone()),
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&replay);
+        assert_eq!(
+            scheduler.rejoin_replay.as_ref().map(|left| left.len()),
+            Some(0)
+        );
+        assert!(scheduler.rejoin_from_preemption_record);
+
+        // A finished backgrounded call, with only a poller queued: a fresh run
+        // readmits it at once (`recording_preemptions_logs_hermit_runs_readmissions_without_changing_them`).
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let fixture = run_rejoin_fixture(op_id, true, true);
+        scheduler.priorities = fixture.priorities;
+        scheduler.run_queue = fixture.run_queue;
+        scheduler.blocked = fixture.blocked;
+        scheduler.next_turns = fixture.next_turns;
+        for turn in [12, 13, 4000] {
+            scheduler.turn = turn;
+            assert!(
+                scheduler.step2c_process_io_blockers().is_ok(),
+                "turn {turn}"
+            );
+            assert!(!scheduler.run_queue.contains_tid(op_id.tid), "turn {turn}");
+            assert!(
+                scheduler
+                    .blocked
+                    .external_io_blockers
+                    .contains_key(&op_id.tid),
+                "turn {turn}"
+            );
+        }
+        // The run ends with the call still out, as its recording did: nothing
+        // is left unreplayed.
+        assert_eq!(scheduler.unreplayed_rejoins(), None);
+        // If it cannot end without the call, it is refused at the valve.
+        scheduler.replay_exhausted_since =
+            std::time::Instant::now().checked_sub(Scheduler::REJOIN_STALL_VALVE);
+        assert!(scheduler.step2c_process_io_blockers().is_err());
+        assert!(scheduler.rejoin_refusal.is_some());
+        assert!(!scheduler.run_queue.contains_tid(op_id.tid));
+    }
+
+    /// The records main's writer at `fcd62385f` writes below format 4 keep
+    /// their readmissions in replay: a schedule replay's re-record, which
+    /// states format 3, and a record from a writer that states no format,
+    /// whose list starts empty. The scheduler a replay of each makes holds
+    /// the list and readmits a finished call only where it says: the
+    /// re-record's at its turn 12, the empty list's never. Driven from the
+    /// record file through `Scheduler::new`, as a replay loads it.
+    #[test]
+    fn a_record_main_wrote_below_format_4_replays_with_its_readmissions() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let dir = tempfile::tempdir().unwrap();
+        for (name, text, readmitted_at) in [
+            (
+                "format-3 re-record",
+                r#"{"per_thread":{},"global":[],"format_version":3,"rejoins":[{"turn":12,"wakes":0,"calls":[[21,9]],"popped":[]}]}"#,
+                Some(12),
+            ),
+            (
+                "unformatted",
+                r#"{"per_thread":{},"global":[],"rejoins":[]}"#,
+                None,
+            ),
+        ] {
+            let path = dir.path().join("record.json");
+            std::fs::write(&path, text).unwrap();
+            let replay = Config {
+                sequentialize_threads: true,
+                replay_preemptions_from: Some(path.clone()),
+                ..Config::default()
+            };
+            let mut scheduler = Scheduler::new(&replay);
+            assert_eq!(
+                scheduler.rejoin_replay.as_ref().map(|left| left.len()),
+                Some(usize::from(readmitted_at.is_some())),
+                "{name}"
+            );
+            let fixture = run_rejoin_fixture(op_id, true, true);
+            scheduler.priorities = fixture.priorities;
+            scheduler.run_queue = fixture.run_queue;
+            scheduler.blocked = fixture.blocked;
+            scheduler.next_turns = fixture.next_turns;
+            for turn in [11, 12] {
+                scheduler.turn = turn;
+                assert!(
+                    scheduler.step2c_process_io_blockers().is_ok(),
+                    "{name}: turn {turn}"
+                );
+                assert_eq!(
+                    scheduler.run_queue.contains_tid(op_id.tid),
+                    readmitted_at.is_some_and(|at| turn >= at),
+                    "{name}: turn {turn}"
+                );
+            }
+            assert!(scheduler.rejoin_refusal.is_none(), "{name}");
+            assert!(scheduler.determinism_losses.is_empty(), "{name}");
+        }
+    }
+
+    /// Leaving a replayed record's readmissions ends a `--strict` replay,
+    /// whether or not `--die-on-desync` is given, as `--die-on-desync` alone
+    /// ends any replay: a strict replay may not succeed after readmitting a
+    /// call by host timing. The run names the flag that ended it. Before,
+    /// only `--die-on-desync` did, so a strict replay could leave its record,
+    /// record the loss, and exit 0.
+    #[test]
+    fn a_strict_replay_ends_where_it_leaves_its_readmissions() {
+        for (strict, die, ends) in [
+            (false, false, None),
+            (false, true, Some("--die-on-desync")),
+            (true, false, Some("--strict")),
+            (true, true, Some("--strict")),
+        ] {
+            let cfg = Config {
+                strict_binder: strict,
+                die_on_desync: die,
+                ..Config::default()
+            };
+            assert_eq!(rejoin_desync_ends_the_run(&cfg), ends, "{strict} {die}");
+            assert_eq!(
+                Scheduler::new(&cfg).die_on_rejoin_desync,
+                ends,
+                "{strict} {die}"
+            );
+        }
+    }
+
+    /// A preemption replay that stops following its record's readmissions
+    /// for any reason but the valve (a readmission already passed, the wrong
+    /// call parked, the run ending before its last one) goes on, but not
+    /// unmarked: the record it writes says it departed from its source
+    /// (`replay_departed_at`, which faithful replay refuses), and the run
+    /// records a determinism loss, which verification refuses to compare.
+    /// Before, it only warned, and its record read as an exact one.
+    #[test]
+    fn a_preemption_replay_that_leaves_its_readmissions_marks_its_record_and_the_run() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        // At its run's end, with a readmission never reached.
+        let mut ended = run_rejoin_fixture(op_id, false, false);
+        ended.rejoin_from_preemption_record = true;
+        ended.preemption_writer = Some(PreemptionWriter::new(None));
+        replaying(
+            &mut ended,
+            &[Rejoin {
+                turn: 20,
+                wakes: 0,
+                calls: vec![(op_id.tid, 9)],
+                popped: None,
+            }],
+        );
+        ended.turn = 12;
+        let reason = ended.unreplayed_rejoins().unwrap().reason;
+        ended.leave_replayed_record(reason.clone());
+        assert!(ended.rejoin_replay.is_none());
+        assert!(ended.rejoin_refusal.is_none());
+        assert_eq!(
+            ended.determinism_losses.len(),
+            1,
+            "{:?}",
+            ended.determinism_losses
+        );
+        assert!(
+            ended.determinism_losses[0].starts_with("HERMIT_REPLAY_LEFT_READMISSIONS")
+                && ended.determinism_losses[0].contains(&reason),
+            "{:?}",
+            ended.determinism_losses
+        );
+        let text = ended.preemption_writer.take().unwrap().into_string();
+        let record: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            record["incomplete_preemption_record"]["replay_departed_at"].is_u64(),
+            "{text}"
+        );
+        let read: crate::preemptions::PreemptionRecord = serde_json::from_str(&text).unwrap();
+        assert!(read.replay_departed_at().is_some());
+
+        // Without a record to write, the run still records the loss.
+        let (mut passed, _) = run_replay_ahead_of_its_record(true);
+        passed.turn = 21;
+        assert!(passed.step2c_process_io_blockers().is_err());
+        assert!(passed.rejoin_replay.is_none());
+        assert!(passed.rejoin_refusal.is_none());
+        assert!(
+            passed
+                .determinism_losses
+                .iter()
+                .any(|loss| loss.starts_with("HERMIT_REPLAY_LEFT_READMISSIONS")),
+            "{:?}",
+            passed.determinism_losses
+        );
     }
 
     /// Readmissions a record lists out of order are refused when it is read:

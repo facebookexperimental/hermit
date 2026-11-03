@@ -60580,18 +60580,42 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
     };
 
-    // The schedule as a host whose branch counter fails Reverie's validation
-    // can repeat it: which thread ran which event, in order. Such a counter
-    // (an AMD Zen host with SpecLockMap on, say) can tally a few branches
-    // more or less between two system calls, a branch count no replay can
-    // make repeat.
-    let events = |schedule: &serde_json::Value| -> Vec<(serde_json::Value, serde_json::Value)> {
-        schedule
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|event| (event["dettid"].clone(), event["op"].clone()))
-            .collect()
+    // The schedule and priority histories as a host whose branch counter
+    // fails Reverie's validation can repeat them: everything but what that
+    // counter decides. Such a counter (an AMD Zen host with SpecLockMap on,
+    // say) can tally a few branches more or less between two system calls, a
+    // count no replay can make repeat, and with it the times, instruction
+    // pointers and counts derived from it: an event's end time and
+    // instruction pointers, the count of an event that is not a system call,
+    // and the times, branch counts and chaos epochs of a thread's priority
+    // changes. Which thread ran which event, in what order, each system call
+    // and its phase, and each priority a thread took, are compared whole.
+    let without_the_counter = |record: &serde_json::Value| -> serde_json::Value {
+        let mut global = record["global"].clone();
+        for event in global.as_array_mut().unwrap() {
+            let event = event.as_object_mut().unwrap();
+            for derived in ["end_time", "start_rip", "end_rip"] {
+                event.remove(derived);
+            }
+            if event["op"].get("Syscall").is_none() {
+                event.remove("count");
+            }
+        }
+        let mut per_thread = record["per_thread"].clone();
+        for history in per_thread.as_object_mut().unwrap().values_mut() {
+            let history = history.as_object_mut().unwrap();
+            history.remove("preemption_rcbs");
+            history.remove("chaos_epochs");
+            if let Some(changes) = history.get_mut("prio_changes") {
+                *changes = changes
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|change| change[1].clone())
+                    .collect();
+            }
+        }
+        serde_json::json!({"global": global, "per_thread": per_thread})
     };
 
     let record = directory.path().join("record.json");
@@ -60599,6 +60623,63 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
     let exact_counter = !stderr(&recorded).contains("performance counters failed");
     let recorded_order = order(&recorded);
     let recording = read(&record);
+
+    // The comparison for such a host ignores what the counter decides, and
+    // nothing a replay must repeat: a mutation of the counter's fields alone
+    // compares equal, and a mutation of any other field does not.
+    let edited = |edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut copy = recording.clone();
+        edit(&mut copy);
+        without_the_counter(&copy)
+    };
+    let events = recording["global"].as_array().unwrap();
+    let syscall = events
+        .iter()
+        .position(|event| event["op"].get("Syscall").is_some())
+        .expect("a system call event");
+    let other = events
+        .iter()
+        .position(|event| event["op"].get("Syscall").is_none())
+        .expect("an event that is not a system call");
+    let original = without_the_counter(&recording);
+    assert_eq!(
+        edited(&|copy| {
+            let event = &mut copy["global"][other];
+            event["count"] = serde_json::json!(4_000_000);
+            event["end_time"] = serde_json::json!(1);
+            event["end_rip"] = serde_json::json!(1);
+            event["start_rip"] = serde_json::json!(1);
+        }),
+        original
+    );
+    for (what, edit) in [
+        (
+            "a system call's number",
+            &(|copy: &mut serde_json::Value| {
+                copy["global"][syscall]["op"]["Syscall"][0] = serde_json::json!(999);
+            }) as &dyn Fn(&mut serde_json::Value),
+        ),
+        ("an event's thread", &|copy| {
+            copy["global"][other]["dettid"] = serde_json::json!(999);
+        }),
+        ("an event's kind", &|copy| {
+            copy["global"][other]["op"] = serde_json::json!({"Syscall": [39, "Prehook"]});
+        }),
+        ("the number of events", &|copy| {
+            copy["global"].as_array_mut().unwrap().pop();
+        }),
+        ("a thread's final priority", &|copy| {
+            let (_, history) = copy["per_thread"]
+                .as_object_mut()
+                .unwrap()
+                .iter_mut()
+                .next()
+                .unwrap();
+            history["final_prio"] = serde_json::json!(7);
+        }),
+    ] {
+        assert_ne!(edited(edit), original, "{what} is not compared");
+    }
     let rejoins = &recording["rejoins"];
     assert!(
         rejoins
@@ -60633,8 +60714,8 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
             }
         } else {
             assert_eq!(
-                events(&replay["global"]),
-                events(&recording["global"]),
+                without_the_counter(&replay),
+                without_the_counter(&recording),
                 "probe seed {probe_seed}: the replay re-recorded another schedule"
             );
         }
@@ -60643,9 +60724,9 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
 
 /// A replay whose record names a readmission it cannot follow leaves the
 /// record with a WARN naming the event and goes on as a fresh run. A
-/// preemption replay always goes on, as it does at any other mismatch. A
-/// schedule replay under `--die-on-desync` ends there as it does at a
-/// schedule desync: the container exits 1, which Hermit reports as an
+/// preemption replay without `--die-on-desync` goes on, as it does at any
+/// other mismatch. A schedule replay under `--die-on-desync` ends there as it
+/// does at a schedule desync: the container exits 1, which Hermit reports as an
 /// unexpected container exit. Before, it went on.
 #[test]
 fn a_schedule_replay_that_leaves_its_readmissions_ends_there_under_die_on_desync() {
@@ -60721,6 +60802,189 @@ fn a_schedule_replay_that_leaves_its_readmissions_ends_there_under_die_on_desync
         stderr(&dies).contains("class=container-child-exit status=Exited(1)"),
         "{}",
         stderr(&dies)
+    );
+}
+
+/// A preemption replay whose record names a readmission it cannot follow
+/// ends there under `--die-on-desync`, as it does at a schedule desync.
+/// Without it, the replay goes on as a fresh run would, but not unmarked:
+/// the record it re-records says it departed from its source
+/// (`replay_departed_at`, written inside the incomplete-record envelope that
+/// faithful replay refuses). Before, it went on under `--die-on-desync` too,
+/// and re-recorded an ordinary record. The record is edited so that its first
+/// readmission names another call of the same thread. A copy lowered to
+/// format 3 without its background starts, as main's schedule replays
+/// re-record, keeps its readmissions: followed as recorded, it succeeds with
+/// no departure, and edited the same way it is left and ends the run.
+#[test]
+fn a_preemption_replay_that_leaves_its_readmissions_is_marked_or_ends_under_die_on_desync() {
+    let _guard = hermit_run_guard();
+    let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let epoch = format!("--epoch={}", detcore_model::config::CANONICAL_TEST_EPOCH);
+    let run = |extra: &[&str]| {
+        let mut args = vec!["run", "--base-env=minimal", &epoch];
+        args.extend(extra);
+        args.extend(["--", guest.as_str(), "signalfd-inread"]);
+        let output = hermit_test::hermit_output(
+            &format!("hermit {args:?}"),
+            hermit_command(&args)
+                .env_remove("HERMIT_EPOCH")
+                .env("HERMIT_RACE_PROBE", "bg_harvest_skip=0@0.5")
+                .env("HERMIT_RACE_PROBE_SEED", "13")
+                .stdin(Stdio::null()),
+        );
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        (args, output)
+    };
+    let succeeded = |(args, output): &(Vec<String>, Output)| {
+        assert_success(output, &args.iter().map(String::as_str).collect::<Vec<_>>());
+    };
+    let record = directory.path().join("record.json");
+    succeeded(&run(&[&format!(
+        "--record-preemptions-to={}",
+        record.display()
+    )]));
+    let mut recording: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let call = &mut recording["rejoins"][0]["calls"][0][1];
+    assert!(call.is_u64(), "no readmission recorded: {recording}");
+    *call = serde_json::json!(999_999);
+    let edited = directory.path().join("edited.json");
+    fs::write(&edited, recording.to_string()).unwrap();
+    let replay_edited = format!("--replay-preemptions-from={}", edited.display());
+    let left = "stopped following the replayed record's readmissions";
+
+    // The record as it was is followed to the end, `--die-on-desync` or not.
+    let faithful = run(&[
+        &format!("--replay-preemptions-from={}", record.display()),
+        "--die-on-desync",
+    ]);
+    succeeded(&faithful);
+    assert!(
+        !stderr(&faithful.1).contains(left),
+        "{}",
+        stderr(&faithful.1)
+    );
+
+    // The edited one is left and marked ...
+    let rerecord = directory.path().join("rerecord.json");
+    let marked = run(&[
+        &replay_edited,
+        &format!("--record-preemptions-to={}", rerecord.display()),
+    ]);
+    succeeded(&marked);
+    assert!(stderr(&marked.1).contains(left), "{}", stderr(&marked.1));
+    let rerecorded: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&rerecord).unwrap()).unwrap();
+    assert!(
+        rerecorded["incomplete_preemption_record"]["replay_departed_at"].is_u64(),
+        "the re-record does not say it departed: {rerecorded}"
+    );
+
+    // ... or, under `--die-on-desync`, ends the run where it leaves it.
+    let (_, dies) = run(&[&replay_edited, "--die-on-desync"]);
+    assert_eq!(
+        dies.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "{}",
+        stderr(&dies)
+    );
+    assert!(stderr(&dies).contains(left), "{}", stderr(&dies));
+    assert!(
+        stderr(&dies).contains(
+            "Replay mode desynchronized from trace, bailing out (--die-on-desync): \
+             HERMIT_REPLAY_LEFT_READMISSIONS"
+        ),
+        "{}",
+        stderr(&dies)
+    );
+
+    // The readmissions of a format-3 record are followed as a format-4
+    // record's are: main's writer stores them there.
+    let lower = |mut value: serde_json::Value, name: &str| {
+        value["format_version"] = serde_json::json!(3);
+        value.as_object_mut().unwrap().remove("background_starts");
+        let path = directory.path().join(name);
+        fs::write(&path, value.to_string()).unwrap();
+        format!("--replay-preemptions-from={}", path.display())
+    };
+    let original: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let lowered = run(&[&lower(original, "lowered.json"), "--die-on-desync"]);
+    succeeded(&lowered);
+    assert!(!stderr(&lowered.1).contains(left), "{}", stderr(&lowered.1));
+    let (_, lowered_dies) = run(&[&lower(recording, "lowered-edited.json"), "--die-on-desync"]);
+    assert_eq!(
+        lowered_dies.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "the format-3 record's readmissions were not followed: {}",
+        stderr(&lowered_dies)
+    );
+    assert!(
+        stderr(&lowered_dies).contains(left),
+        "{}",
+        stderr(&lowered_dies)
+    );
+}
+
+/// A `--strict` preemption replay that leaves its record's readmissions ends
+/// there, by name, whether or not `--die-on-desync` is given: a strict replay
+/// may not succeed after readmitting a call by host timing. The record as it
+/// was is followed to a successful end. Needs a branch counter `--strict`
+/// accepts, which many VMs lack, so it is host-limited.
+#[test]
+#[ignore = "host-limited: needs a branch counter --strict accepts; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
+fn a_strict_preemption_replay_that_leaves_its_readmissions_ends_there() {
+    let _guard = hermit_run_guard();
+    let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let epoch = format!("--epoch={}", detcore_model::config::CANONICAL_TEST_EPOCH);
+    let run = |extra: &[&str]| {
+        let mut args = vec!["run", "--base-env=minimal", &epoch];
+        args.extend(extra);
+        args.extend(["--", guest.as_str(), "signalfd-inread"]);
+        hermit_test::hermit_output(
+            &format!("hermit {args:?}"),
+            hermit_command(&args)
+                .env_remove("HERMIT_EPOCH")
+                .env("HERMIT_RACE_PROBE", "bg_harvest_skip=0@0.5")
+                .env("HERMIT_RACE_PROBE_SEED", "13")
+                .stdin(Stdio::null()),
+        )
+    };
+    let record = directory.path().join("record.json");
+    let recorded = run(&[&format!("--record-preemptions-to={}", record.display())]);
+    assert_success(&recorded, &["record"]);
+    let faithful = run(&[
+        "--strict",
+        &format!("--replay-preemptions-from={}", record.display()),
+    ]);
+    assert_success(&faithful, &["--strict", "faithful replay"]);
+    let mut recording: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let call = &mut recording["rejoins"][0]["calls"][0][1];
+    assert!(call.is_u64(), "no readmission recorded: {recording}");
+    *call = serde_json::json!(999_999);
+    let edited = directory.path().join("edited.json");
+    fs::write(&edited, recording.to_string()).unwrap();
+    let ends = run(&[
+        "--strict",
+        &format!("--replay-preemptions-from={}", edited.display()),
+    ]);
+    assert_eq!(
+        ends.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "{}",
+        stderr(&ends)
+    );
+    assert!(
+        stderr(&ends).contains(
+            "Replay mode desynchronized from trace, bailing out (--strict): \
+             HERMIT_REPLAY_LEFT_READMISSIONS"
+        ),
+        "{}",
+        stderr(&ends)
     );
 }
 
