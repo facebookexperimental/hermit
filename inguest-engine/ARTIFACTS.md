@@ -12,7 +12,7 @@ stream and `cargo metadata --locked --offline --format-version 1` output. The
 engine build selection is exactly:
 
 ```text
-ci/run-with-reverie-dbt-budget.sh cargo build --locked --offline --release -p hermit-inguest-engine --lib --message-format=json-render-diagnostics
+ci/run-with-core-build.sh cargo build --locked --offline --release -p hermit-inguest-engine --lib --message-format=json-render-diagnostics
 ```
 
 This is an interface description, not authorization to launch an unbounded
@@ -26,7 +26,7 @@ install` with all of these required arguments:
 | Argument | Required input |
 | --- | --- |
 | `--hermit-revision` | The current committed 40-character core Hermit HEAD |
-| `--reverie-revision` | Its exact Reverie gitlink and all three engine dependency revisions |
+| `--reverie-revision` | Its exact Reverie gitlink and all four engine dependency revisions |
 | `--cargo-events` | The completed normal build's raw Cargo JSON stream |
 | `--cargo-metadata` | Completed locked/offline metadata for that source and target |
 | `--target-dir` | The same declared target directory used by both Cargo commands |
