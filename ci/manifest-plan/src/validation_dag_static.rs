@@ -73,8 +73,10 @@ impl StructuredResultProducerKind {
     /// harness node of a bucket in
     /// [`crate::validation_dag::DIAGNOSTIC_MANIFEST_BUCKETS`], which runs with
     /// `--diagnostic-results`, and for a KVM gap-ledger node, whose failing gap
-    /// rows are diagnostic failures (never passes); the default schema 2 for
-    /// every other producer.
+    /// rows are diagnostic failures (never passes); schema 5 for a Nextest
+    /// node, whose counted writer classifies runtime skips from the run's
+    /// `HERMIT_TEST_SKIP_FILE` sidecar; the default schema 2 for every other
+    /// producer.
     pub(super) fn declaration(
         self,
         owner: String,
@@ -87,6 +89,8 @@ impl StructuredResultProducerKind {
                 });
         if diagnostic {
             StructuredTestResultsManifest::diagnostic(owner)
+        } else if self == Self::Nextest {
+            StructuredTestResultsManifest::skipped(owner)
         } else {
             StructuredTestResultsManifest::current(owner)
         }
@@ -6636,6 +6640,16 @@ impl StaticStepSpec {
                 env.insert(crate::nextest_binaries::REQUIRED_ENV.into(), "1".into())
                     .is_none()
             );
+            if producer == Some(StructuredResultProducerKind::Nextest) {
+                // The counted writer publishes schema 5 for this node (see
+                // `declaration`) and reads runtime-skip markers from the
+                // sidecar this variable's value enables.
+                assert!(
+                    env.insert("HERMIT_NEXTEST_RESULTS_SCHEMA".into(), "5".into())
+                        .is_none(),
+                    "{tag} declares HERMIT_NEXTEST_RESULTS_SCHEMA twice"
+                );
+            }
         }
         // A known-gap ledger is declared once, in crate::known_gaps::DECLARATIONS, and reaches
         // its node only through this variable: the node's runner reads the ledger from it, and

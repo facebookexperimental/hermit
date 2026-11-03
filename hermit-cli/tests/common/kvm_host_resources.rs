@@ -8,7 +8,6 @@
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -64,8 +63,10 @@ fn remaining(start: Instant, budget: Duration) -> Duration {
 /// first reservation, that reservation would fail first, and the run would
 /// end without the refusal.
 pub(super) fn launch_refusal() {
+    const CALLER_TEST: &str =
+        "run_kvm_refuses_a_finite_soft_address_space_limit_before_the_guest_starts";
     let _lock = super::hermit_run_guard();
-    if !Path::new("/dev/kvm").exists() {
+    if super::kvm_unavailable(CALLER_TEST) {
         return;
     }
     let start = Instant::now();
@@ -278,8 +279,10 @@ fn kvm_supervisor() -> u32 {
 /// "Cannot allocate memory" nor its line after the exec. The same run left
 /// unlimited execs /bin/true and exits 0.
 pub(super) fn exec_refusal() {
+    const CALLER_TEST: &str =
+        "run_kvm_an_exec_the_host_refuses_memory_for_is_a_policy_refusal_not_a_guest_enomem";
     let _lock = super::hermit_run_guard();
-    if !Path::new("/dev/kvm").exists() {
+    if super::kvm_unavailable(CALLER_TEST) {
         return;
     }
     let start = Instant::now();

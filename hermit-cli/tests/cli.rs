@@ -5565,10 +5565,45 @@ fn dbt_unavailable(test: &str) -> bool {
     true
 }
 
+/// Record a runtime skip for `test`: the test started, found it could not
+/// run, and returns normally. The marker line goes to stdout for humans and,
+/// when the runner set `HERMIT_TEST_SKIP_FILE`, as one `write()` on an
+/// `O_APPEND` descriptor to that sidecar, from which
+/// `ci/nextest-test-results.rs` classifies the test's row as a skip (schema
+/// 5) instead of a pass. The line stays under `PIPE_BUF` so parallel test
+/// processes cannot interleave entries; a longer entry is a programming
+/// error and panics rather than truncate.
+fn record_test_skip(test: &str, reason: &str) {
+    println!("HERMIT-TEST-SKIP: {test}\t{reason}");
+    let Some(path) = std::env::var_os("HERMIT_TEST_SKIP_FILE") else {
+        return;
+    };
+    let line = format!("HERMIT-TEST-SKIP: {test}\t{reason}\n");
+    assert!(
+        line.len() < 4096,
+        "skip marker for {test} is {} bytes; keep the reason under one PIPE_BUF line",
+        line.len()
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("HERMIT_TEST_SKIP_FILE must name the runner's writable skip sidecar");
+    let written = file
+        .write(line.as_bytes())
+        .expect("writing a skip marker to HERMIT_TEST_SKIP_FILE failed");
+    assert_eq!(
+        written,
+        line.len(),
+        "a skip marker must land in one write() so parallel appends cannot interleave"
+    );
+}
+
 /// Whether this host has no KVM: no `/dev/kvm`. A device that exists but
 /// cannot be used fails the run that tries it. With `HERMIT_REQUIRE_KVM` set, a
 /// missing device is a failure rather than a skip, as `HERMIT_REQUIRE_DBT` is
-/// for DBT.
+/// for DBT. An unavailable device is recorded as a runtime skip for `test`
+/// (see `record_test_skip`); callers that merely filter KVM out of a wider
+/// comparison must check `/dev/kvm` themselves instead of calling this.
 fn kvm_unavailable(test: &str) -> bool {
     if Path::new("/dev/kvm").exists() {
         return false;
@@ -5578,7 +5613,32 @@ fn kvm_unavailable(test: &str) -> bool {
         "HERMIT_REQUIRE_KVM is set, but this host has no /dev/kvm, so {test} cannot \
          exercise the backend it claims to cover."
     );
+    record_test_skip(test, "no /dev/kvm on this host");
     true
+}
+
+#[test]
+fn record_test_skip_appends_one_marker_line_to_the_sidecar() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let sidecar = directory.path().join("skips.txt");
+    fs::write(&sidecar, "").unwrap();
+    // SAFETY: Nextest runs each test in a process of its own, and this test
+    // starts no thread before it sets the variable.
+    unsafe {
+        std::env::set_var("HERMIT_TEST_SKIP_FILE", &sidecar);
+    }
+    record_test_skip("run_kvm_example", "no /dev/kvm on this host");
+    record_test_skip("run_kvm_example", "no /dev/kvm on this host");
+    unsafe {
+        std::env::remove_var("HERMIT_TEST_SKIP_FILE");
+    }
+    // One line per call, in the exact shape the result parser reads; a
+    // duplicate is the parser's refusal to make, not the helper's to hide.
+    assert_eq!(
+        fs::read_to_string(&sidecar).unwrap(),
+        "HERMIT-TEST-SKIP: run_kvm_example\tno /dev/kvm on this host\n\
+         HERMIT-TEST-SKIP: run_kvm_example\tno /dev/kvm on this host\n"
+    );
 }
 
 /// Every backend that runs Detcore, in the order the cross-backend tests
@@ -5968,7 +6028,10 @@ fn procfs_backends_among(test: &str, among: &[&str]) -> Vec<&'static str> {
             }
             let unavailable = match *backend {
                 "dbt" => dbt_unavailable(test),
-                "kvm" => kvm_unavailable(test),
+                // Filtering a backend out of a comparison is not the test
+                // skipping, so this must not record a skip marker the way
+                // `kvm_unavailable` does for an early return.
+                "kvm" => !Path::new("/dev/kvm").exists(),
                 "sabre" => !cfg!(feature = "sabre"),
                 "liteinst" | "in-guest-trap" => !cfg!(feature = "liteinst"),
                 "e9patch" => !cfg!(feature = "e9patch"),
@@ -17718,7 +17781,7 @@ fn run_dbt_verifies_process_wait_lifecycle() {
 
 #[test]
 fn run_kvm_exact_child_waits_have_stable_scheduler_turns() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_exact_child_waits_have_stable_scheduler_turns") {
         eprintln!("skipping KVM exact-child waits: /dev/kvm is unavailable");
         return;
     }
@@ -17797,7 +17860,7 @@ fn handled_inbound_signal_count_rejects_legacy_alarm_and_other_signals() {
 
 #[test]
 fn run_kvm_self_sigkill_from_nonleader_is_group_fatal() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_self_sigkill_from_nonleader_is_group_fatal") {
         eprintln!("skipping KVM self-SIGKILL regression: /dev/kvm is unavailable");
         return;
     }
@@ -18591,7 +18654,7 @@ fn run_dbt_rejects_unfollowed_execveat() {
 /// and 17. Plain Linux numbering would give 4, 5, 6, 7, 8, 9, 10.
 #[test]
 fn run_kvm_numbers_guest_tasks_as_the_ptrace_backend() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_numbers_guest_tasks_as_the_ptrace_backend") {
         eprintln!("skipping KVM task IDs: /dev/kvm is unavailable");
         return;
     }
@@ -18617,7 +18680,7 @@ fn run_kvm_numbers_guest_tasks_as_the_ptrace_backend() {
 /// sees; AT_RANDOM, which lies just below the strings, shows it.
 #[test]
 fn run_kvm_names_the_execve_filename_in_at_execfn_as_ptrace_does() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_names_the_execve_filename_in_at_execfn_as_ptrace_does") {
         eprintln!("skipping KVM AT_EXECFN: /dev/kvm is unavailable");
         return;
     }
@@ -18728,7 +18791,7 @@ fn a_replay_past_its_schedule_ends_slices_as_a_run_without_one_does() {
 /// (https://github.com/rrnewton/hermit/issues/4156).
 #[test]
 fn run_kvm_a_parked_sleep_carries_the_deadline_cap() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_a_parked_sleep_carries_the_deadline_cap") {
         return;
     }
     let guest = kvm_deadline_spin_wait_guest()
@@ -18763,7 +18826,7 @@ fn run_kvm_a_parked_sleep_carries_the_deadline_cap() {
 
 #[test]
 fn run_kvm_executes_dynamic_guest() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_executes_dynamic_guest") {
         return;
     }
 
@@ -18789,7 +18852,7 @@ fn run_kvm_executes_dynamic_guest() {
 
 #[test]
 fn run_kvm_gettimeofday_invalid_tv_returns_efault_and_guest_continues() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_gettimeofday_invalid_tv_returns_efault_and_guest_continues") {
         return;
     }
 
@@ -18817,7 +18880,7 @@ fn run_kvm_gettimeofday_invalid_tv_returns_efault_and_guest_continues() {
 
 #[test]
 fn run_kvm_gettimeofday_faulting_tz_returns_efault_without_tool_error() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_gettimeofday_faulting_tz_returns_efault_without_tool_error") {
         return;
     }
 
@@ -18885,7 +18948,11 @@ fn run_kvm_gettimeofday_faulting_tz_returns_efault_without_tool_error() {
 /// real and is stated here rather than papered over with a claim of independence.
 #[test]
 fn run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stderr_flags() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/awk").exists() {
+    if kvm_unavailable("run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stderr_flags")
+    {
+        return;
+    }
+    if !Path::new("/usr/bin/awk").exists() {
         return;
     }
 
@@ -18970,7 +19037,11 @@ fn run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stderr_flags() 
 /// it reports a silent pass -- the exact hazard that node's description warns of.
 #[test]
 fn run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stdout_flags() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
+    if kvm_unavailable("run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stdout_flags")
+    {
+        return;
+    }
+    if !Path::new("/usr/bin/perl").exists() {
         return;
     }
 
@@ -19021,7 +19092,10 @@ fn run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stdout_flags() 
 
 #[test]
 fn run_kvm_awk_mincore_probe_terminates() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/awk").exists() {
+    if kvm_unavailable("run_kvm_awk_mincore_probe_terminates") {
+        return;
+    }
+    if !Path::new("/usr/bin/awk").exists() {
         return;
     }
 
@@ -19058,7 +19132,7 @@ fn run_kvm_awk_mincore_probe_terminates() {
 
 #[test]
 fn run_kvm_resolves_bare_program_from_guest_path() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_resolves_bare_program_from_guest_path") {
         return;
     }
 
@@ -19081,10 +19155,13 @@ fn run_kvm_resolves_bare_program_from_guest_path() {
 
 #[test]
 fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
-    if !Path::new("/dev/kvm").exists()
-        || !Path::new("/usr/bin/setpriv").exists()
-        || !Path::new("/bin/date").exists()
-    {
+    if kvm_unavailable("run_kvm_setpriv_capability_wrapper_is_deterministic") {
+        return;
+    }
+    if !Path::new("/usr/bin/setpriv").exists() {
+        return;
+    }
+    if !Path::new("/bin/date").exists() {
         return;
     }
 
@@ -19218,7 +19295,7 @@ fn guest_env_difference_rejects_a_dropped_explicit_variable() {
 
 #[test]
 fn run_kvm_propagates_explicit_environment() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_propagates_explicit_environment") {
         return;
     }
 
@@ -19254,11 +19331,16 @@ fn run_kvm_propagates_explicit_environment() {
 
 #[test]
 fn run_kvm_bash_process_substitution_is_deterministic() {
-    if !Path::new("/dev/kvm").exists()
-        || !Path::new("/bin/bash").exists()
-        || !Path::new("/usr/bin/paste").exists()
-        || !Path::new("/usr/bin/diff").exists()
-    {
+    if kvm_unavailable("run_kvm_bash_process_substitution_is_deterministic") {
+        return;
+    }
+    if !Path::new("/bin/bash").exists() {
+        return;
+    }
+    if !Path::new("/usr/bin/paste").exists() {
+        return;
+    }
+    if !Path::new("/usr/bin/diff").exists() {
         return;
     }
 
@@ -19283,7 +19365,7 @@ fn run_kvm_bash_process_substitution_is_deterministic() {
 
 #[test]
 fn run_kvm_cpuid_policy_is_deterministic() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_cpuid_policy_is_deterministic") {
         return;
     }
     let compiler = ["cc", "gcc", "clang"]
@@ -19339,7 +19421,7 @@ fn run_kvm_cpuid_policy_is_deterministic() {
 
 #[test]
 fn run_kvm_respects_workdir_for_relative_paths() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_respects_workdir_for_relative_paths") {
         return;
     }
 
@@ -19400,7 +19482,7 @@ fn run_kvm_respects_workdir_for_relative_paths() {
 
 #[test]
 fn run_kvm_lists_host_directory_metadata() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_lists_host_directory_metadata") {
         return;
     }
 
@@ -19482,7 +19564,7 @@ fn run_kvm_lists_host_directory_metadata() {
 
 #[test]
 fn run_kvm_reads_host_file() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_reads_host_file") {
         return;
     }
 
@@ -19506,7 +19588,7 @@ fn run_kvm_reads_host_file() {
 
 #[test]
 fn run_kvm_reads_standard_input() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_reads_standard_input") {
         return;
     }
 
@@ -19527,7 +19609,10 @@ fn run_kvm_reads_standard_input() {
 
 #[test]
 fn run_kvm_f_getfl_and_reads_standard_input() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
+    if kvm_unavailable("run_kvm_f_getfl_and_reads_standard_input") {
+        return;
+    }
+    if !Path::new("/usr/bin/perl").exists() {
         return;
     }
 
@@ -19551,7 +19636,10 @@ fn run_kvm_f_getfl_and_reads_standard_input() {
 
 #[test]
 fn run_kvm_verify_f_getfl_and_replays_standard_input() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
+    if kvm_unavailable("run_kvm_verify_f_getfl_and_replays_standard_input") {
+        return;
+    }
+    if !Path::new("/usr/bin/perl").exists() {
         return;
     }
 
@@ -19609,7 +19697,7 @@ fn run_kvm_verify_replays_standard_input() {
 
 #[test]
 fn run_kvm_preserves_closed_standard_input() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_preserves_closed_standard_input") {
         return;
     }
 
@@ -19750,7 +19838,7 @@ fn run_kvm_verify_does_not_write_to_standard_input() {
 
 #[test]
 fn run_kvm_counts_standard_input() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_counts_standard_input") {
         return;
     }
 
@@ -19774,7 +19862,7 @@ fn run_kvm_counts_standard_input() {
 
 #[test]
 fn run_kvm_reports_hostname() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_reports_hostname") {
         return;
     }
 
@@ -19798,7 +19886,7 @@ fn run_kvm_reports_hostname() {
 // TODO-HUMAN-REVIEW(#544): Confirm the host C compiler is acceptable for this KVM smoke guest.
 #[test]
 fn run_kvm_pipe_pipe2_and_getgroups_round_trip() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_pipe_pipe2_and_getgroups_round_trip") {
         return;
     }
     let compiler = ["cc", "gcc", "clang"]
@@ -19896,7 +19984,7 @@ int main(void) {
 
 #[test]
 fn run_kvm_random_device_lseek_matches_linux() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_random_device_lseek_matches_linux") {
         return;
     }
     let _guard = hermit_run_guard();
@@ -20068,7 +20156,7 @@ int main(int argc, char **argv) {
 // reports what a traced guest does.
 #[test]
 fn run_kvm_reports_the_launcher_s_supplementary_groups() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_reports_the_launcher_s_supplementary_groups") {
         return;
     }
 
@@ -21226,7 +21314,10 @@ fn a_child_exit_is_notified_once_with_linuxs_siginfo() {
 /// took 50.8 to 57 seconds, at the 57-second per-test limit.
 #[test]
 fn run_kvm_notifies_a_child_exit_once_at_bitwise_parity() {
-    kvm_child_exit_is_notified_once_at_bitwise_parity("exit-group");
+    kvm_child_exit_is_notified_once_at_bitwise_parity(
+        "exit-group",
+        "run_kvm_notifies_a_child_exit_once_at_bitwise_parity",
+    );
 }
 
 /// `raw-exit` half of `run_kvm_notifies_a_child_exit_once_at_bitwise_parity`,
@@ -21235,16 +21326,18 @@ fn run_kvm_notifies_a_child_exit_once_at_bitwise_parity() {
 /// compared, under the same nine schedules.
 #[test]
 fn run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity() {
-    kvm_child_exit_is_notified_once_at_bitwise_parity("raw-exit");
+    kvm_child_exit_is_notified_once_at_bitwise_parity(
+        "raw-exit",
+        "run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity",
+    );
 }
 
 /// Runs tests/c/sigchld_once_per_child_exit.c in `mode` on KVM five times at
 /// the default schedule and once under each of chaos seeds 1, 2, 3 and 7, and
 /// requires one SIGCHLD with Linux's siginfo and bitwise parity with INFO
 /// messages compared in every run.
-fn kvm_child_exit_is_notified_once_at_bitwise_parity(mode: &str) {
-    if !Path::new("/dev/kvm").exists() {
-        eprintln!("skipping the KVM child-exit notification ({mode}): /dev/kvm is unavailable");
+fn kvm_child_exit_is_notified_once_at_bitwise_parity(mode: &str, test: &str) {
+    if kvm_unavailable(test) {
         return;
     }
     let _guard = hermit_run_guard();
@@ -21320,7 +21413,7 @@ fn kvm_child_exit_is_notified_once_at_bitwise_parity(mode: &str) {
 /// refusal naming it, not with an errno the guest could mistake for contention.
 #[test]
 fn run_kvm_flock_is_a_named_refusal_where_ptrace_excludes() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_flock_is_a_named_refusal_where_ptrace_excludes") {
         eprintln!("skipping the KVM flock refusal case: /dev/kvm is unavailable");
         return;
     }
@@ -21582,7 +21675,7 @@ fn masked_ppoll_pending_guest() -> PathBuf {
 /// a bare ENOSYS, as on main.
 #[test]
 fn run_kvm_masked_ppoll_with_a_pending_signal_answers_as_linux() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_masked_ppoll_with_a_pending_signal_answers_as_linux") {
         eprintln!("skipping the KVM masked ppoll case: /dev/kvm is unavailable");
         return;
     }
@@ -21938,7 +22031,7 @@ fn two_path_procfs_guest() -> PathBuf {
 /// mid-call leaves no unsearchable directory behind.
 #[test]
 fn run_kvm_a_second_path_past_another_process_cmdline_is_refused_by_name() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_a_second_path_past_another_process_cmdline_is_refused_by_name") {
         eprintln!("skipping the KVM two-path case: /dev/kvm is unavailable");
         return;
     }
@@ -22227,7 +22320,7 @@ fn procfs_argument_errors_guest() -> PathBuf {
 /// descriptor, and KVM gives Linux's answers.
 #[test]
 fn run_kvm_argument_errors_on_another_process_procfs_answer_as_linux() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_argument_errors_on_another_process_procfs_answer_as_linux") {
         eprintln!("skipping the KVM procfs argument-error case: /dev/kvm is unavailable");
         return;
     }
@@ -22322,7 +22415,7 @@ fn run_kvm_argument_errors_on_another_process_procfs_answer_as_linux() {
 /// (https://github.com/rrnewton/hermit/issues/4485).
 #[test]
 fn run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills") {
         eprintln!("skipping the KVM kill refusal case: /dev/kvm is unavailable");
         return;
     }
@@ -22404,7 +22497,7 @@ fn run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills() {
 /// run must reach bitwise parity.
 #[test]
 fn run_kvm_a_sibling_may_exit_while_its_signal_is_taken() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_a_sibling_may_exit_while_its_signal_is_taken") {
         eprintln!("skipping the KVM signal-then-exit case: /dev/kvm is unavailable");
         return;
     }
@@ -22624,7 +22717,7 @@ fn assert_group_exit_beside_an_observed_wait(log: &str) {
 /// b82ae16f that exit waited for the permit's release instead.
 #[test]
 fn run_kvm_signal_permits_are_per_thread() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_signal_permits_are_per_thread") {
         eprintln!("skipping the KVM per-thread signal permit cases: /dev/kvm is unavailable");
         return;
     }
@@ -22666,7 +22759,7 @@ fn run_ptrace_signal_permits_are_per_thread() {
 /// reach bitwise parity with INFO messages compared.
 #[test]
 fn run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec") {
         eprintln!("skipping the KVM parked-wait-then-exec case: /dev/kvm is unavailable");
         return;
     }
@@ -22737,7 +22830,7 @@ fn run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec() {
 /// lines and reach bitwise parity with INFO messages compared.
 #[test]
 fn run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec") {
         eprintln!("skipping the KVM parked-read-signal-then-exec case: /dev/kvm is unavailable");
         return;
     }
@@ -23371,7 +23464,7 @@ fn a_draw_without_a_range_draws_from_the_recommended_range() {
 /// either: 90 ms before, 4 ms now.
 #[test]
 fn run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting") {
         eprintln!("skipping the KVM chaos spinner case: /dev/kvm is unavailable");
         return;
     }
@@ -43819,7 +43912,7 @@ fn a_read_of_an_unmatched_received_inotify_instance_is_refused_by_name() {
 /// and the marker), not as a failure of Hermit's.
 #[test]
 fn run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name") {
         return;
     }
     let guest = inotify_blocking_read_guest().to_str().unwrap().to_owned();
@@ -44064,7 +44157,7 @@ fn run_dbt_received_inotify_instances_are_refused_by_name() {
 /// polled call yet, with or without this capability.
 #[test]
 fn run_kvm_a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux") {
         return;
     }
     let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
@@ -45951,7 +46044,7 @@ fn cpuinfo_matches_cpuid() {
 /// read, while Detcore's answer already reached Hermit runs.
 #[test]
 fn run_kvm_cpuid_rows_match_ptrace() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_cpuid_rows_match_ptrace") {
         eprintln!("skipping KVM CPUID rows: /dev/kvm is unavailable");
         return;
     }
@@ -45991,7 +46084,7 @@ fn run_kvm_cpuid_rows_match_ptrace() {
 /// here.
 #[test]
 fn run_kvm_cpuinfo_matches_cpuid() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_cpuinfo_matches_cpuid") {
         eprintln!("skipping KVM cpuinfo: /dev/kvm is unavailable");
         return;
     }
@@ -48664,7 +48757,7 @@ fn a_virtual_timeout_is_not_verified_under_the_default_verify_allow() {
 /// `class=run-timeout` or an internal failure.
 #[test]
 fn run_kvm_virtual_timeout_is_reported_from_the_childs_note() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_virtual_timeout_is_reported_from_the_childs_note") {
         return;
     }
     let guest = virtual_timeout_loop_guest().to_str().unwrap().to_owned();
@@ -54895,7 +54988,7 @@ fn a_directory_descriptors_first_seeks() {
 /// [`assert_first_directory_seeks`] on KVM.
 #[test]
 fn run_kvm_a_directory_descriptors_first_seeks() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_a_directory_descriptors_first_seeks") {
         eprintln!("skipping the KVM first directory seeks: /dev/kvm is unavailable");
         return;
     }
@@ -55073,7 +55166,7 @@ fn dbt_a_procfs_directory_keeps_its_size() {
 /// [`assert_procfs_directory_keeps_its_size`] on KVM.
 #[test]
 fn run_kvm_a_procfs_directory_keeps_its_size() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_a_procfs_directory_keeps_its_size") {
         eprintln!("skipping the KVM procfs directory size: /dev/kvm is unavailable");
         return;
     }
@@ -55187,7 +55280,7 @@ fn a_futex_wait_on_an_unreadable_word_is_efault() {
 /// the run is bounded by the harness deadline instead.
 #[test]
 fn run_kvm_futex_wait_on_an_unreadable_word_matches_linux() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_futex_wait_on_an_unreadable_word_matches_linux") {
         return;
     }
     let guest = futex_c_guest(
@@ -56569,7 +56662,7 @@ fn verify_fifos_shared_by_guests(modes: &[(&str, &str)]) {
 /// reads. KVM refuses `--timeout`, so the harness bounds each run.
 #[test]
 fn run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux") {
         return;
     }
     let guest = fifo_peer_guest().to_str().unwrap();
@@ -56654,7 +56747,7 @@ fn run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux() {
 /// re-checks the kick signal every 1,024 entries.
 #[test]
 fn run_kvm_costs_one_host_syscall_per_guest_syscall() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_costs_one_host_syscall_per_guest_syscall") {
         eprintln!("skipping KVM host-syscall budget: /dev/kvm is unavailable");
         return;
     }
@@ -58064,7 +58157,7 @@ fn the_discarded_at_send_rows_record_and_replay() {
 /// output and ptrace's.
 #[test]
 fn run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does") {
         eprintln!("skipping KVM rt_sigtimedwait siginfo: /dev/kvm is unavailable");
         return;
     }
@@ -58215,7 +58308,7 @@ fn assert_group_exit_ends_signal_waits_at_bitwise_parity(backend: &str) {
 /// ptrace. Each mode must exit 0 with its line within 10 s.
 #[test]
 fn run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing") {
         eprintln!("skipping the KVM group-exit signal-wait case: /dev/kvm is unavailable");
         return;
     }
@@ -58227,7 +58320,7 @@ fn run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing() {
 /// kills the waiter at the group exit: each reaches bitwise parity.
 #[test]
 fn run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity() {
-    if !Path::new("/dev/kvm").exists() {
+    if kvm_unavailable("run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity") {
         eprintln!("skipping the KVM group-exit signal-wait parity case: /dev/kvm is unavailable");
         return;
     }
