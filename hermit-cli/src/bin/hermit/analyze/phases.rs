@@ -6166,8 +6166,10 @@ mod tests {
                 dir.path().join("final-passing.json"),
                 dir.path().join("trial.json"),
             );
-            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing);
-            options.write_trial_schedule(Vec::new(), &trial).unwrap();
+            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing, &[]);
+            options
+                .write_trial_schedule_from(Vec::new(), &[], &trial)
+                .unwrap();
             [failing, passing, trial].map(|path| {
                 detcore::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(&path)
                     .unwrap()

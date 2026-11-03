@@ -2015,7 +2015,7 @@ mod tests {
         let read = || PreemptionReader::try_new(&output).unwrap().into_inner();
 
         options
-            .write_trial_schedule(events.clone(), &output)
+            .write_trial_schedule_from(events.clone(), &[], &output)
             .unwrap();
         let spliced = read();
         assert_eq!(spliced.format_version(), Some(BACKGROUND_STARTS_FORMAT - 1));
@@ -2083,7 +2083,7 @@ mod tests {
             &PreemptionRecord::from_sched_events(events.clone()).with_format(Some(newer)),
         );
         let refusal = options
-            .write_trial_schedule(events.clone(), &output)
+            .write_trial_schedule_from(events.clone(), &[], &output)
             .unwrap_err();
         assert!(
             format!("{refusal:#}").contains(&format!("record format Some({newer})")),
