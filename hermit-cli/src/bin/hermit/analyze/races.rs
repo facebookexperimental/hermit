@@ -795,7 +795,12 @@ pub struct Outcome {
 /// longer write leaves a gap after them, and so does output the trace does
 /// not show at all: everything before its first event (unless it starts at
 /// event 0), a write it kept no bytes of, and output another call (sendfile,
-/// splice, sendmsg, ...) put on fd 1 or 2. A pattern is matched only within
+/// splice, sendmsg, ...) put on fd 1 or 2. Streams are told by descriptor
+/// number, so a call that replaces or aliases descriptor 1 or 2 in any
+/// process (an open or a dup onto it, as `2>&1` or a child's `> file` does,
+/// or a dup of it onto another number, as `exec 3>&1` does) is a gap too,
+/// after which the stream's writes by number no longer tell what reaches it
+/// ([`redirects`]): none of them counts. A pattern is matched only within
 /// the output since the stream's last gap, never across one, so the bytes on
 /// either side of a cut write never join into a match neither run printed.
 /// Once a gap comes before a stream's match, where that stream first matched
@@ -847,13 +852,21 @@ pub fn outcome(
         }
     }
     for sys in &syscalls {
+        for (index, why) in redirects(sys) {
+            let stream = &mut streams[index];
+            if patterns[index].is_some() && stream.point.is_none() && !stream.met_before {
+                stream.redirected = true;
+                stream.since_gap.clear();
+                stream.gap.get_or_insert((sys.pre, why));
+            }
+        }
         let Some((index, shown)) = shown_output(sys) else {
             continue;
         };
         let (Some(pattern), stream) = (patterns[index], &mut streams[index]) else {
             continue;
         };
-        if stream.point.is_some() || stream.met_before {
+        if stream.point.is_some() || stream.met_before || stream.redirected {
             continue;
         }
         let kept = match shown {
@@ -943,6 +956,58 @@ struct ShownOutput {
     point: Option<OutcomeRef>,
     /// It matched only after a gap.
     matched_after_gap: bool,
+    /// A call replaced or aliased its descriptor ([`redirects`]): its writes
+    /// by number no longer count.
+    redirected: bool,
+}
+
+/// The output streams (0 for stdout, 1 for stderr) whose descriptor `sys`
+/// replaced or aliased, each with what it did: an open or a dup onto
+/// descriptor 1 or 2, in any process's table, or a dup of 1 or 2 onto
+/// another number. After it a write to fd 1 may not reach the run's stdout
+/// (a child's `> file`), and output may reach it through another number
+/// (`2>&1`, `exec 3>&1`), so the stream's writes by number no longer tell
+/// what it holds. A close alone redirects nothing; the open that reuses the
+/// number does.
+fn redirects(sys: &SyscallRecord) -> Vec<(usize, String)> {
+    let stream = |fd: i32| match fd {
+        1 => Some(0),
+        2 => Some(1),
+        _ => None,
+    };
+    let mut found = Vec::new();
+    for access in &sys.accesses {
+        let Access::Fd { slot, op, .. } = access else {
+            continue;
+        };
+        if let (FdOp::Open { .. } | FdOp::Dup { .. }, Some(index)) = (op, stream(slot.fd)) {
+            found.push((
+                index,
+                format!(
+                    "is not told by descriptor number after {} at event {} replaced descriptor {}",
+                    call_text(sys),
+                    sys.pre,
+                    slot.fd
+                ),
+            ));
+        }
+        if let FdOp::Dup { source } = op
+            && let Some(index) = stream(*source)
+            && slot.fd != *source
+        {
+            found.push((
+                index,
+                format!(
+                    "is not told by descriptor number after {} at event {} made descriptor {} \
+                     another name for descriptor {source}",
+                    call_text(sys),
+                    sys.pre,
+                    slot.fd
+                ),
+            ));
+        }
+    }
+    found
 }
 
 /// What the trace keeps of a call's output to stdout or stderr.
@@ -8373,6 +8438,159 @@ mod tests {
         let mut late = records(vec![whole(95, "ERROR\n"), exit(104)]);
         late.header.from = 50;
         assert_eq!(at(outcome(&late, S, &stdout_and_exit)), Some(104));
+    }
+
+    /// Output is told by descriptor number, so once a call replaces or
+    /// aliases descriptor 1 or 2 no write by number counts for that stream:
+    /// after `2>&1` the run's stdout holds the fd-2 writes and its stderr
+    /// none of them, after `exec 3>&1` it holds the fd-3 writes, and a
+    /// child's fd-1 writes after its `> file` are not in it at all. Each
+    /// would have given a match no run printed there; the point is unknown.
+    #[test]
+    fn an_output_stream_is_not_told_by_number_after_a_redirect() {
+        let write = |pre, tid: i32, fd: u64, text: &str| {
+            let mut sys = call(
+                pre,
+                tid,
+                pre,
+                Sysno::write,
+                &[fd, 0x1000, text.len() as u64],
+                Some(text.len() as i64),
+                Vec::new(),
+            );
+            sys.out_bytes = Some(text.as_bytes().to_vec());
+            sys
+        };
+        let slot = |files: i32, number: i32, op: FdOp| Access::Fd {
+            slot: FdSlot {
+                files: FilesId::initial(t(files)),
+                fd: number,
+            },
+            open_file: Some(file(7, 1)),
+            op,
+        };
+        let records = |calls: Vec<SyscallRecord>| {
+            traced(calls.into_iter().map(TraceRecord::Syscall).collect())
+        };
+        let (error, xx) = (Regex::new("ERROR").unwrap(), Regex::new("XX").unwrap());
+        let any = ExitStatusConstraint::Any;
+        let root = Some(DetPid::from_raw(3));
+        let stdout = OutcomeCriteria {
+            stdout: Some(&error),
+            stderr: None,
+            exit_code: &any,
+            root,
+        };
+        let stderr = OutcomeCriteria {
+            stdout: None,
+            stderr: Some(&xx),
+            ..stdout
+        };
+        let unknown = |trace: &AccessTrace, criteria: &OutcomeCriteria<'_>, why: &str| {
+            let found = outcome(trace, S, criteria);
+            assert_eq!(found.point, None, "{why}");
+            assert!(
+                found
+                    .unknown
+                    .as_deref()
+                    .is_some_and(|note| note.contains(why)),
+                "{why}: {:?}",
+                found.unknown
+            );
+        };
+        // 2>&1: dup2(1, 2), then "ER" on fd 1, "XX" on fd 2, "ROR" on fd 1.
+        let dup2 = call(
+            100,
+            7,
+            100,
+            Sysno::dup2,
+            &[1, 2],
+            Some(2),
+            vec![slot(3, 2, FdOp::Dup { source: 1 })],
+        );
+        let merged = records(vec![
+            dup2,
+            write(101, 7, 1, "ER"),
+            write(103, 7, 2, "XX"),
+            write(105, 7, 1, "ROR\n"),
+        ]);
+        unknown(
+            &merged,
+            &stdout,
+            "stdout's output is not told by descriptor number after dup2(1, 2) at event 100 made \
+             descriptor 2 another name for descriptor 1",
+        );
+        unknown(
+            &merged,
+            &stderr,
+            "stderr's output is not told by descriptor number after dup2(1, 2) at event 100 \
+             replaced descriptor 2",
+        );
+        // exec 3>&1: dup2(1, 3), then "ER", "XX" on fd 3, "ROR".
+        let dup3 = call(
+            100,
+            7,
+            100,
+            Sysno::dup2,
+            &[1, 3],
+            Some(3),
+            vec![slot(3, 3, FdOp::Dup { source: 1 })],
+        );
+        let aliased = records(vec![
+            dup3,
+            write(101, 7, 1, "ER"),
+            write(103, 7, 3, "XX"),
+            write(105, 7, 1, "ROR\n"),
+        ]);
+        unknown(
+            &aliased,
+            &stdout,
+            "made descriptor 3 another name for descriptor 1",
+        );
+        // A child's `> file`: its own descriptor 1 now names a file.
+        let mut redirected = call(
+            100,
+            11,
+            100,
+            Sysno::openat,
+            &[(-100i64) as u64, 0x2000, 0x241],
+            Some(1),
+            vec![slot(11, 1, opened("out.log"))],
+        );
+        redirected.pid = DetPid::from_raw(11);
+        let mut logged = write(101, 11, 1, "ERROR\n");
+        logged.pid = DetPid::from_raw(11);
+        unknown(
+            &records(vec![redirected, logged]),
+            &stdout,
+            "replaced descriptor 1",
+        );
+        // A close alone redirects nothing, and a match before any redirect
+        // stands.
+        let closed = call(
+            100,
+            7,
+            100,
+            Sysno::close,
+            &[1],
+            Some(0),
+            vec![slot(3, 1, FdOp::Close)],
+        );
+        let found = outcome(
+            &records(vec![write(101, 7, 1, "ERROR\n"), closed.clone()]),
+            S,
+            &stdout,
+        );
+        assert_eq!(found.point.map(|o| o.event), Some(101));
+        let mut dup_after = closed;
+        dup_after.pre = 103;
+        dup_after.accesses = vec![slot(3, 2, FdOp::Dup { source: 1 })];
+        let found = outcome(
+            &records(vec![write(101, 7, 1, "ERROR\n"), dup_after]),
+            S,
+            &stdout,
+        );
+        assert_eq!(found.point.map(|o| o.event), Some(101));
     }
 
     /// A deciding event that no call enters or returns at (a timeslice that
