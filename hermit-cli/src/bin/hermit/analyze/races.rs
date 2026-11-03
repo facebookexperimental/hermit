@@ -64,9 +64,14 @@
 //!   pipe or pipe2, the dup family and fcntl F_DUPFD (the same description),
 //!   and fork or clone inheritance (the same description). Any other arrival
 //!   of one of its descriptions, such as a receive over SCM_RIGHTS,
-//!   pidfd_getfd, or a route not listed here, untracks that pipe. A pipe
-//!   description the trace gives no pair identity, such as a reopen through
-//!   /proc/self/fd, could be any pipe's, so it untracks every pipe.
+//!   pidfd_getfd, or a route not listed here, untracks that pipe. A FIFO
+//!   access, or a pipe description the trace gives no pair identity, from
+//!   any descriptor table, could be a reopen of any pipe through
+//!   /proc/<pid>/fd, so either untracks every pipe. This catch-all also
+//!   covers a descriptor Detcore discovers without an open note.
+//! - Scope: the run's own processes. A process outside the run (one an end
+//!   is sent to over SCM_RIGHTS, or a host process that opens
+//!   /proc/<pid>/fd) is not traced, and its bytes are out of scope.
 //! - Content: an admitted pipe still gives no edge when its bytes are not one
 //!   piece per traced write, put in at its entry, and one consumption per
 //!   traced read: a tee or a vmsplice, packet mode, or a write that waited or
@@ -962,7 +967,9 @@ const ARRIVED: &str = "one of its descriptions reached a process by a route the 
                        follow (not its creation, a dup or inheritance), such as SCM_RIGHTS or \
                        pidfd_getfd";
 const UNPAIRED: &str = "the trace has a pipe description without a pair identity (such as a reopen \
-                        through /proc/self/fd), which could be any pipe's";
+                        through /proc/<pid>/fd), which could be any pipe's";
+const FIFO_SEEN: &str = "the trace has a FIFO access, which could be a reopen of any pipe through \
+                         /proc/<pid>/fd";
 const PACKET: &str = "it may be a packet pipe (pipe2 with O_DIRECT, or a status flag change by \
                       fcntl F_SETFL), whose reads discard the rest of a packet";
 const UNPLACED_WRITE: &str = "a write to it may not have gone in whole at its entry: it waited for \
@@ -1132,11 +1139,22 @@ struct Unfollowed {
 ///
 /// Any other open note of a pipe's description is an arrival by another
 /// route: a receive over SCM_RIGHTS, pidfd_getfd, or one this list does not
-/// know. It puts that pipe out ([`ARRIVED`]). A pipe description with no pair
-/// identity is a pipe the trace did not see created, such as a reopen
-/// through /proc/self/fd, which Detcore classifies as a pipe when it manages
-/// the pipe it names (files.rs, `reopens_scheduler_managed_pipe`). Its bytes
-/// can reach any pipe, so it puts every pipe out ([`UNPAIRED`]).
+/// know. It puts that pipe out ([`ARRIVED`]).
+///
+/// A reopen of a pipe end through /proc/<pid>/fd makes a new description,
+/// and its bytes can reach any pipe, so it puts every pipe out. Detcore
+/// classifies it as a pipe without a pair identity when the opener holds
+/// another end of that pipe (files.rs, `reopens_scheduler_managed_pipe`):
+/// [`UNPAIRED`]. Otherwise, as for an opener that holds no end, on a backend
+/// whose tool cannot name guest descriptors, or with nonblocking sockets
+/// off, it is a FIFO by its mode, with an inode identity: [`FIFO_SEEN`]. So
+/// any FIFO access, or any pipe access without a pair identity, from any
+/// descriptor table in the trace, puts every pipe out. A thread made with
+/// CLONE_THREAD but not CLONE_FILES has a descriptor table of its own under
+/// its process's ID, which is why the rule does not go by process. The
+/// catch-all is also what covers a descriptor Detcore finds without noting
+/// an open (its automatic descriptor discovery), since such a descriptor is
+/// no arrival this function can see.
 fn unfollowed_pipes(syscalls: &[&SyscallRecord]) -> Unfollowed {
     let creates = |sys: &SyscallRecord| creates_a_channel_pair(sys.sysno) && sys.result == Some(0);
     fn opens(sys: &SyscallRecord) -> impl Iterator<Item = OpenFileId> + '_ {
@@ -1172,18 +1190,23 @@ fn unfollowed_pipes(syscalls: &[&SyscallRecord]) -> Unfollowed {
                 }
             }
         }
-        let unpaired = sys.accesses.iter().any(|access| {
-            matches!(
-                access,
+        for access in &sys.accesses {
+            match access {
                 Access::Channel {
                     id: None,
                     channel: ChannelKind::Pipe,
                     ..
+                } => {
+                    unfollowed.all.get_or_insert(UNPAIRED);
                 }
-            )
-        });
-        if unpaired {
-            unfollowed.all.get_or_insert(UNPAIRED);
+                Access::Channel {
+                    channel: ChannelKind::Fifo,
+                    ..
+                } => {
+                    unfollowed.all.get_or_insert(FIFO_SEEN);
+                }
+                _ => {}
+            }
         }
     }
     unfollowed
@@ -4871,6 +4894,118 @@ mod tests {
             let data = data_edges(&calls.iter().collect::<Vec<_>>());
             assert!(data.untracked.is_empty(), "{:?}", data.untracked);
             assert_eq!(data.edges.len(), 1, "{:?}", data.edges);
+        }
+    }
+
+    /// A process that holds no end of a pipe can still reach it: process 5
+    /// makes ends 3 and 4 (files 1 and 2), and its forked child, process 8,
+    /// which closed both, opens /proc/5/fd/4 and writes XXXX. Detcore types
+    /// that descriptor a FIFO by its mode, with an inode identity, not a pipe
+    /// without one. Process 5 then writes BBBB through 4 and reads 4 bytes
+    /// through 3, getting XXXX. Any FIFO access puts every pipe out, so no
+    /// edge runs from the BBBB write to the read.
+    #[test]
+    fn a_fifo_access_from_a_process_holding_no_end_gives_no_edge() {
+        let key = ChannelKey::Shared(ChannelId::Pair(file(7, 1)));
+        let reopened = {
+            let mut sys = call(
+                10,
+                8,
+                5,
+                Sysno::write,
+                &[3, 0x1000, 4],
+                Some(4),
+                vec![Access::Channel {
+                    open_file: file(8, 3),
+                    id: Some(ChannelId::Inode(detcore_model::fd::DetInode::mint(99))),
+                    channel: ChannelKind::Fifo,
+                    op: ChannelOp::Write,
+                }],
+            );
+            sys.pid = DetPid::from_raw(8);
+            sys
+        };
+        let w = call(
+            20,
+            7,
+            2,
+            Sysno::write,
+            &[4, 0x1000, 4],
+            Some(4),
+            vec![pipe(file(7, 2), ChannelOp::Write)],
+        );
+        let r = call(
+            22,
+            7,
+            3,
+            Sysno::read,
+            &[3, 0x2000, 4],
+            Some(4),
+            vec![pipe(file(7, 1), ChannelOp::Read)],
+        );
+        let calls = [
+            creates(1, [file(7, 1), file(7, 2)]),
+            reopened,
+            w.clone(),
+            r.clone(),
+        ];
+        let data = data_edges(&calls.iter().collect::<Vec<_>>());
+        assert_eq!(data.edges, Vec::new());
+        assert_eq!(data.untracked.get(&key).map(|u| u.why), Some(FIFO_SEEN));
+        // Without the FIFO access, the write orders the read.
+        let calls = [creates(1, [file(7, 1), file(7, 2)]), w, r];
+        let data = data_edges(&calls.iter().collect::<Vec<_>>());
+        assert_eq!(data.edges.len(), 1, "{:?}", data.edges);
+    }
+
+    /// The two reopens a descriptor table holding no end of the pipe makes,
+    /// in real traces of tests/fixtures/access_trace_pipes.c, written by
+    /// Hermit (tests/fixtures/access_trace_fifo_reopen_*.jsonl):
+    /// - child: process 3 makes the pipe and forks process 5, which closes
+    ///   both ends, opens /proc/3/fd/4 for nonblocking writes and writes XXXX;
+    ///   process 3 writes SSSS through 4 and reads XXXX through 3.
+    /// - thread: process 3 makes the pipe and starts thread 7 with
+    ///   CLONE_THREAD but not CLONE_FILES, so it has a descriptor table of its
+    ///   own under process 3. Thread 7 opens /proc/3/task/3/fd/4 for
+    ///   nonblocking writes and writes TTTT; thread 3 writes UUUU through 4
+    ///   and reads TTTT through 3.
+    ///
+    /// In both, Detcore records the reopened write as a FIFO access, so every
+    /// pipe is out and no edge runs from the main thread's write to its read.
+    #[test]
+    fn real_fifo_reopen_traces_give_no_edge() {
+        for (trace, first) in [
+            (
+                include_bytes!("../../../../tests/fixtures/access_trace_fifo_reopen_child.jsonl")
+                    .as_slice(),
+                file(3, 12),
+            ),
+            (
+                include_bytes!("../../../../tests/fixtures/access_trace_fifo_reopen_thread.jsonl")
+                    .as_slice(),
+                file(3, 14),
+            ),
+        ] {
+            let trace =
+                detcore_model::access_trace::read_access_trace(trace).expect("the fixture parses");
+            let calls: Vec<&SyscallRecord> = trace
+                .records
+                .iter()
+                .filter_map(|record| match record {
+                    TraceRecord::Syscall(sys) => Some(sys),
+                    _ => None,
+                })
+                .collect();
+            assert!(calls.iter().any(|sys| sys.sysno == Sysno::openat));
+            let data = data_edges(&calls);
+            assert_eq!(data.edges, Vec::new(), "{first:?}");
+            assert_eq!(
+                data.untracked
+                    .get(&ChannelKey::Shared(ChannelId::Pair(first)))
+                    .map(|u| u.why),
+                Some(FIFO_SEEN),
+                "{first:?}"
+            );
         }
     }
 

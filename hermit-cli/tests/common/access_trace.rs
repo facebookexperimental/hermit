@@ -20,6 +20,7 @@ use detcore_model::access_trace::AccessTrace;
 use detcore_model::access_trace::ChannelId;
 use detcore_model::access_trace::EdgeKind;
 use detcore_model::access_trace::EdgeRecord;
+use detcore_model::access_trace::ChannelKind;
 use detcore_model::access_trace::FdOp;
 use detcore_model::access_trace::LifetimeOp;
 use detcore_model::access_trace::ObservedSignalDisposition;
@@ -286,7 +287,11 @@ fn syscalls(trace: &AccessTrace) -> impl Iterator<Item = &SyscallRecord> {
 /// the first read dropped the rest of the first packet. A successful fcntl
 /// F_SETFL notes the open file of the end it changed. A write through a
 /// reopen of a pipe end by /proc/self/fd names a pipe channel without a
-/// pair identity, on a description other than the pipe's own. A write larger than
+/// pair identity, on a description other than the pipe's own; a forked
+/// child holding no end that reopens the parent's end through
+/// /proc/<parent>/fd writes to a FIFO channel, and so does a thread with a
+/// descriptor table of its own that reopens it through
+/// /proc/<pid>/task/<tid>/fd. A write larger than
 /// the pipe, which a child drains while it blocks, is one record with its
 /// whole length and result, though it went in in parts; it waited, so its
 /// return is not the event after its entry, while each small write's is.
@@ -316,7 +321,7 @@ fn the_trace_shows_what_leaves_a_pipes_data_edges_out() {
         .iter()
         .filter(|call| call.sysno.name() == "pipe2" && call.result == Some(0))
         .collect();
-    assert_eq!(pipes.len(), 4, "{pipes:?}");
+    assert_eq!(pipes.len(), 6, "{pipes:?}");
     assert_ne!(
         pipes[0].args[1] & libc::O_DIRECT as u64,
         0,
@@ -369,6 +374,52 @@ fn the_trace_shows_what_leaves_a_pipes_data_edges_out() {
         )),
         "{reopened:?}"
     );
+    // A child that holds no end of the pipe reopens the parent's end through
+    // /proc/<parent>/fd: a FIFO by its mode, written from another process.
+    assert!(
+        stdout.contains("reopened by a child holding no end, first read: XXXX"),
+        "{stdout}"
+    );
+    let child_write = calls
+        .iter()
+        .find(|call| call.sysno.name() == "write" && call.pid != pipes[3].pid && call.args[2] == 4)
+        .expect("the child's write through its reopen");
+    assert!(
+        child_write.accesses.iter().any(|access| matches!(
+            access,
+            Access::Channel {
+                channel: ChannelKind::Fifo,
+                ..
+            }
+        )),
+        "{child_write:?}"
+    );
+    // A thread with a descriptor table of its own (CLONE_THREAD without
+    // CLONE_FILES) reopens the main thread's end through
+    // /proc/<pid>/task/<tid>/fd: a FIFO too, though under the same process.
+    assert!(
+        stdout.contains("reopened by a thread with its own descriptor table, first read: TTTT"),
+        "{stdout}"
+    );
+    let thread_write = calls
+        .iter()
+        .find(|call| {
+            call.sysno.name() == "write"
+                && call.pid == pipes[4].pid
+                && call.tid != pipes[4].tid
+                && call.args[2] == 4
+        })
+        .expect("the thread's write through its reopen");
+    assert!(
+        thread_write.accesses.iter().any(|access| matches!(
+            access,
+            Access::Channel {
+                channel: ChannelKind::Fifo,
+                ..
+            }
+        )),
+        "{thread_write:?}"
+    );
     let size = 3 * 65536;
     let large: Vec<&&SyscallRecord> = calls
         .iter()
@@ -393,7 +444,7 @@ fn the_trace_shows_what_leaves_a_pipes_data_edges_out() {
         large[0].accesses.iter().any(|access| matches!(
             access,
             Access::Channel { id: Some(ChannelId::Pair(first)), .. }
-                if ends(pipes[3]).first() == Some(first)
+                if ends(pipes[5]).first() == Some(first)
         )),
         "{:?}",
         large[0]

@@ -7,17 +7,36 @@
 // the_trace_shows_what_leaves_a_pipes_data_edges_out can check their records:
 // a packet pipe (pipe2 with O_DIRECT), whose first read takes half a packet
 // and drops the rest; a pipe whose write end fcntl F_SETFL changes; a pipe
-// end reopened through /proc/self/fd; and a write larger than the pipe,
-// which a child drains while it blocks.
+// end reopened through /proc/self/fd; one a child that holds no end reopens
+// through /proc/<parent>/fd; and a write larger than the pipe, which a child
+// drains while it blocks.
 
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <sched.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 static char big[3 * 65536];
+
+// A thread made with CLONE_THREAD but not CLONE_FILES: its own descriptor
+// table, under the process's ID. It reopens the main thread's pipe end
+// through /proc/<pid>/task/<tid>/fd/<n> and writes through the reopen, with
+// raw system calls only, since it shares the main thread's TLS.
+static char thread_path[64];
+static char thread_stack[65536];
+static volatile int thread_done;
+
+static int reopen_thread(void *arg) {
+  (void)arg;
+  long fd = syscall(SYS_openat, AT_FDCWD, thread_path, O_WRONLY | O_NONBLOCK);
+  thread_done = fd >= 0 && syscall(SYS_write, fd, "TTTT", 4) == 4 ? 1 : 2;
+  syscall(SYS_exit, 0);
+  return 0;
+}
 
 int main(void) {
   int p[2];
@@ -63,6 +82,51 @@ int main(void) {
     return 18;
   printf("reopened pipe first read: %.4s\n", buf);
   close(reopened);
+  close(p[0]);
+  close(p[1]);
+
+  // A child that holds no end of the pipe reopens the parent's write end.
+  if (pipe2(p, 0) != 0)
+    return 19;
+  pid_t opener = fork();
+  if (opener < 0)
+    return 20;
+  if (opener == 0) {
+    int end = p[1];
+    close(p[0]);
+    close(p[1]);
+    snprintf(path, sizeof path, "/proc/%d/fd/%d", (int)getppid(), end);
+    int sibling = open(path, O_WRONLY | O_NONBLOCK);
+    _exit(sibling >= 0 && write(sibling, "XXXX", 4) == 4 ? 0 : 1);
+  }
+  int opened_status;
+  if (waitpid(opener, &opened_status, 0) != opener ||
+      !WIFEXITED(opened_status) || WEXITSTATUS(opened_status) != 0)
+    return 21;
+  if (write(p[1], "SSSS", 4) != 4)
+    return 22;
+  if (read(p[0], buf, 4) != 4)
+    return 23;
+  printf("reopened by a child holding no end, first read: %.4s\n", buf);
+  close(p[0]);
+  close(p[1]);
+
+  if (pipe2(p, 0) != 0)
+    return 24;
+  snprintf(thread_path, sizeof thread_path, "/proc/%d/task/%d/fd/%d", (int)getpid(),
+           (int)syscall(SYS_gettid), p[1]);
+  if (clone(reopen_thread, thread_stack + sizeof thread_stack,
+            CLONE_VM | CLONE_THREAD | CLONE_SIGHAND, NULL) < 0)
+    return 25;
+  while (!thread_done)
+    sched_yield();
+  if (thread_done != 1)
+    return 26;
+  if (write(p[1], "UUUU", 4) != 4)
+    return 27;
+  if (read(p[0], buf, 4) != 4)
+    return 28;
+  printf("reopened by a thread with its own descriptor table, first read: %.4s\n", buf);
   close(p[0]);
   close(p[1]);
 
