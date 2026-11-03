@@ -219,43 +219,59 @@ pub fn plan_with_external_targets(
     report
 }
 
+/// Scope cut, if review ever requires it: when true, the rewrite runs
+/// only on ranges that decode completely — any word the decoder does not
+/// recognise at all refuses every site, not just unclassifiable ones.
+/// Flipping this one constant is the whole cut.
+const REQUIRE_FULLY_DECODED_RANGES: bool = false;
+
 /// Whether `word` might be a direct branch whose target is unknown.
 ///
-/// The entry protection fails closed. Every PC-relative direct branch
-/// in the A64 ISA lives in the branch/exception/system group (bits
-/// 28:26 = 101) or is one of the families the decoder knows; the data
-/// processing and load/store groups contain no direct branch at all.
-/// So a word the decoder does not positively recognise is a possible
-/// direct branch when it falls in that group — beyond the positively
-/// known non-direct members (system/hint space and exception
-/// generation, which have no image target, and the indirect
-/// branch/return space) — or in the reserved top-level space (bits
-/// 28:25 = 0000), which no current instruction occupies. Anything
-/// else unrecognised is in a group with no direct branch and cannot
-/// be aimed at a sequence's interior.
+/// The entry protection fails closed BY CONSTRUCTION: it is a positive
+/// allow-list of the top-level encoding classes (bits 28:25) that are
+/// positively known to contain no PC-relative direct branch, each
+/// matched by its documented fixed bits:
+///
+/// - `01xx`: data processing (register) and scalar FP/SIMD — no branch
+///   encodings at all;
+/// - `100x`: data processing (immediate), including ADR/ADRP, which
+///   compute an address but never transfer control;
+/// - `11xx`: loads/stores and data processing (register) — literal
+///   loads read memory, nothing here jumps.
+///
+/// Every other word the decoder does not recognise is a possible direct
+/// branch with an unknown target: the reserved (`0000`, SME), SVE
+/// (`0010`) and UNALLOCATED (`0001`, `0011`) top-level classes, any
+/// future extension, and everything in the branch/exception/system
+/// group (`101x`) beyond its positively known non-direct members —
+/// exception generation (11010100: SVC/HVC/SMC/BRK and kin, which
+/// trap), the system/hint space (11010101: MSR/MRS, barriers, hints,
+/// CLREX), and the indirect branch/return forms (1101011 with
+/// BR/BLR/RET/ERET/DRPS opcodes), which have no computable image
+/// target here. Known direct branches are decoded by `decode` and
+/// never reach this predicate as `Other`.
 pub fn unknown_direct_branch_possible(word: u32) -> bool {
     if insn::decode(word) != Insn::Other {
         return false;
     }
-    if (word >> 26) & 0x7 == 0b101 {
-        // Positively known to have no image target: exception
-        // generation (11010100: SVC/HVC/SMC/BRK and kin, which trap),
-        // the system/hint space (11010101: MSR/MRS, barriers, hints,
-        // CLREX), and the indirect branch/return forms (1101011 with
-        // BR/BLR/RET/ERET/DRPS opcodes). Everything else in the group
-        // that the decoder does not recognise — a branch family it does
-        // not know, or an unallocated encoding — is a possible direct
-        // branch.
-        let known_non_direct = (word >> 24) & 0xff == 0b11010100
-            || (word >> 24) & 0xff == 0b11010101
-            || ((word >> 25) & 0x7f == 0b1101011
-                && matches!(
-                    (word >> 21) & 0xf,
-                    0b0000 | 0b0001 | 0b0010 | 0b0100 | 0b0101
-                ));
-        !known_non_direct
-    } else {
-        (word >> 25) & 0xf == 0
+    if REQUIRE_FULLY_DECODED_RANGES {
+        return true;
+    }
+    match (word >> 25) & 0xf {
+        // Positively known non-direct top-level classes (above).
+        0b0100..=0b0111 | 0b1000 | 0b1001 | 0b1100..=0b1111 => false,
+        0b1010 | 0b1011 => {
+            let known_non_direct = (word >> 24) & 0xff == 0b11010100
+                || (word >> 24) & 0xff == 0b11010101
+                || ((word >> 25) & 0x7f == 0b1101011
+                    && matches!(
+                        (word >> 21) & 0xf,
+                        0b0000 | 0b0001 | 0b0010 | 0b0100 | 0b0101
+                    ));
+            !known_non_direct
+        }
+        // Reserved, SVE, unallocated, and anything not yet assigned.
+        _ => true,
     }
 }
 
@@ -817,6 +833,59 @@ mod tests {
                 Some(Refusal::UnknownDirectBranch),
                 "{unknown:#x}"
             );
+        }
+    }
+
+    #[test]
+    fn every_top_level_class_is_classified_by_the_allow_list() {
+        // All sixteen top-level classes (bits 28:25), one representative
+        // unrecognised word each: only the positively known non-direct
+        // classes (data processing immediate/register, scalar FP/SIMD,
+        // loads/stores) may sit beside a rewrite. Reserved, SVE and both
+        // UNALLOCATED classes refuse, as does an unrecognised word in
+        // the branch/exception/system group.
+        let cases: [(u32, bool); 16] = [
+            (0x0000_0000, true),  // 0000 reserved (SME)
+            (0x0200_0000, true),  // 0001 UNALLOCATED
+            (0x0400_0000, true),  // 0010 SVE (not allow-listed)
+            (0x0600_0000, true),  // 0011 UNALLOCATED
+            (0x0800_0000, false), // 0100 data processing (register)
+            (0x0a00_0400, false), // 0101 data processing / SIMD
+            (0x0c00_0000, false), // 0110 scalar FP / SIMD
+            (0x0e00_0000, false), // 0111 data processing (register)
+            (0x1000_0000, false), // 1000 data processing (immediate)
+            (0x1200_0000, false), // 1001 data processing (immediate)
+            (0xd700_0000, true),  // 101x branch group, unrecognised
+            (0xd400_0000, false), // 101x exception generation (traps)
+            (0x1800_0000, false), // 1100 loads/stores
+            (0x1a00_0000, false), // 1101 loads/stores
+            (0x1c00_0000, false), // 1110 data processing (register)
+            (0x1e00_0000, false), // 1111 data processing (register)
+        ];
+        let (_, _, loop_words, _) = CASES[0];
+        for (word, refused) in cases {
+            assert_eq!(
+                insn::decode(word),
+                Insn::Other,
+                "{word:#x} must be unrecognised for this test"
+            );
+            assert_eq!(unknown_direct_branch_possible(word), refused, "{word:#x}");
+            // Through the production planner: an unallocated-class word
+            // beside the canonical loop refuses it; an allow-listed one
+            // leaves the rewrite in place.
+            let mut words = vec![word];
+            words.extend_from_slice(loop_words);
+            let report = plan(&words, BASE);
+            if refused {
+                assert_eq!(report.patched, vec![], "{word:#x}");
+                assert_eq!(
+                    report.refused.first().map(|r| r.reason.clone()),
+                    Some(Refusal::UnknownDirectBranch),
+                    "{word:#x}"
+                );
+            } else {
+                assert_eq!(report.patched.len(), 1, "{word:#x}");
+            }
         }
     }
 
