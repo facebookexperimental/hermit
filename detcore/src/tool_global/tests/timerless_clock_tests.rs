@@ -16,6 +16,7 @@ use std::sync::Mutex;
 use clap::Parser;
 use detcore_model::schedule::Op;
 use detcore_model::schedule::SchedEvent;
+use detcore_model::schedule::SyscallPhase;
 use reverie::Errno;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
@@ -676,6 +677,136 @@ async fn replay_continue_installs_a_logical_deadline_without_requiring_a_timer()
         assert_eq!(replayer.cursor.peek(), Some(&branch));
         assert_eq!(sched.turn, 0);
     }
+}
+
+/// A schedule replay that switches threads at a syscall prehook, to a thread
+/// whose next recorded slice ends at a timer preemption (a nonempty recorded
+/// duration), leaves the switching thread its own slice end, clock and state.
+/// The prehook is traced through the actual `trace_schedevent`,
+/// `receive_rpc` and replayer path, and the reply is applied by the same code
+/// a guest thread runs; the switching thread runs on into its call, so no
+/// grant is waited for. The recorded duration is staged for the destination
+/// alone (`Scheduler::timeslices`) and nothing desynchronizes. Before, the
+/// reply handed the destination's 123 RCBs to the switching thread, which
+/// installed them as its own slice end (and its maximum): once its call
+/// returned past that point it ended a slice its recording did not have, and
+/// that turn's charge moved the clock the guest reads.
+///
+/// A real guest replay shows that effect only with slices short enough for a
+/// switch to carry a recorded duration (an explicit `--max-timeslice`). At
+/// main's default bound the switches in such guests carry none, and at an
+/// explicit bound main's replay of them leaves the recording earlier, for
+/// reasons outside this change, with or without it; so the evidence here is
+/// this traced-event path.
+#[tokio::test]
+async fn a_prehook_switch_leaves_the_switching_thread_its_own_slice_end() {
+    const NEXT: DetTid = DetTid::from_raw(18);
+    let sample_time =
+        crate::types::DetTime::new(&Config::default()).as_nanos() + LogicalTime::from_nanos(70);
+    let prehook = SchedEvent {
+        dettid: TID,
+        op: Op::Syscall(reverie::syscalls::Sysno::sched_yield, SyscallPhase::Prehook),
+        count: 1,
+        start_rip: None,
+        end_rip: std::num::NonZeroUsize::new(RIP as usize),
+        end_time: Some(sample_time),
+    };
+    // The next thread's slice, ended by a timer preemption as recordings
+    // write it: branches with no OtherInstructions after them, then another
+    // thread's event.
+    let branches = SchedEvent {
+        dettid: NEXT,
+        op: Op::Branch,
+        count: 123,
+        start_rip: None,
+        end_rip: None,
+        end_time: Some(sample_time + LogicalTime::from_rcbs(123)),
+    };
+    let after = SchedEvent {
+        dettid: DetTid::from_raw(19),
+        op: Op::Syscall(reverie::syscalls::Sysno::getpid, SyscallPhase::Prehook),
+        count: 1,
+        start_rip: None,
+        end_rip: std::num::NonZeroUsize::new(RIP as usize),
+        end_time: Some(sample_time + LogicalTime::from_rcbs(123)),
+    };
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        file.path(),
+        crate::preemptions::PreemptionRecord::from_sched_events(vec![
+            prehook.clone(),
+            branches,
+            after,
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let config = Config {
+        sequentialize_threads: true,
+        replay_schedule_from: Some(file.path().to_path_buf()),
+        ..Config::default()
+    };
+    let state = GlobalState::initialize(&config, false);
+    state
+        .past_first_execve
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    state
+        .sched
+        .lock()
+        .unwrap()
+        .thread_tree
+        .add_child(TID, TID, true);
+    super::install_test_registration(&state, TID, crate::ivar::Ivar::new());
+    let tool: Detcore = Detcore::new(Tid::from_raw(TID.as_raw()), &config);
+    let mut thread = tool.init_thread_state(Tid::from_raw(TID.as_raw()), None);
+    thread.detpid = Some(TID);
+    thread.past_global_first_execve = true;
+    thread.thread_logical_time.add_rcbs(7);
+    thread.committed_clock_value = 7;
+    thread.account_process_cpu_time();
+    assert_eq!(thread.thread_logical_time.as_nanos(), sample_time);
+    // The switching thread's own slice, from its recording.
+    let own_end = sample_time + LogicalTime::from_rcbs(4_000);
+    thread.end_of_timeslice = Some(own_end);
+    thread.max_timeslice_end = Some(own_end);
+    let expected = bincode::serde::encode_to_vec(&thread, bincode::config::legacy()).unwrap();
+    let mut guest = ClockGuest {
+        config,
+        thread,
+        raw: 7,
+        reads: 0,
+        records: Mutex::new(Vec::new()),
+        precise_timers: Vec::new(),
+        imprecise_timers: Vec::new(),
+        rpc_state: Some(state),
+    };
+    super::super::trace_schedevent(&mut guest, prehook.clone(), false).await;
+    assert_eq!(*guest.records.lock().unwrap(), vec![prehook]);
+    assert_eq!(guest.thread.end_of_timeslice, Some(own_end));
+    assert_eq!(guest.thread.max_timeslice_end, Some(own_end));
+    assert_eq!(
+        bincode::serde::encode_to_vec(&guest.thread, bincode::config::legacy()).unwrap(),
+        expected,
+        "the switching thread's clock and state are its own"
+    );
+    let sched = guest.rpc_state.as_ref().unwrap().sched.lock().unwrap();
+    assert_eq!(
+        sched.timeslices.get(&NEXT),
+        Some(&Some(LogicalTime::from_rcbs(123))),
+        "the recorded duration is the next thread's"
+    );
+    let replayer = sched.replayer.as_ref().unwrap();
+    assert_eq!(replayer.traced_event_count, 1);
+    assert_eq!(replayer.events_popped, 1);
+    assert!(
+        replayer
+            .desync_counts
+            .values()
+            .all(|counts| counts.soft == 0 && counts.hard == 0),
+        "{:?}",
+        replayer.desync_counts
+    );
+    assert_eq!(replayer.cursor.peek().map(|event| event.dettid), Some(NEXT));
 }
 
 /// Actual shared pre/post hooks and the CPUID Tool callback, with typed
