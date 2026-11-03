@@ -1135,7 +1135,7 @@ line that says which. The class line is the first line on stderr:
 | Exit | Line on stderr | Meaning |
 | --- | --- | --- |
 | 0 (or `--success-exit-code`) | none | The report names the critical events (`"verdict": "critical_events"`). |
-| 0 (or `--success-exit-code`) | `HERMIT_ANALYZE_VERDICT class=no-deciding-event` | No event of the target schedule decides the outcome: without chaos the scheduler alone meets the target, so debug that run directly. The report says why (`"verdict": "no_deciding_event"`) and names no event. |
+| 0 (or `--success-exit-code`) | `HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule` | The target is reproduced without the target schedule: without chaos the scheduler alone meets the target, so the prefix search localizes no event (which does not show that no event decides the outcome); debug that run directly. The report says why (`"verdict": "reproduced_without_schedule"`) and names no event. |
 | 2 | `HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced` | The target run, the failing endpoint of a bisection, or `--minimize`'s last record does not meet the target criteria. |
 | 2 | `HERMIT_ANALYZE_PRECONDITION class=baseline-not-reproduced` | The baseline meets the target too, or the baseline the user chose does not finish. |
 | 2 | `HERMIT_ANALYZE_PRECONDITION class=no-prefix-continuation` | No continuation timeslice allows a prefix search. |
@@ -1158,7 +1158,7 @@ schedule meets it, and exits 2 with the same lines when one does not.
 A report file (`--report-file`) has one schema for every verdict: read its
 `verdict` first. `critical_events` fills `critical_event1` and
 `critical_event2` (and `deciding_event` for a timing decision);
-`no_deciding_event` leaves them out, and the racing accesses
+`reproduced_without_schedule` leaves them out, and the racing accesses
 (`racing_accesses`) too, and `header` says why. Its
 `verdict_reason` says what the scheduler alone shows. When the trials keep
 timing settings from the run arguments (`--pipe-wake-latency`,

@@ -210,8 +210,8 @@ deterministic execution.
 What `hermit analyze` concludes is not a failure of Hermit, and it does not
 exit 125 or print `HERMIT_INTERNAL_FAILURE`: inputs that do not give it what
 it needs exit **2**, the "trouble" code of `diff`, `cmp` and `grep`, and an
-analysis that concludes that no event decides the outcome has completed and
-exits 0. Only a failure to conclude (replay that does not reproduce, a search
+analysis that reproduces the target without the target schedule, and so
+localizes no event, has completed and exits 0. Only a failure to conclude (replay that does not reproduce, a search
 that does not converge) exits 125, under a class line that says which. The
 class line is the first line on stderr; clap's usage error exits 2 too,
 without one. `hermit bisect` verifies its `--good` and `--bad` schedules the
@@ -221,7 +221,7 @@ same way and exits the same. Every exit status of `hermit analyze` and
 | Exit | Line on stderr | Condition |
 | --- | --- | --- |
 | 0 (or `--success-exit-code`) | none | The report names the critical events (`"verdict": "critical_events"`). |
-| 0 (or `--success-exit-code`) | `HERMIT_ANALYZE_VERDICT class=no-deciding-event` | No event of the target schedule decides the outcome (`"verdict": "no_deciding_event"`; the report has no critical-event fields). |
+| 0 (or `--success-exit-code`) | `HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule` | The scheduler alone, replaying none of the target schedule, meets the target, so the prefix search localizes no event; this does not show that no event decides the outcome (`"verdict": "reproduced_without_schedule"`; the report has no critical-event fields). |
 | 2 | `HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced` | The first run without `--search`, the failing endpoint of a bisection (bisect's `--bad`), or `--minimize`'s last record does not meet the target. |
 | 2 | `HERMIT_ANALYZE_PRECONDITION class=baseline-not-reproduced` | The passing endpoint (bisect's `--good`) meets the target, the baseline run meets it, or the baseline the user chose does not finish. |
 | 2 | `HERMIT_ANALYZE_PRECONDITION class=no-prefix-continuation` | No continuation timeslice allows a prefix search. |
@@ -237,7 +237,7 @@ same way and exits the same. Every exit status of `hermit analyze` and
 
 | Message | Class | Trigger | Fix |
 | --- | --- | --- | --- |
-| `no event of the target schedule decides the outcome`, exit 0, `HERMIT_ANALYZE_VERDICT class=no-deciding-event` | Configuration | A completed `--prefix-search`: without chaos, the scheduler alone meets the target at every continuation tried, so the outcome does not depend on a chaos decision. The report's `verdict` is `no_deciding_event`. | Debug that run directly (the reproducer the message names runs it), or pass `--continuation-timeslice` with a timeslice at which the scheduler alone misses the target, or use the default search with a passing `--run2-seed`. When the report's `verdict_reason` is `timing_semantics`, one more trial showed that the scheduler alone meets the target because of timing settings every trial keeps from the recording: the default search can end the same way, and a new failing run with the listed `alternatives` in its run arguments may have a deciding event. |
+| `the target is reproduced without the target schedule`, exit 0, `HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule` | Configuration | A completed `--prefix-search`: without chaos, the scheduler alone, replaying none of the target schedule, meets the target at every continuation tried, so the search has no run that misses the target to start from and localizes no event. Only the empty prefix was tried, so this does not show that no event decides the outcome. The report's `verdict` is `reproduced_without_schedule`. | Debug that run directly (the reproducer the message names runs it), or pass `--continuation-timeslice` with a timeslice at which the scheduler alone misses the target, or use the default search with a passing `--run2-seed`. When the report's `verdict_reason` is `timing_semantics`, one more trial showed that the scheduler alone meets the target because of timing settings every trial keeps from the recording: the default search can end the same way, and a new failing run with the listed `alternatives` in its run arguments may have a deciding event. |
 | `no continuation allows a prefix search`, exit 2, `HERMIT_ANALYZE_PRECONDITION class=no-prefix-continuation` | Configuration | At no continuation timeslice does replaying the whole target schedule meet the target while the scheduler alone misses it. | Follow the remedy in the message (raise `--trial-timeout`, check `--selfcheck`), or use the default search with a passing `--run2-seed`. |
 | `the failing schedule endpoint did not reproduce the target failure`, exit 2, `HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced` | Configuration | Replaying the target schedule (`hermit bisect`'s `--bad`) does not meet the target. Analyze recorded its endpoints itself, so there the replay did not reproduce the run, and the message says so. | Check that the target run replays (`--selfcheck`) and that this host's branch counter is exact (`hermit host-capabilities`); for bisect, pass a `--bad` schedule recorded with the same run arguments. |
 | `the --good and --bad schedules contain identical event traces`, exit 2, `HERMIT_ANALYZE_PRECONDITION class=endpoints-identical` | Configuration | Bisect's two schedules contain the same events (ignoring event times). | Pass a `--good` and a `--bad` schedule from runs that took different orders. |

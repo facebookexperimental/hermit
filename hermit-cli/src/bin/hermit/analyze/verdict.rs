@@ -41,13 +41,16 @@ pub enum Verdict {
     /// `critical_event2`), and for a timing decision the deciding one.
     #[default]
     CriticalEvents,
-    /// No event of the target schedule decides the outcome: without chaos,
-    /// the scheduler alone meets the target. The report says why and names
-    /// no event.
-    NoDecidingEvent,
+    /// The target is reproduced without the target schedule: without chaos,
+    /// the scheduler alone, replaying none of it, meets the target. A prefix
+    /// search needs a run that misses the target to start from, so it
+    /// localizes no event. This does not show that no event decides the
+    /// outcome (an interior prefix may still miss the target). The report
+    /// says so and names no event.
+    ReproducedWithoutSchedule,
 }
 
-/// Why analyze concluded [`Verdict::NoDecidingEvent`]: the `verdict_reason`
+/// Why analyze concluded [`Verdict::ReproducedWithoutSchedule`]: the `verdict_reason`
 /// field of its report, `{"cause": "scheduler_alone"}` (with
 /// `"timing_in_force"` when the trials keep timing settings), or
 /// `{"cause": "timing_semantics", "options": [...], "alternatives": [...],
@@ -115,9 +118,9 @@ pub enum AlternativeTiming {
 /// with the class line [`AnalyzeVerdict::class_line`] on stderr.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnalyzeVerdict {
-    /// [`Verdict::NoDecidingEvent`], with the explanation analyze prints and
+    /// [`Verdict::ReproducedWithoutSchedule`], with the explanation analyze prints and
     /// the report carries, and its reason.
-    NoDecidingEvent {
+    ReproducedWithoutSchedule {
         /// What analyze prints, and the report's header.
         explanation: String,
         /// The report's `verdict_reason`.
@@ -129,10 +132,13 @@ pub enum AnalyzeVerdict {
 }
 
 impl AnalyzeVerdict {
-    /// [`Verdict::NoDecidingEvent`]: the scheduler alone meets the target,
+    /// [`Verdict::ReproducedWithoutSchedule`]: the scheduler alone meets the target,
     /// continuing at `continuation`, as `explanation` says.
-    pub fn no_deciding_event(explanation: impl Into<String>, continuation: MaybeTimeslice) -> Self {
-        AnalyzeVerdict::NoDecidingEvent {
+    pub fn reproduced_without_schedule(
+        explanation: impl Into<String>,
+        continuation: MaybeTimeslice,
+    ) -> Self {
+        AnalyzeVerdict::ReproducedWithoutSchedule {
             explanation: explanation.into(),
             reason: VerdictReason::SchedulerAlone {
                 timing_in_force: Vec::new(),
@@ -145,7 +151,7 @@ impl AnalyzeVerdict {
     /// target.
     pub fn continuation(&self) -> MaybeTimeslice {
         match self {
-            AnalyzeVerdict::NoDecidingEvent { continuation, .. } => *continuation,
+            AnalyzeVerdict::ReproducedWithoutSchedule { continuation, .. } => *continuation,
         }
     }
 
@@ -159,13 +165,13 @@ impl AnalyzeVerdict {
     /// values (and a record, stamped with its --pipe-wake-latency, is
     /// refused under another). With no settings, the verdict is unchanged.
     pub fn with_timing(self, timing: &[TimingSetting], tried: AlternativeTiming) -> Self {
-        let AnalyzeVerdict::NoDecidingEvent {
+        let AnalyzeVerdict::ReproducedWithoutSchedule {
             explanation,
             continuation,
             ..
         } = self;
         if timing.is_empty() {
-            return AnalyzeVerdict::no_deciding_event(explanation, continuation);
+            return AnalyzeVerdict::reproduced_without_schedule(explanation, continuation);
         }
         let options: Vec<String> = timing.iter().map(|t| t.option.clone()).collect();
         let alternatives: Vec<String> = timing.iter().map(|t| t.alternative.clone()).collect();
@@ -214,7 +220,7 @@ impl AnalyzeVerdict {
                 },
             ),
         };
-        AnalyzeVerdict::NoDecidingEvent {
+        AnalyzeVerdict::ReproducedWithoutSchedule {
             explanation,
             reason,
             continuation,
@@ -224,14 +230,14 @@ impl AnalyzeVerdict {
     /// The report's `verdict`.
     pub fn verdict(&self) -> Verdict {
         match self {
-            AnalyzeVerdict::NoDecidingEvent { .. } => Verdict::NoDecidingEvent,
+            AnalyzeVerdict::ReproducedWithoutSchedule { .. } => Verdict::ReproducedWithoutSchedule,
         }
     }
 
     /// The report's `verdict_reason`.
     pub fn reason(&self) -> &VerdictReason {
         match self {
-            AnalyzeVerdict::NoDecidingEvent { reason, .. } => reason,
+            AnalyzeVerdict::ReproducedWithoutSchedule { reason, .. } => reason,
         }
     }
 
@@ -239,7 +245,7 @@ impl AnalyzeVerdict {
     /// parsing the report.
     pub fn class_line(&self) -> String {
         let class = match self {
-            AnalyzeVerdict::NoDecidingEvent { .. } => "no-deciding-event",
+            AnalyzeVerdict::ReproducedWithoutSchedule { .. } => "reproduced-without-schedule",
         };
         format!("HERMIT_ANALYZE_VERDICT class={class}")
     }
@@ -248,7 +254,9 @@ impl AnalyzeVerdict {
 impl std::fmt::Display for AnalyzeVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AnalyzeVerdict::NoDecidingEvent { explanation, .. } => f.write_str(explanation),
+            AnalyzeVerdict::ReproducedWithoutSchedule { explanation, .. } => {
+                f.write_str(explanation)
+            }
         }
     }
 }
@@ -412,8 +420,8 @@ mod tests {
     #[test]
     fn a_verdict_is_written_in_snake_case() {
         assert_eq!(
-            serde_json::to_string(&Verdict::NoDecidingEvent).unwrap(),
-            "\"no_deciding_event\""
+            serde_json::to_string(&Verdict::ReproducedWithoutSchedule).unwrap(),
+            "\"reproduced_without_schedule\""
         );
         assert_eq!(
             serde_json::to_string(&Verdict::CriticalEvents).unwrap(),
@@ -422,14 +430,14 @@ mod tests {
         assert_eq!(Verdict::default(), Verdict::CriticalEvents);
     }
 
-    /// A no-deciding-event verdict reached under timing settings the
+    /// A reproduced-without-schedule verdict reached under timing settings the
     /// recording carries says what the trial under their alternatives
     /// showed: "because of" only when it missed the target, "under" when it
     /// met it or was not tried; without settings it stays the scheduler
     /// alone. A cause from a later build reads as unknown.
     #[test]
     fn a_verdict_under_timing_settings_says_what_the_trial_showed() {
-        let alone = AnalyzeVerdict::no_deciding_event("No event decides.", None);
+        let alone = AnalyzeVerdict::reproduced_without_schedule("No event decides.", None);
         let latency = [TimingSetting {
             option: "--pipe-wake-latency=50000".to_owned(),
             alternative: "no --pipe-wake-latency".to_owned(),
@@ -451,7 +459,7 @@ mod tests {
                 trial: trial.clone(),
             },
         );
-        assert_eq!(shown.verdict(), Verdict::NoDecidingEvent);
+        assert_eq!(shown.verdict(), Verdict::ReproducedWithoutSchedule);
         assert_eq!(
             shown.to_string(),
             "No event decides. The scheduler alone meets the target because of \

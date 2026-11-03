@@ -2145,14 +2145,17 @@ mod tests {
                 format!("HERMIT_INTERNAL_FAILURE class={class}")
             );
         }
-        let verdict = Error::new(AnalyzeVerdict::no_deciding_event("no event decides", None));
+        let verdict = Error::new(AnalyzeVerdict::reproduced_without_schedule(
+            "no event decides",
+            None,
+        ));
         assert_eq!(failure_exit_code(&verdict), 0);
         assert_eq!(
             classify_failure(&verdict),
-            "HERMIT_ANALYZE_VERDICT class=no-deciding-event"
+            "HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule"
         );
         // The same words without the type stay an internal failure.
-        let prose = Error::msg("no event of the target schedule decides the outcome");
+        let prose = Error::msg("the target is reproduced without the target schedule");
         assert_eq!(failure_exit_code(&prose), HERMIT_INTERNAL_FAILURE_EXIT);
         assert_eq!(
             classify_failure(&prose),

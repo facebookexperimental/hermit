@@ -355,10 +355,10 @@ pub struct AnalyzeOpts {
     pub keep_tmp: bool,
 
     /// Specify that analyze itself should return a non-zero exit code on success.
-    /// This is needed under esoteric invocation scenarios. 2 and 120 to 127 are refused:
-    /// analyze exits 2 when its inputs do not give it what it needs, and Hermit reserves
-    /// 120 to 127 for its own statuses.
-    #[clap(long, value_name = "INT32", value_parser = parse_success_exit_code)]
+    /// This is needed under esoteric invocation scenarios. It is an exit status, 0 to 255, and
+    /// 2 and 120 to 127 are refused: analyze exits 2 when its inputs do not give it what it
+    /// needs, and Hermit reserves 120 to 127 for its own statuses.
+    #[clap(long, value_name = "STATUS", value_parser = parse_success_exit_code)]
     pub success_exit_code: Option<i32>,
 
     /// Additional arguments to pass through unmodified to the hermit run subcommand.  While
@@ -591,12 +591,24 @@ impl FromStr for ExitStatusConstraint {
     }
 }
 
-/// `--success-exit-code`: any status but those that already mean something
-/// else for analyze (see the exit-code allocation table in `hermit::lib`).
+/// `--success-exit-code`: an exit status, 0 to 255, but those that already
+/// mean something else for analyze (see the exit-code allocation table in
+/// `hermit::lib`). A process exits with the low 8 bits of the value it
+/// passes (`exit`, `exit_group`: `(error_code & 0xff) << 8`,
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/exit.c?h=v6.9#n992>),
+/// so a value outside that range is refused before the reserved ones are
+/// checked: 258 would exit 2 and 378 or -134 would exit 122.
 fn parse_success_exit_code(text: &str) -> Result<i32, String> {
     let code: i32 = text
         .parse()
         .map_err(|error| format!("{text:?} is not a 32-bit integer: {error}"))?;
+    if !(0..=255).contains(&code) {
+        return Err(format!(
+            "{code} is not an exit status: a process exits with the low 8 bits of the value it \
+             passes, 0 to 255, so a process exiting with {code} exits {}",
+            code & 0xff
+        ));
+    }
     match code {
         hermit::HERMIT_ANALYZE_PRECONDITION_EXIT => Err(format!(
             "{code} is the status analyze exits with when its inputs do not give it what it \
@@ -615,7 +627,7 @@ fn parse_success_exit_code(text: &str) -> Result<i32, String> {
 #[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
 pub struct Report {
     /// What the analysis concluded; read it first. `critical_events` names
-    /// the critical events below. `no_deciding_event` names none: the header
+    /// the critical events below. `reproduced_without_schedule` names none: the header
     /// says why, and the event fields are absent. A report without the field,
     /// from before it, names the critical events.
     #[serde(default)]

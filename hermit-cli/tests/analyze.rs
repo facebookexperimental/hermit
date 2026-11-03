@@ -1313,10 +1313,11 @@ fn analyze_continues_prefixes_at_a_coarser_timeslice() {
 }
 
 /// The same race with `--continuation-timeslice=100000`: there is no other
-/// continuation to try, so analyze concludes that the outcome does not
-/// depend on a chaos decision, and says what to run or pass instead. That is
+/// continuation to try, so analyze reports the target reproduced without
+/// the target schedule, localizes no event, and says what to run or pass
+/// instead. That is
 /// a completed analysis: exit 0, `HERMIT_ANALYZE_VERDICT
-/// class=no-deciding-event`, and a report whose verdict says so. Before, it
+/// class=reproduced-without-schedule`, and a report whose verdict says so. Before, it
 /// exited 125 with `HERMIT_INTERNAL_FAILURE class=cli-error`.
 #[test]
 #[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
@@ -1333,23 +1334,26 @@ fn analyze_explains_a_target_the_scheduler_meets_alone() {
     assert!(
         stderr
             .lines()
-            .any(|line| line == "HERMIT_ANALYZE_VERDICT class=no-deciding-event")
+            .any(|line| line == "HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule")
             && !stderr.contains("HERMIT_INTERNAL_FAILURE"),
         "{label}\n{combined}"
     );
     let report = report.unwrap_or_else(|| panic!("{label}: no report\n{combined}"));
-    assert_eq!(report["verdict"], "no_deciding_event", "{label}: {report}");
+    assert_eq!(
+        report["verdict"], "reproduced_without_schedule",
+        "{label}: {report}"
+    );
     assert!(
         report["header"].as_str().is_some_and(
-            |header| header.starts_with("no event of the target schedule decides the outcome")
+            |header| header.starts_with("the target is reproduced without the target schedule")
         ),
         "{label}: {report}"
     );
     for expected in [
-        "no continuation gives the prefix search a miss to bisect against: replaying none of the \
-         target schedule and then scheduling without chaos, the scheduler alone already meets \
-         the target criteria at a 100000 ns timeslice",
-        "a longer prefix may still miss the target",
+        "the target is reproduced without the target schedule: without chaos, the scheduler \
+         alone, replaying none of the target schedule, meets the target criteria at a 100000 ns \
+         timeslice",
+        "this does not show that no event of the schedule decides the outcome",
         "prefix_round_001.repro",
         "pass --continuation-timeslice",
         "--run2-seed",
@@ -1363,14 +1367,14 @@ fn analyze_explains_a_target_the_scheduler_meets_alone() {
 
 /// A target the scheduler meets without chaos at every timeslice (thread a
 /// winning the race, which it does unless chaos or a tiny timeslice lets b
-/// in): the prefix search concludes that no event decides the outcome, a
-/// completed analysis that exits 0 with `HERMIT_ANALYZE_VERDICT
-/// class=no-deciding-event` and a report whose verdict says so. Unlike
+/// in): the prefix search reports the target reproduced without the target
+/// schedule and localizes no event, a completed analysis that exits 0 with `HERMIT_ANALYZE_VERDICT
+/// class=reproduced-without-schedule` and a report whose verdict says so. Unlike
 /// `analyze_explains_a_target_the_scheduler_meets_alone`, it needs no short
 /// timeslice, so it does not depend on preemption repeating on the host.
 #[test]
 #[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
-fn analyze_concludes_no_event_decides_a_target_met_without_chaos() {
+fn analyze_reports_a_target_met_without_chaos_as_reproduced_without_the_schedule() {
     let label = "analyze --prefix-search analyze_race_then exit, target a-first";
     let guest = &workloads().race_then;
     let _guard = analyze_lock();
@@ -1393,7 +1397,7 @@ fn analyze_concludes_no_event_decides_a_target_met_without_chaos() {
     assert!(
         stderr
             .lines()
-            .any(|line| line == "HERMIT_ANALYZE_VERDICT class=no-deciding-event")
+            .any(|line| line == "HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule")
             && !stderr.contains("HERMIT_INTERNAL_FAILURE"),
         "{label}\n{combined}"
     );
@@ -1402,13 +1406,17 @@ fn analyze_concludes_no_event_decides_a_target_met_without_chaos() {
             .unwrap_or_else(|error| panic!("{label}: no report: {error}\n{combined}")),
     )
     .unwrap();
-    assert_eq!(report["verdict"], "no_deciding_event", "{label}: {report}");
+    assert_eq!(
+        report["verdict"], "reproduced_without_schedule",
+        "{label}: {report}"
+    );
     assert!(
         report["header"]
             .as_str()
             .is_some_and(|header| header.starts_with(
-                "no event of the target schedule decides the outcome: without chaos, the scheduler \
-             alone already meets the target criteria"
+                "the target is reproduced without the target schedule: without chaos, the \
+                 scheduler alone, replaying none of the target schedule, meets the target \
+                 criteria"
             )),
         "{label}: {report}"
     );

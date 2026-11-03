@@ -373,9 +373,10 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //
 //   0          a completed analysis (or `--success-exit-code`, which refuses 2
 //              and 120 ..= 127): the report names the critical events
-//              (verdict `critical_events`; no class line), or no event decides
-//              the outcome (verdict `no_deciding_event`,
-//              `HERMIT_ANALYZE_VERDICT class=no-deciding-event`).
+//              (verdict `critical_events`; no class line), or the target is
+//              reproduced without the target schedule, which localizes no
+//              event (verdict `reproduced_without_schedule`,
+//              `HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule`).
 //   2          HERMIT_ANALYZE_PRECONDITION_EXIT -- the inputs do not give
 //              analyze what it needs, `diff`'s "trouble":
 //              `HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced`,

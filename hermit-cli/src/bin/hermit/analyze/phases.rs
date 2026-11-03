@@ -334,15 +334,18 @@ fn choose_continuation(
         .collect();
     if let (true, Some(&(first, _))) = (alone.len() == outcomes.len(), outcomes.first()) {
         // A completed analysis, not a failure (`AnalyzeVerdict`).
-        return Err(AnalyzeVerdict::no_deciding_event(
+        return Err(AnalyzeVerdict::reproduced_without_schedule(
             format!(
-                "no event of the target schedule decides the outcome: without chaos, the scheduler \
-             alone already meets the target criteria {}. The outcome does not depend on a chaos \
-             decision, so debug that run directly: the reproducer of the first trial \
-             (prefix_round_001.repro in the workspace) runs it. To bisect against a run that \
-             misses the target instead, pass --continuation-timeslice with a timeslice at which \
-             the scheduler alone misses it, or use the default search with a passing \
-             --run2-seed.",
+                "the target is reproduced without the target schedule: without chaos, the \
+                 scheduler alone, replaying none of the target schedule, meets the target \
+                 criteria {}. A prefix search needs a run that misses the target to start from, \
+                 so it localizes no event here. Only the empty prefix was tried: an interior \
+                 prefix may still miss the target, so this does not show that no event of the \
+                 schedule decides the outcome. Debug that run directly: the reproducer of the \
+                 first trial (prefix_round_001.repro in the workspace) runs it. To bisect against \
+                 a run that misses the target instead, pass --continuation-timeslice with a \
+                 timeslice at which the scheduler alone misses it, or use the default search \
+                 with a passing --run2-seed.",
                 alone.join(" and ")
             ),
             first,
@@ -5420,6 +5423,59 @@ mod tests {
         );
     }
 
+    /// Prefix outcomes need not be monotone: here replaying none of the
+    /// schedule meets the target (Met(0)), an interior prefix misses it
+    /// (Missed(4)) and the whole schedule meets it again (Met(10)). The
+    /// endpoint check tries only the empty prefix, so the verdict reports
+    /// what that trial observed and nothing more: the target reproduced
+    /// without the schedule and no event localized, never that no event
+    /// decides the outcome or that it does not depend on a chaos decision.
+    /// With the empty prefix missing instead, the same check finds the
+    /// endpoints a search can use.
+    #[test]
+    fn a_target_met_without_the_schedule_is_reported_as_only_that() {
+        let continuation = [Some(NonZeroU64::new(1000).unwrap())];
+        let mut tried = Vec::new();
+        let error = choose_continuation(&continuation, 10, |prefix, _| {
+            tried.push(prefix);
+            Ok(prefix != 4)
+        })
+        .unwrap_err();
+        assert_eq!(tried, [0], "only the empty prefix is tried");
+        let verdict = error
+            .downcast_ref::<AnalyzeVerdict>()
+            .unwrap_or_else(|| panic!("not a verdict: {error:#}"));
+        assert_eq!(verdict.verdict(), Verdict::ReproducedWithoutSchedule);
+        assert_eq!(
+            verdict.class_line(),
+            "HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule"
+        );
+        let header = verdict.to_string();
+        for expected in [
+            "the target is reproduced without the target schedule: without chaos, the scheduler \
+             alone, replaying none of the target schedule, meets the target criteria at a 1000 ns \
+             timeslice",
+            "so it localizes no event here",
+            "an interior prefix may still miss the target, so this does not show that no event \
+             of the schedule decides the outcome",
+        ] {
+            assert!(header.contains(expected), "no {expected:?} in {header}");
+        }
+        for overclaim in [
+            "no event of the target schedule decides",
+            "does not depend on a chaos decision",
+        ] {
+            assert!(!header.contains(overclaim), "{overclaim:?} in {header}");
+        }
+        tried.clear();
+        let usable = choose_continuation(&continuation, 10, |prefix, _| {
+            tried.push(prefix);
+            Ok(prefix != 0 && prefix != 4)
+        })
+        .unwrap();
+        assert_eq!((usable, tried), (continuation[0], vec![0, 10]));
+    }
+
     /// The prefix search finds the event at which the outcome flips, wherever
     /// it lies, in about log2(len) trials once its endpoints differ.
     #[test]
@@ -5708,13 +5764,13 @@ mod tests {
         assert!(
             matches!(
                 alone.downcast_ref::<AnalyzeVerdict>(),
-                Some(AnalyzeVerdict::NoDecidingEvent { .. })
+                Some(AnalyzeVerdict::ReproducedWithoutSchedule { .. })
             ),
             "{alone:#}"
         );
         let message = alone.to_string();
         assert!(
-            message.contains("the scheduler alone already meets the target criteria at a 1000 ns timeslice and at a 200000000 ns timeslice"),
+            message.contains("the scheduler alone, replaying none of the target schedule, meets the target criteria at a 1000 ns timeslice and at a 200000000 ns timeslice"),
             "{message}"
         );
         assert!(
@@ -5744,7 +5800,7 @@ mod tests {
     }
 
     /// A verdict that names no event is reported as a completed analysis:
-    /// its report carries `"verdict": "no_deciding_event"`, its reason and the
+    /// its report carries `"verdict": "reproduced_without_schedule"`, its reason and the
     /// explanation, and analyze exits as it does after naming an event (0, or
     /// `--success-exit-code`). `main.rs` never sees it as an error. Without
     /// timing settings in force no other trial runs. With them, a recording
@@ -5785,14 +5841,15 @@ mod tests {
     fn a_verdict_is_reported_and_ends_analyze_successfully() {
         let dir = tempfile::tempdir().unwrap();
         let report = dir.path().join("report.json");
-        let verdict = AnalyzeVerdict::no_deciding_event("no event decides the outcome.", None);
+        let verdict =
+            AnalyzeVerdict::reproduced_without_schedule("no event decides the outcome.", None);
         let written = |status: anyhow::Result<ExitStatus>, expected: ExitStatus| {
             assert_eq!(status.unwrap(), expected);
             let text = std::fs::read_to_string(&report).unwrap();
             std::fs::remove_file(&report).unwrap();
             // One schema reads both kinds of report.
             let parsed: Report = serde_json::from_str(&text).unwrap();
-            assert_eq!(parsed.verdict, Verdict::NoDecidingEvent);
+            assert_eq!(parsed.verdict, Verdict::ReproducedWithoutSchedule);
             assert_eq!(parsed.critical_event1, None);
             serde_json::from_str::<serde_json::Value>(&text).unwrap()
         };
@@ -5817,7 +5874,7 @@ mod tests {
             assert_eq!(
                 written(options.finish_prefix_search(searched), status),
                 serde_json::json!({
-                    "verdict": "no_deciding_event",
+                    "verdict": "reproduced_without_schedule",
                     "verdict_reason": {"cause": "scheduler_alone"},
                     "header": "no event decides the outcome.",
                     "additional_context": "",
@@ -5932,7 +5989,7 @@ mod tests {
         assert!(!report.exists());
         assert_eq!(
             verdict.class_line(),
-            "HERMIT_ANALYZE_VERDICT class=no-deciding-event"
+            "HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule"
         );
     }
 
@@ -6158,7 +6215,7 @@ mod tests {
     }
 
     /// `--success-exit-code` refuses the statuses that already mean something
-    /// for analyze, naming why.
+    /// for analyze, and values that are not exit statuses, naming why.
     #[test]
     fn a_success_exit_code_that_means_something_else_is_refused() {
         for code in ["2", "120", "122", "125", "127"] {
@@ -6176,7 +6233,29 @@ mod tests {
                 "{code}: {error}"
             );
         }
-        for code in ["0", "1", "3", "119", "128"] {
+        // Linux keeps the low 8 bits: these would exit 2, 122, 2, 122, 0 and
+        // 255, so they are refused as not being exit statuses at all.
+        for (code, exits) in [
+            ("258", 2),
+            ("378", 122),
+            ("-254", 2),
+            ("-134", 122),
+            ("256", 0),
+            ("-1", 255),
+        ] {
+            let flag = format!("--success-exit-code={code}");
+            let error = AnalyzeOpts::try_parse_from(["analyze", flag.as_str(), "--", "/bin/true"])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!(
+                    "{code} is not an exit status: a process exits with the low 8 bits of the \
+                     value it passes, 0 to 255, so a process exiting with {code} exits {exits}"
+                )),
+                "{code}: {error}"
+            );
+        }
+        for code in ["0", "1", "3", "119", "128", "255"] {
             let options = AnalyzeOpts::try_parse_from([
                 "analyze",
                 "--success-exit-code",
