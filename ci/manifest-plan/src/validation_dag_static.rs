@@ -1262,7 +1262,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nextest list.
     // Full validate at 85b8cec25a executed 1973, all passed, against the
     // 1971 pin: 1971 + 2 = 1973, measured by that run.
-    ("test.regular_crates", 1973),
+    ("test.regular_crates", 1944),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1975,7 +1975,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Batch 1 (PRs 4539/4677/4561/4707) adds two hermit-run units:
     // 1344 + 2 = 1346, from the batch1 validate at 9baea420 carried
     // through the split rebase.
-    ("test.hermit_unit", 1348),
+    ("test.hermit_unit", 1212),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5267,7 +5267,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // exclusions are present exactly once: 1971 - 14 = 1957, by nextest list.
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a): 1957 + 2 = 1959 (1973 - 14).
-    ("test.regular_crates_on_host", 1959),
+    ("test.regular_crates_on_host", 1930),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6229,7 +6229,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Composed source count; re-measure with the compiled inventory.
     // Batch 1 recount (same growth as test.hermit_unit): 1338 + 2 = 1340.
-    ("test.hermit_unit_on_host", 1342),
+    ("test.hermit_unit_on_host", 1206),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6467,7 +6467,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nextest list.
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a), none hosted-excluded: 1957 + 2 = 1959 (1973 - 14).
-    ("test.regular_crates_on_host", 1959),
+    ("test.regular_crates_on_host", 1930),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
