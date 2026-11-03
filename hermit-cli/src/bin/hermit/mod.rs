@@ -2797,8 +2797,8 @@ mod tests {
     /// the positions Reverie's collector gives them. An opaque `caller_defined` predicate here would
     /// silently disqualify every DBT verdict from bitwise parity, while
     /// `dbt_evidence_transport_v1` would leave the initialization positions
-    /// uncompared. The DBT evidence tests in `backends.rs` check behaviourally
-    /// that the log and the verdict carry that stream.
+    /// uncompared. The DBT evidence tests moved out with the DBT backend;
+    /// what remains here pins the live comparison options in `run.rs`.
     #[test]
     fn dbt_verdict_names_a_canonical_record_envelope() {
         let common = include_str!("run.rs");
@@ -2883,15 +2883,6 @@ mod tests {
         assert!(normalized.contains(
             "record_native_branch_clock_comparison(&self.label, outcome, self.branches)"
         ));
-        let builtin = include_str!("backends.rs")
-            .split_once("impl DbtVerificationComparison {")
-            .unwrap()
-            .1
-            .split_once("/// Where DynamoRIO")
-            .unwrap()
-            .0;
-        assert!(builtin.contains("self.native.configure(options)"));
-        assert!(builtin.contains("self.native.apply(outcome)"));
         let common = include_str!("run.rs")
             .split_once("pub(super) fn conclude_verification(")
             .unwrap()

@@ -4083,7 +4083,6 @@ mod tests {
         };
         for (name, source, left, right) in [
             ("generic run", include_str!("run.rs"), "run 1", "run 2"),
-            ("DBT run", include_str!("backends.rs"), "run 1", "run 2"),
             (
                 "record/replay",
                 include_str!("record_start.rs"),
