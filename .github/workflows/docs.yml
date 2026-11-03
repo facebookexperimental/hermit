@@ -396,6 +396,13 @@ jobs:
         # Docs runs (36461693420, 36470493141, 36491135006; recorded in
         # d3a0a4ae3d16) and its slow phase was not visible.
         COMPATIBILITY_WEBSITE_PHASE_TIMING: "1"
+        # The export's evidence verdict cache must live outside the builder
+        # checkout: build_and_serve otherwise creates it under the state
+        # root (the checkout itself), and the build's later clean-checkout
+        # verification refuses its own cache (run 41547597829). The scratch
+        # parent is job-owned and removed after the run, like the build's
+        # other scratch state.
+        LEDGER_EVIDENCE_VERIFY_CACHE_DIR: ${{ runner.temp }}/evidence-verify-cache
         LEDGER_COMMIT: ${{ steps.website-source.outputs.ledger_commit }}
         VALIDATION_HISTORY_COMMIT: ${{ steps.website-history.outputs.validation_history_commit }}
       run: |
