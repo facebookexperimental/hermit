@@ -207,7 +207,7 @@ was armed for and `k` (straight-line code can return to an address without a
 conditional branch, so the step count, not an address, names the point), and
 `--replay-preemptions-from` arms the same timer. A written record omits the
 offsets when it has none, so a record made without the option is unchanged.
-A record whose rows hold one states `"format_version": 4`
+A record whose rows hold one states `"format_version": 6`
 (`INSTRUCTION_OFFSET_ROWS_FORMAT`), which a Hermit that predates the offsets
 refuses by name rather than replaying those slices to their branch targets;
 every copy and edit of such rows keeps it, and this Hermit refuses offset rows

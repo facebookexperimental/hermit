@@ -842,8 +842,8 @@ impl PreemptionRecord {
         self.validate_combined_reserved_inputs(other)
             .map_err(|refusal| refusal.to_string())?;
         // The stated formats must agree, and so must the timing rules they
-        // stand for here (`timing_format`): rows alone in format 4 follow
-        // format 1's rules, a schedule in format 4 format 3's.
+        // stand for here (`timing_format`): rows alone in format 6 follow
+        // format 1's rules, a schedule in format 6 its own.
         if self.format_version != other.format_version
             || self.timing_format() != other.timing_format()
         {
@@ -2235,14 +2235,15 @@ mod tests {
     /// preemption replay's re-record whatever format it follows. A writer that
     /// notes none (a schedule replay's re-record) records such an end as an
     /// ordinary one and stays below format 5. A record read with a mark in an
-    /// older format is refused, as is a format this Hermit does not know (6).
+    /// older format is refused, as is a format this Hermit does not know (one
+    /// past `PREEMPTION_RECORD_FORMAT`).
     /// So a Hermit that reads formats 1 to 4 refuses a record with marks,
     /// where it would replay those ends with a stop it does not find.
     #[test]
     fn stopless_slice_ends_need_format_5() {
         let tid = DetTid::from_raw(3);
         let marked = SchedEvent::branches(tid, 100).taken_without_stop();
-        assert_eq!(PREEMPTION_RECORD_FORMAT, STOPLESS_SLICE_ENDS_FORMAT);
+        const { assert!(PREEMPTION_RECORD_FORMAT >= STOPLESS_SLICE_ENDS_FORMAT) };
         assert_eq!(STOPLESS_SLICE_ENDS_FORMAT, BACKGROUND_STARTS_FORMAT + 1);
         let written = |mut writer: PreemptionWriter| {
             writer.insert_schedevent(SchedEvent::branches(tid, 100));
@@ -2297,7 +2298,7 @@ mod tests {
         let mut read = record;
         read.format_version = Some(STOPLESS_SLICE_ENDS_FORMAT);
         read.validate_format().unwrap();
-        read.format_version = Some(STOPLESS_SLICE_ENDS_FORMAT + 1);
+        read.format_version = Some(PREEMPTION_RECORD_FORMAT + 1);
         assert!(read.validate_format().is_err());
     }
 
@@ -2386,7 +2387,7 @@ mod tests {
             SchedEvent::branches(tid, 20),
         ];
         let mut record = PreemptionRecord::from_sched_events(events.clone());
-        record.format_version = Some(PREEMPTION_RECORD_FORMAT);
+        record.format_version = Some(STOPLESS_SLICE_ENDS_FORMAT);
         record.background_starts.push(BackgroundStart {
             after: 1,
             thread: tid,
@@ -2406,7 +2407,7 @@ mod tests {
         let lowered = (Some(BACKGROUND_STARTS_FORMAT - 1), 0);
         assert_eq!(
             reads_back(&record.schedule_prefix(2), "a prefix of the whole schedule"),
-            (Some(PREEMPTION_RECORD_FORMAT), 1)
+            (Some(STOPLESS_SLICE_ENDS_FORMAT), 1)
         );
         assert_eq!(
             reads_back(&record.schedule_prefix(1), "a shorter prefix"),
@@ -2558,7 +2559,7 @@ mod tests {
         let mut none = PreemptionWriter::new(None).noting_background_starts();
         none.insert_schedevent(event(3));
         let none = read(none);
-        assert_eq!(none.format_version, Some(PREEMPTION_RECORD_FORMAT));
+        assert_eq!(none.format_version, Some(STOPLESS_SLICE_ENDS_FORMAT));
         assert!(none.notes_background_starts());
         assert!(none.background_starts().is_empty());
 
@@ -2636,12 +2637,12 @@ mod tests {
         noting.insert_background_start(tid, 1);
         noting.insert_schedevent(SchedEvent::branches(tid, 20));
         let noting = read(noting);
-        assert_eq!(noting.format_version(), Some(PREEMPTION_RECORD_FORMAT));
+        assert_eq!(noting.format_version(), Some(STOPLESS_SLICE_ENDS_FORMAT));
         assert!(noting.notes_background_starts());
         assert_eq!(noting.background_starts().len(), 1);
         assert_eq!(
             noting.clone().with_current_format().format_version(),
-            Some(PREEMPTION_RECORD_FORMAT)
+            Some(STOPLESS_SLICE_ENDS_FORMAT)
         );
         assert_eq!(
             PreemptionRecord::from_sched_events(Vec::new())
@@ -2669,7 +2670,7 @@ mod tests {
         };
         let source = |order: &[(DetTid, u32)], after: u64| {
             let mut record = PreemptionRecord::from_sched_events(events(order));
-            record.format_version = Some(PREEMPTION_RECORD_FORMAT);
+            record.format_version = Some(BACKGROUND_STARTS_FORMAT);
             record.background_starts.push(BackgroundStart {
                 after,
                 thread: tid,
@@ -2689,7 +2690,7 @@ mod tests {
             a.interpolate_events(&b, a.schedevents().to_vec())
                 .unwrap()
                 .format_version(),
-            Some(PREEMPTION_RECORD_FORMAT)
+            Some(BACKGROUND_STARTS_FORMAT)
         );
     }
 
@@ -3641,7 +3642,7 @@ mod tests {
     /// Rows alone in `INSTRUCTION_OFFSET_ROWS_FORMAT` follow format 1's timing
     /// rules, as the same rows without an offset state no format
     /// (`timing_format`): no reader that keys timing on the format takes
-    /// their format 4 for a claim to list every jump of global time or to
+    /// their format 6 for a claim to list every jump of global time or to
     /// charge replayed switch-ins, which index or replay a schedule trace
     /// they do not hold. Here they meet each such reader in this file: the
     /// timing predicates, the loader a replay uses, `validate_format`'s rule
@@ -5061,14 +5062,17 @@ impl PreemptionWriter {
     /// Stamp the record with the current format: the run records its
     /// schedule without replaying one, so it notes every background start it
     /// takes (`insert_background_start`), and a record without any says its
-    /// run began none.
+    /// run began none. It states the newest format below
+    /// [`INSTRUCTION_OFFSET_ROWS_FORMAT`] ([`format_without_instruction_offsets`]),
+    /// which its first row with an instruction offset raises (`raise_format`).
     pub fn noting_background_starts(mut self) -> Self {
+        let current = format_without_instruction_offsets(Some(PREEMPTION_RECORD_FORMAT));
         // A slice-boundary writer notes no starts (`insert_background_start`),
         // so it states the format below theirs.
         self.inner.format_version = if self.boundary_records.is_some() {
-            format_without_background_starts(Some(PREEMPTION_RECORD_FORMAT))
+            format_without_background_starts(current)
         } else {
-            Some(PREEMPTION_RECORD_FORMAT)
+            current
         };
         self
     }

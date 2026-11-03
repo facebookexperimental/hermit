@@ -25885,7 +25885,7 @@ mod test {
                 5,
                 offset,
             );
-            // Rows alone, as `clone_preemptions_only` leaves them: format 4
+            // Rows alone, as `clone_preemptions_only` leaves them: format 6
             // with the offset, no format without.
             let rows =
                 serde_json::from_str::<crate::preemptions::PreemptionRecord>(&writer.into_string())
@@ -25929,6 +25929,7 @@ mod test {
     fn a_replay_re_records_a_background_starts_record_below_its_format() {
         use crate::preemptions::BACKGROUND_STARTS_FORMAT;
         use crate::preemptions::PreemptionRecord;
+        use crate::preemptions::STOPLESS_SLICE_ENDS_FORMAT;
         let dir = tempfile::tempdir().unwrap();
         let tid = DetTid::from_raw(3);
         let events = vec![
@@ -25957,7 +25958,7 @@ mod test {
             ..Config::default()
         });
         let recorded = written(&mut fresh);
-        assert_eq!(recorded.format_version(), Some(PREEMPTION_RECORD_FORMAT));
+        assert_eq!(recorded.format_version(), Some(STOPLESS_SLICE_ENDS_FORMAT));
         assert!(recorded.notes_background_starts());
 
         let mut noting = replay(serde_json::to_value(&recorded).unwrap());

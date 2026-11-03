@@ -1992,13 +1992,13 @@ mod tests {
 
     /// A prefix trial of a recording whose rows hold an instruction offset,
     /// written by the real trial writer (`write_trial_record`) and read
-    /// back, keeps the recording's format 4 and its timing at every length:
+    /// back, keeps the recording's format 6 and its timing at every length:
     /// with no event, with some and with all, with and without a jump of
     /// global time at event zero, it lists its jumps (the one at event zero
     /// included) and charges replayed switch-ins, as a schedule of that
     /// format does. A prefix of no events is a complete, empty schedule, not
     /// rows alone. Rows copied alone (`clone_preemptions_only`) are the
-    /// control: format 4 with format 1's timing.
+    /// control: format 6 with format 1's timing.
     #[test]
     fn a_prefix_trial_of_offset_rows_keeps_its_timing_at_every_length() {
         use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
