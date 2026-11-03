@@ -5898,6 +5898,21 @@ fn record_replay_refuses_to_make_a_read_only_shared_mapping_writable() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// Opening a shared file with O_TRUNC must clear its existing views before
+/// advice can refill them. Refilling never grants guest write permission to a
+/// mapping originally made through a read-only descriptor.
+#[test]
+fn record_replay_preserves_read_only_shared_pages_after_truncate_and_advice() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "read-only-truncate-advice",
+        "read-only-truncate-advice: before advice: zero\n\
+         read-only-truncate-advice: after advice: zero\n\
+         read-only-truncate-advice: mprotect: EACCES\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// A guest that chroots into a directory below the replay root and maps the
 /// file again shares it with the mapping it made before: the backing belongs
 /// to the replay, not to the root the guest sees, and the chrooted guest

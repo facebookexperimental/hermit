@@ -43,6 +43,9 @@
  *         and asks mprotect to make the mapping writable, which Linux refuses
  *         with EACCES, then does the same through a descriptor opened for
  *         reading and writing, which it allows.
+ *   read-only-truncate-advice: truncates and regrows a file seen through a
+ *         read-only shared mapping, checks zeroes before and after advice,
+ *         and checks that the mapping still cannot become writable.
  *   chroot: maps the memfd, chroots into a new directory below the working
  *         directory, maps the memfd again and writes through the new
  *         mapping; the old one sees it. Natively it needs `unshare --user
@@ -305,6 +308,50 @@ static void read_only_mprotect(void) {
   check(unlink(path) == 0, "unlink the file");
 }
 
+static void read_only_truncate_advice(void) {
+  const char* path = "/tmp/hermit-shared-mappings-read-only-advice";
+  int writable = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  check(writable >= 0, "create the advice file");
+  if (writable < 0) return;
+  check(ftruncate(writable, page) == 0, "size the advice file");
+  check(pwrite(writable, "A", 1, 0) == 1, "seed the advice file");
+  int read_only = open(path, O_RDONLY);
+  check(read_only >= 0, "open the advice file read-only");
+  if (read_only < 0) return;
+  unsigned char* view = mmap(NULL, page, PROT_READ, MAP_SHARED, read_only, 0);
+  check(view != MAP_FAILED, "map the advice file read-only");
+  if (view == MAP_FAILED) return;
+  check(view[0] == 'A', "read the initial advice file byte");
+  int truncating = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  check(truncating >= 0, "truncate the mapped advice file by open");
+  if (truncating < 0) return;
+  check(ftruncate(truncating, page) == 0, "regrow the mapped advice file");
+  const volatile unsigned char* observed = view;
+  int zero_before = 1;
+  for (long i = 0; i < page; i++) zero_before &= observed[i] == 0;
+  check(zero_before, "the whole shared page is zero before advice");
+  printf("read-only-truncate-advice: before advice: %s\n",
+         zero_before ? "zero" : "stale");
+  check(madvise(view, page, MADV_DONTNEED) == 0, "discard the shared page");
+  int zero_after = 1;
+  for (long i = 0; i < page; i++) zero_after &= observed[i] == 0;
+  check(zero_after, "the whole shared page is zero after advice");
+  printf("read-only-truncate-advice: after advice: %s\n",
+         zero_after ? "zero" : "stale");
+  errno = 0;
+  int writable_result = mprotect(view, page, PROT_READ | PROT_WRITE);
+  int writable_errno = errno;
+  check(writable_result == -1 && writable_errno == EACCES,
+        "the shared read-only mapping still refuses write permission");
+  printf("read-only-truncate-advice: mprotect: %s\n",
+         writable_result == 0 ? "made writable" : strerrorname_np(writable_errno));
+  check(munmap(view, page) == 0, "unmap the advice file");
+  check(close(truncating) == 0, "close the truncating descriptor");
+  check(close(read_only) == 0, "close the read-only descriptor");
+  check(close(writable) == 0, "close the writable descriptor");
+  check(unlink(path) == 0, "unlink the advice file");
+}
+
 static void chroot_remap(void) {
   int fd = memfd(1);
   char* outside = map_pages(fd, 0, 1);
@@ -381,6 +428,8 @@ int main(int argc, char** argv) {
     nested_pidns();
   } else if (strcmp(mode, "read-only-mprotect") == 0) {
     read_only_mprotect();
+  } else if (strcmp(mode, "read-only-truncate-advice") == 0) {
+    read_only_truncate_advice();
   } else if (strcmp(mode, "chroot") == 0) {
     chroot_remap();
   } else if (strcmp(mode, "seccomp-filter") == 0) {

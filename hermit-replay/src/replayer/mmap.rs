@@ -81,7 +81,7 @@ const PAGE_SIZE: usize = 4096;
 pub(super) const SHARED_MAPPING_REFUSAL: &str = "replay refused: replay cannot make a \
     MAP_SHARED file mapping share the file's memory with its other mappings";
 
-fn refuse(step: &str, error: impl Display) -> ! {
+pub(super) fn refuse(step: &str, error: impl Display) -> ! {
     panic!("{SHARED_MAPPING_REFUSAL}: {step}: {error}")
 }
 
@@ -485,69 +485,113 @@ fn handed_descriptor(backing: &File, access: i32) -> io::Result<OwnedFd> {
 /// The replay object descriptor `fd` of thread `tid` names, if it is a
 /// regular file of its own: an eventfd or other anonymous inode that stands
 /// in for a file shares its inode with every other one, so it names nothing.
-fn replay_object(tid: Pid, fd: RawFd) -> Option<FileId> {
+fn replay_object(tid: Pid, fd: RawFd) -> io::Result<Option<FileId>> {
     let path = format!("/proc/{}/fd/{fd}", tid.as_raw());
-    let metadata = std::fs::metadata(&path).ok()?;
-    let anonymous = std::fs::read_link(&path).is_ok_and(|target| {
-        target
-            .as_os_str()
-            .as_encoded_bytes()
-            .starts_with(b"anon_inode:")
-    });
-    (metadata.file_type().is_file() && !anonymous).then(|| FileId::of(&metadata))
+    replay_object_with(std::fs::metadata(&path), || std::fs::read_link(&path))
+}
+
+fn replay_object_with(
+    metadata: io::Result<std::fs::Metadata>,
+    read_link: impl FnOnce() -> io::Result<std::path::PathBuf>,
+) -> io::Result<Option<FileId>> {
+    let metadata = metadata?;
+    if !metadata.file_type().is_file() {
+        return Ok(None);
+    }
+    let target = read_link()?;
+    let anonymous = target
+        .as_os_str()
+        .as_encoded_bytes()
+        .starts_with(b"anon_inode:");
+    Ok((!anonymous).then(|| FileId::of(&metadata)))
 }
 
 /// Links the replay object descriptor `fd` of thread `tid` in process `pid`
 /// names to `file`'s backing, so that replayed writes through it reach the
 /// backing too.
-fn link_object(file: SharedFile, pid: Pid, tid: Pid, fd: RawFd) {
-    let Some(object) = replay_object(tid, fd) else {
-        return;
+fn link_object(file: SharedFile, pid: Pid, tid: Pid, fd: RawFd) -> io::Result<()> {
+    let object = replay_object(tid, fd)?;
+    link_object_in(&mut shared_backings(), file, object, || {
+        crate::fd::duplicate_guest_thread_fd(pid, tid, fd)
+    })
+}
+
+fn link_object_in(
+    backings: &mut SharedBackings,
+    file: SharedFile,
+    object: Option<FileId>,
+    pin: impl FnOnce() -> io::Result<OwnedFd>,
+) -> io::Result<()> {
+    let Some(object) = object else {
+        return Ok(());
     };
-    let mut backings = shared_backings();
     if backings.iter().any(|(other, backing)| {
         *other != file && backing.objects.iter().any(|(id, _)| *id == object)
     }) {
         // One replay object names one recorded file. Two names would mean
         // replay lost track of a descriptor; writes through it reach neither.
-        tracing::warn!(
-            ?file,
-            ?object,
-            "replay object already backs another shared file"
-        );
-        return;
+        return Err(io::Error::other(
+            "replay object already backs another shared file",
+        ));
     }
     let Some(backing) = backings.get_mut(&file) else {
-        return;
+        return Err(io::Error::other(
+            "shared file backing disappeared before object pinning",
+        ));
     };
     if backing.objects.iter().any(|(id, _)| *id == object) {
-        return;
+        return Ok(());
     }
-    match crate::fd::duplicate_guest_thread_fd(pid, tid, fd) {
-        Ok(pin) => backing.objects.push((object, pin)),
-        Err(error) => tracing::debug!(%error, fd, "cannot hold a shared file's replay object"),
-    }
+    backing.objects.push((object, pin()?));
+    Ok(())
 }
 
 /// The backing that descriptor `fd` of thread `tid` writes, if it names a
 /// replay object linked to one. `tid`'s own descriptor table is the one
 /// read: a thread made without `CLONE_FILES` has a table of its own.
-fn object_backing(tid: Pid, fd: RawFd) -> Option<File> {
-    if shared_backings().is_empty() {
-        return None;
+fn object_backing(tid: Pid, fd: RawFd) -> io::Result<Option<File>> {
+    object_backing_in(
+        &shared_backings(),
+        || replay_object(tid, fd),
+        OwnedFd::try_clone,
+    )
+}
+
+fn object_backing_in(
+    backings: &SharedBackings,
+    inspect: impl FnOnce() -> io::Result<Option<FileId>>,
+    duplicate: impl FnOnce(&OwnedFd) -> io::Result<OwnedFd>,
+) -> io::Result<Option<File>> {
+    if backings.is_empty() {
+        return Ok(None);
     }
-    let object = replay_object(tid, fd)?;
-    let backings = shared_backings();
-    let backing = backings
+    let Some(object) = inspect()? else {
+        return Ok(None);
+    };
+    let Some(backing) = backings
         .values()
-        .find(|backing| backing.objects.iter().any(|(id, _)| *id == object))?;
-    Some(File::from(backing.file.try_clone().ok()?))
+        .find(|backing| backing.objects.iter().any(|(id, _)| *id == object))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(File::from(duplicate(&backing.file)?)))
+}
+
+/// Resolve a required side effect before treating a missing association as a
+/// no-op. The lookup has returned and released its registry lock before a
+/// failure becomes a named refusal.
+fn shared_write_target(lookup: impl FnOnce() -> io::Result<Option<File>>) -> Option<File> {
+    lookup().unwrap_or_else(|error| refuse("look up the shared file's backing", error))
+}
+
+fn pin_shared_object(pin: impl FnOnce() -> io::Result<()>) {
+    pin().unwrap_or_else(|error| refuse("pin the shared file's replay object", error));
 }
 
 /// Whether replayed writes through descriptor `fd` of thread `tid` reach a
 /// shared file's backing.
 pub(super) fn writes_shared_backing(tid: Pid, fd: RawFd) -> bool {
-    object_backing(tid, fd).is_some()
+    shared_write_target(|| object_backing(tid, fd)).is_some()
 }
 
 /// Applies a replayed write of `bytes` at `offset` through descriptor `fd` of
@@ -559,7 +603,7 @@ pub(super) fn write_shared_backing(
     bytes: &[u8],
     offset: u64,
 ) -> io::Result<()> {
-    match object_backing(tid, fd) {
+    match shared_write_target(|| object_backing(tid, fd)) {
         Some(backing) => backing.write_all_at(bytes, offset),
         None => Ok(()),
     }
@@ -571,7 +615,7 @@ pub(super) fn write_shared_backing(
 /// The backing keeps its size, so a mapping past the end reads zeros where
 /// Linux would raise SIGBUS, as replay's copies always did.
 pub(super) fn truncate_shared_backing(tid: Pid, fd: RawFd, length: u64) -> io::Result<()> {
-    let Some(backing) = object_backing(tid, fd) else {
+    let Some(backing) = shared_write_target(|| object_backing(tid, fd)) else {
         return Ok(());
     };
     let size = backing.metadata()?.len();
@@ -888,7 +932,7 @@ impl Replayer {
         backing
             .write_all_at(recorded, shared.offset)
             .unwrap_or_else(|error| refuse("write the recorded bytes", error));
-        link_object(file, pid, tid, syscall.fd());
+        pin_shared_object(|| link_object(file, pid, tid, syscall.fd()));
 
         let opened = match &opening {
             Opening::Name(name) => Some(self.open_view(guest, name, shared.access).await),
@@ -1274,8 +1318,10 @@ impl Replayer {
 }
 
 impl Replayer {
-    /// Writes `refill.bytes[offset..offset + len]`, lifting write protection
-    /// for the duration of the write.
+    /// Writes `refill.bytes[offset..offset + len]`. Shared file views use the
+    /// owned writable backing without changing guest permissions. Private
+    /// stand-ins and positively identified anonymous shmem retain the original
+    /// guest-memory route, temporarily lifting write protection as before.
     ///
     /// The advice has already been applied, so a failure here panics rather
     /// than return an error the recording never saw.
@@ -1286,11 +1332,40 @@ impl Replayer {
         offset: usize,
         len: usize,
     ) {
-        let start = refill.addr + offset;
+        let start = refill
+            .addr
+            .checked_add(offset)
+            .unwrap_or_else(|| refuse("locate madvise refill", "recorded address overflow"));
+        let bytes = offset
+            .checked_add(len)
+            .and_then(|end| refill.bytes.get(offset..end))
+            .unwrap_or_else(|| refuse("read madvise refill", "recorded byte range overflow"));
+        let maps = std::fs::read_to_string(format!("/proc/{}/maps", guest.tid().as_raw()))
+            .unwrap_or_else(|error| refuse("read mappings for madvise refill", error));
+        let plan = {
+            let backings = shared_backings();
+            plan_refill(&maps, &backings, start, len)
+        }
+        .unwrap_or_else(|error| refuse("locate madvise refill backings", error));
+        let guest_memory = apply_shared_refill(plan, bytes)
+            .unwrap_or_else(|error| refuse("write madvise refill to its backing", error));
         let prot = ProtFlags::from_bits_truncate(refill.prot);
+        for range in guest_memory {
+            self.write_memory_refill(guest, start + range.start, &bytes[range], prot)
+                .await;
+        }
+    }
+
+    async fn write_memory_refill<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        start: usize,
+        bytes: &[u8],
+        prot: ProtFlags,
+    ) {
         if !prot.contains(ProtFlags::PROT_WRITE) {
             guest
-                .inject_with_retry(protection(start, len, prot | ProtFlags::PROT_WRITE))
+                .inject_with_retry(protection(start, bytes.len(), prot | ProtFlags::PROT_WRITE))
                 .await
                 .unwrap_or_else(|err| {
                     panic!("Cannot unprotect madvise refill at {start:#x}: {err}")
@@ -1298,19 +1373,172 @@ impl Replayer {
         }
         // This is safe since the recorder only records mapped addresses.
         let addr = unsafe { AddrMut::<u8>::from_raw_unchecked(start) };
-        guest
-            .memory()
-            .write_exact(addr, &refill.bytes[offset..offset + len])
-            .unwrap();
+        guest.memory().write_exact(addr, bytes).unwrap();
         if !prot.contains(ProtFlags::PROT_WRITE) {
             guest
-                .inject_with_retry(protection(start, len, prot))
+                .inject_with_retry(protection(start, bytes.len(), prot))
                 .await
                 .unwrap_or_else(|err| {
                     panic!("Cannot reprotect madvise refill at {start:#x}: {err}")
                 });
         }
     }
+}
+
+struct RefillPart {
+    bytes: std::ops::Range<usize>,
+    backing: Option<(File, u64)>,
+}
+
+/// Anonymous shared mappings and System V segments use the kernel's internal
+/// shmem mount, as memfds do. A user-created file with the same pathname lives
+/// on a different mount, so its name alone cannot admit the anonymous route.
+fn kernel_shmem_device() -> io::Result<u64> {
+    // SAFETY: the name is a valid C string; the new descriptor is checked and owned.
+    let fd =
+        unsafe { libc::memfd_create(c"hermit-replay-shmem-device".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: memfd_create returned a fresh descriptor that nothing else owns.
+    let file = unsafe { File::from_raw_fd(fd) };
+    Ok(file.metadata()?.dev())
+}
+
+/// Resolve the complete interval against current VMAs. A recording's one VMA
+/// can be several replay VMAs because each view was opened separately, and
+/// mprotect/munmap/mremap can split or move them. The observed maps identity,
+/// never the opaque recorded file key, identifies an owned shared backing.
+fn plan_refill(
+    maps: &str,
+    backings: &SharedBackings,
+    start: usize,
+    len: usize,
+) -> io::Result<Vec<RefillPart>> {
+    let invalid = || io::Error::other("invalid or incomplete live mapping for madvise refill");
+    let end = start.checked_add(len).ok_or_else(invalid)?;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut cursor = start;
+    let mut previous_end = 0;
+    let mut parts = Vec::new();
+    let mut shmem_device = None;
+    for line in maps.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let (lo, hi) = fields
+            .next()
+            .and_then(|range| range.split_once('-'))
+            .ok_or_else(invalid)?;
+        let lo = usize::from_str_radix(lo, 16).map_err(|_| invalid())?;
+        let hi = usize::from_str_radix(hi, 16).map_err(|_| invalid())?;
+        let permissions = fields.next().ok_or_else(invalid)?.as_bytes();
+        let offset =
+            u64::from_str_radix(fields.next().ok_or_else(invalid)?, 16).map_err(|_| invalid())?;
+        let (major, minor) = fields
+            .next()
+            .and_then(|dev| dev.split_once(':'))
+            .ok_or_else(invalid)?;
+        let major = u32::from_str_radix(major, 16).map_err(|_| invalid())?;
+        let minor = u32::from_str_radix(minor, 16).map_err(|_| invalid())?;
+        let inode = fields
+            .next()
+            .ok_or_else(invalid)?
+            .parse::<u64>()
+            .map_err(|_| invalid())?;
+        let path = fields.collect::<Vec<_>>().join(" ");
+        if lo >= hi
+            || lo < previous_end
+            || permissions.len() != 4
+            || !matches!(permissions[3], b'p' | b's')
+        {
+            return Err(invalid());
+        }
+        previous_end = hi;
+        if hi <= cursor || lo >= end {
+            continue;
+        }
+        if lo > cursor {
+            return Err(invalid());
+        }
+        let stop = hi.min(end);
+        let backing = if permissions[3] == b's' {
+            let view = FileId {
+                device: libc::makedev(major, minor),
+                inode,
+            };
+            let mut matches = backings
+                .values()
+                .filter(|backing| backing.view == Some(view) || backing.file_id == view);
+            if let Some(backing) = matches.next() {
+                if matches.next().is_some() {
+                    return Err(io::Error::other(
+                        "shared madvise refill names multiple backings",
+                    ));
+                }
+                let offset = offset
+                    .checked_add(u64::try_from(cursor - lo).map_err(|_| invalid())?)
+                    .ok_or_else(invalid)?;
+                offset
+                    .checked_add(u64::try_from(stop - cursor).map_err(|_| invalid())?)
+                    .ok_or_else(invalid)?;
+                Some((File::from(backing.file.try_clone()?), offset))
+            } else {
+                // The recorder conservatively includes anonymous shmem if its
+                // device probe failed. These mappings already run live during
+                // replay and retain the existing guest-memory refill route.
+                let anonymous_name = path == "/dev/zero (deleted)" || path.starts_with("/SYSV");
+                if !anonymous_name {
+                    return Err(io::Error::other(
+                        "shared madvise refill has no identified owned backing",
+                    ));
+                }
+                let device = match shmem_device {
+                    Some(device) => device,
+                    None => {
+                        let device = kernel_shmem_device()?;
+                        shmem_device = Some(device);
+                        device
+                    }
+                };
+                if view.device != device {
+                    return Err(io::Error::other(
+                        "shared madvise refill name does not identify kernel anonymous shmem",
+                    ));
+                }
+                None
+            }
+        } else {
+            None
+        };
+        parts.push(RefillPart {
+            bytes: cursor - start..stop - start,
+            backing,
+        });
+        cursor = stop;
+    }
+    if cursor != end {
+        return Err(invalid());
+    }
+    Ok(parts)
+}
+
+/// Fill owned shared file pages and return spans needing guest-memory writes:
+/// private stand-ins or positively identified anonymous shmem. In particular
+/// an O_RDONLY shared file view never reaches the guest mprotect route.
+fn apply_shared_refill(
+    plan: Vec<RefillPart>,
+    bytes: &[u8],
+) -> io::Result<Vec<std::ops::Range<usize>>> {
+    let mut guest_memory = Vec::new();
+    for part in plan {
+        if let Some((backing, offset)) = part.backing {
+            backing.write_all_at(&bytes[part.bytes], offset)?;
+        } else {
+            guest_memory.push(part.bytes);
+        }
+    }
+    Ok(guest_memory)
 }
 
 fn protection(start: usize, len: usize, protection: ProtFlags) -> Mprotect {
@@ -1761,5 +1989,498 @@ mod tests {
             differing_pages(&current, &recorded),
             vec![(PAGE_SIZE, 2 * PAGE_SIZE + 10)]
         );
+    }
+    fn local_backing(directory: &std::path::Path, inode: u64) -> (SharedFile, SharedBacking, File) {
+        let backing = SharedBacking::new(path_descriptor(directory)).unwrap();
+        let file = File::from(backing.file.try_clone().unwrap());
+        let key = SharedFile {
+            root: FileId::of(&std::fs::metadata(directory).unwrap()),
+            recorded: FileId {
+                device: u64::MAX,
+                inode,
+            },
+        };
+        (key, backing, file)
+    }
+
+    fn assert_shared_refusal(action: impl FnOnce(), step: &str) {
+        let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action))
+            .expect_err("a required shared operation must refuse, not become a no-op");
+        let message = refusal.downcast_ref::<String>().unwrap();
+        assert!(message.starts_with(SHARED_MAPPING_REFUSAL), "{message}");
+        assert!(message.contains(step), "{message}");
+    }
+
+    #[test]
+    fn a_shared_backing_clone_failure_refuses_instead_of_omitting_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (key, mut backing, file) = local_backing(directory.path(), 1);
+        file.write_all_at(b"unchanged", 0).unwrap();
+        let object = tempfile::tempfile().unwrap();
+        let identity = FileId::of(&object.metadata().unwrap());
+        backing
+            .objects
+            .push((identity, object.try_clone().unwrap().into()));
+        let registry = Mutex::new(SharedBackings::from([(key, backing)]));
+        let calls = std::cell::Cell::new(0);
+        assert_shared_refusal(
+            || {
+                shared_write_target(|| {
+                    object_backing_in(
+                        &registry.lock().unwrap(),
+                        || Ok(Some(identity)),
+                        |_| {
+                            calls.set(calls.get() + 1);
+                            Err(io::Error::from_raw_os_error(libc::EMFILE))
+                        },
+                    )
+                });
+            },
+            "look up the shared file's backing",
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "the actual descriptor clone seam was reached"
+        );
+        let backings = registry
+            .lock()
+            .expect("named refusal must not poison the registry");
+        assert_eq!(backings[&key].objects.len(), 1);
+        let mut bytes = [0; 9];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"unchanged");
+        let resolved = shared_write_target(|| {
+            object_backing_in(&backings, || Ok(Some(identity)), OwnedFd::try_clone)
+        })
+        .expect("a successful clone resolves the associated backing");
+        assert_eq!(
+            FileId::of(&resolved.metadata().unwrap()),
+            backings[&key].file_id
+        );
+    }
+
+    #[test]
+    fn a_failed_unassociated_descriptor_inspection_is_not_a_successful_noop() {
+        let directory = tempfile::tempdir().unwrap();
+        let (key, backing, file) = local_backing(directory.path(), 2);
+        file.write_all_at(b"unchanged", 0).unwrap();
+        let registry = Mutex::new(SharedBackings::from([(key, backing)]));
+        let unrelated = tempfile::tempfile().unwrap();
+        let calls = std::cell::Cell::new(0);
+        assert_shared_refusal(
+            || {
+                shared_write_target(|| {
+                    object_backing_in(
+                        &registry.lock().unwrap(),
+                        || {
+                            replay_object_with(unrelated.metadata(), || {
+                                calls.set(calls.get() + 1);
+                                Err(io::Error::from_raw_os_error(libc::EMFILE))
+                            })
+                        },
+                        |_| panic!("failed inspection must not duplicate a backing"),
+                    )
+                });
+            },
+            "look up the shared file's backing",
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "valid metadata reached the failing readlink seam"
+        );
+        let backings = registry
+            .lock()
+            .expect("named refusal must not poison the registry");
+        assert!(backings[&key].objects.is_empty());
+        let mut bytes = [0; 9];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"unchanged");
+        assert!(
+            shared_write_target(|| {
+                object_backing_in(
+                    &backings,
+                    || {
+                        replay_object_with(unrelated.metadata(), || {
+                            std::fs::read_link(format!("/proc/self/fd/{}", unrelated.as_raw_fd()))
+                        })
+                    },
+                    |_| panic!("a proved unassociated descriptor must not duplicate a backing"),
+                )
+            })
+            .is_none()
+        );
+        assert_shared_refusal(
+            || {
+                shared_write_target(|| {
+                    object_backing_in(
+                        &backings,
+                        || {
+                            replay_object_with(
+                                Err(io::Error::from_raw_os_error(libc::ENOENT)),
+                                || panic!("failed metadata must not read the link"),
+                            )
+                        },
+                        |_| panic!("failed metadata must not duplicate a backing"),
+                    )
+                });
+            },
+            "look up the shared file's backing",
+        );
+    }
+
+    #[test]
+    fn a_shared_object_pin_failure_refuses_before_losing_its_association() {
+        let directory = tempfile::tempdir().unwrap();
+        let (key, backing, file) = local_backing(directory.path(), 3);
+        file.write_all_at(b"unchanged", 0).unwrap();
+        let registry = Mutex::new(SharedBackings::from([(key, backing)]));
+        let object = tempfile::tempfile().unwrap();
+        let identity = FileId::of(&object.metadata().unwrap());
+        let calls = std::cell::Cell::new(0);
+        assert_shared_refusal(
+            || {
+                pin_shared_object(|| {
+                    link_object_in(&mut registry.lock().unwrap(), key, Some(identity), || {
+                        calls.set(calls.get() + 1);
+                        Err(io::Error::from_raw_os_error(libc::EMFILE))
+                    })
+                });
+            },
+            "pin the shared file's replay object",
+        );
+        assert_eq!(calls.get(), 1, "the actual pin seam was reached");
+        assert!(
+            registry
+                .lock()
+                .expect("named refusal must not poison the registry")[&key]
+                .objects
+                .is_empty()
+        );
+        let mut bytes = [0; 9];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"unchanged");
+        pin_shared_object(|| {
+            link_object_in(&mut registry.lock().unwrap(), key, Some(identity), || {
+                Ok(object.try_clone()?.into())
+            })
+        });
+        assert_eq!(registry.lock().unwrap()[&key].objects.len(), 1);
+        pin_shared_object(|| {
+            link_object_in(&mut registry.lock().unwrap(), key, Some(identity), || {
+                panic!("an already pinned object needs no second pin")
+            })
+        });
+        assert_eq!(registry.lock().unwrap()[&key].objects.len(), 1);
+    }
+
+    #[test]
+    fn shared_object_association_conflicts_and_missing_backings_refuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let (first, mut backing, _) = local_backing(directory.path(), 4);
+        let (second, other, _) = local_backing(directory.path(), 5);
+        let object = tempfile::tempfile().unwrap();
+        let identity = FileId::of(&object.metadata().unwrap());
+        backing
+            .objects
+            .push((identity, object.try_clone().unwrap().into()));
+        let registry = Mutex::new(SharedBackings::from([(first, backing), (second, other)]));
+        assert_shared_refusal(
+            || {
+                pin_shared_object(|| {
+                    link_object_in(
+                        &mut registry.lock().unwrap(),
+                        second,
+                        Some(identity),
+                        || panic!("a conflicting object must not be pinned again"),
+                    )
+                });
+            },
+            "replay object already backs another shared file",
+        );
+        assert_eq!(registry.lock().unwrap()[&first].objects.len(), 1);
+        assert!(registry.lock().unwrap()[&second].objects.is_empty());
+        let missing = SharedFile {
+            recorded: FileId {
+                device: 0,
+                inode: 0,
+            },
+            ..first
+        };
+        assert_shared_refusal(
+            || {
+                pin_shared_object(|| {
+                    link_object_in(
+                        &mut registry.lock().unwrap(),
+                        missing,
+                        Some(FileId {
+                            device: 0,
+                            inode: 1,
+                        }),
+                        || panic!("an absent backing must not acquire a pin"),
+                    )
+                });
+            },
+            "shared file backing disappeared before object pinning",
+        );
+        assert_eq!(registry.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn descriptors_without_shared_associations_remain_successful_noops() {
+        let directory = tempfile::tempdir().unwrap();
+        let (key, backing, _) = local_backing(directory.path(), 6);
+        let mut backings = SharedBackings::from([(key, backing)]);
+        assert!(
+            shared_write_target(|| {
+                object_backing_in(
+                    &backings,
+                    || {
+                        replay_object_with(std::fs::metadata(directory.path()), || {
+                            panic!("a proved nonregular descriptor needs no link inspection")
+                        })
+                    },
+                    |_| panic!("a proved nonregular descriptor needs no duplication"),
+                )
+            })
+            .is_none()
+        );
+        pin_shared_object(|| {
+            link_object_in(&mut backings, key, None, || {
+                panic!("an anonymous stand-in has no object to pin")
+            })
+        });
+        assert!(backings[&key].objects.is_empty());
+        assert!(
+            shared_write_target(|| {
+                object_backing_in(
+                    &SharedBackings::new(),
+                    || {
+                        panic!(
+                            "an empty registry proves no association without descriptor inspection"
+                        )
+                    },
+                    |_| panic!("an empty registry has no backing to duplicate"),
+                )
+            })
+            .is_none()
+        );
+    }
+
+    struct TestMapping {
+        address: *mut libc::c_void,
+        len: usize,
+    }
+
+    impl Drop for TestMapping {
+        fn drop(&mut self) {
+            // SAFETY: each test owns this complete reservation, including replacements.
+            assert_eq!(unsafe { libc::munmap(self.address, self.len) }, 0);
+        }
+    }
+
+    #[test]
+    fn a_read_only_shared_refill_updates_split_views_without_permission_elevation() {
+        let directory = tempfile::tempdir().unwrap();
+        let (key, mut backing, file) = local_backing(directory.path(), 7);
+        file.write_all_at(&vec![b'A'; 4 * PAGE_SIZE], 0).unwrap();
+        let (other_key, mut other, sentinel) = local_backing(directory.path(), 8);
+        sentinel.write_all_at(&vec![b'Z'; PAGE_SIZE], 0).unwrap();
+        // SAFETY: reserve a fresh range; MAP_FIXED below replaces only our reservation.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                3 * PAGE_SIZE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED);
+        let reservation = TestMapping {
+            address,
+            len: 3 * PAGE_SIZE,
+        };
+        for (page, source, offset) in [
+            (0, &file, PAGE_SIZE),
+            (1, &file, 2 * PAGE_SIZE),
+            (2, &sentinel, 0),
+        ] {
+            // A separate open file description per view reproduces replay's split VMAs.
+            let read_only = handed_descriptor(source, libc::O_RDONLY).unwrap();
+            let at = (address as usize + page * PAGE_SIZE) as *mut libc::c_void;
+            // SAFETY: at is within our reserved range and this valid descriptor is read-only.
+            assert_eq!(
+                unsafe {
+                    libc::mmap(
+                        at,
+                        PAGE_SIZE,
+                        libc::PROT_READ,
+                        libc::MAP_SHARED | libc::MAP_FIXED,
+                        read_only.as_raw_fd(),
+                        offset as libc::off_t,
+                    )
+                },
+                at
+            );
+        }
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        backing.view = Some(mapping_at(&maps, address as usize).unwrap());
+        other.view = Some(mapping_at(&maps, address as usize + 2 * PAGE_SIZE).unwrap());
+        // The opaque recorded identities deliberately do not name their live views.
+        assert_ne!(key.recorded, backing.view.unwrap());
+        let backings = SharedBackings::from([(key, backing), (other_key, other)]);
+        let plan = plan_refill(&maps, &backings, address as usize, 2 * PAGE_SIZE).unwrap();
+        assert_eq!(
+            plan.len(),
+            2,
+            "each separately opened view has its own live VMA"
+        );
+        assert_eq!(plan[0].bytes, 0..PAGE_SIZE);
+        assert_eq!(plan[1].bytes, PAGE_SIZE..2 * PAGE_SIZE);
+        let mut refill = vec![b'B'; 2 * PAGE_SIZE];
+        refill[PAGE_SIZE..].fill(b'C');
+        let private = apply_shared_refill(plan, &refill).unwrap();
+        assert!(
+            private.is_empty(),
+            "no shared span may reach the guest mprotect/write route"
+        );
+        // SAFETY: these mappings remain readable and live for the reservation's scope.
+        let observed = unsafe { std::slice::from_raw_parts(address.cast::<u8>(), 3 * PAGE_SIZE) };
+        assert_eq!(&observed[..2 * PAGE_SIZE], refill.as_slice());
+        assert_eq!(&observed[2 * PAGE_SIZE..], vec![b'Z'; PAGE_SIZE]);
+        let mut all = vec![0; 4 * PAGE_SIZE];
+        file.read_exact_at(&mut all, 0).unwrap();
+        assert_eq!(&all[..PAGE_SIZE], vec![b'A'; PAGE_SIZE]);
+        assert_eq!(&all[PAGE_SIZE..3 * PAGE_SIZE], refill.as_slice());
+        assert_eq!(&all[3 * PAGE_SIZE..], vec![b'A'; PAGE_SIZE]);
+        // SAFETY: the first two pages are our live read-only shared mappings.
+        let result =
+            unsafe { libc::mprotect(address, 2 * PAGE_SIZE, libc::PROT_READ | libc::PROT_WRITE) };
+        assert_eq!(
+            (result, io::Error::last_os_error().raw_os_error()),
+            (-1, Some(libc::EACCES))
+        );
+        drop(reservation);
+    }
+
+    #[test]
+    fn refill_planning_keeps_private_spans_and_checks_complete_shared_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let (key, backing, file) = local_backing(directory.path(), 9);
+        file.write_all_at(&vec![b'A'; 3 * PAGE_SIZE], 0).unwrap();
+        let id = backing.file_id;
+        let backings = SharedBackings::from([(key, backing)]);
+        let shared = format!(
+            "2000-3000 r--s 00001000 {:x}:{:x} {} /backing\n",
+            libc::major(id.device),
+            libc::minor(id.device),
+            id.inode
+        );
+        let maps = format!("1000-2000 r--p 00000000 00:00 0\n{shared}");
+        let plan = plan_refill(&maps, &backings, 0x1800, 0x1000).unwrap();
+        let private = apply_shared_refill(plan, &vec![b'B'; 0x1000]).unwrap();
+        assert_eq!(private, vec![0..0x800]);
+        let mut bytes = vec![0; 3 * PAGE_SIZE];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes[..PAGE_SIZE], vec![b'A'; PAGE_SIZE]);
+        assert_eq!(&bytes[PAGE_SIZE..PAGE_SIZE + 0x800], vec![b'B'; 0x800]);
+        assert_eq!(&bytes[PAGE_SIZE + 0x800..], vec![b'A'; PAGE_SIZE + 0x800]);
+        assert!(
+            plan_refill(&shared, &backings, 0x1000, 0x2000).is_err(),
+            "a hole is not a private span"
+        );
+        assert!(
+            plan_refill(&maps, &SharedBackings::new(), 0x2000, PAGE_SIZE).is_err(),
+            "an unresolved shared view is not a private span"
+        );
+        assert!(plan_refill(&maps, &backings, usize::MAX, 1).is_err());
+        let overflow = shared.replace("00001000", "ffffffffffffffff");
+        assert!(plan_refill(&overflow, &backings, 0x2001, 1).is_err());
+        assert!(plan_refill("malformed", &backings, 0x1000, 1).is_err());
+        assert!(plan_refill("", &backings, 0x1000, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn conservative_anonymous_shmem_refills_keep_the_live_memory_route() {
+        // A recorder whose device probe failed can include this otherwise
+        // excluded shared-anonymous VMA in its conservative refill list.
+        // SAFETY: create a fresh anonymous mapping, owned until the guard drops.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE_SIZE,
+                libc::PROT_READ,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED);
+        let mapping = TestMapping {
+            address,
+            len: PAGE_SIZE,
+        };
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let plan = plan_refill(&maps, &SharedBackings::new(), address as usize, PAGE_SIZE).unwrap();
+        assert_eq!(plan.len(), 1);
+        let refill = vec![b'R'; PAGE_SIZE];
+        assert_eq!(
+            apply_shared_refill(plan, &refill).unwrap(),
+            vec![0..PAGE_SIZE]
+        );
+        // Unlike an O_RDONLY file view, this live anonymous mapping permits
+        // the temporary write protection used by the preserved memory route.
+        // SAFETY: the range is our own live mapping.
+        assert_eq!(
+            unsafe { libc::mprotect(address, PAGE_SIZE, libc::PROT_READ | libc::PROT_WRITE) },
+            0
+        );
+        // SAFETY: that complete live range is now writable and does not overlap refill.
+        unsafe { std::ptr::copy_nonoverlapping(refill.as_ptr(), address.cast::<u8>(), PAGE_SIZE) };
+        // SAFETY: restore the protection on the same live range.
+        assert_eq!(
+            unsafe { libc::mprotect(address, PAGE_SIZE, libc::PROT_READ) },
+            0
+        );
+        // SAFETY: our live mapping is readable for its complete length.
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(address.cast::<u8>(), PAGE_SIZE) },
+            refill
+        );
+        let device = kernel_shmem_device().unwrap();
+        assert_ne!(device, 0, "the internal shmem mount has a device identity");
+        let wrong_device = "1000-2000 r--s 00000000 00:00 42 /dev/zero (deleted)\n";
+        assert!(plan_refill(wrong_device, &SharedBackings::new(), 0x1000, PAGE_SIZE).is_err());
+        let same_device_wrong_name = format!(
+            "1000-2000 r--s 00000000 {:x}:{:x} 42 /other\n",
+            libc::major(device),
+            libc::minor(device)
+        );
+        assert!(
+            plan_refill(
+                &same_device_wrong_name,
+                &SharedBackings::new(),
+                0x1000,
+                PAGE_SIZE
+            )
+            .is_err()
+        );
+        let sysv = format!(
+            "1000-2000 r--s 00000000 {:x}:{:x} 42 /SYSV00000000 (deleted)\n",
+            libc::major(device),
+            libc::minor(device)
+        );
+        assert_eq!(
+            apply_shared_refill(
+                plan_refill(&sysv, &SharedBackings::new(), 0x1000, PAGE_SIZE).unwrap(),
+                &refill
+            )
+            .unwrap(),
+            vec![0..PAGE_SIZE]
+        );
+        drop(mapping);
     }
 }

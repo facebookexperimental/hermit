@@ -2626,6 +2626,12 @@ impl Replayer {
                             "replay materialized open returned a different descriptor"
                         );
                         remember_materialized_file(guest.pid(), actual as libc::c_int);
+                        if flags.contains(OFlag::O_TRUNC) {
+                            mmap::truncate_shared_backing(guest.tid(), actual as libc::c_int, 0)
+                                .unwrap_or_else(|error| {
+                                    mmap::refuse("truncate the shared backing after open", error)
+                                });
+                        }
                     }
                     Err(error) => {
                         tracing::debug!(
