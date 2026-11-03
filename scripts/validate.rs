@@ -19749,7 +19749,9 @@ mod nextest_timeout_tests {
                 // split was replayed onto main d2e8d2c61f3, whose manifests
                 // gained the cells main enabled meanwhile (the expanded plan's
                 // CI cells: 371 added, 12 removed, 318 of the added replay).
-                assert_eq!(all.len(), 2958, "the original all-owner population is retained");
+                // 2971 on the batch6 base fcd62385 (batch6's manifest cells:
+                // 13 added, measured by the full validate at e3e107cd).
+                assert_eq!(all.len(), 2971, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
