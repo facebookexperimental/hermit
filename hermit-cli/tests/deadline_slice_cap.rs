@@ -1451,12 +1451,27 @@ fn a_recording_keeps_lone_slice_ends_and_marks_them() {
 /// run as a stop at every end does: the same output, with its virtual
 /// CLOCK_MONOTONIC reading, the same INFO log and the same desynchronized
 /// events, so a schedule replay accepts a stop at an end its recording took
-/// without one. A schedule replay of a recording that stopped at every end
-/// takes none without a stop, since it checks every RIP that recording read;
-/// a preemption replay of it takes them, since it checks none.
+/// without one.
+///
+/// The preemption replay also reproduces the recording itself: the
+/// recording's output, with its virtual clock reading, no desynchronized
+/// event, and its own record of the run is the recording's events, event
+/// for event (the same operations, however each run took a slice end). A
+/// schedule replay of this `--chaos` recording at a 1000 ns maximum slice
+/// does not reproduce it on main either, with a stop at every end: it
+/// desyncs 32 events and reads CLOCK_MONOTONIC 11.5 ms late, a baseline
+/// defect of schedule replay (<https://github.com/rrnewton/hermit/issues/5104>)
+/// that no slice length with lone ends to take escapes for this fixture. So
+/// the schedule replay of the marked recording is required to be exactly the
+/// schedule replay of the recording that stopped at every end: the same
+/// output, the same INFO log and the same desynchronized events. A schedule
+/// replay of a recording that stopped at every end takes none without a
+/// stop, since it checks every RIP that recording read; a preemption replay
+/// of it takes them, since it checks none.
 #[test]
 fn replays_take_recorded_lone_slice_ends_the_same_way() {
-    let (_, marked, marked_record) = lone_record("wait", false);
+    let (recorded, marked, marked_record) = lone_record("wait", false);
+    let recorded_events = global_events(&marked_record);
     let (_, unmarked, _) = lone_record("wait", true);
     let marked_ends = global_events(&marked_record)
         .iter()
@@ -1474,23 +1489,69 @@ fn replays_take_recorded_lone_slice_ends_the_same_way() {
                 &[format!("{option}={}", record.display())],
             )
         };
-        let lazy = replay(marked.as_path(), false, "marked");
+        let rerecorded = lone_dir().join(format!(
+            "{}-rerecorded.preemptions.json",
+            option.trim_start_matches("--")
+        ));
+        let _ = fs::remove_file(&rerecorded);
+        let lazy = lone_run_with(
+            "wait",
+            "1000",
+            false,
+            &format!("{}-marked", option.trim_start_matches("--")),
+            &[
+                format!("{option}={}", marked.display()),
+                format!("--record-preemptions-to={}", rerecorded.display()),
+            ],
+        );
         let eager = replay(marked.as_path(), true, "marked-eager");
         assert_eq!(lazy.stdout, eager.stdout, "{option}: outputs differ");
         assert_eq!(lazy.info, eager.info, "{option}: INFO logs differ");
         assert_eq!(lazy.desynced, eager.desynced, "{option}: desyncs differ");
+        if option == "--replay-preemptions-from" {
+            // Fidelity to the recording, not only between the two replays.
+            assert_eq!(
+                lazy.stdout, recorded.stdout,
+                "{option}: the replay's output, with its virtual clock reading, is not the \
+                 recording's"
+            );
+            assert_eq!(lazy.desynced, 0, "{option}: desynchronized events");
+            let text = fs::read_to_string(&rerecorded)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error}", rerecorded.display()));
+            let replayed: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|error| panic!("{} is not JSON: {error}", rerecorded.display()));
+            let replayed_events = global_events(&replayed);
+            assert_eq!(
+                replayed_events.len(),
+                recorded_events.len(),
+                "{option}: event counts differ"
+            );
+            for (index, (replayed, recorded)) in
+                replayed_events.iter().zip(&recorded_events).enumerate()
+            {
+                assert!(
+                    replayed.same_operations(recorded),
+                    "{option}: event {index} differs: {replayed} against {recorded}"
+                );
+            }
+        }
         // How many depends on how much of the recording the replay follows,
         // which the replay fixes outside this change decide.
         let skipped = lazy.stopless.expect("the replay reports a count");
         assert!(skipped > 0, "{option}: no marked end taken without a stop");
         assert_eq!(eager.stopless, None, "{option}");
-        // Its output is not compared with the marked record's replay: how
-        // closely a schedule replay follows a record without marks depends
-        // on replay fixes outside this change.
         let all_stops = replay(unmarked.as_path(), false, "unmarked");
         let skipped = all_stops.stopless.expect("the replay reports a count");
         if option == "--replay-schedule-from" {
             assert_eq!(skipped, 0, "{option}: a recorded stop was skipped");
+            // The marked recording replays exactly as the recording that
+            // stopped at every end does.
+            assert_eq!(lazy.stdout, all_stops.stdout, "{option}: outputs differ");
+            assert_eq!(lazy.info, all_stops.info, "{option}: INFO logs differ");
+            assert_eq!(
+                lazy.desynced, all_stops.desynced,
+                "{option}: desyncs differ"
+            );
         } else {
             assert!(skipped > 0, "{option}: no end taken without a stop");
         }
