@@ -123,6 +123,15 @@ fn activity(survivor: &Survivor) -> String {
 /// survivor nor `this_process`, or when its parent is `this_process` but it is
 /// not the run's `root`: Hermit started only the root, so any other child of
 /// Hermit was re-parented to it.
+/// The name the report prints for a survivor. Linux names an exec'd task by
+/// the basename of its image (`begin_new_exec` stores `kbasename(filename)`
+/// in `comm`), so a `comm` carrying a directory prefix came from the
+/// executor's naming of the host process, not from the guest's own name.
+/// Print the basename, as the kernel's own `comm` would read for that exec.
+fn display_comm(comm: &str) -> &str {
+    comm.rsplit('/').next().unwrap_or(comm)
+}
+
 pub(crate) fn describe(
     survivors: &[Survivor],
     this_process: i32,
@@ -144,7 +153,7 @@ pub(crate) fn describe(
             format!(
                 "pid {} \"{}\" (parent {}{}) {}",
                 survivor.pid,
-                survivor.comm,
+                display_comm(&survivor.comm),
                 survivor.ppid,
                 if orphaned {
                     ", orphaned: its parent exited"
@@ -209,6 +218,17 @@ mod tests {
              pid 20491 \"guest\" (parent 77) stopped outside a system call"
         );
         assert_eq!(describe(&[], 77, None), None);
+    }
+
+    /// An executor may name the host process for an exec'd guest by its full
+    /// image path; the report still names the guest by its comm, which Linux
+    /// stores as the image's basename.
+    #[test]
+    fn a_timeout_report_names_an_execd_guest_by_its_basename() {
+        let mut named = survivor(9, 1, "-1", "");
+        named.comm = "/bin/cat".to_owned();
+        let line = describe(&[named], 77, None).expect("one survivor");
+        assert!(line.contains("pid 9 \"cat\""), "{line}");
     }
 
     /// Where Hermit is the container's init, an orphan is re-parented to Hermit
