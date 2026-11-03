@@ -1972,7 +1972,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // against the 1341 the old pin expected; both new units PASS).
     // The split retains nine additional core identities: 1335 + 9 = 1344.
     // Composed source count; re-measure with the compiled inventory.
-    ("test.hermit_unit", 1344),
+    // Batch 1 (PRs 4539/4677/4561/4707) adds two hermit-run units:
+    // 1344 + 2 = 1346, from the batch1 validate at 9baea420 carried
+    // through the split rebase.
+    ("test.hermit_unit", 1346),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4623,7 +4626,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // = 780, measured by nextest list.
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds seven cli
     // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
-    ("test.cli", 787),
+    // Batch 1 adds one cli case: 787 + 1 = 788, from the batch1 validate
+    // at 9baea420 carried through the split rebase.
+    ("test.cli", 788),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5251,7 +5256,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same K8-d cli case: 698 + 1 = 699, measured by nextest list.
     // Train 1 recount (measured by the 216dbc929a full validate, same
     // growth as test.cli): 699 + 7 = 706.
-    ("test.cli_on_host", 706),
+    // Batch 1 recount (same growth as test.cli): 706 + 1 = 707.
+    ("test.cli_on_host", 707),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -6222,7 +6228,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the hosted CPUID-faulting skip set): 1327 + 2 = 1329.
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Composed source count; re-measure with the compiled inventory.
-    ("test.hermit_unit_on_host", 1338),
+    // Batch 1 recount (same growth as test.hermit_unit): 1338 + 2 = 1340.
+    ("test.hermit_unit_on_host", 1340),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
