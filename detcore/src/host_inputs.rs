@@ -462,7 +462,15 @@ impl ReplayHostInputs {
         if self.opened.contains(path) {
             return None;
         }
-        if kernel_object || (!snapshot && is_kernel_object(path)) || guest_rebound(mutated, path) {
+        // The descriptor-path `kernel_object` bit is a path heuristic: a
+        // regular snapshot copy under `/dev/shm` (a permitted `TMPDIR`)
+        // gets it from its copy path, yet its authenticated content hash
+        // (`of_snapshot`) is stronger evidence than the path. Mirror
+        // `input_set`: a snapshot identity is compared even when the bit
+        // is set; an actual device has no snapshot identity and stays
+        // excluded by either check.
+        if (!snapshot && (kernel_object || is_kernel_object(path))) || guest_rebound(mutated, path)
+        {
             return None;
         }
         self.opened.insert(path.to_owned());
@@ -615,7 +623,7 @@ mod tests {
             HostFileIdentity::of_snapshot(64, 0xaa)
         );
         // Different snapshot bytes give a different persisted digest.
-        let changed_set = input_set(&[snapshot(0xbb), device], &none);
+        let changed_set = input_set(&[snapshot(0xbb), device.clone()], &none);
         assert_ne!(recorded.digest, changed_set.digest);
         // Unchanged: no change at the open or at the end.
         let mut replay = ReplayHostInputs::new(recorded.clone());
@@ -637,7 +645,7 @@ mod tests {
             None
         );
         // Changed: reported at the open with both hashes.
-        let mut replay = ReplayHostInputs::new(recorded);
+        let mut replay = ReplayHostInputs::new(recorded.clone());
         let change = replay
             .observe(
                 "/dev/__properties__/properties_serial",
@@ -647,6 +655,47 @@ mod tests {
                 &none,
             )
             .expect("a changed snapshot hash is reported");
+        assert_eq!(change.recorded.content, Some(0xaa));
+        assert_eq!(change.now.content, Some(0xbb));
+        // The producer case: a regular copy under `/dev/shm` (a permitted
+        // `TMPDIR` below `/dev`) carries `kernel_object=true` from its
+        // descriptor path, in the persisted record and at replay. The
+        // authenticated snapshot identity must survive both, while an
+        // actual device with the bit set stays excluded.
+        let shm_snapshot = HostInputRecord {
+            kernel_object: true,
+            ..snapshot(0xaa)
+        };
+        let recorded = input_set(&[shm_snapshot, device.clone()], &none);
+        assert_eq!(recorded.files.len(), 1, "true-bit snapshot is retained");
+        assert_eq!(
+            recorded.files[0].identity,
+            HostFileIdentity::of_snapshot(64, 0xaa)
+        );
+        let mut replay = ReplayHostInputs::new(recorded.clone());
+        assert_eq!(
+            replay.observe(
+                "/dev/__properties__/properties_serial",
+                HostFileIdentity::of_snapshot(64, 0xaa),
+                true,
+                true,
+                &none,
+            ),
+            None,
+            "unchanged true-bit snapshot reports no change"
+        );
+        assert_eq!(replay.finish(|_| None, &none), []);
+        assert!(replay.changes().is_empty());
+        let mut replay = ReplayHostInputs::new(recorded);
+        let change = replay
+            .observe(
+                "/dev/__properties__/properties_serial",
+                HostFileIdentity::of_snapshot(64, 0xbb),
+                true,
+                true,
+                &none,
+            )
+            .expect("a changed true-bit snapshot hash is reported");
         assert_eq!(change.recorded.content, Some(0xaa));
         assert_eq!(change.now.content, Some(0xbb));
     }

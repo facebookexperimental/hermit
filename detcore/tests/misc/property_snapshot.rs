@@ -107,6 +107,10 @@ fn a_property_snapshot_serves_every_read_of_the_files_it_copied() {
 /// alternate spelling (`..`, a parent symlink, a dirfd), while a copied
 /// file through the same spellings still serves its copy (the positive
 /// control). In a non-fail-closed run the refusal is `EOPNOTSUPP`.
+/// Readable mutations of that late file are refused before they run, so
+/// the host file keeps its bytes and no absent file is created; a
+/// nonreading `O_PATH` open of it still succeeds, as natively, and its
+/// `read` fails with `EBADF`.
 #[test]
 fn a_late_property_file_is_refused_through_alias_spellings() {
     let area = area();
@@ -114,7 +118,9 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
     let file = area.live.path().join(name);
     let later_name = "u:object_r:later_prop:s0";
     let later = area.live.path().join(later_name);
-    std::fs::write(&later, [9]).unwrap();
+    std::fs::write(&later, [9, 10, 11, 12]).unwrap();
+    let absent_name = "u:object_r:absent_prop:s0";
+    let absent = area.live.path().join(absent_name);
     // A directory symlink to the area, made outside it.
     let outside = tempfile::tempdir_in(area.live.path().parent().unwrap()).unwrap();
     let alias_dir = outside.path().join("alias-area");
@@ -138,6 +144,8 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
         ..Default::default()
     };
     let live_dir = area.live.path().to_owned();
+    let later_host = later.clone();
+    let absent_host = absent.clone();
     let guest = move || {
         let expect_refused = |path: &Path, what: &str| {
             let error = std::fs::read(path).unwrap_err();
@@ -149,6 +157,59 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
         };
         expect_refused(&dotdot, "dotdot spelling");
         expect_refused(&alias_dir.join(later_name), "parent-symlink spelling");
+        // F3: readable mutations are refused before any live open runs.
+        // The host-side bytes are asserted after the guest, below.
+        let expect_open_refused = |path: &Path, flags: libc::c_int, what: &str| {
+            let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: a valid NUL-terminated path and a creation mode.
+            let fd = unsafe { libc::open(c.as_ptr(), flags, 0o644) };
+            assert_eq!(fd, -1, "{what} must be refused");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EOPNOTSUPP),
+                "{what}"
+            );
+        };
+        expect_open_refused(&later, libc::O_RDONLY | libc::O_TRUNC, "direct O_TRUNC");
+        expect_open_refused(
+            &alias_dir.join(later_name),
+            libc::O_RDONLY | libc::O_TRUNC,
+            "alias O_TRUNC",
+        );
+        expect_open_refused(
+            &alias_dir.join(absent_name),
+            libc::O_RDONLY | libc::O_CREAT | libc::O_EXCL,
+            "alias O_CREAT|O_EXCL of an absent file",
+        );
+        // F5: a nonreading `O_PATH` open succeeds as natively; reading
+        // it is `EBADF`, and a readable reopen through its descriptor
+        // link is decided (and refused) as its own open.
+        {
+            let c =
+                std::ffi::CString::new(alias_dir.join(later_name).as_os_str().as_encoded_bytes())
+                    .unwrap();
+            // SAFETY: a valid NUL-terminated path.
+            let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+            assert!(fd >= 0, "O_PATH: {}", std::io::Error::last_os_error());
+            let mut byte = [0_u8; 1];
+            // SAFETY: `fd` is open and `byte` is writable for its length.
+            let read = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), byte.len()) };
+            assert_eq!(read, -1, "an O_PATH descriptor reads nothing");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+            let reopen = std::ffi::CString::new(format!("/proc/self/fd/{fd}")).unwrap();
+            // SAFETY: a valid NUL-terminated descriptor-link path.
+            let reopened = unsafe { libc::open(reopen.as_ptr(), libc::O_RDONLY) };
+            assert_eq!(reopened, -1, "a readable reopen must be refused");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EOPNOTSUPP)
+            );
+            // SAFETY: the descriptor opened above.
+            unsafe { libc::close(fd) };
+        }
         // A dirfd on the area, and one on its parent, naming it relatively.
         use std::os::fd::AsRawFd;
         let dir = std::fs::File::open(&live_dir).unwrap();
@@ -182,6 +243,10 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
         config,
         detcore_testutils::expect_success,
     );
+    // F3 host-side effects: no refused mutation reached the live file,
+    // and the refused creation made no file.
+    assert_eq!(std::fs::read(&later_host).unwrap(), [9, 10, 11, 12]);
+    assert!(!absent_host.exists(), "a refused O_CREAT made a file");
 }
 
 /// A redirected open serves its copy through a non-`AT_FDCWD` dirfd and

@@ -1209,6 +1209,21 @@ fn uncatalogued_area_name(
         .or_else(|| live_area_name_by_identity(snapshot, dev, ino))
 }
 
+/// The area name a not-yet-existing file at `path` would have: its parent,
+/// kernel-resolved on the host (symlinks and `..` walked, as
+/// `resolved_property_area_name` relies on), is the live area itself. This
+/// decides an `O_CREAT` open before it can create anything.
+fn area_parent_name(
+    snapshot: &detcore_model::config::PropertySnapshot,
+    path: &Path,
+) -> Option<String> {
+    let parent = path.parent()?;
+    let name = path.file_name()?;
+    let canonical_parent = crate::util::canonicalize(parent).ok()?;
+    let canonical_area = crate::util::canonicalize(&snapshot.guest_dir).ok()?;
+    (canonical_parent == canonical_area).then(|| name.to_string_lossy().into_owned())
+}
+
 /// Whether an open with `flags` only reads: `O_RDONLY` without `O_CREAT` or
 /// `O_TRUNC`, or `O_PATH`, for which Linux ignores every flag but
 /// `O_CLOEXEC`, `O_DIRECTORY` and `O_NOFOLLOW` (fs/open.c `build_open_flags`).
@@ -5872,6 +5887,31 @@ impl<T: RecordOrReplay> Detcore<T> {
                 file.name
             )));
         }
+        // A readable open of an uncatalogued live-area object (by any
+        // spelling: the stat above follows symlinks and dirfds, and the
+        // identity search lists the area itself) is refused here, before
+        // the live open can truncate or create anything. `O_PATH` is not
+        // readable (`opens_readable`), so it keeps its native success
+        // below; a later readable reopen is decided on its own.
+        if opens_readable(call.flags()) {
+            if let Some(stat) = object
+                && let Some(name) = uncatalogued_area_name(snapshot, None, stat.st_dev, stat.st_ino)
+            {
+                return Some(PropertyOpen::Live(format!(
+                    "{name} is in the property area but not in its snapshot"
+                )));
+            }
+            // No object: an `O_CREAT` whose parent resolves into the area
+            // would create a late file there. Refuse it before creation.
+            if object.is_none()
+                && call.flags().contains(OFlag::O_CREAT)
+                && let Some(name) = area_parent_name(snapshot, path)
+            {
+                return Some(PropertyOpen::Live(format!(
+                    "{name} is in the property area but not in its snapshot"
+                )));
+            }
+        }
         match (copied, in_area) {
             (Some(file), _) if !pure_read => Some(PropertyOpen::Live(format!(
                 "it opens the property file {} to read and also to write, create or truncate \
@@ -5887,6 +5927,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     snapshot.copy_dir.display()
                 ))
             }),
+            (None, Some(name)) if opens_readable(call.flags()) => {
+                Some(PropertyOpen::Live(format!(
+                    "{name} is in the property area but not in its snapshot",
+                    name = name.to_string_lossy()
+                )))
+            }
             (None, Some(name)) => Some(PropertyOpen::Unknown(name.to_string_lossy().into_owned())),
             (None, None) => None,
         }
@@ -6513,16 +6559,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // A file in the property area the snapshot does not hold,
                 // which this open reached live: one made after the snapshot.
                 let live_read = match property_unknown.take() {
-                    Some(name) => Some(format!(
+                    // Only a readable descriptor is refused: an `O_PATH`
+                    // descriptor reads nothing (its `read` is `EBADF`
+                    // natively), so it stays usable, as native Linux
+                    // leaves it. A later readable reopen is a new open
+                    // and is decided there.
+                    Some(name) if opens_readable(call.flags()) => Some(format!(
                         "{name} is in the property area but not in its snapshot"
                     )),
+                    Some(_) => None,
                     None if property_copy.is_none()
                         && self.cfg.property_snapshot.is_some()
-                        && (is_pure_read(call.flags()) || opens_readable(call.flags())) =>
+                        && opens_readable(call.flags()) =>
                     {
-                        // A pure read, or an open that also reads, that may
-                        // have reached the live area, or could not be
-                        // checked, is refused fail-closed.
+                        // A readable open that may have reached the live
+                        // area, or could not be checked, is refused
+                        // fail-closed. `O_PATH` is excluded here too:
+                        // `opens_readable` is false for it.
                         match Box::pin(self.property_reached_live(guest, fd, host_stat.as_ref()))
                             .await
                         {
