@@ -96,6 +96,8 @@ fn refusal_name(reason: &Refusal) -> &'static str {
         Refusal::Registers(_) => "register-constraint",
         Refusal::UnsupportedOperation => "unsupported-operation",
         Refusal::BranchOutOfRange => "branch-out-of-range",
+        Refusal::ConditionalCas => "conditional-cas",
+        Refusal::UnknownDirectBranch => "unknown-direct-branch",
         Refusal::Relocated => "relocation-inside-the-sequence",
     }
 }
@@ -259,6 +261,28 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
             rewrite::direct_branch_targets(&words, *vaddr)
         })
         .collect();
+    // The same collection, for the fail-closed entry rule: a possible
+    // direct branch with an unknown target in any section could reach
+    // any other, so its presence refuses every section's rewrites.
+    let any_unknown_direct_branch = sections.iter().any(|(offset, filesz, _, _)| {
+        let start = *offset as usize;
+        let Some(end) = offset
+            .checked_add(*filesz)
+            .and_then(|end| usize::try_from(end).ok())
+            .filter(|end| *end <= bytes.len() && start.is_multiple_of(4))
+        else {
+            return false;
+        };
+        (0..(end - start) / 4).any(|i| {
+            let at = start + 4 * i;
+            rewrite::unknown_direct_branch_possible(u32::from_le_bytes([
+                bytes[at],
+                bytes[at + 1],
+                bytes[at + 2],
+                bytes[at + 3],
+            ]))
+        })
+    });
     let mut report = FileReport::default();
     let mut patches = Vec::new();
     if relr_unreadable {
@@ -296,6 +320,19 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
             })
             .collect();
         let mut plan = rewrite::plan_with_external_targets(&words, vaddr, &external_targets);
+        // An unknown possible direct branch in ANY executable section
+        // could be aimed into this one, so no section's sites rewrite.
+        if any_unknown_direct_branch {
+            let unknown: Vec<rewrite::RefusedSite> = plan
+                .patched
+                .drain(..)
+                .map(|site| rewrite::RefusedSite {
+                    addr: site.addr,
+                    reason: rewrite::Refusal::UnknownDirectBranch,
+                })
+                .collect();
+            plan.refused.extend(unknown);
+        }
         // A relocation inside a sequence means the loader will write those
         // bytes itself, for the instruction that used to be there.
         if !relocated.is_empty() {

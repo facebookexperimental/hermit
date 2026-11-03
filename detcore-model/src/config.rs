@@ -1717,6 +1717,34 @@ fn parse_virtual_cpus(value: &str) -> Result<NonZeroU32, String> {
         })
 }
 
+/// Why a run may not rewrite exclusive loops in the guest's memory
+/// ([`Config::rewrite_exclusives_in_memory_refusal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteExclusivesRefusal {
+    /// The host does not execute the FEAT_LSE atomics the rewrite emits.
+    HostLacksLseAtomics,
+    /// Threads run concurrently, so one could execute code Detcore writes.
+    ThreadsNotSequentialized,
+}
+
+impl std::fmt::Display for RewriteExclusivesRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HostLacksLseAtomics => write!(
+                f,
+                "rewriting exclusive loops in the guest's memory rewrites them into FEAT_LSE \
+                 atomic instructions, which this host does not execute (no HWCAP_ATOMICS); \
+                 the rewritten image would raise SIGILL"
+            ),
+            Self::ThreadsNotSequentialized => write!(
+                f,
+                "rewriting exclusive loops in the guest's memory writes code that another \
+                 thread could be running; run with threads sequentialized"
+            ),
+        }
+    }
+}
+
 impl Config {
     /// How many CPUs the guest sees: `--virtual-cpus`, or Hermit's
     /// historical one.
@@ -1833,6 +1861,29 @@ impl Config {
             "max_timeslice must be at least one RCB ({} virtual nanoseconds)",
             minimum_max_timeslice
         );
+    }
+
+    /// Whether this run may rewrite exclusive loops in the guest's memory,
+    /// given whether the host executes FEAT_LSE atomics. `None` admits the
+    /// run. Every launch path checks this at Detcore's operational
+    /// admission, so a library caller gets the CLI's refusal without
+    /// running the CLI's validator: without LSE a rewritten site would
+    /// raise SIGILL, and with threads running concurrently one could be
+    /// inside the code while Detcore writes it.
+    pub fn rewrite_exclusives_in_memory_refusal(
+        &self,
+        host_has_lse_atomics: bool,
+    ) -> Option<RewriteExclusivesRefusal> {
+        if !self.rewrite_exclusives_in_memory {
+            return None;
+        }
+        if !self.sequentialize_threads {
+            return Some(RewriteExclusivesRefusal::ThreadsNotSequentialized);
+        }
+        if !host_has_lse_atomics {
+            return Some(RewriteExclusivesRefusal::HostLacksLseAtomics);
+        }
+        None
     }
 
     /// Sanity check the flags, and update any wherever flag B is implied by A.
@@ -5846,6 +5897,35 @@ mod tests {
             .unwrap_err();
         assert!(message.contains("at least 1"), "{message}");
         assert!(message.contains("at most 1000000000"), "{message}");
+    }
+
+    /// The in-memory rewrite admission every launch path applies: a host
+    /// without LSE and a run with concurrent threads are each refused,
+    /// and the serialized run on an LSE host is admitted.
+    #[test]
+    fn rewrite_exclusives_in_memory_admission_refuses_what_the_cli_refuses() {
+        let on = Config {
+            rewrite_exclusives_in_memory: true,
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        assert_eq!(
+            on.rewrite_exclusives_in_memory_refusal(false),
+            Some(RewriteExclusivesRefusal::HostLacksLseAtomics)
+        );
+        let concurrent = Config {
+            sequentialize_threads: false,
+            ..on.clone()
+        };
+        assert_eq!(
+            concurrent.rewrite_exclusives_in_memory_refusal(true),
+            Some(RewriteExclusivesRefusal::ThreadsNotSequentialized)
+        );
+        assert_eq!(on.rewrite_exclusives_in_memory_refusal(true), None);
+        assert_eq!(
+            Config::default().rewrite_exclusives_in_memory_refusal(false),
+            None
+        );
     }
 
     /// `rewrite_exclusives_in_memory` never enters the legacy form, whatever its value: the

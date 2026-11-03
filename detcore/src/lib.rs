@@ -4150,6 +4150,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         {
             crate::scheduler::exit_on_scheduler_refusal(&refusal);
         }
+        // Rewriting exclusive loops in the guest's memory needs a host
+        // that executes the rewritten instructions and threads that
+        // cannot run the code while it is written. The CLI refuses both
+        // for its own launches; this is the same admission for every
+        // other launch path.
+        if let Some(refusal) =
+            config.rewrite_exclusives_in_memory_refusal(crate::aarch64_lse::host_has_lse_atomics())
+        {
+            return Err(reverie::Error::Tool(anyhow::anyhow!(refusal)));
+        }
         T::facility_admission(config)
     }
 

@@ -165,6 +165,13 @@ pub enum Insn {
         /// Byte offset from this instruction.
         offset: i64,
     },
+    /// FEAT_CMPBR compare-and-branch (CB<cc> register/immediate,
+    /// CBB<cc>, CBH<cc>): a PC-relative direct branch whose target the
+    /// entry analysis needs; never part of a supported loop idiom.
+    CompareAndBranch {
+        /// Byte offset from this instruction (signed imm9, times 4).
+        offset: i64,
+    },
     /// B.cond.
     CondBranch {
         /// The condition code.
@@ -381,11 +388,25 @@ pub fn decode(word: u32) -> Insn {
             offset: sign_extend((word >> 5) & 0x3fff, 14) * 4,
         };
     }
-    // Conditional branch (immediate): 0101010 o1 imm19 o0 cond.
-    if (word >> 24) & 0xff == 0b0101_0100 && (word >> 4) & 1 == 0 {
+    // Conditional branch (immediate): 0101010 o1 imm19 o0 cond. Bit 4
+    // (o0) set is FEAT_HBC's BC.cond, the same direct branch with the
+    // same signed imm19 target, so both decode as `CondBranch`: an
+    // interior entry by BC.cond is collected like one by B.cond.
+    if (word >> 24) & 0xff == 0b0101_0100 {
         return Insn::CondBranch {
             cond: word & 0xf,
             offset: sign_extend((word >> 5) & 0x7ffff, 19) * 4,
+        };
+    }
+    // FEAT_CMPBR compare-and-branch: bits 30:24 = 111010x, signed imm9
+    // at bits 13:5 (times 4). Register form (1110100, bits 15:14 = 00),
+    // immediate form (1110101, bit 14 = 0), and the byte/halfword forms
+    // CBB/CBH (1110100 with bit 31 = 0, bits 15:14 = 10/11).
+    if (word >> 24) & 0x7e == 0b1110100
+        && !((word >> 24) & 0x7f == 0b1110100 && (word >> 14) & 0x3 == 0b01)
+    {
+        return Insn::CompareAndBranch {
+            offset: sign_extend((word >> 5) & 0x1ff, 9) * 4,
         };
     }
     // Unconditional branch (immediate): op 00101 imm26.
@@ -608,6 +629,33 @@ mod tests {
                 offset: 12
             }
         );
+    }
+
+    #[test]
+    fn a_bc_cond_decodes_as_the_conditional_branch_it_is() {
+        // BC.ne .+8 (FEAT_HBC): 01010100 imm19 1 cond, differing from B.cond
+        // only in bit 4, with the same signed imm19 target computation.
+        assert_eq!(decode(0x5400_0051), Insn::CondBranch { cond: 1, offset: 8 });
+        // B.ne .+12 for contrast.
+        assert_eq!(
+            decode(0x5400_0061),
+            Insn::CondBranch {
+                cond: 1,
+                offset: 12
+            }
+        );
+    }
+
+    #[test]
+    fn cmpbr_branches_decode_with_their_signed_imm9_target() {
+        // CBEQ X6, X6, .+8; CBGT (immediate) .+8; CBBEQ .+8; CBHEQ .+8.
+        for word in [0xf4c6_0046, 0xf5c0_0046, 0x74c6_8046, 0x74c6_c046] {
+            assert_eq!(
+                decode(word),
+                Insn::CompareAndBranch { offset: 8 },
+                "{word:#x}"
+            );
+        }
     }
 
     #[test]

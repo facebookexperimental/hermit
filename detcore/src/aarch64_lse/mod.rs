@@ -27,3 +27,21 @@
 pub mod elf;
 pub mod insn;
 pub mod rewrite;
+
+/// Whether this host executes the FEAT_LSE atomics the rewrite emits.
+///
+/// The rewritten image is a program for the machine that is about to run
+/// it: without FEAT_LSE every rewritten site would raise SIGILL.
+pub fn host_has_lse_atomics() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // HWCAP_ATOMICS, Linux Documentation/arch/arm64/elf_hwcaps.rst.
+        const HWCAP_ATOMICS: libc::c_ulong = 1 << 8;
+        // SAFETY: getauxval reads the process's own auxiliary vector.
+        (unsafe { libc::getauxval(libc::AT_HWCAP) } & HWCAP_ATOMICS) != 0
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
