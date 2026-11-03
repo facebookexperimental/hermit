@@ -1721,8 +1721,9 @@ mod tests {
         assert!(noting.notes_background_starts());
         let re_record = PreemptionRecord::from_sched_events(events.clone())
             .with_format(Some(BACKGROUND_STARTS_FORMAT - 1));
-        let args = crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
-        let crate::Subcommand::Analyze(mut options) = args.command else {
+        let args =
+            crate::app::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+        let crate::app::Subcommand::Analyze(mut options) = args.command else {
             panic!("not analyze")
         };
         options.apply_global(&args.global);
