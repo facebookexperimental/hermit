@@ -23,6 +23,9 @@ use crate::app::container::PolicyRefusal;
 /// How often the budget's watchdog reads the process's memory.
 const WATCH_INTERVAL: Duration = Duration::from_millis(100);
 
+/// The name of the watchdog's thread.
+const WATCHDOG_THREAD: &str = "memory-budget";
+
 /// How much memory the process of `hermit analyze` or `hermit bisect` may
 /// hold, resident or swapped out (`RssAnon` plus `VmSwap`): the schedules and
 /// the search's working set. Each trial runs in a child process, which this
@@ -119,10 +122,12 @@ impl MemoryBudget {
         // runs, and only the cloning thread lives on in a container. So the
         // loop takes no lock, allocates nothing and leaves signal
         // dispositions alone (the rule `ContainerInitStopSignalBridge::install`
-        // states); only a refusal allocates, as the process exits.
-        std::thread::Builder::new()
-            .name("memory-budget".to_owned())
-            .spawn(move || {
+        // states); only a refusal allocates, as the process exits. The thread
+        // blocks the stop signals from its start, so analyze's stop handler,
+        // installed after it, never runs on it.
+        super::stop::spawn_blocking_stop_signals(
+            std::thread::Builder::new().name(WATCHDOG_THREAD.to_owned()),
+            move || {
                 while !stopped.load(Ordering::Relaxed) {
                     if let Some(held) = held_memory()
                         && held > budget
@@ -132,7 +137,8 @@ impl MemoryBudget {
                     }
                     std::thread::sleep(WATCH_INTERVAL);
                 }
-            })?;
+            },
+        )?;
         Ok(MemoryWatchdog(Some(stop)))
     }
 }
@@ -328,6 +334,63 @@ mod tests {
         assert_eq!(kibibyte_field(status, b"RssAnon:"), Some(1 << 20));
         assert_eq!(kibibyte_field(status, b"VmSwap:"), None);
         assert!(held_memory().is_some_and(|bytes| bytes > 0));
+    }
+
+    /// The bits of the stop signals in a `SigBlk` mask of
+    /// `/proc/<pid>/task/<tid>/status`, one bit per signal from bit 0 for
+    /// signal 1 (`render_sigset_t`,
+    /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/proc/array.c?h=v6.9#n227>).
+    fn stop_signals_blocked(status: &str) -> [bool; 3] {
+        let mask = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigBlk:"))
+            .map(|mask| u64::from_str_radix(mask.trim(), 16).unwrap())
+            .unwrap_or_else(|| panic!("no SigBlk line in {status}"));
+        [libc::SIGTERM, libc::SIGINT, libc::SIGHUP].map(|signal| mask & (1 << (signal - 1)) != 0)
+    }
+
+    /// The watchdog's thread blocks SIGTERM, SIGINT and SIGHUP from its
+    /// start, so analyze's stop handler, installed after it, never runs on it
+    /// (`stop::spawn_blocking_stop_signals`); the thread that started it
+    /// blocks them no more than before.
+    #[test]
+    fn the_watchdog_thread_blocks_the_stop_signals() {
+        let before = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        let _watchdog = MemoryBudget::Bytes(u64::MAX)
+            .enforce("hermit analyze")
+            .unwrap();
+        // The thread names itself as it starts, after the kernel gave it its
+        // mask at creation: once the name shows, the mask is the one to read.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let watchdogs: Vec<String> = loop {
+            let found: Vec<String> = std::fs::read_dir("/proc/self/task")
+                .unwrap()
+                .filter_map(|task| {
+                    let task = task.ok()?.path();
+                    let comm = std::fs::read_to_string(task.join("comm")).ok()?;
+                    (comm.trim_end() == WATCHDOG_THREAD)
+                        .then(|| std::fs::read_to_string(task.join("status")).ok())
+                        .flatten()
+                })
+                .collect();
+            if !found.is_empty() {
+                break found;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the watchdog thread never started"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(watchdogs.len(), 1, "{watchdogs:?}");
+        assert_eq!(
+            stop_signals_blocked(&watchdogs[0]),
+            [true; 3],
+            "{}",
+            watchdogs[0]
+        );
+        let after = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        assert_eq!(stop_signals_blocked(&after), stop_signals_blocked(&before));
     }
 
     /// The marker under which [`growth_past_the_budget_ends_the_process`]

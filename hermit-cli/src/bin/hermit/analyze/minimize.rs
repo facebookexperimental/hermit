@@ -311,6 +311,12 @@ impl AnalyzeOpts {
                             let preempts = remaining_unknown.get_mut(&selected_tid).unwrap();
                             preempts.append(&mut cut);
                         }
+                        // A cut of the thread's last untested interventions
+                        // took it out of consideration; they are untested
+                        // again, so it is back in.
+                        if !remaining_threads.contains(&selected_tid) {
+                            remaining_threads.push(selected_tid);
+                        }
                         continue;
                     }
                 }
@@ -386,6 +392,46 @@ mod tests {
                 "minimization ran more trials after trial {failing_trial} failed"
             );
         }
+    }
+
+    /// When a cut that took a thread's last untested interventions fails,
+    /// those go back to be tested again in smaller batches, so the result
+    /// holds only interventions found critical. Before, the thread was not
+    /// taken up again: its interventions stayed in the "minimized" record
+    /// untested, and the count printed left them out.
+    #[test]
+    fn a_failed_cut_of_a_threads_last_interventions_is_tested_again() {
+        let workspace = tempfile::tempdir().unwrap();
+        let preempts_path = workspace.path().join("target.preempts");
+        let critical = FIRST_PRIORITY + 1;
+        let history: Vec<(LogicalTime, Priority)> = (1..=8)
+            .map(|k| (LogicalTime::from_nanos(k * 1000), FIRST_PRIORITY + k))
+            .collect();
+        PreemptionRecord::from_vecs(&BTreeMap::from([(DetTid::from_raw(3), history)]))
+            .write_to_disk(&preempts_path)
+            .unwrap();
+        let options =
+            AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
+                .unwrap();
+        let has_critical = |record: &PreemptionRecord| {
+            record
+                .as_vecs()
+                .values()
+                .any(|history| history.iter().any(|(_, prio)| *prio == critical))
+        };
+        let (minimized, _, _) = options
+            .minimize_with(&preempts_path, |_runname, trial_preempts| {
+                Ok(has_critical(
+                    &PreemptionReader::new(trial_preempts).load_all(),
+                ))
+            })
+            .unwrap();
+        let left: Vec<Priority> = minimized
+            .as_vecs()
+            .values()
+            .flat_map(|history| history.iter().map(|(_, prio)| *prio))
+            .collect();
+        assert_eq!(left, [critical], "{minimized}");
     }
 }
 

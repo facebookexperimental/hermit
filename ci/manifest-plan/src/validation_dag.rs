@@ -6377,6 +6377,53 @@ sys.exit(37)
         refuse(OUTPUT, "the file", text);
     }
 
+    /// The PMU analyze node runs these ignored integrations of
+    /// hermit-cli/tests/analyze.rs by exact name, in both the authored and
+    /// the generated DAG, and its description names them; and the tests
+    /// still exist. A rename or a lost selector fails here, not as a node
+    /// that runs fewer tests than its pin.
+    #[test]
+    fn the_pmu_analyze_node_runs_the_ignored_analyze_integrations() {
+        let source = include_str!("../../../hermit-cli/tests/analyze.rs");
+        for case in [
+            // The workspace change's.
+            "analyze_keeps_its_workspace_after_an_error",
+            "analyze_cleans_up_when_a_signal_stops_it",
+            "analyze_stops_a_run_whose_init_has_not_armed",
+        ] {
+            assert!(
+                source.contains(&format!("fn {case}()")),
+                "{case} is not in hermit-cli/tests/analyze.rs"
+            );
+            for (origin, dag) in [
+                (
+                    "validation_dag_static",
+                    crate::validation_dag_static::config(),
+                ),
+                (
+                    OUTPUT,
+                    dag_from_json(include_str!("../../dag/validate.json")).unwrap(),
+                ),
+            ] {
+                let step = dag
+                    .steps
+                    .iter()
+                    .find(|step| {
+                        step.tag() == "super.pmu_analyze_hello_race_stress_calibrated_skid"
+                    })
+                    .unwrap();
+                assert!(
+                    step.cmd.contains(&format!("test(={case})")),
+                    "{origin}: {case}"
+                );
+                assert!(
+                    step.description.contains(case),
+                    "{origin}: {case} description"
+                );
+            }
+        }
+    }
+
     /// This guest spins without committing calls: only a PMU preemption
     /// ends its slice. Both authored and generated DAGs must select it in
     /// the PMU lane and exclude it from the ordinary CLI lanes.

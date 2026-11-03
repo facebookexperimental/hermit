@@ -27,13 +27,17 @@
 mod hermit_test;
 
 use std::fs;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
+use std::time::Duration;
+use std::time::Instant;
 
 static ANALYZE_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<AnalyzeWorkloads> = OnceLock::new();
@@ -94,6 +98,55 @@ fn repository() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository")
+}
+
+/// The `--tmp-dir` a test's analysis creates its workspace in, beside its
+/// report. Analyze removes the workspace when it exits, unless `--keep-tmp`.
+fn tmp_dir_in(report_dir: &Path) -> PathBuf {
+    report_dir.join("workspaces")
+}
+
+/// What an analysis left in its `--tmp-dir` (or any directory).
+fn left_in(dir: &Path) -> Vec<PathBuf> {
+    match fs::read_dir(dir) {
+        Ok(entries) => entries.map(|entry| entry.unwrap().path()).collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("cannot list {}: {error}", dir.display()),
+    }
+}
+
+/// An analysis that has exited left no workspace in `tmp_dir`: one that
+/// finished, or one a stop signal ended.
+fn assert_no_workspace_left(label: &str, tmp_dir: &Path, combined: &str) {
+    let left = left_in(tmp_dir);
+    assert!(
+        left.is_empty(),
+        "{label}: analyze left {left:?} in its --tmp-dir\n{combined}"
+    );
+}
+
+/// An analysis that ended with an error kept its one workspace in `tmp_dir`,
+/// said why on the line that names it, and the workspace still holds
+/// `evidence`, files of the trials the error is about.
+fn assert_workspace_kept_after_error(
+    label: &str,
+    tmp_dir: &Path,
+    combined: &str,
+    evidence: &[&str],
+) {
+    let left = left_in(tmp_dir);
+    assert!(
+        left.len() == 1 && evidence.iter().all(|file| left[0].join(file).is_file()),
+        "{label}: analyze kept {left:?} in its --tmp-dir, not one workspace holding \
+         {evidence:?}\n{combined}"
+    );
+    assert!(
+        combined.contains(&format!(
+            ":: Kept the workspace at {} (the error above can name files in it)",
+            left[0].display()
+        )),
+        "{label}: analyze did not say it kept the workspace for the error\n{combined}"
+    );
 }
 
 fn compile_c_pthread(source: &Path, output: &Path) {
@@ -186,6 +239,7 @@ fn run_analyze(
     let _guard = analyze_lock();
     let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
     let report_file = report_dir.path().join("report.json");
+    let tmp_dir = tmp_dir_in(report_dir.path());
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.arg("analyze");
@@ -193,6 +247,7 @@ fn run_analyze(
     add_calibrated_skid_margin(&mut command, label);
     command
         .arg(format!("--report-file={}", report_file.display()))
+        .arg(format!("--tmp-dir={}", tmp_dir.display()))
         .args(["--analyze-seed=0", "--search", "--"])
         // Arguments forwarded to the underlying `hermit run` invocations:
         .args(["--chaos", "--summary", "--max-timeslice=400000", "--"])
@@ -209,6 +264,9 @@ fn run_analyze(
         combined.contains("Stack trace for thread"),
         "{label}: hermit analyze did not print a guest stack trace\n{combined}"
     );
+    // The report is the user's; the workspace is analyze's.
+    assert!(report_file.is_file(), "{label}: no report\n{combined}");
+    assert_no_workspace_left(label, &tmp_dir, &combined);
     // Automatic bounds grow with completed endpoint measurements. The exact
     // formula is unit-tested; a slow host may legitimately announce more than 60.
     let bounds: Vec<u64> = combined
@@ -281,6 +339,7 @@ fn run_analyze_expect_baseline_collision(label: &str, guest: &Path, analyze_opts
     let _guard = analyze_lock();
     let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
     let report_file = report_dir.path().join("report.json");
+    let tmp_dir = tmp_dir_in(report_dir.path());
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.arg("analyze");
@@ -288,6 +347,7 @@ fn run_analyze_expect_baseline_collision(label: &str, guest: &Path, analyze_opts
     add_calibrated_skid_margin(&mut command, label);
     command
         .arg(format!("--report-file={}", report_file.display()))
+        .arg(format!("--tmp-dir={}", tmp_dir.display()))
         .args(["--analyze-seed=0", "--search", "--"])
         .args(["--chaos", "--summary", "--preemption-timeout=400000", "--"])
         .arg(guest);
@@ -307,6 +367,14 @@ fn run_analyze_expect_baseline_collision(label: &str, guest: &Path, analyze_opts
     assert!(
         combined.contains("baseline run matched target criteria when it should not"),
         "{label}: analyze did not reject indistinguishable endpoints\n{combined}"
+    );
+    // The error is about the baseline run: its reproducer and the output that
+    // met the target stay to be read.
+    assert_workspace_kept_after_error(
+        label,
+        &tmp_dir,
+        &combined,
+        &["run2_baseline.repro", "run2_baseline.stdout"],
     );
 }
 
@@ -848,6 +916,7 @@ fn analyze_race_then_with(
     let seed = race_then_target_seed_matching(then, run_args);
     let dir = tempfile::tempdir().unwrap();
     let report_file = dir.path().join("report.json");
+    let tmp_dir = tmp_dir_in(dir.path());
     let mut command = Command::new("timeout");
     command
         .args(["--signal=KILL", "120s"])
@@ -860,7 +929,8 @@ fn analyze_race_then_with(
         ])
         .args(analyze_opts)
         .arg(format!("--run1-seed={seed}"))
-        .arg(format!("--report-file={}", report_file.display()));
+        .arg(format!("--report-file={}", report_file.display()))
+        .arg(format!("--tmp-dir={}", tmp_dir.display()));
     add_calibrated_skid_margin(&mut command, then);
     command
         .args(["--", "--chaos"])
@@ -869,6 +939,16 @@ fn analyze_race_then_with(
         .arg(&workloads().race_then)
         .arg(then);
     let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    if output.status.success() {
+        assert_no_workspace_left(&format!("{command:?}"), &tmp_dir, &combined_output(&output));
+    } else {
+        assert_workspace_kept_after_error(
+            &format!("{command:?}"),
+            &tmp_dir,
+            &combined_output(&output),
+            &["run1_target.repro"],
+        );
+    }
     let report = fs::read_to_string(&report_file).ok().map(|text| {
         serde_json::from_str(&text).unwrap_or_else(|error| {
             panic!("unreadable report: {error}\n{}", combined_output(&output))
@@ -912,8 +992,8 @@ fn analyze_continues_prefixes_at_a_coarser_timeslice() {
 }
 
 /// The same race with `--continuation-timeslice=100000`: there is no other
-/// continuation to try, so analyze fails, saying that the outcome does not
-/// depend on a chaos decision and what to run or pass instead.
+/// continuation to try, so analyze fails, saying what its empty-prefix trial
+/// observed (no miss to bisect against) and what to run or pass instead.
 #[test]
 #[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_explains_a_target_the_scheduler_meets_alone() {
@@ -926,8 +1006,10 @@ fn analyze_explains_a_target_the_scheduler_meets_alone() {
     let combined = combined_output(&output);
     assert!(!output.status.success(), "{label}\n{combined}");
     for expected in [
-        "no event of the target schedule decides the outcome: without chaos, the scheduler alone \
-         already meets the target criteria at a 100000 ns timeslice",
+        "no continuation gives the prefix search a miss to bisect against: replaying none of the \
+         target schedule and then scheduling without chaos, the scheduler alone already meets \
+         the target criteria at a 100000 ns timeslice",
+        "a longer prefix may still miss the target",
         "prefix_round_001.repro",
         "pass --continuation-timeslice",
         "--run2-seed",
@@ -937,4 +1019,193 @@ fn analyze_explains_a_target_the_scheduler_meets_alone() {
             "{label}: no {expected:?}\n{combined}"
         );
     }
+}
+
+/// An analysis that ends with an error keeps its workspace, with or without
+/// `--keep-tmp`, since the error can name trial files in it (main's
+/// `incomplete_trial` says they are retained): the target run here misses a
+/// target nothing prints, and without `--search` analyze ends there.
+#[test]
+#[ignore = "slow: runs a chaos trial; requires PMU branch counters and working mount namespaces"]
+fn analyze_keeps_its_workspace_after_an_error() {
+    for keep in [false, true] {
+        let label = format!("analyze hello_race, target never met, keep: {keep}");
+        let _guard = analyze_lock();
+        let dir = tempfile::tempdir().expect("failed to create analyze directory");
+        let tmp_dir = tmp_dir_in(dir.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            .arg("analyze")
+            .arg(format!("--tmp-dir={}", tmp_dir.display()))
+            .args(["--run-arg=--base-env=host", "--target-stdout=never printed"]);
+        if keep {
+            command.arg("--keep-tmp");
+        }
+        command
+            .args(["--", "--chaos", "--max-timeslice=400000", "--"])
+            .arg(&workloads().hello_race);
+        let output = hermit_test::hermit_output(&label, &mut command);
+        let combined = combined_output(&output);
+        assert!(
+            !output.status.success()
+                && combined.contains("The run did not match the target criteria"),
+            "{label}: {}\n{combined}",
+            output.status
+        );
+        let left = left_in(&tmp_dir);
+        assert!(
+            left.len() == 1 && left[0].join("run1_target.repro").is_file(),
+            "{label}: {left:?}\n{combined}"
+        );
+        assert!(
+            combined.contains(if keep {
+                "Kept the workspace at"
+            } else {
+                "(the error above can name files in it)"
+            }),
+            "{label}\n{combined}"
+        );
+    }
+}
+
+/// Makes a container init wait before it arms its own stop handlers, under
+/// the thread name [`ARMING_STALL_COMM`]; both are copied from
+/// `stall_container_init_before_arming_if_asked` in `bin/hermit/container.rs`.
+const ARMING_STALL_ENV: &str = "HERMIT_INTERNAL_STALL_CONTAINER_INIT_BEFORE_ARMING";
+const ARMING_STALL_COMM: &str = "unarmed-init";
+
+/// The children of process `parent`, by the parent field of each
+/// `/proc/<pid>/stat`.
+fn children_of(parent: u32) -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse::<u32>().ok())
+                    == Some(parent)
+            })
+        })
+        .collect()
+}
+
+/// Run `hermit analyze` over a target run that spins for ever, with `env`,
+/// send SIGTERM to analyze alone once `ready` says so, and check that it ends
+/// that run and the analysis: analyze removes its workspace and the run's own
+/// temporary directories (its private /tmp, in TMPDIR), leaves no process,
+/// and dies of the signal, as a shell reports with 143.
+fn analyze_stopped_by_sigterm(label: &str, env: &[(&str, &str)], ready: impl Fn(u32) -> bool) {
+    let _guard = analyze_lock();
+    let dir = tempfile::tempdir().expect("failed to create analyze directory");
+    let tmp_dir = tmp_dir_in(dir.path());
+    let run_tmp = dir.path().join("TMPDIR");
+    fs::create_dir(&run_tmp).unwrap();
+    let stderr = dir.path().join("stderr");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    hermit_test::pin_canonical_epoch(&mut command);
+    command
+        .arg("analyze")
+        .arg(format!("--tmp-dir={}", tmp_dir.display()))
+        .args(["--", "--chaos", "--max-timeslice=400000", "--"])
+        .args(["/bin/sh", "-c", "while :; do :; done"])
+        .env("TMPDIR", &run_tmp)
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&stderr).unwrap());
+    let mut analyze = command.spawn().expect("failed to start hermit analyze");
+    let said = || fs::read_to_string(&stderr).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !ready(analyze.id()) {
+        assert!(
+            analyze.try_wait().unwrap().is_none() && Instant::now() < deadline,
+            "{label}: analyze did not get as far as the signal\n{}",
+            said()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let inits = children_of(analyze.id());
+    // SAFETY: kill(2) on this test's own child.
+    assert_eq!(
+        unsafe { libc::kill(analyze.id() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = analyze.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = analyze.kill();
+            let _ = analyze.wait();
+            panic!("{label}: analyze did not stop\n{}", said());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let said = said();
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "{label}: {status}\n{said}"
+    );
+    assert!(
+        said.contains("hermit analyze stopped on SIGTERM")
+            && said.contains("Removed the workspace"),
+        "{label}\n{said}"
+    );
+    assert_no_workspace_left(label, &tmp_dir, &said);
+    let run_left = left_in(&run_tmp);
+    assert!(
+        run_left.is_empty(),
+        "{label}: the run left {run_left:?} in TMPDIR\n{said}"
+    );
+    // Analyze reaped the run's container init before it exited.
+    let survivors: Vec<_> = inits
+        .iter()
+        .filter(|init| Path::new(&format!("/proc/{init}")).exists())
+        .collect();
+    assert!(
+        survivors.is_empty(),
+        "{label}: the run's init {survivors:?} outlived analyze\n{said}"
+    );
+}
+
+/// SIGTERM sent to analyze alone, 2 s into a target run that spins for ever,
+/// ends that run and the analysis, and analyze cleans up. Before, the
+/// workspace stayed behind whatever ended analyze, and a SIGTERM also left
+/// the run's directories.
+#[test]
+#[ignore = "slow: runs a chaos trial; requires PMU branch counters and working mount namespaces"]
+fn analyze_cleans_up_when_a_signal_stops_it() {
+    let started = std::cell::Cell::new(None);
+    analyze_stopped_by_sigterm("analyze of a guest that spins, SIGTERM", &[], |analyze| {
+        // The target run's container init is analyze's only child.
+        let at = started
+            .get()
+            .or((!children_of(analyze).is_empty()).then(Instant::now));
+        started.set(at);
+        at.is_some_and(|at| at.elapsed() >= Duration::from_secs(2))
+    });
+}
+
+/// SIGTERM sent to analyze while its run's container init is held before
+/// it arms its own stop handlers (Hermit's internal stall) reaches that init
+/// all the same: the handler it inherited from analyze ends it as its own
+/// would, and analyze cleans up.
+#[test]
+#[ignore = "slow: runs a chaos trial; requires PMU branch counters and working mount namespaces"]
+fn analyze_stops_a_run_whose_init_has_not_armed() {
+    analyze_stopped_by_sigterm(
+        "analyze, SIGTERM before the run's init arms",
+        &[(ARMING_STALL_ENV, "1")],
+        |analyze| {
+            children_of(analyze).iter().any(|init| {
+                fs::read_to_string(format!("/proc/{init}/comm"))
+                    .is_ok_and(|comm| comm.trim() == ARMING_STALL_COMM)
+            })
+        },
+    );
 }

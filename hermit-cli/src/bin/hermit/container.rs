@@ -5000,7 +5000,48 @@ pub(super) fn arm_container_init_guards() -> Result<(), SerializableError> {
     // above will never send it, so stop here instead.
     super::tracing::exit_if_log_cap_already_crossed();
     install_container_init_stop_handlers().map_err(SerializableError::from)?;
+    // Last, before anything can start a guest: a stop signal the parent took
+    // before it forked this init reached no init, so act on it here.
+    exit_if_stop_requested();
     Ok(())
+}
+
+/// The stop signal (SIGTERM, SIGINT or SIGHUP) that the `hermit` process has
+/// taken and acts on itself, or 0. `hermit analyze`'s handler sets it
+/// (`analyze::stop`) and passes the signal on to the container init of the
+/// run in progress, but a signal that arrives before that init is forked
+/// reaches no init. The init then copies this value at the fork and exits at
+/// [`exit_if_stop_requested`] instead of starting its guest. A signal that
+/// is pending when the fork starts is handled before the child is created
+/// (`copy_process`,
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?h=v6.9#n2201>),
+/// so the child copies it, and one that arrives during the fork is handled
+/// after it, when the child is there to be signalled.
+static STOP_REQUESTED: AtomicI32 = AtomicI32::new(0);
+
+/// Record `signal` in [`STOP_REQUESTED`] unless a signal is recorded
+/// already. Async-signal-safe.
+pub(super) fn request_stop(signal: libc::c_int) {
+    let _ = STOP_REQUESTED.compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+/// The first stop signal [`request_stop`] recorded in this process, or in the
+/// process that forked it before the fork.
+pub(super) fn stop_requested() -> Option<libc::c_int> {
+    match STOP_REQUESTED.load(Ordering::SeqCst) {
+        0 => None,
+        signal => Some(signal),
+    }
+}
+
+/// Exit 128 + signo, as the container init's own stop handler does
+/// ([`on_container_init_stop_signal`]), if a stop signal is recorded.
+/// Async-signal-safe.
+pub(super) fn exit_if_stop_requested() {
+    if let Some(signal) = stop_requested() {
+        // SAFETY: `_exit` has no preconditions and is async-signal-safe.
+        unsafe { libc::_exit(128 + signal) }
+    }
 }
 
 /// The `run --namespace-only` counterpart of [`arm_container_init_guards`], run

@@ -5195,6 +5195,51 @@ fn a_chaos_timeslice_range_caps_the_run_at_its_max() {
     );
 }
 
+/// Analysis selects a fixed non-chaos continuation after the target run's
+/// options were validated. Every later launch and saved command must keep
+/// that maximum, including options that previously drew or resolved it.
+#[test]
+fn analyze_continuations_survive_range_and_seed_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("prefix.json");
+    let chosen = std::num::NonZeroU64::new(500_000_000);
+    detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+        .with_chaos_timeslice(chosen.map(std::num::NonZeroU64::get))
+        .write_to_disk(&record)
+        .unwrap();
+    for selection in [
+        &["--chaos-timeslice-range=1000..5000000"][..],
+        &[
+            "--chaos-timeslice-range=1000..5000000",
+            "--chaos-timeslice-draw=run",
+        ][..],
+        &["--chaos-seeded-timeslice"][..],
+    ] {
+        let mut args = vec!["hermit", "run", "--chaos", "--seed=7"];
+        args.extend_from_slice(selection);
+        args.push("/bin/true");
+        let mut options = run_opts_for(&args);
+        options.validate_args_with_perf_support(true).unwrap();
+        assert_ne!(options.det_opts.det_config.max_timeslice, chosen);
+        options.set_analysis_continuation_timeslice(chosen);
+        options.det_opts.det_config.replay_schedule_from = Some(record.clone());
+        for _ in 0..2 {
+            options.validate_args_with_perf_support(true).unwrap();
+            assert_eq!(
+                options.det_opts.det_config.max_timeslice, chosen,
+                "{selection:?}"
+            );
+            assert!(!options.det_opts.det_config.chaos);
+        }
+        let command = shell_words::split(&format!("hermit run {options}")).unwrap();
+        let words: Vec<&str> = command.iter().map(String::as_str).collect();
+        let mut repro = run_opts_for(&words);
+        repro.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(repro.det_opts.det_config.max_timeslice, chosen);
+        assert!(!repro.det_opts.det_config.chaos);
+    }
+}
+
 /// `--chaos-timeslice-draw=run` draws the run's `--max-timeslice` from the
 /// scheduler seed and keeps it for the run's record. A replay of a record that
 /// states a drawn timeslice runs under it, from a range or in place of the
@@ -11115,7 +11160,10 @@ impl RunOpts {
     /// [`Self::validate_args_with_timer_support`] for tests, with a missing
     /// timer reported as missing perf counters.
     #[cfg(test)]
-    fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
+    pub(crate) fn validate_args_with_perf_support(
+        &mut self,
+        perf_supported: bool,
+    ) -> Result<(), Error> {
         self.validate_args_with_timer_support(if perf_supported {
             Ok(())
         } else {
@@ -15129,6 +15177,36 @@ impl RunOpts {
     pub(crate) fn capture_max_timeslice_source(&mut self, matches: &clap::ArgMatches) {
         self.max_timeslice_explicit =
             matches.value_source("max_timeslice") != Some(clap::parser::ValueSource::DefaultValue);
+    }
+
+    /// Resolve the maximum a non-chaos analysis replay will use. Keep this
+    /// on the same resolution path as launch validation: a range supplies
+    /// its MAX and a seeded draw supplies its non-chaos fallback.
+    pub(crate) fn analysis_replay_max_timeslice(
+        &mut self,
+    ) -> Result<detcore_model::config::MaybeTimeslice, Error> {
+        self.det_opts.det_config.chaos = false;
+        self.resolve_chaos_timeslice_range()?;
+        self.resolve_seeded_chaos_timeslice()?;
+        Ok(self.det_opts.det_config.max_timeslice)
+    }
+
+    /// Freeze an analysis prefix trial's chosen continuation. The prefix
+    /// record carries the matching maximum; retaining a range or seeded draw
+    /// here would select a different maximum when launch validates again.
+    pub(crate) fn set_analysis_continuation_timeslice(
+        &mut self,
+        continuation: detcore_model::config::MaybeTimeslice,
+    ) {
+        self.chaos_seeded_timeslice = false;
+        self.max_timeslice_explicit = true;
+        self.chaos_timeslice_adopted = false;
+        let config = &mut self.det_opts.det_config;
+        config.chaos = false;
+        config.max_timeslice = continuation;
+        config.chaos_timeslice = None;
+        config.chaos_timeslice_range = None;
+        config.chaos_timeslice_draw = detcore_model::config::ChaosTimesliceDraw::Slice;
     }
 
     /// The maximum timeslice `--chaos-seeded-timeslice` drew from the

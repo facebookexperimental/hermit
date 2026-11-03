@@ -34,6 +34,7 @@ use reverie::process::Output;
 use tracing::metadata::LevelFilter;
 
 use crate::app::analyze::consts::*;
+use crate::app::analyze::stop;
 use crate::app::analyze::types::AnalyzeOpts;
 use crate::app::analyze::types::ContinuationTimeslice;
 use crate::app::analyze::types::TRIAL_LOG_FACTOR;
@@ -144,6 +145,43 @@ impl RunData {
         self.sched_path_in.as_ref().unwrap()
     }
 
+    /// Remove the schedules a bisection trial wrote in the workspace (the one
+    /// it replayed, the one it recorded, and that recording with event
+    /// times), once its outcome and realized schedule are read, unless
+    /// --keep-tmp keeps them. A bisection runs dozens of trials, each with
+    /// schedules as large as the endpoints' (hundreds of MB for a few million
+    /// events), which would otherwise stay until analyze exits. Only the
+    /// workspace's own names are removed, never a path from the run arguments
+    /// such as `--replay-schedule-from`, and a file the trial did not write
+    /// (an unfinished trial records no schedule) is skipped.
+    pub fn discard_schedules(&self) {
+        if self.analyze_opts.keep_tmp {
+            return;
+        }
+        for path in [
+            self.root_path().with_extension(PREEMPTS_EXT),
+            self.out_path().with_extension(PREEMPTS_EXT),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+        self.discard_timed_recording();
+    }
+
+    /// Remove the recording with event times that a run makes and analyze
+    /// rewrites without them ([`Self::post_process_events_file`]), unless
+    /// --keep-tmp keeps it: analyze reads only the rewritten one.
+    fn discard_timed_recording(&self) {
+        if !self.analyze_opts.keep_tmp {
+            let _ = std::fs::remove_file(self.timed_recording_path());
+        }
+    }
+
+    /// Where a run records its schedule with event times, which analyze then
+    /// rewrites without them to the path the run options name.
+    fn timed_recording_path(&self) -> PathBuf {
+        self.root_path().with_extension(PREEMPTS_EXT_PRESTRIPPED)
+    }
+
     /// Convenience function
     pub fn sched_out_file_name(&mut self) -> String {
         self.sched_path_out()
@@ -212,19 +250,18 @@ impl RunData {
             .map_err(anyhow::Error::msg)
     }
 
-    /// Called after the run has been launched, normalize the output preemptions and swap around so
-    /// that our output file points to the normalized version.
-    pub fn normalize_preempts_out(&mut self) {
+    /// Write a normalized copy of the output preemption record, for reading
+    /// only, beside it, and return its path and contents. The run keeps its
+    /// own record: normalization renumbers priorities across the scheduler's
+    /// fixed ones, so the copy can replay another schedule.
+    pub fn write_normalized_preempts(&mut self) -> (PathBuf, PreemptionRecord) {
         assert!(self.has_launched());
-        let preempts_path = self.preempts_path_out();
-        let normalized_path = preempts_path.with_extension("normalized");
-
+        let normalized_path = self.preempts_path_out().with_extension("normalized");
         let normalized = self.preempts_out().normalize();
         normalized
             .write_to_disk(&normalized_path)
             .expect("write of preempts file to succeed");
-        self.in_mem_sched_out = Some(normalized);
-        self.sched_path_out = Some(normalized_path);
+        (normalized_path, normalized)
     }
 
     /// The global options a trial run is launched with. Trials go through
@@ -260,7 +297,11 @@ impl RunData {
     }
 
     /// Execute the run. (Including setting up logging and temp dir binding.)
+    ///
+    /// Once a stop signal has arrived (`stop`), no run starts, and the run it
+    /// ended reports the stop instead of its own outcome.
     pub fn launch(&mut self) -> anyhow::Result<()> {
+        stop::check()?;
         let root = self.root_path();
         let gopts = self.trial_global_opts();
         // Open it HERE, on the host, for the same reason `main` does: `launch` runs
@@ -279,7 +320,7 @@ impl RunData {
 
         // Some last-minute sleight-of-hand to record to a temporary location instead.
         if final_record_path.is_some() {
-            let temp_path = root.with_extension(PREEMPTS_EXT_PRESTRIPPED);
+            let temp_path = self.timed_recording_path();
             self.runopts.det_opts.det_config.record_preemptions_to = Some(temp_path);
         }
 
@@ -290,7 +331,9 @@ impl RunData {
         self.runopts.write_debug_options_dump()?;
 
         let started = Instant::now();
-        let (_, output, terminal_outcome) = self.runopts.run(&gopts, true).map_err(|error| {
+        let ran = self.runopts.run(&gopts, true);
+        stop::check()?;
+        let (_, output, terminal_outcome) = ran.map_err(|error| {
             self.run_error(self.name_the_trial_bound(error), gopts.log_file.as_deref())
         })?;
         let output: Output = output.context("expected captured output")?;
@@ -312,6 +355,7 @@ impl RunData {
             .take();
         if let Some(temp_path) = temp_path {
             Self::post_process_events_file(&temp_path, final_record_path.as_ref().unwrap())?;
+            self.discard_timed_recording();
             // Restore the setting:
             self.runopts.det_opts.det_config.record_preemptions_to = final_record_path;
         }
@@ -1190,10 +1234,19 @@ impl AnalyzeOpts {
     /// schedule does not end, or one for a run without PMU timeslices, whose
     /// clock it would change.
     pub fn refuse_unsound_continuation_timeslice(&self) -> anyhow::Result<()> {
+        self.refuse_unsound_continuation_for(self.trial_max_timeslice()?)
+    }
+
+    /// Recheck against the target record once it is available, before any
+    /// prefix trial can apply an explicitly selected continuation.
+    pub(super) fn refuse_unsound_continuation_for(
+        &self,
+        run: detcore_model::config::MaybeTimeslice,
+    ) -> anyhow::Result<()> {
         let ContinuationTimeslice::Nanos(nanos) = self.continuation_timeslice else {
             return Ok(());
         };
-        let reason = match self.trial_max_timeslice() {
+        let reason = match run {
             None => "the run arguments disable PMU timeslices, and a continuation timeslice \
                      would turn them on for the replayed prefix too"
                 .to_owned(),
@@ -1212,13 +1265,11 @@ impl AnalyzeOpts {
         )
     }
 
-    /// The trials' `--max-timeslice`, from their run arguments (`None` for
-    /// disabled).
-    pub fn trial_max_timeslice(&self) -> detcore_model::config::MaybeTimeslice {
-        RunData::get_raw_runopts(self)
-            .det_opts
-            .det_config
-            .max_timeslice
+    /// The non-chaos replay trials' effective maximum, after recorded-value
+    /// adoption and the same range/seed resolution used at launch (`None`
+    /// for disabled).
+    pub fn trial_max_timeslice(&self) -> anyhow::Result<detcore_model::config::MaybeTimeslice> {
+        RunData::get_raw_runopts(self).analysis_replay_max_timeslice()
     }
 
     /// The trials' `--pipe-wake-latency`, from their run arguments (`None`
@@ -3526,6 +3577,57 @@ mod tests {
         assert_eq!(later.runopts.run_timeout(), Some(Duration::from_secs(200)));
     }
 
+    #[test]
+    fn continuation_admission_uses_the_resolved_range_maximum() {
+        for (range, continuation, admitted) in [
+            ("1000..5000000", 5_000_000, true),
+            ("1000..5000000", 4_999_999, false),
+            ("1000..500000000", 500_000_000, true),
+            ("1000..500000000", 200_000_000, false),
+        ] {
+            let options = AnalyzeOpts::try_parse_from([
+                "analyze".to_owned(),
+                "--prefix-search".into(),
+                format!("--continuation-timeslice={continuation}"),
+                "--".into(),
+                "--chaos".into(),
+                format!("--chaos-timeslice-range={range}"),
+                "/bin/true".into(),
+            ])
+            .unwrap();
+            let result = options.refuse_unsound_continuation_timeslice();
+            if admitted {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error
+                        .downcast_ref::<crate::app::container::PolicyRefusal>()
+                        .is_some(),
+                    "{error:#}"
+                );
+                assert!(
+                    format!("{error:#}").contains("shorter than the run's --max-timeslice="),
+                    "{error:#}"
+                );
+            }
+        }
+        let seeded = AnalyzeOpts::try_parse_from([
+            "analyze",
+            "--prefix-search",
+            "--",
+            "--chaos",
+            "--chaos-seeded-timeslice",
+            "--seed=7",
+            "/bin/true",
+        ])
+        .unwrap();
+        assert_eq!(
+            seeded.trial_max_timeslice().unwrap(),
+            Some(hermit::chaos_timeslice::DEFAULT_MAX_TIMESLICE)
+        );
+    }
+
     /// A `--continuation-timeslice` shorter than the run's `--max-timeslice`,
     /// or one for a run without PMU timeslices, is refused before any
     /// workspace or trial, naming what to pass instead; one at least as long
@@ -3582,6 +3684,107 @@ mod tests {
         ])
         .unwrap();
         refusal(&["--"]).unwrap();
+    }
+
+    /// A bisection trial's schedules are removed once read, unless --keep-tmp
+    /// keeps them: the workspace's names only, so a schedule the run arguments
+    /// name (`--replay-schedule-from`) stays, and so does the reproducer.
+    #[test]
+    fn a_trials_schedules_are_discarded_unless_kept() {
+        for keep_tmp in [false, true] {
+            let outside = tempfile::tempdir().unwrap();
+            let user_schedule = outside.path().join("mine.preempts");
+            // Main's trials read the record their run arguments replay when
+            // they are built (`RunData::new_baseline`), so it exists first.
+            PreemptionRecord::from_sched_events(Vec::new())
+                .write_to_disk(&user_schedule)
+                .unwrap();
+            let replay = format!("--replay-schedule-from={}", user_schedule.display());
+            let mut options =
+                AnalyzeOpts::try_parse_from(["analyze", "--", replay.as_str(), "/bin/true"])
+                    .unwrap();
+            options.keep_tmp = keep_tmp;
+            let workspace = tempfile::tempdir().unwrap();
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            let run = RunData::new_baseline(&options, "bisect_round_001".to_owned()).unwrap();
+            let root = run.root_path();
+            let written = [
+                root.with_extension(PREEMPTS_EXT),
+                run.out_path().with_extension(PREEMPTS_EXT),
+                run.timed_recording_path(),
+            ];
+            // They are the names a trial built as the bisection builds one,
+            // without a schedule in its run arguments, replays and records.
+            let mut plain = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+            plain.tmp_dir = options.tmp_dir.clone();
+            let mut trial = RunData::new_baseline(&plain, "bisect_round_001".to_owned())
+                .unwrap()
+                .with_schedule_replay()
+                .with_schedule_recording();
+            assert_eq!(trial.sched_path_in(), written[0]);
+            assert_eq!(trial.sched_path_out(), written[1]);
+            let kept = [root.with_extension("repro"), user_schedule.clone()];
+            for path in written.iter().chain(&kept) {
+                std::fs::write(path, "{}").unwrap();
+            }
+            run.discard_schedules();
+            for path in &written {
+                assert_eq!(
+                    path.exists(),
+                    keep_tmp,
+                    "{} with keep_tmp={keep_tmp}",
+                    path.display()
+                );
+            }
+            for path in &kept {
+                assert!(path.exists(), "{} was removed", path.display());
+            }
+            // An unfinished trial recorded no schedule: what it wrote goes.
+            std::fs::write(&written[2], "{}").unwrap();
+            run.discard_schedules();
+            assert_eq!(written[2].exists(), keep_tmp);
+        }
+    }
+
+    /// The normalized copy of a run's preemption record is written beside it
+    /// for reading, and the run keeps its own record: the target endpoint
+    /// and --minimize's baseline replay the record that met the target.
+    /// Before, the run switched to the copy, whose renumbered priorities can
+    /// run another schedule, and a minimized record that met the target was
+    /// then "still not matching" it.
+    #[test]
+    fn a_normalized_record_is_written_for_reading_and_not_replayed() {
+        use detcore::preemptions::PreemptionRecord;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        let recorded = workspace.path().join("round_014.preempts");
+        let history = vec![
+            (detcore::types::LogicalTime::from_nanos(1_000), 352),
+            (detcore::types::LogicalTime::from_nanos(2_000), 4923),
+        ];
+        let record = PreemptionRecord::from_vecs(&std::collections::BTreeMap::from([(
+            detcore::DetTid::from_raw(7),
+            history,
+        )]));
+        record.write_to_disk(&recorded).unwrap();
+        let mut run = RunData::from_minimize_output(
+            &options,
+            "minimized".to_owned(),
+            RunData::get_raw_runopts(&options),
+            record.clone(),
+            recorded.clone(),
+            workspace.path().join("round_014.log"),
+        );
+        let (normalized_path, normalized) = run.write_normalized_preempts();
+        assert_eq!(
+            normalized_path,
+            workspace.path().join("round_014.normalized")
+        );
+        assert!(normalized_path.exists());
+        assert_ne!(normalized, record, "normalizing renumbers the priorities");
+        assert_eq!(run.preempts_path_out(), recorded.as_path());
+        assert_eq!(run.preempts_out(), &record);
     }
 }
 
