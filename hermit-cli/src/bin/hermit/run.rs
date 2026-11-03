@@ -2317,20 +2317,10 @@ pub struct RunOpts {
     #[clap(skip)]
     prepared_program: Option<PathBuf>,
 
-    /// Complete root-image preparation result, retained so later consumers do
-    /// not have to recover any count from the presentation banner.
-    #[clap(skip)]
-    e9patch_engagement: Option<BackendEngagement>,
-
     /// What `--cpu-profile auto` resolved to and why, for the diagnostic
     /// line `--log=debug` and finer show.
     #[clap(skip)]
     auto_resolution: Option<String>,
-
-    /// The root-image rewrite's sites in the dispatch record's terms; every
-    /// count is unmeasured when the root executable was not an ELF image.
-    #[clap(skip)]
-    e9patch_sites: Option<reverie::SiteCounters>,
 
     /// Why this host's retired-branch counter is inexact, if it is. Only the
     /// `--strict` refusal and the warning without `--strict` consult it; tests
@@ -10675,7 +10665,7 @@ impl RunOpts {
         }
         let (program, _, rootfs) = self.guest_program_on_host()?;
         let to_host = |path: &Path| match &rootfs {
-            Some(rootfs) => crate::image::resolve_in_rootfs(rootfs, path),
+            Some(rootfs) => crate::app::image::resolve_in_rootfs(rootfs, path),
             None => match self.mapped_host_program(path) {
                 GuestPathMapping::Mapped(host) => host,
                 GuestPathMapping::Unchanged | GuestPathMapping::Hidden => path.to_path_buf(),
@@ -13378,23 +13368,16 @@ impl RunOpts {
                 }
             }
             if let Some((_, host)) = best {
-                return validate_executable(&host, &guest_abs, None);
+                validate_executable(&host, &guest_abs, None)?;
+                return Ok((host, guest_abs, None));
             }
             // Resolve chroot-aware: images (nixos/nix especially) expose
             // `/bin/sh` as a symlink to an absolute `/nix/store/...` target that
             // only resolves under the image root, so a naive host `stat` would
             // follow it against the host `/` and fail.
             let in_rootfs = crate::app::image::resolve_in_rootfs(&rootfs, &guest_abs);
-            return validate_executable(&in_rootfs, &guest_abs, Some(&rootfs));
-        }
-
-            let in_rootfs = crate::image::resolve_in_rootfs(&rootfs, &guest_abs);
+            validate_executable(&in_rootfs, &guest_abs, Some(&rootfs))?;
             return Ok((in_rootfs, guest_abs, Some(rootfs)));
-        }
-
-        if self.selected_backend() == Backend::E9patch {
-            let (_, host) = self.resolve_guest_and_host_program()?;
-            return Ok((host, self.program.clone(), None));
         }
 
         let command = self.guest_command()?;
@@ -13412,7 +13395,7 @@ impl RunOpts {
                 );
             }
             self.refuse_program_under_dev_shm(requested)?;
-            return validate_executable(requested, requested, None);
+            validate_executable(requested, requested, None)?;
             return Ok((requested.to_path_buf(), requested.to_path_buf(), None));
         }
 
@@ -16352,15 +16335,11 @@ impl RunOpts {
     /// implicit inputs this run resolved written out, so that loading it
     /// reproduces the run rather than resolving them again.
     pub(crate) fn saved_run_config(&self) -> Result<crate::app::run_config::RunConfig, Error> {
+        use crate::app::run_config::CPU_PROFILE_KEY;
         use crate::app::run_config::EPOCH_KEY;
         use crate::app::run_config::PID_BASE_KEY;
         use crate::app::run_config::SEED_FROM_KEY;
         use crate::app::run_config::SEED_KEY;
-    pub(crate) fn saved_run_config(&self) -> Result<crate::run_config::RunConfig, Error> {
-        use crate::run_config::CPU_PROFILE_KEY;
-        use crate::run_config::EPOCH_KEY;
-        use crate::run_config::SEED_FROM_KEY;
-        use crate::run_config::SEED_KEY;
 
         let mut config = self.config_capture.clone().ok_or_else(|| {
             Error::msg(
@@ -16395,6 +16374,7 @@ impl RunOpts {
             && let Some(base) = self.det_opts.det_config.guest_ids.base()
         {
             config.run.insert(PID_BASE_KEY.to_owned(), base.into());
+        }
         // The profile auto resolved to, given or not: loading the config
         // (`--config`, or `--from` a manifest) runs that profile and never
         // derives one again.

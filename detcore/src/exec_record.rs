@@ -196,50 +196,6 @@ impl ExecRecord {
     }
 }
 
-/// The program interpreter (`PT_INTERP`) the ELF64 image at `path` names,
-/// which the kernel opens and maps at the exec (`load_elf_binary`,
-/// fs/binfmt_elf.c), or `None` for any other file, an image without one, and
-/// one the caller cannot read. Like the kernel, this refuses a name shorter
-/// than 2 or longer than `PATH_MAX` bytes or one whose last byte is not NUL,
-/// and the name is the string up to its first NUL, which `open_exec` opens.
-pub fn program_interpreter(path: &Path) -> Option<PathBuf> {
-    let file = crate::util::RawFd::open(path, libc::O_RDONLY).ok()?;
-    let read_exact = |offset: u64, buffer: &mut [u8]| {
-        (file.read_at(buffer, offset).ok()? == buffer.len()).then_some(())
-    };
-    let mut header = [0_u8; 64];
-    read_exact(0, &mut header)?;
-    if header[..4] != *b"\x7fELF" || header[4] != 2 || header[5] != 1 {
-        return None;
-    }
-    let u16_at = |at: usize| u16::from_le_bytes([header[at], header[at + 1]]);
-    let phoff = u64::from_le_bytes(header[32..40].try_into().unwrap());
-    let (phentsize, phnum) = (usize::from(u16_at(54)), u16_at(56));
-    if phentsize < 56 {
-        return None;
-    }
-    let mut entry = vec![0_u8; phentsize];
-    for index in 0..u64::from(phnum) {
-        read_exact(phoff.checked_add(index * phentsize as u64)?, &mut entry)?;
-        if u32::from_le_bytes(entry[..4].try_into().unwrap()) != 3 {
-            continue; // not PT_INTERP
-        }
-        let field = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().unwrap());
-        let (offset, size) = (field(8), field(32));
-        if size < 2 || size > libc::PATH_MAX as u64 {
-            return None;
-        }
-        let mut name = vec![0_u8; size as usize];
-        read_exact(offset, &mut name)?;
-        if name.last() != Some(&0) {
-            return None;
-        }
-        let end = name.iter().position(|byte| *byte == 0)?;
-        return Some(PathBuf::from(std::ffi::OsStr::from_bytes(&name[..end])));
-    }
-    None
-}
-
 /// What decides where Linux starts a process's program break after it execs
 /// an ELF image (`load_elf_binary`, fs/binfmt_elf.c), from the image's file
 /// header and program headers.
@@ -766,6 +722,9 @@ pub fn first_needing_above<'a>(
         _ => None,
     })
 }
+
+/// The kernel's page size on x86-64, the most a `PT_INTERP` name can be.
+const PAGE_SIZE: u64 = 4096;
 
 /// The program interpreter (`PT_INTERP`) the x86-64 ELF64 image at `path`
 /// names: `Ok(None)` for an image naming none, an error for a file that is
@@ -2025,12 +1984,13 @@ mod tests {
     #[test]
     fn an_image_names_its_program_interpreter_as_the_kernel_reads_it() {
         let interpreter = program_interpreter(Path::new("/proc/self/exe"))
+            .expect("the test binary reads")
             .expect("the test binary is dynamically linked");
         assert!(interpreter.is_absolute(), "{}", interpreter.display());
         assert!(interpreter.exists(), "{}", interpreter.display());
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("script");
         fs::write(&script, "#!/bin/sh\n").unwrap();
-        assert_eq!(program_interpreter(&script), None);
+        assert!(program_interpreter(&script).is_err());
     }
 }

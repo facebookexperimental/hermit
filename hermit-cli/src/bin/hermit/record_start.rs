@@ -646,7 +646,7 @@ impl StartOpts {
             let (profile, why) =
                 hermit::cpu_profile_admission::resolve_auto(&program, Path::to_path_buf).map_err(
                     |why| {
-                        Error::new(crate::container::PolicyRefusal)
+                        Error::new(crate::app::container::PolicyRefusal)
                             .context(format!("--cpu-profile auto refused: {why}"))
                     },
                 )?;
@@ -654,7 +654,7 @@ impl StartOpts {
             resolved.cpu_profile = profile;
             resolved.auto_resolution =
                 Some(format!("--cpu-profile auto resolved to {profile}: {why}"));
-            return resolved.main(global);
+            return resolved.main_with_preparation(global, preparation);
         }
         hermit::cpu_profile_admission::check_record_or_replay(self.cpu_profile).map_err(
             |refusal| Error::new(crate::app::container::PolicyRefusal).context(refusal.to_string()),
