@@ -607,8 +607,14 @@ def publish_release(pin, archive, registry, ledger_commit, hermit_commit):
     return asset_id(release, pin, registry.name, registry_sha, len(registry_bytes))
 
 
-def rebuild(parent, scratch, receipt, *, ledger_commit, validation_history_commit):
-    config = configuration()
+def rebuild(
+    parent, scratch, receipt, *, ledger_commit, validation_history_commit, config_path=None
+):
+    # The workflow passes the pin saved from the DISPATCHED commit: this
+    # checkout stands at hermit_commit, whose own pin file names an older
+    # builder generation.  Reading the pin here instead would silently
+    # build with that older pair (runs 41537071693 and 41666103898).
+    config = configuration(config_path) if config_path is not None else configuration()
     ledger_commit = exact_commit(ledger_commit, "cell ledger")
     validation_history_commit = exact_commit(
         validation_history_commit, "parent validation history"
@@ -756,10 +762,16 @@ def main(argv=None):
         allow_abbrev=False,
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser(
+    source_config = commands.add_parser(
         "source-config",
         allow_abbrev=False,
         help="print the exact reviewed builder checkout configuration",
+    )
+    source_config.add_argument(
+        "--builder-config",
+        type=Path,
+        default=None,
+        help="pin file saved from the dispatched commit (default: this checkout's pin)",
     )
     commands.add_parser(
         "capture-ledger",
@@ -784,6 +796,12 @@ def main(argv=None):
         required=True,
         help="full origin/main SHA from the later full-history private checkout",
     )
+    build.add_argument(
+        "--builder-config",
+        type=Path,
+        default=None,
+        help="pin file saved from the dispatched commit (default: this checkout's pin)",
+    )
     verify = commands.add_parser(
         "verify-public",
         allow_abbrev=False,
@@ -793,7 +811,11 @@ def main(argv=None):
     arguments = parser.parse_args(argv)
     try:
         if arguments.command == "source-config":
-            result = configuration()
+            result = (
+                configuration(arguments.builder_config)
+                if arguments.builder_config is not None
+                else configuration()
+            )
         elif arguments.command == "capture-ledger":
             result = capture_ledger()
         elif arguments.command == "rebuild":
@@ -811,6 +833,7 @@ def main(argv=None):
                     arguments.receipt,
                     ledger_commit=arguments.ledger_commit,
                     validation_history_commit=arguments.validation_history_commit,
+                    config_path=arguments.builder_config,
                 )
             finally:
                 resources.update(

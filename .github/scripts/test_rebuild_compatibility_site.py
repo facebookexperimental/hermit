@@ -760,6 +760,34 @@ class HostedAdapterTests(unittest.TestCase):
             ADAPTER.verify_public(receipt, timeout=1)
         self.assertFalse(json.loads(receipt.read_bytes())["deployed"])
 
+    def test_source_config_reads_the_saved_dispatched_pin(self):
+        # The workflow saves the dispatched commit's pin before the pin
+        # checkout moves the workspace; source-config must honor that
+        # file, or the rebuild silently uses the older pin recorded at
+        # hermit_commit (runs 41537071693 and 41666103898).
+        saved = copy.deepcopy(self.config)
+        saved["parent_commit"] = "a" * 40
+        saved["hermit_commit"] = "b" * 40
+        path = self.root / "dispatched-pin.json"
+        path.write_text(json.dumps(saved))
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                SCRIPT,
+                "source-config",
+                "--builder-config",
+                str(path),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        printed = json.loads(result.stdout)
+        self.assertEqual(printed["parent_commit"], "a" * 40)
+        self.assertEqual(printed["hermit_commit"], "b" * 40)
+
     def test_public_help_is_readable_and_has_no_build_side_effect(self):
         for command in (
             [],
