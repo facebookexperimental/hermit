@@ -511,7 +511,7 @@ fn is_zero(count: &u64) -> bool {
 /// What rewriting one file's exclusive loops in a guest's memory did. Every
 /// exclusive pair the scan found in the file's executable mappings is in
 /// exactly one count.
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct ExclusiveRewrite {
     /// Loops the guest's memory holds as single LSE atomics.
     pub rewritten: u64,
@@ -522,6 +522,12 @@ pub struct ExclusiveRewrite {
     /// Loops the rewrite could not write; a mapping that could not be read
     /// counts one. These still retry.
     pub failed: u64,
+    /// Why loops were not written, where any were not (`failed`): for
+    /// example that the mapped file cannot be proven to be the one planned
+    /// without `/proc/<pid>/map_files` on btrfs or overlayfs. Absent when
+    /// every loop asked for was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_written: Option<String>,
 }
 
 /// The store-exclusives a run's guest speculatively executed that failed,
@@ -1032,11 +1038,16 @@ impl RunSummary {
                     rewritten,
                     left,
                     failed,
+                    not_written,
                 } = rewrite;
-                writeln!(
+                write!(
                     f,
                     "  {path}: {rewritten} rewritten, {left} left, {failed} not written"
                 )?;
+                match not_written {
+                    Some(why) => writeln!(f, " ({why})")?,
+                    None => writeln!(f)?,
+                }
             }
         }
         if include_report_metadata && let Some(snapshot) = property_snapshot {
@@ -1179,6 +1190,7 @@ mod tests {
                         rewritten: 16,
                         left: 2,
                         failed: 1,
+                        not_written: None,
                     },
                 ),
                 (
@@ -1187,6 +1199,7 @@ mod tests {
                         rewritten: 3,
                         left: 0,
                         failed: 0,
+                        not_written: None,
                     },
                 ),
                 // A mapping that could not be read: no pair scanned, one
@@ -1197,6 +1210,7 @@ mod tests {
                         rewritten: 0,
                         left: 0,
                         failed: 1,
+                        not_written: None,
                     },
                 ),
             ]),
@@ -1693,6 +1707,36 @@ mod tests {
         }
     }
 
+    /// A file the in-memory rewrite could not write says why, in the JSON and
+    /// beside its counts in both views, so an unprivileged run on btrfs
+    /// reports each file as not written and why, not a bare count.
+    #[test]
+    fn a_file_the_in_memory_rewrite_could_not_write_says_why() {
+        let why = "the mapped file cannot be proven to be the one planned";
+        let summary = RunSummary {
+            exclusive_rewrites: BTreeMap::from([(
+                "/lib64/libc.so.6".to_owned(),
+                ExclusiveRewrite {
+                    rewritten: 0,
+                    left: 0,
+                    failed: 19,
+                    not_written: Some(why.to_owned()),
+                },
+            )]),
+            ..Default::default()
+        };
+        let line = format!("  /lib64/libc.so.6: 0 rewritten, 0 left, 19 not written ({why})\n");
+        assert!(summary.info(None).to_string().contains(&line), "{summary}");
+        assert!(summary.to_string().contains(&line), "{summary}");
+        let value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            value["exclusive_rewrites"]["/lib64/libc.so.6"]["not_written"],
+            why
+        );
+        let back: RunSummary = serde_json::from_value(value).unwrap();
+        assert_eq!(back.exclusive_rewrites, summary.exclusive_rewrites);
+    }
+
     /// The in-memory rewrite's per-path counts are in both views, its plan
     /// cache's peak only in the full report; the peak is left out of the
     /// JSON while zero.
@@ -1711,6 +1755,7 @@ mod tests {
                     rewritten: 19,
                     left: 0,
                     failed: 0,
+                    not_written: None,
                 },
             )]),
             exclusive_rewrite_cache_peak: 2_254_552,

@@ -1822,6 +1822,15 @@ pub struct RunOpts {
     /// run: the files are untouched, and a guest that reads its own code sees
     /// the rewritten instructions. `auto`, the default, is `memory` under
     /// `--no-namespace` and `overlay` otherwise.
+    ///
+    /// `memory` writes into a mapping only when it can prove the mapped
+    /// object is the file it planned from: through `/proc/<pid>/map_files`,
+    /// which needs `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`, or by the
+    /// file's inode and device where those identify it. On btrfs or
+    /// overlayfs, whose inode numbers are not identities across subvolumes
+    /// or layers, an unprivileged run therefore writes nothing: the summary
+    /// reports each file as not written, and why, and the guest runs its
+    /// original loops.
     #[clap(
         long,
         value_enum,

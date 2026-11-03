@@ -1434,6 +1434,24 @@ pointer passed on or kept can be read as well as called. Only forming an
 address that names a function's start (an unwind table entry), with nothing
 read through it, leaves the instruction there unprotected.
 
+`--rewrite-exclusives-mode` chooses where the rewrite applies. `overlay`
+rewrites copies of the guest executable and the `--rewrite-exclusives-also`
+files and bind-mounts them over the originals, which needs a mount namespace.
+`memory` rewrites the loops of every executable file the guest maps, in the
+guest's own pages, before any of their instructions run, and leaves the files
+untouched. `auto`, the default, is `memory` under `--no-namespace` and
+`overlay` otherwise. Both apply the same proof of code.
+
+The in-memory rewrite writes into a mapping only when it can prove that the
+mapped object is the file it planned from: through `/proc/<pid>/map_files`,
+which needs `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`, or by the file's
+inode and device where those identify it. On btrfs or overlayfs, whose inode
+numbers are not identities across subvolumes or layers, an unprivileged run
+therefore writes nothing. The run summary's `exclusive_rewrites` reports each
+such file as not written, with the reason, and the guest runs its original
+loops. Run from a filesystem whose inode numbers identify files (ext4, xfs or
+tmpfs), with the capability, or with the overlay.
+
 ### Virtual Inputs
 
 | Option | Effect |

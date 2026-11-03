@@ -405,6 +405,50 @@ mod model {
         /// `unsupported-mapping-symbol` (`FileReport::unproven`). Those of
         /// this range are among `left`.
         pub unmarked: bool,
+        /// Why loops the rewrite was asked for were not written (`failed`), if
+        /// any were not: the first reason this range met.
+        pub not_written: Option<NotWritten>,
+    }
+
+    /// Why the in-memory rewrite wrote nothing into a mapping, or not all it
+    /// was asked to.
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        serde::Serialize,
+        serde::Deserialize
+    )]
+    pub enum NotWritten {
+        /// The mapped object could not be proven to be the file the plan was
+        /// read from: `/proc/<pid>/map_files`, which needs
+        /// `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`, was not available,
+        /// and the file is on a filesystem whose inode numbers are not
+        /// identities (btrfs, overlayfs).
+        Unproven,
+        /// The file could not be read whole and unchanged within the bound a
+        /// plan reads.
+        Unreadable,
+        /// The guest's memory could not be opened, read or written.
+        Memory,
+    }
+
+    impl std::fmt::Display for NotWritten {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(match self {
+                NotWritten::Unproven => {
+                    "the mapped file cannot be proven to be the one planned: \
+                     /proc/<pid>/map_files needs CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN, and \
+                     on btrfs or overlayfs an inode number is not an identity"
+                }
+                NotWritten::Unreadable => {
+                    "the file could not be read whole and unchanged within the planning bound"
+                }
+                NotWritten::Memory => "the guest's memory could not be read or written",
+            })
+        }
     }
 
     impl Rewrite {
@@ -427,6 +471,7 @@ mod model {
                 left: self.left + other.left,
                 failed: self.failed + other.failed,
                 unmarked: self.unmarked || other.unmarked,
+                not_written: self.not_written.or(other.not_written),
             }
         }
 
@@ -863,6 +908,7 @@ mod model {
             None => (
                 Rewrite {
                     failed: pairs.max(1),
+                    not_written: Some(NotWritten::Memory),
                     ..Rewrite::default()
                 },
                 0,
@@ -921,6 +967,7 @@ mod model {
                     "[store-exclusive] cannot read the guest's code at {address:#x}: {error}"
                 );
                 rewrite.failed += 1;
+                rewrite.not_written.get_or_insert(NotWritten::Memory);
                 continue;
             }
             let end = address + patch.original.len() as u64;
@@ -950,6 +997,7 @@ mod model {
                                  rewritten: {why}"
                             );
                             rewrite.failed += 1;
+                            rewrite.not_written.get_or_insert(NotWritten::Memory);
                         }
                         Written::Broken(why) => panic!(
                             "the in-memory rewrite of {} left the guest's code at {address:#x} \
@@ -1222,6 +1270,7 @@ mod model {
                         left,
                         failed,
                         unmarked,
+                        not_written,
                     } = rewrite;
                     if unmarked {
                         unmarked_files.push(path.clone());
@@ -1232,6 +1281,7 @@ mod model {
                             rewritten,
                             left,
                             failed,
+                            not_written: not_written.map(|why| why.to_string()),
                         },
                     )
                 })
@@ -1333,6 +1383,7 @@ mod runtime {
     use super::model::Found;
     use super::model::GuestCode;
     use super::model::LiveMapping;
+    use super::model::NotWritten;
     use super::model::Opened;
     use super::model::PairTally;
     use super::model::Range;
@@ -2245,48 +2296,65 @@ mod runtime {
         path: &Path,
         map: &MemoryMap,
         key: FileRange,
-    ) -> Result<Arc<Option<FilePlan>>, String> {
-        let (file, opened) = open_mapped(tid, path, map, key).map_err(|error| error.to_string())?;
+    ) -> Result<Arc<Option<FilePlan>>, (NotWritten, String)> {
+        let unreadable = |error: std::io::Error| (NotWritten::Unreadable, error.to_string());
+        // A name that now leads to another file than the mapped one is a
+        // file this rewrite cannot prove, not one it could not read.
+        let (file, opened) = open_mapped(tid, path, map, key).map_err(|error| {
+            let why = if error.kind() == std::io::ErrorKind::Other {
+                NotWritten::Unproven
+            } else {
+                NotWritten::Unreadable
+            };
+            (why, error.to_string())
+        })?;
         if !opened.may_plan_writes() {
-            return Err(
+            return Err((
+                NotWritten::Unproven,
                 "the mapped object cannot be proven without /proc/<pid>/map_files on this \
                  filesystem (btrfs or overlayfs, where an inode number is not an identity)"
                     .to_owned(),
-            );
+            ));
         }
-        let stamp = file_stamp(&file).map_err(|error| error.to_string())?;
-        let too_large =
-            || format!("the file is larger than the {MAX_PLANNED_FILE} bytes planned in memory");
+        let stamp = file_stamp(&file).map_err(unreadable)?;
+        let too_large = || {
+            (
+                NotWritten::Unreadable,
+                format!("the file is larger than the {MAX_PLANNED_FILE} bytes planned in memory"),
+            )
+        };
         if stamp.0 > MAX_PLANNED_FILE {
             return Err(too_large());
         }
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(stamp.0 as usize + 1)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| (NotWritten::Unreadable, error.to_string()))?;
         // Read at most one byte past the bound, so a file that grows while it
         // is read can neither pass the bound nor grow the buffer unchecked.
         std::io::Read::read_to_end(
             &mut std::io::Read::take(&file, MAX_PLANNED_FILE + 1),
             &mut bytes,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(unreadable)?;
         if bytes.len() as u64 > MAX_PLANNED_FILE {
             return Err(too_large());
         }
         // The bytes read are the file the stamp names only if nothing
         // changed it meanwhile.
-        if file_stamp(&file).map_err(|error| error.to_string())? != stamp
-            || bytes.len() as u64 != stamp.0
-        {
-            return Err("the file changed while it was read".to_owned());
+        if file_stamp(&file).map_err(unreadable)? != stamp || bytes.len() as u64 != stamp.0 {
+            return Err((
+                NotWritten::Unreadable,
+                "the file changed while it was read".to_owned(),
+            ));
         }
         // The plan is a function of the bytes alone, so the cache keys them.
         if let Some(plan) = PLANS.lock().unwrap().get(&bytes) {
             return Ok(plan);
         }
         let plan = Arc::new(
-            crate::aarch64_lse::elf::plan_bytes(&bytes).map_err(|error| error.to_string())?,
+            crate::aarch64_lse::elf::plan_bytes(&bytes)
+                .map_err(|error| (NotWritten::Unreadable, error.to_string()))?,
         );
         let charge = plan_charge(&plan);
         PLANS.lock().unwrap().insert(bytes, plan.clone(), charge);
@@ -2353,12 +2421,18 @@ mod runtime {
         }
         let plan = match plan_for(tid, path, map, key) {
             Ok(plan) => plan,
-            Err(error) => {
+            Err((why, error)) => {
                 debug!(
                     "[store-exclusive] cannot read {} to plan its rewrite: {error}",
                     path.display()
                 );
-                return (all_failed, 0);
+                return (
+                    Rewrite {
+                        not_written: Some(why),
+                        ..all_failed
+                    },
+                    0,
+                );
             }
         };
         let Some(plan) = plan.as_ref() else {
@@ -2902,6 +2976,7 @@ mod tests {
     use super::model::Found;
     use super::model::GuestCode;
     use super::model::LiveMapping;
+    use super::model::NotWritten;
     use super::model::Opened;
     use super::model::PairTally;
     use super::model::Placement;
@@ -3009,6 +3084,7 @@ mod tests {
                 (
                     named(Rewrite {
                         failed: 1,
+                        not_written: Some(NotWritten::Memory),
                         ..Rewrite::default()
                     }),
                     0
@@ -3034,6 +3110,7 @@ mod tests {
             (
                 Rewrite {
                     failed: 1,
+                    not_written: Some(NotWritten::Memory),
                     ..Rewrite::default()
                 },
                 0
@@ -3914,6 +3991,7 @@ mod tests {
                 left: 4,
                 failed: 0,
                 unmarked: true,
+                not_written: None,
             })
         );
         let mut proved = PairTally::default();
@@ -3934,6 +4012,7 @@ mod tests {
                 left,
                 failed,
                 unmarked,
+                not_written: None,
             },
             ..mapping(path, 0, 0x1000, rewritten + left + failed)
         };
@@ -3976,6 +4055,7 @@ mod tests {
                         rewritten: 0,
                         left: 2,
                         failed: 0,
+                        not_written: None,
                     }
                 );
                 let mut expected = vec!["/overlay/unproved".to_owned()];
@@ -4007,6 +4087,7 @@ mod tests {
                 rewritten: 5,
                 left: 1,
                 failed: 2,
+                not_written: None,
             }
         );
         assert_eq!(summary.exclusive_rewrite_unmarked, vec![path.to_owned()]);
@@ -4024,6 +4105,7 @@ mod tests {
                 left,
                 failed,
                 unmarked: false,
+                not_written: None,
             },
             ..mapping(libc, offset, 0x1000, pairs)
         };
@@ -4051,6 +4133,7 @@ mod tests {
                 left: 2,
                 failed: 1,
                 unmarked: false,
+                not_written: None,
             })
         );
         assert!(!rewrites.contains_key("/bin/plain"), "{rewrites:?}");
@@ -4088,6 +4171,7 @@ mod tests {
                 left: 3,
                 failed: 0,
                 unmarked: false,
+                not_written: None,
             })
         );
         // With equal remaining exposure, the process with more loops.
@@ -4101,6 +4185,7 @@ mod tests {
                 left: 2,
                 failed: 0,
                 unmarked: false,
+                not_written: None,
             })
         );
     }
