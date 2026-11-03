@@ -1137,8 +1137,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// sleep whose deadline the clock has already reached returns at once, as
     /// on Linux (an expired timer fires at once, :729-735), and one that would
     /// have to wait is refused by the unsupported-operation policy rather than
-    /// ended by another process's work. A relative sleep waits for the CPU
-    /// time it requests, so only a zero request returns at once. An absolute
+    /// ended by another process's work. That refusal is a known limitation,
+    /// tracked as a follow-up: a wait keyed to a task's CPU time, which
+    /// relative CPU timers need too, would let such a sleep wait as on Linux.
+    /// A relative sleep waits for the CPU time it requests, so only a zero
+    /// request returns at once. An absolute
     /// one waits for its deadline less the clock's current reading
     /// ([`cpu_sleep_remaining`]), which needs the reading, so an absolute
     /// sleep on another process's clock is refused too (`cpu_clock_reading`).
@@ -1397,8 +1400,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // virtual clock, which every process advances, so one that would wait
         // for CPU time still to come, or reload for more, is refused by the
         // unsupported-operation policy rather than ended by another process's
-        // work, as a CPU-clock sleep is (`cpu_clock_sleep`). A relative
-        // expiration counts down on the virtual clock as before.
+        // work, as a CPU-clock sleep is (`cpu_clock_sleep`; the same known
+        // limitation and follow-up). A relative expiration counts down on the
+        // virtual clock as before, which that follow-up would also correct.
         let cpu_timer_clock = guest
             .thread_state()
             .posix_timers
