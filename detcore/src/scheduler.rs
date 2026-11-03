@@ -2565,6 +2565,14 @@ pub struct Scheduler {
     /// recording ran out (`release_replay_priorities_if_exhausted`).
     replay_priorities_released: bool,
 
+    /// The recorded global event count when the replayed schedule ran out
+    /// or was released, while the replay does not record logical priorities.
+    /// Exhaustion alone does not mark the record: a run that ends with its
+    /// schedule (an exact replay) omitted nothing. The mark is applied only
+    /// when the run actually continues past this point
+    /// (`mark_past_schedule_departure`).
+    replay_exhausted_at: Option<u64>,
+
     /// How many recorded callback checkpoints the scheduler dropped for each
     /// thread when the thread heard that the replay released its schedule
     /// (`drop_released_callback_checkpoints`), for the run summary.
@@ -5640,6 +5648,7 @@ impl Scheduler {
             boundary_stacktrace_events,
             recorded_host_inputs,
             replay_priorities_released: false,
+            replay_exhausted_at: None,
             released_callback_checkpoints: BTreeMap::new(),
             fair_continuation: cfg.replay_continue_fairly.then(Default::default),
             continuation_clocks: BTreeMap::new(),
@@ -18924,6 +18933,11 @@ impl Scheduler {
         // Alter the threads priority and requeue.
         let old_priority = self.priorities.insert(dettid, new_priority);
 
+        // A change point drawn past the end of the replayed schedule is
+        // exactly the omission the exhaustion mark names: this run has
+        // continued past its schedule, so its record is not exact.
+        self.mark_past_schedule_departure();
+
         // The global event this change point comes at, for a record that has
         // to leave it out (`PreemptionWriter::mark_replay_departed`).
         let event = self.recorded_event_count;
@@ -20889,14 +20903,13 @@ impl Scheduler {
         // change points that a raw schedule replay does not record, and the
         // record keeps the replayed schedule's charging rules (a legacy
         // record's free switch-in turns) while the continuation's turns are
-        // charged. Mark it, so a faithful replay refuses it by name
-        // (`PreemptionRecord::require_faithful_replay`) rather than accept
-        // it as the run's authority. A replay that records logical
+        // charged. Remember where the schedule ran out; the mark itself is
+        // applied only if the run continues past this point
+        // (`mark_past_schedule_departure`), so a run that ends with its
+        // schedule stays an exact record. A replay that records logical
         // priorities records the continuation's too.
-        if !self.record_logical_replay_priorities
-            && let Some(writer) = self.preemption_writer.as_mut()
-        {
-            writer.mark_replay_departed(self.recorded_event_count);
+        if !self.record_logical_replay_priorities {
+            self.replay_exhausted_at = Some(self.recorded_event_count);
         }
         info!(
             "[sched] the replayed schedule {}; every thread takes the default priority",
@@ -20909,6 +20922,21 @@ impl Scheduler {
         let threads: Vec<DetTid> = self.priorities.keys().copied().collect();
         for dettid in threads {
             self.requeue_with_new_priority(dettid, DEFAULT_PRIORITY);
+        }
+    }
+
+    /// Mark the record as departed at the point the replayed schedule ran
+    /// out, because the run has now continued past that point without
+    /// recording the continuation's priority change points
+    /// (`release_replay_priorities_if_exhausted`). A faithful replay then
+    /// refuses the record by name (`PreemptionRecord::require_faithful_replay`)
+    /// rather than accept it as the run's authority.
+    fn mark_past_schedule_departure(&mut self) {
+        if let Some(event) = self.replay_exhausted_at
+            && !self.record_logical_replay_priorities
+            && let Some(writer) = self.preemption_writer.as_mut()
+        {
+            writer.mark_replay_departed(event);
         }
     }
 
@@ -22486,6 +22514,17 @@ impl Scheduler {
 
         let print_stack = self.try_pop_stacktrace_event(self.recorded_event_count, ev);
         self.recorded_event_count += 1;
+        // Recording past the schedule's end marks the record, with one
+        // event of allowance: the event whose consumption exhausted the
+        // schedule is itself recorded after the release, and it belongs to
+        // the schedule. A second recorded event is a genuine continuation
+        // (a single continuing slice draws no change point, so
+        // `perform_priority_changepoint` alone would miss it).
+        if let Some(exhausted_at) = self.replay_exhausted_at
+            && self.recorded_event_count > exhausted_at + 1
+        {
+            self.mark_past_schedule_departure();
+        }
         print_stack
     }
 
@@ -26928,6 +26967,52 @@ mod test {
             Some(DEFAULT_PRIORITY)
         );
         assert_eq!(sched.priorities.get(&foreground), Some(&DEFAULT_PRIORITY));
+    }
+
+    /// Exhausting the replayed schedule does not by itself mark the record:
+    /// a run that ends with its schedule omitted no priority change point.
+    /// Recording a second event past the end does mark it, at the count
+    /// where the schedule ran out (the first event recorded after the
+    /// release is the one whose consumption exhausted the schedule).
+    #[test]
+    fn ending_with_the_schedule_marks_nothing_but_recording_past_it_marks_the_record() {
+        let foreground = DetTid::from_raw(3);
+        let first = SchedEvent::syscall(foreground, Sysno::getpid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(10_000));
+        let last = SchedEvent::syscall(foreground, Sysno::getppid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(20_000));
+
+        let written_departure = |sched: &mut Scheduler| {
+            let written = sched.preemption_writer.take().unwrap().into_string();
+            let record: crate::preemptions::PreemptionRecord =
+                serde_json::from_str(&written).unwrap();
+            record.replay_departed_at()
+        };
+
+        // The run ends with its schedule: nothing is marked.
+        let mut sched = Scheduler::new(&Config::default());
+        sched.record_logical_replay_priorities = false;
+        sched.replayer = Some(Replayer::new(vec![first.clone(), last.clone()]));
+        sched.preemption_writer = Some(PreemptionWriter::new(None));
+        let _ = sched.consume_schedevent(&first);
+        let _ = sched.consume_schedevent(&last);
+        assert!(sched.replay_priorities_released);
+        assert_eq!(written_departure(&mut sched), None);
+
+        // The run records past the end: the record is marked where the
+        // schedule ran out.
+        let mut sched = Scheduler::new(&Config::default());
+        sched.record_logical_replay_priorities = false;
+        sched.replayer = Some(Replayer::new(vec![first.clone(), last.clone()]));
+        sched.preemption_writer = Some(PreemptionWriter::new(None));
+        let _ = sched.consume_schedevent(&first);
+        let _ = sched.consume_schedevent(&last);
+        assert!(sched.replay_priorities_released);
+        let extra = SchedEvent::syscall(foreground, Sysno::getpid, SyscallPhase::Posthook)
+            .with_time(LogicalTime::from_nanos(30_000));
+        sched.record_event(&extra);
+        sched.record_event(&extra);
+        assert_eq!(written_departure(&mut sched), Some(0));
     }
 
     fn plain_replay_with_writer(events: Vec<SchedEvent>) -> Scheduler {

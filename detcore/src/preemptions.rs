@@ -160,7 +160,9 @@ pub struct PreemptionRecord {
     /// event count where the schedule ran out or was released: the record
     /// holds none of the continuation's priority change points and keeps the
     /// replayed schedule's charging rules, so it is not an exact record of the
-    /// run either (`Scheduler::release_replay_priorities_if_exhausted`).
+    /// run either (`Scheduler::release_replay_priorities_if_exhausted`). The
+    /// mark is applied only once the run continues past that point; a run
+    /// that ends with its schedule omitted nothing and stays unmarked.
     /// Absence preserves legacy admission; it does not prove historical
     /// completeness. Newly marked JSON uses a mandatory envelope that old
     /// readers reject, and marked non-human serialization is refused.
