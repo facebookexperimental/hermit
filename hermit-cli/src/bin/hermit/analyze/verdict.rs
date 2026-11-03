@@ -183,14 +183,13 @@ impl AnalyzeVerdict {
                 format!(
                     "{explanation} The scheduler alone meets the target because of {opts}, the \
                      recording's timing semantics, which every trial keeps: the empty prefix \
-                     with {alts}, continued {at}, misses it ({trial} in the workspace). The \
-                     failure needs no \
-                     chaos decision under them, so no event decides it, and a two-seed search \
-                     against a passing seed can end the same way, as it falls back to this \
-                     search when it establishes no exact one-swap pair of schedules with \
-                     opposite outcomes. To name a deciding \
-                     event, analyze a new failing run with {alts} in the run arguments, if one \
-                     fails there."
+                     with {alts}, continued {at}, misses it ({trial} in the workspace). Under \
+                     {opts} the empty prefix already meets the target, so the prefix search has \
+                     no endpoint that misses it to start from and localizes no event; a two-seed \
+                     search against a passing seed can end the same way, as it falls back to \
+                     this search when it establishes no exact one-swap pair of schedules with \
+                     opposite outcomes. To name a deciding event, analyze a new failing run with \
+                     {alts} in the run arguments, if one fails there."
                 ),
                 VerdictReason::TimingSemantics {
                     options,
@@ -437,7 +436,7 @@ mod tests {
     /// alone. A cause from a later build reads as unknown.
     #[test]
     fn a_verdict_under_timing_settings_says_what_the_trial_showed() {
-        let alone = AnalyzeVerdict::reproduced_without_schedule("No event decides.", None);
+        let alone = AnalyzeVerdict::reproduced_without_schedule("Reproduced without it.", None);
         let latency = [TimingSetting {
             option: "--pipe-wake-latency=50000".to_owned(),
             alternative: "no --pipe-wake-latency".to_owned(),
@@ -462,17 +461,24 @@ mod tests {
         assert_eq!(shown.verdict(), Verdict::ReproducedWithoutSchedule);
         assert_eq!(
             shown.to_string(),
-            "No event decides. The scheduler alone meets the target because of \
+            "Reproduced without it. The scheduler alone meets the target because of \
              --pipe-wake-latency=50000, the recording's timing semantics, which every trial \
              keeps: the empty prefix with no --pipe-wake-latency, continued without PMU \
-             timeslices, misses it (prefix_alternative_timing.repro in the workspace). The \
-             failure needs no chaos \
-             decision under them, so no event decides it, and a two-seed search against a \
-             passing seed can end the same way, as it falls back to this search when it \
-             establishes no exact one-swap pair of schedules with opposite outcomes. To name a \
-             deciding event, analyze a new failing run \
-             with no --pipe-wake-latency in the run arguments, if one fails there."
+             timeslices, misses it (prefix_alternative_timing.repro in the workspace). Under \
+             --pipe-wake-latency=50000 the empty prefix already meets the target, so the prefix \
+             search has no endpoint that misses it to start from and localizes no event; a \
+             two-seed search against a passing seed can end the same way, as it falls back to \
+             this search when it establishes no exact one-swap pair of schedules with opposite \
+             outcomes. To name a deciding event, analyze a new failing run with no \
+             --pipe-wake-latency in the run arguments, if one fails there."
         );
+        // It states the timing experiment and the endpoint, never more.
+        for overclaim in ["no event decides", "needs no chaos decision"] {
+            assert!(
+                !shown.to_string().contains(overclaim),
+                "{overclaim:?}: {shown}"
+            );
+        }
         assert_eq!(
             serde_json::to_value(shown.reason()).unwrap(),
             serde_json::json!({

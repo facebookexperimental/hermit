@@ -5841,8 +5841,7 @@ mod tests {
     fn a_verdict_is_reported_and_ends_analyze_successfully() {
         let dir = tempfile::tempdir().unwrap();
         let report = dir.path().join("report.json");
-        let verdict =
-            AnalyzeVerdict::reproduced_without_schedule("no event decides the outcome.", None);
+        let verdict = AnalyzeVerdict::reproduced_without_schedule("reproduced without it.", None);
         let written = |status: anyhow::Result<ExitStatus>, expected: ExitStatus| {
             assert_eq!(status.unwrap(), expected);
             let text = std::fs::read_to_string(&report).unwrap();
@@ -5876,7 +5875,7 @@ mod tests {
                 serde_json::json!({
                     "verdict": "reproduced_without_schedule",
                     "verdict_reason": {"cause": "scheduler_alone"},
-                    "header": "no event decides the outcome.",
+                    "header": "reproduced without it.",
                     "additional_context": "",
                     "baseline_run": false,
                 })
