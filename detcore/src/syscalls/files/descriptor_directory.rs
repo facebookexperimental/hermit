@@ -1590,7 +1590,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The target of the symbolic link at the absolute guest path `link`, by
     /// one injected `readlinkat`, or `None`.
-    async fn injected_link_target<G: Guest<Self>>(
+    pub(crate) async fn injected_link_target<G: Guest<Self>>(
         &self,
         guest: &mut G,
         link: &[u8],

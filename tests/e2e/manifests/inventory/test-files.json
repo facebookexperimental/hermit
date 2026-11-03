@@ -1993,6 +1993,12 @@
       "why": "tests/c/proc_fdinfo_mount_classes.c is owned by hermit-cli/tests/procfs_determinism.rs: The dedicated procfs integration suite compiles the guest and asserts mount-class identities in fdinfo under its controlled filesystem setup, which is outside the generic manifest contract."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/proc_link_targets.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/proc_link_targets.c is owned by hermit-cli/tests/cli.rs: the_callers_own_link_targets_answer_as_linux runs it on ptrace and run_kvm_the_callers_own_link_targets_answer_as_linux on KVM, each under run --strict --verify --verify-strict at bitwise parity, and requires its transcript of the caller's own /proc/<pid>/fd/<n> links for each kind of target (a file, renamed and unlinked ones, a directory and a removed one, an O_PATH descriptor, /dev/null, pipe ends, a socket, an eventfd, an epoll instance, a timerfd, a signalfd, a memfd and a named FIFO) by six spellings, a closed descriptor, short, empty and unwritable buffers, links followed by a final slash, a second thread's and a fork child's reads, the exe link, and the working directory's link after it is renamed and removed, by seven spellings, to equal the same guest's native run line for line: on KVM every line, where Detcore answers these links from the backend's link_path fact (package K slice F2-h); on ptrace every line but the named FIFO's, a known difference the test pins. A generic manifest cannot compare a backend's transcript with a native run whose pipe and socket inodes differ from run to run."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/proc_locks.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

@@ -1897,9 +1897,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `thread-self` and the namespace links). The caller's own descriptor
     /// link spelled through its thread is answered as `/proc/self/fd/N` is,
     /// with the kernel reading `/proc/thread-self/fd/N`, the calling thread's
-    /// own table. Not in a nested PID namespace, where the caller's pid is
-    /// not Detcore's, nor after a guest `chroot`, where `/proc` need not be
-    /// procfs, nor for a pathname too long for Linux to look up.
+    /// own table. Where Detcore reads the caller's own links from the
+    /// backend's `link_path` fact (KVM), every spelling of the caller's own
+    /// descriptor link is answered from it instead
+    /// (`Detcore::readlink_own_descriptor_fact`, package K slice F2-h). Not
+    /// in a nested PID namespace, where the caller's pid is not Detcore's,
+    /// nor after a guest `chroot`, where `/proc` need not be procfs, nor for
+    /// a pathname too long for Linux to look up.
     async fn readlink_decided_link<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1944,14 +1948,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
-        let decided = decided_procfs_link(
-            resolved
-                .as_deref()
-                .or(unprefixed.as_deref())
-                .unwrap_or(bytes),
-            self.own_detpid(guest).as_raw(),
-            tid,
-        );
+        let spelling = resolved
+            .as_deref()
+            .or(unprefixed.as_deref())
+            .unwrap_or(bytes);
+        // The caller's own descriptor link, by any of its spellings, where
+        // Detcore reads it from the backend's fact (KVM, package K slice
+        // F2-h).
+        if let Some(result) = self
+            .readlink_own_descriptor_fact(guest, (spelling, bytes), link, buffer, buffer_len)
+            .await?
+        {
+            return Ok(Some(result));
+        }
+        let decided = decided_procfs_link(spelling, self.own_detpid(guest).as_raw(), tid);
         let decided = match decided {
             Some(decided) => decided,
             // A directory Detcore serves there (`/proc`, the caller's own

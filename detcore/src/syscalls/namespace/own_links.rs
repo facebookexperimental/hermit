@@ -43,6 +43,20 @@
 //! for two filesystem facts no provider reports yet (the backend's procfs is
 //! the guest's kernel procfs; the tool's filesystem view is the guest's):
 //! <https://github.com/rrnewton/hermit/issues/4700>.
+//!
+//! Where the backend's procfs is not the guest's kernel procfs (KVM), so that
+//! its own readlink answer is not the kernel's, Detcore reads the caller's
+//! own `fd/<n>`, `exe` and `cwd` links from the backend's `link_path` fact
+//! (`reverie::Guest::link_path`, package K slice F2-h) before anything else:
+//! the name the backend's own records give the descriptor's file, the
+//! process's image and the thread's working directory, rendered as `d_path`
+//! renders them (a path, " (deleted)" once it is unlinked, or an object's
+//! name such as `pipe:[<inode>]` and `anon_inode:[eventfd]`). A pipe's and a
+//! socket's inode number, and a placeholder's name, are then Detcore's, as
+//! for every descriptor link. Where the backend does not provide the fact
+//! for a link (another process's, a sibling thread's working directory, an
+//! object of the backend's own), the sources above answer, and then the
+//! backend's readlink, as before.
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -50,10 +64,13 @@ use std::path::PathBuf;
 
 use reverie::Errno;
 use reverie::Error;
+use reverie::FactError;
 use reverie::Guest;
+use reverie::PathLink;
 use reverie::syscalls;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::PathPtr;
 use reverie::syscalls::Sysno;
 
 use crate::record_or_replay::RecordOrReplay;
@@ -197,6 +214,27 @@ pub(crate) fn own_task_link(path: &[u8], pid: i32, tid: i32) -> Option<OwnTaskLi
     })
 }
 
+/// How the absolute spelling `path` of a link goes on past the link's name,
+/// from its last bytes: only slashes ([`Past::Slash`]), a `.` component among
+/// them ([`Past::Walk`]), or nothing ([`Past::Nothing`]).
+pub(crate) fn past_the_link(path: &[u8]) -> Past {
+    let mut rest = path;
+    let mut past = Past::Nothing;
+    loop {
+        if let Some(before) = rest.strip_suffix(b"/") {
+            rest = before;
+            if past == Past::Nothing {
+                past = Past::Slash;
+            }
+        } else if let Some(before) = rest.strip_suffix(b"/.") {
+            rest = before;
+            past = Past::Walk;
+        } else {
+            return past;
+        }
+    }
+}
+
 /// The task an own link describes once Detcore checked its numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DescribedTask {
@@ -302,14 +340,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             .into());
         }
         let target = match spelled.link {
-            OwnLink::Exe => self.own_exe_target(guest),
+            // The process's image is one for all its threads: the caller's
+            // fact names it.
+            OwnLink::Exe => match self.own_link_fact(guest, PathLink::Executable)? {
+                Some(target) => Some(target),
+                None => self.own_exe_target(guest),
+            },
             OwnLink::Cwd | OwnLink::Root if !self.shares_filesystem(guest, described) => None,
-            OwnLink::Cwd => match self.injected_working_directory(guest, buffer, size).await {
-                Ok(directory) => cwd_link_target(&directory).map(<[u8]>::to_vec),
-                // A removed working directory (`getcwd` refuses it, and only
-                // its name, which Detcore does not know, would render it),
-                // and any other failure: answered as before.
-                Err(_) => None,
+            // The caller's working directory is the one the spelling names
+            // (`shares_filesystem`).
+            OwnLink::Cwd => match self.own_link_fact(guest, PathLink::WorkingDirectory)? {
+                Some(target) => Some(target),
+                None => match self.injected_working_directory(guest, buffer, size).await {
+                    Ok(directory) => cwd_link_target(&directory).map(<[u8]>::to_vec),
+                    // A removed working directory (`getcwd` refuses it, and
+                    // only its name, which Detcore does not know, would
+                    // render it), and any other failure: answered as before.
+                    Err(_) => None,
+                },
             },
             OwnLink::Root => Some(b"/".to_vec()),
         };
@@ -327,6 +375,189 @@ impl<T: RecordOrReplay> Detcore<T> {
         let copied = &target[..target.len().min(size)];
         let address = buffer.ok_or(Errno::EFAULT)?;
         copy_link_out(guest, address.cast::<u8>(), copied)
+    }
+
+    /// Answer `readlink` of the caller's own descriptor link at the absolute
+    /// spelling `spelled` from the backend's `link_path` fact, where Detcore
+    /// reads it ([`Self::reads_link_facts`]), into the guest's `buffer` of
+    /// `buffer_len` bytes. `spelled` is the spelling the walk resolved (each
+    /// `..` within the caller's own task tree resolved, the components
+    /// before `proc` that name nothing dropped); `guest_bytes` the guest's own
+    /// spelling, whose last bytes say whether the link is followed
+    /// ([`past_the_link`]); `link` the guest's `dirfd` and pathname, through
+    /// which a placeholder's name is confirmed.
+    ///
+    /// The spellings are those [`super::own_descriptor_link`] names: the
+    /// process's table (`/proc/self/fd/N`, `/proc/<pid>/fd/N`, and
+    /// `/dev/fd/N` where `/dev/fd` is the link to `/proc/self/fd` it is on
+    /// Linux) and the calling thread's (`/proc/thread-self/fd/N`,
+    /// `/proc/<pid>/task/<tid>/fd/N`). Linux (v6.17) looks the descriptor
+    /// up in that task's table (`proc_lookupfd_common`, fs/proc/fd.c), so a
+    /// descriptor it does not hold is `ENOENT`; and renders the file's path
+    /// with `d_path` into `do_proc_readlink`'s buffer, copied without a NUL
+    /// and cut to the buffer's size (fs/proc/base.c). A spelling that follows
+    /// the link with a final `/` (`lookup_last`, fs/namei.c) needs a
+    /// directory there: `ENOTDIR` for any other file, and `EINVAL` for a
+    /// directory, which is no link (`do_readlinkat`, fs/stat.c).
+    ///
+    /// `Ok(None)` leaves the call to the path it took before: a spelling
+    /// with a `.` after the link (a lookup in what it leads to, checked for
+    /// search permission), the process's table read by a thread that does
+    /// not hold it, `/dev/fd` that is not that link, a link the backend
+    /// does not provide, and a backend that cannot write with the guest's
+    /// permissions.
+    pub(crate) async fn readlink_own_descriptor_fact<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        (spelled, guest_bytes): (&[u8], &[u8]),
+        link: (i32, Option<PathPtr<'_>>),
+        buffer: Option<AddrMut<'_, libc::c_char>>,
+        buffer_len: usize,
+    ) -> Result<Option<i64>, Error> {
+        if !self.reads_link_facts() {
+            return Ok(None);
+        }
+        let Some(own) = self.procfs_caller_ids(guest) else {
+            return Ok(None);
+        };
+        let Some(descriptor) =
+            super::own_descriptor_link(Path::new(std::ffi::OsStr::from_bytes(spelled)), Some(own))
+        else {
+            return Ok(None);
+        };
+        let past = past_the_link(guest_bytes);
+        if past == Past::Walk {
+            return Ok(None);
+        }
+        if descriptor.table == super::DescriptorTable::Process {
+            let state = guest.thread_state();
+            if state.dettid.as_raw() != own.0 && !state.holds_process_files() {
+                return Ok(None);
+            }
+        }
+        if spelled.starts_with(b"/dev/")
+            && self
+                .injected_link_target(guest, b"/dev/fd")
+                .await
+                .as_deref()
+                != Some(Path::new("/proc/self/fd"))
+        {
+            return Ok(None);
+        }
+        // Linux refuses a size that is not positive before it looks the path up.
+        let size = super::readlink_size(buffer_len)?;
+        let Some(text) = self.own_link_fact(guest, PathLink::Descriptor(descriptor.fd))? else {
+            return Ok(None);
+        };
+        if past == Past::Slash {
+            let stat = self.inject_fstat(guest, descriptor.fd).await?;
+            return Err(if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                Errno::EINVAL
+            } else {
+                Errno::ENOTDIR
+            }
+            .into());
+        }
+        let target = self
+            .descriptor_link_target(guest, descriptor.fd, link, text)
+            .await?;
+        let copied = &target[..target.len().min(size)];
+        let address = buffer.ok_or(Errno::EFAULT)?;
+        copy_link_out(guest, address.cast::<u8>(), copied)
+    }
+
+    /// The target the guest sees for the caller's descriptor `fd`, whose
+    /// link the backend names `text`: a placeholder's link, confirmed through
+    /// the guest's own spelling at `link`, names the procfs file it stands
+    /// for, as Linux's link names the file; a pipe's or a socket's
+    /// (`pipe:[<inode>]`, `socket:[<inode>]`, the names `pipefs_dname` and
+    /// `sockfs_dname` give an object with no path) names the inode number
+    /// Detcore gives the descriptor's file (an inherited standard stream's,
+    /// or the pool's for its host identity), as its `fstat` does; any other
+    /// is the backend's text, a path (a named FIFO's included) or an
+    /// object's name.
+    async fn descriptor_link_target<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+        link: (i32, Option<PathPtr<'_>>),
+        text: Vec<u8>,
+    ) -> Result<Vec<u8>, Error> {
+        if let Some(path) = self.placeholder_link_within_level(guest, &text)
+            && self.placeholder_link_confirmed(guest, link).await
+        {
+            return Ok(path.as_os_str().as_bytes().to_vec());
+        }
+        let Some(identity) = super::anonymous_proc_fd_identity(&text) else {
+            return Ok(text);
+        };
+        let standard = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| {
+                crate::syscalls::deterministic_stdio_inode_for_resource(fd, detfd.resource())
+            })
+            .ok()
+            .flatten();
+        let inode = match standard {
+            Some(inode) => inode,
+            None => {
+                let stat = self.inject_fstat(guest, fd).await?;
+                crate::tool_global::determinize_inode(
+                    guest,
+                    crate::types::RawInode::new(stat.st_dev, stat.st_ino),
+                )
+                .await
+                .0
+            }
+        };
+        Ok(format!("{}:[{inode}]", identity.kind).into_bytes())
+    }
+
+    /// Whether Detcore reads the caller's own `fd/<n>`, `exe` and `cwd`
+    /// links from the backend's `link_path` fact: where the backend's procfs
+    /// is not the guest's kernel procfs
+    /// ([`crate::procfs_inode::tool_can_name_guest_descriptors`], KVM), so
+    /// that the backend's own readlink answer is not the kernel's, and not
+    /// under record and replay, which leave procfs to the kernel. Where it is
+    /// the kernel's (ptrace), the kernel answers, as before.
+    fn reads_link_facts(&self) -> bool {
+        !self.cfg.recordreplay_modes
+            && !crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend)
+    }
+
+    /// The text of the caller's own path link `link` from the backend's
+    /// `link_path` fact, where Detcore reads it ([`Self::reads_link_facts`]):
+    /// `Ok(Some(text))`, Linux's readlink text; `Err(ENOENT)` for a
+    /// descriptor the caller's table does not hold, as procfs has no such
+    /// entry; `Err` with the backend's errno for a name it could not render
+    /// (`ENAMETOOLONG`, as `d_path`'s); `Ok(None)` where Detcore does not
+    /// read the fact or the backend does not provide it, and for an `ESRCH`
+    /// that would say the calling thread is not live, which the fact's
+    /// contract excludes: the caller's other sources answer.
+    fn own_link_fact<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        link: PathLink,
+    ) -> Result<Option<Vec<u8>>, Errno> {
+        if !self.reads_link_facts() {
+            return Ok(None);
+        }
+        match guest.link_path(guest.tid(), link) {
+            Ok(text) => Ok(Some(text.as_bytes().to_vec())),
+            Err(FactError::Errno(Errno::EBADF)) if matches!(link, PathLink::Descriptor(_)) => {
+                Err(Errno::ENOENT)
+            }
+            Err(FactError::Errno(Errno::ESRCH)) => {
+                tracing::debug!(
+                    "[detcore, tid {}] the backend's link_path fact says the caller is not live; \
+                     its {link:?} link is answered as before",
+                    guest.tid()
+                );
+                Ok(None)
+            }
+            Err(FactError::Errno(errno)) => Err(errno),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Which task of the caller's process, if any, the spelling's `task`
@@ -661,6 +892,24 @@ mod tests {
             "/proc/self/task/5",
         ] {
             assert_eq!(named(path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_links_last_bytes_say_whether_it_is_followed() {
+        for path in ["/proc/self/fd/3", "/dev/fd/3", "/proc/self/fd/3/.."] {
+            assert_eq!(past_the_link(path.as_bytes()), Past::Nothing, "{path}");
+        }
+        for path in ["/proc/self/fd/3/", "/proc/thread-self/fd/3///"] {
+            assert_eq!(past_the_link(path.as_bytes()), Past::Slash, "{path}");
+        }
+        for path in [
+            "/proc/self/fd/3/.",
+            "/proc/self/fd/3/./",
+            "/proc/self/fd/3//.",
+            "/proc/self/fd/3/./.",
+        ] {
+            assert_eq!(past_the_link(path.as_bytes()), Past::Walk, "{path}");
         }
     }
 

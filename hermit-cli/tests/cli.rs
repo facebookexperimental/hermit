@@ -67798,3 +67798,152 @@ fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
         }
     }
 }
+
+static PROC_LINK_TARGETS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// How many lines the link-targets guest prints.
+const PROC_LINK_TARGET_LINES: usize = 57;
+
+/// `tests/c/proc_link_targets.c`'s guest.
+fn proc_link_targets_guest() -> &'static Path {
+    compiled_c_guest(&PROC_LINK_TARGETS_GUEST, "proc_link_targets")
+}
+
+/// The link-targets guest's transcript run natively, with the native lines
+/// that name each kind of target checked first, so a host that answers
+/// otherwise fails here rather than in the comparison.
+fn proc_link_targets_native() -> String {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let output = Command::new(proc_link_targets_guest())
+        .arg(directory.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the link-targets guest natively");
+    assert!(output.status.success(), "native: {output:?}");
+    let native = stdout(&output);
+    assert_eq!(native.lines().count(), PROC_LINK_TARGET_LINES, "{native}");
+    for line in [
+        "unlinked file=<dir>/doomed (deleted)",
+        "removed directory=<dir>/gone (deleted)",
+        "pipe read end: names pipe:[<its fstat inode>]=1",
+        "socket: names socket:[<its fstat inode>]=1",
+        "eventfd=anon_inode:[eventfd]",
+        "epoll=anon_inode:[eventpoll]",
+        "timerfd=anon_inode:[timerfd]",
+        "signalfd=anon_inode:[signalfd]",
+        "memfd=/memfd:f2h-link (deleted)",
+        "named fifo=<dir>/fifo",
+        "closed fd=-1 errno=ENOENT",
+        "followed: file fd/=-1 errno=ENOTDIR",
+        "followed: removed directory fd/=-1 errno=EINVAL",
+        "removed: cwd=<dir>/moved (deleted)",
+        "removed: cwd spellings=7 same=7",
+        "failures=0",
+    ] {
+        assert!(
+            native.lines().any(|native| native == line),
+            "{line}: {native}"
+        );
+    }
+    native
+}
+
+/// The link-targets guest's transcript under Hermit on `backend` at L2: two
+/// runs at bitwise parity under `--verify-strict`, with the same nonzero
+/// number of INFO records compared.
+fn proc_link_targets_at_l2(backend: &str) -> String {
+    let guest = proc_link_targets_guest();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join(format!("{backend}.json"));
+    let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+    let work = directory.path().join("work");
+    fs::create_dir(&work).expect("create the guest's directory");
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        &report_arg,
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        work.to_str().expect("directory path is UTF-8"),
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+            .expect("parse the verification report");
+    assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+    let compared = &verdict["compared_log_messages"];
+    assert!(
+        compared["left"].as_u64().is_some_and(|count| count > 0)
+            && compared["left"] == compared["right"],
+        "{backend} compared no INFO messages: {verdict}"
+    );
+    stdout(&output)
+}
+
+/// The caller's own `/proc/<pid>/fd/<n>` links (`tests/c/proc_link_targets.c`)
+/// on ptrace, where the kernel answers them, at L2, as natively: each kind
+/// of target (a file, renamed and unlinked ones, a directory and a removed
+/// one, an `O_PATH` descriptor, `/dev/null`, pipe ends, a socket, an
+/// eventfd, an epoll instance, a timerfd, a signalfd, a memfd), by six
+/// spellings; a closed descriptor, short, empty and unwritable buffers, and
+/// links followed by a final slash; a second thread's and a fork child's
+/// reads; the `exe` link; and the working directory's link after it is
+/// renamed and removed, by seven spellings. Package K slice F2-h leaves
+/// ptrace as it was, so one line keeps the answer it had: KNOWN DIFFERENCE,
+/// NOT COMPLETION: a named FIFO's link, which Linux names by the FIFO's path,
+/// reads `pipe:[<n>]`, because Detcore's canonicalization of a descriptor
+/// link the kernel answered rewrites by the descriptor's `fstat` file type
+/// (`canonicalize_namespace_readlink_result`), which is `S_IFIFO` for a named
+/// FIFO too. On KVM Detcore keys that rewrite on the link's text
+/// ([`run_kvm_the_callers_own_link_targets_answer_as_linux`]).
+#[test]
+fn the_callers_own_link_targets_answer_as_linux() {
+    let native = proc_link_targets_native();
+    let transcript = proc_link_targets_at_l2("ptrace");
+    assert_eq!(
+        transcript.lines().count(),
+        native.lines().count(),
+        "ptrace:\n{transcript}\nnative:\n{native}"
+    );
+    for (line, native_line) in transcript.lines().zip(native.lines()) {
+        if native_line == "named fifo=<dir>/fifo" {
+            let inode = line
+                .strip_prefix("named fifo=pipe:[")
+                .and_then(|rest| rest.strip_suffix(']'));
+            assert!(
+                inode.is_some_and(|inode| inode.bytes().all(|byte| byte.is_ascii_digit())),
+                "ptrace's named FIFO link changed (update this test and its doc): {line}"
+            );
+            continue;
+        }
+        assert_eq!(line, native_line, "ptrace:\n{transcript}");
+    }
+}
+
+/// The caller's own `/proc/<pid>/fd/<n>`, `exe` and `cwd` links
+/// (`tests/c/proc_link_targets.c`, the cases of
+/// [`the_callers_own_link_targets_answer_as_linux`]) on KVM, at L2, exactly
+/// as natively, every line. Detcore answers them from the backend's
+/// `link_path` fact (package K slice F2-h), where the KVM executor's own
+/// readlink answered them before: then a named FIFO's link read `pipe:[<n>]`,
+/// a link followed by a final slash failed with `ELOOP` (Linux: `ENOTDIR`
+/// for a file or a pipe, `EINVAL` for a directory), and the working
+/// directory's link after it was renamed and removed kept the path the last
+/// `chdir` set, without " (deleted)".
+#[test]
+fn run_kvm_the_callers_own_link_targets_answer_as_linux() {
+    let test = "run_kvm_the_callers_own_link_targets_answer_as_linux";
+    if kvm_unavailable(test) {
+        return;
+    }
+    let native = proc_link_targets_native();
+    assert_eq!(proc_link_targets_at_l2("kvm"), native, "kvm");
+}

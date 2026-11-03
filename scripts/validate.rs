@@ -20745,8 +20745,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // (https://github.com/rrnewton/reverie/issues/1108) retires the default
         // rustc link refusal and lists the shared file view beside a second
         // thread, the exited-threads fork test and the fork refusal beside a live
-        // thread: 129, matching the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 129usize),
+        // thread: 129. And package K slice F2-h's
+        // run_kvm_the_callers_own_link_targets_answer_as_linux: 130, matching
+        // the DAG pin in validation_dag_static.
+        ("privileged-only-test.cli_kvm", 130usize),
     ] {
         let step = privileged
             .steps
