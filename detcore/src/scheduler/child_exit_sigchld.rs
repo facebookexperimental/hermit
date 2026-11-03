@@ -1070,6 +1070,10 @@ impl Scheduler {
             ChildExitSigchldControl::Flushed => {
                 let parent = self.sigchld_process(dtid);
                 self.child_exit_sigchld.flush(parent);
+                // The flushed copy may be a fenced one: its mark goes with it,
+                // or a later delivery, whose turn may depend on host timing,
+                // would take it (`BlockedPool::sigchld_fenced`).
+                self.blocked.sigchld_fenced.remove(&parent);
                 // `do_sigaction` flushes every thread's private queue too.
                 let private = std::mem::take(&mut self.child_exit_sigchld.private_sent);
                 self.child_exit_sigchld.private_sent = private

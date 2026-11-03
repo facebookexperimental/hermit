@@ -772,11 +772,14 @@ pub struct BlockedPool {
     /// delivery whose turn depends on host timing would take it
     /// (`sigchld_fence_commit`). So no mark is set where Linux sends nothing
     /// (an explicit `SIG_IGN`) or where the copy may be consumed without a
-    /// delivery (a signalfd of the process covering `SIGCHLD`, or a thread in
-    /// `rt_sigtimedwait` for it); and a mark expires at the commit of a turn of
-    /// a thread of the process that could take the copy by such a call, or
-    /// that does not block `SIGCHLD` and already had a turn since the mark (it
-    /// returned to user mode once without taking it). A thread that blocks
+    /// delivery (a signalfd covering `SIGCHLD` in any process, since its open
+    /// description may be shared, or a thread of the process in
+    /// `rt_sigtimedwait` for it); a mark expires at the commit of a turn of a
+    /// thread of the process that could take the copy by such a call, or that
+    /// does not block `SIGCHLD` and already had a turn since the mark (it
+    /// returned to user mode once without taking it); and a disposition change
+    /// that flushes the pending copy (`SIG_IGN` or `SIG_DFL`,
+    /// `ChildExitSigchldControl::Flushed`) removes it. A thread that blocks
     /// `SIGCHLD` cannot take it, so its turns leave the mark alone. A copy
     /// that coalesced with an earlier, host-timed one can still leave a mark
     /// that a later delivery of that process takes, before any of these; that
@@ -11711,10 +11714,7 @@ impl Scheduler {
             return;
         }
         let bit = kernel_signal_bit(libc::SIGCHLD);
-        let by_call = self
-            .signalfd_masks
-            .get(&parent)
-            .is_some_and(|mask| mask & bit != 0)
+        let by_call = self.signalfd_may_read(bit)
             || self
                 .sigtimedwait_sets
                 .iter()
@@ -11725,14 +11725,14 @@ impl Scheduler {
         self.blocked.sigchld_fenced.insert(parent, BTreeSet::new());
     }
 
-    /// Whether `thread` of `process` can take a pending `SIGCHLD` without a
-    /// delivery: by a signalfd of the process that covers it, or by the
+    /// Whether `thread` can take a pending `SIGCHLD` without a delivery: by a
+    /// signalfd that covers it, in any process, since a signalfd's open
+    /// description may be inherited or passed and its mask changed where
+    /// Detcore does not see it (`signalfd_may_read`), or by the
     /// `rt_sigtimedwait` it is in.
-    fn may_take_sigchld_by_call(&self, process: DetPid, thread: DetTid) -> bool {
+    fn may_take_sigchld_by_call(&self, thread: DetTid) -> bool {
         let bit = kernel_signal_bit(libc::SIGCHLD);
-        self.signalfd_masks
-            .get(&process)
-            .is_some_and(|mask| mask & bit != 0)
+        self.signalfd_may_read(bit)
             || self
                 .sigtimedwait_sets
                 .get(&thread)
@@ -11759,7 +11759,7 @@ impl Scheduler {
         let blocks = self
             .thread_signal_mask_for(dtid, libc::SIGCHLD)
             .is_some_and(|mask| mask & bit != 0);
-        let by_call = self.may_take_sigchld_by_call(process, dtid);
+        let by_call = self.may_take_sigchld_by_call(dtid);
         let ran_on = self
             .blocked
             .sigchld_fenced
@@ -40793,6 +40793,12 @@ mod test {
         scheduler.signalfd_masks.insert(process, chld);
         scheduler.fence_child_exit_sigchld(process, Some(ChildExitNotification::Discard));
         assert!(scheduler.blocked.sigchld_fenced.is_empty());
+        // A signalfd recorded under another process: its open description
+        // may be shared with this one.
+        let mut scheduler = fresh();
+        scheduler.signalfd_masks.insert(DetPid::from_raw(7), chld);
+        scheduler.fence_child_exit_sigchld(process, Some(ChildExitNotification::Discard));
+        assert!(scheduler.blocked.sigchld_fenced.is_empty());
         let mut scheduler = fresh();
         scheduler.sigtimedwait_sets.insert(sibling, chld);
         scheduler.fence_child_exit_sigchld(process, Some(ChildExitNotification::Discard));
@@ -40857,6 +40863,96 @@ mod test {
         scheduler.sigtimedwait_sets.insert(waiter, chld);
         scheduler.sigchld_fence_commit(waiter);
         assert!(!scheduler.blocked.sigchld_fenced.contains_key(&process));
+    }
+
+    /// Two more routes by which a fenced copy goes without a delivery taking
+    /// its mark. A signalfd covering `SIGCHLD` recorded under another process
+    /// after the mark (its open description may be shared with the parent's
+    /// process) removes the mark at the next commit of a thread of the
+    /// parent's process. A disposition change that flushes the pending copy
+    /// (`SIG_IGN` or `SIG_DFL`: `ChildExitSigchldControl::Flushed`) removes it
+    /// at once. In both, a later delivery to the parent is deferred with no
+    /// snapshot (`sigchld_deferred_behind`) and waits for quiescence alone.
+    /// The controls: with neither, the blocking sibling's turns and the
+    /// parent's first turn keep the mark, and the deferral is bounded.
+    #[test]
+    fn a_fenced_sigchld_that_a_shared_signalfd_or_a_flush_may_take_leaves_no_bound() {
+        let (busy, parent) = (DetTid::from_raw(100), DetTid::from_raw(101));
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let fenced = || {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.thread_tree.add_child(parent, parent, true);
+            scheduler.thread_tree.add_child(parent, busy, false);
+            for tid in [busy, parent] {
+                register_known_thread(&mut scheduler, tid);
+                scheduler.runqueue_push_back(tid);
+            }
+            scheduler.blocked.continuation_masks.insert(parent, Some(0));
+            scheduler
+                .blocked
+                .continuation_masks
+                .insert(busy, Some(chld));
+            let process = scheduler.sigchld_process(parent);
+            scheduler.fence_child_exit_sigchld(process, Some(ChildExitNotification::Discard));
+            assert!(scheduler.blocked.sigchld_fenced.contains_key(&process));
+            (scheduler, process)
+        };
+        let defer = |scheduler: &mut Scheduler| {
+            assert_eq!(scheduler.run_queue.tentative_pop_tid(parent), Some(parent));
+            let inbound = ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD));
+            assert!(
+                scheduler
+                    .block_for_one_resource(
+                        parent,
+                        &inbound,
+                        &Permission::W,
+                        None,
+                        None,
+                        &Ivar::new()
+                    )
+                    .is_err()
+            );
+            assert!(scheduler.blocked.sigchld_deferred.contains(&parent));
+            assert!(scheduler.blocked.sigchld_fenced.is_empty());
+        };
+        // The control: the busy sibling blocks SIGCHLD, and the parent's
+        // first turn may end where it takes the copy.
+        let (mut scheduler, _) = fenced();
+        scheduler.sigchld_fence_commit(busy);
+        scheduler.sigchld_fence_commit(parent);
+        defer(&mut scheduler);
+        assert_eq!(
+            scheduler.blocked.sigchld_deferred_behind.get(&parent),
+            Some(&BTreeSet::from([busy]))
+        );
+        // A signalfd for SIGCHLD recorded under another process.
+        let (mut scheduler, process) = fenced();
+        scheduler.signalfd_masks.insert(DetPid::from_raw(7), chld);
+        scheduler.sigchld_fence_commit(busy);
+        assert!(!scheduler.blocked.sigchld_fenced.contains_key(&process));
+        defer(&mut scheduler);
+        assert!(scheduler.blocked.sigchld_deferred_behind.is_empty());
+        // The parent blocks SIGCHLD, so its turns keep the mark, and sets its
+        // action to SIG_IGN or SIG_DFL, which flushes the pending copy; it
+        // later restores a handler and unblocks SIGCHLD.
+        let (mut scheduler, process) = fenced();
+        scheduler
+            .blocked
+            .continuation_masks
+            .insert(parent, Some(chld));
+        for _ in 0..3 {
+            scheduler.sigchld_fence_commit(parent);
+            scheduler.sigchld_fence_commit(busy);
+        }
+        assert!(scheduler.blocked.sigchld_fenced.contains_key(&process));
+        scheduler.child_exit_sigchld_control(
+            parent,
+            crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::Flushed,
+        );
+        assert!(!scheduler.blocked.sigchld_fenced.contains_key(&process));
+        scheduler.blocked.continuation_masks.insert(parent, Some(0));
+        defer(&mut scheduler);
+        assert!(scheduler.blocked.sigchld_deferred_behind.is_empty());
     }
 
     /// The control for the two tests above: a queue of real pollers alone still
@@ -52098,7 +52194,10 @@ mod test {
         );
 
         private_sent(&mut scheduler, creator);
-        scheduler.child_exit_sigchld_control(parent, ChildExitSigchldControl::Flushed);
+        scheduler.child_exit_sigchld_control(
+            parent,
+            crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::Flushed,
+        );
         assert!(!scheduler.child_exit_sigchld.private_sent.contains(&creator));
         private_sent(&mut scheduler, creator);
         scheduler.logically_kill_thread(&creator, &parent, MmId::initial(creator));
@@ -52338,7 +52437,10 @@ mod test {
             scheduler.child_exit_sigchld_control(creator, ChildExitSigchldControl::PlacedPending),
             ChildExitSigchldAnswer::Placed(true)
         );
-        scheduler.child_exit_sigchld_control(parent, ChildExitSigchldControl::Flushed);
+        scheduler.child_exit_sigchld_control(
+            parent,
+            crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::Flushed,
+        );
         assert_eq!(
             scheduler.child_exit_sigchld_control(creator, ChildExitSigchldControl::PlacedPending),
             ChildExitSigchldAnswer::Placed(false)
