@@ -520,10 +520,12 @@ pub enum DesyncKind {
     /// The run ended with recorded callback checkpoints of a thread never
     /// reached.
     IncompleteCallbackHistory,
-    /// Priority-history replay refused a recorded callback checkpoint.
-    CallbackRefusal,
     /// Recorded background starts the replay did not take.
     UntakenBackgroundStarts,
+    /// Recorded jumps of global time the replay could not make as recorded
+    /// (made otherwise than the recording, or not made), never reached, or
+    /// still unconfirmed when it ended.
+    GlobalTimeJumps,
     /// A kind this build does not know, written by a later Hermit.
     #[serde(other)]
     Other,
@@ -593,7 +595,10 @@ pub struct DesyncNote {
     /// event stood for (`schedule_event`); the event ending the checkpoint's
     /// slice (`callback_checkpoint`); the first unconsumed checkpoint's
     /// (`incomplete_callback_history`); the first untaken start's `after`
-    /// (`untaken_background_starts`). `None` when the record gives none.
+    /// (`untaken_background_starts`); the earliest of those recorded jumps'
+    /// places, before the record's event of that index (`global_time_jumps`).
+    /// `None` when the record gives none, as a boundary-protocol record does
+    /// not for a jump, whose place there counts its boundary records too.
     pub record_event: Option<u64>,
     /// The recorded callback checkpoints it concerns, each with the index of
     /// the event ending its slice.
@@ -607,8 +612,8 @@ pub struct DesyncNote {
     /// itself (`schedule_event`); when the thread reported the checkpoint,
     /// which can be later than `record_event`, since a thread reports it on
     /// its next check-in (`callback_checkpoint`); where the replay ended
-    /// (`incomplete_callback_history`, `untaken_background_starts`). `None`
-    /// without a schedule replay.
+    /// (`incomplete_callback_history`, `untaken_background_starts`,
+    /// `global_time_jumps`). `None` without a schedule replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_at: Option<ReplayPosition>,
     /// The line `desync_descrip` carries for it.

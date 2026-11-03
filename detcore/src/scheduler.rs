@@ -1683,6 +1683,9 @@ pub struct Scheduler {
     /// The target of the last recorded jump the replay made before any thread
     /// had registered a deadline there (`check_unconfirmed_time_skip`).
     unconfirmed_time_skip: Option<TimeSkip>,
+    /// The first recorded jump the replay could not make as recorded
+    /// (`time_skip_desync`), which the run summary places in the record.
+    first_time_skip_desync: Option<TimeSkip>,
     /// Under a driven replay, the stream position and reason of the latest
     /// commit that would have requested a jump in a free run: a FIFO open's
     /// poll or an idle guest-state poller's retry when nothing else can run
@@ -5754,6 +5757,7 @@ impl Scheduler {
             charge_replayed_switch_ins,
             switch_in_committed_at: None,
             unconfirmed_time_skip: None,
+            first_time_skip_desync: None,
             jump_request: None,
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
@@ -11166,9 +11170,12 @@ impl Scheduler {
         // did; a jump beyond the end was never reached.
         let end = self.replay_position();
         for skip in unmade.into_iter().filter(|skip| skip.event > end) {
-            self.time_skip_desync(&format!(
-                "the recording jumped as {skip:?}, but the replay ran out of records first"
-            ));
+            self.time_skip_desync(
+                skip,
+                &format!(
+                    "the recording jumped as {skip:?}, but the replay ran out of records first"
+                ),
+            );
         }
     }
 
@@ -11210,10 +11217,13 @@ impl Scheduler {
             expected.pop_front();
             self.jump_request = None;
             if !requested {
-                self.time_skip_desync(&format!(
-                    "the recording jumped as {skip:?}, but the replay passed that point \
-                     before the FIFO open found nothing else could run"
-                ));
+                self.time_skip_desync(
+                    skip,
+                    &format!(
+                        "the recording jumped as {skip:?}, but the replay passed that point \
+                         before the FIFO open found nothing else could run"
+                    ),
+                );
             }
             self.make_recorded_time_skip(global_time, skip);
         }
@@ -11227,9 +11237,10 @@ impl Scheduler {
         let now = gt.as_nanos();
         if skip.target <= now || skip.target.is_indefinite() {
             drop(gt);
-            self.time_skip_desync(&format!(
-                "the recording jumped as {skip:?}, but global time is already {now}"
-            ));
+            self.time_skip_desync(
+                skip,
+                &format!("the recording jumped as {skip:?}, but global time is already {now}"),
+            );
             return;
         }
         info!(
@@ -11246,10 +11257,13 @@ impl Scheduler {
             writer.insert_time_skip(TimeSkip { event, ..skip });
         }
         match known {
-            Some(known) if known < skip.target => self.time_skip_desync(&format!(
-                "the recording jumped as {skip:?}, past a finite deadline this replay knows, \
-                 {known}"
-            )),
+            Some(known) if known < skip.target => self.time_skip_desync(
+                skip,
+                &format!(
+                    "the recording jumped as {skip:?}, past a finite deadline this replay \
+                     knows, {known}"
+                ),
+            ),
             Some(known) if known == skip.target => self.unconfirmed_time_skip = None,
             _ => self.unconfirmed_time_skip = Some(skip),
         }
@@ -11270,10 +11284,13 @@ impl Scheduler {
         match self.earliest_known_deadline() {
             Some(known) if known < skip.target => {
                 self.unconfirmed_time_skip = None;
-                self.time_skip_desync(&format!(
-                    "the recording jumped as {skip:?}, but a thread then registered an earlier \
-                     deadline, {known}, which the jump passed"
-                ));
+                self.time_skip_desync(
+                    skip,
+                    &format!(
+                        "the recording jumped as {skip:?}, but a thread then registered an \
+                         earlier deadline, {known}, which the jump passed"
+                    ),
+                );
             }
             Some(known) if known == skip.target => self.unconfirmed_time_skip = None,
             _ => {}
@@ -11333,8 +11350,9 @@ impl Scheduler {
 
     /// A recorded jump of global time the replay cannot make as recorded:
     /// reported, and fatal under `--die-on-desync`, as an event desync is.
-    fn time_skip_desync(&mut self, complaint: &str) {
+    fn time_skip_desync(&mut self, skip: TimeSkip, complaint: &str) {
         self.time_skip_desyncs += 1;
+        self.first_time_skip_desync.get_or_insert(skip);
         warn!("[scheduler] schedule replay desynchronized: {complaint}");
         if self.die_on_time_skip_desync {
             eprintln!("Replay mode desynchronized from trace, bailing out: {complaint}");
@@ -17787,16 +17805,9 @@ impl Scheduler {
             );
             // Selected now, once: acknowledge the recorded row it ends.
             if let Err(refusal) = self.acknowledge_priority_row(dettid, rs) {
-                self.callback_checkpoint_desyncs
-                    .push(detcore_model::summary::DesyncNote {
-                        kind: detcore_model::summary::DesyncKind::CallbackRefusal,
-                        thread: Some(dettid),
-                        record_event: None,
-                        checkpoints: Vec::new(),
-                        background_starts: Vec::new(),
-                        reported_at: self.traced_replay_position(),
-                        message: refusal.clone(),
-                    });
+                // The refusal ends the run here, before any summary is
+                // written, so it is no summary note: its message is the
+                // refusal the run exits with.
                 exit_on_replay_refusal(&refusal);
             }
         }
@@ -22108,16 +22119,49 @@ impl Scheduler {
             || unmade_time_skips > 0
             || self.unconfirmed_time_skip.is_some()
         {
+            // The earliest place among the jumps this line counts. A jump's
+            // place is a global event index only in the original format; a
+            // boundary-protocol record counts its boundary records too.
+            let unmade = match &self.time_skip_mode {
+                TimeSkipMode::Driven(rest) => rest.front(),
+                _ => None,
+            };
+            let record_event = if self.boundary_replayer.is_none() {
+                [
+                    self.first_time_skip_desync.as_ref(),
+                    self.unconfirmed_time_skip.as_ref(),
+                    unmade,
+                ]
+                .into_iter()
+                .flatten()
+                .map(|skip| skip.event)
+                .min()
+            } else {
+                None
+            };
+            let ended_at = self.traced_replay_position();
             let message = format!(
-                "DESYNC recorded jumps of global time: {} desynced, {} not reached, {} unconfirmed",
+                "DESYNC recorded jumps of global time: {} desynced, {} not reached, \
+                 {} unconfirmed; the first {}{}",
                 self.time_skip_desyncs,
                 unmade_time_skips,
                 usize::from(self.unconfirmed_time_skip.is_some()),
+                Self::record_position_text(record_event),
+                Self::reported_at_text(ended_at, "the replay ended"),
             );
             tracing::warn!("{}", message);
             desync_descrip
                 .get_or_insert_with(String::new)
                 .push_str(&format!("{message}\n"));
+            desync_notes.push(detcore_model::summary::DesyncNote {
+                kind: detcore_model::summary::DesyncKind::GlobalTimeJumps,
+                thread: None,
+                record_event,
+                checkpoints: Vec::new(),
+                background_starts: Vec::new(),
+                reported_at: ended_at,
+                message,
+            });
         }
 
         let (reprio_descrip, info_reprio_descrip) = if end == RunEnd::Stopped
@@ -24361,6 +24405,80 @@ mod test {
         sched.runqueue_push_back(runnable);
         sched.fast_forward_to_next_finite_deadline(&global_time, pending);
         assert_eq!(global_time.lock().unwrap().as_nanos(), start);
+    }
+
+    /// A summarized desync of recorded jumps of global time is a summary note
+    /// as well as a line of `desync_descrip`, as every other summarized desync
+    /// is (https://github.com/rrnewton/hermit/issues/4876): placed at the
+    /// earliest of the jumps it counts, a desynced, an unconfirmed or an
+    /// unreached one, and reported where the replay ended.
+    #[test]
+    fn a_summarized_time_jump_desync_is_a_note_at_its_recorded_event() {
+        use detcore_model::summary::DesyncKind;
+        use detcore_model::summary::ReplayPosition;
+        let skip = |event, nanos| TimeSkip {
+            event,
+            target: LogicalTime::from_nanos(nanos),
+            reason: TimeSkipReason::IdleGuestPollers,
+        };
+        let jumps_note = |sched: &mut Scheduler| {
+            let summary = sched.generate_partial_run_summary(None).unwrap();
+            let text = summary.desync_descrip.clone().unwrap_or_default();
+            let notes: Vec<_> = summary
+                .desync_notes
+                .iter()
+                .filter(|note| note.kind == DesyncKind::GlobalTimeJumps)
+                .cloned()
+                .collect();
+            assert_eq!(notes.len(), 1, "{text}");
+            assert!(text.contains(&notes[0].message), "{text}");
+            let json = serde_json::to_value(&summary).unwrap();
+            assert_eq!(json["desync_notes"][0]["kind"], "global_time_jumps");
+            let parsed: detcore_model::summary::RunSummary = serde_json::from_value(json).unwrap();
+            assert_eq!(parsed.desync_notes, summary.desync_notes);
+            notes.into_iter().next().unwrap()
+        };
+
+        // One desynced jump, one unconfirmed and one never reached: the note
+        // names the earliest place, the desynced jump's.
+        let mut sched = Scheduler::new(&Config::default());
+        sched.replayer = Some(crate::scheduler::replayer::Replayer::new([]));
+        sched.time_skip_desync(skip(4, 1_000_000), "made past a known deadline");
+        sched.unconfirmed_time_skip = Some(skip(6, 2_000_000));
+        sched.time_skip_mode = TimeSkipMode::Driven([skip(9, 3_000_000)].into_iter().collect());
+        let note = jumps_note(&mut sched);
+        assert_eq!(note.record_event, Some(4));
+        assert_eq!(note.thread, None);
+        assert_eq!(
+            note.reported_at,
+            Some(ReplayPosition {
+                event: 0,
+                record_event: 0
+            })
+        );
+        assert!(
+            note.message
+                .contains("1 desynced, 1 not reached, 1 unconfirmed; the first at record event #4"),
+            "{}",
+            note.message
+        );
+
+        // Only a jump never reached: it is the place.
+        let mut sched = Scheduler::new(&Config::default());
+        sched.replayer = Some(crate::scheduler::replayer::Replayer::new([]));
+        sched.time_skip_mode = TimeSkipMode::Driven([skip(9, 3_000_000)].into_iter().collect());
+        assert_eq!(jumps_note(&mut sched).record_event, Some(9));
+
+        // Every jump made and confirmed: no note, as no line.
+        let mut sched = Scheduler::new(&Config::default());
+        sched.replayer = Some(crate::scheduler::replayer::Replayer::new([]));
+        let summary = sched.generate_partial_run_summary(None).unwrap();
+        assert!(
+            summary
+                .desync_notes
+                .iter()
+                .all(|note| note.kind != DesyncKind::GlobalTimeJumps)
+        );
     }
 
     /// A replay of a record that lists its jumps makes each where the
