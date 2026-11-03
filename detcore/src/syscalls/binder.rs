@@ -1073,6 +1073,7 @@ mod tests {
             fds: vec![7, 9],
             messages: Vec::new(),
             refused: None,
+            may_have_installed: false,
         };
         let reason = unrecorded_receipt_reason(4, &delivered).unwrap();
         assert!(
