@@ -313,9 +313,15 @@ impl std::hash::Hash for HostObservedCount {
 /// - Format 4 ([`BACKGROUND_STARTS_FORMAT`]) notes every background start its
 ///   run took (`background_starts`), so its schedule replay begins each
 ///   kernel-run call where the recording did.
+/// - Format 5 ([`STOPLESS_SLICE_ENDS_FORMAT`]) may mark a Branch event
+///   `stopless`: a lone thread's timeslice end its run took without a stop,
+///   so the event has no `end_rip`, and a replay takes that end without a stop
+///   where its thread runs alone.
 ///
-/// A record of a newer format is refused (`PreemptionRecord::validate_format`).
-pub const PREEMPTION_RECORD_FORMAT: u32 = BACKGROUND_STARTS_FORMAT;
+/// A record of a newer format is refused (`PreemptionRecord::validate_format`),
+/// so a Hermit that reads only formats 1 to 4 refuses a record with such
+/// marks rather than replay it with a stop it would not find at those ends.
+pub const PREEMPTION_RECORD_FORMAT: u32 = STOPLESS_SLICE_ENDS_FORMAT;
 
 /// The format from which a record lists all its jumps of global time.
 pub const TIME_SKIPS_FORMAT: u32 = 2;
@@ -333,6 +339,19 @@ pub const TIME_SKIPS_FORMAT: u32 = 2;
 /// turn rule continues to decide subsequent signal charges. This format alone
 /// does not claim equality of every record/replay clock observation.
 pub const SWITCH_IN_CHARGE_FORMAT: u32 = 3;
+
+/// The format from which a record may mark a lone thread's timeslice end
+/// taken without a stop (`SchedEvent::stopless`): the next number above
+/// [`BACKGROUND_STARTS_FORMAT`]. A writer that notes its run's background
+/// starts writes it (`PreemptionWriter::noting_background_starts`): a run
+/// that follows no record, and a preemption replay's re-record. A record of
+/// an older format holds no mark: a writer below this format records such an
+/// end as an ordinary one (`PreemptionWriter::insert_schedevent`), and a
+/// record lowered below `BACKGROUND_STARTS_FORMAT` drops its marks with its
+/// starts (`PreemptionRecord::forget_stopless_marks_below_their_format`). A
+/// record read with a mark in an older format is refused
+/// (`PreemptionRecord::validate_format`).
+pub const STOPLESS_SLICE_ENDS_FORMAT: u32 = 5;
 
 /// A record whose format, or jumps of global time, this Hermit refuses to
 /// replay (`PreemptionRecord::validate_format`): a policy refusal, not a
@@ -554,7 +573,7 @@ impl PreemptionRecord {
                 (!kept.is_empty()).then_some((*tid, kept))
             })
             .collect();
-        PreemptionRecord {
+        let mut prefix = PreemptionRecord {
             per_thread: per_thread.clone(),
             global,
             epoch: *epoch,
@@ -620,6 +639,32 @@ impl PreemptionRecord {
             },
             // A setting of the recorded run, which a replay must share.
             rewrite_exclusives_in_memory: *rewrite_exclusives_in_memory,
+        };
+        prefix.forget_stopless_marks_below_their_format();
+        prefix
+    }
+
+    /// Drop the `stopless` marks of a record whose format is older than
+    /// [`STOPLESS_SLICE_ENDS_FORMAT`], so that it reads back
+    /// (`validate_format`): each such end then replays with a stop. This is
+    /// how a record that keeps no background starts, lowered below
+    /// [`BACKGROUND_STARTS_FORMAT`] (`format_without_background_starts`),
+    /// keeps its lone-slice ends. It follows the format ladder's rule: a
+    /// later feature that cannot be lowered keeps its number and marks the
+    /// earlier feature's data absent with an explicit flag; a feature that
+    /// can be lowered without breaking replay is lowered. These marks can be,
+    /// so no flag says they were dropped: a replay that stops at such an end
+    /// reproduces the run as one that takes it without a stop does
+    /// (`hermit-cli`'s `deadline_slice_cap` tests compare a recording's
+    /// replays with those of a recording that stopped at every end).
+    fn forget_stopless_marks_below_their_format(&mut self) {
+        if self
+            .format_version
+            .is_none_or(|format| format < STOPLESS_SLICE_ENDS_FORMAT)
+        {
+            for event in &mut self.global {
+                event.stopless = false;
+            }
         }
     }
 
@@ -631,6 +676,7 @@ impl PreemptionRecord {
     pub fn with_schedule(&self, events: Vec<SchedEvent>) -> Option<PreemptionRecord> {
         let mut record = self.clone();
         record.global = events;
+        record.forget_stopless_marks_below_their_format();
         record.validate().is_ok().then_some(record)
     }
 
@@ -717,6 +763,7 @@ impl PreemptionRecord {
             );
         }
         record.global = events;
+        record.forget_stopless_marks_below_their_format();
         record.validate()?;
         Ok(record)
     }
@@ -768,9 +815,12 @@ impl PreemptionRecord {
 
     /// The same record in `format` (`None` for format 1). Analyze and bisect
     /// require one shared timing format across the recordings they read
-    /// (`hermit-cli`'s `time_skip_carry`).
+    /// (`hermit-cli`'s `time_skip_carry`). A format older than
+    /// [`STOPLESS_SLICE_ENDS_FORMAT`] drops the record's `stopless` marks
+    /// (`forget_stopless_marks_below_their_format`).
     pub fn with_format(mut self, format: Option<u32>) -> Self {
         self.format_version = format;
+        self.forget_stopless_marks_below_their_format();
         self
     }
 
@@ -977,6 +1027,7 @@ impl PreemptionRecord {
         // start, and keeps the timing rules of the format below.
         self.background_starts.clear();
         self.format_version = format_without_background_starts(self.format_version);
+        self.forget_stopless_marks_below_their_format();
     }
 
     /// TODO: provide a better way to create an empty PreemptionRecord but with entries for a given set of tids.
@@ -1298,6 +1349,18 @@ impl PreemptionRecord {
         let known = self
             .format_version
             .is_none_or(|format| (TIME_SKIPS_FORMAT..=PREEMPTION_RECORD_FORMAT).contains(&format));
+        let stopless = self.global.iter().filter(|event| event.stopless).count();
+        if stopless > 0
+            && self
+                .format_version
+                .is_none_or(|format| format < STOPLESS_SLICE_ENDS_FORMAT)
+        {
+            return Err(format!(
+                "record format {:?} with {stopless} timeslice ends taken without a stop \
+                 (`stopless`): such ends need format {STOPLESS_SLICE_ENDS_FORMAT} or later",
+                self.format_version
+            ));
+        }
         if !known || (!skips.is_empty() && !self.lists_its_time_skips()) {
             return Err(format!(
                 "record format {:?} with {} time skips: this Hermit reads formats 1 to \
@@ -1800,6 +1863,134 @@ mod tests {
             "a marked record has no unversioned binary encoding"
         );
         assert!(bytes.is_empty(), "refuse before writing a partial record");
+    }
+
+    /// A record that marks a timeslice end taken without a stop is format 5,
+    /// the first above `BACKGROUND_STARTS_FORMAT`. A writer that notes its
+    /// run's background starts keeps the marks: a recording's, and a
+    /// preemption replay's re-record whatever format it follows. A writer that
+    /// notes none (a schedule replay's re-record) records such an end as an
+    /// ordinary one and stays below format 5. A record read with a mark in an
+    /// older format is refused, as is a format this Hermit does not know (6).
+    /// So a Hermit that reads formats 1 to 4 refuses a record with marks,
+    /// where it would replay those ends with a stop it does not find.
+    #[test]
+    fn stopless_slice_ends_need_format_5() {
+        let tid = DetTid::from_raw(3);
+        let marked = SchedEvent::branches(tid, 100).taken_without_stop();
+        assert_eq!(PREEMPTION_RECORD_FORMAT, STOPLESS_SLICE_ENDS_FORMAT);
+        assert_eq!(STOPLESS_SLICE_ENDS_FORMAT, BACKGROUND_STARTS_FORMAT + 1);
+        let written = |mut writer: PreemptionWriter| {
+            writer.insert_schedevent(SchedEvent::branches(tid, 100));
+            writer.insert_schedevent(marked.clone());
+            let record: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+            record.validate_format().unwrap();
+            let marks: Vec<bool> = record.global.iter().map(|event| event.stopless).collect();
+            (record.format_version, marks)
+        };
+        for followed in [
+            Some(PREEMPTION_RECORD_FORMAT),
+            Some(BACKGROUND_STARTS_FORMAT),
+            Some(SWITCH_IN_CHARGE_FORMAT),
+        ] {
+            assert_eq!(
+                written(
+                    PreemptionWriter::new(None)
+                        .with_format(followed)
+                        .noting_background_starts()
+                ),
+                (Some(STOPLESS_SLICE_ENDS_FORMAT), vec![false, true]),
+                "a writer noting its starts, following {followed:?}"
+            );
+        }
+        for followed in [
+            Some(PREEMPTION_RECORD_FORMAT),
+            Some(SWITCH_IN_CHARGE_FORMAT),
+            None,
+        ] {
+            let (format, marks) = written(PreemptionWriter::new(None).with_format(followed));
+            assert!(
+                format.is_none_or(|format| format < STOPLESS_SLICE_ENDS_FORMAT),
+                "a writer noting no starts, following {followed:?}: {format:?}"
+            );
+            assert_eq!(marks, vec![false, false], "following {followed:?}");
+        }
+        let record = PreemptionRecord::from_sched_events(vec![marked]);
+        for format in [
+            None,
+            Some(TIME_SKIPS_FORMAT),
+            Some(SWITCH_IN_CHARGE_FORMAT),
+            Some(BACKGROUND_STARTS_FORMAT),
+        ] {
+            let mut read = record.clone();
+            read.format_version = format;
+            let error = read.validate_format().unwrap_err();
+            assert!(
+                error.contains("taken without a stop"),
+                "{format:?}: {error}"
+            );
+        }
+        let mut read = record;
+        read.format_version = Some(STOPLESS_SLICE_ENDS_FORMAT);
+        read.validate_format().unwrap();
+        read.format_version = Some(STOPLESS_SLICE_ENDS_FORMAT + 1);
+        assert!(read.validate_format().is_err());
+    }
+
+    /// A record that keeps no background starts keeps no `stopless` marks:
+    /// lowered below `BACKGROUND_STARTS_FORMAT`, to format 3, it drops them
+    /// and reads back, and its replay stops at those ends. A prefix of part
+    /// of the schedule, an edit, a mixed schedule and a shared trial format
+    /// each lower it; a prefix of the whole schedule keeps its format and its
+    /// marks.
+    #[test]
+    fn a_record_that_keeps_no_background_starts_keeps_no_stopless_marks() {
+        let tid = DetTid::from_raw(3);
+        let events = vec![
+            SchedEvent::branches(tid, 10).taken_without_stop(),
+            SchedEvent::branches(tid, 20),
+        ];
+        let mut record = PreemptionRecord::from_sched_events(events.clone());
+        record.format_version = Some(PREEMPTION_RECORD_FORMAT);
+        record.background_starts.push(BackgroundStart {
+            after: 1,
+            thread: tid,
+            call: 1,
+        });
+        record.validate().unwrap();
+        let reads_back = |record: &PreemptionRecord, what: &str| {
+            let back: PreemptionRecord =
+                serde_json::from_str(&serde_json::to_string(record).unwrap()).unwrap();
+            back.validate_format()
+                .unwrap_or_else(|error| panic!("{what}: {error}"));
+            back.validate()
+                .unwrap_or_else(|error| panic!("{what}: {error}"));
+            let marks = back.global.iter().filter(|event| event.stopless).count();
+            (back.format_version, marks)
+        };
+        let lowered = (Some(BACKGROUND_STARTS_FORMAT - 1), 0);
+        assert_eq!(
+            reads_back(&record.schedule_prefix(2), "a prefix of the whole schedule"),
+            (Some(PREEMPTION_RECORD_FORMAT), 1)
+        );
+        assert_eq!(
+            reads_back(&record.schedule_prefix(1), "a shorter prefix"),
+            lowered
+        );
+        let mut edited = record.clone();
+        edited.schedevents_iter_mut().for_each(|_| ());
+        assert_eq!(reads_back(&edited, "an edit"), lowered);
+        let mixed = record
+            .interpolate_events(&record, events.iter().rev().cloned().collect())
+            .unwrap();
+        assert_eq!(reads_back(&mixed, "a mixed schedule"), lowered);
+        // Analyze and bisect trials state one shared format; one below the
+        // starts' (a trial built from a schedule, which holds none) drops the
+        // marks too.
+        let mut schedule = record.clone();
+        schedule.background_starts.clear();
+        let trial = schedule.with_format(format_without_background_starts(record.format_version));
+        assert_eq!(reads_back(&trial, "a shared trial format"), lowered);
     }
 
     #[test]
@@ -3973,8 +4164,22 @@ impl PreemptionWriter {
         history.chaos_epochs.push(transition);
     }
 
-    /// Add a SchedEvent to the global log of thread behavior.
-    pub fn insert_schedevent(&mut self, ev: SchedEvent) {
+    /// Add a SchedEvent to the global log of thread behavior. A writer below
+    /// [`STOPLESS_SLICE_ENDS_FORMAT`], which notes no background starts
+    /// (`noting_background_starts`), records a timeslice end taken without a
+    /// stop (`SchedEvent::stopless`) as an ordinary end: its record holds no
+    /// marks, as a record lowered below its starts holds none
+    /// (`PreemptionRecord::forget_stopless_marks_below_their_format`), and its
+    /// replay stops at that end.
+    pub fn insert_schedevent(&mut self, mut ev: SchedEvent) {
+        if ev.stopless
+            && self
+                .inner
+                .format_version
+                .is_none_or(|format| format < STOPLESS_SLICE_ENDS_FORMAT)
+        {
+            ev.stopless = false;
+        }
         if let Some(records) = &mut self.boundary_records {
             assert!(
                 ev.count > 0,

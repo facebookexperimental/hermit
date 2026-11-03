@@ -567,10 +567,12 @@ pointer the recording read. A thread that the replay switches to takes its
 first end with a stop. A preemption replay (`--replay-preemptions-from`) takes
 any recorded end at a retired-branch count without a stop when the thread runs
 alone, except in a record with per-thread chaos rates. A record made before
-this mark existed replays as before. An older Hermit reads a record that holds
-the mark but ignores it: it stops at each such end, except one that its
-thread's own check-in follows directly, which it does not end; its replay
-desynchronizes there.
+this mark existed replays as before. A record that holds the mark is preemption
+record format 5, which an older Hermit, reading formats 1 to 4, refuses as a
+format it does not know before the guest starts. A record that keeps no
+background starts, and so states format 3 (a schedule replay's re-record, a
+prefix or edit of a schedule, an analyze or bisect trial), keeps no marks
+either: its replay stops at those ends, which replays the run as faithfully.
 
 Which slice length exposes a race depends on the race: some need a preemption
 in a short window (fine slices), others a long uninterrupted run of one thread
