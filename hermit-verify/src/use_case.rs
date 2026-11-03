@@ -31,6 +31,12 @@ pub struct UseCaseOptions {
     pub verify_commits: bool,
     pub verify_exit_statuses: bool,
     pub verify_schedules: bool,
+    /// Whether the later run's written preemption record must not be
+    /// marked as departed from the record it replayed
+    /// (`replay_departed_at`). A replay that left its record readmitted
+    /// calls by host timing; its outputs can still match, so only the
+    /// record it writes can refuse it.
+    pub verify_replay_not_departed: bool,
     /// Whether the two schedule files must also agree, exactly, on every
     /// per-thread priority history and every callback checkpoint: the fixed
     /// point of priority-history replay, which re-records what it replays.
@@ -62,6 +68,7 @@ pub trait UseCase {
             verify_exit_statuses: true,
             verify_desync: true,
             verify_schedules: false,
+            verify_replay_not_departed: false,
             verify_priority_histories: false,
             ignore_lines: Vec::new(),
         }

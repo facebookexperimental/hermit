@@ -16578,9 +16578,14 @@ impl Scheduler {
     ///   or if the parked call is not the logged one.
     ///   With nothing runnable and no readmission due, record spun until a call
     ///   finished; replay waits `REJOIN_STALL_VALVE` for other work to appear
-    ///   (a thread admission, say) rather than hang, and then leaves its
-    ///   record (`refuse_rejoin`): a preemption replay goes on as a fresh
-    ///   run, while `hermit replay` is refused.
+    ///   (a thread admission, say) rather than hang. A preemption replay
+    ///   whose next logged readmission's calls have all finished and are
+    ///   parked under the logged sequences, with every pop it names made,
+    ///   then applies that readmission: no committed turn could come
+    ///   between this point and it, so it is the next committed turn as
+    ///   in the recording, and the rest of the log stays in force.
+    ///   Otherwise it leaves its record (`refuse_rejoin`): a preemption
+    ///   replay goes on as a fresh run, while `hermit replay` is refused.
     ///
     /// By induction on turns, the two schedules agree up to the next logged
     /// turn: everything host-timed before it (poll results, readmissions) is
@@ -16605,10 +16610,10 @@ impl Scheduler {
             None => unreachable!("only replay follows the rejoin log"),
         };
         let describe = describe_rejoin_calls;
-        if let Some(next) = next {
-            let place = self.rejoin_place(&next);
+        if let Some(ref next) = next {
+            let place = self.rejoin_place(next);
             if place == RejoinPlace::Passed {
-                let reason = self.rejoin_passed_reason(&next);
+                let reason = self.rejoin_passed_reason(next);
                 return self.refuse_rejoin(reason);
             }
             if place == RejoinPlace::Due {
@@ -16620,7 +16625,7 @@ impl Scheduler {
                     if parked != Some(*sequence) {
                         let reason = format!(
                             "the recording readmitted {} at turn {}, but replay has {} parked there",
-                            describe(&next),
+                            describe(next),
                             next.turn,
                             parked.map_or("no such call".to_string(), |parked| format!(
                                 "call {parked} of thread {}",
@@ -16649,7 +16654,7 @@ impl Scheduler {
                     let reason = format!(
                         "the recording readmitted {} at turn {}, and replay waited {} s there \
                          for those calls to finish",
-                        describe(&next),
+                        describe(next),
                         next.turn,
                         Self::REJOIN_STALL_VALVE.as_secs()
                     );
@@ -16677,6 +16682,46 @@ impl Scheduler {
             std::thread::yield_now();
             return Err(SkipTurn);
         }
+        // A preemption replay can reach this point short of the logged
+        // readmission's turn, because a recording's noncommitted turns
+        // (a blocked `SleepUntil` attempt, say) are not recorded events
+        // and so are not replayed. If the next logged readmission's calls
+        // have all finished and are parked under the logged sequences,
+        // and nothing has been able to commit for the whole valve, then
+        // no committed turn can come between this point and that
+        // readmission in this replay: applying the logged readmission
+        // now makes it the next committed turn, exactly as in the
+        // recording, and the rest of the log stays in force. This is
+        // not leaving the record: no departure is marked and no later
+        // readmission is dropped.
+        if self.rejoin_from_preemption_record
+            && let Some(next) = &next
+        {
+            let parked_match = next.calls.iter().all(|(dtid, sequence)| {
+                blockers
+                    .iter()
+                    .find(|(blocked, _, _)| blocked == dtid)
+                    .map(|(_, op_id, _)| op_id.sequence)
+                    == Some(*sequence)
+            });
+            // As at a due readmission, every timed pop the readmission
+            // names must already be made; an unmade one is work this
+            // replay still owes before the readmission, not a stall.
+            let pops_made = match &next.popped {
+                Some(popped) if self.replayer.is_some() => self.first_unmade(popped).is_none(),
+                _ => true,
+            };
+            let due: Vec<DetTid> = next.calls.iter().map(|(dtid, _)| *dtid).collect();
+            if parked_match && pops_made && due.iter().all(|dtid| ready.contains(dtid)) {
+                self.rejoin_stalled_since = None;
+                if let Some(rejoins) = self.rejoin_replay.as_mut() {
+                    rejoins.pop_front();
+                }
+                self.log_rejoin(blockers, &due);
+                requeue_ready(self, &due);
+                return Ok(());
+            }
+        }
         let reason = format!(
             "at turn {} nothing can run, and the next logged readmission is {}",
             self.turn,
@@ -16689,16 +16734,6 @@ impl Scheduler {
                 None => "none".to_string(),
             }
         );
-        // A preemption replay can reach this point one turn short of the
-        // logged readmission, because a recording's noncommitted turns
-        // (a blocked `SleepUntil` attempt, say) are not recorded events
-        // and so are not replayed. Refusing there would make such a
-        // record unreplayable, so a preemption replay leaves its record
-        // here (`refuse_rejoin`), as it did before the valve refusals:
-        // it goes on as a fresh run, with the departure marked and
-        // recorded, and ending the run under `--strict` or
-        // `--die-on-desync`. `hermit replay`, which serves calls from
-        // its log and cannot go on, is refused.
         self.refuse_rejoin(reason)
     }
 
@@ -32765,20 +32800,23 @@ mod test {
         assert!(went_on.rejoin_stalled_since.is_none());
     }
 
-    /// A replay off its record, where only a readmission could move the
-    /// point and a finished call is parked that the record does not readmit
-    /// there, waits out the valve and then leaves its record, rather than
-    /// leaving the call parked for good (only an indefinite deadline pending)
-    /// or ending the run as a deadlock (a finished `rt_sigsuspend` alone).
-    /// It then goes on as a fresh run, readmitting the call by host timing,
-    /// with the departure marked and recorded (and ending the run under
-    /// `--strict` or `--die-on-desync`, through `leave_replayed_record`).
-    /// Refusing here instead made a record unreplayable whenever the
-    /// recording's noncommitted turns (a blocked `SleepUntil` attempt, say)
-    /// put its logged readmission one turn past the replay's count, as in
-    /// the `blocking-sigsuspend` trace replay.
+    /// A preemption replay stalled where only a readmission could move
+    /// the point, with that readmission's call finished and parked under
+    /// its logged sequence, waits out the valve and then applies the
+    /// logged readmission, rather than leaving the call parked for good
+    /// (only an indefinite deadline pending), ending the run as a
+    /// deadlock (a finished `rt_sigsuspend` alone), leaving its record,
+    /// or refusing. Nothing could commit between the stall and the
+    /// readmission, so applying it makes it the next committed turn as
+    /// in the recording; the log is consumed, not dropped, and no
+    /// departure is recorded. Refusing here instead made a record
+    /// unreplayable whenever the recording's noncommitted turns (a
+    /// blocked `SleepUntil` attempt, say) put its logged readmission
+    /// past the replay's count, as in the `blocking-sigsuspend` trace
+    /// replay.
     #[test]
-    fn a_preemption_replay_off_its_record_leaves_it_where_nothing_else_moves() {
+    fn a_preemption_replay_stalled_before_its_logged_readmission_applies_it_where_nothing_else_moves()
+     {
         let (mut indefinite, op_id) = run_replay_ahead_of_its_record(true);
         indefinite
             .blocked
@@ -32800,10 +32838,18 @@ mod test {
             assert!(!scheduler.run_queue.contains_tid(op_id.tid), "{name}");
             scheduler.rejoin_stalled_since =
                 std::time::Instant::now().checked_sub(Scheduler::REJOIN_STALL_VALVE);
-            assert!(scheduler.step2c_process_io_blockers().is_err(), "{name}");
-            assert!(scheduler.rejoin_replay.is_none(), "{name}");
-            assert!(scheduler.rejoin_refusal.is_none(), "{name}");
             assert!(scheduler.step2c_process_io_blockers().is_ok(), "{name}");
+            assert!(scheduler.rejoin_refusal.is_none(), "{name}");
+            // The logged readmission was applied, not dropped: the log
+            // is consumed and the call is queued, with no departure.
+            assert!(
+                scheduler
+                    .rejoin_replay
+                    .as_ref()
+                    .is_some_and(|left| left.is_empty()),
+                "{name}"
+            );
+            assert!(scheduler.determinism_losses.is_empty(), "{name}");
             assert!(scheduler.run_queue.contains_tid(op_id.tid), "{name}");
         }
     }

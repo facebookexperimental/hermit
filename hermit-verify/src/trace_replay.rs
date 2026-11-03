@@ -144,6 +144,11 @@ impl UseCase for TraceReplayOpts {
             verify_exit_statuses: true,
             verify_desync: true,
             verify_schedules: false,
+            // The replay child runs without --verify or --strict, so a
+            // replay that left its recording is visible only in the
+            // record it writes: refuse a record marked departed, or the
+            // run could pass on matched outputs alone.
+            verify_replay_not_departed: true,
             verify_priority_histories: false,
             ignore_lines: if self.chaos {
                 vec![
@@ -208,6 +213,16 @@ mod tests {
             split_branches: false,
             args: Vec::new(),
         }
+    }
+
+    #[test]
+    fn trace_replay_refuses_a_departed_replay_record() {
+        assert!(
+            trace_replay_opts(false)
+                .options()
+                .verify_replay_not_departed
+        );
+        assert!(trace_replay_opts(true).options().verify_replay_not_departed);
     }
 
     #[test]

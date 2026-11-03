@@ -301,6 +301,37 @@ impl<P: AsRef<OsStr>> Verify<P> {
         )
     }
 
+    /// The later run's written preemption record must not be marked as
+    /// departed from the record it replayed. This reads the record's own
+    /// `replay_departed_at` marker through Detcore's reader, so it does
+    /// not depend on any warning's wording or on log filtering.
+    pub fn verify_replay_not_departed(&self, right: &RunEnvironment) -> anyhow::Result<bool> {
+        println!(
+            "{}",
+            "::  Checking the replay record is not departed:".bold()
+        );
+        match detcore::preemptions::read_recorded_replay_departure(&right.schedule_file) {
+            Ok(None) => {
+                println!("Replay record is not marked departed");
+                Ok(true)
+            }
+            Ok(Some(event)) => {
+                println!(
+                    "{}",
+                    format!("WARNING: replay record is marked departed at event {event}").red()
+                );
+                Ok(false)
+            }
+            Err(err) => {
+                println!(
+                    "{}",
+                    format!("WARNING: replay record departure unreadable: {err}").red()
+                );
+                Ok(false)
+            }
+        }
+    }
+
     pub fn verify_desync(&self, right: &RunEnvironment) -> anyhow::Result<bool> {
         //FIXME: extract log-diff out of hermit and handle DESYNCs there (T135657122 + some extra work)
         println!("{}", "::  Looking for desync events:".bold());
@@ -475,6 +506,33 @@ mod test {
             Verify::<PathBuf>::priority_history_differences(&left, &thread),
             vec!["per_thread.5: in the second run only".to_owned()]
         );
+    }
+
+    /// Negative control for the trace-replay admission check: a replay
+    /// whose outputs, logs and exit statuses all match but whose written
+    /// record is marked departed must fail verification, while a complete
+    /// record passes and an unreadable one fails closed.
+    #[test]
+    fn a_departed_replay_record_fails_verification() -> anyhow::Result<()> {
+        let env = TemporaryEnvironmentBuilder::new().run_count(1).build()?;
+        let run = &env.runs()[0];
+        let verify = Verify::new(PathBuf::from("hermit"));
+
+        write_to_file(
+            &run.schedule_file,
+            r#"{"incomplete_preemption_record":{"version":1,"replay_departed_at":290,"record":{"per_thread":{},"global":[],"rejoins":[]}}}"#,
+        )?;
+        assert_eq!(verify.verify_replay_not_departed(run)?, false);
+
+        write_to_file(
+            &run.schedule_file,
+            r#"{"per_thread":{},"global":[],"rejoins":[]}"#,
+        )?;
+        assert_eq!(verify.verify_replay_not_departed(run)?, true);
+
+        write_to_file(&run.schedule_file, "not a record")?;
+        assert_eq!(verify.verify_replay_not_departed(run)?, false);
+        Ok(())
     }
 
     #[test]

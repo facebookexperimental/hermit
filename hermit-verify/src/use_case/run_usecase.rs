@@ -58,6 +58,10 @@ fn compare_results<T: UseCase>(
         result &= verify.verify_desync(right)?;
     }
 
+    if options.verify_replay_not_departed {
+        result &= verify.verify_replay_not_departed(right)?;
+    }
+
     if options.verify_schedules {
         result &= verify.verify_schedules(left, right)?;
     }

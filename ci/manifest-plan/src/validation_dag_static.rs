@@ -3269,9 +3269,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // one cli test: 3467 + 2 = 3469.
     // And scheduler::test::the_chaos_bounds_apply_past_the_end_of_a_replayed_schedule
     // (bounds past a replayed schedule's end, PR #4926): 3469 + 1 = 3470, listed.
-    // PR #4751 (rebased onto post-split main) adds twelve detcore units
-    // (measured by #[test] delta) and gates binder cli tests host-limited
-    // (cli executed -1): 3470 + 12 = 3482.
+    // PR #4751 (rebased onto post-split main) adds 27 detcore units net
+    // (measured by compiled nextest list identity diff against main
+    // 2baafbdf: 3565 -> 3592 identities; 30 added, of which 15 are Tokio
+    // async binder cases and 3 are the renamed valve cases, against the
+    // 3 old valve names removed) and gates binder cli tests host-limited
+    // (cli executed -1). The pin below keeps its earlier composed value
+    // (3470 + 12 on this base): the counted runner substitutes the compiled
+    // population for it, so neither 3482 nor a derived 3497 is a measured
+    // nextest count.
     ("test.detcore_unit", 3482),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
