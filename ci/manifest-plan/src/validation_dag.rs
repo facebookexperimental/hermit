@@ -6672,9 +6672,9 @@ sys.exit(37)
     /// The PMU analyze node retains exactly the ten other ignored
     /// integrations (the six refusal/workspace/timeout cases, the
     /// racewrite selfcheck regression, the race finder's fd_reuse
-    /// case and the verdict change's two) while hello-race
-    /// pinpointing and the race-candidates case are excluded for
-    /// their tracked reasons.
+    /// case and the verdict change's two) plus the resume change's
+    /// one, while hello-race pinpointing and the race-candidates
+    /// case are excluded for their tracked reasons.
     #[test]
     fn the_pmu_analyze_node_runs_the_ignored_analyze_integrations() {
         let source = include_str!("../../../hermit-cli/tests/analyze.rs");
@@ -6691,6 +6691,8 @@ sys.exit(37)
             // The verdict change's.
             "bisect_exits_2_when_its_good_schedule_meets_the_target",
             "analyze_reports_a_target_met_without_chaos_as_reproduced_without_the_schedule",
+            // The resume change's.
+            "a_budget_ends_analyze_with_a_partial_report_that_resume_finishes",
         ];
         for case in cases {
             assert!(
