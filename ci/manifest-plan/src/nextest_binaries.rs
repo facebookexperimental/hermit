@@ -2337,6 +2337,37 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     Ok(())
 }
 
+/// The BudgetContext field names whose values differ between the resolved
+/// map and a fresh computation, for the context-changed refusal. Naming the
+/// field turns a bare "resolve again" into a diagnosis (a cpuset change, a
+/// dirtied tree, a refreshed prepared record each point at a different owner).
+fn changed_context_fields(
+    resolved: &crate::nextest_cpu::BudgetContext,
+    actual: Option<&crate::nextest_cpu::BudgetContext>,
+) -> String {
+    let Some(actual) = actual else {
+        return "context now absent".into();
+    };
+    let resolved = serde_json::to_value(resolved).unwrap_or_default();
+    let actual = serde_json::to_value(actual).unwrap_or_default();
+    let (Some(resolved), Some(actual)) = (resolved.as_object(), actual.as_object()) else {
+        return "context".into();
+    };
+    let fields: Vec<&str> = resolved
+        .keys()
+        .chain(actual.keys())
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|field| resolved.get(*field) != actual.get(*field))
+        .collect();
+    if fields.is_empty() {
+        "context".into()
+    } else {
+        fields.join(", ")
+    }
+}
+
 pub fn run(
     root: &Path,
     operation: &str,
@@ -2395,7 +2426,10 @@ pub fn run(
             serde_json::from_str(&budget_context(&root, args, launch)?)
                 .map_err(|e| e.to_string())?;
         if actual.as_ref() != Some(&map.context) {
-            return Err("Nextest source/build/launch context changed after budget resolution; resolve again before running".into());
+            return Err(format!(
+                "Nextest source/build/launch context changed after budget resolution ({}); resolve again before running",
+                changed_context_fields(&map.context, actual.as_ref()),
+            ));
         }
     }
     let mut command = Command::new("cargo");
@@ -3944,6 +3978,28 @@ mod tests {
     /// that the throwaway is byte-identical afterwards. The environment goes
     /// to the child only; this process never exports it, so concurrently
     /// running tests are unaffected.
+    #[test]
+    fn changed_context_fields_name_only_the_differing_fields() {
+        let resolved = crate::nextest_cpu::BudgetContext {
+            source_sha256: "a".into(),
+            source_clean: true,
+            build_sha256: "b".into(),
+            machine: "x86_64:test".into(),
+            available_cpus: 8,
+            execution_cohort: None,
+            launch_proof: None,
+        };
+        let mut actual = resolved.clone();
+        assert_eq!(changed_context_fields(&resolved, Some(&actual)), "context");
+        actual.available_cpus = 4;
+        actual.source_clean = false;
+        assert_eq!(
+            changed_context_fields(&resolved, Some(&actual)),
+            "available_cpus, source_clean",
+        );
+        assert_eq!(changed_context_fields(&resolved, None), "context now absent");
+    }
+
     #[test]
     fn scratch_repository_tests_ignore_inherited_git_location_variables() {
         const CHILD_TESTS: [&str; 3] = [

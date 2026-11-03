@@ -253,55 +253,88 @@ function run_nextest {
     # Prepared consumers can bind calibration to the exact checked build and
     # selected inventory. Standalone/unsupported populations keep the existing
     # path. Never infer a calibration context from unchecked executable names.
-    if [[ ${HERMIT_PREPARED_NEXTEST_REQUIRED:-0} == 1 && $cpu_report != - ]]; then
-        [[ -z $calibration_launch ]] || launch_arguments+=(--launch-proof "$calibration_launch")
-        if ! run_rust_script "$SCRIPT_DIR/nextest-binaries.rs" budget-context \
-            "${launch_arguments[@]}" "${inventory_arguments[@]}" >"$budget_context"; then
-            cleanup_nextest_config
-            return 2
-        fi
-        if ! HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" run_rust_script "$TIMEOUT_CONFIG_WRITER" \
-            --resolve "$SCRIPT_DIR/../.config/nextest.toml" "$wall_multiplier" "$nextest_config" \
-            "$inventory" "$budget_context" "$budget_map" "$SCRIPT_DIR/../.config/nextest-budgets.json" \
-            -- "$@"; then
-            cleanup_nextest_config
-            return 2
-        fi
-        if [[ -f $budget_map ]]; then
-            local digest_line
-            digest_line=$(sha256sum -- "$budget_map") || return $?
-            nextest_budget_map=$budget_map
-            nextest_budget_sha=${digest_line%% *}
-            # Keep the exact digest-bound CPU/wall input on both success and
-            # failure, beside the existing attempt report. Never replace an
-            # earlier invocation's retained calibration evidence.
-            if ! (set -o noclobber; cat -- "$budget_map" >"$cpu_report.budgets.json"); then
+    # The context is recomputed at run time and compared exactly, so a field
+    # that moves between resolution and run (a cpuset change, a dirtied tree,
+    # a refreshed prepared record) refuses before any test executes. That
+    # refusal is safe to retry exactly once after re-resolving: counted,
+    # bounded at one re-resolution, and the second refusal stands.
+    local budget_attempt=0 run_stderr="$attempts/budget-run-stderr.txt"
+    while :; do
+        budget_attempt=$((budget_attempt + 1))
+        if [[ ${HERMIT_PREPARED_NEXTEST_REQUIRED:-0} == 1 && $cpu_report != - ]]; then
+            if (( budget_attempt == 1 )); then
+                [[ -z $calibration_launch ]] || launch_arguments+=(--launch-proof "$calibration_launch")
+            fi
+            if ! run_rust_script "$SCRIPT_DIR/nextest-binaries.rs" budget-context \
+                "${launch_arguments[@]}" "${inventory_arguments[@]}" >"$budget_context"; then
                 cleanup_nextest_config
                 return 2
             fi
+            if ! HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" run_rust_script "$TIMEOUT_CONFIG_WRITER" \
+                --resolve "$SCRIPT_DIR/../.config/nextest.toml" "$wall_multiplier" "$nextest_config" \
+                "$inventory" "$budget_context" "$budget_map" "$SCRIPT_DIR/../.config/nextest-budgets.json" \
+                -- "$@"; then
+                cleanup_nextest_config
+                return 2
+            fi
+            if [[ -f $budget_map ]]; then
+                local digest_line retained="$cpu_report.budgets.json"
+                (( budget_attempt == 1 )) || retained="$cpu_report.budgets.reresolved.json"
+                digest_line=$(sha256sum -- "$budget_map") || return $?
+                nextest_budget_map=$budget_map
+                nextest_budget_sha=${digest_line%% *}
+                # Keep the exact digest-bound CPU/wall input on both success and
+                # failure, beside the existing attempt report. Never replace an
+                # earlier invocation's retained calibration evidence.
+                if ! (set -o noclobber; cat -- "$budget_map" >"$retained"); then
+                    cleanup_nextest_config
+                    return 2
+                fi
+            fi
         fi
-    fi
 
     # A schema-5 node gets a fresh skip sidecar for this run: test helpers
     # append one HERMIT-TEST-SKIP line per runtime skip to it, and the
-    # result writer classifies those rows from it after the run.
+    # result writer classifies those rows from it after the run. A budget
+    # re-resolution retry ran no tests, so it keeps the first sidecar.
     local skip_file=
-    if [[ ${HERMIT_NEXTEST_RESULTS_SCHEMA:-} == 5 ]]; then
+    if [[ ${HERMIT_NEXTEST_RESULTS_SCHEMA:-} == 5 && -z ${HERMIT_TEST_SKIP_FILE:-} ]]; then
         skip_file=$(mktemp "${TMPDIR:-/tmp}/hermit-test-skips.XXXXXX") || return $?
         export HERMIT_TEST_SKIP_FILE="$skip_file"
     fi
 
-    set +e
-    # nextest's stderr remains presentation. The versioned stdout event stream
-    # is the only input to the aggregate count and per-test result adapter.
-    HERMIT_NEXTEST_CPU_BINARY_MAP="$binary_map" \
-        HERMIT_NEXTEST_CPU_RECORD_DIR="$attempts" \
-        HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" \
-        NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 invoke_nextest run \
-        --color never --message-format libtest-json-plus --message-format-version 0.1 \
-        "$@" >"$events_log"
-    status=$?
-    set -e
+        set +e
+        # nextest's stderr remains presentation. On the prepared path it is
+        # captured only so the context-changed refusal can be told from a
+        # test failure, then replayed verbatim; other paths keep it live.
+        # The versioned stdout event stream is the only input to the
+        # aggregate count and per-test result adapter.
+        if [[ -n $nextest_budget_map ]]; then
+            HERMIT_NEXTEST_CPU_BINARY_MAP="$binary_map" \
+                HERMIT_NEXTEST_CPU_RECORD_DIR="$attempts" \
+                HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" \
+                NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 invoke_nextest run \
+                --color never --message-format libtest-json-plus --message-format-version 0.1 \
+                "$@" >"$events_log" 2>"$run_stderr"
+            status=$?
+            cat "$run_stderr" >&2
+        else
+            HERMIT_NEXTEST_CPU_BINARY_MAP="$binary_map" \
+                HERMIT_NEXTEST_CPU_RECORD_DIR="$attempts" \
+                HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" \
+                NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 invoke_nextest run \
+                --color never --message-format libtest-json-plus --message-format-version 0.1 \
+                "$@" >"$events_log"
+            status=$?
+        fi
+        set -e
+        if (( status == 0 || budget_attempt > 1 )) || [[ -z $nextest_budget_map ]] \
+            || ! grep -q "context changed after budget resolution" "$run_stderr"; then
+            break
+        fi
+        printf 'run-nextest-counted: budget context changed after resolution; re-resolving once (attempt %s of 2)\n' \
+            "$((budget_attempt + 1))" >&2
+    done
     cleanup_nextest_config
 
     # Gate only a successful run on executed == listed: a failed run already
