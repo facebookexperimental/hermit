@@ -10342,7 +10342,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
         deps: &[r########"privileged-build.privileged_tests"########],
-        env: &[],
+        env: &[(r########"HERMIT_FORBID_SKIPS"########, r########"1"########)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 60.0,
@@ -11722,7 +11722,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
         deps: &[r########"privileged-only-build.privileged_tests"########],
-        env: &[],
+        env: &[(r########"HERMIT_FORBID_SKIPS"########, r########"1"########)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 60.0,
@@ -13281,7 +13281,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
         deps: &[r########"privileged-only-build.privileged_tests_on_host"########],
-        env: &[],
+        env: &[(r########"HERMIT_FORBID_SKIPS"########, r########"1"########)],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 60.0,

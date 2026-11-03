@@ -175,6 +175,39 @@ function emit_libtest_count {
         printf 'run-nextest-counted: cannot derive typed test results from %s\n' "$events" >&2
         return "$writer_status"
     fi
+    # Zero-skips gate (opt-in per node, HERMIT_FORBID_SKIPS=1): a node that
+    # must really run its population (the cli_kvm nodes, which already
+    # refuse a host without /dev/kvm) fails when any test reported a
+    # runtime skip, naming each skipped test and its reason. The typed
+    # report stays published; only the node's status changes.
+    if [[ ${HERMIT_FORBID_SKIPS:-} == 1 && $path != - && -n $path ]]; then
+        if ! python3 - "$path" <<'PYEOF'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+skips = [
+    row for row in report.get("results", []) if row.get("result") == "skip"
+]
+for row in skips:
+    print(
+        f"run-nextest-counted: FORBID-SKIPS: {row.get('id')}: "
+        f"{row.get('skip_reason') or 'no reason recorded'}",
+        file=sys.stderr,
+    )
+if skips:
+    print(
+        f"run-nextest-counted: FORBID-SKIPS: {len(skips)} skipped test(s) "
+        "in a zero-skips node",
+        file=sys.stderr,
+    )
+sys.exit(1 if skips else 0)
+PYEOF
+        then
+            return 1
+        fi
+    fi
 }
 
 function run_nextest {
@@ -436,6 +469,19 @@ PYEOF
     [[ $status == 2 ]] || return 1
     grep -q 'not opted into schema 5' "$scratch/no-optin.stderr" || return 1
     [[ ! -e $scratch/no-optin-counts.json ]] || return 1
+
+    # A zero-skips node fails on the same skip population, naming the
+    # skipped test, while the typed report still publishes.
+    status=0
+    HERMIT_NEXTEST_RESULTS_SCHEMA=5 HERMIT_TEST_SKIP_FILE="$scratch/skips.txt" \
+        HERMIT_FORBID_SKIPS=1 \
+        DAGRUN_TEST_COUNTS_PATH="$scratch/forbid-skip-counts.json" \
+        emit_libtest_count "$scratch/events.jsonl" 0 \
+        >/dev/null 2>"$scratch/forbid-skip.stderr" || status=$?
+    [[ $status == 1 ]] || return 1
+    grep -q 'FORBID-SKIPS: suite\$passes: no /dev/kvm on this host' \
+        "$scratch/forbid-skip.stderr" || return 1
+    [[ -e $scratch/forbid-skip-counts.json ]] || return 1
 
     sed 's/"filtered_out":7/"filtered_out":11/' \
         "$scratch/events.jsonl" >"$scratch/mutated-events.jsonl"
