@@ -88,6 +88,8 @@ struct RawRecord {
     background_starts: Vec<BackgroundStart>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     rewrite_exclusives_in_memory: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    rows_alone: bool,
 }
 
 // The INFO comparison projection: RawRecord's exact serialization except the

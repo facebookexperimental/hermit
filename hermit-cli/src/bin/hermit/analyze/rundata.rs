@@ -1990,6 +1990,109 @@ mod tests {
 
     use super::*;
 
+    /// A prefix trial of a recording whose rows hold an instruction offset,
+    /// written by the real trial writer (`write_trial_record`) and read
+    /// back, keeps the recording's format 4 and its timing at every length:
+    /// with no event, with some and with all, with and without a jump of
+    /// global time at event zero, it lists its jumps (the one at event zero
+    /// included) and charges replayed switch-ins, as a schedule of that
+    /// format does. A prefix of no events is a complete, empty schedule, not
+    /// rows alone. Rows copied alone (`clone_preemptions_only`) are the
+    /// control: format 4 with format 1's timing.
+    #[test]
+    fn a_prefix_trial_of_offset_rows_keeps_its_timing_at_every_length() {
+        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
+        use detcore::preemptions::InstructionOffset;
+        use detcore::preemptions::PreemptionWriter;
+        use detcore::preemptions::TimeSkip;
+        use detcore::preemptions::TimeSkipReason;
+        use detcore::types::DetTid;
+        use detcore::types::LogicalTime;
+        use detcore::types::SchedEvent;
+
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let jump = TimeSkip {
+            event: 0,
+            target: LogicalTime::from_nanos(5_000),
+            reason: TimeSkipReason::IdleGuestPollers,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("prefix.json");
+        for with_jump in [false, true] {
+            let mut writer = PreemptionWriter::new(None)
+                .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT));
+            writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
+            writer.insert_reprioritization(
+                tid,
+                LogicalTime::from_nanos(10),
+                18,
+                detcore::DEFAULT_PRIORITY,
+                5,
+                Some(offset),
+            );
+            if with_jump {
+                writer.insert_time_skip(jump);
+            }
+            writer.insert_schedevent(SchedEvent::branches(tid, 20));
+            writer.insert_schedevent(SchedEvent::branches(tid, 3));
+            let source: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+            source.validate().unwrap();
+            assert_eq!(
+                source.format_version(),
+                Some(INSTRUCTION_OFFSET_ROWS_FORMAT)
+            );
+
+            let args =
+                crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("not analyze")
+            };
+            options.apply_global(&args.global);
+            options.time_skip_sources.lock().unwrap().remember(&source);
+            for len in [0, 1, source.schedevents().len()] {
+                let what = format!("prefix of {len} events, jump at event 0: {with_jump}");
+                options
+                    .write_trial_record(source.schedule_prefix(len), &output)
+                    .unwrap_or_else(|error| panic!("{what}: {error:#}"));
+                let written: PreemptionRecord =
+                    serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+                written.validate().unwrap();
+                assert_eq!(written.schedevents().len(), len, "{what}");
+                assert_eq!(
+                    written.format_version(),
+                    Some(INSTRUCTION_OFFSET_ROWS_FORMAT),
+                    "{what}"
+                );
+                assert_eq!(
+                    written.timing_format(),
+                    Some(INSTRUCTION_OFFSET_ROWS_FORMAT),
+                    "{what}"
+                );
+                assert!(written.lists_its_time_skips(), "{what}");
+                assert!(written.charges_replayed_switch_ins(), "{what}");
+                assert_eq!(
+                    written.time_skips(),
+                    with_jump.then_some(&[jump][..]),
+                    "{what}"
+                );
+            }
+            let rows = source.clone_preemptions_only();
+            assert_eq!(rows.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+            assert_eq!(
+                (
+                    rows.timing_format(),
+                    rows.lists_its_time_skips(),
+                    rows.charges_replayed_switch_ins()
+                ),
+                (None, false, false)
+            );
+        }
+    }
+
     /// The records analyze edited (minimization's and the baseline search's)
     /// replay with `--replay-edited-preemptions`, and so do the repro
     /// commands it prints for them; a recording replays strictly. Before, a

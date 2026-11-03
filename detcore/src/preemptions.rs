@@ -274,6 +274,15 @@ pub struct PreemptionRecord {
     /// other code with nothing to tell it apart, and is refused. Written only
     /// when on, so absent means off, as for every record made before it.
     rewrite_exclusives_in_memory: bool,
+    /// Whether the record holds rows alone, without the schedule trace and
+    /// jumps of global time of the run they came from: a copy of a record's
+    /// rows (`clone_preemptions_only`) whose rows hold an instruction offset.
+    /// Such a record states [`INSTRUCTION_OFFSET_ROWS_FORMAT`] to fence out a
+    /// Hermit that predates the offsets, and follows format 1's timing rules
+    /// (`timing_format`). A record whose schedule trace is merely empty, a
+    /// prefix of no events or a run that recorded none, is not rows alone: it
+    /// keeps its format's timing. Written only when set.
+    rows_alone: bool,
 }
 
 /// A count a record's run observed on its host rather than decided: it is
@@ -375,14 +384,16 @@ pub const STOPLESS_SLICE_ENDS_FORMAT: u32 = 5;
 /// written in the newest format below it
 /// ([`format_without_instruction_offsets`]), readable as before.
 ///
-/// With a schedule trace, a record of this format has every timing property
-/// of [`SWITCH_IN_CHARGE_FORMAT`]. Without one, as rows alone (a record
-/// `PreemptionRecord::clone_preemptions_only` or
-/// `PreemptionRecord::preemptions_only` leaves), it follows format 1's
-/// timing rules, as the same rows without offsets state no format: it lists
-/// no jumps of global time and charges no replayed switch-in. Every reader
-/// that keys timing on the format reads `PreemptionRecord::timing_format`,
-/// which decides that by the record's content, not the number.
+/// A record of this format has every timing property of
+/// [`SWITCH_IN_CHARGE_FORMAT`], even with an empty schedule trace, as a
+/// prefix of no events has. Rows alone, copied from a record without its
+/// schedule trace and jumps of global time
+/// (`PreemptionRecord::clone_preemptions_only`), say so
+/// (`PreemptionRecord::rows_alone`) and follow format 1's timing rules, as
+/// the same rows without offsets state no format: they list no jumps of
+/// global time and charge no replayed switch-in. Every reader that keys
+/// timing on the format reads `PreemptionRecord::timing_format`, which
+/// decides that by the mark, not the number alone.
 pub const INSTRUCTION_OFFSET_ROWS_FORMAT: u32 = 6;
 
 /// The newest format a record may state when its rows hold no instruction
@@ -536,6 +547,7 @@ impl PreemptionRecord {
             rejoins: None,
             background_starts: Vec::new(),
             rewrite_exclusives_in_memory: false,
+            rows_alone: false,
         }
     }
 
@@ -609,6 +621,7 @@ impl PreemptionRecord {
             rejoins,
             background_starts,
             rewrite_exclusives_in_memory,
+            rows_alone,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -710,6 +723,7 @@ impl PreemptionRecord {
             },
             // A setting of the recorded run, which a replay must share.
             rewrite_exclusives_in_memory: *rewrite_exclusives_in_memory,
+            rows_alone: *rows_alone,
         };
         prefix.forget_stopless_marks_below_their_format();
         prefix
@@ -962,26 +976,22 @@ impl PreemptionRecord {
     }
 
     /// The format whose timing rules the record follows (`None` for format
-    /// 1): its own, except that a record of [`INSTRUCTION_OFFSET_ROWS_FORMAT`]
-    /// without a schedule trace, rows alone, follows format 1's, as the same
-    /// rows without an offset state no format. A format this Hermit does not
-    /// read stays as stated, for `validate_format` to refuse. The stated format of
-    /// such a record only fences out a Hermit that predates the offsets; it
-    /// claims no listed jumps and no switch-in charges, which index or
-    /// replay a schedule trace it does not hold. Every reader that keys
-    /// timing on the format ([`Self::lists_its_time_skips`],
+    /// 1): its own, except that rows alone (`rows_alone`, as
+    /// `clone_preemptions_only` leaves rows that hold an instruction offset)
+    /// in [`INSTRUCTION_OFFSET_ROWS_FORMAT`] follow format 1's, as the same
+    /// rows without an offset state no format. The stated format of such a
+    /// record only fences out a Hermit that predates the offsets; it claims no
+    /// listed jumps and no switch-in charges, which index or replay a
+    /// schedule trace it does not hold. A record whose schedule trace is only
+    /// empty, such as a prefix of no events, keeps its format's timing, its
+    /// listed jumps included. A format this Hermit does not read stays as
+    /// stated, for `validate_format` to refuse. Every reader that keys timing
+    /// on the format ([`Self::lists_its_time_skips`],
     /// [`Self::charges_replayed_switch_ins`]) reads this.
     pub fn timing_format(&self) -> Option<u32> {
-        self.timing_format_with(!self.global.is_empty())
-    }
-
-    /// [`Self::timing_format`], given whether the record has a schedule trace:
-    /// a slice-boundary recording keeps its trace beside these rows
-    /// (`boundary_recording::Recording::timing_format`).
-    pub(crate) fn timing_format_with(&self, schedule_trace: bool) -> Option<u32> {
         match self.format_version {
             Some(format)
-                if !schedule_trace
+                if self.rows_alone
                     && (INSTRUCTION_OFFSET_ROWS_FORMAT..=PREEMPTION_RECORD_FORMAT)
                         .contains(&format) =>
             {
@@ -1273,6 +1283,7 @@ impl PreemptionRecord {
             rejoins: None,
             background_starts: Vec::new(),
             rewrite_exclusives_in_memory: self.rewrite_exclusives_in_memory,
+            rows_alone: self.rows_carry_instruction_offsets(),
         }
     }
 
@@ -1352,6 +1363,7 @@ impl PreemptionRecord {
             rejoins: None,
             background_starts: Vec::new(),
             rewrite_exclusives_in_memory: false,
+            rows_alone: false,
         }
     }
 
@@ -1513,6 +1525,9 @@ impl PreemptionRecord {
         // same rule).
         if let Some(rejoins) = &self.rejoins {
             crate::scheduler::rejoin_log::ordered(rejoins)?;
+        }
+        if self.rows_alone && !self.global.is_empty() {
+            return Err("a record of rows alone (rows_alone) holds a schedule trace".to_string());
         }
         self.validate_callback_checkpoints()?;
         self.validate_histories()
@@ -3699,6 +3714,20 @@ mod tests {
             .interpolate_events(&schedule, schedule.schedevents().clone())
             .unwrap_err();
         assert!(refusal.contains("replay rules differ"), "{refusal}");
+
+        // The mark, not an empty schedule trace, makes rows alone: a prefix
+        // of no events keeps its format's timing, and rows alone that hold
+        // a schedule trace are malformed.
+        let empty = schedule.schedule_prefix(0);
+        assert_eq!(empty.timing_format(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+        let mut traced = rows.clone();
+        traced.global = schedule.schedevents().clone();
+        assert!(
+            traced
+                .validate_contents()
+                .unwrap_err()
+                .contains("rows alone")
+        );
     }
 
     /// The instruction offsets ride in a thread's history beside its RCB

@@ -556,11 +556,12 @@ impl Recording {
 
     /// The format whose timing rules the recording follows
     /// (`PreemptionRecord::timing_format`). A slice-boundary recording keeps
-    /// its schedule trace in its boundary stream, not in its rows' record.
+    /// its schedule trace in its boundary stream, not in its rows' record, so
+    /// it follows its stated format whatever that record says of its rows.
     pub fn timing_format(&self) -> Option<u32> {
         match self {
             Self::Legacy(record) => record.timing_format(),
-            Self::Boundaries(record) => record.preemptions.timing_format_with(true),
+            Self::Boundaries(record) => record.preemptions.format_version(),
         }
     }
 

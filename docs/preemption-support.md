@@ -211,9 +211,11 @@ A record whose rows hold one states `"format_version": 4`
 (`INSTRUCTION_OFFSET_ROWS_FORMAT`), which a Hermit that predates the offsets
 refuses by name rather than replaying those slices to their branch targets;
 every copy and edit of such rows keeps it, and this Hermit refuses offset rows
-in an older format. Rows alone in format 4, without a schedule trace, follow
-format 1's timing rules: they claim no list of jumps of global time and no
-switch-in charges.
+in an older format. Rows copied alone, without the schedule trace and the
+jumps of global time of their run (`"rows_alone": true`), follow format 1's
+timing rules: they claim no list of jumps of global time and no switch-in
+charges. A schedule whose trace is only empty, such as a prefix of no events,
+keeps its format's timing and its jumps.
 Schedule traces do not carry the offsets: `--replay-schedule-from`,
 `--strict-schedule-boundaries`, `hermit analyze` and `hermit bisect` refuse
 the option and records that use it.
