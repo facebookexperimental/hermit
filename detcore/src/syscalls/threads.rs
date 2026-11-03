@@ -3177,8 +3177,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
-        // Exited, but counted among the run's tasks until a wait reaps its
-        // process (`LiveTasks`).
+        // Granted: still one of the run's tasks until the grant is committed
+        // below (`LiveTasks`).
         let dettid = guest.thread_state().dettid;
         guest
             .thread_state()
@@ -3224,6 +3224,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         // before the native exit, as an exit_group does
         // (`Self::release_table_at_exit`).
         self.release_table_at_exit(guest, false).await;
+        // The grant is committed: the last thing this thread does in its turn
+        // before the native exit, after which, with sequentialized threads,
+        // it never runs again. Where the backend reports the exit complete
+        // afterwards (`BackendCapabilities::runs_exit_robust_list`: its exit
+        // hook comes after the kernel's `mm_release`), a thread that does not
+        // lead its process leaves the run's tasks here, its report awaited
+        // before any off-turn binder call is issued. A leader stays, a zombie,
+        // until a wait reaps its process, as does every thread elsewhere
+        // (`LiveTasks::commit_thread_exit`).
+        if self.cfg.sequentialize_threads && self.cfg.backend.runs_exit_robust_list {
+            let detpid = guest.thread_state().detpid.expect("detpid unset");
+            guest
+                .thread_state()
+                .live_tasks
+                .lock()
+                .expect("live tasks mutex poisoned")
+                .commit_thread_exit(dettid, detpid);
+        }
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }

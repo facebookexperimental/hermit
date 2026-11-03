@@ -5885,20 +5885,30 @@ pub(crate) struct SignalAnnouncementState {
 /// reads (`Detcore::binder_other_tasks`). A binder call runs off the guest's
 /// turn alone only while its caller is the run's one task.
 ///
-/// One record is shared by every task of the run, as the guest clock is, and
-/// only guest calls change it: a clone's entry and its return in its caller,
-/// and the wait that reaps a process in the waiter. While a caller finds
-/// itself the only task, no other task exists to change the record, so the
-/// answer cannot change under it; while it finds others, each of them is
-/// live, unreaped or being made, so it can only be too many.
+/// One record is shared by every task of the run, as the guest clock is. A
+/// task joins it at the entry of the clone that makes it (or, where a backend
+/// runs the clone natively, at that backend's report of it,
+/// `Detcore::register_external_child`), and leaves it at the wait that reaps
+/// its process, or, for a thread that ends by its own `exit` without leading
+/// its process, at the commit of that exit's grant in its own turn, after
+/// which a sequentialized thread never runs again (on a backend that reports
+/// the exit complete afterwards). Every change is at a logical event in
+/// Hermit's turn order, never at a host-timed report, so a run and its verify
+/// pass find the same tasks; the report only delays an off-turn call until
+/// the kernel's last writes for the retired thread are done
+/// (`LiveTasks::unreported`). While a caller finds itself the only task, no
+/// other task exists to change the record, so the answer cannot change under
+/// it; while it finds others, each of them is live, unreaped or being made,
+/// so it can only be too many.
 #[derive(Debug, Default)]
 pub(crate) struct LiveTasks {
     /// Each task, by thread ID, with its process, from the return of the
     /// clone that made it, or the run's start for its first task, until the
-    /// wait that reaps its process. A thread that exits, or that an exec or
-    /// an `exit_group` ends, stays until then too, as an exited leader does as
-    /// a zombie: nothing a guest call says shows when the kernel is done with
-    /// it.
+    /// wait that reaps its process; a thread that does not lead its process
+    /// and ends by its own `exit` leaves at the commit of that exit's grant
+    /// (`LiveTasks::commit_thread_exit`). A thread that an exec, an
+    /// `exit_group` or a signal ends, and a leader that exits while its
+    /// threads run on, a zombie, stay until the reap.
     tasks: BTreeMap<DetTid, DetPid>,
     /// How many clones each task has entered without returning: each may
     /// have made a child that already runs, as a vfork's child does while its
@@ -5909,10 +5919,30 @@ pub(crate) struct LiveTasks {
     /// `exit_group`, was granted: still counted, and named as exited in a
     /// refusal. Only names; never shortens the count.
     exited: BTreeSet<DetTid>,
+    /// The threads retired at the commit of their own `exit`
+    /// (`LiveTasks::commit_thread_exit`), each with its process, whose exit
+    /// the backend has not yet reported complete. Until it has, the kernel may
+    /// still mark the futex words of the thread's robust list and store 0 to
+    /// its `clear_child_tid` word (`mm_release`), anywhere in the memory it
+    /// shared. They no longer count, which was decided in turn order, but an
+    /// off-turn binder call is issued only once none is left
+    /// (`Detcore::run_binder_call_with`), so those writes are done before the call
+    /// can read or write a buffer. The report is Detcore's `on_exit_thread`,
+    /// which a backend whose kernel runs the exit
+    /// (`BackendCapabilities::runs_exit_robust_list`) calls only after the
+    /// thread's final exit status; a wait that reaps the thread's process
+    /// forgets its entry, since its exit is then complete whether or not a
+    /// report came.
+    unreported: BTreeMap<DetTid, DetPid>,
     /// Set where this record was not carried here: a thread state read back
     /// from its serialized form, which does not hold it. Then which tasks
     /// are live is unknown, and no task is taken to be alone.
     unknown: bool,
+    /// Set once a backend reported a task it cloned natively without first
+    /// announcing the clone (`LiveTasks::end_reported_clone`): the child may
+    /// have run unnamed, so from then on which tasks are live is unknown,
+    /// and no task is taken to be alone.
+    unannounced_clone: bool,
 }
 
 impl LiveTasks {
@@ -5936,6 +5966,21 @@ impl LiveTasks {
     /// `creator` enters a clone, before the child can exist.
     pub(crate) fn begin_clone(&mut self, creator: DetTid) {
         *self.creating.entry(creator).or_default() += 1;
+    }
+
+    /// `creator`'s backend reported `child`, of process `pid`, a task it made
+    /// by running the clone natively (`Detcore::register_external_child`).
+    /// Where the backend counted that clone from its native entry
+    /// (`ThreadState::begin_native_clone`), this ends it and names the child.
+    /// Where it did not, the child may have run unnamed before this report,
+    /// so which tasks are live is unknown from here (`Self::unknown`) and no
+    /// task is taken to be alone again: an application backend that runs
+    /// native clones calls `begin_native_clone` before each one.
+    pub(crate) fn end_reported_clone(&mut self, creator: DetTid, child: DetTid, pid: DetPid) {
+        if !self.creating.contains_key(&creator) {
+            self.unannounced_clone = true;
+        }
+        self.end_clone(creator, Some((child, pid)));
     }
 
     /// `creator`'s clone returned, having made `child` (its thread ID and
@@ -5964,15 +6009,52 @@ impl LiveTasks {
             }
             kept
         });
+        // A reaped process's threads have all finished exiting, reported or
+        // not, so none of them can hold a binder call back any longer.
+        self.unreported.retain(|_, process| *process != pid);
     }
 
-    /// Task `tid`'s `exit` was granted. It stays counted until a wait reaps
-    /// its process: nothing a guest call says shows when the kernel is done
-    /// with it.
+    /// Task `tid` had its own `exit`, or its process's `exit_group`, granted.
+    /// It still counts, named as exited, until the grant is committed
+    /// (`Self::commit_thread_exit`) or a wait reaps its process.
     pub(crate) fn note_exit(&mut self, tid: DetTid) {
         if self.tasks.contains_key(&tid) {
             self.exited.insert(tid);
         }
+    }
+
+    /// Task `tid`, of process `pid`, committed the grant of its own `exit`
+    /// in its turn, the last thing it does there: under sequentialized
+    /// threads it never runs again. A thread that does not lead its process
+    /// leaves the record here, its exit awaiting the backend's report
+    /// (`Self::unreported`). A leader stays, as the zombie it is, until a
+    /// wait reaps its process. Returns whether the thread left.
+    pub(crate) fn commit_thread_exit(&mut self, tid: DetTid, pid: DetPid) -> bool {
+        if tid.as_raw() == pid.as_raw() || !self.exited.remove(&tid) {
+            return false;
+        }
+        self.tasks.remove(&tid);
+        self.unreported.insert(tid, pid);
+        true
+    }
+
+    /// The backend reported task `tid`'s exit complete: the kernel has done
+    /// every write it makes for it (`Self::unreported`).
+    pub(crate) fn exit_reported(&mut self, tid: DetTid) {
+        self.unreported.remove(&tid);
+    }
+
+    /// Whether a thread retired at its exit's commit still awaits its
+    /// backend's report (`Self::unreported`).
+    #[cfg(test)]
+    pub(crate) fn exits_unreported(&self) -> bool {
+        !self.unreported.is_empty()
+    }
+
+    /// A thread retired at its exit's commit whose report is still awaited,
+    /// the lowest-numbered, to name in a refusal.
+    pub(crate) fn first_unreported(&self) -> Option<DetTid> {
+        self.unreported.keys().next().copied()
     }
 
     /// Process `pid`'s `exit_group` was granted, which ends each of its
@@ -5992,6 +6074,13 @@ impl LiveTasks {
             return Some(
                 "which tasks are live is unknown (this thread's state was read back from its \
                  serialized form)"
+                    .to_string(),
+            );
+        }
+        if self.unannounced_clone {
+            return Some(
+                "which tasks are live is unknown (a backend reported a task it cloned natively \
+                 without announcing the clone first)"
                     .to_string(),
             );
         }
@@ -6079,6 +6168,96 @@ mod live_tasks_tests {
         assert!(tasks.others(DetTid::from_raw(9)).is_some());
         drop(tasks);
         assert!(LiveTasks::unknown().lock().unwrap().others(one).is_some());
+    }
+
+    /// A thread that does not lead its process and leaves by its own `exit`
+    /// counts while its exit is granted but not committed, and not once the
+    /// grant is committed, though its exit then awaits the backend's report
+    /// until it comes: a process that joined its helper is alone again. A
+    /// leader is never retired at its exit, and a process that exited counts
+    /// until a wait reaps it.
+    #[test]
+    fn a_thread_leaves_at_its_exit_s_commit_and_a_zombie_at_its_reap() {
+        let one = DetTid::from_raw(1);
+        let record = LiveTasks::of_first_task(one, one);
+        let mut tasks = record.lock().unwrap();
+        tasks.begin_clone(one);
+        tasks.end_clone(one, Some((DetTid::from_raw(2), one)));
+        // A commit with no grant retires nothing.
+        assert!(!tasks.commit_thread_exit(DetTid::from_raw(2), one));
+        tasks.note_exit(DetTid::from_raw(2));
+        assert_eq!(
+            tasks.others(one).as_deref(),
+            Some("task 2 of process 1, which exited and is not reaped yet")
+        );
+        assert!(tasks.commit_thread_exit(DetTid::from_raw(2), one));
+        assert_eq!(tasks.others(one), None);
+        assert!(tasks.exits_unreported());
+        tasks.exit_reported(DetTid::from_raw(2));
+        assert!(!tasks.exits_unreported());
+        // A leader whose threads run on stays a zombie until the reap.
+        tasks.note_exit(one);
+        assert!(!tasks.commit_thread_exit(one, one));
+        // A child process that exited counts until a wait reaps it.
+        tasks.begin_clone(one);
+        tasks.end_clone(one, Some((DetTid::from_raw(3), DetTid::from_raw(3))));
+        tasks.note_exit(DetTid::from_raw(3));
+        assert!(!tasks.commit_thread_exit(DetTid::from_raw(3), DetTid::from_raw(3)));
+        assert!(
+            tasks
+                .others(DetTid::from_raw(9))
+                .is_some_and(|others| others.contains("task 3, which exited"))
+        );
+        tasks.reaped(DetTid::from_raw(3));
+        assert!(
+            !tasks
+                .others(DetTid::from_raw(9))
+                .is_some_and(|others| others.contains("task 3"))
+        );
+    }
+
+    /// A wait that reaps a process forgets the unreported exits of its
+    /// threads retired at their exit's commit: they have all finished, so a
+    /// report that never arrives for them cannot hold back a later binder
+    /// call. Another process's unreported exit is kept.
+    #[test]
+    fn a_reaped_process_forgets_its_threads_unreported_exits() {
+        let one = DetTid::from_raw(1);
+        let record = LiveTasks::of_first_task(one, one);
+        let mut tasks = record.lock().unwrap();
+        // Process 3, and thread 5 of it; thread 2 of process 1.
+        tasks.begin_clone(one);
+        tasks.end_clone(one, Some((DetTid::from_raw(3), DetTid::from_raw(3))));
+        tasks.begin_clone(DetTid::from_raw(3));
+        tasks.end_clone(
+            DetTid::from_raw(3),
+            Some((DetTid::from_raw(5), DetTid::from_raw(3))),
+        );
+        tasks.begin_clone(one);
+        tasks.end_clone(one, Some((DetTid::from_raw(2), one)));
+        for (thread, process) in [(5, 3), (2, 1)] {
+            tasks.note_exit(DetTid::from_raw(thread));
+            assert!(tasks.commit_thread_exit(DetTid::from_raw(thread), DetTid::from_raw(process)));
+        }
+        assert_eq!(tasks.first_unreported(), Some(DetTid::from_raw(2)));
+        tasks.reaped(DetTid::from_raw(3));
+        assert_eq!(tasks.first_unreported(), Some(DetTid::from_raw(2)));
+        tasks.exit_reported(DetTid::from_raw(2));
+        assert!(!tasks.exits_unreported());
+        // Reaped first, then reported: the report finds nothing to clear.
+        tasks.begin_clone(one);
+        tasks.end_clone(one, Some((DetTid::from_raw(6), DetTid::from_raw(6))));
+        tasks.begin_clone(DetTid::from_raw(6));
+        tasks.end_clone(
+            DetTid::from_raw(6),
+            Some((DetTid::from_raw(7), DetTid::from_raw(6))),
+        );
+        tasks.note_exit(DetTid::from_raw(7));
+        assert!(tasks.commit_thread_exit(DetTid::from_raw(7), DetTid::from_raw(6)));
+        tasks.reaped(DetTid::from_raw(6));
+        assert!(!tasks.exits_unreported());
+        tasks.exit_reported(DetTid::from_raw(7));
+        assert!(!tasks.exits_unreported());
     }
 }
 
@@ -7500,6 +7679,21 @@ impl<T> ThreadState<T> {
             .expect("process CPU time mutex poisoned")
             .exited_children
             .contains_key(&pid)
+    }
+
+    /// A backend that runs a clone natively (an application backend, through
+    /// `hermit::app::backend_hook`) is about to: from here until its report
+    /// of the child (`Detcore::register_external_child`), the clone may have
+    /// made a task the run's record does not name, so it counts as one
+    /// (`LiveTasks::begin_clone`). Such a backend calls this before every
+    /// native clone; a report of a clone it did not announce leaves the
+    /// record unknown, and binder never alone (`LiveTasks::end_reported_clone`).
+    /// A native clone that fails, and so is never reported, stays counted.
+    pub fn begin_native_clone(&self) {
+        self.live_tasks
+            .lock()
+            .expect("live tasks mutex poisoned")
+            .begin_clone(self.dettid);
     }
 
     pub(crate) fn reap_child_process_cpu_time(&mut self, pid: DetPid) {

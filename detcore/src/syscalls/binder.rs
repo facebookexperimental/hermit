@@ -267,9 +267,51 @@ pub(crate) enum Blocking {
     Freeze,
 }
 
+/// What a binder call's argument held, read from guest memory once, after
+/// the exit-report barrier (`Detcore::binder_snapshot`): the
+/// `binder_write_read` of a `BINDER_WRITE_READ` and the `binder_freeze_info`
+/// of a `BINDER_FREEZE`, `None` where the request has none or it cannot be
+/// read. Every decision Detcore makes before the call (its route, its poll,
+/// its refusals) and the `read_consumed` its receipts parse from after it
+/// come from this one read, so none reads the argument twice or before the
+/// barrier.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Snapshot {
+    pub(crate) write_read: Option<WriteRead>,
+    pub(crate) freeze: Option<[u32; 3]>,
+}
+
+impl Snapshot {
+    /// Whether `request` has an argument Detcore reads:
+    /// `BINDER_WRITE_READ` and `BINDER_FREEZE`.
+    pub(crate) fn reads(request: u64) -> bool {
+        is_write_read(request) || request & 0xffff_ffff == BINDER_FREEZE
+    }
+
+    /// Read the argument of binder `request` at `argument`.
+    pub(crate) fn read<M: MemoryAccess>(memory: &M, request: u64, argument: usize) -> Self {
+        Snapshot {
+            write_read: is_write_read(request)
+                .then(|| write_read(memory, argument))
+                .flatten(),
+            freeze: (request & 0xffff_ffff == BINDER_FREEZE)
+                .then(|| freeze_info(memory, argument))
+                .flatten(),
+        }
+    }
+
+    /// The `read_consumed` the call was given: the bytes of `read_buffer` an
+    /// earlier call wrote, which this one leaves alone. Zero where there is
+    /// no `binder_write_read` or it could not be read, so the whole buffer is
+    /// parsed, as before.
+    pub(crate) fn consumed_before(&self) -> u64 {
+        self.write_read.map_or(0, |call| call.read_consumed)
+    }
+}
+
 /// `WriteRead` of the call whose argument is at `argument`, read from guest
 /// memory; `None` when it cannot be read.
-pub(crate) fn write_read<M: MemoryAccess>(memory: &M, argument: usize) -> Option<WriteRead> {
+fn write_read<M: MemoryAccess>(memory: &M, argument: usize) -> Option<WriteRead> {
     let address = Addr::<WriteRead>::from_raw(argument)?;
     memory.read_value(address).ok()
 }
@@ -335,7 +377,7 @@ pub(crate) enum Effect {
     Freeze,
 }
 
-/// How Detcore issues a binder `ioctl` (`Detcore::run_binder_call`).
+/// How Detcore issues a binder `ioctl` (`Detcore::run_binder_call_with`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Route {
     /// It returns on its own, so it runs in the caller's turn.
@@ -404,7 +446,7 @@ pub(crate) fn host_timed_reason(effect: Effect, fd: RawFd) -> String {
     )
 }
 
-/// How a binder call ran (`Detcore::run_binder_call`), which decides how
+/// How a binder call ran (`Detcore::run_binder_call_with`), which decides how
 /// the descriptors its read delivers are taken
 /// (`Detcore::take_binder_receipts`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -464,7 +506,7 @@ pub(crate) fn unrecorded_receipt_reason(fd: RawFd, delivered: &Delivered) -> Opt
 }
 
 /// `struct binder_freeze_info` at `argument`, read from guest memory.
-pub(crate) fn freeze_info<M: MemoryAccess>(memory: &M, argument: usize) -> Option<[u32; 3]> {
+fn freeze_info<M: MemoryAccess>(memory: &M, argument: usize) -> Option<[u32; 3]> {
     let address = Addr::<[u32; 3]>::from_raw(argument)?;
     memory.read_value(address).ok()
 }
@@ -478,7 +520,7 @@ pub(crate) fn freeze_info<M: MemoryAccess>(memory: &M, argument: usize) -> Optio
 /// (`external_calls`).
 ///
 /// Returns whether it warned. Which calls go to the background is decided by
-/// host timing (`run_binder_call`'s zero-timeout poll), so whether a process
+/// host timing (`run_binder_call_with`'s zero-timeout poll), so whether a process
 /// warns at all, and the count, can differ between runs; the line's text
 /// cannot.
 pub(crate) fn note_blocking(waits: Blocking, process: i32) -> bool {
@@ -510,16 +552,6 @@ static EXTERNAL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// summary; another backend reports none.
 pub(crate) fn external_calls() -> u64 {
     EXTERNAL_CALLS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// The `read_consumed` of the `struct binder_write_read` at `argument`,
-/// read before the call: the bytes of `read_buffer` an earlier call wrote,
-/// which this one leaves alone. Zero where it cannot be read, so the whole
-/// buffer is parsed, as before.
-pub(crate) fn consumed_before<M: MemoryAccess>(memory: &M, argument: usize) -> u64 {
-    Addr::<[u64; 6]>::from_raw(argument)
-        .and_then(|address| memory.read_value(address).ok())
-        .map_or(0, |words: [u64; 6]| words[4])
 }
 
 /// The descriptors a successful `BINDER_WRITE_READ`, whose
@@ -1267,10 +1299,12 @@ mod tests {
         // Old commands do not consume this call's budget or get parsed again.
         // Only the small FD transaction after the large old prefix is new.
         assert_eq!(
-            consumed_before(
+            Snapshot::read(
                 &memory,
+                BINDER_WRITE_READ,
                 [0, 0, 0, 0, MAX_COMMAND_BYTES as u64, 0].as_ptr() as usize
-            ),
+            )
+            .consumed_before(),
             MAX_COMMAND_BYTES as u64
         );
         assert_eq!(

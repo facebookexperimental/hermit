@@ -1794,12 +1794,17 @@ yet reaped, or being created, and no debugger is attached (`--gdbserver`,
 `--dap-listen`). Then no other task can change what the call reads and writes,
 use a descriptor it delivers before Hermit records it, or take the work it waits
 for. A single-threaded binder client or service, whose peer runs outside Hermit,
-works this way. The count keeps every task whose end no guest call shows: a
-thread that exited stays counted until its whole process is reaped, and a child
-reaped without a wait (its parent ignores `SIGCHLD` or set `SA_NOCLDWAIT`), or
-an orphan reaped by a process outside the guest, is never removed. Once such a
-task exists, the run is never alone again, so a fail-closed run refuses its
-waiting binder calls.
+works this way. A thread that ends by its own `exit` without leading its
+process stops counting when Hermit commits that exit in the thread's turn, after
+which it never runs again, so a program that joined its helper threads and runs
+on alone is alone again (on the ptrace backend; elsewhere, or with
+`--no-sequentialize-threads`, it counts until its process is reaped). Every
+other ended task counts until a wait reaps its process: a process that exited, a
+thread-group leader that exited while its threads ran on, and a thread that an
+exec, an `exit_group` or a signal ended. A child reaped without a wait (its
+parent ignores `SIGCHLD` or set `SA_NOCLDWAIT`), and an orphan reaped by a
+process outside the guest, are never removed. Once such a task exists, the run
+is never alone again, so a fail-closed run refuses its waiting binder calls.
 
 Beside any other task, such a call is refused by name, naming the other tasks,
 and the run ends with the policy-refusal status (122). With

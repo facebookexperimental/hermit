@@ -63678,19 +63678,23 @@ fn binder_guest_output_with(mode: &str, side: BinderSide, hermit_args: &[&str]) 
     let await_ready = format!(
         "i=0; while [ ! -e {mountpoint}.ready ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done"
     );
+    // The side outside Hermit is given up to 10 s to finish on its own, so
+    // its output is whole, before any cleanup kill.
+    let reap_peer = "i=0; while kill -0 $peer 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; \
+                     i=$((i+1)); done; kill $peer 2>/dev/null; wait $peer";
     let report_peer = format!("echo '--- outside Hermit ---' >&2; cat {peer_log} >&2");
     let run = match side {
         BinderSide::Both => format!("exec {}", under_hermit("both")),
         BinderSide::Manager => format!(
             "( {await_ready}; exec timeout --kill-after 5s 60s {guest} {mountpoint} {mode} \
-             client ) >{peer_log} 2>&1 & peer=$!; {}; status=$?; kill $peer 2>/dev/null; \
-             wait $peer; {report_peer}; exit $status",
+             client ) >{peer_log} 2>&1 & peer=$!; {}; status=$?; {reap_peer}; \
+             {report_peer}; exit $status",
             under_hermit("manager")
         ),
         BinderSide::Client => format!(
             "timeout --kill-after 5s 60s {guest} {mountpoint} {mode} manager >{peer_log} 2>&1 & \
-             peer=$!; {await_ready}; {}; status=$?; kill $peer 2>/dev/null; wait $peer; \
-             {report_peer}; exit $status",
+             peer=$!; {await_ready}; {}; status=$?; {reap_peer}; {report_peer}; \
+             exit $status",
             under_hermit("client")
         ),
     };
