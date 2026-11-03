@@ -2506,6 +2506,105 @@ mod tests {
     /// minimization trial whose knock-out let a thread start a slice past
     /// its recorded end stopped the whole analysis with Detcore's "Cannot
     /// set end of timeslice" panic (exit 101).
+    /// A prefix trial of a recording whose schedule trace holds instruction
+    /// offsets (format 5), written by the real trial writer
+    /// (`write_trial_record`) and read back, keeps format 5 and its timing at
+    /// every length: with no event, with the offset batch and with all, with
+    /// and without a jump of global time at event zero, it lists its jumps
+    /// (complete, so no list means none was taken), keeps the one at event
+    /// zero, charges replayed switch-ins and stays recorded with offsets. A
+    /// prefix of no events is a complete, empty schedule, not rows alone.
+    /// (Minimization's rows alone keep format 1's timing:
+    /// `a_minimize_record_states_only_what_its_rows_hold`.)
+    #[test]
+    fn a_prefix_trial_of_trace_offsets_keeps_its_timing_at_every_length() {
+        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
+        use detcore::preemptions::InstructionOffset;
+        use detcore::preemptions::PreemptionWriter;
+        use detcore::preemptions::RecordedOffsets;
+        use detcore::preemptions::TimeSkip;
+        use detcore::preemptions::TimeSkipReason;
+        use detcore::types::DetTid;
+        use detcore::types::LogicalTime;
+
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let jump = TimeSkip {
+            event: 0,
+            target: LogicalTime::from_nanos(5_000),
+            reason: TimeSkipReason::IdleGuestPollers,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("prefix.json");
+        for with_jump in [false, true] {
+            let mut writer = PreemptionWriter::new(None)
+                .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT));
+            writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
+            writer.insert_reprioritization(
+                tid,
+                LogicalTime::from_nanos(10),
+                18,
+                detcore::DEFAULT_PRIORITY,
+                5,
+                Some(offset),
+            );
+            if with_jump {
+                writer.insert_time_skip(jump);
+            }
+            writer.insert_schedevent(
+                SchedEvent::branches(tid, 22).with_instruction_offset(Some(offset)),
+            );
+            writer.insert_schedevent(SchedEvent::branches(tid, 3));
+            let source: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+            source.validate().unwrap();
+            assert_eq!(source.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+
+            let args =
+                crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("not analyze")
+            };
+            options.apply_global(&args.global);
+            options.time_skip_sources.lock().unwrap().remember(&source);
+            for len in [0, 1, source.schedevents().len()] {
+                let what = format!("prefix of {len} events, jump at event 0: {with_jump}");
+                options
+                    .write_trial_record(source.schedule_prefix(len), &output)
+                    .unwrap_or_else(|error| panic!("{what}: {error:#}"));
+                let written = PreemptionReader::try_new(&output)
+                    .unwrap_or_else(|error| panic!("{what}: {error:#}"))
+                    .into_inner();
+                written.validate().unwrap();
+                assert_eq!(written.schedevents().len(), len, "{what}");
+                assert_eq!(
+                    written.format_version(),
+                    Some(INSTRUCTION_OFFSET_FORMAT),
+                    "{what}"
+                );
+                assert_eq!(
+                    written.timing_format(),
+                    Some(INSTRUCTION_OFFSET_FORMAT),
+                    "{what}"
+                );
+                assert!(written.lists_its_time_skips(), "{what}");
+                assert!(written.charges_replayed_switch_ins(), "{what}");
+                assert_eq!(
+                    written.time_skips(),
+                    with_jump.then_some(&[jump][..]),
+                    "{what}"
+                );
+                assert_eq!(
+                    written.recorded_offsets(),
+                    RecordedOffsets::Recorded,
+                    "{what}"
+                );
+            }
+        }
+    }
+
     /// A prefix trial of a recording whose rows carry instruction offsets,
     /// written as `prefix_trial` writes it, keeps the recording's offsets
     /// format whether the prefix keeps no event, the events before the first

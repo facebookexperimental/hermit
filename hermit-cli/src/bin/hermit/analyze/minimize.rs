@@ -552,6 +552,8 @@ mod tests {
                     .is_none_or(|format| (2..=3).contains(&format));
                 assert_eq!(read_before_offsets, !keeps_offset, "{label}");
                 assert_eq!(written.timing_format(), None, "{label}");
+                assert!(!written.lists_its_time_skips(), "{label}");
+                assert!(!written.charges_replayed_switch_ins(), "{label}");
                 assert_eq!(written.time_skips(), None, "{label}");
                 let mut rows = written.extract_all().remove(&tid).unwrap().into_iter();
                 while let Some((time, _, rcbs, offset)) = rows.next_with_offset() {
