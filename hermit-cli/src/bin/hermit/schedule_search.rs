@@ -260,7 +260,10 @@ fn stopless_points(schedules: [&[SchedEvent]; 2]) -> HashSet<(DetTid, u64)> {
             schedule
                 .iter()
                 .zip(branch_totals(schedule))
-                .filter(|(event, _)| event.stopless)
+                // A record that marks an end it holds a RIP for is refused
+                // where records are read (`SchedEvent::stopless_mark_refusal`);
+                // should one reach here, its known RIP is still compared.
+                .filter(|(event, _)| event.stopless && event.end_rip.is_none())
                 .map(|(event, total)| (event.dettid, total))
                 .collect::<Vec<_>>()
         })
@@ -1192,6 +1195,21 @@ mod tests {
         let taken_alone = vec![SchedEvent::branches(a, 100).taken_without_stop()];
         assert_eq!(just_distance(&requested, &taken_alone), (0, 0));
         assert_eq!(just_distance(&taken_alone, &elsewhere), (0, 0));
+        // A mark on an end with a known RIP, which no record reader admits,
+        // does not hide that RIP either.
+        let marked = |events: &[SchedEvent]| {
+            events
+                .iter()
+                .map(|event| SchedEvent {
+                    stopless: true,
+                    ..event.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(
+            just_distance(&marked(&requested), &marked(&elsewhere)),
+            (0, 0)
+        );
 
         // Zero jitter allowed: the replay that ended elsewhere is replayed
         // again before it classifies the schedule.

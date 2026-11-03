@@ -187,9 +187,36 @@ impl SchedEvent {
     }
 
     /// Set the end_rip field.  The instruction pointer after the event completed.
+    /// An end taken without a stop (`stopless`) has none
+    /// ([`Self::stopless_mark_refusal`]).
     pub fn with_end_rip(mut self, end_rip: InstructionPointer) -> Self {
+        assert!(
+            !self.stopless,
+            "a slice end without a stop has no RIP: {self:?}"
+        );
         self.end_rip = Some(end_rip);
         self
+    }
+
+    /// Why this event's `stopless` mark contradicts the rest of it, if it
+    /// does: only the branches up to a timeslice end are marked, and an end
+    /// taken without a stop has no `end_rip`, since the guest was not stopped
+    /// there. The builders refuse both (`taken_without_stop`,
+    /// `with_end_rip`), and so do the record writer and reader, so that no
+    /// record says an end was taken without a stop while it holds the RIP a
+    /// stop read.
+    pub fn stopless_mark_refusal(&self) -> Option<&'static str> {
+        if !self.stopless {
+            None
+        } else if self.op != Op::Branch {
+            Some("only the branches up to a timeslice end may be marked `stopless`")
+        } else if self.end_rip.is_some() {
+            Some(
+                "a timeslice end marked `stopless` has no end RIP: the guest was not stopped there",
+            )
+        } else {
+            None
+        }
     }
 
     /// Whether the two events are the same operation by the same thread at
@@ -441,6 +468,16 @@ mod sched_event_tests {
         let _ = SchedEvent::branches(DetTid::from_raw(3), 1)
             .with_end_rip(InstructionPointer::new(0x1000).unwrap())
             .taken_without_stop();
+    }
+
+    /// Nor can a RIP be set on an end already marked as taken without a stop,
+    /// in the other order.
+    #[test]
+    #[should_panic(expected = "a slice end without a stop has no RIP")]
+    fn a_rip_cannot_be_set_on_a_slice_end_taken_without_a_stop() {
+        let _ = SchedEvent::branches(DetTid::from_raw(3), 1)
+            .taken_without_stop()
+            .with_end_rip(InstructionPointer::new(0x1000).unwrap());
     }
 }
 

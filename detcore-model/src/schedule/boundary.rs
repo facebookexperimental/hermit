@@ -373,6 +373,15 @@ impl Schedule {
                         reason: "event owner and count must be positive",
                     });
                 }
+                // A slice-boundary recording stops at every timeslice end: its
+                // writer notes no background starts, so it states a format
+                // below the one that may mark an end taken without a stop.
+                if event.stopless {
+                    return Err(Error::InvalidEvent {
+                        index,
+                        reason: "a slice-boundary recording marks no event `stopless`",
+                    });
+                }
                 continue;
             }
             let Record::TimesliceEnd(boundary) = record else {

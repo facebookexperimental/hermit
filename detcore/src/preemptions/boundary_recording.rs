@@ -836,6 +836,22 @@ mod tests {
         assert_eq!(writer.into_string(), legacy.to_string());
     }
 
+    /// A slice-boundary recording stops at every timeslice end, so it marks
+    /// no event `stopless`: an event so marked is refused on read, as an
+    /// invalid event, whatever else it holds.
+    #[test]
+    fn a_stopless_mark_is_rejected_on_new_format_read() {
+        let event = SchedEvent::branches(DetTid::from_raw(3), 1).taken_without_stop();
+        assert!(Schedule::new(vec![Record::Event(event.clone())]).is_err());
+        let mut wire: serde_json::Value =
+            serde_json::from_slice(&sample(false).encode().unwrap()).unwrap();
+        let schedule = &mut wire["slice_boundary_recording"]["schedule"];
+        schedule["record_count"] = 1.into();
+        schedule["records"] = serde_json::json!([Record::Event(event)]);
+        let error = Recording::decode(&serde_json::to_vec(&wire).unwrap()).unwrap_err();
+        assert!(format!("{error:#}").contains("`stopless`"), "{error:#}");
+    }
+
     #[test]
     fn zero_count_or_nonpositive_event_owner_is_rejected_on_new_format_read() {
         for (tid, count) in [(3, 0), (0, 1), (-1, 1)] {

@@ -1349,6 +1349,14 @@ impl PreemptionRecord {
         let known = self
             .format_version
             .is_none_or(|format| (TIME_SKIPS_FORMAT..=PREEMPTION_RECORD_FORMAT).contains(&format));
+        if let Some((index, refusal)) = self
+            .global
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| Some((index, event.stopless_mark_refusal()?)))
+        {
+            return Err(format!("record event {index}: {refusal}"));
+        }
         let stopless = self.global.iter().filter(|event| event.stopless).count();
         if stopless > 0
             && self
@@ -1935,6 +1943,77 @@ mod tests {
         read.validate_format().unwrap();
         read.format_version = Some(STOPLESS_SLICE_ENDS_FORMAT + 1);
         assert!(read.validate_format().is_err());
+    }
+
+    /// A `stopless` mark that contradicts its event is refused wherever a
+    /// record is built, written or read: on an end that holds a RIP (the
+    /// RIP a stop reads, which an end taken without one does not have) and
+    /// on an event that is not a Branch. The builder refuses a RIP on a marked
+    /// end, a writer that keeps marks refuses either shape, and the public
+    /// reader refuses both records with differing known RIPs and the record
+    /// with a marked syscall by name, as a record-format refusal, before any
+    /// alignment could leave those RIPs out. The valid shapes, a marked end
+    /// with no RIP and an unmarked end with a RIP, are read.
+    #[test]
+    fn contradictory_stopless_marks_are_refused_where_records_are_built_written_and_read() {
+        use std::panic::AssertUnwindSafe;
+        use std::panic::catch_unwind;
+
+        use reverie::syscalls::Sysno;
+
+        use crate::types::SyscallPhase;
+
+        let tid = DetTid::from_raw(3);
+        let rip = |at| crate::types::InstructionPointer::new(at).unwrap();
+        let marked_at = |at| SchedEvent {
+            end_rip: Some(rip(at)),
+            ..SchedEvent::branches(tid, 100).taken_without_stop()
+        };
+        let marked_syscall = SchedEvent {
+            stopless: true,
+            ..SchedEvent::syscall(tid, Sysno::getppid, SyscallPhase::Prehook)
+        };
+
+        assert!(
+            catch_unwind(|| SchedEvent::branches(tid, 100)
+                .taken_without_stop()
+                .with_end_rip(rip(0x401000)))
+            .is_err()
+        );
+        for event in [marked_at(0x401000), marked_syscall.clone()] {
+            let mut writer = PreemptionWriter::new(None).noting_background_starts();
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| writer.insert_schedevent(event.clone()))).is_err(),
+                "{event:?}"
+            );
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("record.json");
+        let read = |event: SchedEvent| {
+            let mut record = PreemptionRecord::from_sched_events(vec![event]);
+            record.format_version = Some(PREEMPTION_RECORD_FORMAT);
+            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+            PreemptionReader::try_new(&path).map(|_| ())
+        };
+        for (event, refusal) in [
+            (marked_at(0x401000), "has no end RIP"),
+            (marked_at(0x402000), "has no end RIP"),
+            (marked_syscall, "only the branches"),
+        ] {
+            let error = read(event.clone()).expect_err("a contradictory mark is read");
+            assert!(
+                error.chain().any(|cause| cause.is::<RecordFormatRefusal>()),
+                "{event:?}: {error:#}"
+            );
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("record event 0") && message.contains(refusal),
+                "{event:?}: {message}"
+            );
+        }
+        read(SchedEvent::branches(tid, 100).taken_without_stop()).unwrap();
+        read(SchedEvent::branches(tid, 100).with_end_rip(rip(0x401000))).unwrap();
     }
 
     /// A record that keeps no background starts keeps no `stopless` marks:
@@ -4179,6 +4258,9 @@ impl PreemptionWriter {
                 .is_none_or(|format| format < STOPLESS_SLICE_ENDS_FORMAT)
         {
             ev.stopless = false;
+        }
+        if let Some(refusal) = ev.stopless_mark_refusal() {
+            panic!("a record writer was given {ev:?}: {refusal}");
         }
         if let Some(records) = &mut self.boundary_records {
             assert!(
