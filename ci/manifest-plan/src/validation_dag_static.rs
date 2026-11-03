@@ -1275,7 +1275,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (dh-4a61v): 1951 - 1 = 1950.
     // And the departed shell py_hello replay (dh-9r2mg): 1950 - 1 = 1949.
     // PR 4920 (3): two model/config units: 1955 + 2 = 1957.
-    ("test.regular_crates", 1957),
+    // drain/4709: main + this change's detcore-model cpu_profile test (+1).
+    ("test.regular_crates", 1958),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5382,7 +5383,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same departed blocking-sigsuspend (dh-4a61v) and shell py_hello
     // (dh-9r2mg) named losses: 1937 - 2 = 1935.
     // PR 4920 (3): the same two units: 1941 + 2 = 1943.
-    ("test.regular_crates_on_host", 1943),
+    // drain/4709: main + this change's detcore-model cpu_profile test (+1).
+    ("test.regular_crates_on_host", 1944),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6627,7 +6629,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same departed blocking-sigsuspend (dh-4a61v) and shell py_hello
     // (dh-9r2mg) named losses: 1937 - 2 = 1935.
     // PR 4920 (3): the same two units: 1941 + 2 = 1943.
-    ("test.regular_crates_on_host", 1943),
+    // drain/4709: main + this change's detcore-model cpu_profile test (+1).
+    ("test.regular_crates_on_host", 1944),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

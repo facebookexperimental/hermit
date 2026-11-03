@@ -1727,6 +1727,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// checked at its exec stop, before the interpreter's first instruction;
     /// LiteInst's and in-guest-trap's callbacks come later, after the loader
     /// has run.
+    ///
+    /// KVM is narrower than that, and no claim is made otherwise: the KVM
+    /// backend performs no per-exec ISA check after the first image. Its
+    /// `AdmitExec` admission is a file-identity hash of the image a later
+    /// exec would run, not an ISA declaration check, and `KvmGuest` has
+    /// no exec callback that reaches this function for a later image. A
+    /// KVM guest whose later exec runs an image declaring more than the
+    /// profile gets no typed refusal from this check; closing that gap
+    /// needs a KVM exec-time check that does not exist yet.
     pub(crate) fn isa_refusal<G: Guest<Self>>(&self, guest: &G) -> Option<String> {
         use crate::exec_record::IsaNeeds;
         let profile = self.cfg.cpu_profile;

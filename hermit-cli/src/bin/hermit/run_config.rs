@@ -1747,12 +1747,12 @@ mod tests {
             let argv = argv(&[], run_args, GUEST);
             let (mut args, matches) = parse_at(&argv, SAVING_CLOCK);
             let config = capture(
-                &crate::Args::command(),
+                &crate::app::Args::command(),
                 &matches,
                 matches.subcommand_matches(RUN).unwrap(),
             )
             .unwrap();
-            let crate::Subcommand::Run(run) = &mut args.command else {
+            let crate::app::Subcommand::Run(run) = &mut args.command else {
                 panic!("{argv:?} is not a `run` command");
             };
             run.set_config_capture(config);
@@ -1767,15 +1767,15 @@ mod tests {
             write(&path, saved).unwrap();
             let by_config = parsed(&parse_at(&load(&path, &[]), LOADING_CLOCK).0);
             let (global, run_inputs) = to_manifest_parts(saved).unwrap();
-            let manifest = crate::manifest::Manifest::new(
+            let manifest = crate::app::manifest::Manifest::new(
                 hermit::Id::unique(),
-                crate::manifest::Kind::InputsOnly,
-                crate::manifest::Command {
+                crate::app::manifest::Kind::InputsOnly,
+                crate::app::manifest::Command {
                     program: saved.program.clone(),
                     args: saved.args.clone(),
                     cwd: None,
                 },
-                crate::manifest::Inputs {
+                crate::app::manifest::Inputs {
                     global,
                     run: run_inputs,
                     host_drawn: BTreeMap::new(),
@@ -1784,10 +1784,10 @@ mod tests {
             let path = directory
                 .path()
                 .join("id")
-                .join(crate::manifest::MANIFEST_NAME);
-            crate::manifest::write(&path, &manifest).unwrap();
+                .join(crate::app::manifest::MANIFEST_NAME);
+            crate::app::manifest::write(&path, &manifest).unwrap();
             let expanded = expand_argv(
-                &crate::Args::command(),
+                &crate::app::Args::command(),
                 &argv_for_from(path.parent().unwrap()),
             )
             .unwrap()

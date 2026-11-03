@@ -402,6 +402,19 @@ impl StartOpts {
             .map(|seconds| Duration::from_secs(seconds.get()))
     }
 
+    /// The host path a guest path is read at in this launch's completed
+    /// view: under a `--mount` target, its source (the file the guest
+    /// sees); `None` where a mount with no source hides it. Outside every
+    /// mount, the path itself.
+    fn mapped_launch_path(&self, guest: &Path) -> Option<PathBuf> {
+        for mount in self.mount.iter().rev() {
+            if let Ok(suffix) = guest.strip_prefix(mount.get_target()) {
+                return mount.get_source().map(|source| source.join(suffix));
+            }
+        }
+        Some(guest.to_path_buf())
+    }
+
     fn guest_command(&self) -> Result<Command, Error> {
         let mut command = Command::new(self.program());
         command.args(&self.args);
@@ -636,29 +649,47 @@ impl StartOpts {
         global: &GlobalOpts,
         preparation: RecordPreparation<'_>,
     ) -> Result<ExitStatus, Error> {
+        // A `--verify-replay-of` run never execs the original program: it
+        // replays the first run's recording, whose metadata names the
+        // recorded profile. Classifying the (possibly changed or missing)
+        // original here would refuse a replay that would have run, so
+        // Auto is resolved only for a run that records.
+        let replay_only = self.verify_replay_of.is_some();
         // `--cpu-profile auto` records the named profile it resolves to
         // (`hermit::cpu_profile_admission::resolve_auto`), so replay uses
-        // that profile and never derives it again.
-        if self.cpu_profile == detcore_model::cpu_profile::CpuProfile::Auto {
-            let program = self.guest_command()?.find_program().with_context(|| {
+        // that profile and never derives it again. The program and every
+        // interpreter hop are read in this launch's completed view: a
+        // path under a `--mount` target is read at its source, as the
+        // guest sees it, never at the host file the target shadows.
+        if self.cpu_profile == detcore_model::cpu_profile::CpuProfile::Auto && !replay_only {
+            let found = self.guest_command()?.find_program().with_context(|| {
                 format!("Could not resolve program {:?} in PATH", self.program())
             })?;
-            let (profile, why) =
-                hermit::cpu_profile_admission::resolve_auto(&program, Path::to_path_buf).map_err(
-                    |why| {
-                        Error::new(crate::app::container::PolicyRefusal)
-                            .context(format!("--cpu-profile auto refused: {why}"))
-                    },
-                )?;
+            let refuse = |why: String| {
+                Error::new(crate::app::container::PolicyRefusal)
+                    .context(format!("--cpu-profile auto refused: {why}"))
+            };
+            let program = self
+                .mapped_launch_path(&found)
+                .ok_or_else(|| refuse(format!("{} is hidden by a mount", found.display())))?;
+            let (profile, why) = hermit::cpu_profile_admission::resolve_auto(&program, |guest| {
+                self.mapped_launch_path(guest)
+                    .unwrap_or_else(|| guest.to_path_buf())
+            })
+            .map_err(|why| refuse(why))?;
             let mut resolved = self.clone();
             resolved.cpu_profile = profile;
             resolved.auto_resolution =
                 Some(format!("--cpu-profile auto resolved to {profile}: {why}"));
             return resolved.main_with_preparation(global, preparation);
         }
-        hermit::cpu_profile_admission::check_record_or_replay(self.cpu_profile).map_err(
-            |refusal| Error::new(crate::app::container::PolicyRefusal).context(refusal.to_string()),
-        )?;
+        if !replay_only {
+            hermit::cpu_profile_admission::check_record_or_replay(self.cpu_profile).map_err(
+                |refusal| {
+                    Error::new(crate::app::container::PolicyRefusal).context(refusal.to_string())
+                },
+            )?;
+        }
         if self.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3 {
             super::verify::CPU_PROFILE_V3_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
             // Qualify here, before any container: a refusal ends the command at

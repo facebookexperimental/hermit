@@ -413,6 +413,22 @@ impl NoteWalk {
             (None, None) => IsaNeeds::Unmarked,
         }
     }
+
+    /// [`Self::result`] for a reader that must refuse incomplete evidence:
+    /// a declaration found beside a later scan state the reader could not
+    /// decide (a truncated or unreadable property) is itself malformed
+    /// there, because the later state could hide a higher need. The known
+    /// declaration stays the lower bound [`Self::result`] reports for a
+    /// refusal; completeness is kept separately, here.
+    fn result_strict(self) -> IsaNeeds {
+        match (self.found, self.unknown) {
+            _ if self.conflict => IsaNeeds::Malformed("more than one x86 ISA needed property"),
+            (Some(_), Some(why)) => IsaNeeds::Malformed(why),
+            (Some((_, level)), None) => level,
+            (None, Some(why)) => IsaNeeds::Malformed(why),
+            (None, None) => IsaNeeds::Unmarked,
+        }
+    }
 }
 
 impl IsaNeeds {
@@ -432,6 +448,26 @@ impl IsaNeeds {
     /// [`Self::read_file`] of the file at `path`.
     pub fn read_path(path: &Path) -> Option<Self> {
         Self::read_file(&crate::util::RawFd::open(path, libc::O_RDONLY).ok()?)
+    }
+
+    /// [`Self::read_file`], refusing incomplete scan evidence: a found
+    /// declaration beside a scan state the reader could not decide (a
+    /// truncated or unreadable later property) reads as
+    /// [`Self::Malformed`], so an automatic consumer cannot select a
+    /// profile from a lower bound alone. An explicit consumer that only
+    /// needs the lower bound for its refusal keeps [`Self::read_file`].
+    pub fn read_file_strict(file: &crate::util::RawFd) -> Option<Self> {
+        let read_exact = |offset: u64, buffer: &mut [u8]| {
+            (file.read_at(buffer, offset).ok()? == buffer.len()).then_some(())
+        };
+        let mut header = [0_u8; 64];
+        read_exact(0, &mut header)?;
+        Self::parse_inner(&header, None, read_exact, true)
+    }
+
+    /// [`Self::read_file_strict`] of the file at `path`.
+    pub fn read_path_strict(path: &Path) -> Option<Self> {
+        Self::read_file_strict(&crate::util::RawFd::open(path, libc::O_RDONLY).ok()?)
     }
 
     /// What the image a process has mapped at load bias `bias`, with its
@@ -462,7 +498,16 @@ impl IsaNeeds {
     fn parse(
         header: &[u8; 64],
         mapped: Option<(u64, u64)>,
+        read_at: impl FnMut(u64, &mut [u8]) -> Option<()>,
+    ) -> Option<Self> {
+        Self::parse_inner(header, mapped, read_at, false)
+    }
+
+    fn parse_inner(
+        header: &[u8; 64],
+        mapped: Option<(u64, u64)>,
         mut read_at: impl FnMut(u64, &mut [u8]) -> Option<()>,
+        strict: bool,
     ) -> Option<Self> {
         let u16_at = |at: usize| u16::from_le_bytes([header[at], header[at + 1]]);
         let u64_at = |at: usize| u64::from_le_bytes(header[at..at + 8].try_into().unwrap());
@@ -544,7 +589,11 @@ impl IsaNeeds {
                 None => walk.unknown("a note segment past the address space"),
             }
         }
-        Some(walk.result())
+        Some(if strict {
+            walk.result_strict()
+        } else {
+            walk.result()
+        })
     }
 
     /// Walk the notes of one segment of `size` bytes, read at `address` and
@@ -991,7 +1040,7 @@ fn below(root: &Path, path: &Path) -> Option<PathBuf> {
 
 /// What the kernel's script handler makes of a file.
 #[derive(Debug, PartialEq, Eq)]
-enum Script {
+pub enum Script {
     /// Not a script.
     Not,
     /// A file the caller may not read, which the kernel may still execute.
@@ -1003,7 +1052,7 @@ enum Script {
 }
 
 /// What the kernel's script handler makes of the file at `path`.
-fn script_interpreter(path: &Path) -> Script {
+pub fn script_interpreter(path: &Path) -> Script {
     let mut header = Vec::with_capacity(BINPRM_BUF_SIZE);
     // Nonblocking and without a controlling terminal, so that a file
     // replaced by a FIFO or device since it was checked cannot wait.
@@ -1219,6 +1268,55 @@ mod tests {
             IsaNeeds::read_file(&file),
             None | Some(IsaNeeds::Malformed(_))
         ));
+    }
+
+    /// A found declaration beside a later property whose size the reader
+    /// cannot decide is a lower bound for an explicit refusal, and
+    /// incomplete evidence for an automatic one: the strict read refuses
+    /// it as malformed, the plain read keeps the level.
+    #[test]
+    fn a_declaration_beside_an_undecidable_property_is_incomplete_evidence() {
+        // A valid declaration in one note segment, and a second note
+        // segment whose description runs past its end, in another.
+        let truncated = {
+            let mut note = Vec::new();
+            note.extend_from_slice(&4_u32.to_le_bytes());
+            note.extend_from_slice(&0x1000_u32.to_le_bytes());
+            note.extend_from_slice(&NT_GNU_PROPERTY_TYPE_0.to_le_bytes());
+            note.extend_from_slice(b"GNU\0");
+            note
+        };
+        let file = image_aligned(
+            EM_X86_64,
+            &[
+                (PT_NOTE, property_note(&[isa_needed(0b11)]), 8),
+                (PT_NOTE, truncated, 4),
+            ],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image");
+        fs::write(&path, &file).unwrap();
+        assert_eq!(
+            IsaNeeds::read_path(&path),
+            Some(IsaNeeds::Level(2)),
+            "the plain read keeps the found lower bound"
+        );
+        assert!(
+            matches!(
+                IsaNeeds::read_path_strict(&path),
+                Some(IsaNeeds::Malformed(_))
+            ),
+            "the strict read refuses incomplete evidence: {:?}",
+            IsaNeeds::read_path_strict(&path)
+        );
+        // A complete scan reads the same under both.
+        let complete = image_with(
+            EM_X86_64,
+            &[(PT_GNU_PROPERTY, property_note(&[isa_needed(0b11)]))],
+        );
+        let path = directory.path().join("complete");
+        fs::write(&path, &complete).unwrap();
+        assert_eq!(IsaNeeds::read_path_strict(&path), Some(IsaNeeds::Level(2)));
     }
 
     #[test]
