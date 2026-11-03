@@ -6599,7 +6599,7 @@ fn watch_is_refused_where_it_could_not_arm_or_report() {
         "{error}"
     );
     // A watch the hardware cannot hold does not parse.
-    let misaligned = <crate::Args as clap::CommandFactory>::command()
+    let misaligned = <crate::app::Args as clap::CommandFactory>::command()
         .try_get_matches_from(["hermit", "run", "--watch=0x404014:8", "prog"])
         .unwrap_err()
         .to_string();
