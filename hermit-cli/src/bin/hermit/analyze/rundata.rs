@@ -3672,15 +3672,30 @@ mod tests {
         use crate::app::container::PolicyRefusal;
         use crate::app::container::RunTimeoutMarker;
 
-        for (verbose, selfcheck) in [(false, false), (true, false), (false, true)] {
+        // A baseline run writes its own log file only at a --trial-log above
+        // warn: --verbose and --selfcheck alone give it none (it is not a
+        // run --selfcheck compares), so its refusal points at Hermit's stderr.
+        for (verbose, selfcheck, trial_log, has_file) in [
+            (false, false, None, false),
+            (true, false, None, false),
+            (false, true, None, false),
+            (false, false, Some(TrialLog::Debug), true),
+            (true, true, Some(TrialLog::Info), true),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
             options.tmp_dir = Some(dir.path().to_path_buf());
             options.verbose = verbose;
             options.selfcheck = selfcheck;
+            options.trial_log = trial_log;
             let run = RunData::new_baseline(&options, "refused_trial".to_owned()).unwrap();
             let mut global = run.trial_global_opts();
             global.open_log_file().unwrap();
+            assert_eq!(
+                global.log_file.is_some(),
+                has_file,
+                "verbose {verbose}, selfcheck {selfcheck}, trial log {trial_log:?}"
+            );
             for error in [
                 anyhow::Error::new(PolicyRefusal),
                 anyhow::Error::new(PolicyRefusal).context("unsupported operation: restart_syscall"),

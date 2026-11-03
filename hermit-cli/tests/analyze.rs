@@ -839,7 +839,10 @@ fn analyze_stops_on_a_refused_trial() {
 }
 
 /// A refused target has no outcome, while a guest's ordinary exit 122 does.
-/// With verbose logging the error must name the actual retained trial log.
+/// With the trials logged into files (`--trial-log=debug`) the error must
+/// name the actual retained trial log; with `--verbose` alone, which no
+/// longer sets the trials' level, it points at Hermit's stderr, where the
+/// refusal's reason is.
 #[test]
 #[ignore = "requires PMU and mount namespaces; selected by the calibrated analyze validation node"]
 fn analyze_ends_with_a_refused_target_run() {
@@ -854,28 +857,40 @@ fn analyze_ends_with_a_refused_target_run() {
     assert_eq!(ordinary.status.code(), Some(122));
     assert!(!combined_output(&ordinary).contains("HERMIT_POLICY_REFUSAL"));
 
-    let dir = tempfile::tempdir().unwrap();
-    let workspace_parent = dir.path().join("workspace");
-    let report = dir.path().join("report.json");
-    let mut command = Command::new("timeout");
-    command
-        .args(["--signal=KILL", "30s"])
-        .arg(hermit_test::hermit_binary())
-        .args([
-            "analyze",
-            "--verbose",
-            "--prefix-search",
-            "--target-stdout=a-first",
-        ])
-        .arg(format!("--tmp-dir={}", workspace_parent.display()))
-        .arg(format!("--report-file={}", report.display()));
-    add_calibrated_skid_margin(&mut command, "analyze refused target");
-    command
-        .args(["--", "--timeout=3", "--"])
-        .arg(&workloads().refusal_after_race)
-        .arg("refuse");
-    let output = hermit_test::hermit_output("analyze refused target", &mut command);
-    let combined = assert_no_refusal_report(&output, &report);
+    let refused = |trial_log: &[&str]| {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_parent = dir.path().join("workspace");
+        let report = dir.path().join("report.json");
+        let mut command = Command::new("timeout");
+        command
+            .args(["--signal=KILL", "30s"])
+            .arg(hermit_test::hermit_binary())
+            .args(["analyze", "--verbose"])
+            .args(trial_log)
+            .args(["--prefix-search", "--target-stdout=a-first"])
+            .arg(format!("--tmp-dir={}", workspace_parent.display()))
+            .arg(format!("--report-file={}", report.display()));
+        add_calibrated_skid_margin(&mut command, "analyze refused target");
+        command
+            .args(["--", "--timeout=3", "--"])
+            .arg(&workloads().refusal_after_race)
+            .arg("refuse");
+        let output = hermit_test::hermit_output("analyze refused target", &mut command);
+        let combined = assert_no_refusal_report(&output, &report);
+        (dir, workspace_parent, output, combined)
+    };
+    // --verbose alone: the refusal's reason is on Hermit's stderr.
+    let (_dir, _, output, combined) = refused(&[]);
+    assert!(
+        combined.contains("Hermit refused analysis run run1_target")
+            && combined.contains("Hermit's stderr above"),
+        "{combined}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unsupported syscall: restart_syscall"),
+        "{combined}"
+    );
+    let (_dir, workspace_parent, _, combined) = refused(&["--trial-log=debug"]);
     assert!(
         combined.contains("Hermit refused analysis run run1_target"),
         "{combined}"
