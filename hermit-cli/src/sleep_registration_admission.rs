@@ -138,13 +138,10 @@ mod tests {
         }
     }
 
-    const UNREADABLE: [Backend; 5] = [
-        Backend::Dbt,
-        Backend::Sabre,
-        Backend::Liteinst,
-        Backend::InGuestTrap,
-        Backend::Kvm,
-    ];
+    // Post-split core backends whose sleepers' signal state is not read.
+    // (DBT/SaBRe left core with the split; their rows move to the external
+    // backend repositories.)
+    const UNREADABLE: [Backend; 3] = [Backend::Liteinst, Backend::InGuestTrap, Backend::Kvm];
 
     /// An explicit `first-pass` is refused by name on every backend whose
     /// sleepers' signal state the scheduler does not read, and admitted on
@@ -244,7 +241,7 @@ mod tests {
                 let config = Config {
                     replay_schedule_from: schedule.then(|| path.clone()),
                     replay_preemptions_from: (!schedule).then(|| path.clone()),
-                    ..prepared(Backend::Dbt, None)
+                    ..prepared(Backend::Kvm, None)
                 };
                 let result = refuse_unreadable_first_pass_launch(&config);
                 if first_pass {

@@ -1431,7 +1431,9 @@ impl AnalyzeOpts {
                 Some(self.trial_sleep_registration()),
                 true,
             ) {
-                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+                return Err(
+                    anyhow::Error::new(crate::app::container::PolicyRefusal).context(refusal)
+                );
             }
         }
         Ok(())

@@ -2777,8 +2777,8 @@ mod tests {
             argv.push("--");
             argv.extend(run_args);
             argv.push("/bin/true");
-            let args = crate::Args::try_parse_from(&argv).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let args = crate::app::Args::try_parse_from(&argv).unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.prepare(&args.global).map(|_| options)

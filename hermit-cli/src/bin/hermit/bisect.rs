@@ -909,8 +909,8 @@ mod tests {
             let mut argv = vec!["hermit", "bisect", good.as_str(), bad.as_str(), "--"];
             argv.extend(run_args);
             argv.push("/bin/true");
-            let args = crate::Args::try_parse_from(&argv).unwrap();
-            let crate::Subcommand::Bisect(options) = args.command else {
+            let args = crate::app::Args::try_parse_from(&argv).unwrap();
+            let crate::app::Subcommand::Bisect(options) = args.command else {
                 panic!("{argv:?} is not bisect")
             };
             options
