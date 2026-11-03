@@ -1554,6 +1554,10 @@ pub enum TestResultVerdict {
     /// `failed_tests`: `TestResultTotals::diagnostic_failed_tests` counts it.
     #[serde(rename = "diagnostic_fail")]
     DiagnosticFail,
+    /// A test that started and reported it could not run (dagrun
+    /// structured-result schema 5). It is not a pass or a failure:
+    /// `TestResultTotals::skipped_tests` counts it.
+    Skip,
 }
 
 /// One producer-owned terminal test row in the retained JSONL artifact.
@@ -1684,6 +1688,11 @@ pub struct TestResultTotals {
     /// without one keeps its existing bytes.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub diagnostic_failed_tests: u64,
+    /// Executed tests that reported at runtime they could not run (schema-5
+    /// `skip` rows); not in `passed_tests` or `failed_tests`. Omitted when
+    /// zero, so every artifact without one keeps its existing bytes.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skipped_tests: u64,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -1767,6 +1776,7 @@ struct RecomputedTestResultCounts {
     passed_tests: u64,
     failed_tests: u64,
     diagnostic_failed_tests: u64,
+    skipped_tests: u64,
 }
 
 impl RecomputedTestResultCounts {
@@ -1779,6 +1789,7 @@ impl RecomputedTestResultCounts {
             TestResultVerdict::Pass => &mut self.passed_tests,
             TestResultVerdict::Fail => &mut self.failed_tests,
             TestResultVerdict::DiagnosticFail => &mut self.diagnostic_failed_tests,
+            TestResultVerdict::Skip => &mut self.skipped_tests,
         };
         *count = count
             .checked_add(1)
@@ -1808,6 +1819,7 @@ fn checked_summary(summary: &TestResultTotals, row_count: u64) -> Result<(), Str
         .passed_tests
         .checked_add(summary.failed_tests)
         .and_then(|total| total.checked_add(summary.diagnostic_failed_tests))
+        .and_then(|total| total.checked_add(summary.skipped_tests))
         .ok_or_else(|| "test-results pass/fail total overflowed u64".to_string())?
         != summary.executed_tests
     {
@@ -1888,6 +1900,7 @@ impl TestResultsEvidenceV9 {
             failed_tests: 0,
             filtered_tests: 0,
             diagnostic_failed_tests: 0,
+            skipped_tests: 0,
         };
         let mut recorded_count = 0u64;
         let mut add = |summary: &TestResultTotals, row_count: u64| -> Result<(), String> {
@@ -1912,6 +1925,10 @@ impl TestResultsEvidenceV9 {
                 .diagnostic_failed_tests
                 .checked_add(summary.diagnostic_failed_tests)
                 .ok_or("schema 9 diagnostic_failed_tests overflowed u64")?;
+            totals.skipped_tests = totals
+                .skipped_tests
+                .checked_add(summary.skipped_tests)
+                .ok_or("schema 9 skipped_tests overflowed u64")?;
             recorded_count = recorded_count
                 .checked_add(row_count)
                 .ok_or("schema 9 recorded_count overflowed u64")?;
@@ -2126,6 +2143,7 @@ impl TestResultsEvidenceV9 {
             failed_tests: 0,
             filtered_tests: 0,
             diagnostic_failed_tests: 0,
+            skipped_tests: 0,
         };
         let mut add_verified = |counts: RecomputedTestResultCounts,
                                 filtered_tests: u64|
@@ -2136,6 +2154,7 @@ impl TestResultsEvidenceV9 {
                 failed_tests: counts.failed_tests,
                 filtered_tests,
                 diagnostic_failed_tests: counts.diagnostic_failed_tests,
+                skipped_tests: counts.skipped_tests,
             };
             verified_totals.executed_tests = verified_totals
                 .executed_tests
@@ -2157,6 +2176,10 @@ impl TestResultsEvidenceV9 {
                 .diagnostic_failed_tests
                 .checked_add(totals.diagnostic_failed_tests)
                 .ok_or("schema 9 verified diagnostic_failed_tests overflowed u64")?;
+            verified_totals.skipped_tests = verified_totals
+                .skipped_tests
+                .checked_add(totals.skipped_tests)
+                .ok_or("schema 9 verified skipped_tests overflowed u64")?;
             Ok(totals)
         };
 
@@ -2173,6 +2196,7 @@ impl TestResultsEvidenceV9 {
                 || recomputed.passed_tests != summary.totals.passed_tests
                 || recomputed.failed_tests != summary.totals.failed_tests
                 || recomputed.diagnostic_failed_tests != summary.totals.diagnostic_failed_tests
+                || recomputed.skipped_tests != summary.totals.skipped_tests
             {
                 return Err(format!(
                     "schema 9 test-results artifact totals differ for producer {}",
@@ -2201,6 +2225,7 @@ impl TestResultsEvidenceV9 {
                     || recomputed.passed_tests != summary.totals.passed_tests
                     || recomputed.failed_tests != summary.totals.failed_tests
                     || recomputed.diagnostic_failed_tests != summary.totals.diagnostic_failed_tests
+                    || recomputed.skipped_tests != summary.totals.skipped_tests
                 {
                     return Err(
                         "schema 9 test-results artifact totals differ for compatibility producer"

@@ -2350,6 +2350,7 @@ fn run_scorecard_owner_reexec_probe(
     summary.executed_tests = Some(0);
     summary.passed_tests = Some(0);
     summary.diagnostic_failed_tests = Some(0);
+    summary.skipped_tests = Some(0);
     // Record the write-back through the decision a full run makes. The probe
     // has no finalized ledger row, so a run that still owns its write-back
     // reaches the real projection and records that refusal before it touches
@@ -4079,6 +4080,7 @@ fn self_test() -> Result<(), String> {
     writeback_failed.executed_tests = Some(1);
     writeback_failed.passed_tests = Some(1);
     writeback_failed.diagnostic_failed_tests = Some(0);
+    writeback_failed.skipped_tests = Some(0);
     record_scorecard_writeback(
         &mut writeback_failed,
         Some(ScorecardWriteback::Failed {
@@ -4126,6 +4128,7 @@ fn self_test() -> Result<(), String> {
     writeback_delegated.executed_tests = Some(1);
     writeback_delegated.passed_tests = Some(1);
     writeback_delegated.diagnostic_failed_tests = Some(0);
+    writeback_delegated.skipped_tests = Some(0);
     record_scorecard_writeback(
         &mut writeback_delegated,
         Some(ScorecardWriteback::Delegated),
@@ -4168,6 +4171,7 @@ fn self_test() -> Result<(), String> {
     genuine_could_not_run.executed_tests = Some(0);
     genuine_could_not_run.passed_tests = Some(0);
     genuine_could_not_run.diagnostic_failed_tests = Some(0);
+    genuine_could_not_run.skipped_tests = Some(0);
     let could_not_run_path = writeback_result_dir.path().join("could-not-run.json");
     write_validation_service_result(&could_not_run_path, &genuine_could_not_run)?;
     let could_not_run = ValidationServiceResult::from_json_slice(
@@ -4195,6 +4199,7 @@ fn self_test() -> Result<(), String> {
     service_summary.executed_tests = Some(2129);
     service_summary.passed_tests = Some(2129);
     service_summary.diagnostic_failed_tests = Some(0);
+    service_summary.skipped_tests = Some(0);
     write_validation_service_result(&service_result_path, &service_summary)?;
     let service_result = ValidationServiceResult::from_json_slice(
         &std::fs::read(&service_result_path)
@@ -4241,6 +4246,7 @@ fn self_test() -> Result<(), String> {
     failed_summary.executed_tests = Some(2);
     failed_summary.passed_tests = Some(1);
     failed_summary.diagnostic_failed_tests = Some(0);
+    failed_summary.skipped_tests = Some(0);
     let failed_result_path = service_result_dir.path().join("failed.json");
     write_validation_service_result(&failed_result_path, &failed_summary)?;
     let failed_result = ValidationServiceResult::from_json_slice(
@@ -4262,6 +4268,7 @@ fn self_test() -> Result<(), String> {
     permissionless_summary.executed_tests = Some(1);
     permissionless_summary.passed_tests = Some(1);
     permissionless_summary.diagnostic_failed_tests = Some(0);
+    permissionless_summary.skipped_tests = Some(0);
     let permission_error = publish_validation_service_result_or_refuse(
         Some(permissionless_path),
         &mut permissionless_summary,
@@ -4405,16 +4412,18 @@ fn self_test() -> Result<(), String> {
 
     service_summary.passed_tests = Some(2128);
     service_summary.diagnostic_failed_tests = Some(0);
+    service_summary.skipped_tests = Some(0);
     let mismatch_path = service_result_dir.path().join("mismatch.json");
     let mismatch_error = write_validation_service_result(&mismatch_path, &service_summary)
         .expect_err("a successful service result must reject a mismatched passed count");
-    if !mismatch_error.contains("passed_tests + diagnostic_failed_tests == executed_tests") {
+    if !mismatch_error.contains("passed_tests + diagnostic_failed_tests + skipped_tests == executed_tests") {
         return Err(format!(
             "summary: service result did not refuse a mismatched passed count: {mismatch_error}"
         ));
     }
     service_summary.passed_tests = Some(2129);
     service_summary.diagnostic_failed_tests = Some(0);
+    service_summary.skipped_tests = Some(0);
     // A passing run with producer-declared diagnostics and bounded retries
     // publishes them explicitly: 42 executed = 35 passed + 7 diagnostics,
     // with one test that failed and then passed on its granted retry. The
@@ -4424,6 +4433,7 @@ fn self_test() -> Result<(), String> {
     diagnostic_summary.executed_tests = Some(42);
     diagnostic_summary.passed_tests = Some(35);
     diagnostic_summary.diagnostic_failed_tests = Some(7);
+    diagnostic_summary.skipped_tests = Some(0);
     diagnostic_summary.retry_occurrences = 1;
     diagnostic_summary.flaky = vec![TestIdRetry {
         node: "e2e.deadline".into(),
@@ -23937,6 +23947,41 @@ fn exact_diagnostic_test_count(outcomes: &[StepOutcome]) -> Option<i64> {
     seen.then(|| i64::try_from(diagnostic).ok()).flatten()
 }
 
+/// Exact count of runtime skips (schema-5 `skip` rows), with the same
+/// unknown rules as [`exact_diagnostic_test_count`].
+fn exact_skipped_test_count(outcomes: &[StepOutcome]) -> Option<i64> {
+    let mut seen = false;
+    let mut skipped = 0u64;
+    for outcome in outcomes {
+        let count_bearing = outcome.executed_tests.is_some()
+            || outcome.filtered_tests.is_some()
+            || outcome.test_results.is_some();
+        if !count_bearing {
+            continue;
+        }
+        seen = true;
+        let executed = outcome.executed_tests?;
+        let outcome_skipped = match &outcome.test_results {
+            Some(results) => {
+                if u64::try_from(results.len()).ok()? != executed {
+                    return None;
+                }
+                u64::try_from(
+                    results
+                        .iter()
+                        .filter(|result| result.is_skipped())
+                        .count(),
+                )
+                .ok()?
+            }
+            None if executed == 0 || outcome.ok => 0,
+            None => return None,
+        };
+        skipped = skipped.checked_add(outcome_skipped)?;
+    }
+    seen.then(|| i64::try_from(skipped).ok()).flatten()
+}
+
 /// The run's test counts, derived in one place so run() cannot count from a
 /// different set of outcomes than the self-tests check. An unknown count stays
 /// `None`: whether a count qualifies a receipt is the qualifying-receipt
@@ -23945,6 +23990,7 @@ struct RunCounts {
     executed_tests: Option<i64>,
     passed_tests: Option<i64>,
     diagnostic_failed_tests: Option<i64>,
+    skipped_tests: Option<i64>,
     filtered_tests: Option<i64>,
     compatibility_count_error: Option<String>,
 }
@@ -23967,6 +24013,7 @@ fn derive_run_counts(
         executed_tests,
         passed_tests,
         diagnostic_failed_tests: exact_diagnostic_test_count(outcomes),
+        skipped_tests: exact_skipped_test_count(outcomes),
         filtered_tests,
         compatibility_count_error,
     }
@@ -27150,6 +27197,9 @@ struct RunSummary {
     /// Exact producer-declared non-blocking diagnostic failures from those
     /// same outcomes. Counted apart: never a pass, never dropped.
     diagnostic_failed_tests: Option<i64>,
+    /// Exact runtime skips from those same outcomes. Counted apart:
+    /// never a pass, never a failure, never dropped.
+    skipped_tests: Option<i64>,
     /// Individual test ids that failed and then passed, with the retry grants
     /// that followed their failed attempts. Rendered even on a green run.
     flaky: Vec<TestIdRetry>,
@@ -27216,6 +27266,7 @@ impl RunSummary {
             executed_tests: None,
             passed_tests: None,
             diagnostic_failed_tests: None,
+            skipped_tests: None,
             flaky: Vec::new(),
             failed_ids: Vec::new(),
             test_cases: Vec::new(),
@@ -27292,6 +27343,7 @@ fn cache_hit_run_summary(
         // A cached exact pass count already required executed == passed,
         // so its diagnostic count is exactly zero.
         summary.diagnostic_failed_tests = Some(0);
+        summary.skipped_tests = Some(0);
     }
     Ok(summary)
 }
@@ -28075,6 +28127,7 @@ fn write_validation_service_result(path: &Path, summary: &RunSummary) -> Result<
         executed_tests: summary.executed_tests,
         passed_tests: summary.passed_tests,
         diagnostic_failed_tests: summary.diagnostic_failed_tests,
+        skipped_tests: summary.skipped_tests,
         scorecard_writeback: summary.scorecard_writeback.clone(),
         composition: None,
         test_cases: (!summary.test_cases.is_empty()).then(|| summary.test_cases.clone()),
@@ -30702,6 +30755,7 @@ fn run(
     let executed_tests = run_counts.executed_tests;
     let passed_tests = run_counts.passed_tests;
     let diagnostic_failed_tests = run_counts.diagnostic_failed_tests;
+    let skipped_tests = run_counts.skipped_tests;
     let filtered_tests = run_counts.filtered_tests;
     let compatibility_count_error = run_counts.compatibility_count_error.clone();
     if let Some(error) = &compatibility_count_error {
@@ -31015,6 +31069,7 @@ fn run(
         s.executed_tests = executed_tests;
         s.passed_tests = passed_tests;
         s.diagnostic_failed_tests = diagnostic_failed_tests;
+        s.skipped_tests = skipped_tests;
         s.selection_mode = Some(plan.selection_mode.into());
         s.wall_s = Some(wall);
         s.jobs = Some(jobs);
@@ -31621,6 +31676,7 @@ fn run(
     s.executed_tests = executed_tests;
     s.passed_tests = passed_tests;
     s.diagnostic_failed_tests = diagnostic_failed_tests;
+    s.skipped_tests = skipped_tests;
     s.selection_mode = Some(plan.selection_mode.into());
     s.wall_s = Some(wall);
     s.jobs = Some(jobs);
@@ -34465,12 +34521,13 @@ mod final_validate_status_tests {
         refused.executed_tests = Some(0);
         refused.passed_tests = Some(0);
         refused.diagnostic_failed_tests = Some(0);
+        refused.skipped_tests = Some(0);
         let refused_path = temp.path().join("refused.json");
         write_validation_service_result(&refused_path, &refused).unwrap();
         let refused_result =
             ValidationServiceResult::from_json_slice(&std::fs::read(&refused_path).unwrap())
                 .unwrap();
-        // Detail arrived in schema 5; the current schema is 7.
+        // Detail arrived in schema 5; the current schema is 8.
         assert_eq!(
             refused_result.schema_version,
             hermit_manifest_plan::service_result::SCHEMA_VERSION
@@ -34493,6 +34550,7 @@ mod final_validate_status_tests {
         failed.executed_tests = Some(2);
         failed.passed_tests = Some(1);
         failed.diagnostic_failed_tests = Some(0);
+        failed.skipped_tests = Some(0);
         let failed_path = temp.path().join("failed.json");
         write_validation_service_result(&failed_path, &failed).unwrap();
         let failed_result =
@@ -34511,6 +34569,7 @@ mod final_validate_status_tests {
         passed.executed_tests = Some(2);
         passed.passed_tests = Some(2);
         passed.diagnostic_failed_tests = Some(0);
+        passed.skipped_tests = Some(0);
         let passed_path = temp.path().join("passed.json");
         write_validation_service_result(&passed_path, &passed).unwrap();
         let passed_result =

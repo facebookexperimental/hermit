@@ -227,6 +227,7 @@ fn ordinary_fixture_with_path(
         failed_tests: 0,
         filtered_tests: 0,
         diagnostic_failed_tests: 0,
+        skipped_tests: 0,
     };
     let tests = TestResultsEvidenceV9 {
         path,

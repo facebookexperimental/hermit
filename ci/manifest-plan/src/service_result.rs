@@ -15,12 +15,19 @@ pub const DETAIL_SCHEMA_VERSION: u64 = 5;
 /// write-back variant, so a run whose publication belongs to the launcher says
 /// so explicitly instead of writing an ambiguous null.
 pub const DIAGNOSTIC_COUNTS_SCHEMA_VERSION: u64 = 7;
+/// Schema 8 adds `skipped_tests`: executed tests their producer reported
+/// at runtime could not run (dagrun structured-result schema 5 `skip`
+/// rows). They are neither passes nor failures, so a passing schema-8
+/// result must account for them explicitly:
+/// `passed + diagnostic + skipped == executed`. Schemas before 8 cannot
+/// carry the field.
+pub const SKIPPED_COUNTS_SCHEMA_VERSION: u64 = 8;
 /// Schema 7 adds `diagnostic_failed_tests`: executed tests their producer
 /// declared non-blocking diagnostics (schema-4 `diagnostic_fail` rows). They
 /// are neither passes nor blocking failures, so a passing result must account
 /// for them explicitly: `passed + diagnostic == executed`. Schemas before 7
 /// cannot carry the field and keep the exact `passed == executed` rule.
-pub const SCHEMA_VERSION: u64 = 7;
+pub const SCHEMA_VERSION: u64 = 8;
 pub const HISTORICAL_FIELD_NAMES: [&str; 7] = [
     "schema_version",
     "commit",
@@ -88,6 +95,21 @@ pub const DIAGNOSTIC_COUNTS_FIELD_NAMES: [&str; 12] = [
     "executed_tests",
     "passed_tests",
     "diagnostic_failed_tests",
+    "scorecard_writeback",
+];
+pub const SKIPPED_COUNTS_FIELD_NAMES: [&str; 13] = [
+    "schema_version",
+    "commit",
+    "profile",
+    "selection_mode",
+    "final_validate_status",
+    "detail",
+    "exit_code",
+    "executed_nodes",
+    "executed_tests",
+    "passed_tests",
+    "diagnostic_failed_tests",
+    "skipped_tests",
     "scorecard_writeback",
 ];
 
@@ -255,6 +277,11 @@ pub struct ValidationServiceResult {
     /// with an executed count is malformed, not zero.
     #[serde(default)]
     pub diagnostic_failed_tests: Option<i64>,
+    /// Executed tests counted apart as runtime skips. Schema 8 and later
+    /// only; absence on a schema-8 result with an executed count is
+    /// malformed, not zero.
+    #[serde(default)]
+    pub skipped_tests: Option<i64>,
     /// Kept separate from `final_validate_status`: a write-back failure must
     /// make the command fail loudly without rewriting a real tree verdict.
     #[serde(default)]
@@ -296,6 +323,7 @@ impl ValidationServiceResult {
             TEST_COUNTS_SCHEMA_VERSION => TEST_COUNTS_FIELD_NAMES.into_iter().collect(),
             DETAIL_SCHEMA_VERSION => FIELD_NAMES.into_iter().collect(),
             DIAGNOSTIC_COUNTS_SCHEMA_VERSION => DIAGNOSTIC_COUNTS_FIELD_NAMES.into_iter().collect(),
+            SKIPPED_COUNTS_SCHEMA_VERSION => SKIPPED_COUNTS_FIELD_NAMES.into_iter().collect(),
             other => {
                 return Err(format!(
                     "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, {DETAIL_SCHEMA_VERSION}, {DIAGNOSTIC_COUNTS_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {other}"
@@ -363,12 +391,13 @@ impl ValidationServiceResult {
             SELECTION_SCHEMA_VERSION,
             TEST_COUNTS_SCHEMA_VERSION,
             DETAIL_SCHEMA_VERSION,
+            DIAGNOSTIC_COUNTS_SCHEMA_VERSION,
             SCHEMA_VERSION,
         ]
         .contains(&self.schema_version)
         {
             return Err(format!(
-                "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, {DETAIL_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {}",
+                "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, {DETAIL_SCHEMA_VERSION}, {DIAGNOSTIC_COUNTS_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {}",
                 self.schema_version
             ));
         }
@@ -542,6 +571,37 @@ impl ValidationServiceResult {
                 ));
             }
         }
+        if self.schema_version < SKIPPED_COUNTS_SCHEMA_VERSION && self.skipped_tests.is_some() {
+            return Err(format!(
+                "validation-service-result-historical-fields: schema {} cannot carry skipped_tests",
+                self.schema_version
+            ));
+        }
+        if self.schema_version >= SKIPPED_COUNTS_SCHEMA_VERSION
+            && self.executed_tests.is_some()
+            && self.skipped_tests.is_none()
+        {
+            return Err(
+                "validation-service-result-skipped_tests: current result with executed_tests requires an exact count"
+                    .to_string(),
+            );
+        }
+        if self.skipped_tests.is_some_and(|count| count < 0) {
+            return Err(
+                "validation-service-result-skipped_tests: must be nonnegative or null".to_string(),
+            );
+        }
+        if let Some(skipped) = self.skipped_tests {
+            let executed = self.executed_tests.ok_or_else(|| {
+                "validation-service-result-skipped_tests: cannot be present when executed_tests is null"
+                    .to_string()
+            })?;
+            if skipped > executed {
+                return Err(format!(
+                    "validation-service-result-skipped_tests: {skipped} exceeds executed_tests {executed}"
+                ));
+            }
+        }
         // An unknown count does not stop a PASSED result from being reported:
         // whether a run's counts qualify it as landing evidence is ci-hub's
         // qualifying-receipt predicate's decision (profile full, at least one
@@ -556,15 +616,26 @@ impl ValidationServiceResult {
             self.passed_tests,
             self.executed_tests,
         ) {
-            match self.diagnostic_failed_tests {
-                Some(diagnostic) => {
+            match (self.diagnostic_failed_tests, self.skipped_tests) {
+                (Some(diagnostic), Some(skipped)) => {
+                    if passed
+                        .checked_add(diagnostic)
+                        .and_then(|total| total.checked_add(skipped))
+                        != Some(executed)
+                    {
+                        return Err(format!(
+                            "validation-service-result-passed_tests: current PASSED result requires passed_tests + diagnostic_failed_tests + skipped_tests == executed_tests, got {passed} + {diagnostic} + {skipped} != {executed}"
+                        ));
+                    }
+                }
+                (Some(diagnostic), None) => {
                     if passed.checked_add(diagnostic) != Some(executed) {
                         return Err(format!(
                             "validation-service-result-passed_tests: current PASSED result requires passed_tests + diagnostic_failed_tests == executed_tests, got {passed} + {diagnostic} != {executed}"
                         ));
                     }
                 }
-                None => {
+                (None, _) => {
                     if passed != executed {
                         return Err(format!(
                             "validation-service-result-passed_tests: current PASSED result requires passed_tests == executed_tests, got {passed} != {executed}"
@@ -594,6 +665,7 @@ mod tests {
             executed_tests: Some(2129),
             passed_tests: Some(2129),
             diagnostic_failed_tests: Some(0),
+            skipped_tests: Some(0),
             scorecard_writeback: None,
             composition: None,
             test_cases: None,
@@ -614,19 +686,17 @@ mod tests {
         // A diagnostic counted as a pass leaves the sum over-executed.
         result.passed_tests = Some(42);
         assert!(
-            result
-                .validate()
-                .unwrap_err()
-                .contains("passed_tests + diagnostic_failed_tests == executed_tests")
+            result.validate().unwrap_err().contains(
+                "passed_tests + diagnostic_failed_tests + skipped_tests == executed_tests"
+            )
         );
 
         // An unlisted failure leaves the sum short.
         result.passed_tests = Some(34);
         assert!(
-            result
-                .validate()
-                .unwrap_err()
-                .contains("passed_tests + diagnostic_failed_tests == executed_tests")
+            result.validate().unwrap_err().contains(
+                "passed_tests + diagnostic_failed_tests + skipped_tests == executed_tests"
+            )
         );
 
         // Diagnostics are never silently dropped on a current result.
@@ -644,6 +714,44 @@ mod tests {
                 .validate()
                 .unwrap_err()
                 .contains("cannot carry diagnostic_failed_tests")
+        );
+    }
+
+    #[test]
+    fn passing_result_accounts_for_runtime_skips_explicitly() {
+        // 42 executed = 35 passed + 5 diagnostics + 2 runtime skips.
+        let mut result = valid();
+        result.executed_tests = Some(42);
+        result.passed_tests = Some(35);
+        result.diagnostic_failed_tests = Some(5);
+        result.skipped_tests = Some(2);
+        result.validate().unwrap();
+
+        // A skip counted as a pass or as a failure leaves the sum wrong.
+        result.passed_tests = Some(37);
+        assert!(
+            result.validate().unwrap_err().contains(
+                "passed_tests + diagnostic_failed_tests + skipped_tests == executed_tests"
+            )
+        );
+        result.passed_tests = Some(35);
+
+        // Skips are never silently dropped on a schema-8 result.
+        result.skipped_tests = None;
+        assert!(
+            result.validate().unwrap_err().contains(
+                "skipped_tests: current result with executed_tests requires an exact count"
+            )
+        );
+
+        // Schemas before 8 cannot carry the field at all.
+        result.schema_version = DIAGNOSTIC_COUNTS_SCHEMA_VERSION;
+        result.skipped_tests = Some(2);
+        assert!(
+            result
+                .validate()
+                .unwrap_err()
+                .contains("cannot carry skipped_tests")
         );
     }
 
@@ -741,6 +849,7 @@ mod tests {
                 executed_tests: None,
                 passed_tests: None,
                 diagnostic_failed_tests: None,
+                skipped_tests: None,
                 scorecard_writeback: None,
                 composition: None,
                 test_cases: None,
@@ -767,6 +876,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("diagnostic_failed_tests");
+        value.as_object_mut().unwrap().remove("skipped_tests");
         value.as_object_mut().unwrap().remove("scorecard_writeback");
         let decoded =
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
@@ -791,6 +901,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("diagnostic_failed_tests");
+        value.as_object_mut().unwrap().remove("skipped_tests");
         let decoded =
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(decoded.schema_version, WRITEBACK_SCHEMA_VERSION);
@@ -805,6 +916,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("diagnostic_failed_tests");
+        value.as_object_mut().unwrap().remove("skipped_tests");
         let decoded =
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(decoded.schema_version, SELECTION_SCHEMA_VERSION);
@@ -817,6 +929,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("diagnostic_failed_tests");
+        value.as_object_mut().unwrap().remove("skipped_tests");
         let decoded =
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(decoded.schema_version, TEST_COUNTS_SCHEMA_VERSION);
@@ -835,6 +948,7 @@ mod tests {
                 .as_object_mut()
                 .unwrap()
                 .remove("diagnostic_failed_tests");
+            value.as_object_mut().unwrap().remove("skipped_tests");
             if writeback["status"] == "failed" {
                 value["exit_code"] = Value::from(75);
             }
@@ -855,6 +969,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("diagnostic_failed_tests");
+        value.as_object_mut().unwrap().remove("skipped_tests");
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
@@ -896,6 +1011,7 @@ mod tests {
                 other.executed_tests = None;
                 other.passed_tests = None;
                 other.diagnostic_failed_tests = None;
+                other.skipped_tests = None;
             } else {
                 other.passed_tests = Some(2128);
             }
@@ -929,6 +1045,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("diagnostic_failed_tests");
+        value.as_object_mut().unwrap().remove("skipped_tests");
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
@@ -954,7 +1071,7 @@ mod tests {
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
-                .contains("schema 7 expected")
+                .contains("schema 8 expected")
         );
     }
 
@@ -965,7 +1082,7 @@ mod tests {
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
-                .contains("schema 7 expected")
+                .contains("schema 8 expected")
         );
     }
 
@@ -976,7 +1093,7 @@ mod tests {
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
-                .contains("schema 7 expected")
+                .contains("schema 8 expected")
         );
     }
 
@@ -987,7 +1104,7 @@ mod tests {
         let error =
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&missing).unwrap())
                 .unwrap_err();
-        assert!(error.contains("schema 7 expected"), "{error}");
+        assert!(error.contains("schema 8 expected"), "{error}");
 
         for status in [FinalValidateStatus::Passed, FinalValidateStatus::Failed] {
             let mut result = valid();
@@ -1007,6 +1124,7 @@ mod tests {
         no_result.executed_tests = None;
         no_result.passed_tests = None;
         no_result.diagnostic_failed_tests = None;
+        no_result.skipped_tests = None;
         no_result.detail = None;
         no_result.validate().expect("genuine absence stays null");
         no_result.detail = Some(vec![]);
@@ -1070,12 +1188,9 @@ mod tests {
 
         let mut lower = valid();
         lower.passed_tests = Some(2128);
-        assert!(
-            lower
-                .validate()
-                .unwrap_err()
-                .contains("requires passed_tests + diagnostic_failed_tests == executed_tests")
-        );
+        assert!(lower.validate().unwrap_err().contains(
+            "requires passed_tests + diagnostic_failed_tests + skipped_tests == executed_tests"
+        ));
 
         let mut greater = valid();
         greater.passed_tests = Some(2130);
@@ -1102,6 +1217,7 @@ mod tests {
         unknown.executed_tests = None;
         unknown.passed_tests = None;
         unknown.diagnostic_failed_tests = None;
+        unknown.skipped_tests = None;
         unknown.validate().unwrap();
     }
 
@@ -1128,6 +1244,7 @@ mod tests {
         no_result.executed_tests = None;
         no_result.passed_tests = None;
         no_result.diagnostic_failed_tests = None;
+        no_result.skipped_tests = None;
         no_result.validate().unwrap();
     }
 
@@ -1141,7 +1258,7 @@ mod tests {
             .iter()
             .map(|value| value.as_str().unwrap())
             .collect();
-        assert_eq!(fields, DIAGNOSTIC_COUNTS_FIELD_NAMES);
+        assert_eq!(fields, SKIPPED_COUNTS_FIELD_NAMES);
         assert_eq!(schema["schema_version"], SCHEMA_VERSION);
         let outcomes = schema["outcomes"].as_object().unwrap();
         let declared: BTreeSet<&str> = outcomes.keys().map(String::as_str).collect();
