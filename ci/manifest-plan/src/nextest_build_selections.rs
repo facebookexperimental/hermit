@@ -994,7 +994,9 @@ mod tests {
             // The split retains seven package-identity cases in
             // version_provenance and transfers the copied-child TTY case to
             // its DynamoRIO owner: 713 + 7 - 1 = 719.
-            assert_eq!(population, 719);
+            // PR 4630's three fatal-core cases grow shard 2: 719 + 3 = 722,
+            // measured by the batch3 donor validate at f7ec284e.
+            assert_eq!(population, 722);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
