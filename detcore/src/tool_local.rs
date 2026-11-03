@@ -9420,10 +9420,16 @@ impl<T> ThreadState<T> {
                     // schedule replay draws none: its slices end where the
                     // record says, and the drawn ends would only add PMU
                     // check-ins. A per-run timeslice (`--chaos-timeslice-draw=run`,
-                    // or one a replayed record states) replaces the draw too.
+                    // or one a replayed record states) replaces the draw too,
+                    // and so does the post-crash switch: a switched process's
+                    // slices are drawn around its post-crash bound
+                    // (`after_post_crash`), the coarse scale the switch is for,
+                    // never from the range again.
                     let target_timeout_rcbs = match cfg.chaos_timeslice_range {
                         Some(range)
-                            if !replay_controls_deadline && cfg.chaos_timeslice.is_none() =>
+                            if !replay_controls_deadline
+                                && cfg.chaos_timeslice.is_none()
+                                && self.post_crash_bound.is_none() =>
                         {
                             range.log_uniform(self.chaos_prng.random::<f64>()) / nanos_per_rcb
                         }
@@ -11421,6 +11427,54 @@ mod timeslice_tests {
             assert_eq!(with.max_timeslice_end, without.max_timeslice_end);
         }
         assert!(with.chaos_prng == without.chaos_prng);
+    }
+
+    /// Once its process has switched to the post-crash bound, a thread draws
+    /// no slice mean from `--chaos-timeslice-range`: its deadlines and
+    /// generator state are those of the same switched thread without a range,
+    /// drawn around the post-crash bound, where before the range replaced
+    /// that mean with a fresh fine-grained draw at every slice. Before the
+    /// switch the range draws as usual. A schedule replay of such a run
+    /// draws nothing either way (`replay_controls_deadline`).
+    #[test]
+    fn a_switched_thread_draws_no_slice_mean_from_the_chaos_timeslice_range() {
+        let plain = Config {
+            chaos: true,
+            max_timeslice: nz(2_000),
+            post_crash_timeslice: nz(200_000_000),
+            ..Default::default()
+        };
+        let ranged = Config {
+            chaos_timeslice_range: Some("1000..2000".parse().unwrap()),
+            ..plain.clone()
+        };
+        let mut without = ThreadState::new(DetPid::from_raw(1), &plain, ());
+        let mut with = ThreadState::new(DetPid::from_raw(1), &ranged, ());
+        without.next_timeslice(&plain);
+        with.next_timeslice(&ranged);
+        assert!(
+            with.chaos_prng != without.chaos_prng,
+            "before the switch the range draws"
+        );
+        let mut without = ThreadState::new(DetPid::from_raw(1), &plain, ());
+        let mut with = ThreadState::new(DetPid::from_raw(1), &ranged, ());
+        let bound = std::num::NonZeroU64::new(200_000_000);
+        without.post_crash_bound = bound;
+        with.post_crash_bound = bound;
+        let now = with.thread_logical_time.as_nanos();
+        let mut longest = 0;
+        for _ in 0..16 {
+            without.next_timeslice(&plain);
+            with.next_timeslice(&ranged);
+            assert_eq!(with.end_of_timeslice, without.end_of_timeslice);
+            assert_eq!(with.max_timeslice_end, without.max_timeslice_end);
+            longest = longest.max((with.end_of_timeslice.unwrap() - now).as_nanos());
+        }
+        assert!(with.chaos_prng == without.chaos_prng);
+        assert!(
+            longest > 2_000,
+            "slices are drawn around the post-crash bound"
+        );
     }
 
     #[test]
