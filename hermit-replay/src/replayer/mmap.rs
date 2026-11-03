@@ -28,7 +28,9 @@
 //! the file as a real `MAP_SHARED` view of that file at the recorded offset.
 //! Overlapping, adjacent, split, shrunk and moved mappings then share exactly
 //! the pages Linux shares, because the kernel keeps them as mappings of one
-//! file.
+//! file. A mapping of `/dev/zero` is recorded as a mapping of the new shmem
+//! object Linux made for it, so it gets a backing of its own, which its
+//! copies in forked children and a mapping of the object's own file share.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -1541,8 +1543,10 @@ fn plan_refill(
                 Some((File::from(backing.file.try_clone()?), offset))
             } else {
                 // The recorder conservatively includes anonymous shmem if its
-                // device probe failed. These mappings already run live during
-                // replay and retain the existing guest-memory refill route.
+                // device probe failed. MAP_SHARED | MAP_ANONYMOUS mappings run
+                // live during replay and retain the existing guest-memory
+                // refill route; a /dev/zero mapping is a view of an owned
+                // backing in replay and is matched above.
                 let anonymous_name = path == "/dev/zero (deleted)" || path.starts_with("/SYSV");
                 if !anonymous_name {
                     return Err(io::Error::other(

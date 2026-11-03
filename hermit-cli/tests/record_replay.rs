@@ -6005,6 +6005,129 @@ fn record_replay_shares_a_file_a_forked_child_maps_again() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// Two `MAP_SHARED` mappings of one `/dev/zero` descriptor share nothing:
+/// Linux gives each a new shmem object of its own (`mmap_zero` calls
+/// `shmem_zero_setup`). Replay used to key every shared mapping by the
+/// descriptor's device and inode, so both mappings were views of one backing
+/// and a store through the first was read through the second.
+#[test]
+fn record_replay_keeps_two_dev_zero_mappings_apart() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "dev-zero",
+        "dev-zero: second sees zeros\ndev-zero: first sees first\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A forked child's copy of a `MAP_SHARED` mapping of `/dev/zero` is the
+/// same shmem object, so the parent reads the child's store through its own
+/// mapping, while a mapping the child makes of the descriptor again is a new
+/// object, zero-filled.
+#[test]
+fn record_replay_shares_a_dev_zero_mapping_with_a_forked_childs_copy() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "dev-zero-fork",
+        "dev-zero-fork: child's copy sees parent\n\
+         dev-zero-fork: child's new mapping sees zeros\n\
+         dev-zero-fork: parent sees child\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The total size of the files beneath `dir`.
+fn tree_size(dir: &Path) -> u64 {
+    fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+        .map(|entry| {
+            let entry = entry.expect("read a directory entry");
+            let metadata = entry.metadata().expect("stat a recording file");
+            if metadata.is_dir() {
+                tree_size(&entry.path())
+            } else {
+                metadata.len()
+            }
+        })
+        .sum()
+}
+
+/// Recording reads no byte of a new `MAP_SHARED` mapping of `/dev/zero`: the
+/// new shmem object holds zeros, as replay's new backing does, and reading it
+/// through `/proc/<pid>/mem` would fault in every page of the guest's
+/// mapping during the recorded run. The guest cannot see that residency
+/// under Hermit (Detcore reports every page resident to `mincore` and no
+/// faults to `getrusage`), but the recording would carry the bytes it read:
+/// the recording of a guest with a 32 MiB mapping (some 5 MiB, most of it the
+/// bytes of the loader's and libc's file mappings) stays below 32 MiB only
+/// when none of that mapping's bytes are read.
+#[test]
+fn record_replay_reads_no_byte_of_a_new_dev_zero_mapping() {
+    let _guard = hermit_record_lock();
+    let data = tempfile::tempdir().expect("create a recording directory");
+    let expected = b"dev-zero-large: first page sees zeros, last byte 0\n";
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=off",
+            "record",
+            "start",
+            "--record-timeout=30",
+            "--data-dir",
+        ])
+        .arg(data.path())
+        .arg("--")
+        .arg(&workload("c_record_replay_shared_mappings").path)
+        .arg("dev-zero-large");
+    let recorded = command_output(record, "large /dev/zero mapping recording");
+    assert_eq!(recorded.stdout, expected);
+    let size = tree_size(data.path());
+    assert!(
+        size < 32 << 20,
+        "the recording holds {size} bytes: it read the new mapping's pages"
+    );
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "replay", "--autopilot", "--data-dir"])
+        .arg(data.path());
+    let replayed = command_output(replay, "large /dev/zero mapping replay");
+    assert_eq!(replayed.stdout, expected);
+}
+
+/// A `MAP_SHARED` mapping of `/dev/zero` at a nonzero offset is a shmem
+/// object as long as the mapping, whose pages past that length fault SIGBUS,
+/// which no replay mapping reproduces. The guest records as it runs natively,
+/// and the recording is one replay refuses by name, before it starts the
+/// guest.
+#[test]
+fn record_replay_refuses_a_dev_zero_mapping_at_an_offset() {
+    let _guard = hermit_record_lock();
+    let (failures, stderrs) = record_replay_output_failures_with(
+        "shared-mappings-dev-zero-offset",
+        &workload("c_record_replay_shared_mappings").path,
+        &["dev-zero-offset"],
+        &|_| {},
+        &[],
+        "dev-zero-offset: first page sees zeros\n",
+    );
+    assert_eq!(failures.len(), 1, "{}", failures.join("\n"));
+    assert!(
+        failures[0].starts_with("shared-mappings-dev-zero-offset replay"),
+        "{}",
+        failures[0]
+    );
+    let stderr = stderrs.last().expect("the replay's stderr");
+    assert!(
+        stderr.contains("This recording cannot be replayed faithfully")
+            && stderr.contains("of /dev/zero (at offset 4096"),
+        "{stderr}"
+    );
+}
+
 /// A guest whose descriptor table is full at its soft limit still replays its
 /// shared mappings. Hermit runs with a soft limit of 256 descriptors, which
 /// the guest inherits and fills; Detcore's virtual limit leaves that kernel

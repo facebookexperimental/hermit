@@ -400,7 +400,11 @@ pub struct MmapEvent {
 }
 /// The file a `MAP_SHARED` mapping maps, by its identity during recording,
 /// the mapping's offset in it, and the access mode of the descriptor it was
-/// mapped through.
+/// mapped through. For a mapping of `/dev/zero` the file is the new shmem
+/// object Linux made for that mapping (`shmem_zero_setup`), as
+/// `/proc/<tid>/maps` names it, so no other mapping shares it but the
+/// mapping's copies in forked children and a mapping of that object's own
+/// file (`/proc/<pid>/map_files`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedMapping {
     /// `st_dev` of the mapped file.

@@ -65,6 +65,19 @@
  *         record/replay test rewrites the recorded address of the memfd
  *         mapping to one of them: replay must place the mapping in the free
  *         hole, and refuse by name over the occupant.
+ *   dev-zero: maps one /dev/zero descriptor twice, with MAP_SHARED and
+ *         with MAP_SHARED_VALIDATE. Linux gives each shared mapping of
+ *         /dev/zero a new shmem object of its own, so neither mapping sees
+ *         the other's stores.
+ *   dev-zero-fork: maps /dev/zero once, then a forked child, whose copy of
+ *         the mapping is the same object, writes through it and maps the
+ *         descriptor again; the parent sees the write through its mapping,
+ *         and the child's new mapping is zero-filled.
+ *   dev-zero-offset: maps two pages of /dev/zero at an offset of one page
+ *         and reads the first. The shmem object is as long as the mapping,
+ *         so the second page, past its end, would fault SIGBUS.
+ *   dev-zero-large: maps 32 MiB of /dev/zero and reads its first page and
+ *         its last byte, leaving the rest of the new object unfaulted.
  *
  * Usage: record_replay_shared_mappings <mode>
  * Prints one line per check and exits 0 only if every check saw what Linux
@@ -444,6 +457,62 @@ static void placement(const char* mode, int flags) {
   printf("%s: mapping reads %lx\n", mode, sum);
 }
 
+static int open_dev_zero(void) {
+  int fd = open("/dev/zero", O_RDWR | O_CLOEXEC);
+  check(fd >= 0, "open /dev/zero");
+  return fd;
+}
+
+static const char* zero_or_not(const char* view) {
+  return view[0] == 0 ? "zeros" : "another mapping's bytes";
+}
+
+static void dev_zero(void) {
+  int fd = open_dev_zero();
+  char* first = map_pages(fd, 0, 1);
+  char* second = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED_VALIDATE, fd, 0);
+  check(second != MAP_FAILED, "mmap MAP_SHARED_VALIDATE");
+  memcpy(first, "first", 6);
+  printf("dev-zero: second sees %s\n", zero_or_not(second));
+  memcpy(second, "second", 7);
+  printf("dev-zero: first sees %s\n", first);
+}
+
+static void dev_zero_fork(void) {
+  int fd = open_dev_zero();
+  char* inherited = map_pages(fd, 0, 1);
+  memcpy(inherited, "parent", 7);
+  pid_t child = fork();
+  check(child >= 0, "fork");
+  if (child == 0) {
+    printf("dev-zero-fork: child's copy sees %s\n", inherited);
+    memcpy(inherited, "child", 6);
+    char* own = map_pages(fd, 0, 1);
+    printf("dev-zero-fork: child's new mapping sees %s\n", zero_or_not(own));
+    memcpy(own, "unseen", 7);
+    _exit(failures == 0 ? 0 : 1);
+  }
+  int status = 0;
+  check(waitpid(child, &status, 0) == child, "waitpid");
+  check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "child status");
+  printf("dev-zero-fork: parent sees %s\n", inherited);
+}
+
+static void dev_zero_offset(void) {
+  int fd = open_dev_zero();
+  char* view = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, page);
+  check(view != MAP_FAILED, "mmap at an offset");
+  printf("dev-zero-offset: first page sees %s\n", zero_or_not(view));
+}
+
+static void dev_zero_large(void) {
+  const size_t len = 32 << 20;
+  int fd = open_dev_zero();
+  char* view = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  check(view != MAP_FAILED, "mmap 32 MiB");
+  printf("dev-zero-large: first page sees %s, last byte %d\n", zero_or_not(view), view[len - 1]);
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   page = sysconf(_SC_PAGESIZE);
@@ -490,6 +559,14 @@ int main(int argc, char** argv) {
     placement(mode, MAP_SHARED_VALIDATE);
   } else if (strcmp(mode, "placement-private") == 0) {
     placement(mode, MAP_PRIVATE);
+  } else if (strcmp(mode, "dev-zero") == 0) {
+    dev_zero();
+  } else if (strcmp(mode, "dev-zero-fork") == 0) {
+    dev_zero_fork();
+  } else if (strcmp(mode, "dev-zero-offset") == 0) {
+    dev_zero_offset();
+  } else if (strcmp(mode, "dev-zero-large") == 0) {
+    dev_zero_large();
   } else {
     fprintf(stderr, "unknown mode %s\n", mode);
     return 2;
