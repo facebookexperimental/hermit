@@ -748,6 +748,15 @@ pub struct BlockedPool {
     /// kernel's copy reached a running parent), which the quiescence wait
     /// absorbs and a bound counted from it would not, so such a thread has no
     /// entry and waits for quiescence alone, as before.
+    ///
+    /// Backend parity (a known limitation): only a backend whose capabilities
+    /// report child-exit publication fences a copy, which at this revision is
+    /// ptrace alone (Reverie's `BackendCapabilities::PTRACE`; the e9patch
+    /// preprocessing path runs on ptrace and inherits the bound, untested).
+    /// LiteInst in-guest, SaBRe, DBT and KVM report none, so there every
+    /// deferral waits for quiescence alone: a parent beside a sibling that
+    /// never blocks still starves there, and its schedule differs from
+    /// ptrace's (<https://github.com/rrnewton/hermit/issues/4132>).
     pub sigchld_deferred_behind: BTreeMap<DetTid, BTreeSet<DetTid>>,
 
     /// Parent processes whose pending `SIGCHLD` from the kernel was raised at
