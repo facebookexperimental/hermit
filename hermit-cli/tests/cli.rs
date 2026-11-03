@@ -64886,3 +64886,26 @@ fn a_blocking_binder_read_does_not_hold_the_guests_turn() {
         stderr(&output)
     );
 }
+
+/// `hermit host-capabilities --cpu-profile x86-64-v3` always measures and
+/// never reads or writes the v3 probe cache, whatever the verdict
+/// (https://github.com/rrnewton/hermit/issues/4515).
+#[test]
+fn host_capabilities_never_touches_the_probe_cache() {
+    let cache_home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut command = hermit_command(&["host-capabilities", "--cpu-profile", "x86-64-v3"]);
+    command
+        .env("XDG_CACHE_HOME", cache_home.path())
+        .stdin(Stdio::null());
+    let output = hermit_test::hermit_output("hermit host-capabilities", &mut command);
+    let text = stdout(&output);
+    assert!(
+        text.starts_with("x86-64-v3: QUALIFIED") || text.starts_with("x86-64-v3: REFUSED"),
+        "{text}\n{}",
+        stderr(&output)
+    );
+    assert!(
+        !cache_home.path().join("hermit").exists(),
+        "host-capabilities wrote the cache"
+    );
+}

@@ -1099,6 +1099,46 @@ mod tests {
         assert!(!warnings[0].contains("is cached"), "{warnings:?}");
     }
 
+    /// A process that misses while another holds the probe lock waits, finds
+    /// the other's verdict under the lock and does not measure: concurrent
+    /// cold runs measure once.
+    #[test]
+    fn a_miss_waits_for_the_lock_and_reuses_the_verdict_stored_meanwhile() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("probe.json");
+        let (holding_tx, holding_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                crate::host_qualification::locked(&path, || {
+                    holding_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    crate::host_qualification::store(
+                        &path,
+                        &cache_host(),
+                        &probe_cache_inputs(),
+                        &probe_report(0x2e7),
+                    );
+                })
+            })
+        };
+        holding_rx.recv().unwrap();
+        let waiter = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                probe_through_cache(Some(&path), 0x2e7, Err("must not measure".into()))
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let (result, ran, warnings) = waiter.join().unwrap();
+        assert_eq!(result, Ok(probe_report(0x2e7)));
+        assert!(!ran, "the waiter measured instead of reusing the verdict");
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
     /// Without a cache directory every admission measures, and says so.
     #[test]
     fn without_a_cache_directory_every_admission_measures() {

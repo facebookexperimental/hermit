@@ -48,9 +48,10 @@ pub(crate) struct HostKey {
     pub(crate) boot_id: String,
     pub(crate) cpu: String,
     pub(crate) microcode: String,
-    /// The running Hermit binary's device, inode, size and modification
-    /// time: a qualification's own code is part of what it certifies, so a
-    /// verdict measured by another build is never reused.
+    /// The running Hermit binary's GNU build ID (or, without one, its
+    /// device, inode, size and modification time): a qualification's own
+    /// code is part of what it certifies, so a verdict measured by another
+    /// build is never reused, even one copied in place with its mtime kept.
     pub(crate) hermit_binary: String,
 }
 
@@ -71,9 +72,73 @@ impl HostKey {
             boot_id: read_trimmed("/proc/sys/kernel/random/boot_id"),
             cpu: cpu_signature(),
             microcode: read_trimmed("/sys/devices/system/cpu/cpu0/microcode/version"),
-            hermit_binary: binary_identity(),
+            hermit_binary: build_id().unwrap_or_else(binary_identity),
         }
     }
+}
+
+/// The running executable's GNU build ID (`NT_GNU_BUILD_ID`), read from its
+/// own `PT_NOTE` segments in memory, as lowercase hex.
+fn build_id() -> Option<String> {
+    unsafe extern "C" fn first_object(
+        info: *mut libc::dl_phdr_info,
+        _size: usize,
+        data: *mut libc::c_void,
+    ) -> libc::c_int {
+        // SAFETY: dl_iterate_phdr passes a valid info for the object it
+        // reports, and `data` is the `Option<String>` below. The first object
+        // it reports is the executable; its notes are mapped where its
+        // program headers say.
+        unsafe {
+            let info = &*info;
+            let found = &mut *(data as *mut Option<String>);
+            let headers = std::slice::from_raw_parts(info.dlpi_phdr, usize::from(info.dlpi_phnum));
+            for header in headers
+                .iter()
+                .filter(|header| header.p_type == libc::PT_NOTE)
+            {
+                let start = (info.dlpi_addr as usize + header.p_vaddr as usize) as *const u8;
+                let notes = std::slice::from_raw_parts(start, header.p_memsz as usize);
+                if let Some(id) = gnu_build_id(notes) {
+                    *found = Some(id);
+                    break;
+                }
+            }
+        }
+        1
+    }
+    let mut found: Option<String> = None;
+    // SAFETY: the callback only reads the reported object's mapped notes.
+    unsafe {
+        libc::dl_iterate_phdr(
+            Some(first_object),
+            (&mut found as *mut Option<String>).cast::<libc::c_void>(),
+        );
+    }
+    found
+}
+
+/// The `NT_GNU_BUILD_ID` descriptor among ELF `notes`, as lowercase hex.
+fn gnu_build_id(notes: &[u8]) -> Option<String> {
+    let word = |at: usize| -> Option<usize> {
+        Some(u32::from_ne_bytes(notes.get(at..at + 4)?.try_into().ok()?) as usize)
+    };
+    let mut at = 0;
+    while at + 12 <= notes.len() {
+        let (name_size, desc_size, kind) = (word(at)?, word(at + 4)?, word(at + 8)?);
+        let name = at + 12;
+        let desc = name + name_size.next_multiple_of(4);
+        let next = desc + desc_size.next_multiple_of(4);
+        if next > notes.len() {
+            return None;
+        }
+        if kind == 3 && notes.get(name..name + name_size)? == b"GNU\0" {
+            let id = &notes[desc..desc + desc_size];
+            return Some(id.iter().map(|byte| format!("{byte:02x}")).collect());
+        }
+        at = next;
+    }
+    None
 }
 
 /// `/proc/self/exe`'s device, inode, size and modification time.
@@ -179,7 +244,8 @@ pub(crate) fn writable(path: &Path) -> bool {
 
 /// Runs `f` holding an exclusive `flock` on `<path>.lock`, so that processes
 /// that miss at once measure one at a time and the later ones can find the
-/// first one's verdict. Without a lock file `f` runs unlocked.
+/// first one's verdict. Without a lock file that is a regular file `f` runs
+/// unlocked; the open neither blocks on a FIFO nor follows a link.
 pub(crate) fn locked<R>(path: &Path, f: impl FnOnce() -> R) -> R {
     use std::os::fd::AsRawFd;
     let lock = path.parent().and_then(|directory| {
@@ -188,9 +254,12 @@ pub(crate) fn locked<R>(path: &Path, f: impl FnOnce() -> R) -> R {
             .create(true)
             .truncate(false)
             .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path.with_extension("lock"))
             .ok()?;
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
         // SAFETY: the descriptor is open for the duration of the call.
         (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(file)
     });
@@ -333,7 +402,6 @@ mod tests {
     /// this test binary's own metadata.
     #[test]
     fn the_current_key_reads_this_host() {
-        use std::os::unix::fs::MetadataExt;
         let host = HostKey::current();
         assert_eq!(
             host.kernel_release,
@@ -374,18 +442,48 @@ mod tests {
                 u64::from_str_radix(field("microcode").trim_start_matches("0x"), 16).unwrap()
             );
         }
-        let exe = fs::metadata(std::env::current_exe().unwrap()).unwrap();
-        assert_eq!(
-            host.hermit_binary,
-            format!(
-                "{}:{}:{}:{}.{}",
-                exe.dev(),
-                exe.ino(),
-                exe.size(),
-                exe.mtime(),
-                exe.mtime_nsec()
-            )
-        );
+        // The build ID read from memory equals the one the binary on disk
+        // carries, parsed independently.
+        use object::Object;
+        let exe = fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let cache = object::read::ReadCache::new(exe);
+        let parsed = object::File::parse(&cache).unwrap();
+        let on_disk = parsed
+            .build_id()
+            .unwrap()
+            .expect("the test binary has a GNU build ID");
+        let hex: String = on_disk.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(host.hermit_binary, hex);
+    }
+
+    #[test]
+    fn the_build_id_is_found_among_notes() {
+        let note = |name: &[u8], kind: u32, desc: &[u8]| {
+            let mut bytes = Vec::new();
+            bytes.extend((name.len() as u32).to_ne_bytes());
+            bytes.extend((desc.len() as u32).to_ne_bytes());
+            bytes.extend(kind.to_ne_bytes());
+            bytes.extend(name);
+            bytes.resize(bytes.len().next_multiple_of(4), 0);
+            bytes.extend(desc);
+            bytes.resize(bytes.len().next_multiple_of(4), 0);
+            bytes
+        };
+        let mut notes = note(b"GNU\0", 1, &[0; 16]);
+        notes.extend(note(b"GNU\0", 3, &[0xc4, 0x63, 0x6a, 0xd1, 0x7d]));
+        assert_eq!(gnu_build_id(&notes).as_deref(), Some("c4636ad17d"));
+        assert_eq!(gnu_build_id(&note(b"GNU\0", 1, &[1, 2])), None);
+        assert_eq!(gnu_build_id(&notes[..notes.len() - 4]), None);
+    }
+
+    /// A FIFO where the lock file goes is not opened for blocking: `f` runs
+    /// unlocked.
+    #[test]
+    fn a_fifo_lock_file_runs_unlocked() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v.json");
+        nix::unistd::mkfifo(&path.with_extension("lock"), nix::sys::stat::Mode::S_IRWXU).unwrap();
+        assert_eq!(locked(&path, || 7), 7);
     }
 
     /// The signature decodes family, model and stepping as `/proc/cpuinfo`
