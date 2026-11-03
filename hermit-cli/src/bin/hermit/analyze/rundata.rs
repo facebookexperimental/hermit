@@ -253,20 +253,6 @@ impl RunData {
             .map_err(anyhow::Error::msg)
     }
 
-    /// Write a normalized copy of the output preemption record, for reading
-    /// only, beside it, and return its path and contents. The run keeps its
-    /// own record: normalization renumbers priorities across the scheduler's
-    /// fixed ones, so the copy can replay another schedule.
-    pub fn write_normalized_preempts(&mut self) -> (PathBuf, PreemptionRecord) {
-        assert!(self.has_launched());
-        let normalized_path = self.preempts_path_out().with_extension("normalized");
-        let normalized = self.preempts_out().normalize();
-        normalized
-            .write_to_disk(&normalized_path)
-            .expect("write of preempts file to succeed");
-        (normalized_path, normalized)
-    }
-
     /// Write the normalized output preemptions beside the output file and
     /// return them, without swapping what this run's own output points to:
     /// a caller that keeps the observed record for its report (the timing
