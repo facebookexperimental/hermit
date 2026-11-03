@@ -64514,10 +64514,25 @@ fn binder_guest_output_with(mode: &str, side: BinderSide, hermit_args: &[&str]) 
              {report_peer}; exit $status",
             under_hermit("manager")
         ),
+        // The manager holds its reply at the guest's reply gate until
+        // this script has seen Hermit admit the client's read as a
+        // blocking external call (`HERMIT_EXTERNAL_INPUT` in the run's
+        // own stderr, printed when the call is dispatched off the
+        // turn): only then is the client's read provably the call that
+        // waits, so its rejoin is what a recording stores. The gate
+        // file sits beside the mount, not in Binderfs, which creates
+        // no files. If the admission never comes (a refused call), the
+        // manager's gate wait fails explicitly in its own output.
         BinderSide::Client => format!(
-            "timeout --kill-after 5s 60s {guest} {mountpoint} {mode} manager >{peer_log} 2>&1 & \
-             peer=$!; {await_ready}; {}; status=$?; {reap_peer}; {report_peer}; \
-             exit $status",
+            "BINDER_REPLY_GATE={mountpoint}.reply-ok timeout --kill-after 5s 60s {guest} \
+             {mountpoint} {mode} manager >{peer_log} 2>&1 & peer=$!; {await_ready}; \
+             {} >{mountpoint}.hout 2>{mountpoint}.hlog & hpid=$!; \
+             i=0; while kill -0 $hpid 2>/dev/null && [ $i -lt 1200 ]; do \
+             if grep -q \"HERMIT_EXTERNAL_INPUT source=binder\" {mountpoint}.hlog \
+             2>/dev/null; then touch {mountpoint}.reply-ok; break; fi; \
+             sleep 0.1; i=$((i+1)); done; wait $hpid; status=$?; \
+             cat {mountpoint}.hout; cat {mountpoint}.hlog >&2; {reap_peer}; \
+             {report_peer}; exit $status",
             under_hermit("client")
         ),
         BinderSide::Inherited => format!(
@@ -67281,12 +67296,13 @@ fn a_strict_replay_refuses_binder() {
     // The supported arrangement: the client alone runs under Hermit
     // (the run's one task) against a context manager outside it, so the
     // waiting calls go off the turn alone and store their readmissions.
-    // The outside manager holds its reply until the client says its
-    // reply read is next (the guest's "<device>.waiting" file), so the
-    // client's read provably waits and stores its rejoin; without that
-    // the reply could land first and the read would return in turn.
-    // PR #4761 still refuses the strict replay below because binder
-    // reply payloads are not recorded.
+    // The outside manager holds its reply at a gate the harness opens
+    // only once Hermit has admitted the client's read as a blocking
+    // external call, so the client's read provably waits and stores
+    // its rejoin; without that the reply could land first and the read
+    // would return in the client's turn. PR #4761 still refuses the
+    // strict replay below because binder reply payloads are not
+    // recorded.
     let recorded = binder_guest_output_with_on_a_capable_host(
         "ping",
         BinderSide::Client,
