@@ -22938,12 +22938,12 @@ mod inject_fstat_scratch {
     /// The ordering control for the post-grant receipt: with the
     /// scheduler's blocking grant held pending, the waiting call has
     /// submitted its `BlockingExternalIO` request but no post-grant
-    /// receipt (`HERMIT_BINDER_BLOCKING_GRANTED`, counted by
-    /// `blocking_granted_calls`) is emitted and the call does not run.
-    /// Opening the grant emits exactly one receipt, correlated with the
+    /// receipt (`HERMIT_BINDER_BLOCKING_GRANTED`, observed in tests by
+    /// `blocking_granted`) is emitted and the call does not run.
+    /// Opening the grant emits the receipt, correlated with the
     /// released operation, before the native call. A receipt emitted at
     /// route choice (the earlier `HERMIT_EXTERNAL_INPUT` point) would
-    /// already be counted while the grant is pending and fail here.
+    /// already be observed while the grant is pending and fail here.
     #[tokio::test]
     async fn a_waiting_binder_calls_receipt_waits_for_its_blocking_grant() {
         use std::future::Future as _;

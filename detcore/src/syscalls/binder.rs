@@ -1016,7 +1016,7 @@ pub(crate) fn note_blocking(waits: Blocking, process: i32) -> bool {
 /// the operation (`ExternalOpId`: thread and per-thread syscall count),
 /// so an outside observer can correlate it with the recorded release.
 pub(crate) fn note_blocking_granted(op_id: crate::resources::ExternalOpId) {
-    GRANTED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
     GRANTED_OPS.lock().unwrap().push(op_id);
     tracing::warn!(
         "[detcore] HERMIT_BINDER_BLOCKING_GRANTED source=binder dettid={} seq={}: \
@@ -1026,20 +1026,17 @@ pub(crate) fn note_blocking_granted(op_id: crate::resources::ExternalOpId) {
     );
 }
 
-/// Waiting binder calls whose blocking grant was received
-/// (`note_blocking_granted`), by operation, so a test can follow its
-/// own call past other calls in the same process.
-static GRANTED_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Test-only observation of post-grant receipts, by operation, so a
+/// test can follow its own call past other calls in the same process.
+/// Production keeps no such state: the receipt is the log line above,
+/// and nothing accumulates per call.
+#[cfg(test)]
 static GRANTED_OPS: std::sync::Mutex<Vec<crate::resources::ExternalOpId>> =
     std::sync::Mutex::new(Vec::new());
 
-/// How many post-grant binder receipts this process has emitted.
-pub(crate) fn blocking_granted_calls() -> u64 {
-    GRANTED_CALLS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Whether the post-grant receipt for `op_id` has been emitted, for
 /// tests that hold a grant pending and prove none is emitted early.
+#[cfg(test)]
 pub(crate) fn blocking_granted(op_id: crate::resources::ExternalOpId) -> bool {
     GRANTED_OPS.lock().unwrap().contains(&op_id)
 }
