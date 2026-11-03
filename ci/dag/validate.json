@@ -6385,6 +6385,13 @@
           "category": "c-programs",
           "test": "c-programs/proc-fd-link-aliases",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/proc-fd-link-aliases",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -8119,6 +8126,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/shared-file-threads",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/shared-file-threads",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/shared-file-vfork",
           "mode": "verify",
           "backend": "kvm"
@@ -9753,6 +9774,13 @@
           "test": "c-programs/thread-self-procfs-handoff",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/thread-self-procfs-handoff",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -13895,6 +13923,13 @@
           "test": "compat/ps",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/ps",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18695,6 +18730,13 @@
           "test": "compat/ps",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/ps",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -29297,6 +29339,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/shared-file-threads",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/shared-file-vfork",
           "mode": "verify",
           "backend": "ptrace"
@@ -35939,6 +35988,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/setitimer-determinism",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/shared-file-threads",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -49436,6 +49492,13 @@
           "category": "c-programs",
           "test": "c-programs/proc-fd-link-aliases",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/proc-fd-link-aliases",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -51170,6 +51233,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/shared-file-threads",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/shared-file-threads",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/shared-file-vfork",
           "mode": "verify",
           "backend": "kvm"
@@ -52804,6 +52881,13 @@
           "test": "c-programs/thread-self-procfs-handoff",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/thread-self-procfs-handoff",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -56930,6 +57014,13 @@
           "test": "compat/ps",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/ps",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
