@@ -796,11 +796,18 @@ pub struct Outcome {
 /// not show at all: everything before its first event (unless it starts at
 /// event 0), a write it kept no bytes of, and output another call (sendfile,
 /// splice, sendmsg, ...) put on fd 1 or 2. Streams are told by descriptor
-/// number, so a call that replaces or aliases descriptor 1 or 2 in any
-/// process (an open or a dup onto it, as `2>&1` or a child's `> file` does,
-/// or a dup of it onto another number, as `exec 3>&1` does) is a gap too,
-/// after which the stream's writes by number no longer tell what reaches it
-/// ([`redirects`]): none of them counts. A pattern is matched only within
+/// number, so whatever makes another number reach the stream's open file, or
+/// fd 1 or 2 reach another, is a gap too, after which the stream's writes by
+/// number no longer tell what reaches it ([`redirects`]): none of them
+/// counts. That is an open or a dup onto descriptor 1 or 2 in any process (as
+/// `2>&1` or a child's `> file` does), a dup of 1 or 2 onto another number
+/// (`exec 3>&1`), an import of the stream's open file at another number
+/// (SCM_RIGHTS, pidfd_getfd), an open of `/dev/stdout`, `/dev/stderr`,
+/// `/dev/fd/1` or `/dev/fd/2` or of a `/proc/.../fd/1` or `/fd/2` path, and a
+/// write through another number to the stream's open file, which also catches
+/// an alias from before the trace (a launch with `3>&1`, or one a process
+/// inherited) that no call in it created. The stream's open files are those
+/// any process's descriptor 1 or 2 is seen to reach in the trace. A pattern is matched only within
 /// the output since the stream's last gap, never across one, so the bytes on
 /// either side of a cut write never join into a match neither run printed.
 /// Once a gap comes before a stream's match, where that stream first matched
@@ -851,8 +858,20 @@ pub fn outcome(
             }
         }
     }
+    let mut outputs: [BTreeSet<OpenFileId>; 2] = Default::default();
+    for access in syscalls.iter().flat_map(|sys| &sys.accesses) {
+        if let Access::Fd {
+            slot,
+            open_file: Some(file),
+            ..
+        } = access
+            && let Some(index) = output_stream(slot.fd)
+        {
+            outputs[index].insert(*file);
+        }
+    }
     for sys in &syscalls {
-        for (index, why) in redirects(sys) {
+        for (index, why) in redirects(sys, &outputs) {
             let stream = &mut streams[index];
             if patterns[index].is_some() && stream.point.is_none() && !stream.met_before {
                 stream.redirected = true;
@@ -969,17 +988,80 @@ struct ShownOutput {
 /// (`2>&1`, `exec 3>&1`), so the stream's writes by number no longer tell
 /// what it holds. A close alone redirects nothing; the open that reuses the
 /// number does.
-fn redirects(sys: &SyscallRecord) -> Vec<(usize, String)> {
-    let stream = |fd: i32| match fd {
-        1 => Some(0),
-        2 => Some(1),
-        _ => None,
-    };
+///
+/// Another number can reach a stream's open file (one of `outputs`, which
+/// any descriptor 1 or 2 is seen to reach) without a dup: an import, as
+/// SCM_RIGHTS and pidfd_getfd give (Detcore notes an open of the existing
+/// open file), an alias from before the trace or one a child inherited, seen
+/// when a write goes through it, and a reopen of the stream by path, which
+/// gives a new open file on the same pipe or terminal.
+fn redirects(sys: &SyscallRecord, outputs: &[BTreeSet<OpenFileId>; 2]) -> Vec<(usize, String)> {
+    let stream = output_stream;
     let mut found = Vec::new();
     for access in &sys.accesses {
-        let Access::Fd { slot, op, .. } = access else {
+        let Access::Fd {
+            slot,
+            op,
+            open_file,
+        } = access
+        else {
             continue;
         };
+        let reaches = |file: &Option<OpenFileId>| {
+            (0..2).find(|&index| file.is_some_and(|file| outputs[index].contains(&file)))
+        };
+        match op {
+            FdOp::Open { path } => {
+                if stream(slot.fd).is_none()
+                    && let Some(index) = reaches(open_file)
+                {
+                    found.push((
+                        index,
+                        format!(
+                            "is not told by descriptor number after {} at event {} installed \
+                             descriptor {}'s open file as descriptor {}",
+                            call_text(sys),
+                            sys.pre,
+                            index + 1,
+                            slot.fd
+                        ),
+                    ));
+                }
+                if let Some(index) = path.as_deref().and_then(stdio_path) {
+                    found.push((
+                        index,
+                        format!(
+                            "is not told by descriptor number after {} at event {} opened {} as \
+                             descriptor {}",
+                            call_text(sys),
+                            sys.pre,
+                            path.as_deref().unwrap_or_default(),
+                            slot.fd
+                        ),
+                    ));
+                }
+            }
+            FdOp::Use
+                if stream(slot.fd).is_none()
+                    && output_fd(sys) == Some(slot.fd as u64)
+                    && sys.result.is_some_and(|written| written > 0) =>
+            {
+                if let Some(index) = reaches(open_file) {
+                    found.push((
+                        index,
+                        format!(
+                            "is not told by descriptor number after {} at event {} wrote to \
+                             descriptor {}'s open file through descriptor {}",
+                            call_text(sys),
+                            sys.pre,
+                            index + 1,
+                            slot.fd
+                        ),
+                    ));
+                }
+            }
+            _ => {}
+        }
         if let (FdOp::Open { .. } | FdOp::Dup { .. }, Some(index)) = (op, stream(slot.fd)) {
             found.push((
                 index,
@@ -1024,22 +1106,7 @@ enum Shown<'a> {
 /// the trace keeps of it; `None` for a call that put none there.
 fn shown_output(sys: &SyscallRecord) -> Option<(usize, Shown<'_>)> {
     let written = sys.result.filter(|r| *r > 0)? as u64;
-    let fd = match sys.sysno {
-        Sysno::write
-        | Sysno::writev
-        | Sysno::pwrite64
-        | Sysno::pwritev
-        | Sysno::pwritev2
-        | Sysno::sendfile
-        | Sysno::vmsplice
-        | Sysno::sendto
-        | Sysno::sendmsg
-        | Sysno::sendmmsg => sys.args[0],
-        Sysno::tee => sys.args[1],
-        Sysno::splice | Sysno::copy_file_range => sys.args[2],
-        _ => return None,
-    };
-    let stream = match fd {
+    let stream = match output_fd(sys)? {
         1 => 0,
         2 => 1,
         _ => return None,
@@ -1056,6 +1123,54 @@ fn shown_output(sys: &SyscallRecord) -> Option<(usize, Shown<'_>)> {
             Shown::Cut(kept)
         },
     ))
+}
+
+/// The output stream (0 for stdout, 1 for stderr) descriptor `fd` names by
+/// number.
+fn output_stream(fd: i32) -> Option<usize> {
+    match fd {
+        1 => Some(0),
+        2 => Some(1),
+        _ => None,
+    }
+}
+
+/// The stream a path names when opened (`/dev/stdout`, `/dev/stderr`,
+/// `/dev/fd/1`, `/dev/fd/2`, and `/proc/PID/fd/1` or `/fd/2`, with
+/// `/proc/PID/task/TID/fd/N` too): a new open file on the stream's pipe or
+/// terminal.
+fn stdio_path(path: &str) -> Option<usize> {
+    let number = match path {
+        "/dev/stdout" => return Some(0),
+        "/dev/stderr" => return Some(1),
+        _ => path.strip_prefix("/dev/fd/").or_else(|| {
+            path.strip_prefix("/proc/")?
+                .split_once("/fd/")
+                .map(|(_, fd)| fd)
+        })?,
+    };
+    output_stream(number.parse().ok()?)
+}
+
+/// The descriptor an output call writes to, for the calls that can put
+/// output on a stream: the write family, sendfile, vmsplice, the send
+/// family, tee, splice and copy_file_range.
+fn output_fd(sys: &SyscallRecord) -> Option<u64> {
+    Some(match sys.sysno {
+        Sysno::write
+        | Sysno::writev
+        | Sysno::pwrite64
+        | Sysno::pwritev
+        | Sysno::pwritev2
+        | Sysno::sendfile
+        | Sysno::vmsplice
+        | Sysno::sendto
+        | Sysno::sendmsg
+        | Sysno::sendmmsg => sys.args[0],
+        Sysno::tee => sys.args[1],
+        Sysno::splice | Sysno::copy_file_range => sys.args[2],
+        _ => return None,
+    })
 }
 
 /// The sentence that says a signal is not the outcome point
@@ -8591,6 +8706,199 @@ mod tests {
             &stdout,
         );
         assert_eq!(found.point.map(|o| o.event), Some(101));
+    }
+
+    /// What the alias tests below share: stdout's open file `file(7, 1)`,
+    /// reached by fd 1 in the root's table; a write of `text` to `fd` by
+    /// `tid` through `open_file`; and the check that the point is unknown
+    /// with a note saying `why`.
+    fn seam_write(
+        pre: EventIndex,
+        tid: i32,
+        fd: i32,
+        open_file: OpenFileId,
+        text: &str,
+    ) -> SyscallRecord {
+        let mut sys = call(
+            pre,
+            tid,
+            pre,
+            Sysno::write,
+            &[fd as u64, 0x1000, text.len() as u64],
+            Some(text.len() as i64),
+            vec![Access::Fd {
+                slot: FdSlot {
+                    files: FilesId::initial(t(tid)),
+                    fd,
+                },
+                open_file: Some(open_file),
+                op: FdOp::Use,
+            }],
+        );
+        sys.out_bytes = Some(text.as_bytes().to_vec());
+        sys
+    }
+
+    /// The point `calls` give for an ERROR on `stream` (0 stdout, 1 stderr)
+    /// is unknown, with a note containing `why`.
+    fn assert_seam_unknown(calls: Vec<SyscallRecord>, stream: usize, why: &str) {
+        let pattern = Regex::new("ERROR").unwrap();
+        let any = ExitStatusConstraint::Any;
+        let criteria = OutcomeCriteria {
+            stdout: (stream == 0).then_some(&pattern),
+            stderr: (stream == 1).then_some(&pattern),
+            exit_code: &any,
+            root: Some(DetPid::from_raw(3)),
+        };
+        let trace = traced(calls.into_iter().map(TraceRecord::Syscall).collect());
+        let found = outcome(&trace, S, &criteria);
+        assert_eq!(found.point.map(|o| o.event), None, "{why}");
+        assert!(
+            found
+                .unknown
+                .as_deref()
+                .is_some_and(|note| note.contains(why)),
+            "{why}: {:?}",
+            found.unknown
+        );
+    }
+
+    /// An import of stdout's open file at another number, over SCM_RIGHTS
+    /// (Detcore notes an open of the existing open file), makes that number
+    /// another way to stdout: its write in the ER/ROR seam joins no match.
+    #[test]
+    fn an_output_imported_over_scm_rights_is_a_gap() {
+        let stdout = file(7, 1);
+        let received = call(
+            100,
+            7,
+            100,
+            Sysno::recvmsg,
+            &[5, 0x4000, 0],
+            Some(1),
+            vec![fd(3, Some(stdout), FdOp::Open { path: None })],
+        );
+        assert_seam_unknown(
+            vec![
+                received,
+                seam_write(101, 3, 1, stdout, "ER"),
+                seam_write(103, 3, 3, stdout, "XX"),
+                seam_write(105, 3, 1, stdout, "ROR\n"),
+            ],
+            0,
+            "installed descriptor 1's open file as descriptor 3",
+        );
+    }
+
+    /// pidfd_getfd of a process's fd 1 does the same.
+    #[test]
+    fn an_output_taken_with_pidfd_getfd_is_a_gap() {
+        let stdout = file(7, 1);
+        let taken = call(
+            100,
+            7,
+            100,
+            Sysno::pidfd_getfd,
+            &[9, 1, 0],
+            Some(3),
+            vec![fd(3, Some(stdout), FdOp::Open { path: None })],
+        );
+        assert_seam_unknown(
+            vec![
+                taken,
+                seam_write(101, 3, 1, stdout, "ER"),
+                seam_write(103, 3, 3, stdout, "XX"),
+                seam_write(105, 3, 1, stdout, "ROR\n"),
+            ],
+            0,
+            "installed descriptor 1's open file as descriptor 3",
+        );
+    }
+
+    /// An alias from before the trace, a launch with `3>&1`, has no call
+    /// in it that created it; the write through it to stdout's open file
+    /// shows it.
+    #[test]
+    fn an_output_alias_from_before_the_trace_is_a_gap() {
+        let stdout = file(7, 1);
+        assert_seam_unknown(
+            vec![
+                seam_write(101, 3, 1, stdout, "ER"),
+                seam_write(103, 3, 3, stdout, "XX"),
+                seam_write(105, 3, 1, stdout, "ROR\n"),
+            ],
+            0,
+            "wrote to descriptor 1's open file through descriptor 3",
+        );
+    }
+
+    /// A child that inherited such an alias across fork or exec writes
+    /// through it from its own table.
+    #[test]
+    fn an_output_alias_a_child_inherited_is_a_gap() {
+        let stdout = file(7, 1);
+        let mut child = seam_write(103, 11, 3, stdout, "XX");
+        child.pid = DetPid::from_raw(11);
+        assert_seam_unknown(
+            vec![
+                seam_write(101, 3, 1, stdout, "ER"),
+                child,
+                seam_write(105, 3, 1, stdout, "ROR\n"),
+            ],
+            0,
+            "wrote to descriptor 1's open file through descriptor 3",
+        );
+    }
+
+    /// Reopening `/dev/stderr` (as `tee /dev/stderr` does) gives a new open
+    /// file on stderr's pipe, which no open-file identity links to fd 2: the
+    /// path does.
+    #[test]
+    fn an_output_reopened_by_path_is_a_gap() {
+        let (stderr, reopened) = (file(7, 2), file(3, 9));
+        let mut opened = call(
+            100,
+            3,
+            100,
+            Sysno::openat,
+            &[(-100i64) as u64, 0x2000, 1],
+            Some(3),
+            Vec::new(),
+        );
+        opened.accesses = vec![Access::Fd {
+            slot: FdSlot {
+                files: FilesId::initial(t(3)),
+                fd: 3,
+            },
+            open_file: Some(reopened),
+            op: opened_path("/dev/stderr"),
+        }];
+        assert_seam_unknown(
+            vec![
+                opened,
+                seam_write(101, 3, 2, stderr, "ER"),
+                seam_write(103, 3, 3, reopened, "XX"),
+                seam_write(105, 3, 2, stderr, "ROR\n"),
+            ],
+            1,
+            "opened /dev/stderr as descriptor 3",
+        );
+        for (path, stream) in [
+            ("/dev/stdout", Some(0)),
+            ("/dev/fd/2", Some(1)),
+            ("/proc/self/fd/1", Some(0)),
+            ("/proc/12/task/12/fd/2", Some(1)),
+            ("/dev/fd/3", None),
+            ("/proc/self/fdinfo/1", None),
+        ] {
+            assert_eq!(stdio_path(path), stream, "{path}");
+        }
+    }
+
+    fn opened_path(path: &str) -> FdOp {
+        FdOp::Open {
+            path: Some(path.to_string()),
+        }
     }
 
     /// A deciding event that no call enters or returns at (a timeslice that
