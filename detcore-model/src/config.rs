@@ -2189,6 +2189,17 @@ impl Config {
                         && self.reads_sleeper_signal_state()
                 }
             }
+    /// The settings of this run under which Detcore can record a descriptor
+    /// without its file type, by their option names: without metadata
+    /// virtualization it keeps no stat of a descriptor it opens, which is what
+    /// tells a FIFO from a plain file. An access trace names them in its header
+    /// (`TraceHeader::untyped_descriptors`).
+    pub fn untyped_descriptor_settings(&self) -> Vec<String> {
+        let mut settings = Vec::new();
+        if !self.virtualize_metadata {
+            settings.push("--no-virtualize-metadata".to_string());
+        }
+        settings
     }
 
     /// Should we convert sockets to SOCK_NONBLOCK?

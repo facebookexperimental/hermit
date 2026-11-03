@@ -5599,6 +5599,7 @@ impl Scheduler {
             crate::access_trace::AccessTraceWriter::create(
                 path,
                 cfg.access_trace_from,
+                cfg.untyped_descriptor_settings(),
                 cfg.access_trace_max_records,
                 cfg.access_trace_max_bytes,
             )

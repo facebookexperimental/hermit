@@ -69,6 +69,11 @@
 //!   any descriptor table, could be a reopen of any pipe through
 //!   /proc/<pid>/fd, so either untracks every pipe. This catch-all also
 //!   covers a descriptor Detcore discovers without an open note.
+//! - Types: the catch-all needs every descriptor's type. A trace recorded
+//!   under a setting that can leave a descriptor untyped (metadata
+//!   virtualization off: `--no-virtualize-metadata`), as its header says, or
+//!   one whose header does not say, gives no pipe edge at all
+//!   ([`untyped_descriptors`]).
 //! - Scope: the run's own processes. A process outside the run (one an end
 //!   is sent to over SCM_RIGHTS, or a host process that opens
 //!   /proc/<pid>/fd) is not traced, and its bytes are out of scope.
@@ -101,6 +106,7 @@ use detcore_model::access_trace::SyscallRecord;
 use detcore_model::access_trace::Task;
 use detcore_model::access_trace::TimerId;
 use detcore_model::access_trace::TimerOp;
+use detcore_model::access_trace::TraceHeader;
 use detcore_model::access_trace::TraceRecord;
 use detcore_model::fd::FdSlot;
 use detcore_model::fd::OpenFileId;
@@ -866,7 +872,7 @@ impl<'a> Run<'a> {
                 _ => None,
             })
             .partition(|e| e.to.event <= e.from.event);
-        let data = data_edges(&syscalls);
+        let data = data_edges_in(&syscalls, untyped_descriptors(&trace.header));
         edges.extend(data.edges);
         edges.sort_by_key(|e| (e.from.event, e.to.event, e.from.tid, e.to.tid, e.kind));
         Self {
@@ -968,6 +974,12 @@ const ARRIVED: &str = "one of its descriptions reached a process by a route the 
                        pidfd_getfd";
 const UNPAIRED: &str = "the trace has a pipe description without a pair identity (such as a reopen \
                         through /proc/<pid>/fd), which could be any pipe's";
+const UNTYPED_METADATA: &str = "the trace was recorded with metadata virtualization off \
+                                (--no-virtualize-metadata), which records a descriptor \
+                                without its file type, so a reopen of a pipe end can name no \
+                                channel";
+const UNTYPED_UNSAID: &str = "the trace does not say that it records every descriptor's file \
+                              type, so a reopen of a pipe end can name no channel";
 const FIFO_SEEN: &str = "the trace has a FIFO access, which could be a reopen of any pipe through \
                          /proc/<pid>/fd";
 const PACKET: &str = "it may be a packet pipe (pipe2 with O_DIRECT, or a status flag change by \
@@ -1026,7 +1038,30 @@ struct DataEdges {
 ///   and Linux keeps only a write of at most PIPE_BUF bytes whole (pipe(7)),
 ///   so Detcore's blocking pipe write can put a larger one in in parts while
 ///   other writers run, recording one result.
+#[cfg(test)]
 fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
+    data_edges_in(syscalls, None)
+}
+
+/// Why no pipe edge can be trusted in a trace with `header`: the trace was
+/// recorded under a setting that can leave a descriptor without its file
+/// type, or does not say ([`TraceHeader::untyped_descriptors`]). Such a
+/// descriptor's accesses name no channel, so the catch-all of
+/// [`unfollowed_pipes`] cannot see a pipe end reopened through
+/// `/proc/<pid>/fd`.
+fn untyped_descriptors(header: &TraceHeader) -> Option<&'static str> {
+    match header.untyped_descriptors.as_deref() {
+        Some([]) => None,
+        Some(settings) if settings.iter().all(|s| s == "--no-virtualize-metadata") => {
+            Some(UNTYPED_METADATA)
+        }
+        _ => Some(UNTYPED_UNSAID),
+    }
+}
+
+/// [`data_edges`], in a trace whose descriptors may be untyped (`untyped`:
+/// why, [`untyped_descriptors`]): then no pipe gives an edge.
+fn data_edges_in(syscalls: &[&SyscallRecord], untyped: Option<&'static str>) -> DataEdges {
     let (steps, mut untracked) = channel_steps(syscalls);
     // The ends a pipe or socketpair call returned. An Open note alone is not
     // a creation: Detcore also notes one when a descriptor joins an existing
@@ -1054,7 +1089,10 @@ fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
         })
         .collect();
     let vmspliced = syscalls.iter().any(|sys| sys.sysno == Sysno::vmsplice);
-    let unfollowed = unfollowed_pipes(syscalls);
+    let mut unfollowed = unfollowed_pipes(syscalls);
+    if let Some(why) = untyped {
+        unfollowed.all = Some(why);
+    }
     // The open files of a packet pipe's ends: both ends pipe2 made with
     // O_DIRECT, and the end a successful F_SETFL changed.
     let packet_files: BTreeSet<OpenFileId> = syscalls
@@ -5007,6 +5045,153 @@ mod tests {
                 "{first:?}"
             );
         }
+    }
+
+    /// A trace recorded with metadata virtualization off holds no file type
+    /// for a descriptor Detcore opens, so a pipe end that a process holding no
+    /// end reopens through /proc/<pid>/fd is a plain file whose accesses name
+    /// no channel: process 8 writes XXXX through it, with no channel access,
+    /// then process 5 writes SSSS through its own end and reads XXXX. The
+    /// finder sees only the SSSS write and the read and would order them. The
+    /// trace's header names the setting, and then no pipe gives an edge, with
+    /// the setting named; a header that does not say gives none either. Read
+    /// from a header line without the field, a trace does not say.
+    #[test]
+    fn a_trace_without_descriptor_types_gives_no_pipe_edge() {
+        let key = ChannelKey::Shared(ChannelId::Pair(file(7, 1)));
+        let reopened = {
+            let mut sys = call(
+                10,
+                8,
+                5,
+                Sysno::write,
+                &[3, 0x1000, 4],
+                Some(4),
+                vec![fd(3, Some(file(8, 3)), FdOp::Use)],
+            );
+            sys.pid = DetPid::from_raw(8);
+            sys
+        };
+        let w = call(
+            20,
+            7,
+            2,
+            Sysno::write,
+            &[4, 0x1000, 4],
+            Some(4),
+            vec![pipe(file(7, 2), ChannelOp::Write)],
+        );
+        let r = call(
+            22,
+            7,
+            3,
+            Sysno::read,
+            &[3, 0x2000, 4],
+            Some(4),
+            vec![pipe(file(7, 1), ChannelOp::Read)],
+        );
+        let traced = |header: TraceHeader| {
+            let mut traced = trace(vec![
+                creates(1, [file(7, 1), file(7, 2)]),
+                reopened.clone(),
+                w.clone(),
+                r.clone(),
+            ]);
+            traced.header = header;
+            traced
+        };
+        let untyped = traced(
+            TraceHeader::new(0)
+                .with_untyped_descriptors(vec!["--no-virtualize-metadata".to_string()]),
+        );
+        let run = Run::new(&untyped);
+        assert!(
+            run.edges.iter().all(|e| e.kind != HbEdgeKind::ChannelBytes),
+            "{:?}",
+            run.edges
+        );
+        assert_eq!(
+            run.untracked.get(&key).map(|u| u.why),
+            Some(UNTYPED_METADATA)
+        );
+        let mut unsaid = TraceHeader::new(0);
+        unsaid.untyped_descriptors = None;
+        let run_unsaid = traced(unsaid);
+        let run = Run::new(&run_unsaid);
+        assert!(
+            run.edges.iter().all(|e| e.kind != HbEdgeKind::ChannelBytes),
+            "{:?}",
+            run.edges
+        );
+        assert_eq!(run.untracked.get(&key).map(|u| u.why), Some(UNTYPED_UNSAID));
+        // With every descriptor typed the same calls give the edge the
+        // header rule withholds: the reopen is invisible to the catch-all.
+        let typed = traced(TraceHeader::new(0));
+        let run = Run::new(&typed);
+        assert!(
+            run.edges.iter().any(|e| e.kind == HbEdgeKind::ChannelBytes),
+            "{:?}",
+            run.edges
+        );
+        // A header line without the field reads as not saying.
+        let old = detcore_model::access_trace::read_access_trace(
+            br#"{"kind":"header","format":"hermit-access-trace","version":2,"from":0}
+{"kind":"end","events":0,"records":0}
+"#
+            .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(old.header.untyped_descriptors, None);
+        assert_eq!(untyped_descriptors(&old.header), Some(UNTYPED_UNSAID));
+    }
+
+    /// The metadata-off reopen in a real trace:
+    /// tests/fixtures/access_trace_untyped_reopen.jsonl holds the records
+    /// Hermit wrote for tests/fixtures/access_trace_pipes.c's child that
+    /// holds no end, run with --no-virtualize-metadata. Its header names the
+    /// setting, and its write through the reopen names no channel; the
+    /// parent's read got that write's bytes. No edge runs from the parent's
+    /// own write to the read.
+    #[test]
+    fn a_real_trace_recorded_without_metadata_virtualization_gives_no_pipe_edge() {
+        let trace = detcore_model::access_trace::read_access_trace(
+            include_bytes!("../../../../tests/fixtures/access_trace_untyped_reopen.jsonl")
+                .as_slice(),
+        )
+        .expect("the fixture parses");
+        assert_eq!(
+            trace.header.untyped_descriptors,
+            Some(vec!["--no-virtualize-metadata".to_string()])
+        );
+        let first = trace
+            .records
+            .iter()
+            .find_map(|record| match record {
+                TraceRecord::Syscall(sys) if sys.sysno == Sysno::pipe2 => {
+                    sys.accesses.iter().find_map(|access| match access {
+                        Access::Fd {
+                            open_file: Some(open_file),
+                            op: FdOp::Open { .. },
+                            ..
+                        } => Some(*open_file),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("the pipe's creation");
+        let run = Run::new(&trace);
+        assert!(
+            run.edges.iter().all(|e| e.kind != HbEdgeKind::ChannelBytes),
+            "{:?}",
+            run.edges
+        );
+        assert_eq!(
+            run.untracked
+                .get(&ChannelKey::Shared(ChannelId::Pair(first)))
+                .map(|u| u.why),
+            Some(UNTYPED_METADATA)
+        );
     }
 
     /// A write that waited went in when it found room, not at its entry. A

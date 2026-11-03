@@ -107,16 +107,34 @@ pub struct TraceHeader {
     /// are omitted. Resource state built before it (who opened an fd) is
     /// therefore only partly visible.
     pub from: EventIndex,
+    /// The run's settings under which Detcore can record a descriptor without
+    /// its file type, so that an access to it names no channel, by their
+    /// option names: `--no-virtualize-metadata` keeps no stat of a descriptor
+    /// it opens, so a FIFO it opens (a reopen of a pipe end through
+    /// `/proc/<pid>/fd` among them) is recorded as a plain file. Empty when
+    /// every descriptor's type is recorded. `None` in a trace whose writer did
+    /// not say, which a reader takes as not knowing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub untyped_descriptors: Option<Vec<String>>,
 }
 
 impl TraceHeader {
-    /// The header this crate's writer emits for a trace starting at `from`.
+    /// The header this crate's writer emits for a trace starting at `from`,
+    /// of a run that records every descriptor's type.
     pub fn new(from: EventIndex) -> Self {
         Self {
             format: ACCESS_TRACE_FORMAT.to_string(),
             version: ACCESS_TRACE_VERSION,
             from,
+            untyped_descriptors: Some(Vec::new()),
         }
+    }
+
+    /// This header, of a run whose `settings` can leave a descriptor without
+    /// its file type ([`TraceHeader::untyped_descriptors`]).
+    pub fn with_untyped_descriptors(mut self, settings: Vec<String>) -> Self {
+        self.untyped_descriptors = Some(settings);
+        self
     }
 }
 

@@ -451,6 +451,67 @@ fn the_trace_shows_what_leaves_a_pipes_data_edges_out() {
     );
 }
 
+/// A trace names in its header the settings under which a descriptor can
+/// be recorded without its file type: none in an ordinary run, and
+/// `--no-virtualize-metadata` in one without metadata virtualization. In that
+/// run, the write of tests/fixtures/access_trace_pipes.c's child that holds no
+/// end, through its reopen of the parent's pipe end, names no channel at all,
+/// which is why analyze's race finder gives no pipe edge in such a trace
+/// (`races::untyped_descriptors`).
+#[test]
+fn a_trace_names_the_settings_that_leave_descriptors_untyped() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let typed = run_traced(&guests().pipes, directory.path(), "typed", None, Some(0));
+    assert_eq!(
+        typed.trace.expect("traced run").header.untyped_descriptors,
+        Some(Vec::new())
+    );
+    let events = directory.path().join("untyped.events");
+    let trace_path = directory.path().join("untyped.access");
+    let args = vec![
+        "run".to_string(),
+        EPOCH.to_string(),
+        "--chaos".to_string(),
+        "--sched-seed=3".to_string(),
+        "--no-virtualize-metadata".to_string(),
+        path_arg("--record-preemptions-to", &events),
+        path_arg("--record-access-trace-to", &trace_path),
+        "--access-trace-from=0".to_string(),
+        "--".to_string(),
+        guests().pipes.display().to_string(),
+    ];
+    let output = run(&args);
+    assert!(output.status.success(), "{args:?}: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("reopened by a child holding no end, first read: XXXX"),
+        "{stdout}"
+    );
+    let trace = read_access_trace(fs::read(&trace_path).expect("no trace").as_slice())
+        .expect("trace does not parse");
+    assert_eq!(
+        trace.header.untyped_descriptors,
+        Some(vec!["--no-virtualize-metadata".to_string()])
+    );
+    let calls: Vec<&SyscallRecord> = syscalls(&trace).collect();
+    let pipes: Vec<&&SyscallRecord> = calls
+        .iter()
+        .filter(|call| call.sysno.name() == "pipe2" && call.result == Some(0))
+        .collect();
+    let child_write = calls
+        .iter()
+        .find(|call| call.sysno.name() == "write" && call.pid != pipes[3].pid && call.args[2] == 4)
+        .expect("the child's write through its reopen");
+    assert!(
+        child_write
+            .accesses
+            .iter()
+            .all(|access| !matches!(access, Access::Channel { .. })),
+        "{child_write:?}"
+    );
+}
+
 /// The trace changes nothing a run shows, whether the run follows a
 /// recorded schedule or makes its own under chaos: exit status, stdout,
 /// stderr, the recorded schedule and the INFO messages are those of the
