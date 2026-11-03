@@ -63,7 +63,6 @@ fn run_scenario_if_inner() {
     std::process::exit(0);
 }
 
-
 /// Release pipe shared by the two terminal-edge scenarios: a descendant
 /// created inside an armed handler reads one byte before it execs, and the
 /// byte is written only after the armed thread has ended.
@@ -158,7 +157,10 @@ fn killed_handler_then_descendant_execs() {
         let trial = libc::fork();
         assert!(trial >= 0);
         if trial == 0 {
-            libc::signal(libc::SIGABRT, killed_handler as *const () as libc::sighandler_t);
+            libc::signal(
+                libc::SIGABRT,
+                killed_handler as *const () as libc::sighandler_t,
+            );
             libc::raise(libc::SIGABRT);
             libc::_exit(127);
         }
@@ -269,7 +271,10 @@ fn exited_leader_then_descendant_execs() {
     });
     // SAFETY: installs the handler and raises the crash on the leader.
     unsafe {
-        libc::signal(libc::SIGABRT, exiting_handler as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGABRT,
+            exiting_handler as *const () as libc::sighandler_t,
+        );
         libc::raise(libc::SIGABRT);
     }
     sibling.join().unwrap();
@@ -465,7 +470,6 @@ fn a_fault_the_handler_resolves_does_not_switch() {
     assert_eq!(record.switch, None);
     assert_eq!(record.bound, Some(200_000_000));
 }
-
 
 /// A descendant created inside an armed handler whose thread the harness
 /// then kills: the handler has ended at the kill, so the descendant's
