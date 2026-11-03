@@ -2162,7 +2162,7 @@ mod tests {
         let record = elsewhere.path().join("target.preempts");
         std::fs::write(&record, "{}").unwrap();
         let run1_preemptions = format!("--run1-preemptions={}", record.display());
-        let args = crate::Args::try_parse_from([
+        let args = crate::app::Args::try_parse_from([
             "hermit",
             "analyze",
             "--trial-timeout=7",
@@ -2171,7 +2171,7 @@ mod tests {
             "/bin/true",
         ])
         .unwrap();
-        let crate::Subcommand::Analyze(mut options) = args.command else {
+        let crate::app::Subcommand::Analyze(mut options) = args.command else {
             panic!("not analyze")
         };
         options.apply_global(&args.global);
