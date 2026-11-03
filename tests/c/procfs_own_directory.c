@@ -68,7 +68,11 @@
  * directory held while it exits: fstat still describes the directory, owned
  * by global root once its task is gone (`pid_getattr`), and getdents64 fails
  * with ENOENT, after a read while it lived and after a rewind too
- * (`proc_pident_readdir`).
+ * (`proc_pident_readdir`). read-listed: instead, list /proc/self and
+ * /proc/thread-self and open each entry they list, reading a regular file
+ * once and listing a directory once, and print `read <dir>/<name>: ok` or
+ * the errno of the open or the read; a listing must not name what cannot be
+ * read (https://github.com/rrnewton/hermit/issues/5063, dh-62azc).
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -763,16 +767,55 @@ static void show_held_after_exit(void) {
   close(opath);
 }
 
+/* Open each entry `path` lists and read it once: a regular file with read,
+ * a directory with getdents64. Links are not followed. */
+static void read_listed(const char *path) {
+  static char listing[65536];
+  static char contents[65536];
+  int dir = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  CHECK(dir >= 0);
+  for (;;) {
+    long n = syscall(SYS_getdents64, dir, listing, sizeof listing);
+    CHECK(n >= 0);
+    if (n == 0) break;
+    for (long off = 0; off < n;) {
+      struct linux_dirent64 *entry = (struct linux_dirent64 *)(listing + off);
+      off += entry->d_reclen;
+      const char *name = entry->d_name;
+      if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
+          (entry->d_type != DT_REG && entry->d_type != DT_DIR)) {
+        continue;
+      }
+      int directory_entry = entry->d_type == DT_DIR;
+      int fd = openat(dir, name, (directory_entry ? O_DIRECTORY : 0) | O_RDONLY | O_CLOEXEC);
+      if (fd < 0) {
+        printf("read %s/%s: open %s\n", path, name, errno_name(errno));
+        continue;
+      }
+      long got = directory_entry ? syscall(SYS_getdents64, fd, contents, sizeof contents)
+                                 : (long)read(fd, contents, sizeof contents);
+      if (got < 0) {
+        printf("read %s/%s: read %s\n", path, name, errno_name(errno));
+      } else {
+        printf("read %s/%s: ok\n", path, name);
+      }
+      close(fd);
+    }
+  }
+  close(dir);
+}
+
 int main(int argc, char **argv) {
   const char *mode = argc == 3 ? argv[2] : "";
   int link_mode = strcmp(mode, "link") == 0 || strcmp(mode, "dotdot-link") == 0;
   int held_mode = strcmp(mode, "held-thread") == 0;
+  int read_mode = strcmp(mode, "read-listed") == 0;
   if (strcmp(mode, "thread-status-dot") == 0) {
     status_spelling = "/proc/thread-self/./status";
   } else if (strcmp(mode, "task-status-dot") == 0) {
     status_spelling = "/proc/self/./task/<tid>/status";
   }
-  CHECK(argc == 2 || (argc == 3 && (link_mode || held_mode || status_spelling != NULL)));
+  CHECK(argc == 2 || (argc == 3 && (link_mode || held_mode || read_mode || status_spelling != NULL)));
   CHECK(snprintf(directory, sizeof directory, "%s", argv[1]) < (int)sizeof directory);
   pid = getpid();
   int tid = (int)syscall(SYS_gettid);
@@ -785,6 +828,12 @@ int main(int argc, char **argv) {
   if (status_spelling != NULL) {
     CHECK(pthread_create(&thread, NULL, second_thread, NULL) == 0);
     CHECK(pthread_join(thread, NULL) == 0);
+    printf("done\n");
+    return 0;
+  }
+  if (read_mode) {
+    read_listed("/proc/self");
+    read_listed("/proc/thread-self");
     printf("done\n");
     return 0;
   }

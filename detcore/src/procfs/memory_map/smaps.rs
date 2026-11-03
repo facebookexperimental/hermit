@@ -492,16 +492,26 @@ fn accounting(out: &mut Vec<u8>, rollup: bool) {
     }
 }
 
+/// Why Detcore cannot render a process's `smaps_rollup` from `map`, if it
+/// cannot: an incomplete list does not say where the address space starts.
+/// The one rule [`render_smaps_rollup`] refuses by, and the one a listing
+/// of the process's directory leaves the name out by
+/// (`Detcore::task_placeholder_snapshot`), so that a listing never names a
+/// `smaps_rollup` its read refuses (dh-62azc).
+pub(crate) fn smaps_rollup_refusal(map: &MemoryMap) -> Option<Refusal> {
+    (!map.complete).then(|| {
+        "Linux's smaps_rollup gives the range from the address space's first mapping to \
+         its last one, and the backend's memory map lists only some of its mappings"
+            .to_string()
+    })
+}
+
 /// The text of a process's `smaps_rollup` for `map`, as Linux prints it
 /// (`show_smaps_rollup`), or the refusal that names why Detcore cannot give
-/// it: an incomplete list does not say where the address space starts.
+/// it ([`smaps_rollup_refusal`]).
 pub(crate) fn render_smaps_rollup(map: &MemoryMap) -> Result<Vec<u8>, Refusal> {
-    if !map.complete {
-        return Err(
-            "Linux's smaps_rollup gives the range from the address space's first mapping to \
-             its last one, and the backend's memory map lists only some of its mappings"
-                .to_string(),
-        );
+    if let Some(refusal) = smaps_rollup_refusal(map) {
+        return Err(refusal);
     }
     let mut own = map.mappings.iter().filter(|mapping| !is_gate_area(mapping));
     let first = own.next();

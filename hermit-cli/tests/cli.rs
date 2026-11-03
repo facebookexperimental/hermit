@@ -67707,6 +67707,11 @@ fn the_callers_own_proc_directories_answer_as_linux() {
 /// renders, `fd`, and a process's `task`), in Linux's order; and a second
 /// thread's directory held while it exits (the guest's held-thread mode),
 /// which Detcore answers from the directory's binding, at L2, as natively.
+/// Every name those listings give opens and reads without a refusal (the
+/// guest's read-listed mode), so `smaps_rollup`, whose read Detcore refuses
+/// while the backend's memory map is incomplete, is listed only when its read
+/// can render it (dh-62azc; KVM's map is incomplete today,
+/// https://github.com/rrnewton/reverie/issues/1211).
 /// Then the guest's other modes ([`OWN_DIRECTORY_MODES`]), each of which stops with
 /// the policy's exit and names why: the open of `/proc/self` itself
 /// (`O_PATH|O_NOFOLLOW`), by its plain spelling and through `..`, which
@@ -67734,7 +67739,6 @@ fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
         "mounts/r",
         "mountinfo/r",
         "smaps/r",
-        "smaps_rollup/r",
         "cgroup/r",
         "io/r",
         "arch_status/r",
@@ -67757,6 +67761,26 @@ fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
         held_thread_native(),
         "kvm held-thread"
     );
+    // Every name the listings give opens and reads without a refusal, so a
+    // listing never advertises a file whose read refuses
+    // (https://github.com/rrnewton/hermit/issues/5063, dh-62azc): the
+    // guest's read-listed mode reads each entry of /proc/self and
+    // /proc/thread-self once, at L2, and reads exactly the names listed.
+    let read = procfs_own_directory_at_l2("kvm", "standard", &["read-listed"]);
+    let mut lines = read.lines().collect::<Vec<_>>();
+    assert_eq!(lines.pop(), Some("done"), "kvm read-listed: {read}");
+    let expected = |directory: &str, thread: bool| {
+        process
+            .iter()
+            .filter_map(|entry| entry.split_once('/'))
+            .filter(|(name, _)| !matches!(*name, "." | ".."))
+            .filter(|(name, _)| !thread || *name != "task")
+            .map(|(name, _)| format!("read {directory}/{name}: ok"))
+            .collect::<Vec<_>>()
+    };
+    let mut wanted = expected("/proc/self", false);
+    wanted.extend(expected("/proc/thread-self", true));
+    assert_eq!(lines, wanted, "kvm read-listed: every listed name reads");
     let guest = procfs_own_directory_guest();
     let link_reason = ["an O_PATH open of /proc/self that does not follow it"; 2];
     let status_reason = "which is not its thread group leader, cannot be served";

@@ -3103,7 +3103,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Detcore's own, which is what Linux lists there less what this backend
     /// would answer otherwise than Linux:
     /// - in a process's or a thread's directory, the per-process files
-    ///   Detcore renders in this session (`ProcfsFile::rendered_path`), the
+    ///   Detcore renders in this session (`ProcfsFile::rendered_path`),
+    ///   `smaps_rollup` among them only while the backend's memory map of the
+    ///   reader's address space is complete, without which its read refuses
+    ///   (`smaps::smaps_rollup_refusal`, dh-62azc), the
     ///   `fd` directory it serves (`descriptor_directory`: a process's to
     ///   every thread of it, a thread's to that thread alone, which is the
     ///   reader taking the listing), and a process's `task`, which it serves
@@ -3137,11 +3140,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A thread's descriptor directory Detcore serves to that thread
         // alone (`fd_directory::classify`).
         let reader = guest.thread_state().dettid.as_raw();
+        // `smaps_rollup` only where its read can render it: the backend's
+        // memory map of the reader's address space, the one the read renders,
+        // is complete (`smaps::smaps_rollup_refusal`, the read's own rule).
+        // On KVM today it is never complete
+        // (https://github.com/rrnewton/reverie/issues/1211), so the name
+        // comes back once the backend reports a complete map (dh-62azc).
+        let rollup_readable = guest.memory_map(guest.tid()).is_ok_and(|map| {
+            crate::procfs::memory_map::smaps::smaps_rollup_refusal(&map).is_none()
+        });
         let kept = |name: &[u8]| match name {
             b"." | b".." => true,
             _ if binding.kind == TaskDirectoryKind::Tasks => true,
             b"fd" => binding.kind == TaskDirectoryKind::Process || binding.tid == reader,
             b"task" => binding.kind == TaskDirectoryKind::Process,
+            b"smaps_rollup" if !rollup_readable => false,
             name => {
                 let path = proc
                     .join(within.strip_prefix("/").unwrap_or(&within))
