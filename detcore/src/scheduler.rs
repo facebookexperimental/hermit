@@ -8267,6 +8267,11 @@ impl Scheduler {
         if let Some(clock) = self.turn_clocks.remove(&caller) {
             self.turn_clocks.insert(new_leader, clock);
         }
+        // The caller survives as the leader: an armed crash of its follows
+        // it to the leader's tid before the kill below forgets the old id,
+        // so the exec's own switch step (note_exec) still finds it. Its
+        // siblings, killed above, genuinely ended and keep the forget.
+        self.post_crash.transfer_arm(caller, new_leader);
         self.logically_kill_thread(&caller, &detpid, pre_exec_mm);
         self.timeslices.remove(&caller);
         retired.push(caller);

@@ -290,6 +290,21 @@ impl PostCrashState {
         }
     }
 
+    /// The exec'ing thread `former` survives its exec under `new` (the
+    /// leader's tid): an armed crash of its follows it there, as its
+    /// timers and queues do, so the exec's own switch step still finds
+    /// it under the surviving identity.
+    pub fn transfer_arm(&mut self, former: DetTid, new: DetTid) {
+        if let Some(armed) = self.armed.remove(&former) {
+            self.armed.insert(new, armed);
+        }
+        for crashes in self.lineage.values_mut() {
+            if crashes.remove(&former) {
+                crashes.insert(new);
+            }
+        }
+    }
+
     /// `dtid` exited: it cannot be in a handler any more.
     pub fn forget(&mut self, dtid: DetTid) {
         self.disarm(dtid);
@@ -853,6 +868,20 @@ mod tests {
         state.process_created(pid(3), pid(21));
         let (_, taken) = step(&mut state, 21, 21, PostCrashEvent::Exec, 13);
         assert_eq!(taken.unwrap().dtid, tid(5), "the lineage still switches");
+    }
+
+    /// An armed thread that execs and survives under the leader's tid
+    /// keeps its arm there: the exec takes its switch, naming the
+    /// surviving identity as the crashed thread.
+    #[test]
+    fn an_exec_survivors_arm_follows_it_to_the_leaders_tid() {
+        let mut state = on();
+        step(&mut state, 5, 3, delivered(ABRT, false), 10);
+        state.transfer_arm(tid(5), tid(3));
+        let (_, taken) = step(&mut state, 3, 3, PostCrashEvent::Exec, 12);
+        let taken = taken.unwrap();
+        assert_eq!(taken.dtid, tid(3));
+        assert_eq!(taken.exec_by, Some(tid(3)));
     }
 
     /// With two threads of one process armed, the switch names the lower
