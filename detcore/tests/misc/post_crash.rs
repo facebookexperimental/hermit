@@ -484,7 +484,12 @@ fn a_pending_realtime_handler_that_execs_does_not_switch() {
 /// A real fault whose handler resolves it and returns; the thread then runs
 /// RDTSC, which Detcore traps, in a loop with no syscall until its slice ends
 /// at a trap and a waiting sibling spawns a program: the switch must not be
-/// taken.
+/// taken. The sibling's program waits on its stdin, so it neither exits nor
+/// sends a SIGCHLD while the RDTSC loop spins: the spawn returns once the
+/// exec has succeeded (`Command::spawn`'s close-on-exec handshake), and the
+/// sibling ends and reaps the program only after the loop is done. A program
+/// that exited at once would leave its parent's SIGCHLD deferred behind the
+/// spinning thread, which never blocks, and the case would never finish.
 #[cfg(target_arch = "x86_64")]
 fn recovered_then_rdtsc_until_sibling_execs() {
     use std::sync::atomic::AtomicBool;
@@ -493,6 +498,7 @@ fn recovered_then_rdtsc_until_sibling_execs() {
     static PAGE: AtomicUsize = AtomicUsize::new(0);
     static RETURNED: AtomicBool = AtomicBool::new(false);
     static SPAWNED: AtomicBool = AtomicBool::new(false);
+    static SPUN: AtomicBool = AtomicBool::new(false);
     extern "C" fn on_segv(_: libc::c_int) {
         // SAFETY: makes the guest's own page readable.
         unsafe {
@@ -509,9 +515,17 @@ fn recovered_then_rdtsc_until_sibling_execs() {
         while !RETURNED.load(Ordering::SeqCst) {
             std::thread::yield_now();
         }
-        let status = std::process::Command::new("/bin/true").status().unwrap();
-        assert!(status.success());
+        let mut program = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
         SPAWNED.store(true, Ordering::SeqCst);
+        while !SPUN.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        drop(program.stdin.take());
+        assert!(program.wait().unwrap().success());
     });
     // SAFETY: the read faults; the handler makes the page readable.
     assert_eq!(unsafe { std::ptr::read_volatile(page as *const u8) }, 0);
@@ -522,6 +536,7 @@ fn recovered_then_rdtsc_until_sibling_execs() {
         acc = acc.wrapping_add(unsafe { core::arch::x86_64::_rdtsc() });
     }
     std::hint::black_box(acc);
+    SPUN.store(true, Ordering::SeqCst);
     sibling.join().unwrap();
 }
 
