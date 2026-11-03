@@ -2548,10 +2548,11 @@ mod tests {
         current.validate().unwrap();
         assert_eq!(current.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
         assert!(current.rows_carry_instruction_offsets());
-        // The same rows in a record written before schedule traces held
-        // offsets: no format, no event offset.
+        // The same rows in a record written by a Hermit whose schedule traces
+        // did not hold offsets: format 4, no event offset.
         let mut legacy = serde_json::to_value(&current).unwrap();
-        legacy.as_object_mut().unwrap().remove("format_version");
+        legacy["format_version"] =
+            serde_json::json!(detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT);
         for event in legacy["global"].as_array_mut().unwrap() {
             event.as_object_mut().unwrap().remove("instruction_offset");
         }
@@ -2622,6 +2623,7 @@ mod tests {
     #[test]
     fn a_trial_of_a_recording_with_instruction_offsets_keeps_its_own_jumps() {
         use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
+        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::types::DetTid;
 
@@ -2647,7 +2649,7 @@ mod tests {
         };
         let s = recording(None, 1000);
         let t = recording(Some(offset), 2000);
-        assert_eq!(s.format_version(), Some(INSTRUCTION_OFFSET_FORMAT - 1));
+        assert_eq!(s.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT - 1));
         assert_eq!(t.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("trial.json");
@@ -2663,7 +2665,7 @@ mod tests {
             }
             for (source, format, target) in [
                 (&t, INSTRUCTION_OFFSET_FORMAT, 2000),
-                (&s, INSTRUCTION_OFFSET_FORMAT - 1, 1000),
+                (&s, INSTRUCTION_OFFSET_ROWS_FORMAT - 1, 1000),
             ] {
                 options
                     .write_trial_record(source.schedule_prefix(2), &output)

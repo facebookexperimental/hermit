@@ -400,7 +400,11 @@ mod tests {
             })
             .unwrap();
         assert!(trials > 1);
-        assert_eq!(minimal.format_version(), None);
+        assert_eq!(
+            minimal.format_version(),
+            Some(detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT)
+        );
+        assert_eq!(minimal.timing_format(), None);
         assert_eq!(
             minimal.recorded_offsets(),
             detcore::preemptions::RecordedOffsets::RowsOnly
@@ -421,10 +425,15 @@ mod tests {
     }
 
     /// Every record minimization writes, its trials' and the minimal one,
-    /// holds rows alone and states no format, from a source with jumps of
-    /// global time with or without instruction offsets: format 2 and every
+    /// holds rows alone and claims no timing format, from a source with jumps
+    /// of global time with or without instruction offsets: format 2 and every
     /// later one claim a complete list of jumps, which rows alone do not hold.
-    /// Its rows keep their exact branch targets and offsets. Each written
+    /// One whose rows keep an offset states format 4
+    /// (`INSTRUCTION_OFFSET_ROWS_FORMAT`), which a Hermit that predates the
+    /// offsets (formats 1 to 3) refuses by name rather than replaying the
+    /// rows without them, and whose rows-only timing is format 1's
+    /// (`PreemptionRecord::timing_format`); one without states none, as
+    /// before. Its rows keep their exact branch targets and offsets. Each written
     /// record validates and reads back, and `hermit run`'s replay guard lets
     /// the preemption replay that runs it through, while a schedule replay of
     /// one that keeps an offset is refused with the rows-only message, as it
@@ -432,8 +441,9 @@ mod tests {
     /// accepts both sources, and refuses a minimal record that keeps an offset
     /// when it is given back to analyze as an input, as any rows-only record.
     #[test]
-    fn a_minimize_record_states_no_format_and_keeps_its_rows() {
+    fn a_minimize_record_states_only_what_its_rows_hold() {
         use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
+        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::preemptions::PreemptionWriter;
         use detcore::preemptions::RecordedOffsets;
@@ -489,7 +499,7 @@ mod tests {
                 Some(if with_offsets {
                     INSTRUCTION_OFFSET_FORMAT
                 } else {
-                    INSTRUCTION_OFFSET_FORMAT - 1
+                    INSTRUCTION_OFFSET_ROWS_FORMAT - 1
                 })
             );
             source.write_to_disk(&preempts_path).unwrap();
@@ -530,13 +540,23 @@ mod tests {
                     .unwrap_or_else(|error| panic!("{label}: {error:#}"))
                     .into_inner();
                 written.validate().unwrap();
-                assert_eq!(written.format_version(), None, "{label}");
+                let keeps_offset = written.rows_carry_instruction_offsets();
+                assert_eq!(
+                    written.format_version(),
+                    keeps_offset.then_some(INSTRUCTION_OFFSET_ROWS_FORMAT),
+                    "{label}"
+                );
+                // Formats 1 to 3, all a Hermit before the offsets reads.
+                let read_before_offsets = written
+                    .format_version()
+                    .is_none_or(|format| (2..=3).contains(&format));
+                assert_eq!(read_before_offsets, !keeps_offset, "{label}");
+                assert_eq!(written.timing_format(), None, "{label}");
                 assert_eq!(written.time_skips(), None, "{label}");
                 let mut rows = written.extract_all().remove(&tid).unwrap().into_iter();
                 while let Some((time, _, rcbs, offset)) = rows.next_with_offset() {
                     assert_eq!(source_rows.get(&time), Some(&(rcbs, offset)), "{label}");
                 }
-                let keeps_offset = written.rows_carry_instruction_offsets();
                 let recorded = detcore::preemptions::read_recorded_offsets(path).unwrap();
                 assert_eq!(
                     recorded,
