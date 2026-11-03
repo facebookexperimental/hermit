@@ -14791,10 +14791,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// not be the one Detcore classified. A
     /// fail-closed run ends here with a named policy refusal
     /// ([`Self::refuse_unserviceable_operation_because`]), and the guest's
-    /// call never runs. A run that allows unsupported operations lets it go
-    /// on, warns once per Hermit process, and records a determinism loss at
-    /// each thread's first such call, so verification refuses to compare the
-    /// run. Returns `None` to go on, or the result the refusal policy chose
+    /// call never runs. A run that allows unsupported operations gets the
+    /// same named refusal with `EOPNOTSUPP` returned to the guest instead
+    /// of the run ending; the call is not issued either way
+    /// (docs/ARCHITECTURE.md principle 6). Returns `None` to go on (never
+    /// for this boundary now), or the result the refusal policy chose
     /// instead.
     async fn admit_shared_binder_call<G: Guest<Self>>(
         &self,
@@ -14804,10 +14805,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<Option<i64>, Error> {
         let reason = crate::syscalls::binder::shared_task_reason(fd, others);
         if self.cfg.panic_on_unsupported_syscalls {
-            let reason = format!(
-                "{reason}. --allow-unsupported-syscalls runs it anyway and records the run as \
-                 nondeterministic"
-            );
+            let reason =
+                format!("{reason}. --allow-unsupported-syscalls returns EOPNOTSUPP for it instead");
             crate::syscalls::helpers::report_refusal_reason(
                 true,
                 &format!(
@@ -14827,24 +14826,31 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await
                 .map(Some);
         }
+        // The opt-in approves this same named refusal with the errno
+        // returned to the guest instead of the run ending; it does not
+        // approve issuing the call (docs/ARCHITECTURE.md principle 6).
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             warn!(
-                "[detcore] HERMIT_SHARED_BINDER_CALL: {reason}; --allow-unsupported-syscalls lets \
-                 it run, and this run is recorded as nondeterministic"
+                "[detcore] HERMIT_SHARED_BINDER_CALL: {reason}; the call is refused with \
+                 EOPNOTSUPP and is not issued"
             );
         }
-        if !std::mem::replace(
-            &mut guest.thread_state_mut().shared_binder_loss_recorded,
-            true,
-        ) {
-            crate::tool_global::report_determinism_loss(
-                guest,
-                format!("HERMIT_SHARED_BINDER_CALL: {reason}"),
-            )
-            .await;
-        }
-        Ok(None)
+        crate::syscalls::helpers::report_refusal_reason(
+            false,
+            &format!(
+                "[dtid {}] ioctl refused: {reason}",
+                guest.thread_state().dettid
+            ),
+        );
+        self.refuse_unserviceable_operation_because(
+            guest,
+            reverie::syscalls::Sysno::ioctl,
+            Errno::EOPNOTSUPP,
+            &reason,
+        )
+        .await
+        .map(Some)
     }
 
     /// Whether this run lets a binder call on `fd` that waits run its
@@ -14855,10 +14861,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// always under `--strict`) ends here with a named policy refusal
     /// ([`Self::refuse_unserviceable_operation_because`]), and the guest's
     /// call never runs. A run that allows unsupported operations
-    /// (`--allow-unsupported-syscalls`) lets the call go to the background,
-    /// warns once per Hermit process, and records a determinism loss at each
-    /// thread's first such call, so verification refuses to compare the run. Returns `None` to go on, or
-    /// the result the refusal policy chose instead.
+    /// (`--allow-unsupported-syscalls`) gets the same named refusal with
+    /// `EOPNOTSUPP` returned to the guest instead of the run ending; the
+    /// call is not issued either way (docs/ARCHITECTURE.md principle 6).
+    /// Returns `None` to go on (never for this boundary now), or the result
+    /// the refusal policy chose instead.
     async fn admit_host_timed_binder_call<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -14869,8 +14876,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if self.cfg.panic_on_unsupported_syscalls {
             let reason = format!(
                 "{reason}. Hermit cannot run it deterministically; \
-                 --allow-unsupported-syscalls runs it anyway and records the run as \
-                 nondeterministic"
+                 --allow-unsupported-syscalls returns EOPNOTSUPP for it instead"
             );
             crate::syscalls::helpers::report_refusal_reason(
                 true,
@@ -14891,27 +14897,31 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await
                 .map(Some);
         }
-        // The warning is once per Hermit process; the loss is recorded by
-        // each thread's first such call, so every run that makes one records
-        // it, whatever ran before it in this process.
+        // The opt-in approves this same named refusal with the errno
+        // returned to the guest instead of the run ending; it does not
+        // approve issuing the call (docs/ARCHITECTURE.md principle 6).
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             warn!(
-                "[detcore] HERMIT_HOST_TIMED_BINDER: {reason}; --allow-unsupported-syscalls lets it \
-                 run, and this run is recorded as nondeterministic"
+                "[detcore] HERMIT_HOST_TIMED_BINDER: {reason}; the call is refused with \
+                 EOPNOTSUPP and is not issued"
             );
         }
-        if !std::mem::replace(
-            &mut guest.thread_state_mut().host_timed_binder_loss_recorded,
-            true,
-        ) {
-            crate::tool_global::report_determinism_loss(
-                guest,
-                format!("HERMIT_HOST_TIMED_BINDER: {reason}"),
-            )
-            .await;
-        }
-        Ok(None)
+        crate::syscalls::helpers::report_refusal_reason(
+            false,
+            &format!(
+                "[dtid {}] ioctl refused: {reason}",
+                guest.thread_state().dettid
+            ),
+        );
+        self.refuse_unserviceable_operation_because(
+            guest,
+            reverie::syscalls::Sysno::ioctl,
+            Errno::EOPNOTSUPP,
+            &reason,
+        )
+        .await
+        .map(Some)
     }
 
     /// After a successful `BINDER_WRITE_READ` on `fd`, whose
@@ -21812,6 +21822,9 @@ mod inject_fstat_scratch {
         unreported_at_ioctl: Option<bool>,
         /// The determinism losses the guest reported to the global state.
         determinism_losses: std::sync::Mutex<Vec<String>>,
+        /// The resource sets this guest requested from the scheduler, in
+        /// order, for a test that witnesses a turn release.
+        resource_requests: std::sync::Mutex<Vec<Vec<crate::resources::ResourceID>>>,
     }
 
     impl ScriptedGuest {
@@ -21866,6 +21879,7 @@ mod inject_fstat_scratch {
                 binder_read_fault: None,
                 unreported_at_ioctl: None,
                 determinism_losses: Default::default(),
+                resource_requests: Default::default(),
             };
             (tool, guest)
         }
@@ -21927,6 +21941,22 @@ mod inject_fstat_scratch {
                     })
                     .collect();
                 return (None, GlobalResponse::ProcfsIds(resolved));
+            }
+            {
+                let request = match &message.2 {
+                    GlobalRequest::WithForwardedCount(_, inner) => inner.as_ref(),
+                    other => other,
+                };
+                if let GlobalRequest::RequestResources(resources, _) = request {
+                    self.resource_requests
+                        .lock()
+                        .unwrap()
+                        .push(resources.resources.keys().cloned().collect());
+                    return (
+                        None,
+                        GlobalResponse::RequestResources(crate::tool_global::ResumeStatus::Normal),
+                    );
+                }
             }
             if let GlobalRequest::RecordDeterminismLoss(reason) = &message.2 {
                 self.determinism_losses.lock().unwrap().push(reason.clone());
@@ -22349,9 +22379,8 @@ mod inject_fstat_scratch {
     /// A freeze, and a write+read, are never kept in the caller's turn by
     /// the poll: a ready caller says nothing about whether the freeze's target
     /// drains or whether the write half leaves the read anything to take.
-    /// Where the run allows unsupported operations they run on the background
-    /// path without a poll, and the run records a determinism loss for their
-    /// off-turn effect. Before, each polled first and, with its caller ready,
+    /// Where the run allows unsupported operations they are refused with
+    /// `EOPNOTSUPP` without a poll and without being issued. Before, each polled first and, with its caller ready,
     /// ran in the caller's turn, holding the guest's only turn until the
     /// freeze timed out or the read's reply came, which nothing could send.
     #[tokio::test]
@@ -22379,7 +22408,6 @@ mod inject_fstat_scratch {
                 "ioctl(BINDER_WRITE_READ) on descriptor 99 both writes and waits",
             ),
         ];
-        let mut losses = Vec::new();
         for (request, argument, named) in calls {
             let (_, mut guest) = ScriptedGuest::new(true, false);
             model_binder_descriptor(&guest);
@@ -22392,33 +22420,24 @@ mod inject_fstat_scratch {
                 .with_request(syscalls::ioctl::Request::Other(request as usize, argument));
             let routed = tool
                 .run_binder_call(&mut guest, call, 99, request, argument)
-                .await
-                .unwrap();
-            assert_eq!(
-                routed,
-                (0, crate::syscalls::binder::BinderRun::OffTurnAlone),
+                .await;
+            // Refused with the errno, without a poll and without the ioctl.
+            assert!(errno_refused(&routed), "{named}: {routed:?}");
+            assert!(guest.injected.is_empty(), "{named}: {:?}", guest.injected);
+            assert!(
+                guest.determinism_losses.lock().unwrap().is_empty(),
                 "{named}"
             );
-            assert_eq!(guest.injected, vec![Sysno::ioctl], "{named}");
-            // Each of these is a run of its own, and records its loss.
-            let recorded = guest.determinism_losses.lock().unwrap().clone();
-            assert_eq!(recorded.len(), 1, "{named}: {recorded:?}");
-            assert!(
-                recorded[0].starts_with(&format!("HERMIT_HOST_TIMED_BINDER: {named}")),
-                "{recorded:?}"
-            );
-            losses.extend(recorded);
         }
-        assert_eq!(losses.len(), 2, "{losses:?}");
     }
 
-    /// Every run that lets a binder call run its effect off the turn records
-    /// a determinism loss, though the warning is once per Hermit process: a
-    /// later run in the same process is not left unmarked. Within one thread
-    /// the loss is recorded once. Before, one per-process latch gated both,
-    /// so the second run here recorded nothing.
+    /// Every run under the opt-in is refused the same way, with nothing
+    /// issued: the first and a later run in the same process each get
+    /// `EOPNOTSUPP` for a host-timed freeze, repeatedly, and no ioctl is
+    /// ever injected. Before, the call ran on the background path and
+    /// each run recorded a determinism loss for its off-turn effect.
     #[tokio::test]
-    async fn every_run_that_lets_a_binder_effect_run_off_the_turn_records_the_loss() {
+    async fn every_run_under_the_opt_in_is_refused_without_issuing_the_call() {
         let mut freeze = [7u32, 1, 100];
         let argument = freeze.as_mut_ptr() as usize;
         let request = crate::syscalls::binder::BINDER_FREEZE;
@@ -22433,20 +22452,11 @@ mod inject_fstat_scratch {
                     .with_request(syscalls::ioctl::Request::Other(request as usize, argument));
                 let routed = tool
                     .run_binder_call(&mut guest, call, 99, request, argument)
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    routed,
-                    (0, crate::syscalls::binder::BinderRun::OffTurnAlone),
-                    "{run}"
-                );
+                    .await;
+                assert!(errno_refused(&routed), "{run}: {routed:?}");
             }
-            let recorded = guest.determinism_losses.lock().unwrap().clone();
-            assert_eq!(recorded.len(), 1, "{run} run: {recorded:?}");
-            assert!(
-                recorded[0].starts_with("HERMIT_HOST_TIMED_BINDER: ioctl(BINDER_FREEZE)"),
-                "{recorded:?}"
-            );
+            assert!(guest.injected.is_empty(), "{run}: {:?}", guest.injected);
+            assert!(guest.determinism_losses.lock().unwrap().is_empty(), "{run}");
         }
     }
 
@@ -22802,14 +22812,109 @@ mod inject_fstat_scratch {
             if error.downcast_ref::<crate::UnsupportedSyscallError>().is_some())
     }
 
+    /// The opt-in's form of the same refusal: `EOPNOTSUPP` for the guest,
+    /// with the call never issued.
+    fn errno_refused(routed: &Result<(i64, crate::syscalls::binder::BinderRun), Error>) -> bool {
+        matches!(routed, Err(Error::Errno(Errno::EOPNOTSUPP)))
+    }
+
+    /// The sequentialized witness for the off-the-turn route: with threads
+    /// sequentialized, a waiting binder read that goes off the turn alone
+    /// releases the caller's scheduler turn with
+    /// `BlockingExternalIO(op_id)` and rejoins it with the matching
+    /// `BlockedExternalContinue(op_id)`, in that order. If dispatch ever
+    /// goes back to serving such a call by record/replay alone, neither
+    /// request is made and this fails. A ready read served in the turn
+    /// makes neither request.
+    #[tokio::test]
+    async fn a_sequentialized_waiting_binder_read_releases_and_rejoins_its_turn() {
+        use crate::resources::ResourceID;
+        use crate::syscalls::binder::BinderRun;
+
+        async fn run(ready: Option<i64>) -> (BinderRun, Vec<Vec<ResourceID>>) {
+            let mut buffer = [0u8; 256];
+            let mut words = [0, 0, 0, 256, 0, buffer.as_mut_ptr() as u64];
+            let argument = words.as_mut_ptr() as usize;
+            let (_, mut guest) = ScriptedGuest::new(true, false);
+            model_binder_descriptor(&guest);
+            guest.config.sequentialize_threads = true;
+            guest.ppoll_ready = Some(ready.unwrap_or(0));
+            guest.binder_read_consumed = Some(0);
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+            let call =
+                syscalls::Ioctl::new()
+                    .with_fd(99)
+                    .with_request(syscalls::ioctl::Request::Other(
+                        crate::syscalls::binder::BINDER_WRITE_READ as usize,
+                        argument,
+                    ));
+            let routed = tool
+                .run_binder_call(
+                    &mut guest,
+                    call,
+                    99,
+                    crate::syscalls::binder::BINDER_WRITE_READ,
+                    argument,
+                )
+                .await
+                .unwrap();
+            let history = guest.resource_requests.lock().unwrap().clone();
+            (routed.1, history)
+        }
+
+        let (route, history) = run(None).await;
+        assert_eq!(route, BinderRun::OffTurnAlone);
+        let release = history.iter().position(|request| {
+            request
+                .iter()
+                .any(|id| matches!(id, ResourceID::BlockingExternalIO(_)))
+        });
+        let rejoin = history.iter().position(|request| {
+            request
+                .iter()
+                .any(|id| matches!(id, ResourceID::BlockedExternalContinue(_)))
+        });
+        let (Some(release), Some(rejoin)) = (release, rejoin) else {
+            panic!("no turn release/rejoin in the resource history: {history:?}");
+        };
+        assert!(release < rejoin, "{history:?}");
+        let released_op = history[release]
+            .iter()
+            .find_map(|id| match id {
+                ResourceID::BlockingExternalIO(op) => Some(*op),
+                _ => None,
+            })
+            .unwrap();
+        let rejoined_op = history[rejoin]
+            .iter()
+            .find_map(|id| match id {
+                ResourceID::BlockedExternalContinue(op) => Some(*op),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(released_op, rejoined_op, "{history:?}");
+
+        // The ready control stays in the turn and releases nothing.
+        let (route, history) = run(Some(1)).await;
+        assert_eq!(route, BinderRun::InTurn);
+        assert!(
+            history.iter().flatten().all(|id| !matches!(
+                id,
+                ResourceID::BlockingExternalIO(_) | ResourceID::BlockedExternalContinue(_)
+            )),
+            "{history:?}"
+        );
+    }
+
     /// A binder call that would wait runs off the guest's turn alone only
     /// while its caller is the run's one task. Beside any other task, of its
     /// process or another, a child that exited and is not reaped yet, a clone
     /// still in flight (even one whose creator's process was reaped since),
     /// a debugger the run serves, or a record that does not know its tasks,
     /// a run that fails closed refuses it by name before it runs, with
-    /// nothing injected, and one that allows unsupported operations runs it
-    /// off the turn and records the loss, naming who else could act. A reaped
+    /// nothing injected, and one that allows unsupported operations gets
+    /// the same refusal as an `EOPNOTSUPP` for the guest, also with
+    /// nothing injected. A reaped
     /// child is gone. Before, a call went off the turn alone wherever its
     /// table, address space and buffers were not seen shared, which missed
     /// memory a merged shared mapping, a writable `/proc/<pid>/mem` or a
@@ -22888,17 +22993,10 @@ mod inject_fstat_scratch {
                         assert!(injected.is_empty(), "{case}: {injected:?}");
                         assert!(losses.is_empty(), "{case}: {losses:?}");
                     }
-                    (Some(named), false) => {
-                        assert_eq!(routed.unwrap(), (0, BinderRun::OffTurnShared), "{case}");
-                        assert_eq!(injected, vec![Sysno::ioctl], "{case}");
-                        assert_eq!(losses.len(), 1, "{case}: {losses:?}");
-                        assert!(
-                            losses[0].starts_with(
-                                "HERMIT_SHARED_BINDER_CALL: a binder call on descriptor 99 waits \
-                                 for another process"
-                            ) && losses[0].contains(named),
-                            "{case}: {losses:?}"
-                        );
+                    (Some(_), false) => {
+                        assert!(errno_refused(&routed), "{case}: {routed:?}");
+                        assert!(injected.is_empty(), "{case}: {injected:?}");
+                        assert!(losses.is_empty(), "{case}: {losses:?}");
                     }
                 }
             }
@@ -22909,9 +23007,10 @@ mod inject_fstat_scratch {
     /// which it announces before (`ThreadState::begin_native_clone`) and
     /// reports afterwards (`Detcore::register_external_child`), counts for
     /// the binder rule from that announcement: the parent's waiting binder
-    /// read is then refused by name where the run fails closed, and marked
-    /// where it allows it. One reported without its announcement leaves the
-    /// run's tasks unknown, and the read is refused or marked the same way.
+    /// read is then refused by name where the run fails closed, and refused
+    /// with `EOPNOTSUPP` where it allows unsupported operations. One
+    /// reported without its announcement leaves the run's tasks unknown,
+    /// and the read is refused the same way.
     /// Before, such a child never entered the run's record, and the parent
     /// read off the turn as if alone beside it.
     #[tokio::test]
@@ -22972,9 +23071,9 @@ mod inject_fstat_scratch {
                     assert!(refused(&routed), "{named}: {routed:?}");
                     assert!(guest.injected.is_empty(), "{:?}", guest.injected);
                 } else {
-                    assert_eq!(routed.unwrap(), (0, BinderRun::OffTurnShared));
-                    assert_eq!(losses.len(), 1, "{losses:?}");
-                    assert!(losses[0].contains(named), "{named}: {losses:?}");
+                    assert!(errno_refused(&routed), "{named}: {routed:?}");
+                    assert!(guest.injected.is_empty(), "{:?}", guest.injected);
+                    assert!(losses.is_empty(), "{losses:?}");
                 }
             }
         }
@@ -23480,11 +23579,10 @@ mod inject_fstat_scratch {
 
     /// A ready binder read keeps the turn, with no wait at all, only where
     /// its caller is the run's one task, under either policy: beside another
-    /// task a rival read could take the work the poll saw (a run that allows
-    /// it lets that rival wait off the turn), and this read would then wait
-    /// in the turn while nothing else runs. There it takes the off-the-turn
-    /// route, without asking the poll: refused by name where the run fails
-    /// closed, marked where it allows it. Before, a ready read beside a
+    /// task a rival read could take the work the poll saw, and this read
+    /// would then wait in the turn while nothing else runs. There it is
+    /// refused without asking the poll: by name where the run fails closed,
+    /// with `EOPNOTSUPP` where it allows unsupported operations. Before, a ready read beside a
     /// sibling of its own table kept the turn where the run failed closed.
     #[tokio::test]
     async fn a_ready_binder_read_keeps_the_turn_only_while_its_caller_is_the_run_s_one_task() {
@@ -23499,9 +23597,9 @@ mod inject_fstat_scratch {
                 assert!(refused(&routed), "{routed:?}");
                 assert!(injected.is_empty(), "{injected:?}");
             } else {
-                assert_eq!(routed.unwrap(), (0, BinderRun::OffTurnShared));
-                assert_eq!(injected, vec![Sysno::ioctl]);
-                assert_eq!(losses.len(), 1, "{losses:?}");
+                assert!(errno_refused(&routed), "{routed:?}");
+                assert!(injected.is_empty(), "{injected:?}");
+                assert!(losses.is_empty(), "{losses:?}");
             }
         }
     }
@@ -23512,7 +23610,8 @@ mod inject_fstat_scratch {
     /// and moved after a fork, and a forked parent that can open the
     /// caller's `/proc/<pid>/mem` for writing after the call is admitted.
     /// Neither is read any more: the other task alone refuses the call where
-    /// the run fails closed and marks it where the run allows it.
+    /// the run fails closed, and refuses it with `EOPNOTSUPP` where the run
+    /// allows unsupported operations.
     #[tokio::test]
     async fn a_merged_shared_mapping_or_a_late_mem_writer_beside_another_task_is_refused_or_marked()
     {
@@ -23563,8 +23662,9 @@ mod inject_fstat_scratch {
                     assert!(refused(&routed), "{case}: {routed:?}");
                     assert!(injected.is_empty(), "{case}: {injected:?}");
                 } else {
-                    assert_eq!(routed.unwrap(), (0, BinderRun::OffTurnShared), "{case}");
-                    assert_eq!(losses.len(), 1, "{case}: {losses:?}");
+                    assert!(errno_refused(&routed), "{case}: {routed:?}");
+                    assert!(injected.is_empty(), "{case}: {injected:?}");
+                    assert!(losses.is_empty(), "{case}: {losses:?}");
                 }
             }
         }

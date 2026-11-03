@@ -67284,6 +67284,17 @@ fn a_strict_replay_refuses_binder() {
         &[&epoch, &record_flag],
     );
     assert_success(&recorded, &["binder_fd_passing", "ping", "client"]);
+    // The supported arrangement (client alone under Hermit) stores its
+    // readmissions in the record; PR #4761 still refuses the strict replay
+    // below because binder reply payloads are not recorded.
+    let json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    assert!(
+        json["rejoins"]
+            .as_array()
+            .is_some_and(|rejoins| !rejoins.is_empty()),
+        "the recording stored no readmission"
+    );
     let replay_flag = format!("--replay-preemptions-from={}", record.display());
 
     let strict = binder_guest_output_with_on_a_capable_host(

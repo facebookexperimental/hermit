@@ -1853,14 +1853,14 @@ is never alone again, so a fail-closed run refuses its waiting binder calls.
 
 Beside any other task, such a call is refused by name, naming the other tasks,
 and the run ends with the policy-refusal status (122). With
-`--allow-unsupported-syscalls` it runs off the turn anyway, and the run records
-a determinism loss (`HERMIT_SHARED_BINDER_CALL`), so verification refuses to
-compare it: a libbinder thread pool, or a client and service that both run under
-Hermit and wait for each other, need this option. A call that sends and waits in
-one `BINDER_WRITE_READ` (as libbinder's `talkWithDriver` does) is refused the
-same way, or with the option recorded as `HERMIT_HOST_TIMED_BINDER`. Calls that
-do not wait, such as every read on a descriptor opened `O_NONBLOCK`, run in the
-caller's turn as usual.
+`--allow-unsupported-syscalls` the same named refusal returns `EOPNOTSUPP` to
+the guest instead of ending the run (`HERMIT_SHARED_BINDER_CALL`); the call is
+not issued either way: a libbinder thread pool, or a client and service that
+both run under Hermit and wait for each other, cannot be served this way. A
+call that sends and waits in one `BINDER_WRITE_READ` (as libbinder's
+`talkWithDriver` does) is refused the same way, recorded as
+`HERMIT_HOST_TIMED_BINDER`. Calls that do not wait, such as every read on a
+descriptor opened `O_NONBLOCK`, run in the caller's turn as usual.
 
 A `--strict` run never holds a binder descriptor, in a fresh run and in a
 replay alike: binder reply payloads are not recorded, so no run can repeat
