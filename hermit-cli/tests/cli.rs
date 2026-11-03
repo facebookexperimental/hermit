@@ -282,6 +282,7 @@ static SLEEP_IGNORED_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STATX_UNIQUE_MOUNT_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_HANDLER_TURN_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static UNTRAP_PASSTHROUGH_CALLS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LISTINGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VIRTUAL_KERNEL_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OMITTED_PROCFS_NAMES_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1795,6 +1796,32 @@ fn procfs_links_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "procfs-links guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn untrap_passthrough_calls_guest() -> &'static Path {
+    UNTRAP_PASSTHROUGH_CALLS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("untrap-passthrough-calls");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create untrap-passthrough-calls directory");
+        let guest = build_root.join("untrap_passthrough_calls");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/untrap_passthrough_calls.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile untrap-passthrough-calls guest");
+        assert!(
+            output.status.success(),
+            "untrap-passthrough-calls guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -8483,6 +8510,121 @@ fn detcore_answers_its_procfs_links_on_every_backend() {
             .map(|(backend, _)| *backend)
             .chain(["ptrace/record"])
             .collect::<Vec<_>>()
+    );
+}
+
+/// `--untrap-passthrough-syscalls` leaves its seven calls to the kernel: none
+/// reaches a Detcore handler, logs a line or charges virtual time, and each
+/// mode still repeats at bitwise parity. `tests/c/untrap_passthrough_calls.c`
+/// makes each of the seven calls 1,000 times between two `CLOCK_MONOTONIC`
+/// reads, under `hermit run --verify --verify-strict` (ptrace, relaxation:
+/// not `--strict`, which refuses the flag) with the flag and without it. Both
+/// runs match with nonzero compared INFO messages and print the same results.
+/// Without the flag the summary counts 7,000 more syscalls, 1,000 of each
+/// call in its histogram, the verify run compares 14,000 more INFO messages
+/// (each trapped call logs its entry and its result), and the guest's
+/// interval is 7,000 times the 250 ns charge longer
+/// (`detcore::syscall_time::cost_ns`). With the flag the histogram lists
+/// none of the seven and says its observation is partial. The flag needs the
+/// preemption timer, so this runs where a PMU is: privileged-test.pmu_cli_cases.
+#[test]
+fn untrapped_passthrough_calls_reach_no_detcore_handler_and_charge_no_time() {
+    const CALLS: u64 = 1_000;
+    const UNTRAPPED: [&str; 7] = [
+        "getppid",
+        "umask",
+        "getgroups",
+        "capget",
+        "sched_get_priority_max",
+        "sched_get_priority_min",
+        "get_robust_list",
+    ];
+    let guest = untrap_passthrough_calls_guest()
+        .to_str()
+        .expect("guest path is UTF-8");
+    let calls = CALLS.to_string();
+    let run = |untrap: bool| {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verify = directory.path().join("verify.json");
+        let summary = directory.path().join("summary.json");
+        let mut args = vec![
+            "run",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            "--base-env=minimal",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verify.to_str().unwrap(),
+            "--summary-json",
+            summary.to_str().unwrap(),
+        ];
+        if untrap {
+            args.push("--untrap-passthrough-syscalls");
+        }
+        args.extend(["--", guest, calls.as_str()]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let read = |path: &Path| -> serde_json::Value {
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+        };
+        (stdout(&output), read(&verify), read(&summary))
+    };
+    let (trapped_out, trapped_verify, trapped_summary) = run(false);
+    let (untrapped_out, untrapped_verify, untrapped_summary) = run(true);
+
+    let messages = |verify: &serde_json::Value, mode: &str| {
+        assert_eq!(verify["verdict"], "matched", "{mode}: {verify}");
+        assert_eq!(verify["bitwise_parity"], true, "{mode}: {verify}");
+        let compared = &verify["compared_log_messages"];
+        assert_eq!(compared["left"], compared["right"], "{mode}: {verify}");
+        let count = compared["left"].as_u64().unwrap();
+        assert!(count > 0, "{mode}: {verify}");
+        count
+    };
+    assert_eq!(
+        messages(&trapped_verify, "trapped") - messages(&untrapped_verify, "untrapped"),
+        UNTRAPPED.len() as u64 * CALLS * 2
+    );
+
+    let handled = |summary: &serde_json::Value, name: &str| {
+        summary["syscall_histogram"]["syscalls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == name)
+            .map_or(0, |row| row["calls"].as_u64().unwrap())
+    };
+    for name in UNTRAPPED {
+        assert_eq!(handled(&trapped_summary, name), CALLS, "trapped {name}");
+        assert_eq!(handled(&untrapped_summary, name), 0, "untrapped {name}");
+    }
+    assert_eq!(
+        trapped_summary["syscalls"].as_u64().unwrap()
+            - untrapped_summary["syscalls"].as_u64().unwrap(),
+        UNTRAPPED.len() as u64 * CALLS
+    );
+    assert_eq!(
+        trapped_summary["syscall_histogram"]["observation_scope"]["kind"],
+        "complete"
+    );
+    assert_eq!(
+        untrapped_summary["syscall_histogram"]["observation_scope"],
+        serde_json::json!({"kind": "partial", "gaps": ["untrapped_passthrough"]})
+    );
+
+    let (trapped_results, trapped_interval) = trapped_out.split_once("interval ").unwrap();
+    let (untrapped_results, untrapped_interval) = untrapped_out.split_once("interval ").unwrap();
+    assert_eq!(trapped_results, untrapped_results);
+    let nanos = |line: &str| -> u64 {
+        line.trim_end()
+            .strip_suffix(" ns")
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    assert_eq!(
+        nanos(trapped_interval) - nanos(untrapped_interval),
+        UNTRAPPED.len() as u64 * CALLS * 250
     );
 }
 

@@ -3535,6 +3535,12 @@
       "why": "tests/c/untraced_clone.c is owned by hermit-cli/tests/cli.rs: Guest that makes children with CLONE_UNTRACED in the shapes programs use, LeakSanitizer's exit-time helper (sharing memory, files and fs, no exit signal, waited for with __WALL), a fork-like child, a thread joined through CLONE_CHILD_CLEARTID and a clone3 child, and prints what it saw, so the integration test can compare a hermit run with a native one. Driven only by its own integration test, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/untrap_passthrough_calls.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/untrap_passthrough_calls.c is owned by hermit-cli/tests/cli.rs: the CLI test untrapped_passthrough_calls_reach_no_detcore_handler_and_charge_no_time runs it under ptrace hermit run --verify --verify-strict with --untrap-passthrough-syscalls and without, and requires both to match at bitwise parity and print the same call results, with the seven untrapped calls absent from the run summary's histogram, 2 INFO messages per call fewer and 250 ns of virtual time per call less with the flag (https://github.com/rrnewton/hermit/pull/4764). It runs in privileged-test.pmu_cli_cases because the flag needs the preemption timer. It stays a fixture because a generic manifest cannot compare two runs' summaries and logs."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/userfaultfd_self_service.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
