@@ -3002,6 +3002,9 @@ mod tests {
                     "prefix of {len} events"
                 );
             }
+        }
+    }
+
     /// The post-crash bound is a setting of the whole run, which every prefix
     /// of the schedule keeps; the switches the run took are points of it,
     /// which only a prefix of the whole schedule keeps (a shorter one lists
