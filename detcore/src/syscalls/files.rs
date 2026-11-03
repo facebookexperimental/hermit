@@ -1148,6 +1148,67 @@ fn property_area_name<'a>(guest_dir: &Path, path: &'a Path) -> Option<&'a std::f
     Some(file)
 }
 
+/// The area name of a kernel-resolved path (`/proc/<pid>/fd/<fd>` of an
+/// opened descriptor): the kernel has already walked `..`, symlinks and
+/// dirfds, so a lexical check on *this* path is a check on the object
+/// itself, not on the guest's spelling. `guest_dir` itself may be named
+/// through a symlink, so its canonical form is tried too.
+fn resolved_property_area_name(
+    snapshot: &detcore_model::config::PropertySnapshot,
+    resolved: &Path,
+) -> Option<String> {
+    let resolved = resolved
+        .to_string_lossy()
+        .strip_suffix(" (deleted)")
+        .map_or_else(|| resolved.to_path_buf(), PathBuf::from);
+    if let Some(name) = property_area_name(&snapshot.guest_dir, &resolved) {
+        return Some(name.to_string_lossy().into_owned());
+    }
+    let canonical = crate::util::canonicalize(&snapshot.guest_dir).ok()?;
+    if canonical == snapshot.guest_dir {
+        return None;
+    }
+    property_area_name(&canonical, &resolved).map(|name| name.to_string_lossy().into_owned())
+}
+
+/// The area name of the live object `(dev, ino)`, found by listing the
+/// live area itself: a fallback where the tool cannot name a guest
+/// descriptor. Only an object on the area's own filesystem can be in it.
+fn live_area_name_by_identity(
+    snapshot: &detcore_model::config::PropertySnapshot,
+    dev: u64,
+    ino: u64,
+) -> Option<String> {
+    let area = crate::util::raw_stat(&snapshot.guest_dir).ok()?;
+    if area.st_dev != dev {
+        return None;
+    }
+    crate::util::find_in_directory(&snapshot.guest_dir, |name| {
+        let meta = crate::util::raw_stat(&snapshot.guest_dir.join(name)).ok()?;
+        ((meta.st_dev, meta.st_ino) == (dev, ino)).then(|| name.to_string_lossy().into_owned())
+    })
+    .ok()
+    .flatten()
+}
+
+/// Whether the live object `(dev, ino)` a descriptor reached, whose
+/// kernel-resolved path is `resolved` where the tool can name it, is a
+/// file of the live area the snapshot does not catalogue (neither copied
+/// nor known-uncopied): its area name, if so.
+fn uncatalogued_area_name(
+    snapshot: &detcore_model::config::PropertySnapshot,
+    resolved: Option<&Path>,
+    dev: u64,
+    ino: u64,
+) -> Option<String> {
+    if snapshot.known_live_file(dev, ino).is_some() {
+        return None;
+    }
+    resolved
+        .and_then(|path| resolved_property_area_name(snapshot, path))
+        .or_else(|| live_area_name_by_identity(snapshot, dev, ino))
+}
+
 /// Whether an open with `flags` only reads: `O_RDONLY` without `O_CREAT` or
 /// `O_TRUNC`, or `O_PATH`, for which Linux ignores every flag but
 /// `O_CLOEXEC`, `O_DIRECTORY` and `O_NOFOLLOW` (fs/open.c `build_open_flags`).
@@ -5872,10 +5933,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             },
         };
-        match snapshot.known_live_file(dev, ino) {
-            Some(file) => LiveCheck::Live(format!(
+        if let Some(file) = snapshot.known_live_file(dev, ino) {
+            return LiveCheck::Live(format!(
                 "an open reached the live property file {}",
                 file.name
+            ));
+        }
+        // An object the capture never catalogued (a file the area gained
+        // afterwards) is still in the live area if the object the kernel
+        // resolved this descriptor to is: by its resolved path, or by its
+        // identity among the area's current entries.
+        let resolved = resolved_open_path(&self.cfg.backend, guest.pid().as_raw(), fd);
+        match uncatalogued_area_name(snapshot, resolved.as_deref(), dev, ino) {
+            Some(name) => LiveCheck::Live(format!(
+                "{name} is in the property area but not in its snapshot"
             )),
             None => LiveCheck::NotLive,
         }
@@ -5911,6 +5982,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 file.name
             );
             self.live_property_area_allowed(guest, &reason).await?;
+            return Ok(());
+        }
+        let resolved = resolved_open_path(&self.cfg.backend, guest.pid().as_raw(), fd);
+        if let Some(name) =
+            uncatalogued_area_name(snapshot, resolved.as_deref(), stat.st_dev, stat.st_ino)
+        {
+            let reason = format!(
+                "descriptor {fd}, which Hermit did not open from its snapshot, maps {name}, \
+                 which is in the property area but not in its snapshot"
+            );
+            self.live_property_area_allowed(guest, &reason).await?;
         }
         Ok(())
     }
@@ -5929,6 +6011,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         // snapshot whose copy paths are longer, and a smaller buffer fits
         // more guest stacks than `PATH_MAX` would.
         const CAPACITY: usize = 512;
+        // hermit-cli publishes an absolute copy root; a relative one left
+        // in a configuration is bound here, against this tool's working
+        // directory, so the guest's dirfd/cwd below cannot move it.
+        let copy = if copy.is_absolute() {
+            copy
+        } else {
+            std::path::absolute(&copy).unwrap_or(copy)
+        };
         let bytes = std::os::unix::ffi::OsStrExt::as_bytes(copy.as_os_str());
         let mut stack = guest.stack().await;
         if bytes.len() >= CAPACITY || stack.capacity() < CAPACITY {
@@ -5949,7 +6039,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(guard) => guard,
             Err(error) => return (Err(error.into()), None),
         };
-        let call = call.with_path(PathPtr::from_ptr(address.as_raw() as *const libc::c_char));
+        // The copy is opened by its absolute path with `AT_FDCWD`: the
+        // guest's dirfd (which may name the property area itself) and its
+        // current directory must not resolve the copy's path. A copy path
+        // that is still relative is made absolute against this tool's own
+        // working directory, never the guest's.
+        let call = call
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(PathPtr::from_ptr(address.as_raw() as *const libc::c_char));
         let result = self.record_or_replay(guest, Syscall::Openat(call)).await;
         drop(stack_guard);
         (result.map_err(Error::from), Some(copy))
@@ -5969,9 +6066,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Whether the guest may read the live property area where the snapshot
-    /// should have served it, for `reason`: a fail-closed run (the default,
-    /// and `--strict`) is refused; a run with `--allow-unsupported-syscalls`
-    /// reads it, and says so once.
+    /// should have served it, for `reason`: never. This operation cannot
+    /// be served from the snapshot, so it goes through the named
+    /// refusal/errno policy in both modes (`docs/ARCHITECTURE.md`
+    /// principle 6): a fail-closed run (the default, and `--strict`) stops,
+    /// and a run with `--allow-unsupported-syscalls` prints the same named
+    /// refusal and returns `EOPNOTSUPP` to the guest. No live read or map
+    /// is issued on this path. Operations that do not read property data
+    /// never reach here and keep their native behaviour.
     async fn live_property_area_allowed<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -5987,22 +6089,24 @@ impl<T: RecordOrReplay> Detcore<T> {
                 &mut crate::util::RetryingStderr,
                 format_args!("hermit: {message}\n"),
             );
-            self.refuse_unserviceable_operation_because(
-                guest,
-                Sysno::openat,
-                Errno::EOPNOTSUPP,
-                &message,
-            )
-            .await?;
-            return Err(Errno::EOPNOTSUPP.into());
-        }
-        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        } else if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             let _ = std::io::Write::write_fmt(
                 &mut crate::util::RetryingStderr,
                 format_args!("WARNING: {message}\n"),
             );
         }
-        Ok(())
+        match self
+            .refuse_unserviceable_operation_because(
+                guest,
+                Sysno::openat,
+                Errno::EOPNOTSUPP,
+                &message,
+            )
+            .await
+        {
+            Ok(_) => Err(Errno::EOPNOTSUPP.into()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Whether guest descriptor `fd` is open on the launcher a launched run
@@ -6442,11 +6546,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     None => None,
                 };
                 if let Some(reason) = live_read {
-                    if self.cfg.panic_on_unsupported_syscalls {
-                        let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
-                        resource_release_all(guest).await;
-                    }
-                    Box::pin(self.live_property_area_allowed(guest, &reason)).await?;
+                    // The live descriptor is never handed to the guest:
+                    // close it and drop its Detcore state in both modes,
+                    // then the named refusal/errno policy decides.
+                    guest.thread_state().remove_fd(fd);
+                    let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+                    resource_release_all(guest).await;
+                    return Box::pin(self.live_property_area_allowed(guest, &reason))
+                        .await
+                        .and_then(|()| Err(Errno::EOPNOTSUPP.into()));
                 }
                 // Linux names a random device by its device number, whatever
                 // path reached it (a literal or relative name, `.` or `..`, a

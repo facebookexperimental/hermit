@@ -290,6 +290,16 @@ fn take_as_root(
     under: &Path,
     chown_root: bool,
 ) -> Result<PropertySnapshotDir, String> {
+    // The published copy directory is absolute, so a relative root (a
+    // relative `TMPDIR`) cannot make a redirected guest open resolve the
+    // copy against the guest's own dirfd or working directory.
+    let under_owned;
+    let under = if under.is_absolute() {
+        under
+    } else {
+        under_owned = std::path::absolute(under).map_err(|error| error.to_string())?;
+        &under_owned
+    };
     let Capture {
         files,
         uncopied,
@@ -766,6 +776,28 @@ mod tests {
         assert_eq!(std::fs::metadata(&property).unwrap().mode() & 0o777, 0o444);
         assert!(!copy.join("subdir").exists());
         assert_eq!(copy.join("u:object_r:secret_prop:s0").exists(), root);
+    }
+
+    /// A relative copy root (a relative `TMPDIR`) is published as an
+    /// absolute copy directory, so a redirected guest open cannot resolve
+    /// it against the guest's dirfd or working directory.
+    #[test]
+    fn a_relative_copy_root_is_published_absolute() {
+        let source = area(&[("properties_serial", &[1, 2, 3, 4])]);
+        let relative = format!("hermit-test-relative-root-{}", std::process::id());
+        let absolute = std::env::current_dir().unwrap().join(&relative);
+        let _ = std::fs::remove_dir_all(&absolute);
+        std::fs::create_dir(&absolute).unwrap();
+        let snapshot = take_as_root(source.path(), Path::new(&relative), false).unwrap();
+        let copy = snapshot.config().copy_dir;
+        assert!(copy.is_absolute(), "{}", copy.display());
+        assert!(copy.starts_with(&absolute), "{}", copy.display());
+        assert_eq!(
+            std::fs::read(copy.join("properties_serial")).unwrap(),
+            [1, 2, 3, 4]
+        );
+        drop(snapshot);
+        let _ = std::fs::remove_dir_all(&absolute);
     }
 
     /// The read counts a reader saw, by file name.

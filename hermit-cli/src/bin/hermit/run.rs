@@ -16871,7 +16871,11 @@ impl RunOpts {
         }
         // SAFETY: `geteuid` takes no arguments and cannot fail.
         let euid = unsafe { libc::geteuid() };
-        let under = std::env::temp_dir();
+        // Bind an absolute copy root before the visibility check, capture
+        // and config publication: a relative `TMPDIR` would otherwise make
+        // the published copy path resolve against the guest's dirfd/cwd.
+        let under =
+            std::path::absolute(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
         let taken = if !self.no_namespace
             && under.starts_with("/tmp")
             && Path::new(super::property_snapshot::PROPERTY_AREA).is_dir()

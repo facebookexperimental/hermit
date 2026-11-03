@@ -51,9 +51,10 @@ fn area() -> Area {
 }
 
 /// A read by its own name or through a symbolic link opens the copy; a file
-/// the area gained after the snapshot is read live in a run that is not
-/// fail-closed; `O_RDONLY | O_TRUNC` truncates the live file, as natively,
-/// and later reads still get the copy.
+/// the area gained after the snapshot, and a readable truncating open of
+/// a copied file, are refused with `EOPNOTSUPP` in a run that is not
+/// fail-closed (the named refusal/errno policy), without any live read or
+/// truncation; later pure reads still get the copy.
 #[test]
 fn a_property_snapshot_serves_every_read_of_the_files_it_copied() {
     let area = area();
@@ -77,13 +78,17 @@ fn a_property_snapshot_serves_every_read_of_the_files_it_copied() {
         let (file, link, later): &(PathBuf, PathBuf, PathBuf) = &paths;
         assert_eq!(std::fs::read(file).unwrap(), [5, 6, 7, 8]);
         assert_eq!(std::fs::read(link).unwrap(), [5, 6, 7, 8]);
-        assert_eq!(std::fs::read(later).unwrap(), [9]);
+        // No live bytes under the opt-in: the named errno, not `[9]`.
+        let refused = std::fs::read(later).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::EOPNOTSUPP), "{refused}");
         let truncated = std::ffi::CString::new(file.as_os_str().as_encoded_bytes()).unwrap();
-        // SAFETY: a valid NUL-terminated path; the descriptor is closed below.
+        // SAFETY: a valid NUL-terminated path.
         let fd = unsafe { libc::open(truncated.as_ptr(), libc::O_RDONLY | libc::O_TRUNC) };
-        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
-        // SAFETY: `fd` is the descriptor just opened.
-        unsafe { libc::close(fd) };
+        assert_eq!(fd, -1, "a readable truncating open must be refused");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EOPNOTSUPP)
+        );
         assert_eq!(std::fs::read(file).unwrap(), [5, 6, 7, 8]);
     };
     detcore_testutils::det_test_fn_with_config(
@@ -93,8 +98,210 @@ fn a_property_snapshot_serves_every_read_of_the_files_it_copied() {
         detcore_testutils::expect_success,
     );
     let _ = std::fs::remove_file(&link);
-    // The guest's truncation reached the live file, never the copy.
-    assert_eq!(std::fs::metadata(Path::new(&file)).unwrap().len(), 0);
+    // No live execution happened: neither file was truncated.
+    assert_eq!(std::fs::metadata(Path::new(&file)).unwrap().len(), 4);
+    assert_eq!(std::fs::read(&later).unwrap(), [9]);
+}
+
+/// A file the area gained after its snapshot is refused through every
+/// alternate spelling (`..`, a parent symlink, a dirfd), while a copied
+/// file through the same spellings still serves its copy (the positive
+/// control). In a non-fail-closed run the refusal is `EOPNOTSUPP`.
+#[test]
+fn a_late_property_file_is_refused_through_alias_spellings() {
+    let area = area();
+    let name = "u:object_r:test_prop:s0";
+    let file = area.live.path().join(name);
+    let later_name = "u:object_r:later_prop:s0";
+    let later = area.live.path().join(later_name);
+    std::fs::write(&later, [9]).unwrap();
+    // A directory symlink to the area, made outside it.
+    let outside = tempfile::tempdir_in(area.live.path().parent().unwrap()).unwrap();
+    let alias_dir = outside.path().join("alias-area");
+    std::os::unix::fs::symlink(area.live.path(), &alias_dir).unwrap();
+    let dotdot = area
+        .live
+        .path()
+        .join("..")
+        .join(area.live.path().file_name().unwrap())
+        .join(later_name);
+    let dotdot_copied = area
+        .live
+        .path()
+        .join("..")
+        .join(area.live.path().file_name().unwrap())
+        .join(name);
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        property_snapshot: Some(area.snapshot.clone()),
+        ..Default::default()
+    };
+    let live_dir = area.live.path().to_owned();
+    let guest = move || {
+        let expect_refused = |path: &Path, what: &str| {
+            let error = std::fs::read(path).unwrap_err();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::EOPNOTSUPP),
+                "{what}: {error}"
+            );
+        };
+        expect_refused(&dotdot, "dotdot spelling");
+        expect_refused(&alias_dir.join(later_name), "parent-symlink spelling");
+        // A dirfd on the area, and one on its parent, naming it relatively.
+        use std::os::fd::AsRawFd;
+        let dir = std::fs::File::open(&live_dir).unwrap();
+        let rel = std::ffi::CString::new(later_name).unwrap();
+        // SAFETY: valid dirfd and NUL-terminated relative path.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), rel.as_ptr(), libc::O_RDONLY) };
+        assert_eq!(fd, -1, "dirfd spelling must be refused");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EOPNOTSUPP)
+        );
+        // Positive controls: the copied file, by alias and by dirfd.
+        assert_eq!(std::fs::read(&dotdot_copied).unwrap(), [5, 6, 7, 8]);
+        assert_eq!(std::fs::read(alias_dir.join(name)).unwrap(), [5, 6, 7, 8]);
+        let rel = std::ffi::CString::new(name).unwrap();
+        // SAFETY: as above; the descriptor is closed below.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), rel.as_ptr(), libc::O_RDONLY) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let mut bytes = [0_u8; 4];
+        // SAFETY: `fd` is open and `bytes` is writable for its length.
+        let read = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+        assert_eq!(read, 4);
+        assert_eq!(bytes, [5, 6, 7, 8]);
+        // SAFETY: the descriptor opened above.
+        unsafe { libc::close(fd) };
+        let _ = file;
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        guest,
+        config,
+        detcore_testutils::expect_success,
+    );
+}
+
+/// A redirected open serves its copy through a non-`AT_FDCWD` dirfd and
+/// after the guest changes its working directory, even when the published
+/// copy directory is relative: it is bound independently of the guest's
+/// dirfd and cwd.
+#[test]
+fn a_copy_is_served_by_dirfd_after_a_guest_chdir() {
+    // Copies in a directory named relative to this process's working
+    // directory, which the guest cannot resolve from its own cwd/dirfd.
+    let area = area();
+    let name = "u:object_r:test_prop:s0";
+    let file = area.live.path().join(name);
+    let relative_name = format!("hermit-test-relative-copies-{}", std::process::id());
+    let relative_abs = std::env::current_dir().unwrap().join(&relative_name);
+    let _ = std::fs::remove_file(relative_abs.join(name));
+    let _ = std::fs::remove_dir(&relative_abs);
+    std::fs::create_dir(&relative_abs).unwrap();
+    std::fs::write(relative_abs.join(name), [5, 6, 7, 8]).unwrap();
+    let mut snapshot = area.snapshot.clone();
+    snapshot.copy_dir = PathBuf::from(&relative_name);
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        property_snapshot: Some(snapshot),
+        ..Default::default()
+    };
+    let live_dir = area.live.path().to_owned();
+    let guest = move || {
+        use std::os::fd::AsRawFd;
+        std::env::set_current_dir("/").unwrap();
+        let dir = std::fs::File::open(&live_dir).unwrap();
+        let rel = std::ffi::CString::new(name).unwrap();
+        // SAFETY: valid dirfd and NUL-terminated relative path.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), rel.as_ptr(), libc::O_RDONLY) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let mut bytes = [0_u8; 4];
+        // SAFETY: `fd` is open and `bytes` is writable for its length.
+        let read = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+        assert_eq!(read, 4);
+        assert_eq!(bytes, [5, 6, 7, 8]);
+        // SAFETY: the descriptor opened above.
+        unsafe { libc::close(fd) };
+        // And by absolute name from the changed cwd.
+        assert_eq!(std::fs::read(&file).unwrap(), [5, 6, 7, 8]);
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        guest,
+        config,
+        detcore_testutils::expect_success,
+    );
+    let _ = std::fs::remove_file(relative_abs.join(name));
+    let _ = std::fs::remove_dir(&relative_abs);
+}
+
+/// A file mapping of a live property descriptor is refused (no live map),
+/// while a mapping of a copied descriptor supplies the copied bytes.
+#[test]
+fn a_live_property_mapping_is_refused_and_a_copied_one_maps_the_copy() {
+    let area = area();
+    let file = area.live.path().join("u:object_r:test_prop:s0");
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        property_snapshot: Some(area.snapshot.clone()),
+        ..Default::default()
+    };
+    let guest = move || {
+        use std::os::fd::AsRawFd;
+        // A write-only open runs natively, so this descriptor is live.
+        let live = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        // SAFETY: a file mapping of the live descriptor.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                live.as_raw_fd(),
+                0,
+            )
+        };
+        assert_eq!(mapped, libc::MAP_FAILED, "a live mapping must be refused");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EOPNOTSUPP)
+        );
+        drop(live);
+        // The copied descriptor maps the frozen bytes.
+        let copied = std::fs::File::open(&file).unwrap();
+        // SAFETY: a file mapping of the copied descriptor, unmapped below.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                copied.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(
+            mapped,
+            libc::MAP_FAILED,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: four bytes are mapped from the copy.
+        let bytes = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), 4) };
+        assert_eq!(bytes, [5, 6, 7, 8]);
+        // SAFETY: the mapping made above.
+        unsafe { libc::munmap(mapped, 4096) };
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        guest,
+        config,
+        detcore_testutils::expect_success,
+    );
 }
 
 /// The same reads with Hermit's metadata virtualization off, where the

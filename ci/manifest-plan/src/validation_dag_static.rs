@@ -3423,7 +3423,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/4791): 214 + 2 = 216.
     // And property_snapshot::an_access_mode_3_open_of_a_copied_property_file_runs_as_natively
     // (the same pull request's review): 216 + 1 = 217.
-    ("test.detcore_misc", 217),
+    // And the late-file alias, dirfd-after-chdir and live-mapping cases
+    // (F1/F4): 217 + 3 = 220.
+    ("test.detcore_misc", 220),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -5540,7 +5542,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the uncopied-file alias refusal: 213 + 1 = 214.
     // And the same two readable-open refusals: 214 + 2 = 216.
     // And the same access-mode-3 case: 216 + 1 = 217.
-    ("test.detcore_misc_on_host", 217),
+    // And the same three alias/dirfd/mapping cases: 217 + 3 = 220.
+    ("test.detcore_misc_on_host", 220),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).

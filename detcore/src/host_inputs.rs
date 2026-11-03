@@ -101,7 +101,14 @@ pub(crate) fn input_set(records: &[HostInputRecord], mutated: &BTreeSet<String>)
     let files: Vec<HostInput> = first
         .into_iter()
         .filter(|(path, record)| {
-            !record.kernel_object && !is_kernel_object(path) && !guest_rebound(mutated, path)
+            // An authenticated snapshot identity (`of_snapshot`, a content
+            // hash Hermit itself computed for its frozen copy) is retained
+            // even though its guest path lies under `/dev`: it names the
+            // snapshot's bytes, not a device. Actual devices and kernel
+            // objects carry no such identity and stay excluded.
+            let snapshot = record.identity.content.is_some();
+            (snapshot || (!record.kernel_object && !is_kernel_object(path)))
+                && !guest_rebound(mutated, path)
         })
         .map(|(path, record)| HostInput {
             path: path.to_owned(),
@@ -444,13 +451,21 @@ impl ReplayHostInputs {
         kernel_object: bool,
         mutated: &BTreeSet<String>,
     ) -> Option<&HostInputChange> {
-        if !self.opened.insert(path.to_owned())
-            || kernel_object
-            || is_kernel_object(path)
-            || guest_rebound(mutated, path)
-        {
+        // A recorded authenticated snapshot identity is compared even
+        // though its path lies under `/dev` (see `input_set`); an actual
+        // device has no recorded entry and stays skipped here.
+        let snapshot = identity.content.is_some()
+            || self
+                .recorded
+                .file(path)
+                .is_some_and(|file| file.identity.content.is_some());
+        if self.opened.contains(path) {
             return None;
         }
+        if kernel_object || (!snapshot && is_kernel_object(path)) || guest_rebound(mutated, path) {
+            return None;
+        }
+        self.opened.insert(path.to_owned());
         let recorded = self.recorded.file(path)?;
         let proven = match recorded.content {
             None => recorded.identity != identity,
@@ -573,6 +588,67 @@ mod tests {
         assert_eq!(files, [("/etc/ld.so.cache", 9), ("/lib64/libc.so.6", 10)]);
         assert_eq!(set.digest.len(), 64);
         assert!(set.digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    /// An authenticated snapshot identity survives `input_set` and replay
+    /// comparison despite its `/dev` guest path: unchanged bytes report no
+    /// change, changed bytes report one, and a real device stays excluded.
+    #[test]
+    fn a_snapshot_identity_survives_the_set_and_replay_comparison() {
+        let none = BTreeSet::new();
+        let snapshot = |hash: u64| HostInputRecord {
+            identity: HostFileIdentity::of_snapshot(64, hash),
+            ..open("/dev/__properties__/properties_serial", 1, 6)
+        };
+        let device = HostInputRecord {
+            kernel_object: true,
+            ..open("/dev/null", 2, 7)
+        };
+        let recorded = input_set(&[snapshot(0xaa), device.clone()], &none);
+        assert_eq!(recorded.files.len(), 1);
+        assert_eq!(
+            recorded.files[0].path,
+            "/dev/__properties__/properties_serial"
+        );
+        assert_eq!(
+            recorded.files[0].identity,
+            HostFileIdentity::of_snapshot(64, 0xaa)
+        );
+        // Different snapshot bytes give a different persisted digest.
+        let changed_set = input_set(&[snapshot(0xbb), device], &none);
+        assert_ne!(recorded.digest, changed_set.digest);
+        // Unchanged: no change at the open or at the end.
+        let mut replay = ReplayHostInputs::new(recorded.clone());
+        assert_eq!(
+            replay.observe(
+                "/dev/__properties__/properties_serial",
+                HostFileIdentity::of_snapshot(64, 0xaa),
+                true,
+                false,
+                &none,
+            ),
+            None
+        );
+        assert_eq!(replay.finish(|_| None, &none), []);
+        assert!(replay.changes().is_empty());
+        // The `/dev/null` control is neither in the set nor compared.
+        assert_eq!(
+            replay.observe("/dev/null", identity(2), false, true, &none),
+            None
+        );
+        // Changed: reported at the open with both hashes.
+        let mut replay = ReplayHostInputs::new(recorded);
+        let change = replay
+            .observe(
+                "/dev/__properties__/properties_serial",
+                HostFileIdentity::of_snapshot(64, 0xbb),
+                true,
+                false,
+                &none,
+            )
+            .expect("a changed snapshot hash is reported");
+        assert_eq!(change.recorded.content, Some(0xaa));
+        assert_eq!(change.now.content, Some(0xbb));
     }
 
     #[test]
