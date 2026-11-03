@@ -352,9 +352,17 @@ pub enum FdOp {
     /// The call installed a new open file at the number (open, openat,
     /// socket, pipe, accept, eventfd, ...).
     Open {
-        /// The path the guest named, when there was one.
+        /// The path of the file the call opened, as Detcore records it once
+        /// the call has opened it (a descriptor link's target where it knows
+        /// one); `None` when it records none (a received or imported
+        /// descriptor, a pipe end).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
+        /// The kind of file it opened, from the file's mode when Detcore has
+        /// it; `None` when it does not, or from a trace before the field
+        /// (which a reader takes as unknown).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<FileKind>,
     },
     /// The number now refers to the open file of `source` (dup, dup2, dup3,
     /// `F_DUPFD`). Replacing an open number also emits a `close` of it.
@@ -365,6 +373,38 @@ pub enum FdOp {
     /// The call released the number (close, close_range, dup2 onto it, or
     /// exec closing a close-on-exec descriptor).
     Close,
+}
+
+/// The kind of an opened file: its mode's file type (`S_IFMT`, inode(7)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileKind {
+    Regular,
+    Directory,
+    /// A pipe or a FIFO: Linux gives both `S_IFIFO`.
+    Fifo,
+    /// A character device, a terminal among them.
+    CharDevice,
+    BlockDevice,
+    Socket,
+    Symlink,
+}
+
+impl FileKind {
+    /// The kind a file of mode `mode` is; `None` for a type Linux does not
+    /// define.
+    pub fn of_mode(mode: u32) -> Option<Self> {
+        Some(match mode & 0o170_000 {
+            0o100_000 => FileKind::Regular,
+            0o040_000 => FileKind::Directory,
+            0o010_000 => FileKind::Fifo,
+            0o020_000 => FileKind::CharDevice,
+            0o060_000 => FileKind::BlockDevice,
+            0o140_000 => FileKind::Socket,
+            0o120_000 => FileKind::Symlink,
+            _ => return None,
+        })
+    }
 }
 
 /// How a syscall used an open file's cursor.
@@ -998,6 +1038,48 @@ mod tests {
     use crate::fd::FilesId;
     use crate::futex::SharedMemoryObjectId;
 
+    /// An open note's kind is optional on the wire both ways: a note
+    /// written before the field reads with no kind (which analyze takes as
+    /// unknown), and a reader ignores a key it does not know, as one from
+    /// before the field does `kind`. So the field changes neither the trace's
+    /// format version nor the RPC, which carries accesses as this JSON.
+    #[test]
+    fn an_open_note_reads_with_or_without_its_kind() {
+        let read = |json: &str| serde_json::from_str::<FdOp>(json).unwrap();
+        assert_eq!(
+            read(r#"{"open":{"path":"/tmp/a"}}"#),
+            FdOp::Open {
+                path: Some("/tmp/a".to_owned()),
+                kind: None
+            }
+        );
+        assert_eq!(
+            read(r#"{"open":{"path":"/dev/null","kind":"char_device","later":1}}"#),
+            FdOp::Open {
+                path: Some("/dev/null".to_owned()),
+                kind: Some(FileKind::CharDevice)
+            }
+        );
+        let written = FdOp::Open {
+            path: None,
+            kind: Some(FileKind::Fifo),
+        };
+        assert_eq!(
+            serde_json::to_string(&written).unwrap(),
+            r#"{"open":{"kind":"fifo"}}"#
+        );
+        for (mode, kind) in [
+            (0o100_644, Some(FileKind::Regular)),
+            (0o020_666, Some(FileKind::CharDevice)),
+            (0o010_600, Some(FileKind::Fifo)),
+            (0o140_777, Some(FileKind::Socket)),
+            (0o040_755, Some(FileKind::Directory)),
+            (0o000_644, None),
+        ] {
+            assert_eq!(FileKind::of_mode(mode), kind, "{mode:o}");
+        }
+    }
+
     fn tid(n: i32) -> DetTid {
         DetTid::from_raw(n)
     }
@@ -1114,6 +1196,7 @@ mod tests {
                     open_file: Some(file(7, 3)),
                     op: FdOp::Open {
                         path: Some("/tmp/misc".to_string()),
+                        kind: None,
                     },
                 }],
                 returned: Some(ReturnedBytes {

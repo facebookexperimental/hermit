@@ -22,6 +22,7 @@ use detcore_model::access_trace::ChannelKind;
 use detcore_model::access_trace::EdgeKind;
 use detcore_model::access_trace::EdgeRecord;
 use detcore_model::access_trace::FdOp;
+use detcore_model::access_trace::FileKind;
 use detcore_model::access_trace::LifetimeOp;
 use detcore_model::access_trace::ObservedSignalDisposition;
 use detcore_model::access_trace::SyncObject;
@@ -54,6 +55,9 @@ struct Guests {
     /// `tests/fixtures/futex_ping_pong.c`: two threads hand a futex word
     /// back and forth.
     ping_pong: PathBuf,
+    /// `tests/fixtures/access_trace_open_kinds.c`: opens a regular file,
+    /// /dev/null and a pipe for writing.
+    open_kinds: PathBuf,
 }
 
 fn guests() -> &'static Guests {
@@ -109,6 +113,12 @@ fn guests() -> &'static Guests {
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/futex_ping_pong.c"),
                 &["-O0", "-g", "-pthread"],
                 "ping_pong",
+            ),
+            open_kinds: compile(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/access_trace_open_kinds.c"),
+                &["-O0", "-g"],
+                "open_kinds",
             ),
         }
     })
@@ -528,6 +538,56 @@ fn a_trace_names_the_settings_that_leave_descriptors_untyped() {
     );
 }
 
+/// Each open note names the file its call opened and that file's kind, from
+/// its mode: a regular file in the run's /tmp, /dev/null (a character
+/// device) and a new pipe's two ends (a FIFO). Detcore notes an open when it
+/// installs the descriptor, before the open's handler sets its path, and
+/// brings the note up to date after (`ThreadState::note_opened_path`).
+/// These are the facts analyze's output matching reads
+/// (`races::not_provably_regular`): it exempts the regular file and
+/// /dev/null opened for writing, and a pipe it creates.
+#[test]
+fn an_open_note_names_the_opened_files_path_and_kind() {
+    let _guard = hermit_run_guard();
+    let guest = &guests().open_kinds;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let traced = run_traced(guest, directory.path(), "traced", None, Some(0));
+    let trace = traced.trace.expect("traced run");
+    let opens: Vec<(&str, Option<String>, Option<FileKind>)> = syscalls(&trace)
+        .flat_map(|call| {
+            call.accesses.iter().filter_map(move |access| match access {
+                Access::Fd {
+                    op: FdOp::Open { path, kind },
+                    ..
+                } => Some((call.sysno.name(), path.clone(), *kind)),
+                _ => None,
+            })
+        })
+        .collect();
+    assert!(
+        opens.iter().any(|(_, path, kind)| {
+            path.as_deref()
+                .is_some_and(|path| path.starts_with("/tmp/access_trace_open_kinds."))
+                && *kind == Some(FileKind::Regular)
+        }),
+        "{opens:?}"
+    );
+    assert!(
+        opens.iter().any(|(_, path, kind)| {
+            path.as_deref() == Some("/dev/null") && *kind == Some(FileKind::CharDevice)
+        }),
+        "{opens:?}"
+    );
+    assert_eq!(
+        opens
+            .iter()
+            .filter(|(call, _, kind)| *call == "pipe2" && *kind == Some(FileKind::Fifo))
+            .count(),
+        2,
+        "{opens:?}"
+    );
+}
+
 /// The trace changes nothing a run shows, whether the run follows a
 /// recorded schedule or makes its own under chaos: exit status, stdout,
 /// stderr, the recorded schedule and the INFO messages are those of the
@@ -726,8 +786,8 @@ fn access_trace_indices_name_the_runs_own_events() {
     // The guest's file is created in the run's own /tmp, which no other run
     // shares: every run draws the same name for it, and in a shared working
     // directory a concurrent run's file made the O_EXCL create fail and the
-    // schedule change. The trace names no paths, so read them from the INFO
-    // messages (`openat(-100, <addr> -> "<path>", ...)`).
+    // schedule change. Read the paths the guest gave from the INFO messages
+    // (`openat(-100, <addr> -> "<path>", ...)`).
     let file_paths: Vec<&str> = traced
         .info
         .iter()

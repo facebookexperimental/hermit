@@ -6762,6 +6762,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                         detfd.set_sigalrm_phase1_provenance(provenance);
                     }
                 })?;
+                // The install noted the open before its path was set.
+                guest.thread_state().note_opened_path(fd);
                 resource_release_all(guest).await;
                 Ok(fd as i64)
             }

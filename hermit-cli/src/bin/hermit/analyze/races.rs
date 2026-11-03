@@ -104,6 +104,7 @@ use detcore_model::access_trace::EdgeKind;
 use detcore_model::access_trace::EventIndex;
 use detcore_model::access_trace::EventRef;
 use detcore_model::access_trace::FdOp;
+use detcore_model::access_trace::FileKind;
 use detcore_model::access_trace::LifetimeOp;
 use detcore_model::access_trace::OUT_BYTES_CAP;
 use detcore_model::access_trace::SyscallRecord;
@@ -807,9 +808,11 @@ pub struct Outcome {
 /// stream's open files are those any process's descriptor 1 or 2 is seen to
 /// reach in the trace. And, without tracking which endpoint a file reaches,
 /// it is any open for writing, or import (SCM_RIGHTS, pidfd_getfd), of a file
-/// the trace does not show to be a regular file ([`not_provably_regular`]):
-/// a pipe, FIFO, socket or terminal reopened by any spelling or reached
-/// directly may be the stream's own pipe or terminal. A call that creates a
+/// the trace does not show to be a regular file, a directory or a null-like
+/// device ([`not_provably_regular`], from the kind Detcore records in the
+/// open note): a pipe, FIFO, socket or terminal reopened by any spelling or
+/// reached directly may be the stream's own pipe or terminal, and an unknown
+/// kind (an import, a trace from before the kind was recorded) may be too. A call that creates a
 /// new pipe, socket or other anonymous file is not such an open: a new
 /// endpoint is not the stream's. An ordinary program that opens an unrelated
 /// pipe, FIFO or terminal for writing therefore loses output matching from
@@ -1030,12 +1033,12 @@ fn redirects(
             (0..2).find(|&index| file.is_some_and(|file| outputs[index].contains(&file)))
         };
         match op {
-            FdOp::Open { path } => {
+            FdOp::Open { path, kind } => {
                 if stream(slot.fd).is_none()
                     && !creates_a_new_file(sys.sysno)
                     && opened_for_writing(sys)
                     && let Some(kind) =
-                        not_provably_regular(path.as_deref(), *open_file, channel_files)
+                        not_provably_regular(path.as_deref(), *kind, *open_file, channel_files)
                 {
                     for index in 0..2 {
                         found.push((
@@ -1154,44 +1157,39 @@ const NOT_A_TERMINAL: [&str; 5] = [
     "/dev/urandom",
 ];
 
-/// What an opened file may be, when the trace does not show it is a
-/// regular file, which no stream is: the open file `file` moves channel data
-/// in the trace (a pipe, FIFO or socket, `channel_files`), or its recorded
-/// path (`path`, as Detcore records it, a descriptor link's target where it
-/// knows one) is missing, relative, an anonymous object's (`pipe:[N]`,
-/// `socket:[N]`, `anon_inode:...`), under `/dev` (a terminal or another
-/// device, but [`NOT_A_TERMINAL`]), or another descriptor's `/proc/.../fd/N`
-/// link. `None` for an absolute path the trace shows nothing else of: a
-/// regular file.
+/// What an opened file may be, when the trace does not show that it is no
+/// stream's pipe or terminal: its open file moves channel data in the trace
+/// (a pipe, FIFO or socket, `channel_files`), or its kind (from its mode,
+/// as Detcore records it in the open note) is a pipe or FIFO, a socket, a
+/// character device other than [`NOT_A_TERMINAL`] by its recorded `path`
+/// (a terminal is one), another kind no stream is shown not to be, or
+/// unknown. `None` for a regular file or a directory, and for the null-like
+/// devices.
 fn not_provably_regular(
     path: Option<&str>,
+    kind: Option<FileKind>,
     file: Option<OpenFileId>,
     channel_files: &BTreeSet<OpenFileId>,
 ) -> Option<String> {
+    let name = path.unwrap_or("a descriptor with no recorded path");
     if file.is_some_and(|file| channel_files.contains(&file)) {
         return Some(format!(
-            "{}, whose open file moves channel data (a pipe, FIFO or socket)",
-            path.unwrap_or("a file")
+            "{name}, whose open file moves channel data (a pipe, FIFO or socket)"
         ));
     }
-    let Some(path) = path else {
-        return Some("a file whose path the trace does not record".to_owned());
+    let what = match kind {
+        Some(FileKind::Regular | FileKind::Directory) => return None,
+        Some(FileKind::CharDevice) if path.is_some_and(|path| NOT_A_TERMINAL.contains(&path)) => {
+            return None;
+        }
+        Some(FileKind::CharDevice) => "a character device, which can be a terminal",
+        Some(FileKind::Fifo) => "a pipe or FIFO",
+        Some(FileKind::Socket) => "a socket",
+        Some(FileKind::BlockDevice) => "a block device",
+        Some(FileKind::Symlink) => "a symbolic link",
+        None => "whose kind the trace does not record",
     };
-    if path.contains(":[") || path.starts_with("anon_inode:") {
-        return Some(format!("{path}, an anonymous file"));
-    }
-    if !path.starts_with('/') {
-        return Some(format!(
-            "{path}, a relative path whose file's kind is unknown"
-        ));
-    }
-    if path.starts_with("/dev/") && !NOT_A_TERMINAL.contains(&path) {
-        return Some(format!("{path}, a device, which can be a terminal"));
-    }
-    if path.starts_with("/proc/") && path.contains("/fd/") {
-        return Some(format!("{path}, another descriptor's file"));
-    }
-    None
+    Some(format!("{name}, {what}"))
 }
 
 /// Whether `sysno` makes a new pipe, socket or other anonymous file, whose
@@ -2617,7 +2615,10 @@ impl<'a> Finder<'a> {
                     _ => continue,
                 };
                 let path = match op {
-                    FdOp::Open { path: Some(path) } => format!(" ({path})"),
+                    FdOp::Open {
+                        path: Some(path),
+                        kind: None,
+                    } => format!(" ({path})"),
                     _ => String::new(),
                 };
                 let event = HistoryEvent {
@@ -4276,7 +4277,11 @@ fn call_text(sys: &SyscallRecord) -> String {
 fn path_text(sys: &SyscallRecord) -> Option<String> {
     sys.accesses.iter().find_map(|a| match a {
         Access::Fd {
-            op: FdOp::Open { path: Some(path) },
+            op:
+                FdOp::Open {
+                    path: Some(path),
+                    kind: None,
+                },
             ..
         } => Some(format!("{path:?}")),
         _ => None,
@@ -4831,6 +4836,7 @@ mod tests {
     fn opened(path: &str) -> FdOp {
         FdOp::Open {
             path: Some(path.to_string()),
+            kind: None,
         }
     }
 
@@ -8866,7 +8872,14 @@ mod tests {
             Sysno::recvmsg,
             &[5, 0x4000, 0],
             Some(1),
-            vec![fd(3, Some(stdout), FdOp::Open { path: None })],
+            vec![fd(
+                3,
+                Some(stdout),
+                FdOp::Open {
+                    path: None,
+                    kind: None,
+                },
+            )],
         );
         assert_seam_unknown(
             vec![
@@ -8876,7 +8889,7 @@ mod tests {
                 seam_write(105, 3, 1, stdout, "ROR\n"),
             ],
             0,
-            "opened a file whose path the trace does not record as descriptor 3",
+            "opened a descriptor with no recorded path, whose kind the trace does not record as descriptor 3",
         );
     }
 
@@ -8891,7 +8904,14 @@ mod tests {
             Sysno::pidfd_getfd,
             &[9, 1, 0],
             Some(3),
-            vec![fd(3, Some(stdout), FdOp::Open { path: None })],
+            vec![fd(
+                3,
+                Some(stdout),
+                FdOp::Open {
+                    path: None,
+                    kind: None,
+                },
+            )],
         );
         assert_seam_unknown(
             vec![
@@ -8901,7 +8921,7 @@ mod tests {
                 seam_write(105, 3, 1, stdout, "ROR\n"),
             ],
             0,
-            "opened a file whose path the trace does not record as descriptor 3",
+            "opened a descriptor with no recorded path, whose kind the trace does not record as descriptor 3",
         );
     }
 
@@ -8942,15 +8962,17 @@ mod tests {
 
     /// An open for writing of a file the trace does not show to be a
     /// regular file may reach a stream's pipe or terminal by a new open file,
-    /// whatever its spelling: `/dev/stderr` (as `tee /dev/stderr` does),
-    /// `/proc/self/fd/1` recorded as its target (a pipe or a pts), a lexical
-    /// `/proc/thread-self/fd/1`, a terminal opened directly, a dirfd-relative
-    /// path, and a named FIFO, which its channel data shows. Each, with its
-    /// write in the ER/ROR seam, leaves the point unknown.
+    /// whatever its spelling: Detcore records the open's resolved target and
+    /// kind, so `/proc/self/fd/1` reopened is a pipe (`pipe:[4026]`) or a
+    /// pts, a terminal opened directly is a character device, a named FIFO
+    /// is a FIFO by its kind or by its channel data, and an open whose kind
+    /// is not recorded (a dirfd-relative one from a trace before the field)
+    /// is unknown. Each, with its write in the ER/ROR seam, leaves the point
+    /// unknown.
     #[test]
     fn an_output_reopened_by_path_is_a_gap() {
         let (stderr, reopened) = (file(7, 2), file(3, 9));
-        let opened = |path: &str| {
+        let opened = |path: &str, kind: Option<FileKind>| {
             let mut sys = call(
                 100,
                 3,
@@ -8966,32 +8988,40 @@ mod tests {
                     fd: 3,
                 },
                 open_file: Some(reopened),
-                op: opened_path(path),
+                op: opened_path(path, kind),
             }];
             sys
         };
-        for (path, why) in [
+        for (path, kind, why) in [
             (
-                "/dev/stderr",
-                "opened /dev/stderr, a device, which can be a terminal",
+                "pipe:[4026]",
+                Some(FileKind::Fifo),
+                "opened pipe:[4026], a pipe or FIFO",
             ),
-            ("pipe:[4026]", "opened pipe:[4026], an anonymous file"),
             (
                 "/dev/pts/3",
-                "opened /dev/pts/3, a device, which can be a terminal",
+                Some(FileKind::CharDevice),
+                "opened /dev/pts/3, a character device, which can be a terminal",
+            ),
+            (
+                "/tmp/out.fifo",
+                Some(FileKind::Fifo),
+                "opened /tmp/out.fifo, a pipe or FIFO",
             ),
             (
                 "/proc/thread-self/fd/1",
-                "opened /proc/thread-self/fd/1, another descriptor's file",
+                None,
+                "opened /proc/thread-self/fd/1, whose kind the trace does not record",
             ),
             (
                 "fifo",
-                "opened fifo, a relative path whose file's kind is unknown",
+                None,
+                "opened fifo, whose kind the trace does not record",
             ),
         ] {
             assert_seam_unknown(
                 vec![
-                    opened(path),
+                    opened(path, kind),
                     seam_write(101, 3, 2, stderr, "ER"),
                     seam_write(103, 3, 3, reopened, "XX"),
                     seam_write(105, 3, 2, stderr, "ROR\n"),
@@ -9000,7 +9030,7 @@ mod tests {
                 why,
             );
         }
-        // A named FIFO by an ordinary path: its write shows channel data.
+        // A FIFO whose kind is not recorded: its write shows channel data.
         let mut into_fifo = seam_write(103, 3, 3, reopened, "XX");
         into_fifo.accesses.push(Access::Channel {
             open_file: reopened,
@@ -9010,7 +9040,7 @@ mod tests {
         });
         assert_seam_unknown(
             vec![
-                opened("/tmp/out.fifo"),
+                opened("/tmp/out.fifo", None),
                 seam_write(101, 3, 1, file(7, 1), "ER"),
                 into_fifo,
                 seam_write(105, 3, 1, file(7, 1), "ROR\n"),
@@ -9020,13 +9050,14 @@ mod tests {
         );
     }
 
-    /// No gap where the trace shows the new open file cannot be a stream's:
-    /// a regular file opened for writing (a log between ER and ROR), a
-    /// terminal opened read-only, and a new pipe.
+    /// No gap where the open note shows the new open file cannot be a
+    /// stream's: a regular file opened for writing (a log written between ER
+    /// and ROR, by an absolute or a relative path), `/dev/null` opened for
+    /// writing, a terminal opened read-only, and a new pipe.
     #[test]
     fn an_open_of_a_regular_file_read_only_device_or_new_pipe_is_no_gap() {
         let (stdout, log) = (file(7, 1), file(3, 9));
-        let open = |path: &str, flags: i32| {
+        let open = |path: &str, kind: FileKind, flags: i32| {
             let mut sys = call(
                 100,
                 3,
@@ -9042,7 +9073,7 @@ mod tests {
                     fd: 3,
                 },
                 open_file: Some(log),
-                op: opened_path(path),
+                op: opened_path(path, Some(kind)),
             }];
             sys
         };
@@ -9054,8 +9085,22 @@ mod tests {
             &[0x3000, 0],
             Some(0),
             vec![
-                fd(3, Some(log), FdOp::Open { path: None }),
-                fd(4, Some(file(3, 10)), FdOp::Open { path: None }),
+                fd(
+                    3,
+                    Some(log),
+                    FdOp::Open {
+                        path: None,
+                        kind: Some(FileKind::Fifo),
+                    },
+                ),
+                fd(
+                    4,
+                    Some(file(3, 10)),
+                    FdOp::Open {
+                        path: None,
+                        kind: Some(FileKind::Fifo),
+                    },
+                ),
             ],
         );
         let pattern = Regex::new("ERROR").unwrap();
@@ -9066,9 +9111,12 @@ mod tests {
             exit_code: &any,
             root: Some(DetPid::from_raw(3)),
         };
+        let writable = libc::O_WRONLY | libc::O_CREAT;
         for opened in [
-            open("/tmp/run.log", libc::O_WRONLY | libc::O_CREAT),
-            open("/dev/tty", libc::O_RDONLY),
+            open("/tmp/run.log", FileKind::Regular, writable),
+            open("run.log", FileKind::Regular, writable),
+            open("/dev/null", FileKind::CharDevice, libc::O_WRONLY),
+            open("/dev/tty", FileKind::CharDevice, libc::O_RDONLY),
             pipe,
         ] {
             let trace = traced(
@@ -9088,15 +9136,12 @@ mod tests {
                 (Some(105), None)
             );
         }
-        assert_eq!(
-            not_provably_regular(Some("/dev/null"), None, &BTreeSet::new()),
-            None
-        );
     }
 
-    fn opened_path(path: &str) -> FdOp {
+    fn opened_path(path: &str, kind: Option<FileKind>) -> FdOp {
         FdOp::Open {
             path: Some(path.to_string()),
+            kind,
         }
     }
 

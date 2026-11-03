@@ -2357,6 +2357,9 @@ impl FileMetadata {
                 path: detfd
                     .and_then(DetFd::path)
                     .map(|path| path.to_string_lossy().into_owned()),
+                kind: detfd
+                    .and_then(DetFd::stat)
+                    .and_then(|stat| detcore_model::access_trace::FileKind::of_mode(stat.mode)),
             },
             FdNoteOp::Dup(source) => FdOp::Dup { source },
         };
@@ -8598,6 +8601,17 @@ impl<T> ThreadState<T> {
                 .note(metadata.slot_note(fd, FdNoteOp::Open));
         }
         Ok(())
+    }
+
+    /// Bring the open note [`Self::add_fd`] made for descriptor `fd` up to
+    /// date once the open's handler has set the descriptor's path, which it
+    /// does after the install: the note then names the file's path as well
+    /// as its kind.
+    pub(crate) fn note_opened_path(&self, fd: RawFd) {
+        if self.traced_call.is_active() {
+            let note = self.metadata().slot_note(fd, FdNoteOp::Open);
+            self.traced_call.replace_open_note(note);
+        }
     }
 
     /// Record descriptor `fd`, which Linux installed by a route Detcore did not

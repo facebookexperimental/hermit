@@ -343,6 +343,21 @@ impl TracedCall {
         }
     }
 
+    /// Replace the call's last open note of `note`'s slot with `note`, the
+    /// same open noted again once more is known of it (its path); nothing
+    /// when the call made no such note.
+    pub(crate) fn replace_open_note(&self, note: FdNote) {
+        if let Some(state) = self.0.lock().expect("traced call mutex poisoned").as_mut()
+            && let Some(old) = state
+                .notes
+                .iter_mut()
+                .rev()
+                .find(|old| old.slot == note.slot && matches!(old.op, FdOp::Open { .. }))
+        {
+            *old = note;
+        }
+    }
+
     /// End the call in progress and return what it gathered.
     pub(crate) fn take(&self) -> Option<CallState> {
         self.0.lock().expect("traced call mutex poisoned").take()
@@ -2041,6 +2056,7 @@ mod tests {
                         open_file: None,
                         op: FdOp::Open {
                             path: Some("/tmp/x".into()),
+                            kind: None,
                         },
                     },
                     Access::Futex {
@@ -2231,7 +2247,14 @@ mod tests {
             [libc::AT_FDCWD as u64, 0x2000, libc::O_RDWR as u64, 0, 0, 0],
             6,
             &[],
-            &[note(6, Some(file(7, 3)), FdOp::Open { path: path.clone() })],
+            &[note(
+                6,
+                Some(file(7, 3)),
+                FdOp::Open {
+                    path: path.clone(),
+                    kind: None,
+                },
+            )],
             Written::default(),
         );
         assert_eq!(
@@ -2239,7 +2262,7 @@ mod tests {
             vec![Access::Fd {
                 slot: slot(6),
                 open_file: Some(file(7, 3)),
-                op: FdOp::Open { path }
+                op: FdOp::Open { path, kind: None }
             }]
         );
         // A later lseek through the number reaches the new open file.
@@ -2534,7 +2557,14 @@ mod tests {
             [libc::CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0],
             9,
             &[],
-            &[note(9, Some(file(3, 4)), FdOp::Open { path: None })],
+            &[note(
+                9,
+                Some(file(3, 4)),
+                FdOp::Open {
+                    path: None,
+                    kind: None,
+                },
+            )],
             Written::default(),
         );
         assert_eq!(
@@ -3027,7 +3057,10 @@ mod tests {
         let open = |fd, f| Access::Fd {
             slot: slot(fd),
             open_file: Some(f),
-            op: FdOp::Open { path: None },
+            op: FdOp::Open {
+                path: None,
+                kind: None,
+            },
         };
         // Before `from`: not written, but its pair is still learned.
         writer.observe(
