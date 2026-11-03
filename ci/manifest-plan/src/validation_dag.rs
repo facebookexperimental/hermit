@@ -6687,6 +6687,9 @@ sys.exit(37)
             "analyze_racewrite_nostdlib",
             // The race finder's.
             "analyze_names_the_close_racing_the_reused_descriptor",
+            // The verdict change's.
+            "bisect_exits_2_when_its_good_schedule_meets_the_target",
+            "analyze_reports_a_target_met_without_chaos_as_reproduced_without_the_schedule",
         ];
         for case in cases {
             assert!(
