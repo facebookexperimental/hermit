@@ -5880,6 +5880,208 @@ pub(crate) struct SignalAnnouncementState {
     pub(crate) turn: InboundTurn,
 }
 
+/// The guest tasks of a run that are live or not yet reaped, and the clones
+/// still making one: every task of every guest process, which the binder rule
+/// reads (`Detcore::binder_other_tasks`). A binder call runs off the guest's
+/// turn alone only while its caller is the run's one task.
+///
+/// One record is shared by every task of the run, as the guest clock is, and
+/// only guest calls change it: a clone's entry and its return in its caller,
+/// and the wait that reaps a process in the waiter. While a caller finds
+/// itself the only task, no other task exists to change the record, so the
+/// answer cannot change under it; while it finds others, each of them is
+/// live, unreaped or being made, so it can only be too many.
+#[derive(Debug, Default)]
+pub(crate) struct LiveTasks {
+    /// Each task, by thread ID, with its process, from the return of the
+    /// clone that made it, or the run's start for its first task, until the
+    /// wait that reaps its process. A thread that exits, or that an exec or
+    /// an `exit_group` ends, stays until then too, as an exited leader does as
+    /// a zombie: nothing a guest call says shows when the kernel is done with
+    /// it.
+    tasks: BTreeMap<DetTid, DetPid>,
+    /// How many clones each task has entered without returning: each may
+    /// have made a child that already runs, as a vfork's child does while its
+    /// parent waits, which `tasks` holds only once its clone returns. A clone
+    /// whose caller dies before it returns stays counted.
+    creating: BTreeMap<DetTid, usize>,
+    /// The tasks in `tasks` whose own `exit`, or their process's
+    /// `exit_group`, was granted: still counted, and named as exited in a
+    /// refusal. Only names; never shortens the count.
+    exited: BTreeSet<DetTid>,
+    /// Set where this record was not carried here: a thread state read back
+    /// from its serialized form, which does not hold it. Then which tasks
+    /// are live is unknown, and no task is taken to be alone.
+    unknown: bool,
+}
+
+impl LiveTasks {
+    /// The record of a run whose first task, `tid`, leads process `pid`.
+    pub(crate) fn of_first_task(tid: DetTid, pid: DetPid) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            tasks: BTreeMap::from([(tid, pid)]),
+            ..Self::default()
+        }))
+    }
+
+    /// A record that knows no task, for a thread state read back from its
+    /// serialized form (`LiveTasks::unknown`).
+    pub(crate) fn unknown() -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            unknown: true,
+            ..Self::default()
+        }))
+    }
+
+    /// `creator` enters a clone, before the child can exist.
+    pub(crate) fn begin_clone(&mut self, creator: DetTid) {
+        *self.creating.entry(creator).or_default() += 1;
+    }
+
+    /// `creator`'s clone returned, having made `child` (its thread ID and
+    /// process) or nothing.
+    pub(crate) fn end_clone(&mut self, creator: DetTid, child: Option<(DetTid, DetPid)>) {
+        if let std::collections::btree_map::Entry::Occupied(mut entry) =
+            self.creating.entry(creator)
+        {
+            *entry.get_mut() -= 1;
+            if *entry.get() == 0 {
+                entry.remove();
+            }
+        }
+        if let Some((tid, pid)) = child {
+            self.tasks.insert(tid, pid);
+        }
+    }
+
+    /// A wait reaped process `pid`: none of its tasks is left.
+    pub(crate) fn reaped(&mut self, pid: DetPid) {
+        let exited = &mut self.exited;
+        self.tasks.retain(|tid, process| {
+            let kept = *process != pid;
+            if !kept {
+                exited.remove(tid);
+            }
+            kept
+        });
+    }
+
+    /// Task `tid`'s `exit` was granted. It stays counted until a wait reaps
+    /// its process: nothing a guest call says shows when the kernel is done
+    /// with it.
+    pub(crate) fn note_exit(&mut self, tid: DetTid) {
+        if self.tasks.contains_key(&tid) {
+            self.exited.insert(tid);
+        }
+    }
+
+    /// Process `pid`'s `exit_group` was granted, which ends each of its
+    /// tasks; they stay counted until a wait reaps it, as `note_exit`.
+    pub(crate) fn note_process_exit(&mut self, pid: DetPid) {
+        for (tid, process) in &self.tasks {
+            if *process == pid {
+                self.exited.insert(*tid);
+            }
+        }
+    }
+
+    /// The tasks besides `caller`, named for a refusal, or `None` where
+    /// `caller` is the run's only task.
+    pub(crate) fn others(&self, caller: DetTid) -> Option<String> {
+        if self.unknown {
+            return Some(
+                "which tasks are live is unknown (this thread's state was read back from its \
+                 serialized form)"
+                    .to_string(),
+            );
+        }
+        let mut named: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|(tid, _)| **tid != caller)
+            .map(|(tid, pid)| {
+                let task = if tid.as_raw() == pid.as_raw() {
+                    format!("task {tid}")
+                } else {
+                    format!("task {tid} of process {pid}")
+                };
+                if self.exited.contains(tid) {
+                    format!("{task}, which exited and is not reaped yet")
+                } else {
+                    task
+                }
+            })
+            .collect();
+        named.extend(self.creating.iter().map(|(creator, clones)| {
+            if *clones == 1 {
+                format!("a task being created by task {creator}")
+            } else {
+                format!("{clones} tasks being created by task {creator}")
+            }
+        }));
+        if named.is_empty() && self.tasks.contains_key(&caller) {
+            return None;
+        }
+        if named.is_empty() {
+            named.push("tasks whose number this record does not hold".to_string());
+        }
+        const SHOWN: usize = 4;
+        let more = named.len().saturating_sub(SHOWN);
+        named.truncate(SHOWN);
+        let mut list = named.join(", ");
+        if more > 0 {
+            list.push_str(&format!(" and {more} more"));
+        }
+        Some(list)
+    }
+}
+
+#[cfg(test)]
+mod live_tasks_tests {
+    use super::*;
+
+    /// A task counts among the run's tasks from the entry of the clone that
+    /// makes it, before it exists, until a wait reaps its process: an exited
+    /// task, and an exited thread of the caller's own process, stay counted
+    /// and are named as exited; a failed clone counts only while it runs. A
+    /// caller the record does not hold, or a record read back from its
+    /// serialized form, is never alone.
+    #[test]
+    fn a_task_counts_from_its_clone_s_entry_until_a_wait_reaps_its_process() {
+        let one = DetTid::from_raw(1);
+        let record = LiveTasks::of_first_task(one, one);
+        let mut tasks = record.lock().unwrap();
+        assert_eq!(tasks.others(one), None);
+        tasks.begin_clone(one);
+        assert_eq!(
+            tasks.others(one).as_deref(),
+            Some("a task being created by task 1")
+        );
+        tasks.end_clone(one, None);
+        assert_eq!(tasks.others(one), None);
+        tasks.begin_clone(one);
+        tasks.end_clone(one, Some((DetTid::from_raw(2), DetPid::from_raw(2))));
+        assert_eq!(tasks.others(one).as_deref(), Some("task 2"));
+        tasks.note_process_exit(DetPid::from_raw(2));
+        assert_eq!(
+            tasks.others(one).as_deref(),
+            Some("task 2, which exited and is not reaped yet")
+        );
+        tasks.reaped(DetPid::from_raw(2));
+        assert_eq!(tasks.others(one), None);
+        tasks.begin_clone(one);
+        tasks.end_clone(one, Some((DetTid::from_raw(3), one)));
+        tasks.note_exit(DetTid::from_raw(3));
+        assert_eq!(
+            tasks.others(one).as_deref(),
+            Some("task 3 of process 1, which exited and is not reaped yet")
+        );
+        assert!(tasks.others(DetTid::from_raw(9)).is_some());
+        drop(tasks);
+        assert!(LiveTasks::unknown().lock().unwrap().others(one).is_some());
+    }
+}
+
 /// The Detcore per-thread state.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ThreadState<T> {
@@ -6152,6 +6354,13 @@ pub struct ThreadState<T> {
     /// serves every guest (ptrace, KVM), so it is never serialized.
     #[serde(skip)]
     pub(crate) unix_connections: Arc<Mutex<crate::syscalls::scm_rights::UnixConnections>>,
+
+    /// The run's live and unreaped tasks, shared by every task of the run, as
+    /// the guest clock is (`LiveTasks`). Never serialized: a thread state
+    /// read back from that form knows no task, and none is taken to be
+    /// alone.
+    #[serde(skip, default = "LiveTasks::unknown")]
+    pub(crate) live_tasks: Arc<Mutex<LiveTasks>>,
 
     /// Parent process accounting notified when this process leader exits.
     pub(crate) parent_process_cpu_time: Option<Arc<Mutex<ProcessCpuTime>>>,
@@ -6503,6 +6712,16 @@ pub struct ThreadState<T> {
     /// go unmarked.
     #[serde(default)]
     pub(crate) host_timed_binder_loss_recorded: bool,
+    /// Whether this thread has recorded the determinism loss of a binder call
+    /// that ran off the turn while the run had another task
+    /// (`Detcore::admit_shared_binder_call`), per thread as above.
+    #[serde(default)]
+    pub(crate) shared_binder_loss_recorded: bool,
+    /// Whether this thread has recorded the determinism loss of descriptors a
+    /// binder read delivered off the turn that Detcore does not record
+    /// (`Detcore::take_binder_receipts`), per thread as above.
+    #[serde(default)]
+    pub(crate) unrecorded_binder_loss_recorded: bool,
 
     /// Thread state associated with record/replay.
     pub record_or_replay: T,
@@ -7284,6 +7503,12 @@ impl<T> ThreadState<T> {
     }
 
     pub(crate) fn reap_child_process_cpu_time(&mut self, pid: DetPid) {
+        // Every reap of a child's termination comes here, in the waiter's
+        // turn.
+        self.live_tasks
+            .lock()
+            .expect("live tasks mutex poisoned")
+            .reaped(pid);
         self.account_process_cpu_time();
         let publication = {
             let mut parent = self
@@ -7390,6 +7615,7 @@ impl<T> ThreadState<T> {
             process_cpu_time: Arc::new(Mutex::new(ProcessCpuTime::default())),
             guest_clock: Arc::new(Mutex::new(GuestClock::default())),
             unix_connections: Default::default(),
+            live_tasks: LiveTasks::of_first_task(pid, pid),
             parent_process_cpu_time: None,
             child_cpu_owners: Default::default(),
             parent_cpu_publication: None,
@@ -7439,6 +7665,8 @@ impl<T> ThreadState<T> {
             consecutive_continuations: 0,
             scheduler_grants: 0,
             host_timed_binder_loss_recorded: false,
+            shared_binder_loss_recorded: false,
+            unrecorded_binder_loss_recorded: false,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
             last_replay_change_point: None,

@@ -9,10 +9,21 @@
 // Pass a file descriptor over binder from one process to another, then use
 // it in the receiver.
 //
-// Usage: binder_fd_passing <binderfs mount> [poll|block|ping|exhausted|writeread].
+// Usage: binder_fd_passing <binderfs mount>
+//            [poll|block|ping|exhausted|writeread|threaded] [both|manager|client].
 // The guest adds a device of its own to that binderfs instance through its
 // binder-control file (BINDER_CTL_ADD; an existing one is reused), so it needs
 // no default device and no servicemanager.
+//
+// The role says which side of the transaction this process plays. "both",
+// the default, plays both: the process forks the sender. "manager" plays
+// only the receiver, the context manager: it adds the device, becomes its
+// context manager, creates the file "<binderfs mount>.ready", answers one
+// transaction and exits. "client" plays only the sender: it opens the device
+// a manager added, waits 100 ms, sends the transaction and waits for the
+// reply, then prints "client received its reply". So a test can run one side
+// outside Hermit, as Android runs servicemanager, and the other alone under
+// it, where it is the run's one task.
 //
 // In "poll" mode, the default, both processes open the device nonblocking
 // and wait in poll() before each read, so no binder ioctl waits in the
@@ -26,10 +37,13 @@
 // added. "writeread" is "ping" whose sender sends the transaction and waits
 // for the reply in one BINDER_WRITE_READ, as libbinder's talkWithDriver does.
 // In "block" and "exhausted" mode the sender sleeps 100 ms first, so the
-// receiver's read is the one that waits.
+// receiver's read is the one that waits. "threaded" is "ping" whose receiver
+// starts a second thread, sharing its descriptor table, before it waits.
 //
-// The parent becomes the device's context manager, with a node that accepts
-// descriptors, and the child sends it a
+// The parent forks first, so each process opens the device itself and no
+// binder open file is held by both tables. The parent becomes the device's
+// context manager, with a node that accepts descriptors, tells the child so
+// through a pipe, and the child sends it a
 // transaction to handle 0 carrying one BINDER_TYPE_FD object for a memfd
 // holding "hello". Linux installs a new descriptor for it in the parent when
 // the parent reads the transaction (binder_apply_fd_fixups). The parent then
@@ -45,6 +59,7 @@
 #include <linux/android/binder.h>
 #include <linux/android/binderfs.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,6 +86,22 @@ static int write_and_read = 0;
 
 // Whether the sender sleeps before it sends, so the receiver waits first.
 static int sender_waits = 0;
+
+// Whether the receiver starts a second thread, which shares its descriptor
+// table, before it waits for the transaction ("threaded").
+static int threaded = 0;
+
+// Which side of the transaction this process plays: both, forking the
+// sender; only the context manager; or only the sender.
+enum role { BOTH, MANAGER, CLIENT };
+static enum role role = BOTH;
+
+// The receiver's second thread: it only sleeps, holding the table.
+static void* idle_thread(void* unused) {
+  (void)unused;
+  sleep(1);
+  return NULL;
+}
 
 static void die(const char* what) {
   fprintf(stderr, "binder_fd_passing: %s: %s\n", what, strerror(errno));
@@ -124,29 +155,39 @@ static size_t read_commands(int fd, void* buffer, size_t size) {
   }
 }
 
-// Walk return commands until one of `wanted`, copying its transaction data.
-static uint32_t wait_for(
-    int fd,
+// Walk the `length` bytes of return commands in `buffer` for `wanted`,
+// copying its transaction data; returns whether it was there.
+static int find_command(
+    const uint8_t* buffer,
+    size_t length,
     uint32_t wanted,
     struct binder_transaction_data* out) {
+  size_t offset = 0;
+  while (offset + sizeof(uint32_t) <= length) {
+    uint32_t cmd;
+    memcpy(&cmd, buffer + offset, sizeof(cmd));
+    offset += sizeof(cmd);
+    size_t payload = _IOC_SIZE(cmd);
+    if (cmd == wanted) {
+      memcpy(out, buffer + offset, sizeof(*out));
+      return 1;
+    }
+    if (cmd == BR_DEAD_REPLY || cmd == BR_FAILED_REPLY) {
+      fprintf(stderr, "binder_fd_passing: transaction failed (%#x)\n", cmd);
+      exit(1);
+    }
+    offset += payload;
+  }
+  return 0;
+}
+
+// Read return commands until one of `wanted`, copying its transaction data.
+static void wait_for(int fd, uint32_t wanted, struct binder_transaction_data* out) {
   uint8_t buffer[512];
   for (;;) {
     size_t length = read_commands(fd, buffer, sizeof(buffer));
-    size_t offset = 0;
-    while (offset + sizeof(uint32_t) <= length) {
-      uint32_t cmd;
-      memcpy(&cmd, buffer + offset, sizeof(cmd));
-      offset += sizeof(cmd);
-      size_t payload = _IOC_SIZE(cmd);
-      if (cmd == wanted) {
-        memcpy(out, buffer + offset, sizeof(*out));
-        return cmd;
-      }
-      if (cmd == BR_DEAD_REPLY || cmd == BR_FAILED_REPLY) {
-        fprintf(stderr, "binder_fd_passing: transaction failed (%#x)\n", cmd);
-        exit(1);
-      }
-      offset += payload;
+    if (find_command(buffer, length, wanted, out)) {
+      return;
     }
   }
 }
@@ -180,9 +221,10 @@ static int client(const char* path) {
               .data.ptr.offsets = (binder_uintptr_t)offsets,
           },
   };
-  if (sender_waits) {
+  if (sender_waits || role == CLIENT) {
     usleep(100 * 1000);
   }
+  struct binder_transaction_data reply;
   if (write_and_read) {
     // The transaction and the wait for its reply in one call. Linux runs the
     // write half first, then the read half (binder_ioctl_write_read).
@@ -200,10 +242,13 @@ static int client(const char* path) {
       fprintf(stderr, "binder_fd_passing: the write half was not consumed\n");
       return 1;
     }
+    // The read half may already have taken the reply.
+    if (find_command(buffer, bwr.read_consumed, BR_REPLY, &reply)) {
+      return 0;
+    }
   } else {
     write_commands(fd, &command, sizeof(command));
   }
-  struct binder_transaction_data reply;
   wait_for(fd, BR_REPLY, &reply);
   return 0;
 }
@@ -229,12 +274,24 @@ static char* add_device(const char* mount, const char* name) {
 }
 
 int main(int argc, char** argv) {
-  const char* usage = "usage: %s <binderfs mount> [poll|block|ping|exhausted|writeread]\n";
-  if (argc < 2 || argc > 3) {
+  const char* usage =
+      "usage: %s <binderfs mount> [poll|block|ping|exhausted|writeread|threaded] "
+      "[both|manager|client]\n";
+  if (argc < 2 || argc > 4) {
     fprintf(stderr, usage, argv[0]);
     return 2;
   }
-  if (argc == 3) {
+  if (argc == 4) {
+    if (strcmp(argv[3], "manager") == 0) {
+      role = MANAGER;
+    } else if (strcmp(argv[3], "client") == 0) {
+      role = CLIENT;
+    } else if (strcmp(argv[3], "both") != 0) {
+      fprintf(stderr, usage, argv[0]);
+      return 2;
+    }
+  }
+  if (argc >= 3) {
     if (strcmp(argv[2], "block") == 0) {
       nonblocking = 0;
       sender_waits = 1;
@@ -250,12 +307,49 @@ int main(int argc, char** argv) {
       nonblocking = 0;
       pass_fd = 0;
       write_and_read = 1;
+    } else if (strcmp(argv[2], "threaded") == 0) {
+      nonblocking = 0;
+      pass_fd = 0;
+      threaded = 1;
     } else if (strcmp(argv[2], "poll") != 0) {
       fprintf(stderr, usage, argv[0]);
       return 2;
     }
   }
+  if (role == CLIENT) {
+    // The manager added the device and became its context manager.
+    static char device[4096];
+    snprintf(device, sizeof(device), "%s/binder-fd-passing", argv[1]);
+    int status = client(device);
+    if (status == 0) {
+      printf("client received its reply\n");
+      fflush(stdout);
+    }
+    return status;
+  }
   const char* path = add_device(argv[1], "binder-fd-passing");
+  // Fork before opening the device, so the child's table never holds the
+  // parent's binder open file (each opens its own), and let the child send
+  // only once the parent is the context manager. A manager forks nothing:
+  // its sender runs elsewhere.
+  int ready[2];
+  if (pipe(ready) < 0) {
+    die("pipe");
+  }
+  pid_t child = role == MANAGER ? 1 : fork();
+  if (child < 0) {
+    die("fork");
+  }
+  if (child == 0) {
+    close(ready[1]);
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) {
+      die("read the ready pipe");
+    }
+    close(ready[0]);
+    _exit(client(path));
+  }
+  close(ready[0]);
   int fd = open_device(path);
   // The context manager's node must accept descriptors, or Linux fails a
   // transaction that carries one (binder_translate_fd).
@@ -268,13 +362,23 @@ int main(int argc, char** argv) {
   }
   uint32_t enter = BC_ENTER_LOOPER;
   write_commands(fd, &enter, sizeof(enter));
-
-  pid_t child = fork();
-  if (child < 0) {
-    die("fork");
+  if (role == MANAGER) {
+    // Tell the sender, which runs elsewhere, that it may send now.
+    char marker_path[4096];
+    snprintf(marker_path, sizeof(marker_path), "%s.ready", argv[1]);
+    int marker = open(marker_path, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    if (marker < 0) {
+      die("create the ready file");
+    }
+    close(marker);
+  } else if (write(ready[1], "r", 1) != 1) {
+    die("write the ready pipe");
   }
-  if (child == 0) {
-    _exit(client(path));
+  close(ready[1]);
+
+  pthread_t idle;
+  if (threaded && pthread_create(&idle, NULL, idle_thread, NULL) != 0) {
+    die("pthread_create");
   }
 
   if (exhausted) {
@@ -342,6 +446,9 @@ int main(int argc, char** argv) {
           },
   };
   write_commands(fd, &commands, sizeof(commands));
+  if (role == MANAGER) {
+    return 0;
+  }
 
   int wstatus;
   if (waitpid(child, &wstatus, 0) != child) {

@@ -1783,6 +1783,35 @@ Compare with `--strace-only` to determine whether interception or Hermit's
 deterministic model causes the failure. Reduce the command to a small reproducer
 before reporting an issue.
 
+### Android Binder
+
+A binder call that waits for another process (a blocking
+`ioctl(BINDER_WRITE_READ)` read, or `BINDER_FREEZE`) cannot hold the guest's
+turn, so Hermit runs it off the turn, and the call then finishes when the host's
+kernel delivers its work. Hermit does that only while the calling task is the
+run's one task: no other thread or process of the guest is live, exited but not
+yet reaped, or being created, and no debugger is attached (`--gdbserver`,
+`--dap-listen`). Then no other task can change what the call reads and writes,
+use a descriptor it delivers before Hermit records it, or take the work it waits
+for. A single-threaded binder client or service, whose peer runs outside Hermit,
+works this way. The count keeps every task whose end no guest call shows: a
+thread that exited stays counted until its whole process is reaped, and a child
+reaped without a wait (its parent ignores `SIGCHLD` or set `SA_NOCLDWAIT`), or
+an orphan reaped by a process outside the guest, is never removed. Once such a
+task exists, the run is never alone again, so a fail-closed run refuses its
+waiting binder calls.
+
+Beside any other task, such a call is refused by name, naming the other tasks,
+and the run ends with the policy-refusal status (122). With
+`--allow-unsupported-syscalls` it runs off the turn anyway, and the run records
+a determinism loss (`HERMIT_SHARED_BINDER_CALL`), so verification refuses to
+compare it: a libbinder thread pool, or a client and service that both run under
+Hermit and wait for each other, need this option. A call that sends and waits in
+one `BINDER_WRITE_READ` (as libbinder's `talkWithDriver` does) is refused the
+same way, or with the option recorded as `HERMIT_HOST_TIMED_BINDER`. Calls that
+do not wait, such as every read on a descriptor opened `O_NONBLOCK`, run in the
+caller's turn as usual.
+
 ### The Guest Hangs
 
 1. Run the command normally to confirm the program itself terminates.

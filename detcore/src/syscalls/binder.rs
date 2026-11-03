@@ -49,7 +49,6 @@ const BR_TRANSACTION: u32 = 0x8040_7202;
 const BR_TRANSACTION_SEC_CTX: u32 = 0x8048_7202;
 /// `_IOR('r', 3, struct binder_transaction_data)`.
 const BR_REPLY: u32 = 0x8040_7203;
-
 /// `TF_STATUS_CODE`: the transaction's data is a 32-bit status. Linux does
 /// not read it when it installs descriptors; the tests use it.
 #[cfg(test)]
@@ -405,27 +404,62 @@ pub(crate) fn host_timed_reason(effect: Effect, fd: RawFd) -> String {
     )
 }
 
-/// The refusal of a binder read on descriptor `fd` that ran on the
-/// background path and delivered descriptors (`delivered`), or `None` when
-/// it delivered none. Linux installs them as the read returns
-/// (`binder_apply_fd_fixups`, drivers/android/binder.c:4666 and :4357 at
-/// v6.4), and other threads run between that and the caller's continuation,
-/// where they could close or replace those numbers, so Detcore cannot record
-/// them, as for a receive on the background path
-/// (`Detcore::record_received_descriptors`). A read whose descriptors cannot
-/// be told is refused too: it may have delivered some.
-pub(crate) fn background_receipt_refusal(fd: RawFd, delivered: &Delivered) -> Option<String> {
+/// How a binder call ran (`Detcore::run_binder_call`), which decides how
+/// the descriptors its read delivers are taken
+/// (`Detcore::take_binder_receipts`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BinderRun {
+    /// In the caller's turn.
+    InTurn,
+    /// Off the turn, on the background path, by the run's one task: no other
+    /// task existed to see the descriptors its read delivers, or change the
+    /// call or what it returns, before the task resumed, so they are recorded
+    /// as in the turn.
+    OffTurnAlone,
+    /// Off the turn while the run had another task, or a debugger
+    /// (`Detcore::binder_other_tasks`), which only a run that allows
+    /// unsupported operations lets happen: the descriptors it delivers are
+    /// not recorded, and the run records the loss.
+    OffTurnShared,
+}
+
+/// Why a binder call on descriptor `fd` that waits off the guest's turn
+/// cannot be followed by Detcore while `others` (the run's other tasks, or a
+/// debugger it serves) can act: the policy's reason, for a refusal or a
+/// recorded determinism loss (`Detcore::admit_shared_binder_call`). Linux
+/// copies the call's argument in when the call starts, not when Detcore
+/// classified it (`binder_ioctl_write_read`, drivers/android/binder.c:5050 at
+/// v6.4), installs each descriptor a read delivers in the caller's table
+/// before the call returns (`binder_apply_fd_fixups`, :4357 and :4666), and
+/// gives a transaction to whichever thread of the binder process waits first
+/// (`binder_select_thread_ilocked`, :2785): another task could change the
+/// call into one Detcore did not admit, use, close or replace those
+/// descriptors, rewrite what the read returned, or take the work the call
+/// waits for, before Detcore accounts for it.
+pub(crate) fn shared_task_reason(fd: RawFd, others: &str) -> String {
+    format!(
+        "a binder call on descriptor {fd} waits for another process, so it would run off the \
+         guest's turn, which Hermit allows only while the caller is the run's one task, but \
+         {others}: Linux reads the call's argument when the call starts and installs each \
+         descriptor a read delivers in the caller's table before the call returns, so another \
+         task could change the call, use, close or replace those descriptors, or take the work \
+         it waits for, before Hermit accounts for them"
+    )
+}
+
+/// Why the descriptors a binder read on descriptor `fd` delivered off the
+/// turn beside another task ([`BinderRun::OffTurnShared`]) go unrecorded, or
+/// why one that ran alone cannot have them recorded (Detcore cannot name them),
+/// or `None` when it delivered none.
+pub(crate) fn unrecorded_receipt_reason(fd: RawFd, delivered: &Delivered) -> Option<String> {
     let what = match delivered.refused {
         Some(why) => format!("may have delivered descriptors Detcore cannot name ({why})"),
         None if delivered.fds.is_empty() => return None,
         None => format!("delivered descriptors {:?}", delivered.fds),
     };
     Some(format!(
-        "ioctl(BINDER_WRITE_READ) on descriptor {fd} ran on the background path and {what}, \
-         which Detcore cannot record there: other threads ran between the kernel installing \
-         them and this thread's return, and could have closed or replaced those numbers. A \
-         binder read that delivers descriptors is served where it completes in the caller's \
-         turn: with work already queued for its thread, or on a nonblocking descriptor"
+        "ioctl(BINDER_WRITE_READ) on descriptor {fd} ran off the guest's turn and {what}, \
+         which Detcore does not record"
     ))
 }
 
@@ -998,36 +1032,32 @@ mod tests {
         );
     }
 
-    /// A read on the background path that delivered descriptors, or whose
-    /// descriptors cannot be told, is refused by name; one that delivered
-    /// none is not.
+    /// A read off the turn that delivered descriptors Detcore does not
+    /// record, or whose descriptors cannot be told, is named with them; one
+    /// that delivered none is not.
     #[test]
-    fn a_background_read_that_delivered_descriptors_is_refused_by_name() {
+    fn a_read_off_the_turn_names_the_descriptors_it_leaves_unrecorded() {
         let delivered = Delivered {
             fds: vec![7, 9],
             messages: Vec::new(),
             refused: None,
         };
-        let refusal = background_receipt_refusal(4, &delivered).unwrap();
+        let reason = unrecorded_receipt_reason(4, &delivered).unwrap();
         assert!(
-            refusal.starts_with("ioctl(BINDER_WRITE_READ) on descriptor 4 ran on the background"),
-            "{refusal}"
+            reason.starts_with("ioctl(BINDER_WRITE_READ) on descriptor 4 ran off the guest's turn"),
+            "{reason}"
         );
-        assert!(
-            refusal.contains("delivered descriptors [7, 9]"),
-            "{refusal}"
-        );
-        assert!(refusal.contains("cannot record"), "{refusal}");
+        assert!(reason.contains("delivered descriptors [7, 9]"), "{reason}");
         let unknown = Delivered {
             refused: Some("its return commands cannot be read"),
             ..Delivered::default()
         };
-        let refusal = background_receipt_refusal(4, &unknown).unwrap();
+        let reason = unrecorded_receipt_reason(4, &unknown).unwrap();
         assert!(
-            refusal.contains("may have delivered descriptors Detcore cannot name (its return commands cannot be read)"),
-            "{refusal}"
+            reason.contains("may have delivered descriptors Detcore cannot name (its return commands cannot be read)"),
+            "{reason}"
         );
-        assert_eq!(background_receipt_refusal(4, &Delivered::default()), None);
+        assert_eq!(unrecorded_receipt_reason(4, &Delivered::default()), None);
     }
 
     /// The command codes are the uapi header's, from their `_IOR` parts.

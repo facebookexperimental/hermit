@@ -5226,6 +5226,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
                 let guest_clock = Arc::clone(&pts.1.guest_clock);
                 let unix_connections = Arc::clone(&pts.1.unix_connections);
+                // Every task of the run shares one record of its tasks
+                // (`tool_local::LiveTasks`); the creator's clone, not this,
+                // adds the child to it.
+                let live_tasks = Arc::clone(&pts.1.live_tasks);
                 // A pending unreported signal may already have changed the
                 // parent's actions unseen: the child gets no copy then.
                 let child_signal_shadow = pts
@@ -5399,6 +5403,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     guest_clock,
                     // So do the connections waiting for an accept.
                     unix_connections,
+                    live_tasks,
                     parent_process_cpu_time: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
                         pts.1.parent_process_cpu_time.clone()
                     } else {
@@ -5503,6 +5508,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     consecutive_continuations: 0,
                     scheduler_grants: 0,
                     host_timed_binder_loss_recorded: false,
+                    shared_binder_loss_recorded: false,
+                    unrecorded_binder_loss_recorded: false,
 
                     end_of_timeslice: None,
                     replay_rcb_end: None,

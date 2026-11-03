@@ -916,7 +916,7 @@ fn binder_fd_passing_guest() -> &'static Path {
         fs::create_dir_all(&build_root).expect("failed to create binder-fd-passing directory");
         let guest = build_root.join("binder_fd_passing");
         let output = Command::new("cc")
-            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
             .arg(repository.join("tests/c/binder_fd_passing.c"))
             .arg("-o")
             .arg(&guest)
@@ -63626,17 +63626,32 @@ fn a_recording_whose_stream_cannot_be_written_in_full_is_refused() {
     );
 }
 
+/// Which side of the binder guest's transaction runs under Hermit.
+#[derive(Clone, Copy)]
+enum BinderSide {
+    /// Both, the guest forking its sender: two guest processes.
+    Both,
+    /// The context manager alone, the run's one task; its sender runs
+    /// outside Hermit once the manager is ready.
+    Manager,
+    /// The sender alone, the run's one task, against a context manager that
+    /// runs outside Hermit, as Android runs servicemanager.
+    Client,
+}
+
 /// Run the binder guest in `mode` on a private binderfs instance this test
-/// mounts in a user and mount namespace of its own, and return its output,
-/// or `None` where the kernel has no binder filesystem or will not mount one
-/// here, saying which. The run is bounded: the failures these tests pin are
-/// hangs.
-fn binder_guest_output(mode: &str) -> Option<Output> {
-    binder_guest_output_with(mode, &[])
+/// mounts in a user and mount namespace of its own, with `side` under Hermit
+/// and the other side, if any, outside it, and return Hermit's output, the
+/// outside side's appended to its stderr after a `--- outside Hermit ---`
+/// line; or `None` where the kernel has no binder filesystem or will not
+/// mount one here, saying which. The run is bounded: the failures these
+/// tests pin are hangs.
+fn binder_guest_output(mode: &str, side: BinderSide) -> Option<Output> {
+    binder_guest_output_with(mode, side, &[])
 }
 
 /// [`binder_guest_output`] with `hermit_args` added to `hermit run`'s own.
-fn binder_guest_output_with(mode: &str, hermit_args: &[&str]) -> Option<Output> {
+fn binder_guest_output_with(mode: &str, side: BinderSide, hermit_args: &[&str]) -> Option<Output> {
     let filesystems = fs::read_to_string("/proc/filesystems").unwrap_or_default();
     if !filesystems
         .lines()
@@ -63651,14 +63666,38 @@ fn binder_guest_output_with(mode: &str, hermit_args: &[&str]) -> Option<Output> 
     let hermit = env!("CARGO_BIN_EXE_hermit");
     let guest = binder_fd_passing_guest().display().to_string();
     let mountpoint = mountpoint.display().to_string();
+    let peer_log = directory.path().join("outside.log").display().to_string();
+    let under_hermit = |role: &str| {
+        format!(
+            "timeout --kill-after 5s 120s {hermit} run --base-env=minimal {} -- \
+             {guest} {mountpoint} {mode} {role}",
+            hermit_args.join(" ")
+        )
+    };
+    // The manager says it is ready by creating `<mount>.ready`.
+    let await_ready = format!(
+        "i=0; while [ ! -e {mountpoint}.ready ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done"
+    );
+    let report_peer = format!("echo '--- outside Hermit ---' >&2; cat {peer_log} >&2");
+    let run = match side {
+        BinderSide::Both => format!("exec {}", under_hermit("both")),
+        BinderSide::Manager => format!(
+            "( {await_ready}; exec timeout --kill-after 5s 60s {guest} {mountpoint} {mode} \
+             client ) >{peer_log} 2>&1 & peer=$!; {}; status=$?; kill $peer 2>/dev/null; \
+             wait $peer; {report_peer}; exit $status",
+            under_hermit("manager")
+        ),
+        BinderSide::Client => format!(
+            "timeout --kill-after 5s 60s {guest} {mountpoint} {mode} manager >{peer_log} 2>&1 & \
+             peer=$!; {await_ready}; {}; status=$?; kill $peer 2>/dev/null; wait $peer; \
+             {report_peer}; exit $status",
+            under_hermit("client")
+        ),
+    };
     // A refused mount is told apart from a failed run by a marker on stdout,
     // which neither the guest nor hermit prints.
-    let script = format!(
-        "mount -t binder binder {mountpoint} || {{ echo NO-BINDERFS; exit 0; }}; \
-         exec timeout --kill-after 5s 120s {hermit} run --base-env=minimal {} -- \
-         {guest} {mountpoint} {mode}",
-        hermit_args.join(" ")
-    );
+    let script =
+        format!("mount -t binder binder {mountpoint} || {{ echo NO-BINDERFS; exit 0; }}; {run}");
     let mut command = Command::new("unshare");
     command.args(["--user", "--map-root-user", "--mount", "sh", "-c", &script]);
     let label = format!("{command:?}");
@@ -63677,8 +63716,8 @@ fn binder_guest_output_with(mode: &str, hermit_args: &[&str]) -> Option<Output> 
 /// host-limited (docs/TESTING_ENVIRONMENTS.md): a run that selects it on a
 /// host without a binder filesystem a user namespace may mount fails, naming
 /// that, rather than counting as a pass that never ran.
-fn binder_guest_output_on_a_capable_host(mode: &str) -> Output {
-    binder_guest_output(mode).unwrap_or_else(|| {
+fn binder_guest_output_on_a_capable_host(mode: &str, side: BinderSide) -> Output {
+    binder_guest_output(mode, side).unwrap_or_else(|| {
         panic!(
             "this binder test needs a binder filesystem (CONFIG_ANDROID_BINDERFS) that an \
              unprivileged user and mount namespace may mount, which this host lacks (see the \
@@ -63696,7 +63735,7 @@ fn binder_guest_output_on_a_capable_host(mode: &str) -> Output {
 #[test]
 #[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
 fn a_descriptor_received_in_a_binder_transaction_is_usable() {
-    let output = binder_guest_output_on_a_capable_host("poll");
+    let output = binder_guest_output_on_a_capable_host("poll", BinderSide::Both);
     assert_success(&output, &["binder_fd_passing"]);
     let stdout = stdout(&output);
     assert!(
@@ -63707,50 +63746,100 @@ fn a_descriptor_received_in_a_binder_transaction_is_usable() {
 
 /// A binder read whose buffer is already full (`read_consumed ==
 /// read_size`) waits for work as any read does (`binder_thread_read`), so it
-/// must not hold the guest's only turn either. The receiver makes one before
-/// its sender, which sleeps first, has sent anything; it returns once the
-/// transaction is queued, with nothing added, and the receiver then reads the
-/// transaction. Before, Detcore classified it as returning on its own and ran
-/// it in the receiver's turn, so the sender never ran.
+/// runs off the turn, as a read with room does. The context manager runs
+/// alone under Hermit and makes one before its sender, which runs outside
+/// Hermit and sleeps first, has sent anything; it returns once the
+/// transaction is queued, with nothing added, and the manager then reads the
+/// transaction. The run says the call waited off the turn
+/// (`HERMIT_EXTERNAL_INPUT`). Before, Detcore classified it as returning on
+/// its own and ran it in the receiver's turn, so a sender under Hermit never
+/// ran.
 #[test]
 #[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
 fn an_exhausted_binder_read_does_not_hold_the_guests_turn() {
-    let output = binder_guest_output_on_a_capable_host("exhausted");
+    let output = binder_guest_output_on_a_capable_host("exhausted", BinderSide::Manager);
     assert_success(&output, &["binder_fd_passing", "exhausted"]);
     let stdout = stdout(&output);
     assert!(
         stdout.starts_with("exhausted read returned\nreceived transaction from pid "),
         "{stdout}"
     );
+    assert_binder_ran_off_the_turn_alone(&output);
 }
 
-/// A blocking binder read that waits for its transaction runs on the
-/// background path, where the descriptors it delivers cannot be recorded, so
-/// the run is refused by name before the receiver sees the transaction. Its
-/// sender sleeps first, so the receiver's read is the one that waits. Before,
-/// the run went on and the receiver's first use of the descriptor failed with
+/// The run's stderr says a binder call went off the turn
+/// (`HERMIT_EXTERNAL_INPUT`, which only that route prints) and that none ran
+/// beside another task, and the sender outside Hermit got its reply.
+fn assert_binder_ran_off_the_turn_alone(output: &Output) {
+    let log = stderr(output);
+    assert!(
+        log.contains("HERMIT_EXTERNAL_INPUT source=binder"),
+        "no binder call ran off the turn: {log}"
+    );
+    assert!(!log.contains("HERMIT_SHARED_BINDER_CALL"), "{log}");
+    assert!(
+        log.split("--- outside Hermit ---")
+            .nth(1)
+            .is_some_and(|outside| outside.contains("client received its reply")),
+        "the sender outside Hermit got no reply: {log}"
+    );
+}
+
+/// A blocking binder read that waits for its transaction runs off the turn,
+/// on the background path, and the descriptor it delivers is recorded and
+/// usable: the context manager is the run's one task, so no other task could
+/// see the descriptor, or change what the read returned, before it resumed.
+/// Its sender runs outside Hermit and sleeps first, so the manager's read is
+/// the one that waits. Before, the run was refused once the descriptor had
+/// arrived, and before that, the receiver's first use of it failed with
 /// EBADF, an answer Linux never gives.
 #[test]
 #[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
-fn a_descriptor_a_backgrounded_binder_read_delivers_is_refused_by_name() {
-    let output = binder_guest_output_on_a_capable_host("block");
-    assert_eq!(
-        output.status.code(),
-        Some(HERMIT_POLICY_REFUSAL_EXIT),
+fn a_descriptor_a_binder_read_delivers_off_the_turn_is_usable() {
+    let output = binder_guest_output_on_a_capable_host("block", BinderSide::Manager);
+    assert_success(&output, &["binder_fd_passing", "block"]);
+    assert_binder_ran_off_the_turn_alone(&output);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.starts_with("received fd ") && stdout.ends_with(": hello\n"),
+        "{stdout}"
+    );
+    assert!(
+        !stderr(&output).contains("Bad file descriptor"),
         "{}",
         stderr(&output)
     );
+}
+
+/// A binder read that would wait off the guest's turn while the run has
+/// another task is refused by name, before it runs, naming that task: Linux
+/// installs the descriptors a read delivers in the caller's table before the
+/// call returns, and another task could use them first. The context manager
+/// here, under Hermit with its sender outside, starts an idle thread before
+/// it waits. Before, the read ran off the turn, and a descriptor it delivered
+/// was visible to that thread before Hermit could account for it.
+#[test]
+#[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
+fn a_binder_read_that_waits_beside_another_thread_is_refused_by_name() {
+    let output = binder_guest_output_on_a_capable_host("threaded", BinderSide::Manager);
     let log = stderr(&output);
-    assert!(
-        log.contains("ran on the background path and delivered descriptors"),
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
         "{log}"
     );
     assert!(
-        !stdout(&output).contains("received fd"),
+        log.contains(
+            "would run off the guest's turn, which Hermit allows only while the caller is the \
+             run's one task, but the run has another task besides it (task "
+        ) && log.contains(" of process "),
+        "{log}"
+    );
+    assert!(
+        !stdout(&output).contains("received transaction"),
         "{}",
         stdout(&output)
     );
-    assert!(!log.contains("Bad file descriptor"), "{log}");
 }
 
 /// A binder call that sends a transaction and waits for its reply in one
@@ -63761,7 +63850,7 @@ fn a_descriptor_a_backgrounded_binder_read_delivers_is_refused_by_name() {
 #[test]
 #[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
 fn a_binder_write_and_read_that_waits_is_refused_by_name() {
-    let output = binder_guest_output_on_a_capable_host("writeread");
+    let output = binder_guest_output_on_a_capable_host("writeread", BinderSide::Client);
     assert_eq!(
         output.status.code(),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
@@ -66231,9 +66320,11 @@ fn a_fresh_strict_run_refuses_binder_and_names_the_replay_route() {
     let epoch = format!("--epoch={}", detcore_model::config::CANONICAL_TEST_EPOCH);
     // Without the preemption timer, a host whose branch counter `--strict`
     // would refuse still reaches the binder call.
-    let Some(output) =
-        binder_guest_output_with("ping", &["--strict", "--max-timeslice=disabled", &epoch])
-    else {
+    let Some(output) = binder_guest_output_with(
+        "ping",
+        BinderSide::Both,
+        &["--strict", "--max-timeslice=disabled", &epoch],
+    ) else {
         return;
     };
     let log = stderr(&output);
@@ -66258,7 +66349,9 @@ fn a_strict_replay_of_a_record_with_readmissions_may_use_binder() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let record = directory.path().join("binder.json");
     let record_flag = format!("--record-preemptions-to={}", record.display());
-    let Some(recorded) = binder_guest_output_with("ping", &[&epoch, &record_flag]) else {
+    let Some(recorded) =
+        binder_guest_output_with("ping", BinderSide::Both, &[&epoch, &record_flag])
+    else {
         return;
     };
     assert_success(&recorded, &["binder_fd_passing", "ping"]);
@@ -66271,8 +66364,12 @@ fn a_strict_replay_of_a_record_with_readmissions_may_use_binder() {
         "the recording stored no readmission"
     );
     let replay_flag = format!("--replay-preemptions-from={}", record.display());
-    let replayed = binder_guest_output_with("ping", &["--strict", &epoch, &replay_flag])
-        .expect("binderfs mounted for the recording");
+    let replayed = binder_guest_output_with(
+        "ping",
+        BinderSide::Both,
+        &["--strict", &epoch, &replay_flag],
+    )
+    .expect("binderfs mounted for the recording");
     // A replay follows the record's preemptions with the branch counter,
     // which `--strict` refuses on a host where it is not exact.
     if replayed.status.code() == Some(HERMIT_POLICY_REFUSAL_EXIT)
@@ -66293,16 +66390,18 @@ fn a_strict_replay_of_a_record_with_readmissions_may_use_binder() {
 }
 
 /// A binder read that waits for another process does not hold the guest's
-/// only turn. Both processes open the device blocking, so each read waits
-/// inside `ioctl(BINDER_WRITE_READ)` until the other sends it work: the way
-/// every binder thread pool works. Detcore runs such a call on the
-/// background path, so the other guest process runs and the pair completes;
-/// before, the first read held the turn and nothing else ever ran.
+/// turn. The context manager runs alone under Hermit and opens the device
+/// blocking, so its read waits inside `ioctl(BINDER_WRITE_READ)` until its
+/// sender, outside Hermit, sends it work: the way every binder thread waits.
+/// Detcore runs such a call on the background path, where it waits alone,
+/// and the pair completes; before, the read held the turn, which a sender
+/// under Hermit needed to run.
 #[test]
 #[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
 fn a_blocking_binder_read_does_not_hold_the_guests_turn() {
-    let output = binder_guest_output_on_a_capable_host("ping");
+    let output = binder_guest_output_on_a_capable_host("ping", BinderSide::Manager);
     assert_success(&output, &["binder_fd_passing", "ping"]);
+    assert_binder_ran_off_the_turn_alone(&output);
     assert!(
         stdout(&output).starts_with("received transaction from pid "),
         "{}",
