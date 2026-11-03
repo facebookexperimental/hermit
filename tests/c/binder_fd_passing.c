@@ -334,6 +334,16 @@ static int client(const char* path) {
   } else {
     write_commands(fd, &command, sizeof(command));
   }
+  // Say, where the manager can see it, that the reply read is next: the
+  // manager holds its reply until this file exists, so the read below
+  // is provably the call that waits (and, under Hermit, the one whose
+  // rejoin a recording stores) instead of racing the reply.
+  char waiting[4096];
+  snprintf(waiting, sizeof(waiting), "%s.waiting", path);
+  int marker = open(waiting, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+  if (marker >= 0) {
+    close(marker);
+  }
   wait_for(fd, BR_REPLY, &reply);
   return 0;
 }
@@ -544,12 +554,17 @@ int main(int argc, char** argv) {
           },
   };
   if (role == MANAGER) {
-    // Reply late, so a sender that runs alone (under Hermit, for the
-    // record/replay fixture) is already waiting in its reply read when
-    // the reply arrives: that read is the one that waits, and its
-    // rejoin is what the recording stores. Without the delay the reply
-    // lands first and the sender's read returns in its turn.
-    usleep(100 * 1000);
+    // Hold the reply until the sender says its reply read is next
+    // (the "<device>.waiting" file `client` creates just before that
+    // read), so the sender's read is provably the call that waits:
+    // under Hermit it goes off the turn alone and its rejoin is what a
+    // recording stores. Without this the reply can land first and the
+    // read returns in the sender's turn.
+    char waiting[4096];
+    snprintf(waiting, sizeof(waiting), "%s/binder-fd-passing.waiting", argv[1]);
+    for (int i = 0; i < 10000 && access(waiting, F_OK) != 0; i++) {
+      usleep(1000);
+    }
   }
   write_commands(fd, &commands, sizeof(commands));
   if (role == MANAGER) {

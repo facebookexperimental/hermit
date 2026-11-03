@@ -67278,26 +67278,37 @@ fn a_strict_replay_refuses_binder() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let record = directory.path().join("binder.json");
     let record_flag = format!("--record-preemptions-to={}", record.display());
+    // The supported arrangement: the client alone runs under Hermit
+    // (the run's one task) against a context manager outside it, so the
+    // waiting calls go off the turn alone and store their readmissions.
+    // The outside manager holds its reply until the client says its
+    // reply read is next (the guest's "<device>.waiting" file), so the
+    // client's read provably waits and stores its rejoin; without that
+    // the reply could land first and the read would return in turn.
+    // PR #4761 still refuses the strict replay below because binder
+    // reply payloads are not recorded.
     let recorded = binder_guest_output_with_on_a_capable_host(
         "ping",
         BinderSide::Client,
         &[&epoch, &record_flag],
     );
     assert_success(&recorded, &["binder_fd_passing", "ping", "client"]);
-    // The supported arrangement (client alone under Hermit) stores its
-    // readmissions; the outside manager delays its reply, so the client's
-    // reply read is the call that waits (without the delay the reply would
-    // land first and the read would return in the client's turn). It
-    // readmissions in the record; PR #4761 still refuses the strict replay
-    // below because binder reply payloads are not recorded.
     let json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
-    assert!(
-        json["rejoins"]
-            .as_array()
-            .is_some_and(|rejoins| !rejoins.is_empty()),
-        "the recording stored no readmission"
-    );
+    if !json["rejoins"]
+        .as_array()
+        .is_some_and(|rejoins| !rejoins.is_empty())
+    {
+        // Keep the recording beside the test's target directory, which
+        // survives this test's temp directory, so a red run here can be
+        // diagnosed from the record itself.
+        let retained =
+            Path::new(env!("CARGO_TARGET_TMPDIR")).join("binder-strict-replay-recording.json");
+        let kept = fs::copy(&record, &retained)
+            .map(|_| format!("; recording retained at {}", retained.display()))
+            .unwrap_or_default();
+        panic!("the recording stored no readmission{kept}");
+    }
     let replay_flag = format!("--replay-preemptions-from={}", record.display());
 
     let strict = binder_guest_output_with_on_a_capable_host(
