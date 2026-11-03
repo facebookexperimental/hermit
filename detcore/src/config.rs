@@ -217,6 +217,12 @@ mod tests {
         // the pair became 25 and 26, appended after main's 22 to 24, at their
         // rebase onto batch5a (digests measured at this head, above SP2).
         (26, "b5fc7394708905c9", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::PidfdSelfQualificationRefusal`: Detcore's
+        // record of a self-sentinel `pidfd_send_signal` refusal its backend
+        // could not qualify, filed with the coordinator before the Tool
+        // image returns it (the release-05 pidfd pair, renumbered to 27 at
+        // its rebase onto C2's 25 and 26; digest measured at this head).
+        (27, "74ceb8dd663f2297", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

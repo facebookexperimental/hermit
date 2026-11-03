@@ -743,6 +743,8 @@ mod tests {
                 reverie::Error::Tool(Error::new(crate::SchedulerEndedRun::new(outcome, None)));
             assert_eq!(classify_ptrace_primary(&primary), FailureKind::Error);
         }
+    }
+
     /// Detcore's refusal of a self-sentinel pidfd_send_signal whose backend
     /// could not qualify its spelling is a policy refusal, through ptrace's
     /// Tool wrapper and across the container boundary, and keeps its reason.
