@@ -1831,9 +1831,11 @@ before reporting an issue.
 ### Android Binder
 
 A binder call that waits for another process (a blocking
-`ioctl(BINDER_WRITE_READ)` read, or `BINDER_FREEZE`) cannot hold the guest's
+`ioctl(BINDER_WRITE_READ)` read) cannot hold the guest's
 turn, so Hermit runs it off the turn, and the call then finishes when the host's
-kernel delivers its work. Hermit does that only while the calling task is the
+kernel delivers its work. A waiting `BINDER_FREEZE` is host-timed, so it is
+refused by name instead (the same refusal returns `EOPNOTSUPP` under
+`--allow-unsupported-syscalls`); it never runs off the turn. Hermit does that only while the calling task is the
 run's one task: no other thread or process of the guest is live, exited but not
 yet reaped, or being created, and no debugger is attached (`--gdbserver`,
 `--dap-listen`). Then no other task can change what the call reads and writes,

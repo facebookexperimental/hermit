@@ -21825,6 +21825,10 @@ mod inject_fstat_scratch {
         /// The resource sets this guest requested from the scheduler, in
         /// order, for a test that witnesses a turn release.
         resource_requests: std::sync::Mutex<Vec<Vec<crate::resources::ResourceID>>>,
+        /// Whether this guest may capture and grant scheduler resource
+        /// requests (the turn-release witness). Every other test leaves
+        /// this off, so an unexpected scheduler RPC still panics below.
+        capture_resource_requests: bool,
     }
 
     impl ScriptedGuest {
@@ -21880,6 +21884,7 @@ mod inject_fstat_scratch {
                 unreported_at_ioctl: None,
                 determinism_losses: Default::default(),
                 resource_requests: Default::default(),
+                capture_resource_requests: false,
             };
             (tool, guest)
         }
@@ -21947,7 +21952,9 @@ mod inject_fstat_scratch {
                     GlobalRequest::WithForwardedCount(_, inner) => inner.as_ref(),
                     other => other,
                 };
-                if let GlobalRequest::RequestResources(resources, _) = request {
+                if let GlobalRequest::RequestResources(resources, _) = request
+                    && self.capture_resource_requests
+                {
                     self.resource_requests
                         .lock()
                         .unwrap()
@@ -22837,6 +22844,7 @@ mod inject_fstat_scratch {
             let argument = words.as_mut_ptr() as usize;
             let (_, mut guest) = ScriptedGuest::new(true, false);
             model_binder_descriptor(&guest);
+            guest.capture_resource_requests = true;
             guest.config.sequentialize_threads = true;
             guest.ppoll_ready = Some(ready.unwrap_or(0));
             guest.binder_read_consumed = Some(0);
