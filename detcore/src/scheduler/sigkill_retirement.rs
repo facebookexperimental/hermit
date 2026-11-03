@@ -587,7 +587,12 @@ impl Scheduler {
         let cohort = (processes.len() > 1).then_some(token);
         for process in processes {
             if !already_notified.contains(&process) {
-                self.own_killed_child_notification(process, reservation.uid, cohort);
+                self.own_killed_child_notification(
+                    process,
+                    reservation.uid,
+                    cohort,
+                    reservation.sender,
+                );
             }
         }
         // A report the notification did not consume is forgotten, as
@@ -603,8 +608,15 @@ impl Scheduler {
     /// parent's SIGCHLD, a hold until the kernel's publication; otherwise
     /// Linux's siginfo (`CLD_KILLED`, `SIGKILL`) on the scheduler's copy, and
     /// the child-exit timer. The first copy delivered stands for the exit
-    /// (`child_exit_sigchld`).
-    fn own_killed_child_notification(&mut self, process: DetPid, uid: u32, cohort: Option<u64>) {
+    /// (`child_exit_sigchld`). `sender` sent the SIGKILL, in its committed
+    /// turn, which fences the parent's copy (`SigchldFence::by`).
+    fn own_killed_child_notification(
+        &mut self,
+        process: DetPid,
+        uid: u32,
+        cohort: Option<u64>,
+        sender: DetTid,
+    ) {
         let Some(parent) = self.thread_tree.parent_process(&process) else {
             return;
         };
@@ -633,7 +645,7 @@ impl Scheduler {
                 }
                 // A discarded copy is pending at a point the schedule fixes;
                 // an ignored one is never sent (`fence_child_exit_sigchld`).
-                self.fence_child_exit_sigchld(parent, Some(notification));
+                self.fence_child_exit_sigchld(parent, Some(notification), sender);
             }
             super::ChildExitNotification::Deliver | super::ChildExitNotification::Undecided => {
                 // The kernel sends the parent its own SIGCHLD too, once the
@@ -649,7 +661,7 @@ impl Scheduler {
                     self.sigkill.unpublished.insert(process);
                 }
                 if self.backend.reports_child_exit_publication {
-                    self.fence_child_exit_sigchld(parent, Some(notification));
+                    self.fence_child_exit_sigchld(parent, Some(notification), sender);
                 }
                 self.child_exit_sigchld.exit_status.insert(
                     process,
