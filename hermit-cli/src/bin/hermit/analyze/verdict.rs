@@ -20,8 +20,8 @@ use detcore_model::config::MaybeTimeslice;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::analyze::phases::describe_continuation;
-use crate::schedule_search::NoSingleSwap;
+use crate::app::analyze::phases::describe_continuation;
+use crate::app::schedule_search::NoSingleSwap;
 
 /// What an analysis concluded: the `verdict` field of its report.
 #[derive(

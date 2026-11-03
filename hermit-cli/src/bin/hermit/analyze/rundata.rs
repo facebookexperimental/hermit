@@ -44,10 +44,10 @@ use crate::app::analyze::types::TRIAL_TIMEOUT_FACTOR;
 use crate::app::analyze::types::TRIAL_TIMEOUT_FLOOR;
 use crate::app::analyze::types::TrialLog;
 use crate::app::analyze::types::TrialTimeout;
+use crate::app::analyze::verdict::TimingSetting;
 use crate::app::container::RunTimeoutMarker;
 use crate::app::global_opts::GlobalOpts;
 use crate::app::run::RunOpts;
-use crate::app::analyze::verdict::TimingSetting;
 
 /// A single run plus the results of the run, either in memory or on disk.
 pub struct RunData {

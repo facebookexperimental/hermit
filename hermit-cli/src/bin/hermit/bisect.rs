@@ -225,10 +225,12 @@ impl BisectOpts {
                 .all(|(g, b)| g.same_operations(b));
         if same_events {
             // An input bisect cannot use, not a failure of Hermit.
-            return Err(crate::app::analyze::AnalyzePrecondition::endpoints_identical(
-                "the --good and --bad schedules contain identical event traces",
-            )
-            .into());
+            return Err(
+                crate::app::analyze::AnalyzePrecondition::endpoints_identical(
+                    "the --good and --bad schedules contain identical event traces",
+                )
+                .into(),
+            );
         }
         Ok((analyzer, good, bad))
     }
@@ -507,9 +509,9 @@ mod tests {
                 error.to_string().contains("identical event traces"),
                 "{error:#}"
             );
-            assert_eq!(crate::failure_exit_code(&error), 2, "{error:#}");
+            assert_eq!(crate::app::failure_exit_code(&error), 2, "{error:#}");
             assert_eq!(
-                crate::classify_failure(&error),
+                crate::app::classify_failure(&error),
                 "HERMIT_ANALYZE_PRECONDITION class=endpoints-identical"
             );
         }

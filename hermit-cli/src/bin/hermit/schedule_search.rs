@@ -25,8 +25,8 @@ use detcore::types::SchedEvent;
 /// on a host whose branch counter is not exact ([`Config::max_branch_count_jitter`]).
 pub const INEXACT_COUNTER_BRANCH_JITTER: u32 = 64;
 
-use crate::analyze::AnalyzeFailure;
-use crate::analyze::AnalyzePrecondition;
+use crate::app::analyze::AnalyzeFailure;
+use crate::app::analyze::AnalyzePrecondition;
 
 /// User configurable settings.
 pub struct Config {
@@ -1340,9 +1340,9 @@ mod tests {
             Some(class),
             "{error:#}"
         );
-        assert_eq!(crate::failure_exit_code(error), 2, "{error:#}");
+        assert_eq!(crate::app::failure_exit_code(error), 2, "{error:#}");
         assert_eq!(
-            crate::classify_failure(error),
+            crate::app::classify_failure(error),
             format!("HERMIT_ANALYZE_PRECONDITION class={class}")
         );
     }
@@ -1655,9 +1655,9 @@ mod tests {
             ),
             "{error:#}"
         );
-        assert_eq!(crate::failure_exit_code(&error), 125);
+        assert_eq!(crate::app::failure_exit_code(&error), 125);
         assert_eq!(
-            crate::classify_failure(&error),
+            crate::app::classify_failure(&error),
             "HERMIT_INTERNAL_FAILURE class=replay-not-reproducible"
         );
     }
@@ -1689,9 +1689,9 @@ mod tests {
                 .is_some_and(|ended| ended.swaps_left == 0),
             "{error:#}"
         );
-        assert_eq!(crate::failure_exit_code(&error), 2);
+        assert_eq!(crate::app::failure_exit_code(&error), 2);
         assert_eq!(
-            crate::classify_failure(&error),
+            crate::app::classify_failure(&error),
             "HERMIT_ANALYZE_PRECONDITION class=endpoints-not-separable"
         );
 
@@ -1718,9 +1718,9 @@ mod tests {
                 ),
                 "needleman {needleman_search}: {error:#}"
             );
-            assert_eq!(crate::failure_exit_code(&error), 125);
+            assert_eq!(crate::app::failure_exit_code(&error), 125);
             assert_eq!(
-                crate::classify_failure(&error),
+                crate::app::classify_failure(&error),
                 "HERMIT_INTERNAL_FAILURE class=search-did-not-converge"
             );
         }

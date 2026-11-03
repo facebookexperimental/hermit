@@ -1196,7 +1196,8 @@ impl AccessTraceWriter {
         Ok(writer)
     }
 
-    /// Write the header of a trace to `out`.
+    /// Write the header of a trace to `out`, of a run that records every
+    /// descriptor's type.
     #[cfg(test)]
     pub(crate) fn new(
         out: Box<dyn Write + Send>,
