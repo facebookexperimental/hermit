@@ -258,12 +258,21 @@ function run_nextest {
     # a refreshed prepared record) refuses before any test executes. That
     # refusal is safe to retry exactly once after re-resolving: counted,
     # bounded at one re-resolution, and the second refusal stands.
-    local budget_attempt=0 run_stderr="$attempts/budget-run-stderr.txt"
+    # The stderr capture sits beside the attempts directory, never inside
+    # it: HERMIT_NEXTEST_CPU_RECORD_DIR is read back as attempt records
+    # only, and one plain-text file there refuses the whole typed report.
+    local budget_attempt=0 run_stderr="$attempts/../budget-run-stderr.txt"
     while :; do
         budget_attempt=$((budget_attempt + 1))
         if [[ ${HERMIT_PREPARED_NEXTEST_REQUIRED:-0} == 1 && $cpu_report != - ]]; then
             if (( budget_attempt == 1 )); then
                 [[ -z $calibration_launch ]] || launch_arguments+=(--launch-proof "$calibration_launch")
+            fi
+            if (( budget_attempt > 1 )); then
+                # The resolver creates its map with create_new; the first
+                # attempt's map and context are retained beside the CPU
+                # report, so the invocation-local ones can go.
+                rm -f -- "$budget_map" "$budget_context"
             fi
             if ! run_rust_script "$SCRIPT_DIR/nextest-binaries.rs" budget-context \
                 "${launch_arguments[@]}" "${inventory_arguments[@]}" >"$budget_context"; then
@@ -584,6 +593,80 @@ PYEOF
         .attempts[0].completion == {kind:"exit", code:23} and
         .attempts[0].cpu_source == "wait4-subtree"
     ' "$scratch/wrapper-cpu.json" >/dev/null || return 1
+    # Budget re-resolution: the first prepared run refuses on a moved
+    # context (before any test executes), the counted runner re-resolves
+    # once and the run proceeds. The captured run stderr must sit beside
+    # the attempt-record directory, never inside it: the typed-results
+    # reader parses every file there as an attempt record, and one
+    # plain-text file refuses the whole report.
+    eval "real_run_rust_script() $(declare -f run_rust_script | sed -n '/^{/,$p')"
+    function run_rust_script {
+        local source=$1
+        shift
+        if [[ $source == *nextest-binaries.rs ]]; then
+            case $1 in
+                budget-context)
+                    printf '%s\n' '{"source_sha256":"0","source_clean":true,"build_sha256":"0","machine":"x86_64:self-test","available_cpus":1}'
+                    ;;
+                list)
+                    jq -nc --arg executable "$fixture_binary" '{
+                        "rust-suites": {
+                            "suite": {
+                                "package-name": "suite",
+                                "binary-id": "suite",
+                                "binary-name": "suite",
+                                "kind": "lib",
+                                "binary-path": $executable
+                            }
+                        }
+                    }'
+                    ;;
+                run)
+                    if [[ ! -e $scratch/reresolve-refused ]]; then
+                        : >"$scratch/reresolve-refused"
+                        printf '%s\n' 'prepared-nextest: Nextest source/build/launch context changed after budget resolution (available_cpus); resolve again before running' >&2
+                        return 2
+                    fi
+                    cp -- "$scratch/wrapper-attempts"/*.json "$HERMIT_NEXTEST_CPU_RECORD_DIR/"
+                    printf '%s\n' \
+                        '{"type":"suite","event":"started","test_count":1,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}' \
+                        '{"type":"test","event":"failed","name":"suite::suite$failure","exec_time":0.01}' \
+                        '{"type":"suite","event":"failed","passed":0,"failed":1,"ignored":0,"measured":0,"filtered_out":0,"exec_time":0.01,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}'
+                    return 100
+                    ;;
+                *) return 99 ;;
+            esac
+            return
+        fi
+        "$source" "$@"
+    }
+    attempts="$scratch/reresolve-attempts"
+    mkdir "$attempts"
+    status=0
+    got=$(TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/reresolve-counts.json" \
+        HERMIT_PREPARED_NEXTEST_REQUIRED=1 \
+        run_nextest "$scratch/reresolve-events" "$wall_multiplier" "$cpu_wrapper" \
+        "$attempts" "$binary_map" "$inventory" "$scratch/reresolve-cpu.json" \
+        --profile ci --workspace --exclude hermit-detcore --exclude hermit-detcore-tests \
+        --exclude hermit-run --exclude hermetic_infra_hermit_flaky-tests \
+        -j 1 --retries 2 \
+        2>"$scratch/reresolve.stderr") || status=$?
+    eval "run_rust_script() $(declare -f real_run_rust_script | sed -n '/^{/,$p')"
+    unset -f real_run_rust_script
+    [[ $status == 100 ]] || return 1
+    grep -q 're-resolving once (attempt 2 of 2)' "$scratch/reresolve.stderr" || return 1
+    [[ -e $scratch/budget-run-stderr.txt && ! -e $attempts/budget-run-stderr.txt ]] || return 1
+    # Only attempt records in the record directory, each one JSON the
+    # typed-results reader would accept as a record.
+    local reresolve_entry
+    for reresolve_entry in "$attempts"/*; do
+        [[ -f $reresolve_entry ]] || return 1
+        python3 -c 'import json,sys; record=json.load(open(sys.argv[1])); assert record["identity"] and record["completion"]' \
+            "$reresolve_entry" || return 1
+    done
+    [[ $(<"$scratch/reresolve-counts.json") == \
+        '{"executed_tests":1,"filtered_tests":0,"results":[{"attempts":1,"id":"suite$failure","result":"fail"}],"schema":2}' ]] || return 1
+    attempts="$scratch/wrapper-attempts"
     grep -q 'period = "86s"' "$scratch/scaled-nextest.toml" || return 1
     [[ $(grep -c '^run-wrapper = "hermit-per-test-cpu"$' \
         "$scratch/scaled-nextest.toml") == 1 ]] || return 1
@@ -646,6 +729,7 @@ PYEOF
     [[ $status == 2 ]] || return 1
     grep -q 'unexpected=' "$scratch/launch-stray.stderr" || return 1
     [[ ! -e $scratch/launch-stray-count.json && ! -e $scratch/launch-stray-cpu.json ]] || return 1
+
     unset -f cargo
 
     printf '%s\n' \
