@@ -13354,6 +13354,25 @@ impl RunOpts {
         GuestPathMapping::Unchanged
     }
 
+    /// The environment and working directory the guest starts with, as its
+    /// command gives them: every variable it inherits or is given (the
+    /// `--base-env` one, an `--image`'s, then `--env`, a bare `--env NAME`
+    /// read from Hermit's own environment), and the directory (`--workdir`,
+    /// an `--image`'s, else Hermit's own).
+    pub(super) fn guest_inputs(
+        &self,
+    ) -> Result<
+        (
+            std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+            PathBuf,
+        ),
+        Error,
+    > {
+        let command = self.guest_command()?;
+        let directory = self.guest_current_dir(&command)?;
+        Ok((command.get_captured_envs(), directory))
+    }
+
     fn guest_current_dir(&self, command: &Command) -> Result<PathBuf, Error> {
         let directory = command
             .get_current_dir()

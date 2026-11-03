@@ -76,6 +76,16 @@ pub struct Identity {
     pub program: Option<FileIdentity>,
     /// The `hermit run` arguments, `--run-arg` ones first.
     pub run_args: Vec<String>,
+    /// The guest's starting environment, each variable by name with the
+    /// sha256 of its value (the values are not kept): a bare `--env NAME` or
+    /// `--base-env=host` takes them from Hermit's own environment, which the
+    /// run arguments do not show. Empty in a checkpoint from before the field.
+    #[serde(default)]
+    pub guest_env: Vec<(String, String)>,
+    /// The guest's starting working directory, against which its relative
+    /// paths resolve. `None` in a checkpoint from before the field.
+    #[serde(default)]
+    pub guest_cwd: Option<PathBuf>,
     /// The target criteria, by option.
     pub target: Vec<(String, String)>,
     /// The options that steer the search, by option.
@@ -142,6 +152,52 @@ impl Identity {
                     ));
                 }
             }
+        }
+        if self.guest_env != now.guest_env {
+            let recorded: std::collections::BTreeMap<&str, &str> = self
+                .guest_env
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            let current: std::collections::BTreeMap<&str, &str> = now
+                .guest_env
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            let mut changed = Vec::new();
+            for name in recorded
+                .keys()
+                .chain(current.keys())
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                match (recorded.get(name), current.get(name)) {
+                    (Some(was), Some(is)) if was != is => changed.push(format!("{name} changed")),
+                    (Some(_), None) => changed.push(format!("{name} unset")),
+                    (None, Some(_)) => changed.push(format!("{name} set")),
+                    _ => {}
+                }
+            }
+            differ.push(format!(
+                "the guest environment: {}",
+                if self.guest_env.is_empty() {
+                    "not recorded".to_owned()
+                } else {
+                    changed.join(", ")
+                }
+            ));
+        }
+        if self.guest_cwd != now.guest_cwd {
+            let describe = |cwd: &Option<PathBuf>| {
+                cwd.as_ref().map_or_else(
+                    || "not recorded".to_owned(),
+                    |cwd| cwd.display().to_string(),
+                )
+            };
+            differ.push(format!(
+                "the guest working directory: recorded {}, now {}",
+                describe(&self.guest_cwd),
+                describe(&now.guest_cwd)
+            ));
         }
         if self.records != now.records {
             let describe = |records: &Vec<(String, FileIdentity)>| {
@@ -603,6 +659,8 @@ mod tests {
             hermit: FileIdentity::of(&hermit).unwrap(),
             program: Some(FileIdentity::of(&program).unwrap()),
             run_args: vec!["--chaos".into(), program.display().to_string()],
+            guest_env: vec![("MODE".into(), "digest of A".into())],
+            guest_cwd: Some(dir.to_path_buf()),
             target: vec![("--target-stdout".into(), "FAILED".into())],
             search: vec![("--prefix-search".into(), "true".into())],
             records: Vec::new(),

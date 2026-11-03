@@ -232,6 +232,16 @@ fn knock_out_latest(record: &PreemptionRecord) -> Option<PreemptionRecord> {
 /// meet.
 fn describe_bracket(bracket: &PrefixBracket) -> String {
     match (bracket.misses, bracket.meets) {
+        // The empty prefix meets the target: scheduler-alone evidence, not a
+        // range of events, and no event comes before it.
+        (_, Some(0)) => format!(
+            "The prefix search had found that replaying none of the target schedule's {} events \
+             meets the target ({}), continuing without chaos {}: there the target is reproduced \
+             without the target schedule, which localizes no event.\n",
+            bracket.events,
+            bracket.meets_run.as_deref().unwrap_or("a trial"),
+            bracket.continuation,
+        ),
         (Some(misses), Some(meets)) => format!(
             "The prefix search's bracket, continuing without chaos {}: replaying the first \
              {misses} of the target schedule's {} events misses the target ({}), and replaying \
@@ -269,26 +279,43 @@ fn describe_bracket(bracket: &PrefixBracket) -> String {
 }
 
 /// The command line that continues this analysis in `workspace`: this
-/// invocation's own, with `--resume=WORKSPACE` in place of any earlier one.
+/// invocation's own ([`resume_command_from`]).
 fn resume_command(workspace: &Path) -> String {
-    let mut args: Vec<String> = std::env::args_os()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    let mut index = 0;
-    while index < args.len() {
+    resume_command_from(
+        std::env::args_os()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect(),
+        workspace,
+    )
+}
+
+/// `args`, a command line that runs `hermit analyze`, with
+/// `--resume=WORKSPACE` in place of any `--resume` among analyze's own
+/// options: those after `analyze` and before the first `--` after it, in
+/// either the split or the equals form. Everything from that `--` on, the
+/// `hermit run` arguments and the guest's, is kept as it is, a guest's own
+/// `--resume` among them.
+fn resume_command_from(mut args: Vec<String>, workspace: &Path) -> String {
+    let analyze = args.iter().position(|arg| arg == "analyze");
+    let start = analyze.map_or(0, |at| at + 1);
+    let mut end = args[start..]
+        .iter()
+        .position(|arg| arg == "--")
+        .map_or(args.len(), |at| start + at);
+    let mut index = start;
+    while index < end {
         if args[index] == "--resume" {
-            args.drain(index..(index + 2).min(args.len()));
+            let taken = 2.min(end - index);
+            args.drain(index..index + taken);
+            end -= taken;
         } else if args[index].starts_with("--resume=") {
             args.remove(index);
+            end -= 1;
         } else {
             index += 1;
         }
     }
-    let resume = format!("--resume={}", workspace.display());
-    match args.iter().position(|arg| arg == "analyze") {
-        Some(at) => args.insert(at + 1, resume),
-        None => args.push(resume),
-    }
+    args.insert(start, format!("--resume={}", workspace.display()));
     shell_words::join(&args)
 }
 
@@ -2549,10 +2576,35 @@ impl AnalyzeOpts {
                 records.push((option.to_owned(), FileIdentity::of(path)?));
             }
         }
+        // An `--image` guest's environment and directory come from the image's
+        // config, which a run materializes, and its command from an
+        // Entrypoint/Cmd not resolved here; a resume is refused with it
+        // (`refuse_resume_with_image`), so none are taken.
+        let (guest_env, guest_cwd) = match runopts.image() {
+            Some(_) => (Vec::new(), None),
+            None => {
+                let (guest_env, guest_cwd) = runopts.guest_inputs()?;
+                let guest_env = guest_env
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.to_string_lossy().into_owned(),
+                            detcore::Digest::new(std::os::unix::ffi::OsStrExt::as_bytes(
+                                value.as_os_str(),
+                            ))
+                            .to_string(),
+                        )
+                    })
+                    .collect();
+                (guest_env, Some(guest_cwd))
+            }
+        };
         Ok(Identity {
             hermit,
             program,
             run_args: self.run_arg.iter().chain(&self.run_args).cloned().collect(),
+            guest_env,
+            guest_cwd,
             target,
             search,
             records,
@@ -2993,9 +3045,18 @@ impl AnalyzeOpts {
         let (Some(pass), Some(resume)) = (interval.pass, interval.resume.clone()) else {
             return None;
         };
-        let load = |path: &Path, hash: &str| {
-            let events = PreemptionReader::new(path).load_all().into_global();
-            (events_digest(&[&events]) == hash).then_some(events)
+        let load = |path: &Path, hash: &str| match PreemptionReader::try_new(path) {
+            Ok(reader) => {
+                let events = reader.into_inner().into_global();
+                (events_digest(&[&events]) == hash).then_some(events)
+            }
+            Err(error) => {
+                eprintln!(
+                    ":: The earlier invocation's interval schedule {} cannot be read: {error:#}.",
+                    path.display()
+                );
+                None
+            }
         };
         let loaded = (resume.endpoints == endpoints)
             .then(|| {
@@ -9112,6 +9173,145 @@ mod tests {
         }
     }
 
+    /// A resume refuses an analysis whose guest would start with another
+    /// environment or in another working directory, though its command line
+    /// is the same: a bare `--env NAME` takes the value from Hermit's own
+    /// environment, and a relative path resolves against the working
+    /// directory. Only the names of changed variables are said; their values
+    /// are not kept.
+    #[test]
+    fn a_resume_refuses_another_guest_environment_or_working_directory() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        const MODE: &str = "HERMIT_TEST_RESUME_MODE";
+        let identity = || {
+            AnalyzeOpts::try_parse_from([
+                "analyze",
+                "--analyze-seed=7",
+                "--",
+                "--base-env=minimal",
+                "--env",
+                MODE,
+                "--",
+                "/bin/true",
+            ])
+            .unwrap()
+            .identity()
+            .unwrap()
+        };
+        // SAFETY: this test runs alone in its process (`rerun_alone`).
+        unsafe { std::env::set_var(MODE, "A") };
+        let first = identity();
+        assert_eq!(first.differences(&identity()), Vec::<String>::new());
+        assert!(
+            first
+                .guest_env
+                .iter()
+                .any(|(name, value)| name == MODE && value != "A"),
+            "{:?}",
+            first.guest_env
+        );
+        unsafe { std::env::set_var(MODE, "B") };
+        let second = identity();
+        assert_eq!(
+            first.differences(&second),
+            [format!("the guest environment: {MODE} changed")]
+        );
+        let elsewhere = tempfile::tempdir().unwrap();
+        let before = std::env::current_dir().unwrap();
+        std::env::set_current_dir(elsewhere.path()).unwrap();
+        let third = identity();
+        std::env::set_current_dir(before).unwrap();
+        let moved = second.differences(&third);
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert!(
+            moved[0].starts_with("the guest working directory: recorded ")
+                && moved[0].ends_with(&format!(
+                    ", now {}",
+                    std::fs::canonicalize(elsewhere.path()).unwrap().display()
+                )),
+            "{moved:?}"
+        );
+    }
+
+    /// The command that resumes an analysis replaces analyze's own
+    /// `--resume`, in either form, and keeps every argument after analyze's
+    /// `--` as it is: the `hermit run` arguments and the guest's, whose own
+    /// `--resume checkpoint` or `--resume=x` is not analyze's.
+    #[test]
+    fn the_resume_command_keeps_the_guests_arguments() {
+        let args = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        let resumed = |line: &str| {
+            shell_words::split(&resume_command_from(args(line), Path::new("/ws/new"))).unwrap()
+        };
+        assert_eq!(
+            resumed(
+                "hermit analyze --resume /ws/old --prefix-search -- --base-env=minimal -- \
+                 /bin/prog --resume checkpoint --resume=x"
+            ),
+            args(
+                "hermit analyze --resume=/ws/new --prefix-search -- --base-env=minimal -- \
+                 /bin/prog --resume checkpoint --resume=x"
+            )
+        );
+        assert_eq!(
+            resumed(
+                "hermit --log=info analyze --prefix-search --resume=/ws/old -- /bin/prog --resume"
+            ),
+            args(
+                "hermit --log=info analyze --resume=/ws/new --prefix-search -- /bin/prog --resume"
+            )
+        );
+        assert_eq!(
+            resumed("hermit analyze -- /bin/prog"),
+            args("hermit analyze --resume=/ws/new -- /bin/prog")
+        );
+    }
+
+    /// A bracket whose shortest prefix known to meet the target is the empty
+    /// one is scheduler-alone evidence, not a range of events: a partial
+    /// report says so, names no event range and exits 120. Before, it
+    /// formatted `meets - 1` with `meets` 0.
+    #[test]
+    fn a_partial_report_with_the_empty_prefix_meeting_names_no_range() {
+        let parent = tempfile::tempdir().unwrap();
+        let report_file = parent.path().join("report.json");
+        let report = format!("--report-file={}", report_file.display());
+        let (mut options, _workspace) =
+            analysis_in(parent.path(), &[report.as_str(), "--trial-budget=1"]);
+        options.budget = Budget::new(options.time_budget, options.trial_budget);
+        options.budget.start_trial().unwrap();
+        let expired = options.budget.start_trial().unwrap_err();
+        options.progress.phase(Phase::PrefixSearch);
+        let mut ends = Ends::new();
+        ends.insert((0, None), TrialEnd::Met);
+        let runs = BTreeMap::from([((0, None), "prefix_round_001".to_owned())]);
+        let bracket = prefix_bracket(&ends, &runs, None, 300);
+        assert_eq!((bracket.misses, bracket.meets), (None, Some(0)));
+        options.progress.bracket(bracket);
+
+        let status = options.report_partial(expired).unwrap();
+        assert_eq!(
+            status,
+            ExitStatus::Exited(hermit::HERMIT_ANALYZE_PARTIAL_EXIT)
+        );
+        let written: Report =
+            serde_json::from_str(&std::fs::read_to_string(&report_file).unwrap()).unwrap();
+        assert_eq!(written.verdict, Verdict::Partial);
+        assert!(
+            written.header.contains(
+                "The prefix search had found that replaying none of the target schedule's 300 \
+                 events meets the target (prefix_round_001), continuing without chaos without PMU \
+                 timeslices: there the target is reproduced without the target schedule, which \
+                 localizes no event."
+            ),
+            "{}",
+            written.header
+        );
+        assert!(!written.header.contains("events #"), "{}", written.header);
+    }
+
     /// A resumed analysis restarts its search from the interval the earlier
     /// invocation recorded, with its trial count and warnings, when that
     /// interval is of the same endpoints and its two files hold what it
@@ -9162,6 +9362,37 @@ mod tests {
         // And one recorded before the search's first pass, which has no state.
         interval.record(&options, None, [&baseline, &target], None, None);
         options.resumed_progress = Some(options.progress.snapshot());
+        assert!(options.resumable_interval(&endpoints).is_none());
+        // A damaged workspace starts over too, without a panic: a truncated
+        // interval file, and a missing one.
+        let state = || SearchState {
+            endpoints: endpoints.clone(),
+            event_level: true,
+            trials: 7,
+        };
+        interval.record(
+            &options,
+            Some(3),
+            [&passing, &failing],
+            Some((2, 1)),
+            Some(state()),
+        );
+        options.resumed_progress = Some(options.progress.snapshot());
+        assert!(options.resumable_interval(&endpoints).is_some());
+        let recorded = options.progress.snapshot().interval.unwrap();
+        let whole = std::fs::read(&recorded.passing).unwrap();
+        std::fs::write(&recorded.passing, &whole[..whole.len() / 2]).unwrap();
+        assert!(options.resumable_interval(&endpoints).is_none());
+        interval.record(
+            &options,
+            Some(3),
+            [&passing, &failing],
+            Some((2, 1)),
+            Some(state()),
+        );
+        options.resumed_progress = Some(options.progress.snapshot());
+        let recorded = options.progress.snapshot().interval.unwrap();
+        std::fs::remove_file(&recorded.failing).unwrap();
         assert!(options.resumable_interval(&endpoints).is_none());
     }
 
