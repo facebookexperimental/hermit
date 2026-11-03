@@ -4969,7 +4969,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // skipped rows (minibeads dh-j7ocf tracks the fix): the node no longer
     // runs them, so its counted run executes 36 of the 42 tests and filters
     // out 6. They were never required, so this count stays 36.
-    ("privileged-test.deadline_slice_cap_kvm", 36),
+    // PR #4728 adds two unignored cases to the same binary
+    // (`a_recording_keeps_lone_slice_ends_and_marks_them` and
+    // `replays_take_recorded_lone_slice_ends_the_same_way`), which the
+    // node runs whole: 42 + 2 declared, 6 skipped, 36 + 2 = 38 required.
+    ("privileged-test.deadline_slice_cap_kvm", 38),
     // The same three https://github.com/rrnewton/hermit/issues/3260 tests as
     // test.cli; all 99 prior identities retained. The same
     // https://github.com/rrnewton/hermit/pull/3547 version test as test.cli

@@ -325,23 +325,29 @@ fn just_distance(sched1: &[SchedEvent], sched2: &[SchedEvent]) -> (usize, usize)
 
 /// `schedule` without the events `other` has no counterpart for, matched as
 /// multisets from the left, if what is left differs from `other` by exactly one
-/// adjacent swap.
+/// adjacent swap. Counterparts are matched by the alignment policy
+/// (`aligned_keys`), as `align` matches them: a slice end one schedule took
+/// without a stop and the other took with one are the same event, so the
+/// shared events are the ones alignment would pair, with `schedule`'s own
+/// events retained.
 fn events_shared_with(schedule: &[SchedEvent], other: &[SchedEvent]) -> Option<Vec<SchedEvent>> {
+    let (schedule_keys, other_keys) = aligned_keys(schedule, other);
     let mut available: std::collections::HashMap<&SchedEvent, usize> =
         std::collections::HashMap::new();
-    for event in other {
-        *available.entry(event).or_default() += 1;
+    for (key, _) in &other_keys {
+        *available.entry(key).or_default() += 1;
     }
     let shared: Vec<SchedEvent> = schedule
         .iter()
-        .filter(|event| match available.get_mut(event) {
+        .zip(&schedule_keys)
+        .filter(|(_, (key, _))| match available.get_mut(key) {
             Some(count) if *count > 0 => {
                 *count -= 1;
                 true
             }
             _ => false,
         })
-        .cloned()
+        .map(|(event, _)| event.clone())
         .collect();
     (shared.len() == other.len() && just_distance(&shared, other) == (1, 1)).then_some(shared)
 }
@@ -1362,6 +1368,30 @@ mod tests {
             events_shared_with(&passing, &passing),
             None,
             "identical schedules are not one swap apart"
+        );
+    }
+
+    /// The shared-events trim matches counterparts by the alignment
+    /// policy, not by raw equality: a slice end the passing run took
+    /// without a stop and the failing run took with one (a known RIP)
+    /// is the same event. With raw matching that end would be dropped
+    /// as unshared, the trim would come up short, and the one-swap
+    /// reduction would report no single swap for a pair it can localize.
+    #[test]
+    fn a_shared_end_taken_with_and_without_a_stop_survives_the_trim() {
+        let a = DetTid::from_raw(3);
+        let stopped_end = SchedEvent::branches(a, 100)
+            .with_end_rip(detcore::types::InstructionPointer::new(0x401000).unwrap());
+        let stopless_end = SchedEvent::branches(a, 100).taken_without_stop();
+        let x = SchedEvent::syscall(DetTid::from_raw(5), Sysno::write, SyscallPhase::Prehook);
+        let y = SchedEvent::syscall(DetTid::from_raw(7), Sysno::read, SyscallPhase::Prehook);
+        let extra = SchedEvent::syscall(DetTid::from_raw(9), Sysno::getpid, SyscallPhase::Prehook);
+        let passing = vec![stopless_end, x.clone(), y.clone()];
+        let failing = vec![stopped_end.clone(), y.clone(), x.clone(), extra];
+        assert_eq!(
+            events_shared_with(&failing, &passing),
+            Some(vec![stopped_end, y, x]),
+            "the trim keeps the failing run's own stopped end and drops only its extra event"
         );
     }
 

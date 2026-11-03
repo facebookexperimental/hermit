@@ -652,19 +652,68 @@ impl PreemptionRecord {
     /// keeps its lone-slice ends. It follows the format ladder's rule: a
     /// later feature that cannot be lowered keeps its number and marks the
     /// earlier feature's data absent with an explicit flag; a feature that
-    /// can be lowered without breaking replay is lowered. These marks can be,
-    /// so no flag says they were dropped: a replay that stops at such an end
-    /// reproduces the run as one that takes it without a stop does
-    /// (`hermit-cli`'s `deadline_slice_cap` tests compare a recording's
-    /// replays with those of a recording that stopped at every end).
+    /// can be lowered without breaking replay is lowered. These marks can
+    /// be, where the end stays visible without the mark: a replay that
+    /// stops at such an end reproduces the run as one that takes it
+    /// without a stop does (`hermit-cli`'s `deadline_slice_cap` tests
+    /// compare a recording's replays with those of a recording that
+    /// stopped at every end), because an end a following Branch or
+    /// another thread's event marks is found by the replay's own rule
+    /// (`Replayer::timer_preemption_branches`).
+    ///
+    /// A mark whose end would become invisible is kept, not dropped: the
+    /// guest retired its last branch at that end and reached a check-in
+    /// of the same thread with no branch between, which a replay reads
+    /// as branches that reach a check-in, not as a slice end. Clearing
+    /// such a mark would silently remove the slice end, its grant and
+    /// its virtual-time charge, so the lowered record instead keeps the
+    /// mark and is refused wherever records are validated or read
+    /// (`validate_format`: such ends need format
+    /// [`STOPLESS_SLICE_ENDS_FORMAT`] or later). The conversion is
+    /// refused, never lossy.
     fn forget_stopless_marks_below_their_format(&mut self) {
         if self
             .format_version
             .is_none_or(|format| format < STOPLESS_SLICE_ENDS_FORMAT)
         {
-            for event in &mut self.global {
-                event.stopless = false;
+            for index in 0..self.global.len() {
+                let event = &self.global[index];
+                if !event.stopless {
+                    continue;
+                }
+                // The last event's end is the record's end: no following
+                // turn is decided by it, so clearing its mark loses no
+                // endpoint a replay could take.
+                let end_stays_visible = self.global.get(index + 1).is_none_or(|following| {
+                    following.op == detcore_model::schedule::Op::Branch
+                        || following.dettid != event.dettid
+                });
+                if end_stays_visible {
+                    self.global[index].stopless = false;
+                }
             }
+        }
+    }
+
+    /// The refusal for a record whose `stopless` marks its format may not
+    /// hold, or `None` if it may: after lowering, a remaining mark is one
+    /// whose slice end would have become invisible without it, so the
+    /// record is refused rather than lossy (`validate_format` states the
+    /// same refusal on read).
+    fn stopless_lowering_refusal(&self) -> Result<(), String> {
+        let stopless = self.global.iter().filter(|event| event.stopless).count();
+        if stopless > 0
+            && self
+                .format_version
+                .is_none_or(|format| format < STOPLESS_SLICE_ENDS_FORMAT)
+        {
+            Err(format!(
+                "record format {:?} with {stopless} timeslice ends taken without a stop \
+                 (`stopless`): such ends need format {STOPLESS_SLICE_ENDS_FORMAT} or later",
+                self.format_version
+            ))
+        } else {
+            Ok(())
         }
     }
 
@@ -2070,6 +2119,87 @@ mod tests {
         schedule.background_starts.clear();
         let trial = schedule.with_format(format_without_background_starts(record.format_version));
         assert_eq!(reads_back(&trial, "a shared trial format"), lowered);
+    }
+
+    /// A `stopless` end the guest reached a same-thread check-in from,
+    /// with no branch between, is invisible without its mark: lowering
+    /// such a record below [`STOPLESS_SLICE_ENDS_FORMAT`] is refused
+    /// wherever the record is validated, rather than silently dropping
+    /// the slice end (its grant and virtual-time charge). The reachable
+    /// sequence is a marked Branch, the check-in's OtherInstructions,
+    /// and its syscall: catch-up records the marked Branch, and the
+    /// syscall prehook records the OtherInstructions with no further
+    /// branch. A writer below the format that records the same sequence
+    /// is refused at flush for the same reason.
+    #[test]
+    fn a_lowering_that_would_hide_a_stopless_end_is_refused() {
+        let tid = DetTid::from_raw(3);
+        let check_in = SchedEvent {
+            dettid: tid,
+            op: Op::OtherInstructions,
+            count: 1,
+            start_rip: None,
+            end_rip: None,
+            end_time: None,
+            stopless: false,
+        };
+        let events = vec![
+            SchedEvent::branches(tid, 123).taken_without_stop(),
+            check_in,
+            SchedEvent::branches(tid, 7),
+        ];
+        let mut record = PreemptionRecord::from_sched_events(events);
+        record.format_version = Some(PREEMPTION_RECORD_FORMAT);
+        record.validate().unwrap();
+
+        let lowered = record
+            .clone()
+            .with_format(Some(BACKGROUND_STARTS_FORMAT - 1));
+        let refusal = lowered.validate().unwrap_err();
+        assert!(
+            refusal.contains("`stopless`"),
+            "lowering must refuse, not hide the end: {refusal}"
+        );
+        assert!(
+            lowered.global[0].stopless,
+            "the mark is kept so the refusal names it"
+        );
+        // The same refusal through a shorter prefix and an edit.
+        assert!(record.schedule_prefix(2).validate().is_err());
+        let mut edited = record.clone();
+        edited.schedevents_iter_mut().for_each(|_| ());
+        assert!(edited.validate().is_err());
+
+        // A writer below the format (which notes no background starts)
+        // recording the same sequence is refused at flush.
+        let mut writer = PreemptionWriter::new(None);
+        writer.insert_schedevent(SchedEvent::branches(tid, 123).taken_without_stop());
+        writer.insert_schedevent(SchedEvent {
+            dettid: tid,
+            op: Op::OtherInstructions,
+            count: 1,
+            start_rip: None,
+            end_rip: None,
+            end_time: None,
+            stopless: false,
+        });
+        let refusal = writer
+            .serialized_string()
+            .expect_err("a writer that would hide the end must refuse");
+        assert!(refusal.contains("`stopless`"), "{refusal}");
+
+        // Control: the same end followed by a Branch stays visible
+        // without its mark, so lowering it is accepted and replayable
+        // with a stop.
+        let visible = vec![
+            SchedEvent::branches(tid, 123).taken_without_stop(),
+            SchedEvent::branches(tid, 7),
+        ];
+        let mut record = PreemptionRecord::from_sched_events(visible);
+        record.format_version = Some(PREEMPTION_RECORD_FORMAT);
+        let lowered = record.with_format(Some(BACKGROUND_STARTS_FORMAT - 1));
+        lowered.validate().unwrap();
+        assert!(!lowered.global[0].stopless);
     }
 
     #[test]
@@ -4249,9 +4379,15 @@ impl PreemptionWriter {
     /// stop (`SchedEvent::stopless`) as an ordinary end: its record holds no
     /// marks, as a record lowered below its starts holds none
     /// (`PreemptionRecord::forget_stopless_marks_below_their_format`), and its
-    /// replay stops at that end.
+    /// replay stops at that end. The mark is dropped only when the finished
+    /// record keeps the end visible without it; a writer whose next event
+    /// would hide the end keeps the mark and its flush is refused, as a
+    /// lowered record's is. A slice-boundary writer drops the mark at once:
+    /// its stream is validated as a whole on read, where a mark in its
+    /// format is refused (`boundary_recording`).
     pub fn insert_schedevent(&mut self, mut ev: SchedEvent) {
         if ev.stopless
+            && self.boundary_records.is_some()
             && self
                 .inner
                 .format_version
@@ -4338,15 +4474,29 @@ impl PreemptionWriter {
         self.write_to_disk()
     }
 
+    /// Drop the `stopless` marks this writer may not hold (below
+    /// [`STOPLESS_SLICE_ENDS_FORMAT`]) and refuse the record if a mark's
+    /// slice end would become invisible without it
+    /// (`PreemptionRecord::forget_stopless_marks_below_their_format`):
+    /// such a record is invalid in its format, and writing it would
+    /// silently lose the end.
+    fn finalize(&mut self) -> Result<(), String> {
+        self.inner.forget_stopless_marks_below_their_format();
+        self.inner.stopless_lowering_refusal()
+    }
+
     fn write_to_disk(&mut self) -> Result<(), String> {
-        if let Some(path) = &self.dest {
+        if self.dest.is_some() {
             if self.boundary_records.is_none() {
-                return self.inner.write_to_disk(path);
+                self.finalize()?;
+                let path = self.dest.clone().unwrap();
+                return self.inner.write_to_disk(&path);
             }
+            let path = self.dest.clone().unwrap();
             // Validate the complete stream before opening an existing file.
             let mut bytes = self.serialized_string()?.into_bytes();
             bytes.push(b'\n');
-            std::fs::write(path, bytes)
+            std::fs::write(&path, bytes)
                 .map_err(|e| format!("Failed to write boundary recording {}: {e}", path.display()))
         } else {
             Err(
@@ -4357,7 +4507,10 @@ impl PreemptionWriter {
 
     fn serialized_string(&self) -> Result<String, String> {
         let Some(records) = &self.boundary_records else {
-            return Ok(self.inner.to_string());
+            let mut record = self.inner.clone();
+            record.forget_stopless_marks_below_their_format();
+            record.stopless_lowering_refusal()?;
+            return Ok(record.to_string());
         };
         let schedule = detcore_model::schedule::boundary::Schedule::new(records.clone())
             .map_err(|e| e.to_string())?;
