@@ -68,8 +68,9 @@
 //!   description the trace gives no pair identity, such as a reopen through
 //!   /proc/self/fd, could be any pipe's, so it untracks every pipe.
 //! - Content: an admitted pipe still gives no edge when its bytes are not one
-//!   piece per traced write and one consumption per traced read: a tee or a
-//!   vmsplice, packet mode, or a write that may exceed PIPE_BUF.
+//!   piece per traced write, put in at its entry, and one consumption per
+//!   traced read: a tee or a vmsplice, packet mode, or a write that waited or
+//!   may exceed PIPE_BUF.
 //!
 //! Window lemma: the schedules agree before S, so a call that ended before S
 //! holds the same events in both runs, and a pair whose order flips lies at
@@ -964,8 +965,9 @@ const UNPAIRED: &str = "the trace has a pipe description without a pair identity
                         through /proc/self/fd), which could be any pipe's";
 const PACKET: &str = "it may be a packet pipe (pipe2 with O_DIRECT, or a status flag change by \
                       fcntl F_SETFL), whose reads discard the rest of a packet";
-const LARGE_WRITE: &str = "a write to it may be larger than PIPE_BUF, which the pipe need not take \
-                           whole: other writers' bytes can come between its parts";
+const UNPLACED_WRITE: &str = "a write to it may not have gone in whole at its entry: it waited for \
+                              room, or it may be larger than PIPE_BUF, which the pipe need not take \
+                              whole, so other writers' bytes can come before or between its parts";
 /// The largest pipe write POSIX keeps atomic, 4096 bytes on Linux
 /// (`PIPE_BUF`, include/uapi/linux/limits.h).
 const PIPE_BUF: u64 = 4096;
@@ -1011,11 +1013,12 @@ struct DataEdges {
 ///   packet it reads from (`pipe_read`, fs/pipe.c#n337 at v6.9). A pipe is
 ///   taken as one when pipe2 made it with O_DIRECT, or when a successful
 ///   fcntl F_SETFL changed the status flags of one of its ends.
-/// - A pipe written by a call that may be larger than PIPE_BUF
-///   ([`LARGE_WRITE`], [`may_exceed_pipe_buf`]): Linux keeps only a write of
-///   at most PIPE_BUF bytes whole (pipe(7)), and Detcore's blocking pipe
-///   write can put a larger one in in parts while other writers run,
-///   recording one result.
+/// - A pipe written by a call that waited, or that may be larger than
+///   PIPE_BUF ([`UNPLACED_WRITE`], [`unplaced_write`]): a write that waited
+///   went in when it found room, after other calls ran, not at its entry;
+///   and Linux keeps only a write of at most PIPE_BUF bytes whole (pipe(7)),
+///   so Detcore's blocking pipe write can put a larger one in in parts while
+///   other writers run, recording one result.
 fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
     let (steps, mut untracked) = channel_steps(syscalls);
     // The ends a pipe or socketpair call returned. An Open note alone is not
@@ -1071,9 +1074,7 @@ fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
         .collect();
     let large: BTreeSet<ChannelId> = steps
         .iter()
-        .filter(|step| {
-            step.write && step.kind == ChannelKind::Pipe && may_exceed_pipe_buf(step.sys)
-        })
+        .filter(|step| step.write && step.kind == ChannelKind::Pipe && unplaced_write(step.sys))
         .map(|step| step.id)
         .collect();
     for step in &steps {
@@ -1095,7 +1096,7 @@ fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
         } else if packet.contains(&step.id) {
             PACKET
         } else if large.contains(&step.id) {
-            LARGE_WRITE
+            UNPLACED_WRITE
         } else {
             continue;
         };
@@ -1188,26 +1189,25 @@ fn unfollowed_pipes(syscalls: &[&SyscallRecord]) -> Unfollowed {
     unfollowed
 }
 
-/// Whether `sys`, a call that wrote to a pipe, may have put its bytes in in
-/// more than one part. A write, a splice or a sendfile may when its length
-/// argument is over PIPE_BUF. The trace does not hold a writev's requested length (it
-/// is in the guest's iovecs), so a writev or pwritev2 counts when it
-/// returned more than PIPE_BUF bytes, or when it waited: its return is not
-/// the event right after its entry. Detcore's blocking write puts in a
-/// second part only after it waited for room, and a writev cut short by a
-/// signal after a first part also waited. Any other call counts when it
-/// returned more than PIPE_BUF bytes.
-fn may_exceed_pipe_buf(sys: &SyscallRecord) -> bool {
+/// Whether `sys`, a call that wrote to a pipe, may not have put its bytes in
+/// whole at its entry. It may not when it waited: its return is not the
+/// event right after its entry. Detcore's blocking pipe write then put its
+/// bytes in when it found room, after other calls ran, perhaps in parts. A
+/// write that did not wait may still have gone in in parts when it asked for
+/// more than PIPE_BUF. That is judged for a write, a splice or a sendfile by
+/// its length argument, and for any other call by what it returned (the
+/// trace does not hold a writev's requested length, which is in the guest's
+/// iovecs).
+fn unplaced_write(sys: &SyscallRecord) -> bool {
+    let waited = sys.post.is_none_or(|post| post > sys.pre + 1);
     let returned_more = sys.result.is_some_and(|r| r as u64 > PIPE_BUF);
-    match sys.sysno {
-        Sysno::write => sys.args[2] > PIPE_BUF,
-        Sysno::splice => sys.args[4] > PIPE_BUF,
-        Sysno::sendfile => sys.args[3] > PIPE_BUF,
-        Sysno::writev | Sysno::pwritev2 => {
-            returned_more || sys.post.is_none_or(|post| post > sys.pre + 1)
+    waited
+        || match sys.sysno {
+            Sysno::write => sys.args[2] > PIPE_BUF,
+            Sysno::splice => sys.args[4] > PIPE_BUF,
+            Sysno::sendfile => sys.args[3] > PIPE_BUF,
+            _ => returned_more,
         }
-        _ => returned_more,
-    }
 }
 
 /// Whether `sysno` returns two connected descriptors, the calls Detcore names
@@ -4732,7 +4732,7 @@ mod tests {
             assert_eq!(data.edges, Vec::new(), "{what}");
             assert_eq!(
                 data.untracked.get(&key).map(|u| u.why),
-                Some(LARGE_WRITE),
+                Some(UNPLACED_WRITE),
                 "{what}"
             );
         }
@@ -4872,6 +4872,97 @@ mod tests {
             assert!(data.untracked.is_empty(), "{:?}", data.untracked);
             assert_eq!(data.edges.len(), 1, "{:?}", data.edges);
         }
+    }
+
+    /// A write that waited went in when it found room, not at its entry. A
+    /// 4096-byte write fills the pipe as far as this test needs; W1 asks for
+    /// 4 bytes at event 10 and waits; R1 drains the 4096; W2 writes BBBB and
+    /// R2 reads 4 bytes, which are W2's; only then does W1 find room. The
+    /// offsets reserved W1 at its entry and credited R2's bytes to W1. A pipe
+    /// with a write that waited gives no edge and is named; the same calls
+    /// with W1 finishing at once keep their edges.
+    #[test]
+    fn a_pipe_write_that_waited_gives_no_edge() {
+        let write = |pre, tid, len: u64, post| {
+            let mut sys = call(
+                pre,
+                tid,
+                pre,
+                Sysno::write,
+                &[4, 0x1000, len],
+                Some(len as i64),
+                vec![pipe(file(7, 2), ChannelOp::Write)],
+            );
+            sys.post = Some(post);
+            sys
+        };
+        let read = |pre, len: u64| {
+            call(
+                pre,
+                9,
+                pre,
+                Sysno::read,
+                &[3, 0x2000, len],
+                Some(len as i64),
+                vec![pipe(file(7, 1), ChannelOp::Read)],
+            )
+        };
+        let key = ChannelKey::Shared(ChannelId::Pair(file(7, 1)));
+        let traced = |w1_post| {
+            [
+                creates(1, [file(7, 1), file(7, 2)]),
+                write(5, 6, PIPE_BUF, 6),
+                write(10, 7, 4, w1_post),
+                read(12, PIPE_BUF),
+                write(14, 8, 4, 15),
+                read(16, 4),
+            ]
+        };
+        let calls = traced(30);
+        let data = data_edges(&calls.iter().collect::<Vec<_>>());
+        assert_eq!(data.edges, Vec::new());
+        assert_eq!(
+            data.untracked.get(&key).map(|u| u.why),
+            Some(UNPLACED_WRITE)
+        );
+        // W1 finishes at once: the fill reaches R1 and W1 reaches R2.
+        let calls = traced(11);
+        let data = data_edges(&calls.iter().collect::<Vec<_>>());
+        assert!(data.untracked.is_empty(), "{:?}", data.untracked);
+        assert_eq!(data.edges.len(), 2, "{:?}", data.edges);
+    }
+
+    /// The /proc/self/fd reopen in a real trace:
+    /// tests/fixtures/access_trace_proc_fd_reopen.jsonl holds the records of
+    /// tests/fixtures/access_trace_pipes.c's reopen as Hermit wrote them.
+    /// pipe2 makes 3 and 4, an open of /proc/self/fd/4 makes 5, XXXX goes in
+    /// through 5 and EEEE through 4, and the read of 4 bytes through 3 gets
+    /// XXXX. The write through 5 names a pipe channel without a pair
+    /// identity, so no edge runs from the EEEE write to the read.
+    #[test]
+    fn a_real_proc_fd_reopen_trace_gives_no_edge() {
+        let trace = detcore_model::access_trace::read_access_trace(
+            include_bytes!("../../../../tests/fixtures/access_trace_proc_fd_reopen.jsonl")
+                .as_slice(),
+        )
+        .expect("the fixture parses");
+        let calls: Vec<&SyscallRecord> = trace
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                TraceRecord::Syscall(sys) => Some(sys),
+                _ => None,
+            })
+            .collect();
+        assert!(calls.iter().any(|sys| sys.sysno == Sysno::openat));
+        let data = data_edges(&calls);
+        assert_eq!(data.edges, Vec::new());
+        assert_eq!(
+            data.untracked
+                .get(&ChannelKey::Shared(ChannelId::Pair(file(3, 9))))
+                .map(|u| u.why),
+            Some(UNPAIRED)
+        );
     }
 
     /// A thread can be killed before it makes a call: thread 5 of process 5
