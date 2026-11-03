@@ -866,7 +866,8 @@ mod tests {
         // SAFETY: `name` is NUL-terminated and `fs` is written before it is read.
         assert_eq!(unsafe { libc::statfs(name.as_ptr(), fs.as_mut_ptr()) }, 0);
         // SAFETY: statfs returned 0, so it filled `fs`.
-        let overlay = unsafe { fs.assume_init() }.f_type == libc::OVERLAYFS_SUPER_MAGIC;
+        let overlay =
+            unsafe { fs.assume_init() }.f_type as u64 == libc::OVERLAYFS_SUPER_MAGIC as u64;
         let link = Path::new("/proc/self/map_files").join(&mapped.range);
         let through_link = crate::util::raw_stat(&link).ok();
         assert!(

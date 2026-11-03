@@ -287,7 +287,7 @@ fn is_on_sysfs(path: &Path) -> bool {
     }
     // SAFETY: filled by the successful call above.
     let buffer = unsafe { buffer.assume_init() };
-    buffer.f_type == libc::SYSFS_MAGIC
+    buffer.f_type as u64 == libc::SYSFS_MAGIC as u64
 }
 
 /// The pathname in an `AF_UNIX` socket address, as its bytes; `None` for
