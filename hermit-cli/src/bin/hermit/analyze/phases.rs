@@ -2716,7 +2716,7 @@ impl AnalyzeOpts {
         if !self.target_exit_code.is_match(out.status) {
             misses.push(format!(
                 "  Exit code {} is not what we're looking for.",
-                crate::analyze::types::run_exit_code(out.status)
+                super::types::run_exit_code(out.status)
             ));
         }
         misses
