@@ -3208,6 +3208,8 @@ impl PreemptionWriter {
     pub fn with_queued_sleeps_registered_at_first_pass(mut self, first_pass: bool) -> Self {
         self.inner.queued_sleeps_registered_at_first_pass = first_pass;
         self
+    }
+
     /// Store where a backgrounded call rejoined the run queue, so a replay
     /// can readmit it at the same turn (`crate::scheduler::rejoin_log`).
     pub(crate) fn push_rejoin(&mut self, rejoin: crate::scheduler::rejoin_log::Rejoin) {
