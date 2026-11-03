@@ -10,7 +10,7 @@
  * A parent's SIGCHLD for a child that ends, while a sibling thread stays
  * runnable until the parent has reaped the child.
  *
- * Usage: sigchld_busy_sibling <kill|exit|sigsuspend>
+ * Usage: sigchld_busy_sibling <kill|exit|sigsuspend|kill-unblocked|exit-unblocked>
  *
  * kill:       the child waits in pause(); the parent SIGKILLs it and reaps
  *             it.
@@ -22,7 +22,9 @@
  *             waiting forever, on Linux too.)
  *
  * The sibling blocks SIGCHLD and calls sched_yield() until the parent sets
- * `done`, so it never blocks. On Linux the parent runs beside it and the
+ * `done`, so it never blocks. In the two -unblocked modes, kill and exit
+ * otherwise, the sibling leaves SIGCHLD unblocked, so the parent's copy may
+ * be taken by either thread. On Linux the parent runs beside it and the
  * program prints one line and exits 0.
  */
 
@@ -42,6 +44,7 @@ static atomic_int done;
 static atomic_int sibling_started;
 static atomic_int handled;
 static atomic_long yields;
+static int sibling_unblocked;
 
 static void on_sigchld(int sig) {
   (void)sig;
@@ -50,10 +53,12 @@ static void on_sigchld(int sig) {
 
 static void* sibling(void* arg) {
   (void)arg;
-  sigset_t set;
-  sigemptyset(&set);
-  sigaddset(&set, SIGCHLD);
-  pthread_sigmask(SIG_BLOCK, &set, NULL);
+  if (!sibling_unblocked) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGCHLD);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+  }
   atomic_store(&sibling_started, 1);
   while (!atomic_load(&done)) {
     sched_yield();
@@ -64,10 +69,16 @@ static void* sibling(void* arg) {
 
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "";
-  int kill_mode = strcmp(mode, "kill") == 0;
+  int kill_mode =
+      strcmp(mode, "kill") == 0 || strcmp(mode, "kill-unblocked") == 0;
   int suspend_mode = strcmp(mode, "sigsuspend") == 0;
-  if (!kill_mode && !suspend_mode && strcmp(mode, "exit") != 0) {
-    fprintf(stderr, "usage: %s <kill|exit|sigsuspend>\n", argv[0]);
+  sibling_unblocked = strcmp(mode, "kill-unblocked") == 0 ||
+      strcmp(mode, "exit-unblocked") == 0;
+  if (!kill_mode && !suspend_mode && strcmp(mode, "exit") != 0 &&
+      strcmp(mode, "exit-unblocked") != 0) {
+    fprintf(stderr,
+            "usage: %s <kill|exit|sigsuspend|kill-unblocked|exit-unblocked>\n",
+            argv[0]);
     return 2;
   }
   sigset_t unblocked;

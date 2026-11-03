@@ -51882,7 +51882,14 @@ fn a_pause_returns_for_a_childs_sigchld() {
 /// `sigsuspend` mode, whose parent waits for its handler, finished already.
 /// The delivery now waits behind the work that was runnable when it came,
 /// one turn of each, each run reaches canonical bitwise parity, and a
-/// recorded schedule of the `kill` run replays to the same output.
+/// recorded schedule of the `kill` run replays to the same output. In the
+/// `-unblocked` modes the sibling does not block `SIGCHLD`, so its second
+/// turn after the copy was fenced ends the bound (`sigchld_fence_commit`)
+/// unless it took the copy itself: under ptrace each of its turns ends in a
+/// ptrace stop, whose `recalc_sigpending_tsk` makes it take a pending copy
+/// on its return to user mode. If that did not hold, the parent's delivery
+/// would wait for a quiescence the sibling never allows, and the run would
+/// end at its timeout.
 #[test]
 fn a_parents_sigchld_is_not_held_behind_a_sibling_that_never_blocks() {
     let guest = sigchld_busy_sibling_guest().to_str().unwrap().to_owned();
@@ -51898,6 +51905,14 @@ fn a_parents_sigchld_is_not_held_behind_a_sibling_that_never_blocks() {
         (
             "sigsuspend",
             "mode=sigsuspend exited=1 code=0 signaled=0 sig=0 handled=1\n",
+        ),
+        (
+            "kill-unblocked",
+            "mode=kill-unblocked exited=0 code=0 signaled=1 sig=9 handled=0\n",
+        ),
+        (
+            "exit-unblocked",
+            "mode=exit-unblocked exited=1 code=0 signaled=0 sig=0 handled=0\n",
         ),
     ] {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
