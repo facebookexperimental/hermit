@@ -93,8 +93,10 @@ mod tests {
     /// 29 is https://github.com/rrnewton/hermit/pull/4884's, 30 is
     /// https://github.com/rrnewton/hermit/pull/4728's, 31 is
     /// https://github.com/rrnewton/hermit/pull/4867's, 32 is the stopless
-    /// layout on top of 31's, and 40, the `CpuClockProcess` pair allocated
-    /// to https://github.com/rrnewton/hermit/pull/4885, is the current
+    /// layout on top of 31's, 40 is the `CpuClockProcess` pair allocated
+    /// to https://github.com/rrnewton/hermit/pull/4885, and 41, the
+    /// `HostFileIdentity::content` layout of
+    /// https://github.com/rrnewton/hermit/pull/4791, is the current
     /// revision.
     const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39];
 
@@ -270,6 +272,18 @@ mod tests {
         // (the stopless layout on top of 31), skipping reserved 33 to 39;
         // digests measured at this head).
         (40, "3919013da0508f27", "f013e36743d8d9e6"),
+        // Adds `HostFileIdentity::content` (JSON key `snapshot_content`),
+        // always encoded, which `GlobalRequest::RecordHostInput` carries in
+        // its `identity`. The digest now also covers that nested type, in
+        // domain 6: its attributes and fields
+        // (https://github.com/rrnewton/hermit/pull/4791; allocated 25 above
+        // main's 24, renumbered to 36 at its rebase onto main's 27, and
+        // renumbered mechanically to 41 at its rebase onto main's 40, the
+        // next revision after main's last row, skipping only the reserved
+        // 33 to 39 (36 is among them on this base); its domain moved from
+        // 4 to 6 because main's 30 took domain 4 for the scheduled event
+        // and domain 5 for its reply; digests measured at this head).
+        (41, "aeb38079447d34fb", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -328,6 +342,12 @@ mod tests {
     const TRACE_REPLY_WIRE: [&str; 1] = ["pub struct TraceSchedEventResponse {"];
     const REPLAYED_SLICE_END_WIRE: [&str; 1] = ["pub struct ReplayedSliceEnd {"];
 
+    /// The nested types, outside the two enums, whose fields decide a
+    /// message's positional (bincode) layout, in detcore-model's
+    /// host_input.rs: the `HostFileIdentity` that
+    /// `GlobalRequest::RecordHostInput` carries.
+    const HOST_INPUT_WIRE: [&str; 1] = ["pub struct HostFileIdentity {"];
+
     /// The lines of code of the item `source` declares, unindented, on the
     /// line `header`: the attributes just above it (its derives and serde
     /// attributes decide its encoding), the header, and its body through
@@ -369,10 +389,17 @@ mod tests {
 
     /// A digest of the code of `GlobalRequest` and `GlobalResponse` in
     /// `source`, of the StoreExclusive payload's types in `payload`, of the
-    /// scheduled event's wire items in `schedule`, and of the trace reply's
-    /// wire items in `source` and `replayer`: their variants, fields, payload
+    /// scheduled event's wire items in `schedule`, of the trace reply's
+    /// wire items in `source` and `replayer`, and of the nested wire types
+    /// in `host_input` (`HOST_INPUT_WIRE`): their variants, fields, payload
     /// types, order and attributes, not their documentation.
-    fn definition_digest(source: &str, payload: &str, schedule: &str, replayer: &str) -> String {
+    fn definition_digest(
+        source: &str,
+        payload: &str,
+        schedule: &str,
+        replayer: &str,
+        host_input: &str,
+    ) -> String {
         let request = definition(source, "pub enum GlobalRequest {").join("\n");
         let response = definition(source, "pub enum GlobalResponse {").join("\n");
         let payload = STORE_EXCLUSIVE_PAYLOAD
@@ -386,12 +413,14 @@ mod tests {
             wire_items(replayer, &REPLAYED_SLICE_END_WIRE),
         ]
         .join("\n");
+        let nested = wire_items(host_input, &HOST_INPUT_WIRE);
         fnv_domains(&[
             (0, request.as_bytes()),
             (1, response.as_bytes()),
             (3, payload.as_bytes()),
             (4, event.as_bytes()),
             (5, reply.as_bytes()),
+            (6, nested.as_bytes()),
         ])
     }
 
@@ -411,7 +440,8 @@ mod tests {
         let payload = include_str!("store_exclusive.rs");
         let schedule = include_str!("../../detcore-model/src/schedule.rs");
         let replayer = include_str!("scheduler/replayer.rs");
-        let digest = definition_digest(source, payload, schedule, replayer);
+        let host_input = include_str!("../../detcore-model/src/host_input.rs");
+        let digest = definition_digest(source, payload, schedule, replayer, host_input);
         let resources = include_str!("resources.rs");
         let resources_digest = resources_definition_digest(resources);
         let revision = crate::tool_global::GLOBAL_RPC_REVISION;
@@ -453,7 +483,7 @@ mod tests {
             1,
         );
         assert_eq!(
-            definition_digest(&documented, payload, schedule, replayer),
+            definition_digest(&documented, payload, schedule, replayer, host_input),
             digest
         );
         let added = source.replacen(
@@ -462,7 +492,7 @@ mod tests {
             1,
         );
         assert_ne!(
-            definition_digest(&added, payload, schedule, replayer),
+            definition_digest(&added, payload, schedule, replayer, host_input),
             digest
         );
         // Retype GlobalRequest's VirtualInotifyCookies wherever it sits: later
@@ -474,7 +504,7 @@ mod tests {
         );
         assert_ne!(retyped, source);
         assert_ne!(
-            definition_digest(&retyped, payload, schedule, replayer),
+            definition_digest(&retyped, payload, schedule, replayer, host_input),
             digest
         );
         // A field added to a payload type changes it too, as this change's
@@ -487,7 +517,7 @@ mod tests {
         );
         assert_ne!(grown, payload);
         assert_ne!(
-            definition_digest(source, &grown, schedule, replayer),
+            definition_digest(source, &grown, schedule, replayer, host_input),
             digest
         );
         let documented = payload.replacen(
@@ -497,7 +527,7 @@ mod tests {
         );
         assert_ne!(documented, payload);
         assert_eq!(
-            definition_digest(source, &documented, schedule, replayer),
+            definition_digest(source, &documented, schedule, replayer, host_input),
             digest
         );
         // The event `TraceSchedEvent` carries is detcore-model's: a field
@@ -509,7 +539,10 @@ mod tests {
             1,
         );
         assert_ne!(grown, schedule);
-        assert_ne!(definition_digest(source, payload, &grown, replayer), digest);
+        assert_ne!(
+            definition_digest(source, payload, &grown, replayer, host_input),
+            digest
+        );
         let carried = schedule.replacen(
             "let written_stopless = *stopless || !serializer.is_human_readable();",
             "let written_stopless = *stopless;",
@@ -517,7 +550,7 @@ mod tests {
         );
         assert_ne!(carried, schedule);
         assert_ne!(
-            definition_digest(source, payload, &carried, replayer),
+            definition_digest(source, payload, &carried, replayer, host_input),
             digest
         );
         let documented = schedule.replacen(
@@ -527,7 +560,7 @@ mod tests {
         );
         assert_ne!(documented, schedule);
         assert_eq!(
-            definition_digest(source, payload, &documented, replayer),
+            definition_digest(source, payload, &documented, replayer, host_input),
             digest
         );
         // So is the reply: a field added to the replayed slice end it holds,
@@ -538,7 +571,10 @@ mod tests {
             1,
         );
         assert_ne!(grown, replayer);
-        assert_ne!(definition_digest(source, payload, schedule, &grown), digest);
+        assert_ne!(
+            definition_digest(source, payload, schedule, &grown, host_input),
+            digest
+        );
         let retyped = source.replacen(
             "    timeslice: Option<ReplayedSliceEnd>,\n",
             "    timeslice: Option<LogicalTime>,\n",
@@ -546,7 +582,7 @@ mod tests {
         );
         assert_ne!(retyped, source);
         assert_ne!(
-            definition_digest(&retyped, payload, schedule, replayer),
+            definition_digest(&retyped, payload, schedule, replayer, host_input),
             digest
         );
         let documented = replayer.replacen(
@@ -556,7 +592,48 @@ mod tests {
         );
         assert_ne!(documented, replayer);
         assert_eq!(
-            definition_digest(source, payload, schedule, &documented),
+            definition_digest(source, payload, schedule, &documented, host_input),
+            digest
+        );
+        // The nested `HostFileIdentity`: a field added, or its encoding's
+        // attributes changed, moves the digest; a doc line does not.
+        let documented = host_input.replacen(
+            "pub struct HostFileIdentity {\n",
+            "pub struct HostFileIdentity {\n    /// Documentation only.\n",
+            1,
+        );
+        assert_ne!(documented, host_input);
+        assert_eq!(
+            definition_digest(source, payload, schedule, replayer, &documented),
+            digest
+        );
+        let added = host_input.replacen(
+            "pub struct HostFileIdentity {\n",
+            "pub struct HostFileIdentity {\n    pub added: u32,\n",
+            1,
+        );
+        assert_ne!(
+            definition_digest(source, payload, schedule, replayer, &added),
+            digest
+        );
+        let renamed = host_input.replacen(
+            "#[serde(default, rename = \"snapshot_content\")]",
+            "#[serde(default)]",
+            1,
+        );
+        assert_ne!(renamed, host_input);
+        assert_ne!(
+            definition_digest(source, payload, schedule, replayer, &renamed),
+            digest
+        );
+        let rederived = host_input.replacen(
+            "#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]\npub struct HostFileIdentity {",
+            "#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]\npub struct HostFileIdentity {",
+            1,
+        );
+        assert_ne!(rederived, host_input);
+        assert_ne!(
+            definition_digest(source, payload, schedule, replayer, &rederived),
             digest
         );
 
@@ -588,6 +665,13 @@ mod tests {
         assert_ne!(ours, model);
         let other = fingerprint_with_revision(&model, revision + 1);
         assert_ne!(other, ours);
+        // A build at the previous revision, from before the newest wire
+        // change, is refused too.
+        let previous = fingerprint_with_revision(&model, revision - 1);
+        assert!(
+            config_fingerprint_mismatch(std::ffi::OsStr::new(&previous)).is_some(),
+            "the previous revision is a mismatch"
+        );
         assert_eq!(
             config_fingerprint_mismatch(std::ffi::OsStr::new(&ours)),
             None
