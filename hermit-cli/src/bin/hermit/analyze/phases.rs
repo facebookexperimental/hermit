@@ -2487,7 +2487,8 @@ impl AnalyzeOpts {
         // baseline knocks a preemption out of, is the record that met the
         // target: a normalized copy renumbers its priorities across the
         // scheduler's fixed ones (the default priority, among others), and
-        // can run another schedule.
+        // can run another schedule. Normalization is written for reading
+        // only; analyze keeps using the observed record.
         let (normalized_path, normalized) = min_run.write_normalized_preempts();
         eprintln!(
             ":: {}\n {}",
