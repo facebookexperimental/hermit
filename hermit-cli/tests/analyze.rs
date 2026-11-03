@@ -1350,10 +1350,10 @@ fn analyze_explains_a_target_the_scheduler_meets_alone() {
         "{label}: {report}"
     );
     for expected in [
-        "the target is reproduced without the target schedule: without chaos, the scheduler \
-         alone, replaying none of the target schedule, meets the target criteria at a 100000 ns \
-         timeslice",
-        "this does not show that no event of the schedule decides the outcome",
+        "the target is reproduced without the target schedule: replaying none of the target \
+         schedule and then scheduling without chaos, the scheduler alone already meets the target \
+         criteria at a 100000 ns timeslice",
+        "a longer prefix may still miss the target",
         "prefix_round_001.repro",
         "pass --continuation-timeslice",
         "--run2-seed",
@@ -1414,9 +1414,9 @@ fn analyze_reports_a_target_met_without_chaos_as_reproduced_without_the_schedule
         report["header"]
             .as_str()
             .is_some_and(|header| header.starts_with(
-                "the target is reproduced without the target schedule: without chaos, the \
-                 scheduler alone, replaying none of the target schedule, meets the target \
-                 criteria"
+                "the target is reproduced without the target schedule: replaying none of the \
+                 target schedule and then scheduling without chaos, the scheduler alone already \
+                 meets the target criteria"
             )),
         "{label}: {report}"
     );
