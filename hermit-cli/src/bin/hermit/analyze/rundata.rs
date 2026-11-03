@@ -1882,7 +1882,7 @@ impl AnalyzeOpts {
         let config = &trial.det_opts.det_config;
         let refuse = |what: String| {
             Err(
-                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                     "`hermit analyze` and `hermit bisect` cannot search {what}: their edited \
                      records do not carry --chaos-instruction-offset's instruction offsets, so \
                      a trial would not reproduce the run. Search without the option, or replay \
@@ -2047,8 +2047,8 @@ mod tests {
             );
 
             let args =
-                crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+                crate::app::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("not analyze")
             };
             options.apply_global(&args.global);

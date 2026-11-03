@@ -6517,14 +6517,16 @@ fn chaos_instruction_offset_round_trips_and_is_refused_where_inert() {
     bound.validate_args_with_perf_support(true).unwrap();
 
     // aarch64's single steps are not validated yet: a policy refusal there.
-    let error = refuse_chaos_instruction_offset(&bound.det_opts.det_config, Backend::Ptrace, true)
-        .unwrap_err();
+    let error =
+        refuse_chaos_instruction_offset(&bound.det_opts.det_config, Backend::Ptrace.as_str(), true)
+            .unwrap_err();
     assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
     assert!(
         format!("{error:#}").contains("validated only on x86_64"),
         "{error:#}"
     );
-    refuse_chaos_instruction_offset(&bound.det_opts.det_config, Backend::Ptrace, false).unwrap();
+    refuse_chaos_instruction_offset(&bound.det_opts.det_config, Backend::Ptrace.as_str(), false)
+        .unwrap();
 
     // A readable record, so that validation reaches the offset refusal
     // rather than stopping where it first reads the record (the drawn
@@ -6557,6 +6559,7 @@ fn chaos_instruction_offset_round_trips_and_is_refused_where_inert() {
                 "run",
                 "--chaos",
                 "--chaos-instruction-offset=4",
+                "--",
                 "fakeprog",
             ],
             "backend `kvm` is refused",
@@ -6568,6 +6571,7 @@ fn chaos_instruction_offset_round_trips_and_is_refused_where_inert() {
                 "run",
                 "--chaos",
                 "--chaos-instruction-offset=4",
+                "--",
                 "fakeprog",
             ],
             "backend `e9patch` is refused",
@@ -9782,7 +9786,7 @@ const MAX_CHAOS_INSTRUCTION_OFFSET: u64 = 256;
 /// is a policy refusal (exit status 122), not a usage error.
 fn refuse_chaos_instruction_offset(
     config: &detcore::Config,
-    backend: Backend,
+    backend: &str,
     aarch64: bool,
 ) -> Result<(), Error> {
     let offset = config.chaos_instruction_offset;
@@ -9804,11 +9808,10 @@ fn refuse_chaos_instruction_offset(
              instruction exactly once, so a recorded offset could not be trusted to replay",
         ));
     }
-    if backend != Backend::Ptrace {
+    if backend != Backend::Ptrace.as_str() {
         anyhow::bail!(
             "--chaos-instruction-offset single-steps the guest with the ptrace backend's precise \
-             timer; backend `{}` is refused",
-            backend.as_str()
+             timer; backend `{backend}` is refused"
         );
     }
     if config.imprecise_timers {
@@ -12437,8 +12440,15 @@ impl RunOpts {
         // `--chaos-instruction-offset` asks the backend's precise timer for
         // single steps past a branch target, which only the ptrace backend
         // takes; elsewhere the request would be ignored or refused mid-run.
+        // An external adapter (e9patch preprocessing, DBT, SaBRe) is named by
+        // the execution backend (`execution_backend_name`), whatever runtime
+        // it runs on.
         if config.chaos_instruction_offset > 0 {
-            refuse_chaos_instruction_offset(config, backend, cfg!(target_arch = "aarch64"))?;
+            refuse_chaos_instruction_offset(
+                config,
+                self.application_backend.unwrap_or(backend.as_str()),
+                cfg!(target_arch = "aarch64"),
+            )?;
         }
         // `--signal-at` is sent by Detcore's scheduler, through the signal
         // path of the ptrace backend (with or without e9patch preprocessing).
