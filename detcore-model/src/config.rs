@@ -2189,6 +2189,8 @@ impl Config {
                         && self.reads_sleeper_signal_state()
                 }
             }
+    }
+
     /// The settings of this run under which Detcore can record a descriptor
     /// without its file type, by their option names: without metadata
     /// virtualization it keeps no stat of a descriptor it opens, which is what
