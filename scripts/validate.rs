@@ -26814,6 +26814,24 @@ fn write_ledger_with_snapshot(
             );
             return None;
         };
+        // Retain the exact row BEFORE the canonical writer judges it. If
+        // the writer refuses, `validate_rows.py record --from-file` can
+        // re-record this file once the refusal's cause is fixed, instead
+        // of the run's only copy of the row dying with the pipe.
+        if let Some(state_root) = ledger.parent() {
+            let retain_as = ctx.run_id.as_deref().unwrap_or(&record_id);
+            if let Err(error) = validate_artifacts::publish_run_artifact_noclobber(
+                state_root,
+                retain_as,
+                "history-row.json",
+                line.as_bytes(),
+                "retained validation history row",
+            ) {
+                eprintln!(
+                    "validate: warning: cannot retain history row before canonical record: {error}"
+                );
+            }
+        }
         let writer_started = std::time::Instant::now();
         let mut child = match Command::new("python3")
             .arg(&adapter)
