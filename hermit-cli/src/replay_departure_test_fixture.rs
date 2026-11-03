@@ -123,7 +123,7 @@ pub(crate) async fn receiver_cleanup(
     let reply = state.receive_rpc(from, start).await;
     assert_eq!(
         granted_lifecycle_reply(&mut thread, reply),
-        json!({"StartNewThread": history}),
+        json!({"StartNewThread": [history, null]}),
         "startup must return this actual admitted history",
     );
 

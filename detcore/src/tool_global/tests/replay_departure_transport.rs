@@ -77,9 +77,10 @@ async fn fixture(edited: bool) -> (tempfile::TempDir, Config, GlobalState, Threa
             .await,
         None
     );
-    let history = crate::tool_global::thread_start_request(&config, &mut guest, tid).await;
+    let (history, first_slice) =
+        crate::tool_global::thread_start_request(&config, &mut guest, tid).await;
     assert!(history.is_some());
-    crate::tool_global::finish_thread_start(&config, &mut guest, history);
+    crate::tool_global::finish_thread_start(&config, &mut guest, history, first_slice);
     assert!(state.sched.lock().unwrap().holds_serial_grant(tid));
     let thread = guest.thread;
     (dir, config, state, thread)
@@ -415,9 +416,10 @@ async fn a_fresh_registered_child_without_exec_history_can_publish_in_its_grant(
         deregister(&state, &root.thread).await;
     };
     let child_run = async {
-        let history = crate::tool_global::thread_start_request(&config, &mut guest, child).await;
+        let (history, first_slice) =
+            crate::tool_global::thread_start_request(&config, &mut guest, child).await;
         assert!(history.is_some());
-        crate::tool_global::finish_thread_start(&config, &mut guest, history);
+        crate::tool_global::finish_thread_start(&config, &mut guest, history, first_slice);
         {
             let scheduler = state.sched.lock().unwrap();
             assert!(scheduler.thread_was_registered(child));

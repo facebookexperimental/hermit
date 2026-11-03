@@ -97,12 +97,13 @@ async fn stale_filing_cleanup(stale: bool) -> (anyhow::Result<()>, Option<u64>, 
             .await,
         None,
     );
-    let history = crate::tool_global::thread_start_request(&config, &mut guest, tid).await;
+    let (history, first_slice) =
+        crate::tool_global::thread_start_request(&config, &mut guest, tid).await;
     assert!(
         history.is_some(),
         "startup must load the actual input history"
     );
-    crate::tool_global::finish_thread_start(&config, &mut guest, history);
+    crate::tool_global::finish_thread_start(&config, &mut guest, history, first_slice);
     assert_eq!(
         guest.thread.end_of_timeslice,
         Some(epoch + Duration::from_nanos(1_000_000)),
