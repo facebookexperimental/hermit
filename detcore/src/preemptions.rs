@@ -2797,6 +2797,9 @@ mod tests {
                 "prefix of {len} events"
             );
             prefix.validate().unwrap();
+        }
+    }
+
     /// Whether the recorded run rewrote exclusive loops in memory is a setting
     /// a replay of the record must share, so a prefix record keeps it, for
     /// any length.

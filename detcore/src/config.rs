@@ -87,10 +87,9 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips: none now, since SP2's 25
-    /// (reserved as 22 with its record version) landed beneath PRCTL's 26,
-    /// with its row. Remove an entry when its change lands, with its row.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[];
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: 31 (PR #4867), not on this
+    /// base yet. Remove an entry when its change lands, with its row.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[31];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -229,6 +228,13 @@ mod tests {
         // its rebase onto main's pidfd revision 27; digest measured at this
         // head).
         (28, "a23bc7a0c1215843", "f013e36743d8d9e6"),
+        // Retypes the `StoreExclusive` payload definitions the digest covers
+        // in `store_exclusive.rs` (PR 4884's in-memory exclusive-rewrite
+        // run tally and reporting; renumbered to 29 at its rebase onto
+        // main's 27, skipping 28 reserved for the pending 4789 change;
+        // digest measured at this head).
+        (29, "05a9f7a4ca16cde1", "f013e36743d8d9e6"),
+>>>>>>> d39e4d5a71 (Fix the 4884 rebase onto current main)
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

@@ -6333,6 +6333,7 @@ pub(super) mod native_branch_policy_tests {
                 }
             },
             dbt_counted_branches: None,
+            store_exclusive_retries: None,
             runtime: None,
             first_divergent_scheduler_turn: None,
             first_divergent_record_positions: None,

@@ -1239,7 +1239,7 @@ fn exclusive_rewrite_planned_line(
 
 /// The lines that state the exclusive-loop overlays as applied, printed from
 /// inside the container, after its mounts succeeded: one per mounted copy.
-fn exclusive_rewrite_applied_lines(overlays: &[PreprocessOverlay]) -> Vec<String> {
+fn exclusive_rewrite_applied_lines(overlays: &[ExecutableOverlayMount]) -> Vec<String> {
     overlays
         .iter()
         .filter_map(|overlay| {
@@ -2437,7 +2437,7 @@ pub(super) fn apply_base_environment(
 
 /// The overlays prepared for analyze trials in this process, by
 /// [`RunOpts::trial_preprocessing_key`].
-static PREPARED_TRIAL_PREPROCESSING: std::sync::Mutex<Vec<(String, Vec<PreprocessOverlay>)>> =
+static PREPARED_TRIAL_PREPROCESSING: std::sync::Mutex<Vec<(String, Vec<ExecutableOverlayMount>)>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Where `--rewrite-exclusives` applies its rewrite.
@@ -2656,7 +2656,11 @@ impl fmt::Display for RunOpts {
                 RewriteExclusivesMode::Memory => write!(f, " --rewrite-exclusives-mode=memory")?,
             }
             for also in &self.rewrite_exclusives_also {
-                write!(f, " --rewrite-exclusives-also={}", also.display())?;
+                write!(
+                    f,
+                    " --rewrite-exclusives-also={}",
+                    shell_words::quote(&also.to_string_lossy())
+                )?;
             }
         }
         let mut dop = self.det_opts.det_config.clone();
@@ -3484,13 +3488,13 @@ fn an_exclusive_rewrite_overlay_reports_rewritten_only_once_mounted() {
     assert!(planned.contains("planned=0"), "{planned}");
     assert!(planned.contains("no copy is mounted"), "{planned}");
     let overlays = [
-        PreprocessOverlay {
+        ExecutableOverlayMount {
             source: PathBuf::from("/cache/guest"),
             target: PathBuf::from("/bin/guest"),
             rewritten: Some(9),
         },
         // e9patch's overlay rewrites no exclusive loop.
-        PreprocessOverlay {
+        ExecutableOverlayMount {
             source: PathBuf::from("/cache/patched-echo"),
             target: PathBuf::from("/bin/echo"),
             rewritten: None,
@@ -13230,6 +13234,24 @@ impl RunOpts {
         anyhow::ensure!(
             self.adapter_executable_overlay_plan()? == *plan,
             "executable overlay no longer matches the admitted guest/mount resolution"
+        );
+        let overlay = if let Some(source) = source {
+            self.validate_executable_overlay_mount_targets()?;
+            self.validate_executable_overlay_source_visibility(source)?;
+            Some(ExecutableOverlayMount {
+                source: source.to_owned(),
+                target: plan.target.clone(),
+                rewritten: None,
+            })
+        } else {
+            None
+        };
+        let mut options = self.clone();
+        options.prepared_program = Some(plan.guest.clone());
+        options.executable_overlay = overlay;
+        Ok(options)
+    }
+
     /// Applies to a trial the preprocessing `RunOpts::main` does before a run
     /// and `RunOpts::run` does not: the exclusive-loop rewrite of
     /// `--rewrite-exclusives`. `hermit analyze` and `hermit bisect` start every
@@ -13246,8 +13268,6 @@ impl RunOpts {
     /// in one process (as tests run) with other mounts or the other mode
     /// prepares, and checks, its own.
     pub(crate) fn prepare_trial_preprocessing(&mut self) -> Result<(), Error> {
-        static PREPARED: std::sync::Mutex<Vec<(String, Vec<ExecutableOverlayMount>)>> =
-            std::sync::Mutex::new(Vec::new());
         if !self.rewrite_exclusives {
             return Ok(());
         }
@@ -13299,7 +13319,7 @@ impl RunOpts {
             // Detcore rewrites each executable file mapping as the guest maps
             // it (`rewrite_exclusives_in_memory` in its config), so there is
             // nothing to prepare here.
-            crate::tracing::diagnostic_eprintln!(
+            crate::app::tracing::diagnostic_eprintln!(
                 ":: Exclusive-loop rewrite: in the guest's memory, as each executable file is \
                  mapped; the files are unchanged"
             );
@@ -13365,7 +13385,7 @@ impl RunOpts {
     /// files into the cache and overlay each copy on its guest path.
     fn prepare_exclusive_rewrite_overlays(&mut self) -> Result<(), Error> {
         let (guest, host) = self.resolve_guest_and_host_program()?;
-        let guest = self.resolve_e9patch_overlay_target(&guest, &host)?;
+        let guest = self.resolve_executable_overlay_target(&guest, &host)?;
         let mut files = vec![(guest, host)];
         for also in &self.rewrite_exclusives_also {
             let path = fs::canonicalize(also).with_context(|| {
@@ -13388,7 +13408,7 @@ impl RunOpts {
         }
         // The overlay mechanism is e9patch's, so its checks apply here too:
         // a custom mount must not hide the target or the cached artifact.
-        self.validate_e9patch_mount_targets()?;
+        self.validate_executable_overlay_mount_targets()?;
         let cache = hermit::aarch64_lse::cache_dir()?;
         for (guest_path, host_path) in files {
             let input = fs::read(&host_path)
@@ -13413,13 +13433,13 @@ impl RunOpts {
                 hermit::aarch64_lse::elf::write_rewritten(&output, &rewritten, &host_path)?;
             }
             let Some(report) = report else {
-                crate::tracing::diagnostic_eprintln!(
+                crate::app::tracing::diagnostic_eprintln!(
                     ":: Exclusive-loop rewrite: {} is not an aarch64 ELF image; left unchanged",
                     guest_path.display()
                 );
                 continue;
             };
-            crate::tracing::diagnostic_eprintln!(
+            crate::app::tracing::diagnostic_eprintln!(
                 "{}",
                 exclusive_rewrite_planned_line(&guest_path, &report)
             );
@@ -13428,92 +13448,15 @@ impl RunOpts {
             }
             if report.patched_total() != 0 {
                 self.validate_executable_overlay_source_visibility(&output)?;
-                self.exclusive_rewrite_overlays.push(ExecutableOverlayMount {
-                    source: output,
-                    target: guest_path,
-                    rewritten: Some(report.patched_total()),
-                });
+                self.exclusive_rewrite_overlays
+                    .push(ExecutableOverlayMount {
+                        source: output,
+                        target: guest_path,
+                        rewritten: Some(report.patched_total()),
+                    });
             }
         }
         Ok(())
-    }
-
-    fn prepare_e9patch_program(&mut self) -> Result<(), Error> {
-        let (guest, host) = self.resolve_guest_and_host_program()?;
-        self.e9patch_program = Some(guest.clone());
-        let overlay_target = self.resolve_e9patch_overlay_target(&guest, &host)?;
-        if !is_elf_file(&host)? {
-            self.e9patch_engagement = Some(BackendEngagement::E9patch {
-                candidate_sites: 0,
-                mapped_sites: 0,
-                b0_sites: 0,
-            });
-            self.e9patch_sites = Some(reverie::SiteCounters::default());
-            crate::tracing::diagnostic_eprintln!(
-                ":: Backend: e9patch preprocessing + ptrace runtime; mapped_sites=0; \
-                 main_executable=non-ELF; preprocessing=not-applicable"
-            );
-            return Ok(());
-        }
-        if let Some(reason) = hermit::e9patch::unavailable_reason() {
-            anyhow::bail!("backend `e9patch` is unavailable: {reason}");
-        }
-        let prepared = hermit::e9patch::prepare(&host)?;
-        self.e9patch_engagement = Some(BackendEngagement::E9patch {
-            candidate_sites: u64::try_from(prepared.candidate_sites)
-                .map_err(|_| Error::msg("e9patch candidate-site count does not fit u64"))?,
-            mapped_sites: u64::try_from(prepared.patched_sites)
-                .map_err(|_| Error::msg("e9patch mapped-site count does not fit u64"))?,
-            b0_sites: u64::try_from(prepared.b0_sites)
-                .map_err(|_| Error::msg("e9patch B0-site count does not fit u64"))?,
-        });
-        self.e9patch_sites = Some(reverie::SiteCounters::from_rewrite(
-            prepared.candidate_sites as u64,
-            prepared.patched_sites as u64,
-        ));
-        if prepared.patched_sites != 0 {
-            self.validate_e9patch_mount_targets()?;
-            self.validate_e9patch_source_visibility(&prepared.binary)?;
-            self.e9patch_overlay = Some(ExecutableOverlayMount {
-                source: prepared.binary,
-                target: overlay_target,
-                rewritten: None,
-            });
-        }
-        let rewrite_cache = if prepared.patched_sites == 0 {
-            "not-applicable"
-        } else if prepared.rewrite_cache_hit {
-            "hit"
-        } else {
-            "miss"
-        };
-        crate::tracing::diagnostic_eprintln!(
-            ":: Backend: e9patch preprocessing + ptrace runtime; candidate_sites={}; \
-             mapped_sites={}; b0_sites={}; \
-             instruction_map_cache={:?}; rewrite_cache={}; artifact_sha256={}; \
-             preprocess_us={}",
-            prepared.candidate_sites,
-            prepared.patched_sites,
-            prepared.b0_sites,
-            prepared.instruction_map_cache_status,
-            rewrite_cache,
-            prepared.artifact_sha256.as_deref().unwrap_or("none"),
-            prepared.preprocess_micros,
-        );
-        let overlay = if let Some(source) = source {
-            self.validate_executable_overlay_mount_targets()?;
-            self.validate_executable_overlay_source_visibility(source)?;
-            Some(ExecutableOverlayMount {
-                source: source.to_owned(),
-                target: plan.target.clone(),
-            })
-        } else {
-            None
-        };
-        let mut options = self.clone();
-        options.prepared_program = Some(plan.guest.clone());
-        options.executable_overlay = overlay;
-        Ok(options)
     }
 
     fn write_backend_engagement_after_run(&self) -> Result<(), Error> {
@@ -13993,7 +13936,7 @@ impl RunOpts {
                 // The child's mounts, the overlays among them, were made
                 // before spawn returned.
                 for line in exclusive_rewrite_applied_lines(&self.exclusive_rewrite_overlays) {
-                    crate::tracing::diagnostic_eprintln!("{line}");
+                    crate::app::tracing::diagnostic_eprintln!("{line}");
                 }
                 child
             }
@@ -15402,11 +15345,10 @@ impl RunOpts {
             .collect::<Vec<_>>();
         mounts.extend(user_mounts);
 
-        if let Some(overlay) = &self.executable_overlay {
         for overlay in self
             .exclusive_rewrite_overlays
             .iter()
-            .chain(self.e9patch_overlay.iter())
+            .chain(self.executable_overlay.iter())
         {
             let target = if let Ok(relative_path) = overlay.target.strip_prefix(TMP_DIR) {
                 tmpfs.join(relative_path)
@@ -16925,7 +16867,7 @@ impl RunOpts {
         // Inside the container: its mounts, the overlays among them, are in
         // place.
         for line in exclusive_rewrite_applied_lines(&self.exclusive_rewrite_overlays) {
-            crate::tracing::diagnostic_eprintln!("{line}");
+            crate::app::tracing::diagnostic_eprintln!("{line}");
         }
 
         let backend = self.runtime_backend();
@@ -17008,7 +16950,7 @@ impl RunOpts {
         let mut forwarded_detlogs = forwarded_detlogs.open_in_container()?;
         hermit::proc_mount::warn_if_readonly_proc();
         for line in exclusive_rewrite_applied_lines(&self.exclusive_rewrite_overlays) {
-            crate::tracing::diagnostic_eprintln!("{line}");
+            crate::app::tracing::diagnostic_eprintln!("{line}");
         }
 
         let (log, _guard) = self.verification_run_log(log_file, global)?;

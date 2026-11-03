@@ -3984,8 +3984,7 @@ mod legacy_backend_json {
                     | "replay_edited_preemptions"
                     | "eager_lone_preemptions"
                     | "replay_continue_fairly"
-                    | "strict_binder",
-                    | "rewrite_exclusives_in_memory",
+                    | "strict_binder"
                     | "rewrite_exclusives_in_memory"
                     | "count_store_exclusives",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),

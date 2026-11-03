@@ -5467,9 +5467,7 @@ impl Scheduler {
                 .with_cap_preemption_charge(cfg.cap_preemption_charge)
                 .with_chaos_timeslice(cfg.chaos_timeslice)
                 .with_guest_ids(cfg.guest_ids)
-                .with_queued_sleeps_registered_at_first_pass(
-                    queued_sleeps_registered_at_first_pass,
-                );
+                .with_queued_sleeps_registered_at_first_pass(queued_sleeps_registered_at_first_pass)
                 .with_rewrite_exclusives_in_memory(cfg.rewrite_exclusives_in_memory);
             // A run that follows no record writes the newest format. A replay
             // writes the format of the record it follows, whose rules it ran

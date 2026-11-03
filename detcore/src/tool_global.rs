@@ -7954,7 +7954,7 @@ pub enum SignalScope {
 // 26 follows SP2's 25, whose variants come before this revision's
 // `ChildSubreaper` pair. 28 retypes `StartNewThread` (PR #4789, renumbered
 // after pidfd's 27).
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 28;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 29;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a

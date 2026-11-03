@@ -705,6 +705,8 @@ mod tests {
             assert_eq!(read.replay_departed_at(), marker, "{written}");
             assert_eq!(read, copy, "{written}");
         }
+    }
+
     /// `rewrite_exclusives_in_memory` rides in `RawRecord`: a plain record
     /// written before the envelope reads it back, a plain record written now
     /// keeps its bytes, and a marked record keeps the setting inside its
