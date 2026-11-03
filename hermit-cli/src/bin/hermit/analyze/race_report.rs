@@ -47,6 +47,7 @@ use crate::app::analyze::races::CandidateCheck;
 use crate::app::analyze::races::CheckVerdict;
 use crate::app::analyze::races::CrossedThread;
 use crate::app::analyze::races::MovedEvents;
+use crate::app::analyze::races::Outcome;
 use crate::app::analyze::races::OutcomeCriteria;
 use crate::app::analyze::races::RaceCandidate;
 use crate::app::analyze::races::RaceStatus;
@@ -54,7 +55,7 @@ use crate::app::analyze::races::RacingAccess;
 use crate::app::analyze::races::RacingAccesses;
 use crate::app::analyze::races::Window;
 use crate::app::analyze::races::find_racing_accesses;
-use crate::app::analyze::races::outcome_point;
+use crate::app::analyze::races::outcome;
 use crate::app::analyze::races::uncounted_signal_outcome;
 use crate::app::analyze::rundata::RunData;
 use crate::app::analyze::types::AnalyzeOpts;
@@ -258,16 +259,30 @@ impl AnalyzeOpts {
             exit_code: &self.target_exit_code,
             root,
         };
-        let outcome = outcome_point(&target_trace.trace, decision, &criteria);
+        let Outcome {
+            point: outcome,
+            unknown: unknown_outcome,
+        } = outcome(&target_trace.trace, decision, &criteria);
         let uncounted_signal =
             uncounted_signal_outcome(&target_trace.trace, decision, &criteria, outcome.as_ref());
         let outcome_thread = outcome.as_ref().map(|o| o.thread);
+        // The thread the target replay ran at the deciding event, as it
+        // realized its schedule (which follows the requested one up to there).
+        let thread = usize::try_from(decision)
+            .ok()
+            .and_then(|at| target.realized.get(at))
+            .map(|event| event.dettid);
         let mut result = find_racing_accesses(
             &target_trace.trace,
             &baseline_trace.trace,
-            Window { decision, outcome },
+            Window {
+                decision,
+                outcome,
+                thread,
+            },
             outcome_thread,
         );
+        result.notes.extend(unknown_outcome);
         for (role, read) in [("target", &target_trace), ("baseline", &baseline_trace)] {
             if read.capped {
                 result.notes.push(format!(
