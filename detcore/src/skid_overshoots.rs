@@ -13,7 +13,7 @@
 //! target, usually with a [`reverie::SkidOvershootDetail`] naming the thread
 //! and the target. Detcore's prehook reports it when the thread ran more
 //! branches since its last handler than its timer was armed for
-//! ([`record_rcb_overshoot_report`], called by `report_rcb_overshoot`). Both
+//! (`record_rcb_overshoot_report`, called by `report_rcb_overshoot`). Both
 //! increment Reverie's process-global count
 //! ([`reverie::record_skid_overshoot`]), so one late event usually counts
 //! twice. That count stays a count of reports: a refusal, and `--verify`'s
@@ -22,7 +22,7 @@
 //! saw.
 //!
 //! Detcore keys each report by thread and target, the pair a detail names, and
-//! [`SkidOvershootCounts::count`] counts a Detcore report whose pair matches a
+//! `SkidOvershootCounts::count` counts a Detcore report whose pair matches a
 //! detail once.
 //!
 //! The pair is matched rather than the order of detection, because the two
@@ -175,7 +175,7 @@ impl SkidOvershootCounts {
 }
 
 /// Take every site's skid overshoots since the last take: Reverie's count and
-/// details and Detcore's reports, counted with [`SkidOvershootCounts::count`].
+/// details and Detcore's reports, counted with `SkidOvershootCounts::count`.
 /// Returns the details as well, in detection order.
 pub fn take_skid_overshoots() -> (SkidOvershootCounts, Vec<SkidOvershootDetail>) {
     let all_reports = reverie::take_skid_overshoot_count();
