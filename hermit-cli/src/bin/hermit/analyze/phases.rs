@@ -493,6 +493,30 @@ fn check_prefix_len(len: usize, role: &str, unchanged: usize) -> usize {
     own.min(unchanged)
 }
 
+/// The record a race candidate's check replays: `recorded`'s first
+/// `unchanged` events with their callback checkpoints, and `edited` (which
+/// starts with those events) as its schedule. Refused when the checkpoints do
+/// not fit the edited events, never replayed as a bare schedule: without them
+/// the unchanged events would not end their slices where the run did, and the
+/// check would measure another run than the one it names. The refusal is the
+/// check's error, which its report names.
+fn candidate_check_record(
+    recorded: &PreemptionRecord,
+    unchanged: usize,
+    edited: &[SchedEvent],
+) -> anyhow::Result<PreemptionRecord> {
+    recorded
+        .schedule_prefix(unchanged)
+        .with_schedule(edited.to_vec())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the callback checkpoints of the recording's first {unchanged} events do not fit \
+                 the edited schedule, and replaying it without them would not follow the run it \
+                 checks"
+            )
+        })
+}
+
 /// The run of `thread`'s events in `schedule` from event `from` on.
 fn slice_from(schedule: &[SchedEvent], from: usize, thread: DetTid) -> Slice {
     let mut slice = Slice {
@@ -2478,14 +2502,10 @@ impl AnalyzeOpts {
                         } else {
                             &realized
                         };
-                        let edited = Recording::read(path)
+                        let recorded = Recording::read(path)
                             .and_then(|recording| recording.into_legacy("a race candidate's check"))
-                            .map_err(|error| anyhow::anyhow!("{error:#}"))?
-                            .schedule_prefix(unchanged)
-                            .with_schedule(edited.to_vec())
-                            .unwrap_or_else(|| {
-                                PreemptionRecord::from_sched_events(edited.to_vec())
-                            });
+                            .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+                        let edited = candidate_check_record(&recorded, unchanged, edited)?;
                         self.prefix_trial(runname, &edited, replay, self.trial_max_timeslice())
                     },
                 ))
@@ -4640,6 +4660,65 @@ mod tests {
                 .contains(" --stacktrace-at-schedule-positions"),
             "{}",
             run.to_repro()
+        );
+    }
+
+    /// A candidate's check keeps the callback checkpoints of the unchanged
+    /// events it replays, and refuses an edit they do not fit instead of
+    /// replaying a bare schedule.
+    #[test]
+    fn a_candidate_check_refuses_checkpoints_that_do_not_fit_its_edit() {
+        let branches = |tid: i32, count: u32| {
+            serde_json::json!({
+                "dettid": tid, "op": "Branch", "count": count,
+                "start_rip": null, "end_rip": null, "end_time": null
+            })
+        };
+        let checkpoint = |row: usize, progress: u64, time: u64| {
+            serde_json::json!({
+                "history_index": row,
+                "origin": {
+                    "callback": "PmuTimer", "site": "Prehook", "progress": progress,
+                    "last_op": "Branch", "time": time, "rcbs": progress
+                }
+            })
+        };
+        let recorded: PreemptionRecord = serde_json::from_value(serde_json::json!({
+            "per_thread": {
+                "3": {
+                    "final_prio": 1000,
+                    "prio_changes": [[100, 1000], [300, 1000]],
+                    "preemption_rcbs": [10, 15]
+                },
+                "5": {"final_prio": 1000, "prio_changes": [[200, 1000]], "preemption_rcbs": [4]}
+            },
+            "global": [branches(3, 10), branches(5, 4), branches(3, 5)],
+            "callback_checkpoints": {
+                "3": [checkpoint(0, 10, 100), checkpoint(1, 15, 300)],
+                "5": [checkpoint(0, 4, 200)]
+            }
+        }))
+        .unwrap();
+        recorded.validate().unwrap();
+        let event = |value| serde_json::from_value::<SchedEvent>(value).unwrap();
+        // The first two events unchanged, then the edit: their checkpoints
+        // carry over.
+        let fits = [branches(3, 10), branches(5, 4), branches(5, 2)].map(event);
+        let kept = candidate_check_record(&recorded, 2, &fits).unwrap();
+        assert_eq!(kept.schedevents(), &fits[..]);
+        assert_eq!(
+            serde_json::to_value(&kept).unwrap()["callback_checkpoints"]["3"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        // An edit that leaves out an unchanged event the checkpoints name.
+        let error = candidate_check_record(&recorded, 2, &[event(branches(5, 4))])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("callback checkpoints of the recording's first 2 events do not fit"),
+            "{error}"
         );
     }
 
