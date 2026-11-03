@@ -252,6 +252,36 @@ fn run_analyze(
     analyze_opts: &[&str],
     expected_output: &str,
 ) -> serde_json::Value {
+    run_analyze_with(
+        label,
+        guest,
+        analyze_opts,
+        expected_output,
+        SkidMargin::Calibrated,
+    )
+}
+
+/// Whether an analysis takes the calibrated PMU skid margin the PMU analyze
+/// node passes in `HERMIT_ANALYZE_SKID_MARGIN` ([`add_calibrated_skid_margin`]).
+enum SkidMargin {
+    Calibrated,
+    /// Not taken, for the reason named. At `--max-timeslice=400000` the timer
+    /// stops a thread that computes between syscalls about every 40000
+    /// retired conditional branches, and Hermit places each such event by
+    /// stepping the guest through up to the margin's branches (its NOTICE
+    /// says so), so a large margin makes every trial of such a guest many
+    /// times slower without changing what the test checks.
+    Without(&'static str),
+}
+
+/// [`run_analyze`], with or without the calibrated skid margin.
+fn run_analyze_with(
+    label: &str,
+    guest: &Path,
+    analyze_opts: &[&str],
+    expected_output: &str,
+    margin: SkidMargin,
+) -> serde_json::Value {
     let _guard = analyze_lock();
     let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
     let report_file = report_dir.path().join("report.json");
@@ -260,7 +290,10 @@ fn run_analyze(
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.arg("analyze");
     command.args(analyze_opts);
-    add_calibrated_skid_margin(&mut command, label);
+    match margin {
+        SkidMargin::Calibrated => add_calibrated_skid_margin(&mut command, label),
+        SkidMargin::Without(reason) => eprintln!("{label}: no calibrated skid margin: {reason}"),
+    }
     command
         .arg(format!("--report-file={}", report_file.display()))
         .arg(format!("--tmp-dir={}", tmp_dir.display()))
@@ -518,10 +551,21 @@ fn analyze_checks_the_race_candidates_and_says_what_each_edit_moved() {
 /// "Racing accesses" section names the closer's close and the writer's lseek
 /// that fails with EBADF, on two threads, and no edge Hermit observes orders
 /// them.
+///
+/// It takes no calibrated skid margin. At `--max-timeslice=400000` the guest's
+/// writer, which computes between its syscalls, has 59 of a run's 64
+/// timeslices end at the timer, and under the PMU analyze node's margin every
+/// such event is placed by stepping through up to 20000 branches. Measured on
+/// an Intel Xeon Gold 6138 with this test's command: without the margin the
+/// analysis finishes in 33 s, its 18 trials taking 1.5 to 2.0 s each; with a
+/// margin of 20000 each trial takes 42 to 61 s, and the analysis had run 7 of
+/// them when a 420 s bound stopped it. What the test checks is the race
+/// finder's report on the pair the search finds, not where a timer event
+/// lands.
 #[test]
 #[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_names_the_close_racing_the_reused_descriptor() {
-    let report = run_analyze(
+    let report = run_analyze_with(
         "analyze fd_reuse_close_race --prefix-search",
         &workloads().fd_reuse_close_race,
         &[
@@ -530,6 +574,11 @@ fn analyze_names_the_close_racing_the_reused_descriptor() {
             "--target-stderr=failed with EBADF",
         ],
         "unordered by the edges Hermit observes",
+        SkidMargin::Without(
+            "its CPU-bound writer is stepped through the margin at each timer event, which made \
+             each prefix trial take 42 to 61 s instead of 1.5 to 2.0 s (see the test's \
+             documentation)",
+        ),
     );
     let racing = &report["racing_accesses"];
     assert_eq!(racing["status"], "found", "{report}");
