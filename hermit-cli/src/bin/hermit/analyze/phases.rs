@@ -1204,20 +1204,21 @@ impl AnalyzeOpts {
         )
     }
 
-    fn phase6_record_prefix_outputs_with(
+    fn phase6_record_prefix_outputs_with<S, C>(
         &self,
         found: PrefixDecision,
-        mut stack: impl FnMut(
+        mut stack: S,
+        continuation: C,
+    ) -> anyhow::Result<Report>
+    where
+        S: FnMut(
             &str,
             &PreemptionRecord,
             usize,
             usize,
         ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)>,
-        continuation: impl FnOnce(
-            &PreemptionRecord,
-            usize,
-        ) -> anyhow::Result<(CompletedScheduleTrial, PathBuf)>,
-    ) -> anyhow::Result<Report> {
+        C: FnOnce(&PreemptionRecord, usize) -> anyhow::Result<(CompletedScheduleTrial, PathBuf)>,
+    {
         let PrefixDecision {
             schedule,
             decision,
@@ -1389,23 +1390,24 @@ impl AnalyzeOpts {
     /// continuation of a record's first `len` events and `stack` each
     /// stack-trace replay (its name, record, length and the event to take
     /// the stack at), both giving completed outcomes or ending the analysis.
-    fn report_timing_decision_with(
+    fn report_timing_decision_with<CT, S>(
         &self,
         schedule: &PreemptionRecord,
         decision: usize,
         continuation: MaybeTimeslice,
         (target_met, deciding): (bool, &Option<PrettyBacktrace>),
         (continued, continued_path): (&[SchedEvent], &Path),
-        (continue_target, stack): (
-            impl FnOnce(&PreemptionRecord, usize) -> anyhow::Result<(CompletedScheduleTrial, PathBuf)>,
-            impl Fn(
-                &str,
-                &PreemptionRecord,
-                usize,
-                usize,
-            ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)>,
-        ),
-    ) -> anyhow::Result<Option<Report>> {
+        (continue_target, stack): (CT, S),
+    ) -> anyhow::Result<Option<Report>>
+    where
+        CT: FnOnce(&PreemptionRecord, usize) -> anyhow::Result<(CompletedScheduleTrial, PathBuf)>,
+        S: Fn(
+            &str,
+            &PreemptionRecord,
+            usize,
+            usize,
+        ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)>,
+    {
         let events = schedule.schedevents();
         let thread = events[decision].dettid;
         let (target_completed, target_continued_path) = continue_target(schedule, decision + 1)?;
