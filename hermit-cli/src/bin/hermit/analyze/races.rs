@@ -85,6 +85,7 @@ use detcore_model::fd::FdSlot;
 use detcore_model::fd::OpenFileId;
 use detcore_model::futex::FutexID;
 use detcore_model::futex::SharedMemoryObjectId;
+use detcore_model::pid::DetPid;
 use detcore_model::pid::DetTid;
 use reverie::syscalls::Sysno;
 use serde::Deserialize;
@@ -936,6 +937,10 @@ const NO_SOCKET_TYPE: &str = "Hermit does not record its socket type";
 const UNSEEN_DATA: &str = "a read returned data the trace does not show being written";
 const PREDATES_TRACE: &str = "the trace does not show it being created, so a read can return bytes \
                               queued before the trace starts instead of a traced write's";
+const TEED: &str = "a tee(2) copied its bytes without consuming them, so a read can return other \
+                    bytes than the writes' offsets give";
+const VMSPLICED: &str = "the trace has a vmsplice(2), which puts bytes in a pipe without a write \
+                         the trace records";
 
 /// What [`data_edges`] derives from one trace.
 struct DataEdges {
@@ -944,10 +949,13 @@ struct DataEdges {
 }
 
 /// Data edges (design section 7), derived from syscall results: the write
-/// that put a byte (a message, an eventfd count) in a channel, to the read
-/// that returned it. For an eventfd, every write since the previous read
-/// reaches a read (in semaphore mode a read consumes one of them, which the
-/// trace cannot tell).
+/// that put a byte in a channel, to the read that returned it.
+///
+/// Today only pipes give edges. Detcore records every socket as
+/// `ChannelKind::Socket`, without its type ([`NO_SOCKET_TYPE`]), and gives an
+/// eventfd no identity both ends share ([`NO_PEER`]); the socketpair,
+/// datagram and eventfd rules in [`replay_channels`] apply once it records
+/// those.
 ///
 /// Only a channel the trace shows being created gives edges: a pipe or
 /// socketpair whose creating call is in it. Any other (one opened before the
@@ -958,6 +966,14 @@ struct DataEdges {
 /// a channel gives no edge at all and is named as untracked
 /// ([`PREDATES_TRACE`]): every consumer of an ordered verdict sees no order
 /// through it.
+///
+/// The replay also assumes that every byte in a created pipe came from a
+/// traced write and that every traced read consumed what it returned. Two
+/// calls break that: tee(2) copies a pipe's bytes without consuming them
+/// (Detcore records its input as a read), and vmsplice(2) puts bytes in a
+/// pipe without a write the trace records (its operand is not traced). So a
+/// pipe a tee touches gives no edge ([`TEED`]), and while the trace has any
+/// vmsplice no pipe does ([`VMSPLICED`]).
 fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
     let (steps, mut untracked) = channel_steps(syscalls);
     // The ends a pipe or socketpair call returned. An Open note alone is not
@@ -976,15 +992,29 @@ fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
             _ => None,
         })
         .collect();
+    let teed: BTreeSet<ChannelId> = syscalls
+        .iter()
+        .filter(|sys| sys.sysno == Sysno::tee)
+        .flat_map(|sys| &sys.accesses)
+        .filter_map(|access| match access {
+            Access::Channel { id: Some(id), .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let vmspliced = syscalls.iter().any(|sys| sys.sysno == Sysno::vmsplice);
     for step in &steps {
-        if !matches!(step.id, ChannelId::Pair(first) if opened.contains(&first)) {
-            untracked
-                .entry(ChannelKey::Shared(step.id))
-                .or_insert(Untracked {
-                    since: 0,
-                    why: PREDATES_TRACE,
-                });
-        }
+        let why = if !matches!(step.id, ChannelId::Pair(first) if opened.contains(&first)) {
+            PREDATES_TRACE
+        } else if teed.contains(&step.id) {
+            TEED
+        } else if vmspliced && step.kind == ChannelKind::Pipe {
+            VMSPLICED
+        } else {
+            continue;
+        };
+        untracked
+            .entry(ChannelKey::Shared(step.id))
+            .or_insert(Untracked { since: 0, why });
     }
     let edges = replay_channels(&steps, &mut untracked);
     DataEdges { edges, untracked }
@@ -1245,6 +1275,8 @@ struct Finder<'a> {
     baseline: Run<'a>,
     /// Per thread, the first `nth` whose sysno or arguments differ.
     split: BTreeMap<DetTid, u64>,
+    /// Each thread's process, as either trace's calls show it.
+    processes: BTreeMap<DetTid, DetPid>,
     decision: EventIndex,
     end: EventIndex,
 }
@@ -1258,6 +1290,12 @@ impl<'a> Finder<'a> {
     ) -> Self {
         let target = Run::new(target);
         let baseline = Run::new(baseline);
+        let processes = target
+            .syscalls
+            .iter()
+            .chain(&baseline.syscalls)
+            .map(|sys| (sys.tid, sys.pid))
+            .collect();
         // A call that entered before the decision did so in both runs alike
         // (the window lemma); where its arguments still differ they point
         // outside the guest's control (the container's first execve gets
@@ -1273,6 +1311,7 @@ impl<'a> Finder<'a> {
             target,
             baseline,
             split,
+            processes,
             decision,
             end,
         }
@@ -1427,7 +1466,7 @@ impl<'a> Finder<'a> {
                 if partner.target.tid == victim.target.tid {
                     continue;
                 }
-                let Some(pair) = flip(*victim, *partner) else {
+                let Some(pair) = flip(*victim, *partner, &self.processes) else {
                     continue;
                 };
                 let names = [victim, partner].map(|op| (op.target.tid, op.target.nth));
@@ -1971,7 +2010,17 @@ impl<'a> Finder<'a> {
                 LifetimeOp::Signal { signo } => *signo == libc::SIGKILL,
                 LifetimeOp::Create | LifetimeOp::Wait => false,
             })
-            .map(|(target, _)| target)
+            .map(|(target, op)| match (target, op) {
+                // A SIGKILL ends the whole thread group even when tgkill or
+                // tkill names one thread: complete_signal() takes a fatal
+                // signal "to the whole group" (kernel/signal.c, v6.9).
+                (Task::Thread(tid), LifetimeOp::Signal { .. }) => self
+                    .processes
+                    .get(&tid)
+                    .copied()
+                    .map_or(target, Task::Process),
+                _ => target,
+            })
             .collect()
     }
 
@@ -2613,9 +2662,13 @@ fn differs(target: &SyscallRecord, baseline: &SyscallRecord) -> bool {
 
 /// The pair `victim` and `partner` form when they conflict and their order
 /// flips, sides in target order.
-fn flip<'a>(victim: Op<'a>, partner: Op<'a>) -> Option<Pair<'a>> {
+fn flip<'a>(
+    victim: Op<'a>,
+    partner: Op<'a>,
+    processes: &BTreeMap<DetTid, DetPid>,
+) -> Option<Pair<'a>> {
     let victim_baseline = victim.baseline?;
-    let conflict = conflict(victim.target, victim_baseline, partner.target)?;
+    let conflict = conflict(victim.target, victim_baseline, partner.target, processes)?;
     // Whether the victim's event comes first, when the two events differ.
     let first = |v: Option<&SyscallRecord>, p: Option<&SyscallRecord>, (at_v, at_p)| {
         let (kv, kp) = (key(v, at_v), key(p, at_p));
@@ -2659,11 +2712,13 @@ struct Conflict {
 /// Two calls on one resource compare entries first, then each entry with the
 /// other's return (a wake against a wait's timeout). A signal, exit or exec
 /// aimed at the victim's thread or process compares with the victim's
-/// return, and the other way round.
+/// return, and the other way round. `processes` gives each thread's process
+/// ([`ends`]).
 fn conflict(
     victim: &SyscallRecord,
     victim_baseline: &SyscallRecord,
     other: &SyscallRecord,
+    processes: &BTreeMap<DetTid, DetPid>,
 ) -> Option<Conflict> {
     use AccessPoint::Entry;
     use AccessPoint::Return;
@@ -2687,16 +2742,23 @@ fn conflict(
         slot: None,
         comparisons,
     };
-    if let Some(task) = ends(other, victim) {
+    if let Some(task) = ends(other, victim, processes) {
         return Some(lifetime(task, &[(Return, Entry)]));
     }
-    ends(victim, other).map(|task| lifetime(task, &[(Entry, Return)]))
+    ends(victim, other, processes).map(|task| lifetime(task, &[(Entry, Return)]))
 }
 
 /// The thread or process of `target` that `killer` signals, ends or
 /// replaces. A group kill also lists each member process, so groups match
-/// through those entries.
-fn ends(killer: &SyscallRecord, target: &SyscallRecord) -> Option<Task> {
+/// through those entries. A SIGKILL that tgkill or tkill aims at one thread
+/// ends its whole thread group (complete_signal(), kernel/signal.c at v6.9),
+/// so it reaches `target` when `target` is in that thread's process
+/// (`processes`), and the task is the process.
+fn ends(
+    killer: &SyscallRecord,
+    target: &SyscallRecord,
+    processes: &BTreeMap<DetTid, DetPid>,
+) -> Option<Task> {
     if killer.result.is_some_and(|r| r < 0) {
         // A failed kill, exit or exec ended nothing.
         return None;
@@ -2706,12 +2768,15 @@ fn ends(killer: &SyscallRecord, target: &SyscallRecord) -> Option<Task> {
             if matches!(op, LifetimeOp::Exit | LifetimeOp::Exec)
                 || matches!(op, LifetimeOp::Signal { signo } if *signo != 0) =>
         {
-            let hits = match task {
-                Task::Thread(tid) => *tid == target.tid,
-                Task::Process(pid) => *pid == target.pid,
-                Task::ProcessGroup(_) => false,
-            };
-            hits.then_some(*task)
+            let sigkill = matches!(op, LifetimeOp::Signal { signo } if *signo == libc::SIGKILL);
+            match task {
+                Task::Thread(tid) if *tid == target.tid => Some(*task),
+                Task::Thread(tid) if sigkill && processes.get(tid) == Some(&target.pid) => {
+                    Some(Task::Process(target.pid))
+                }
+                Task::Process(pid) if *pid == target.pid => Some(*task),
+                _ => None,
+            }
         }
         _ => None,
     })
@@ -3501,18 +3566,26 @@ mod tests {
         }
     }
 
-    /// Thread 7's call at `pre` that creates the channel whose first end is
-    /// `first` (a pipe, a socketpair or an eventfd): only a channel the trace
-    /// shows being created gives data edges.
-    fn creates(pre: EventIndex, first: OpenFileId) -> SyscallRecord {
+    /// Thread 7's pipe2 at `pre` that creates the pipe with the ends `ends`:
+    /// only a channel the trace shows being created gives data edges.
+    fn creates(pre: EventIndex, ends: [OpenFileId; 2]) -> SyscallRecord {
+        creates_with(pre, Sysno::pipe2, ends)
+    }
+
+    /// Thread 7's `sysno` (pipe2 or socketpair) at `pre`, returning the two
+    /// ends `ends`, with an open note for each, as Detcore records it.
+    fn creates_with(pre: EventIndex, sysno: Sysno, ends: [OpenFileId; 2]) -> SyscallRecord {
         call(
             pre,
             7,
             0,
-            Sysno::pipe2,
+            sysno,
             &[0x3000, 0],
             Some(0),
-            vec![fd(3, Some(first), opened("pipe"))],
+            vec![
+                fd(3, Some(ends[0]), opened("pipe")),
+                fd(4, Some(ends[1]), opened("pipe")),
+            ],
         )
     }
 
@@ -4030,7 +4103,7 @@ mod tests {
         // Each read is reached from the write that put its bytes in: offsets
         // per channel, not every earlier write.
         let calls = [
-            creates(1, file(7, 1)),
+            creates(1, [file(7, 1), file(7, 2)]),
             write(10, 7, 1),
             write(12, 8, 1),
             read(14, 1, 4),
@@ -4054,7 +4127,8 @@ mod tests {
         );
 
         // A socketpair carries one stream each way: a read on one end takes
-        // what the other end wrote.
+        // what the other end wrote. (A typed socket channel, which Detcore
+        // does not record today: the rule for when it does.)
         let end = |open_file, op| Access::Channel {
             open_file,
             id: Some(ChannelId::Pair(file(7, 5))),
@@ -4063,7 +4137,7 @@ mod tests {
         };
         let (a, b) = (file(7, 5), file(7, 6));
         let calls = [
-            creates(1, file(7, 5)),
+            creates_with(1, Sysno::socketpair, [file(7, 5), file(7, 6)]),
             call(
                 10,
                 7,
@@ -4106,52 +4180,6 @@ mod tests {
             vec![channel((9, 12), (7, 15)), channel((7, 10), (9, 17))]
         );
 
-        // In semaphore mode one eventfd write feeds two reads; the second
-        // read, with nothing new, is reached from the last write.
-        let counter = |open_file, op| Access::Channel {
-            open_file,
-            id: Some(ChannelId::Pair(file(7, 8))),
-            channel: ChannelKind::Eventfd,
-            op,
-        };
-        let calls = [
-            creates(1, file(7, 8)),
-            call(
-                10,
-                7,
-                1,
-                Sysno::write,
-                &[8, 0x1000, 8],
-                Some(8),
-                vec![counter(file(7, 8), ChannelOp::Write)],
-            ),
-            call(
-                12,
-                9,
-                1,
-                Sysno::read,
-                &[8, 0x2000, 8],
-                Some(8),
-                vec![counter(file(7, 8), ChannelOp::Read)],
-            ),
-            call(
-                14,
-                9,
-                2,
-                Sysno::read,
-                &[8, 0x2000, 8],
-                Some(8),
-                vec![counter(file(7, 8), ChannelOp::Read)],
-            ),
-        ];
-        let data = data_edges(&calls.iter().collect::<Vec<_>>());
-        let count = |to| HbEdge {
-            kind: HbEdgeKind::Eventfd,
-            ..channel((7, 10), (9, to))
-        };
-        assert_eq!(data.edges, vec![count(13), count(15)]);
-        assert!(data.untracked.is_empty(), "{:?}", data.untracked);
-
         // With the deciding event the write comes first and the read returns
         // its bytes; without it the read finds the pipe empty. The traces
         // show the pipe being created, so the read's 4 bytes are the write's:
@@ -4182,6 +4210,160 @@ mod tests {
         );
         assert_eq!(hb.baseline, unordered());
         assert_eq!(r.notes, Vec::<String>::new());
+    }
+
+    /// The replay of a created pipe assumes every read consumes what it
+    /// returns. tee(2) copies a pipe's bytes without consuming them: after W1
+    /// writes 4 bytes, a tee takes 4, W2 writes 4 and R reads 4, R returns
+    /// W1's bytes, not W2's. vmsplice(2) puts bytes in a pipe without a write
+    /// the trace records: after a vmsplice of 4 bytes and a traced write W of
+    /// 4, R's 4 bytes are the vmsplice's. Neither pipe gives an edge, and
+    /// each is named; a pipe neither touches still orders its write before
+    /// its read.
+    #[test]
+    fn a_pipe_a_tee_reads_or_a_vmsplice_fills_gives_no_edge() {
+        let write = |pre, tid, nth| {
+            call(
+                pre,
+                tid,
+                nth,
+                Sysno::write,
+                &[4, 0x1000, 4],
+                Some(4),
+                vec![pipe(file(7, 2), ChannelOp::Write)],
+            )
+        };
+        let read = |pre| {
+            call(
+                pre,
+                9,
+                1,
+                Sysno::read,
+                &[3, 0x2000, 4],
+                Some(4),
+                vec![pipe(file(7, 1), ChannelOp::Read)],
+            )
+        };
+        let other = |open_file, op| Access::Channel {
+            open_file,
+            id: Some(ChannelId::Pair(file(7, 5))),
+            channel: ChannelKind::Pipe,
+            op,
+        };
+        let tee = call(
+            12,
+            8,
+            1,
+            Sysno::tee,
+            &[3, 6, 4, 0],
+            Some(4),
+            vec![
+                pipe(file(7, 1), ChannelOp::Read),
+                other(file(7, 6), ChannelOp::Write),
+            ],
+        );
+        let calls = [
+            creates(1, [file(7, 1), file(7, 2)]),
+            write(10, 7, 1),
+            tee,
+            write(14, 8, 2),
+            read(16),
+        ];
+        let data = data_edges(&calls.iter().collect::<Vec<_>>());
+        assert_eq!(data.edges, Vec::new());
+        assert_eq!(
+            data.untracked
+                .get(&ChannelKey::Shared(ChannelId::Pair(file(7, 1))))
+                .map(|u| u.why),
+            Some(TEED)
+        );
+
+        let vmsplice = call(
+            10,
+            8,
+            1,
+            Sysno::vmsplice,
+            &[4, 0x5000, 1, 0],
+            Some(4),
+            Vec::new(),
+        );
+        let calls = [
+            creates(1, [file(7, 1), file(7, 2)]),
+            vmsplice,
+            write(12, 7, 1),
+            read(14),
+        ];
+        let data = data_edges(&calls.iter().collect::<Vec<_>>());
+        assert_eq!(data.edges, Vec::new());
+        assert_eq!(
+            data.untracked
+                .get(&ChannelKey::Shared(ChannelId::Pair(file(7, 1))))
+                .map(|u| u.why),
+            Some(VMSPLICED)
+        );
+
+        // Neither call: the write orders the read.
+        let calls = [
+            creates(1, [file(7, 1), file(7, 2)]),
+            write(10, 7, 1),
+            read(12),
+        ];
+        let data = data_edges(&calls.iter().collect::<Vec<_>>());
+        assert_eq!(data.edges.len(), 1, "{:?}", data.edges);
+        assert!(data.untracked.is_empty(), "{:?}", data.untracked);
+    }
+
+    /// A SIGKILL sent through tgkill names one thread but ends its whole
+    /// thread group (complete_signal(), kernel/signal.c at v6.9): a wait by
+    /// another thread of that process, which the kill ends in the baseline,
+    /// is the kill's racing access as it is for a kill(2) of the process.
+    #[test]
+    fn a_sigkill_through_tgkill_ends_the_whole_thread_group() {
+        let wait = |post: Option<EventIndex>| {
+            let mut sys = call(
+                95,
+                5,
+                50,
+                Sysno::futex,
+                &[0x6000, 137, 0, 0x7000, 0, 0xffff_ffff],
+                post.map(|_| ETIMEDOUT),
+                vec![futex(FutexOp::Wait)],
+            );
+            sys.pid = DetPid::from_raw(5);
+            sys.post = post;
+            sys
+        };
+        // Thread 6 of process 5, which the tgkill names.
+        let sibling = || {
+            let mut sys = call(90, 6, 1, Sysno::getpid, &[], Some(5), Vec::new());
+            sys.pid = DetPid::from_raw(5);
+            sys
+        };
+        let tgkill = |pre| {
+            call(
+                pre,
+                3,
+                60,
+                Sysno::tgkill,
+                &[5, 6, 9],
+                Some(0),
+                vec![Access::Lifetime {
+                    target: Task::Thread(t(6)),
+                    op: LifetimeOp::Signal { signo: 9 },
+                }],
+            )
+        };
+        let target = trace(vec![sibling(), wait(Some(101)), tgkill(103)]);
+        let baseline = trace(vec![sibling(), wait(None), tgkill(101)]);
+        let r = find(&target, &baseline, Some(3));
+        assert_eq!(r.status, RaceStatus::Found, "{}", r.reason);
+        assert_eq!(
+            r.resource,
+            Some(ResourceText {
+                kind: ResourceKind::Lifetime,
+                text: "process 5".to_string()
+            })
+        );
     }
 
     /// A pipe the traces do not show being created may hold bytes queued
@@ -4801,14 +4983,14 @@ mod tests {
         );
         shutdown.post = Some(S);
         let target = trace(vec![
-            creates(50, file(7, 1)),
+            creates(50, [file(7, 1), file(7, 2)]),
             shutdown.clone(),
             wait(Some(110)),
             send,
             receive(130, 1),
         ]);
         let baseline = trace(vec![
-            creates(50, file(7, 1)),
+            creates(50, [file(7, 1), file(7, 2)]),
             shutdown,
             wait(None),
             receive(132, 2),
@@ -4885,14 +5067,14 @@ mod tests {
         let mut shutdown = log(98, 21, 40, 30);
         shutdown.post = Some(S);
         let mut target = vec![
-            creates(50, file(7, 1)),
+            creates(50, [file(7, 1), file(7, 2)]),
             shutdown.clone(),
             log(110, 53, 150, 106),
             send(120),
             receive(130, 1),
         ];
         let mut baseline = vec![
-            creates(50, file(7, 1)),
+            creates(50, [file(7, 1), file(7, 2)]),
             shutdown,
             log(112, 53, 150, 121),
             send(122),
@@ -5969,7 +6151,7 @@ mod tests {
         // returned more than was written.
         let created = |calls: Vec<SyscallRecord>| {
             trace(
-                std::iter::once(creates(50, file(7, 1)))
+                std::iter::once(creates(50, [file(7, 1), file(7, 2)]))
                     .chain(calls)
                     .collect(),
             )
