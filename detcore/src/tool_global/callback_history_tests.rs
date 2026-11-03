@@ -882,6 +882,10 @@ async fn drive_callback_hook<F: std::future::Future>(
 }
 
 async fn legacy_callback_expired_deadline_trial(annotated: bool, owner_switch: bool) -> (LogicalTime, LogicalTime) {
+    legacy_callback_expired_deadline_trial_recording(annotated, owner_switch, false).await.0
+}
+
+async fn legacy_callback_expired_deadline_trial_recording(annotated: bool, owner_switch: bool, record: bool) -> ((LogicalTime, LogicalTime), Option<u64>) {
     use reverie::Tool;
     use crate::preemptions::callback_history::{Origin, Site, Startup};
     use crate::slice_boundary::callbacks::Callback;
@@ -896,6 +900,13 @@ async fn legacy_callback_expired_deadline_trial(annotated: bool, owner_switch: b
         target_timeslice: std::num::NonZeroU64::new(1_000_000),
         ..Config::default()
     }.with_backend(|backend| backend.delivers_preemption_timer_events = true);
+    if record {
+        // The F1 configuration: a raw schedule replay under a scheduling
+        // heuristic that also records, so it records no logical
+        // priorities (records_logical_replay_priorities is false).
+        config.sched_heuristic = crate::config::SchedHeuristic::Random;
+        config.record_preemptions = true;
+    }
     config.validate();
     let start = crate::ThreadState::new(tid, &config, ()).thread_logical_time.as_nanos();
     let at = start + Duration::from_nanos(110);
@@ -971,7 +982,14 @@ async fn legacy_callback_expired_deadline_trial(annotated: bool, owner_switch: b
     assert!(replayer.desync_counts.values().all(|stats| stats.soft == 0 && stats.hard == 0));
     assert_eq!((replayer.cursor.peek().unwrap().op, replayer.cursor.peek().unwrap().count), (Op::Branch, 90));
     assert!(scheduler.callback_checkpoints.values().all(|points| points.is_empty()));
-    (global, guest.thread.end_of_timeslice.unwrap())
+    drop(scheduler);
+    let departure = if record {
+        let written = state.sched.lock().unwrap().preemption_writer.take().unwrap().into_string();
+        let recorded: crate::preemptions::PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert!(recorded.require_faithful_replay().is_err(), "a record that omitted the expiry row must refuse faithful replay");
+        recorded.replay_departed_at()
+    } else { None };
+    ((global, guest.thread.end_of_timeslice.unwrap()), departure)
 }
 
 #[tokio::test]
@@ -980,6 +998,24 @@ async fn legacy_callback_checkpoint_subsumes_expired_continue_deadline_once() {
         let baseline = legacy_callback_expired_deadline_trial(false, false).await;
         assert_eq!(legacy_callback_expired_deadline_trial(true, false).await, baseline);
     }).await.expect("bounded expired Continue(None) callback");
+}
+
+/// F1 control: the same expiry, recorded by a raw schedule replay under
+/// chaos (no logical priorities). The expiry's priority row is kept out
+/// of that record, so the record is marked incomplete even though the
+/// run finishes with its guide, and faithful replay refuses it.
+#[tokio::test]
+async fn a_recorded_callback_expiry_before_the_schedules_end_marks_the_record() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let (_, departure) =
+            legacy_callback_expired_deadline_trial_recording(true, false, true).await;
+        assert!(
+            departure.is_some(),
+            "the omitted expiry row must mark the recording"
+        );
+    })
+    .await
+    .expect("bounded recorded callback expiry");
 }
 
 #[tokio::test]

@@ -148,6 +148,22 @@ struct Replay {
     trace: Option<AccessTrace>,
 }
 
+/// The global events of a re-recorded schedule, whether the record was
+/// written plain or in the `incomplete_preemption_record` envelope.
+/// Narrower authority, stated plainly: these tests consume only the
+/// global event stream (to name the trace's own events), never the
+/// record as faithful-replay evidence — a record whose priority rows
+/// were omitted stays refused for that, and this reader does not
+/// change it.
+fn recorded_global_events(events: &[u8]) -> Vec<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_slice(events).unwrap();
+    let record = value
+        .get("incomplete_preemption_record")
+        .map(|envelope| &envelope["record"])
+        .unwrap_or(&value);
+    record["global"].as_array().expect("global events").clone()
+}
+
 /// Record `guest` once under chaos, so the schedule interleaves its threads.
 fn record(guest: &Path, directory: &Path) -> PathBuf {
     run_traced(guest, directory, "recorded", None, None);
@@ -594,8 +610,8 @@ fn access_trace_indices_name_the_runs_own_events() {
     let traced = replay(guest, &schedule, directory.path(), "traced", Some(0));
     assert!(traced.output.status.success(), "{:?}", traced.output);
     let trace = traced.trace.expect("traced replay");
-    let events: serde_json::Value = serde_json::from_slice(&traced.events).unwrap();
-    let events = events["global"].as_array().expect("global events");
+    let events = recorded_global_events(&traced.events);
+    let events = &events;
     assert_eq!(
         trace.end.as_ref().map(|end| end.events),
         Some(events.len() as u64)
@@ -975,8 +991,8 @@ fn a_futex_ping_pong_yields_alternating_wake_edges() {
     assert!(traced.output.status.success(), "{:?}", traced.output);
     assert_eq!(traced.output.stdout, b"10 rounds\n");
     let trace = traced.trace.unwrap();
-    let events: serde_json::Value = serde_json::from_slice(&traced.events).unwrap();
-    let events = events["global"].as_array().unwrap();
+    let events = recorded_global_events(&traced.events);
+    let events = &events;
 
     let wakes: Vec<&EdgeRecord> = edges(&trace)
         .into_iter()
@@ -1039,8 +1055,8 @@ fn signal_child_exit_and_join_edges_name_their_events() {
     let traced = replay(guest, &schedule, directory.path(), "traced", Some(0));
     assert!(traced.output.status.success(), "{:?}", traced.output);
     let trace = traced.trace.unwrap();
-    let events: serde_json::Value = serde_json::from_slice(&traced.events).unwrap();
-    let events = events["global"].as_array().unwrap();
+    let events = recorded_global_events(&traced.events);
+    let events = &events;
     let of_kind = |kind: EdgeKind| -> Vec<&EdgeRecord> {
         edges(&trace)
             .into_iter()

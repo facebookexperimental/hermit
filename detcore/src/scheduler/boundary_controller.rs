@@ -195,7 +195,7 @@ impl Scheduler {
         } else {
             None
         };
-        self.release_replay_priorities_if_exhausted();
+        self.release_replay_priorities_if_exhausted(true);
         let keep_running = match action {
             ReplayAction::Continue(None) => true,
             ReplayAction::ContextSwitch(now, next, None) => {
@@ -682,7 +682,7 @@ mod tests {
             scheduler.boundary_replayer.as_ref().unwrap().stored_index(),
             0
         );
-        scheduler.release_replay_priorities_if_exhausted();
+        scheduler.release_replay_priorities_if_exhausted(true);
         scheduler.readmit_ready_thread(peer);
         assert_eq!(
             scheduler.run_queue.queued_priority(peer),
@@ -700,7 +700,7 @@ mod tests {
         assert!(scheduler.replay_priorities_released);
         assert_eq!(scheduler.priorities[&peer], DEFAULT_PRIORITY);
         let queue = scheduler.run_queue.tids().copied().collect::<Vec<_>>();
-        scheduler.release_replay_priorities_if_exhausted();
+        scheduler.release_replay_priorities_if_exhausted(true);
         assert_eq!(
             scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
             queue
