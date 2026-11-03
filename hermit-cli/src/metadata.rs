@@ -942,7 +942,19 @@ impl RecordVersion {
 // LOCK_UN after a release), a contended blocking flock waits instead of being
 // refused, and a malformed operation is answered without a kernel call. An
 // older recording replayed with this binary desyncs at its first flock.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x199);
+// 0x199 -> 0x19a (drain of PR 4885; 0x199 was taken by SP2 above, so this
+// change takes HIGHEST_SHIPPED+1 at its rebase onto main 77be1fd0): CPU clocks
+// answer as Linux does, and replay recomputes every one of these answers:
+// clock_getres of a CPU clock gives the kernel's per-kind resolution instead
+// of a flat value; timer_create and timer_settime on a CPU clock of no live
+// task fail with Linux's errno; an absolute CPU-clock timer whose expiry has
+// passed fires at once; and a CPU-clock sleep that would have to wait is
+// refused by the unsupported-operation policy instead of completing. A
+// recording made before, with any of these calls, would replay with other
+// values, or a refusal where it recorded a completion, and another schedule.
+// It is refused here.
+// https://github.com/rrnewton/hermit/pull/4885
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19a);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -967,7 +979,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x199);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x199;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19a;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
