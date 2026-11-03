@@ -79,6 +79,8 @@ struct Recorded {
     switches: Vec<detcore::post_crash::PostCrashSwitch>,
     /// How many slice ends the record holds, across all threads.
     slice_ends: usize,
+    /// The record's events, in the run's order.
+    events: Vec<detcore_model::schedule::SchedEvent>,
 }
 
 /// Run `scenario` (run by test `test` of this binary) under a fine bound with
@@ -149,6 +151,7 @@ fn read(path: &Path) -> Recorded {
         switch: record.post_crash().first().copied(),
         switches: record.post_crash().to_vec(),
         slice_ends: reader.size(),
+        events: record.schedevents().clone(),
     }
 }
 
@@ -573,6 +576,41 @@ fn a_recovered_handler_followed_by_rdtsc_traps_does_not_switch() {
         "a_recovered_handler_followed_by_rdtsc_traps_does_not_switch",
         "recovered_then_rdtsc_until_sibling_execs",
         Some(200_000_000),
+    );
+    // The premise, from the events Detcore's RDTSC trap handler records
+    // (`Op::Rdtsc`), not from the guest's own reads: the faulting thread
+    // trapped an RDTSC after its handler returned and before the spawned
+    // program's `execve`. The handler's last call is its `mprotect`, and it
+    // has no RDTSC, so the thread's RDTSC events after that call come after
+    // the handler returned. Without them, no switch would prove nothing.
+    use detcore_model::schedule::Op;
+    use reverie::syscalls::Sysno;
+    let events = &record.events;
+    let fault = events
+        .iter()
+        .position(|event| matches!(event.op, Op::SignalReceived(sig) if sig.0 == libc::SIGSEGV))
+        .expect("the record holds the SIGSEGV's delivery");
+    let thread = events[fault].dettid;
+    let returned = fault
+        + events[fault..]
+            .iter()
+            .position(|event| {
+                event.dettid == thread && matches!(event.op, Op::Syscall(Sysno::mprotect, _))
+            })
+            .expect("the record holds the handler's mprotect");
+    let exec = returned
+        + events[returned..]
+            .iter()
+            .position(|event| matches!(event.op, Op::Syscall(Sysno::execve, _)))
+            .expect("the record holds the spawned program's execve");
+    let traps = events[returned..exec]
+        .iter()
+        .filter(|event| event.dettid == thread && event.op == Op::Rdtsc)
+        .count();
+    assert!(
+        traps > 0,
+        "no trapped RDTSC of the faulting thread between its handler's return (event {returned}) \
+         and the exec (event {exec})"
     );
     assert_eq!(record.switches, Vec::new());
 }
