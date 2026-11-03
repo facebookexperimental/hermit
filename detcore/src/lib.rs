@@ -1874,19 +1874,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// whatever this run's flags say; those ends keep their stops, as the
     /// flag keeps them in a run that records it.
     fn replay_allows_stopless_end<U>(&self, thread_state: &ThreadState<U>, end: u64) -> bool {
-        if thread_state
-            .preemption_points
-            .as_ref()
-            .is_some_and(preemptions::ThreadHistoryIterator::has_chaos_epochs)
-        {
-            return false;
-        }
-        if self.cfg.replay_schedule_from.is_some() {
-            return thread_state.replayed_stopless_end == Some(end);
-        }
-        thread_state
-            .replay_rcb_end
-            .is_none_or(|recorded| recorded == end)
+        stopless_end_allowed(self.cfg.replay_schedule_from.is_some(), thread_state, end)
     }
 
     /// Update logical thread time with any outstanding ticks of the Reverie clock.  Returns a list
@@ -9023,6 +9011,74 @@ mod timeslice_timer_tests {
         };
 
         let _ = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+    }
+}
+
+/// [`Detcore::replay_allows_stopless_end`] for a run that replays a
+/// schedule (`schedule_replay`) or not: whether a lone thread may take its
+/// slice end at branch `end` without a stop. The post-hook asks before it
+/// arms an end, and the catch-up after a skipped end asks again for the end
+/// it leaves armed (`Detcore::catch_up_lone_slice_ends`'s last step), so both
+/// refuse alike.
+fn stopless_end_allowed<U>(schedule_replay: bool, thread_state: &ThreadState<U>, end: u64) -> bool {
+    if thread_state
+        .preemption_points
+        .as_ref()
+        .is_some_and(preemptions::ThreadHistoryIterator::has_chaos_epochs)
+    {
+        return false;
+    }
+    if schedule_replay {
+        return thread_state.replayed_stopless_end == Some(end);
+    }
+    thread_state
+        .replay_rcb_end
+        .is_none_or(|recorded| recorded == end)
+}
+
+#[cfg(test)]
+mod stopless_end_permission_tests {
+    use super::*;
+    use crate::preemptions::ThreadHistory;
+    use crate::resources::ChaosEpochTransition;
+    use crate::types::RcbTimeMultiplier;
+
+    /// A replay lets a lone thread take a slice end without a stop only at
+    /// the end its record allows, at that exact branch count:
+    /// - a preemption replay at its recorded end (`replay_rcb_end`), or past
+    ///   the record, and not one branch before or after it;
+    /// - a schedule replay only at an end its recording took without a stop
+    ///   (`replayed_stopless_end`), and never where the recording stopped;
+    /// - neither, when the record carries per-thread chaos rates, which a
+    ///   slice end installs.
+    #[test]
+    fn a_replay_allows_a_stopless_end_only_where_its_record_does() {
+        let config = Config::default();
+        let mut thread = ThreadState::new(DetPid::from_raw(5), &config, ());
+        assert!(stopless_end_allowed(false, &thread, 100), "past the record");
+        assert!(!stopless_end_allowed(true, &thread, 100), "no marked end");
+
+        thread.replay_rcb_end = Some(100);
+        assert!(stopless_end_allowed(false, &thread, 100));
+        assert!(!stopless_end_allowed(false, &thread, 99));
+        assert!(!stopless_end_allowed(false, &thread, 101));
+
+        thread.replayed_stopless_end = Some(100);
+        assert!(stopless_end_allowed(true, &thread, 100));
+        assert!(!stopless_end_allowed(true, &thread, 99));
+        assert!(!stopless_end_allowed(true, &thread, 101));
+
+        thread.preemption_points = Some(
+            ThreadHistory::new()
+                .with_chaos_epochs(vec![ChaosEpochTransition {
+                    logical_time: LogicalTime::ZERO,
+                    epoch: 1,
+                    factor: RcbTimeMultiplier::from_f64(2.0),
+                }])
+                .into_iter(),
+        );
+        assert!(!stopless_end_allowed(false, &thread, 100), "chaos rates");
+        assert!(!stopless_end_allowed(true, &thread, 100), "chaos rates");
     }
 }
 

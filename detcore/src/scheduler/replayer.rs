@@ -1042,12 +1042,16 @@ impl Replayer {
         }
     }
 
-    /// `matched`: the observed event matched the recording's and was popped.
-    /// Only then may the reply let the thread take its next end without a
-    /// stop: that end must be the observing thread's own next event. A
-    /// context switch hands the length to the wrong thread (or to the
-    /// grant), and an unmatched head names no end of this thread's.
-    fn check_context_switch(&mut self, observed: &SchedEvent, matched: bool) -> ReplayAction {
+    /// `popped`: the replay popped a recorded event for `observed`, not only
+    /// on an exact match but also on a soft desync (the same operation with
+    /// other counts or times) and on the event a fast-forward resynchronized
+    /// to (`observe_event`). Each leaves the cursor at the recording's event
+    /// after one of this thread's. Only then may the reply let the thread
+    /// take its next end without a stop, and only when that end is the
+    /// observing thread's own next event: a context switch hands the length
+    /// to another thread (or to the grant), and a hard desync, which pops
+    /// nothing, leaves a head that names no end of this thread's.
+    fn check_context_switch(&mut self, observed: &SchedEvent, popped: bool) -> ReplayAction {
         // We run after the pop of any matched action, so the next action in replay represents the
         // FUTURE not the PRESENT/PAST.
         //
@@ -1095,7 +1099,7 @@ impl Replayer {
                     next_tid,
                     with_a_stop,
                 )
-            } else if matched {
+            } else if popped {
                 // We're still running the next event.
                 ReplayAction::Continue(timeslice)
             } else {
@@ -1888,6 +1892,31 @@ mod tests {
             replayer.observe_event(&schedule[0]),
             ReplayAction::Continue(Some(stop_after(123)))
         );
+    }
+
+    /// A recorded end's RIP is compared exactly unless the recording took
+    /// that end without a stop: a replay that ends a stopped end at another
+    /// instruction is a hard desync naming `end_rip`, while at an end taken
+    /// without a stop, where the recording has no RIP of its own, any RIP
+    /// the replay reads (or none) is not one.
+    #[test]
+    fn a_recorded_end_rip_is_compared_exactly_unless_the_end_was_stopless() {
+        let mut b = builder::SchedTestBuilder::new();
+        let mut recorded = b.branch(100, tid(3));
+        recorded.end_rip = InstructionPointer::new(0x401000);
+        let mut elsewhere = recorded.clone();
+        elsewhere.end_rip = InstructionPointer::new(0x402000);
+        assert!(is_hard_desync(&elsewhere, &recorded));
+        assert_eq!(hard_desync_fields(&elsewhere, &recorded), vec!["end_rip"]);
+        assert!(!is_hard_desync(&recorded.clone(), &recorded));
+
+        let stopless = b.branch(100, tid(3)).taken_without_stop();
+        let mut stopped_there = stopless.clone();
+        stopped_there.stopless = false;
+        stopped_there.end_rip = InstructionPointer::new(0x402000);
+        assert!(!is_hard_desync(&stopped_there, &stopless));
+        assert!(hard_desync_fields(&stopped_there, &stopless).is_empty());
+        assert!(!is_hard_desync(&stopless.clone(), &stopless));
     }
 
     /// A lone thread's slice end the recording took without a stop is
