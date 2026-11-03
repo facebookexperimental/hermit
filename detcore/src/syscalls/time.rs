@@ -1138,10 +1138,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// on Linux (an expired timer fires at once, :729-735), and one that would
     /// have to wait is refused by the unsupported-operation policy rather than
     /// ended by another process's work. That refusal is a known limitation,
-    /// tracked as a follow-up: a wait keyed to a task's CPU time, which
-    /// relative CPU timers need too, would let such a sleep wait as on Linux.
-    /// A relative sleep waits for the CPU time it requests, so only a zero
-    /// request returns at once. An absolute
+    /// tracked as a follow-up
+    /// (<https://github.com/rrnewton/hermit/issues/5102>): a wait keyed to a
+    /// task's CPU time, which relative CPU timers need too, would let such a
+    /// sleep wait as on Linux. A relative sleep waits for the CPU time it
+    /// requests, so only a zero request returns at once. An absolute
     /// one waits for its deadline less the clock's current reading
     /// ([`cpu_sleep_remaining`]), which needs the reading, so an absolute
     /// sleep on another process's clock is refused too (`cpu_clock_reading`).
@@ -1401,8 +1402,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // for CPU time still to come, or reload for more, is refused by the
         // unsupported-operation policy rather than ended by another process's
         // work, as a CPU-clock sleep is (`cpu_clock_sleep`; the same known
-        // limitation and follow-up). A relative expiration counts down on the
-        // virtual clock as before, which that follow-up would also correct.
+        // limitation and follow-up,
+        // https://github.com/rrnewton/hermit/issues/5102). A relative
+        // expiration counts down on the virtual clock as before, which that
+        // follow-up would also correct.
         let cpu_timer_clock = guest
             .thread_state()
             .posix_timers
