@@ -1157,6 +1157,14 @@ fn is_pure_read(flags: OFlag) -> bool {
             && !flags.intersects(OFlag::O_CREAT | OFlag::O_TRUNC))
 }
 
+/// Whether an open with `flags` gives a descriptor its holder can read:
+/// any access mode but `O_WRONLY`, whatever the creation and truncation
+/// flags (`O_RDWR`, and `O_RDONLY` with `O_CREAT` or `O_TRUNC`, read too;
+/// open(2)). An `O_PATH` descriptor reads nothing.
+fn opens_readable(flags: OFlag) -> bool {
+    !flags.contains(OFlag::O_PATH) && flags.bits() & libc::O_ACCMODE != libc::O_WRONLY
+}
+
 /// What `property_reached_live` found about a descriptor.
 enum LiveCheck {
     /// A live property file the snapshot copied, with why.
@@ -5724,13 +5732,19 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// What the open `call`, of `path`, does under `Config::property_snapshot`.
     /// Only a pure read ([`is_pure_read`]) is served from the snapshot; the
-    /// copy is never opened to write. Every other open is the guest's own
+    /// copy is never opened to write. A write-only open is the guest's own
     /// change to the host filesystem, which Hermit does not make
     /// deterministic: it runs as it is, and one that names the area is said
-    /// once ([`Self::note_property_write`]). A pure read is decided before it
-    /// runs by the object it names (a `newfstatat` of its path, which follows
-    /// a last symbolic link unless the open does not) and by its name:
-    /// - an object the snapshot copied: its copy;
+    /// once ([`Self::note_property_write`]). An open that writes, creates or
+    /// truncates and also reads ([`opens_readable`]: `O_RDWR`, or `O_RDONLY`
+    /// with `O_CREAT` or `O_TRUNC`) would read the live file through its
+    /// descriptor, which the read-only copy cannot serve: it is decided as a
+    /// pure read is, and an object the snapshot copied is then
+    /// [`PropertyOpen::Live`], which a fail-closed run refuses before the open
+    /// runs. A pure read, or such an open, is decided before it runs by the
+    /// object it names (a `newfstatat` of its path, which follows a last
+    /// symbolic link unless the open does not) and by its name:
+    /// - an object the snapshot copied: its copy, for a pure read;
     /// - a name directly in the area whose object the snapshot does not hold,
     ///   or could not be classified ([`PropertyOpen::Unknown`]);
     /// - anything else: `None`, the open as it is. Its descriptor is then
@@ -5744,11 +5758,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Option<PropertyOpen> {
         let snapshot = self.cfg.property_snapshot.as_ref()?;
         let in_area = property_area_name(&snapshot.guest_dir, path);
-        if !is_pure_read(call.flags()) {
+        let pure_read = is_pure_read(call.flags());
+        if !pure_read {
             if in_area.is_some() {
                 self.note_property_write(path);
             }
-            return None;
+            if !opens_readable(call.flags()) {
+                return None;
+            }
         }
         let follow = if call.flags().contains(OFlag::O_NOFOLLOW) {
             AtFlags::AT_SYMLINK_NOFOLLOW
@@ -5775,6 +5792,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             )));
         }
         match (copied, in_area) {
+            (Some(file), _) if !pure_read => Some(PropertyOpen::Live(format!(
+                "it opens the property file {} to read and also to write, create or truncate \
+                 it (open flags {:#o}), which its frozen, read-only copy cannot serve",
+                file.name,
+                call.flags().bits()
+            ))),
             (Some(file), _) => Some(if snapshot.copy_dir.is_dir() {
                 PropertyOpen::Copy(snapshot.copy_dir.join(&file.name))
             } else {
@@ -6371,10 +6394,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                     )),
                     None if property_copy.is_none()
                         && self.cfg.property_snapshot.is_some()
-                        && is_pure_read(call.flags()) =>
+                        && (is_pure_read(call.flags()) || opens_readable(call.flags())) =>
                     {
-                        // A pure read that may have reached the live area,
-                        // or could not be checked, is refused fail-closed.
+                        // A pure read, or an open that also reads, that may
+                        // have reached the live area, or could not be
+                        // checked, is refused fail-closed.
                         match Box::pin(self.property_reached_live(guest, fd, host_stat.as_ref()))
                             .await
                         {
@@ -6383,8 +6407,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                         }
                     }
                     None if self.cfg.property_snapshot.is_some() => {
-                        // A write open of a live property file by any name
-                        // runs as it is; say so once.
+                        // A write-only open of a live property file by any
+                        // name runs as it is; say so once.
                         if let LiveCheck::Live(_) =
                             Box::pin(self.property_reached_live(guest, fd, host_stat.as_ref()))
                                 .await

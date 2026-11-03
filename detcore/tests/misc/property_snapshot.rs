@@ -8,9 +8,10 @@
 
 //! The guest reads Hermit's frozen copy of a property area
 //! (`Config::property_snapshot`): a pure read of a file the snapshot copied,
-//! by any name, opens the copy; an open that writes or truncates runs on the
-//! live file, as natively, and never touches the copy; a file in the area
-//! the snapshot does not hold is read live only where the run allows it.
+//! by any name, opens the copy; a write-only open runs on the live file, as
+//! natively, and never touches the copy; an open that also reads the file
+//! it writes, creates or truncates, and a file in the area the snapshot does
+//! not hold, are read live only where the run allows it.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -123,7 +124,7 @@ fn a_property_snapshot_serves_reads_with_metadata_virtualization_off() {
 }
 
 /// In a fail-closed run, an anonymous mapping that names a descriptor of a
-/// live property file (opened to write, which runs natively) succeeds, since
+/// live property file (opened write-only, which runs natively) succeeds, since
 /// Linux ignores the descriptor there, and a file mapping of a descriptor that
 /// is not open fails natively with `EBADF`: neither is refused.
 #[test]
@@ -140,11 +141,7 @@ fn mappings_that_read_no_property_file_are_not_refused() {
     };
     let guest = move || {
         use std::os::fd::AsRawFd;
-        let live = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&file)
-            .unwrap();
+        let live = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
         // SAFETY: an anonymous private mapping, unmapped below.
         let anonymous = unsafe {
             libc::mmap(
@@ -304,6 +301,62 @@ fn a_file_without_a_copy_is_refused_through_an_outside_alias() {
     std::fs::hard_link(&gone, &alias).unwrap();
     run_fail_closed(area.snapshot.clone(), move || {
         let _ = std::fs::read(&alias);
+    });
+    panic!("the run was not refused");
+}
+
+/// Opens `path` with `flags` (and a mode, for `O_CREAT`) in the guest, reads
+/// up to four bytes from it if the open succeeds, and closes it.
+fn open_in_guest(path: &Path, flags: libc::c_int) {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path, and a mode for O_CREAT.
+    let fd = unsafe { libc::open(path.as_ptr(), flags, 0o644) };
+    if fd >= 0 {
+        let mut bytes = [0_u8; 4];
+        // SAFETY: `fd` is open and `bytes` is writable for its length.
+        unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+        // SAFETY: the descriptor opened above.
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// In a fail-closed run, an open that reads a copied property file and also
+/// writes it (`O_RDWR`) is refused before it runs: its descriptor would read
+/// the live file, which processes outside the run rewrite, and the frozen
+/// copy cannot serve a write. Before, it ran on the live file and the guest
+/// read live bytes.
+#[test]
+fn a_readable_write_open_of_a_copied_property_file_is_refused() {
+    if !is_inner_refusal_run(
+        "a_readable_write_open_of_a_copied_property_file_is_refused",
+        "to read and also to write, create or truncate it",
+    ) {
+        return;
+    }
+    let area = area();
+    let file = area.live.path().join("u:object_r:test_prop:s0");
+    run_fail_closed(area.snapshot.clone(), move || {
+        open_in_guest(&file, libc::O_RDWR);
+    });
+    panic!("the run was not refused");
+}
+
+/// The same for `O_RDONLY | O_CREAT` of an existing copied property file:
+/// Linux opens the existing file for reading and creates nothing, so its
+/// descriptor would read the live file. A fail-closed run refuses it before
+/// it runs.
+#[test]
+fn a_readable_create_open_of_a_copied_property_file_is_refused() {
+    if !is_inner_refusal_run(
+        "a_readable_create_open_of_a_copied_property_file_is_refused",
+        "to read and also to write, create or truncate it",
+    ) {
+        return;
+    }
+    let area = area();
+    let file = area.live.path().join("u:object_r:test_prop:s0");
+    run_fail_closed(area.snapshot.clone(), move || {
+        open_in_guest(&file, libc::O_RDONLY | libc::O_CREAT);
     });
     panic!("the run was not refused");
 }
