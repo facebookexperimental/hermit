@@ -1992,6 +1992,14 @@ impl AccessTraceWriter {
         };
         let thread = ledger.threads.entry(tid).or_default();
         thread.hits += 1;
+        // A hit is delivered only by an installed watchpoint, so it is
+        // itself evidence the thread armed — the evidence the summary
+        // otherwise only learns from a later recorded event carrying
+        // `WatchStatus::Armed`, which a thread that runs to its death
+        // after arming never records.
+        if thread.armed_before.is_none() {
+            thread.armed_before = Some(after);
+        }
         let mut record = WatchHitRecord {
             after,
             tid,
@@ -4132,6 +4140,50 @@ mod tests {
             "{:?}",
             writer.edges.signals
         );
+    }
+
+    /// `--watch`: a thread whose hits are recorded but which never
+    /// records another event after arming armed successfully — a hit is
+    /// only delivered by an installed watchpoint — so its summary must
+    /// not call it never armed just because no later event carried
+    /// `WatchStatus::Armed` (the `--watch-from` reply arms it after that
+    /// event's status was sent, and the thread may then run to its death
+    /// without recording again).
+    #[test]
+    fn a_thread_with_only_hits_after_arming_is_not_reported_unarmed() {
+        use crate::watch::WatchStatus;
+        let (mut writer, bytes) = in_memory_writer();
+        writer.enable_watch(7);
+        writer.seed_watch(7, [tid(3)]);
+        writer.note_watch(tid(3), 6, WatchStatus::Pending);
+        // The final interval: accesses, hits, and death, with no further
+        // recorded event to carry the armed status.
+        for n in 0..3 {
+            writer.watch_hit(7 + n, tid(3), 0, 0x404010, 0x401000 + n, vec![]);
+        }
+        assert_eq!(
+            writer.watch_run_summary(),
+            Some(detcore_model::summary::WatchRunSummary {
+                armed: 1,
+                unarmed: vec![],
+                hits: 3,
+            })
+        );
+        writer.finish(500).unwrap();
+        let trace =
+            detcore_model::access_trace::read_access_trace(&bytes.lock().unwrap()[..]).unwrap();
+        let summaries: Vec<&WatchSummaryRecord> = trace
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                TraceRecord::WatchSummary(summary) => Some(summary),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].tid, tid(3));
+        assert_eq!(summaries[0].hits, 3);
+        assert_eq!(summaries[0].unarmed, None);
     }
 
     /// `--watch`: the watches are due from `--watch-from` on; a thread's

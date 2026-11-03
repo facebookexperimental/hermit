@@ -6575,25 +6575,19 @@ fn watch_refusal(config: &DetConfig, slots: u8, backend: &str) -> Option<String>
 /// a backend without watchpoints, and `--watch-from` without a watch.
 #[test]
 fn watch_is_refused_where_it_could_not_arm_or_report() {
-    let base = [
-        "hermit",
-        "run",
-        "--record-preemptions-to=/var/e",
-        "--record-access-trace-to=/var/a",
-    ];
-    let with = |extra: &[&str]| {
-        let argv: Vec<&str> = base.iter().chain(extra).chain(&["prog"]).copied().collect();
-        run_opts_for(&argv)
-            .validate_args_with_perf_support(true)
-            .err()
-            .map(|error| error.to_string())
+    // Four-slot admission and capacity go through the `watch_refusal`
+    // seam with the slot count stated, so this test does not assume the
+    // host's architecture (off x86-64 the backend advertises 0 slots):
+    // one watch is admitted, five are refused naming the four slots.
+    let config = |count: u64| DetConfig {
+        access_trace: Some("/var/a".into()),
+        watch: (0..count)
+            .map(|i| format!("{:#x}", 0x404010 + 8 * i).parse().unwrap())
+            .collect(),
+        ..DetConfig::default()
     };
-    assert_eq!(with(&["--watch=0x404010:8:w", "--watch-from=3"]), None);
-    let five: Vec<String> = (0..5)
-        .map(|i| format!("--watch={:#x}", 0x404010 + 8 * i))
-        .collect();
-    let five: Vec<&str> = five.iter().map(String::as_str).collect();
-    let error = with(&five).expect("five watches");
+    assert_eq!(watch_refusal(&config(1), 4, "ptrace"), None);
+    let error = watch_refusal(&config(5), 4, "ptrace").expect("five watches");
     assert!(
         error.contains("5 --watch flags, and a thread holds 4 hardware watchpoints; drop 1"),
         "{error}"
