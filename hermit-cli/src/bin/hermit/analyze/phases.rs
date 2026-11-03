@@ -5039,18 +5039,18 @@ mod tests {
             target, record,
             "the report starts from the record that met the target"
         );
-    fn timing_report_stack(thread: i32, ip: u64) -> PrettyBacktrace {
-        serde_json::from_value(serde_json::json!({
-            "thread_id": thread,
-            "thread_name": null,
-            "frames": [{
-                "frame": { "ip": ip, "is_signal": false },
-                "symbol": null,
-                "locations": []
-            }]
-        }))
-        .unwrap()
-    }
+        fn timing_report_stack(thread: i32, ip: u64) -> PrettyBacktrace {
+            serde_json::from_value(serde_json::json!({
+                "thread_id": thread,
+                "thread_name": null,
+                "frames": [{
+                    "frame": { "ip": ip, "is_signal": false },
+                    "symbol": null,
+                    "locations": []
+                }]
+            }))
+            .unwrap()
+        }
 
         let deciding = Some(timing_report_stack(3, 0x20));
         for (target_met, baseline_met, contradicted) in [
