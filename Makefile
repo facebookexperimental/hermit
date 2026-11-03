@@ -234,6 +234,7 @@ LINT_CHECK_TARGETS := \
     lint-check-whitespace \
     lint-check-verify-submodules \
     lint-check-reverie-pin \
+    lint-check-musl-detcore \
     lint-check-nested-lockfiles \
     lint-check-record-version-floor \
     lint-check-known-gap-ledgers \
@@ -371,6 +372,9 @@ lint-check-verify-submodules:
 
 lint-check-reverie-pin:
 	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh $(_VALIDATE_PIN_ARG)
+
+lint-check-musl-detcore:
+	./ci/check-musl-detcore.sh
 
 lint-check-nested-lockfiles:
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
