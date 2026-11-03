@@ -4907,7 +4907,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And run_kvm_a_parent_death_signal_reaches_the_child_as_on_linux (PRCTL
     // phase 2: KVM's parent-death signals and the refusals it keeps): 125 + 1
     // = 126, listed.
-    ("privileged-test.cli_kvm", 126),
+    ("privileged-test.cli_kvm", 129),
     // The required tests of hermit-cli/tests/deadline_slice_cap.rs on KVM: the
     // suite's 42 tests less the rows of its known-gap ledger
     // (hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv), measured on Hermit
@@ -5342,7 +5342,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unexchangeable robust word refusal test: 124, listed.
     // And N4's smaps test: 124 + 1 = 125, listed.
     // And the same PRCTL phase 2 parent-death test: 125 + 1 = 126, listed.
-    ("privileged-only-test.cli_kvm", 126),
+    ("privileged-only-test.cli_kvm", 129),
     ("privileged-only-test.pmu_buck_chaos_cases_on_host", 6),
     // And the KVM unreadable futex word test: 56.
     // And run_kvm_a_parked_sleep_carries_the_deadline_cap: 57.
@@ -5391,7 +5391,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unexchangeable robust word refusal test: 124, listed.
     // And the same N4 smaps test: 124 + 1 = 125, listed.
     // And the same PRCTL phase 2 parent-death test: 125 + 1 = 126, listed.
-    ("privileged-only-test.cli_kvm_on_host", 126),
+    ("privileged-only-test.cli_kvm_on_host", 129),
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
