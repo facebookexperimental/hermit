@@ -56,6 +56,21 @@
 //! it in the other. A call that is absent, or never returns, sorts after
 //! every event.
 //!
+//! Data edges order a write before the read that returned its bytes, and only
+//! through a pipe the traces can follow whole ([`data_edges`]). The model is
+//! an allowlist:
+//! - Admission ([`unfollowed_pipes`]): a pipe gives edges only while every
+//!   descriptor of it came by a route the trace follows: its creation by
+//!   pipe or pipe2, the dup family and fcntl F_DUPFD (the same description),
+//!   and fork or clone inheritance (the same description). Any other arrival
+//!   of one of its descriptions, such as a receive over SCM_RIGHTS,
+//!   pidfd_getfd, or a route not listed here, untracks that pipe. A pipe
+//!   description the trace gives no pair identity, such as a reopen through
+//!   /proc/self/fd, could be any pipe's, so it untracks every pipe.
+//! - Content: an admitted pipe still gives no edge when its bytes are not one
+//!   piece per traced write and one consumption per traced read: a tee or a
+//!   vmsplice, packet mode, or a write that may exceed PIPE_BUF.
+//!
 //! Window lemma: the schedules agree before S, so a call that ended before S
 //! holds the same events in both runs, and a pair whose order flips lies at
 //! or after S. Every edge runs forward in the serialized order, so only edges
@@ -942,6 +957,11 @@ const TEED: &str = "a tee(2) copied its bytes without consuming them, so a read 
                     bytes than the writes' offsets give";
 const VMSPLICED: &str = "the trace has a vmsplice(2), which puts bytes in a pipe without a write \
                          the trace records";
+const ARRIVED: &str = "one of its descriptions reached a process by a route the trace does not \
+                       follow (not its creation, a dup or inheritance), such as SCM_RIGHTS or \
+                       pidfd_getfd";
+const UNPAIRED: &str = "the trace has a pipe description without a pair identity (such as a reopen \
+                        through /proc/self/fd), which could be any pipe's";
 const PACKET: &str = "it may be a packet pipe (pipe2 with O_DIRECT, or a status flag change by \
                       fcntl F_SETFL), whose reads discard the rest of a packet";
 const LARGE_WRITE: &str = "a write to it may be larger than PIPE_BUF, which the pipe need not take \
@@ -974,6 +994,10 @@ struct DataEdges {
 /// a channel gives no edge at all and is named as untracked
 /// ([`PREDATES_TRACE`]): every consumer of an ordered verdict sees no order
 /// through it.
+///
+/// Only a pipe every descriptor of which came by a route the trace follows
+/// gives edges ([`unfollowed_pipes`], the admission rule of the model in the
+/// module documentation).
 ///
 /// The replay also assumes that every byte in a created pipe came from a
 /// traced write, in one piece at the write's entry, and that every traced
@@ -1020,6 +1044,7 @@ fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
         })
         .collect();
     let vmspliced = syscalls.iter().any(|sys| sys.sysno == Sysno::vmsplice);
+    let unfollowed = unfollowed_pipes(syscalls);
     // The open files of a packet pipe's ends: both ends pipe2 made with
     // O_DIRECT, and the end a successful F_SETFL changed.
     let packet_files: BTreeSet<OpenFileId> = syscalls
@@ -1054,6 +1079,15 @@ fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
     for step in &steps {
         let why = if !matches!(step.id, ChannelId::Pair(first) if opened.contains(&first)) {
             PREDATES_TRACE
+        } else if let Some(why) = (step.kind == ChannelKind::Pipe)
+            .then(|| {
+                unfollowed
+                    .all
+                    .or_else(|| unfollowed.pipes.get(&step.id).copied())
+            })
+            .flatten()
+        {
+            why
         } else if teed.contains(&step.id) {
             TEED
         } else if vmspliced && step.kind == ChannelKind::Pipe {
@@ -1073,9 +1107,90 @@ fn data_edges(syscalls: &[&SyscallRecord]) -> DataEdges {
     DataEdges { edges, untracked }
 }
 
+/// The pipes no edge may run through because a descriptor of them came by a
+/// route the trace does not follow ([`unfollowed_pipes`]).
+struct Unfollowed {
+    /// Why every pipe is out, when one is.
+    all: Option<&'static str>,
+    /// Why each pipe that is out is.
+    pipes: BTreeMap<ChannelId, &'static str>,
+}
+
+/// The admission rule of the data-edge model, the one place it is decided:
+/// which pipes have a descriptor that came by a route the trace does not
+/// follow.
+///
+/// The followed routes, and why each keeps the replay's offsets right:
+/// - The creation: a successful pipe or pipe2 notes an open of each of the
+///   two descriptions it made, and names them one pair.
+/// - The dup family (dup, dup2, dup3) and fcntl F_DUPFD and
+///   F_DUPFD_CLOEXEC: a new number for the same description, noted as a dup,
+///   not an open.
+/// - fork and clone: the child's descriptors are the same descriptions, and
+///   nothing is noted.
+///
+/// Any other open note of a pipe's description is an arrival by another
+/// route: a receive over SCM_RIGHTS, pidfd_getfd, or one this list does not
+/// know. It puts that pipe out ([`ARRIVED`]). A pipe description with no pair
+/// identity is a pipe the trace did not see created, such as a reopen
+/// through /proc/self/fd, which Detcore classifies as a pipe when it manages
+/// the pipe it names (files.rs, `reopens_scheduler_managed_pipe`). Its bytes
+/// can reach any pipe, so it puts every pipe out ([`UNPAIRED`]).
+fn unfollowed_pipes(syscalls: &[&SyscallRecord]) -> Unfollowed {
+    let creates = |sys: &SyscallRecord| creates_a_channel_pair(sys.sysno) && sys.result == Some(0);
+    fn opens(sys: &SyscallRecord) -> impl Iterator<Item = OpenFileId> + '_ {
+        sys.accesses.iter().filter_map(|access| match access {
+            Access::Fd {
+                open_file: Some(open_file),
+                op: FdOp::Open { .. },
+                ..
+            } => Some(*open_file),
+            _ => None,
+        })
+    }
+    // Each created description, with its pipe's identity: the pair is named
+    // by its first end.
+    let mut created = BTreeMap::new();
+    for sys in syscalls.iter().filter(|sys| creates(sys)) {
+        let ends: Vec<OpenFileId> = opens(sys).collect();
+        if let Some(&first) = ends.first() {
+            for end in ends {
+                created.insert(end, ChannelId::Pair(first));
+            }
+        }
+    }
+    let mut unfollowed = Unfollowed {
+        all: None,
+        pipes: BTreeMap::new(),
+    };
+    for sys in syscalls {
+        if !creates(sys) {
+            for open_file in opens(sys) {
+                if let Some(id) = created.get(&open_file) {
+                    unfollowed.pipes.entry(*id).or_insert(ARRIVED);
+                }
+            }
+        }
+        let unpaired = sys.accesses.iter().any(|access| {
+            matches!(
+                access,
+                Access::Channel {
+                    id: None,
+                    channel: ChannelKind::Pipe,
+                    ..
+                }
+            )
+        });
+        if unpaired {
+            unfollowed.all.get_or_insert(UNPAIRED);
+        }
+    }
+    unfollowed
+}
+
 /// Whether `sys`, a call that wrote to a pipe, may have put its bytes in in
-/// more than one part. A write or a splice may when its length argument is
-/// over PIPE_BUF. The trace does not hold a writev's requested length (it
+/// more than one part. A write, a splice or a sendfile may when its length
+/// argument is over PIPE_BUF. The trace does not hold a writev's requested length (it
 /// is in the guest's iovecs), so a writev or pwritev2 counts when it
 /// returned more than PIPE_BUF bytes, or when it waited: its return is not
 /// the event right after its entry. Detcore's blocking write puts in a
@@ -1087,6 +1202,7 @@ fn may_exceed_pipe_buf(sys: &SyscallRecord) -> bool {
     match sys.sysno {
         Sysno::write => sys.args[2] > PIPE_BUF,
         Sysno::splice => sys.args[4] > PIPE_BUF,
+        Sysno::sendfile => sys.args[3] > PIPE_BUF,
         Sysno::writev | Sysno::pwritev2 => {
             returned_more || sys.post.is_none_or(|post| post > sys.pre + 1)
         }
@@ -4592,11 +4708,15 @@ mod tests {
             sys
         };
         let key = ChannelKey::Shared(ChannelId::Pair(file(7, 1)));
+        // A sendfile that asked for more than PIPE_BUF, though it moved 8.
+        let mut sendfile = write(10, 7, Sysno::sendfile, 8);
+        sendfile.args = [4, 5, 0, PIPE_BUF + 1, 0, 0];
         let first_writes = [
             write(10, 7, Sysno::write, 2 * c + 1),
             write(10, 7, Sysno::write, PIPE_BUF + 1),
             write(10, 7, Sysno::writev, PIPE_BUF + 1),
             waited(8),
+            sendfile,
         ];
         for first in first_writes {
             let len = first.result.unwrap() as u64;
@@ -4633,6 +4753,124 @@ mod tests {
             let data = data_edges(&calls.iter().collect::<Vec<_>>());
             assert!(data.untracked.is_empty(), "{:?}", data.untracked);
             assert_eq!(data.edges.len(), 2, "{:?}", data.edges);
+        }
+    }
+
+    /// The admission rule: a pipe gives edges only while every descriptor of
+    /// it came by a route the trace follows. pipe2 makes ends 3 and 4 (files
+    /// 1 and 2); W writes 4 bytes through 4 and R reads 4 through 3.
+    /// - A reopen through /proc/self/fd/4 makes a new description the trace
+    ///   gives no pair identity; 4 bytes written through it before W are the
+    ///   ones R gets, yet the offsets credit W. Every pipe is out.
+    /// - A receive over SCM_RIGHTS of end 4's description, and a pipe-kind
+    ///   description with no identity and no open at all, put the pipe out
+    ///   too.
+    /// - A dup, an F_DUPFD and a forked child's write through the same
+    ///   description are followed routes, and W still orders R.
+    #[test]
+    fn a_pipe_with_a_descriptor_from_an_unfollowed_route_gives_no_edge() {
+        let key = ChannelKey::Shared(ChannelId::Pair(file(7, 1)));
+        let made = || creates(1, [file(7, 1), file(7, 2)]);
+        let write = |pre, tid, pid: i32, open_file, id| {
+            let mut sys = call(
+                pre,
+                tid,
+                pre,
+                Sysno::write,
+                &[4, 0x1000, 4],
+                Some(4),
+                vec![Access::Channel {
+                    open_file,
+                    id,
+                    channel: ChannelKind::Pipe,
+                    op: ChannelOp::Write,
+                }],
+            );
+            sys.pid = DetPid::from_raw(pid);
+            sys
+        };
+        let w = || write(20, 8, 3, file(7, 2), Some(ChannelId::Pair(file(7, 1))));
+        let read = || {
+            call(
+                22,
+                9,
+                1,
+                Sysno::read,
+                &[3, 0x2000, 4],
+                Some(4),
+                vec![pipe(file(7, 1), ChannelOp::Read)],
+            )
+        };
+        let reopen = call(
+            10,
+            7,
+            2,
+            Sysno::openat,
+            &[libc::AT_FDCWD as u64, 0x4000, libc::O_WRONLY as u64],
+            Some(5),
+            vec![fd(5, Some(file(7, 9)), opened("/proc/self/fd/4"))],
+        );
+        let received = call(
+            10,
+            9,
+            2,
+            Sysno::recvmsg,
+            &[6, 0x5000, 0],
+            Some(1),
+            vec![fd(7, Some(file(7, 2)), opened("socket"))],
+        );
+        let unfollowed: [(Vec<SyscallRecord>, &str); 3] = [
+            (
+                vec![
+                    made(),
+                    reopen,
+                    write(12, 7, 3, file(7, 9), None),
+                    w(),
+                    read(),
+                ],
+                UNPAIRED,
+            ),
+            (vec![made(), received, w(), read()], ARRIVED),
+            (
+                vec![made(), write(12, 7, 3, file(7, 9), None), w(), read()],
+                UNPAIRED,
+            ),
+        ];
+        for (calls, why) in unfollowed {
+            let data = data_edges(&calls.iter().collect::<Vec<_>>());
+            assert_eq!(data.edges, Vec::new(), "{why}");
+            assert_eq!(data.untracked.get(&key).map(|u| u.why), Some(why));
+        }
+        // The followed routes: a dup and an F_DUPFD name the same description
+        // with a dup note, and a forked child (process 8) writes through the
+        // description it inherited, with no note at all.
+        let dup = call(
+            10,
+            8,
+            2,
+            Sysno::dup,
+            &[4],
+            Some(5),
+            vec![fd(5, Some(file(7, 2)), FdOp::Dup { source: 4 })],
+        );
+        let dupfd = call(
+            10,
+            8,
+            2,
+            Sysno::fcntl,
+            &[4, libc::F_DUPFD as u64, 10],
+            Some(10),
+            vec![fd(10, Some(file(7, 2)), FdOp::Dup { source: 4 })],
+        );
+        let forked = write(20, 11, 8, file(7, 2), Some(ChannelId::Pair(file(7, 1))));
+        for calls in [
+            vec![made(), dup, w(), read()],
+            vec![made(), dupfd, w(), read()],
+            vec![made(), forked, read()],
+        ] {
+            let data = data_edges(&calls.iter().collect::<Vec<_>>());
+            assert!(data.untracked.is_empty(), "{:?}", data.untracked);
+            assert_eq!(data.edges.len(), 1, "{:?}", data.edges);
         }
     }
 

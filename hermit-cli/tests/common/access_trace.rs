@@ -284,7 +284,9 @@ fn syscalls(trace: &AccessTrace) -> impl Iterator<Item = &SyscallRecord> {
 /// in its second argument and notes both ends it made, and the packet
 /// pipe's second read gets the second write's bytes (the guest says so):
 /// the first read dropped the rest of the first packet. A successful fcntl
-/// F_SETFL notes the open file of the end it changed. A write larger than
+/// F_SETFL notes the open file of the end it changed. A write through a
+/// reopen of a pipe end by /proc/self/fd names a pipe channel without a
+/// pair identity, on a description other than the pipe's own. A write larger than
 /// the pipe, which a child drains while it blocks, is one record with its
 /// whole length and result, though it went in in parts; it waited, so its
 /// return is not the event after its entry, while each small write's is.
@@ -314,7 +316,7 @@ fn the_trace_shows_what_leaves_a_pipes_data_edges_out() {
         .iter()
         .filter(|call| call.sysno.name() == "pipe2" && call.result == Some(0))
         .collect();
-    assert_eq!(pipes.len(), 3, "{pipes:?}");
+    assert_eq!(pipes.len(), 4, "{pipes:?}");
     assert_ne!(
         pipes[0].args[1] & libc::O_DIRECT as u64,
         0,
@@ -343,6 +345,30 @@ fn the_trace_shows_what_leaves_a_pipes_data_edges_out() {
         )),
         "{setfl:?}"
     );
+    // The reopen through /proc/self/fd is a new description the trace gives
+    // no pair identity: a pipe write through it names no channel.
+    assert!(
+        stdout.contains("reopened pipe first read: XXXX"),
+        "{stdout}"
+    );
+    let reopened = calls
+        .iter()
+        .find(|call| {
+            call.sysno.name() == "write"
+                && call.args[2] == 4
+                && call
+                    .accesses
+                    .iter()
+                    .any(|access| matches!(access, Access::Channel { id: None, .. }))
+        })
+        .expect("the write through the reopened end");
+    assert!(
+        reopened.accesses.iter().all(|access| !matches!(
+            access,
+            Access::Channel { open_file, .. } if ends(pipes[2]).contains(open_file)
+        )),
+        "{reopened:?}"
+    );
     let size = 3 * 65536;
     let large: Vec<&&SyscallRecord> = calls
         .iter()
@@ -367,7 +393,7 @@ fn the_trace_shows_what_leaves_a_pipes_data_edges_out() {
         large[0].accesses.iter().any(|access| matches!(
             access,
             Access::Channel { id: Some(ChannelId::Pair(first)), .. }
-                if ends(pipes[2]).first() == Some(first)
+                if ends(pipes[3]).first() == Some(first)
         )),
         "{:?}",
         large[0]

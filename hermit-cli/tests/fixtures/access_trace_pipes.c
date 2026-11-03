@@ -6,8 +6,9 @@
 // (races::data_edges), made for real so the access trace test
 // the_trace_shows_what_leaves_a_pipes_data_edges_out can check their records:
 // a packet pipe (pipe2 with O_DIRECT), whose first read takes half a packet
-// and drops the rest; a pipe whose write end fcntl F_SETFL changes; and a
-// write larger than the pipe, which a child drains while it blocks.
+// and drops the rest; a pipe whose write end fcntl F_SETFL changes; a pipe
+// end reopened through /proc/self/fd; and a write larger than the pipe,
+// which a child drains while it blocks.
 
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -44,6 +45,24 @@ int main(void) {
     return 8;
   if (read(p[0], buf, 4) != 4)
     return 9;
+  close(p[0]);
+  close(p[1]);
+
+  if (pipe2(p, 0) != 0)
+    return 14;
+  char path[64];
+  snprintf(path, sizeof path, "/proc/self/fd/%d", p[1]);
+  int reopened = open(path, O_WRONLY);
+  if (reopened < 0)
+    return 15;
+  if (write(reopened, "XXXX", 4) != 4)
+    return 16;
+  if (write(p[1], "EEEE", 4) != 4)
+    return 17;
+  if (read(p[0], buf, 4) != 4)
+    return 18;
+  printf("reopened pipe first read: %.4s\n", buf);
+  close(reopened);
   close(p[0]);
   close(p[1]);
 
