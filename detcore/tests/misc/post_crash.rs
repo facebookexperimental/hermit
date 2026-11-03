@@ -475,7 +475,6 @@ fn a_fault_the_handler_resolves_does_not_switch() {
 /// then kills: the handler has ended at the kill, so the descendant's
 /// later exec takes no switch.
 #[test]
-#[test]
 fn a_killed_handlers_descendant_exec_takes_no_switch() {
     run_scenario_if_inner();
     let record = recorded(
