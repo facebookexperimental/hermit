@@ -112,6 +112,9 @@ mod decode {
         last_load: Option<u64>,
         /// The file offset of each pair's load-exclusive.
         pair_loads: Vec<u64>,
+        /// The file offset just past each pair's retry branch, the word after
+        /// its store-exclusive: with `pair_loads`, the bytes the pair covers.
+        pair_ends: Vec<u64>,
         /// The file offset of each counter read.
         reads: Vec<u64>,
     }
@@ -135,6 +138,7 @@ mod decode {
                         .filter(|load| self.index - load <= PAIR_WINDOW)
                     {
                         self.pair_loads.push(self.base + 4 * load);
+                        self.pair_ends.push(self.base + 4 * (self.index + 2));
                     }
                 }
                 _ if is_counter_read(insn) => self.reads.push(self.base + 4 * self.index),
@@ -168,7 +172,9 @@ mod decode {
         pub(crate) fn into_loops(self) -> super::model::FileLoops {
             super::model::FileLoops {
                 pair_loads: self.pair_loads,
+                pair_ends: self.pair_ends,
                 counter_reads: self.reads,
+                unverified: Vec::new(),
             }
         }
     }
@@ -190,24 +196,142 @@ mod decode {
             .then_some((offset, usize::from(count)))
     }
 
-    /// The file ranges (offset, size) of the sections that hold instructions
-    /// (`SHF_EXECINSTR`, with file contents) in an ELF64 little-endian
-    /// section header table. Only these are scanned, so read-only data that
-    /// shares the executable segment cannot pass for an exclusive pair.
-    pub(crate) fn executable_sections(table: &[u8]) -> Vec<(u64, u64)> {
+    /// A section that holds instructions, as an ELF64 section header gives
+    /// it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct ExecutableSection {
+        /// Its index in the section header table, which mapping symbols name.
+        pub(crate) index: usize,
+        /// Its file offset and size.
+        pub(crate) offset: u64,
+        pub(crate) size: u64,
+        /// Its address, which mapping symbols' values are.
+        pub(crate) address: u64,
+    }
+
+    /// The sections that hold instructions (`SHF_EXECINSTR`, with file
+    /// contents) in an ELF64 little-endian section header table. Only these
+    /// are scanned, so read-only data that shares the executable segment
+    /// cannot pass for an exclusive pair.
+    pub(crate) fn executable_sections(table: &[u8]) -> Vec<ExecutableSection> {
         const SHT_NOBITS: u32 = 8;
         const SHF_EXECINSTR: u64 = 0x4;
         table
             .as_chunks::<64>()
             .0
             .iter()
-            .filter_map(|entry| {
+            .enumerate()
+            .filter_map(|(index, entry)| {
                 let word = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().unwrap());
                 let kind = u32::from_le_bytes(entry[4..8].try_into().unwrap());
-                (kind != SHT_NOBITS && word(8) & SHF_EXECINSTR != 0 && word(32) != 0)
-                    .then(|| (word(24), word(32)))
+                (kind != SHT_NOBITS && word(8) & SHF_EXECINSTR != 0 && word(32) != 0).then(|| {
+                    ExecutableSection {
+                        index,
+                        offset: word(24),
+                        size: word(32),
+                        address: word(16),
+                    }
+                })
             })
             .collect()
+    }
+
+    /// File-offset ranges `[start, end)`, in file order.
+    pub(crate) type FileRanges = Vec<(u64, u64)>;
+
+    /// The file ranges (start, end) of `sections` to scan, and of those the
+    /// ones scanned without proof, each sorted and merged. Only `$x` and `$d`
+    /// prove where code is, as the default rewrite takes them
+    /// ([`CodeEvidence::classify`]): what a section's mapping symbols mark
+    /// `$x` is code, and what they mark `$d` is data and is not scanned, so a
+    /// constant table in `.text` cannot pass for an exclusive pair. The rest
+    /// is scanned and labelled unverified: bytes before a section's first
+    /// mapping symbol, and the whole of a section that no mapping symbol
+    /// marks (whatever its unwind table says) or that holds one of another
+    /// kind ([`CodeEvidence::unsupported_in`]). The rewriter leaves those
+    /// alone by default, but this census only names where retries may come
+    /// from, and dropping them would hide a real loop.
+    ///
+    /// A section header is taken as the file states it. One whose offset
+    /// plus size runs past the end of the address space saturates there, so
+    /// its ranges end at `u64::MAX`, beyond the end of any file, where the
+    /// caller's clip to the file's size drops them: a malformed header skips
+    /// the bytes it would place past the file, as a header placing a section
+    /// past the end of the file already does, and never panics.
+    ///
+    /// [`CodeEvidence::classify`]: crate::aarch64_lse::mapping::CodeEvidence::classify
+    /// [`CodeEvidence::unsupported_in`]: crate::aarch64_lse::mapping::CodeEvidence::unsupported_in
+    pub(crate) fn code_file_ranges(
+        sections: &[ExecutableSection],
+        evidence: &crate::aarch64_lse::mapping::CodeEvidence,
+    ) -> (FileRanges, FileRanges) {
+        use crate::aarch64_lse::mapping;
+        let mut ranges = Vec::new();
+        let mut unverified = Vec::new();
+        for section in sections {
+            let end = section.address.saturating_add(section.size);
+            let held = evidence.classify(section.index, section.address, section.size);
+            let (code, unknown) = if held.evidence == Some(mapping::Evidence::MappingSymbols)
+                && evidence.unsupported_in(section.index).is_none()
+            {
+                (held.code, held.unknown)
+            } else {
+                (Vec::new(), vec![(section.address, end)])
+            };
+            // The header's offset, size and address are the file's own: a
+            // malformed one saturates rather than overflows, and the caller
+            // drops what lies past the end of the file.
+            let file = |(start, end): &(u64, u64)| {
+                (
+                    section
+                        .offset
+                        .saturating_add(start.saturating_sub(section.address)),
+                    section
+                        .offset
+                        .saturating_add(end.saturating_sub(section.address)),
+                )
+            };
+            ranges.extend(code.iter().chain(&unknown).map(file));
+            unverified.extend(unknown.iter().map(file));
+        }
+        let merged = |mut spans: Vec<(u64, u64)>| {
+            spans.sort_unstable();
+            let mut out: Vec<(u64, u64)> = Vec::new();
+            for (start, end) in spans {
+                match out.last_mut() {
+                    Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                    _ => out.push((start, end)),
+                }
+            }
+            out
+        };
+        (merged(ranges), merged(unverified))
+    }
+
+    /// What `ranges` of a file hold, each scanned from its start with its
+    /// bytes from `read`, with the `unverified` ranges beside them, as
+    /// [`code_file_ranges`] returns both. Ranges that touch arrive merged,
+    /// so a pair can take its load from proved code and its store from the
+    /// unproved bytes after it; [`super::model::FileLoops::found_in`]
+    /// labels such a pair unverified by every word it covers.
+    pub(crate) fn scan_ranges<E>(
+        ranges: &[(u64, u64)],
+        unverified: FileRanges,
+        mut read: impl FnMut(u64, u64, &mut CodeScan) -> Result<(), E>,
+    ) -> Result<super::model::FileLoops, E> {
+        let mut loops = super::model::FileLoops {
+            unverified,
+            ..Default::default()
+        };
+        for &(start, end) in ranges {
+            let mut scan = CodeScan::at(start);
+            read(start, end, &mut scan)?;
+            let found = scan.into_loops();
+            loops.pair_loads.extend(found.pair_loads);
+            loops.pair_ends.extend(found.pair_ends);
+            loops.counter_reads.extend(found.counter_reads);
+        }
+        Ok(loops)
     }
 
     /// One pass over `words`.
@@ -350,6 +474,13 @@ mod model {
         /// EL0 generic-timer counter reads: time the guest sees that virtual
         /// time does not control.
         pub counter_reads: u64,
+        /// Of `pairs`, those with any word, from the load-exclusive to the
+        /// retry branch after the store, in bytes not known to be code: not
+        /// proved by mapping symbols (neither marked `$x` nor marked `$d`, or
+        /// in a section that holds a mapping symbol of another kind). An
+        /// unwind table proves nothing here. They may be data.
+        #[serde(default)]
+        pub unverified_pairs: u64,
     }
 
     /// What a scan of one mapping found, with the mapping. It crosses to the
@@ -852,8 +983,14 @@ mod model {
     pub(crate) struct FileLoops {
         /// The file offset of each pair's load-exclusive.
         pub(crate) pair_loads: Vec<u64>,
+        /// The file offset just past each pair's retry branch, in the order
+        /// of `pair_loads`: a pair covers `[load, end)`.
+        pub(crate) pair_ends: Vec<u64>,
         /// The file offset of each counter read.
         pub(crate) counter_reads: Vec<u64>,
+        /// The file ranges scanned whole because nothing told their code
+        /// from their data (`decode::code_file_ranges`).
+        pub(crate) unverified: Vec<(u64, u64)>,
     }
 
     impl FileLoops {
@@ -868,9 +1005,25 @@ mod model {
                     .filter(|offset| start <= **offset && **offset < end)
                     .count() as u64
             };
+            // A pair is unverified when any of its words, from its load to
+            // its retry branch, lies in bytes nothing proves are code: one
+            // whose store follows proved code into an unmarked section must
+            // not count as verified.
+            let unverified: Vec<u64> = self
+                .pair_loads
+                .iter()
+                .zip(&self.pair_ends)
+                .filter(|&(load, end)| {
+                    self.unverified
+                        .iter()
+                        .any(|(start, stop)| start < end && load < stop)
+                })
+                .map(|(load, _)| *load)
+                .collect();
             Found {
                 pairs: inside(&self.pair_loads),
                 counter_reads: inside(&self.counter_reads),
+                unverified_pairs: inside(&unverified),
             }
         }
     }
@@ -1227,6 +1380,12 @@ mod model {
             self.per_path(|(found, _)| found.counter_reads)
         }
 
+        /// The pairs of each guest path that has any that nothing told from
+        /// data ([`Found::unverified_pairs`]).
+        pub(crate) fn unverified_pairs_per_path(&self) -> BTreeMap<String, u64> {
+            self.per_path(|(found, _)| found.unverified_pairs)
+        }
+
         /// The in-memory rewrite of each guest path it touched: the sums over
         /// the ranges of one address space, the one that left or could not
         /// write the most (then the one with the most loops), so that the
@@ -1375,8 +1534,11 @@ mod runtime {
     use tracing::warn;
 
     use super::decode::CodeScan;
+    use super::decode::FileRanges;
+    use super::decode::code_file_ranges;
     use super::decode::elf_section_table;
     use super::decode::executable_sections;
+    use super::decode::scan_ranges;
     use super::model::ByteCache;
     use super::model::CpuPmu;
     use super::model::FileLoops;
@@ -1625,6 +1787,7 @@ mod runtime {
                 .filter(|(path, _)| self.not_rewritten.contains(*path))
                 .map(|(path, pairs)| (path.clone(), *pairs))
                 .collect();
+            summary.exclusive_pairs_unverified = self.pairs.unverified_pairs_per_path();
             summary.exclusive_rewrite_cache_peak = PLANS.lock().unwrap().peak() as u64;
             summary.counter_reads = self.pairs.counter_reads_per_path();
             self.pairs.fill_rewrite_summary(summary);
@@ -2508,7 +2671,7 @@ mod runtime {
     /// Scan the mapped range of a file of `size` bytes, in its executable
     /// ELF sections only, for what [`Found`] names.
     fn scan_file(file: &File, size: u64) -> std::io::Result<FileLoops> {
-        let ranges = code_ranges(file, size)?;
+        let (ranges, unverified) = code_ranges(file, size)?;
         // Bounded like a plan: the whole of a file's code is read, whatever
         // a process maps of it, so a huge file counts as not scanned.
         if ranges.iter().map(|(start, end)| end - start).sum::<u64>() > MAX_PLANNED_FILE {
@@ -2516,22 +2679,17 @@ mod runtime {
                 "its code is larger than the {MAX_PLANNED_FILE} bytes scanned"
             )));
         }
-        let mut loops = FileLoops::default();
-        for (start, end) in ranges {
-            // A pair cannot span two sections.
-            let mut section = CodeScan::at(start);
-            read_words(file, start, end, &mut section)?;
-            let found = section.into_loops();
-            loops.pair_loads.extend(found.pair_loads);
-            loops.counter_reads.extend(found.counter_reads);
-        }
-        Ok(loops)
+        scan_ranges(&ranges, unverified, |start, end, scan| {
+            read_words(file, start, end, scan)
+        })
     }
 
-    /// The file ranges that hold instructions: the file's executable ELF
-    /// sections, or the whole file when it has no section headers. Scanned
-    /// whole, whatever a process maps of them.
-    fn code_ranges(file: &File, size: u64) -> std::io::Result<Vec<(u64, u64)>> {
+    /// The file ranges that hold instructions, and of those the ones scanned
+    /// without evidence: the code of the file's executable ELF sections
+    /// ([`code_file_ranges`]), or the whole file, unverified, when it has no
+    /// section headers. Scanned whole, whatever a process maps of them.
+    #[allow(clippy::type_complexity)]
+    fn code_ranges(file: &File, size: u64) -> std::io::Result<(FileRanges, FileRanges)> {
         let mut header = [0u8; 64];
         let table = match file.read_exact_at(&mut header, 0) {
             Ok(()) => elf_section_table(&header),
@@ -2539,18 +2697,47 @@ mod runtime {
             Err(error) => return Err(error),
         };
         let Some((offset, count)) = table else {
-            return Ok(vec![(0, size)]);
+            return Ok((vec![(0, size)], vec![(0, size)]));
         };
         let mut table = vec![0u8; count * 64];
         file.read_exact_at(&mut table, offset)?;
-        Ok(merge_overlaps(
-            executable_sections(&table)
-                .into_iter()
-                .map(|(offset, length)| (offset, offset.saturating_add(length).min(size)))
-                .filter(|(start, end)| start < end)
-                .collect(),
-        ))
+        let shstrndx = usize::from(u16::from_le_bytes([header[0x3E], header[0x3F]]));
+        let e_type = u16::from_le_bytes([header[0x10], header[0x11]]);
+        // Each table the evidence needs, if it lies in the file and is not
+        // larger than the scan reads; one that is not read is evidence the
+        // file lacks, which leaves its sections scanned whole.
+        let mut budget = MAX_EVIDENCE_TABLES;
+        let evidence = crate::aarch64_lse::mapping::CodeEvidence::read(
+            &table,
+            shstrndx,
+            e_type,
+            |(offset, length)| {
+                let end = offset.checked_add(length)?;
+                if end > size || length > budget {
+                    return None;
+                }
+                budget -= length;
+                let mut bytes = vec![0u8; usize::try_from(length).ok()?];
+                file.read_exact_at(&mut bytes, offset).ok()?;
+                Some(bytes)
+            },
+        );
+        let clip = |ranges: Vec<(u64, u64)>| {
+            merge_overlaps(
+                ranges
+                    .into_iter()
+                    .map(|(start, end)| (start, end.min(size)))
+                    .filter(|(start, end)| start < end)
+                    .collect(),
+            )
+        };
+        let (ranges, unverified) = code_file_ranges(&executable_sections(&table), &evidence);
+        Ok((clip(ranges), clip(unverified)))
     }
+
+    /// The most symbol, string and unwind table bytes read to tell a file's
+    /// code from its data. A large test binary's measured 13 MiB.
+    const MAX_EVIDENCE_TABLES: u64 = 256 << 20;
 
     /// Feed `counter` the words of `file` in `start..end`.
     fn read_words(
@@ -2701,6 +2888,16 @@ mod runtime {
                         .map(|(count, noun)| counted(count, noun))
                         .collect::<Vec<_>>()
                         .join(" and ");
+                        // Named only when there are any, so the line is
+                        // otherwise the one it always was.
+                        let what = if found.unverified_pairs == 0 {
+                            what
+                        } else {
+                            format!(
+                                "{what} ({} unverified: in bytes not known to be code)",
+                                found.unverified_pairs
+                            )
+                        };
                         info!(
                             "[detcore, dtid {}] {} in executable mapping {} (offset {:#x}, {:#x} \
                              bytes)",
@@ -2964,15 +3161,19 @@ mod runtime {
 mod tests {
     use super::decode::CodeScan;
     use super::decode::Exclusive;
+    use super::decode::ExecutableSection;
     use super::decode::PAIR_WINDOW;
     use super::decode::classify;
+    use super::decode::code_file_ranges;
     use super::decode::count_pairs;
     use super::decode::elf_section_table;
     use super::decode::executable_sections;
     use super::decode::is_counter_read;
+    use super::decode::scan_ranges;
     use super::decode::scan_words;
     use super::model::ByteCache;
     use super::model::CpuPmu;
+    use super::model::FileLoops;
     use super::model::Found;
     use super::model::GuestCode;
     use super::model::LiveMapping;
@@ -3206,6 +3407,9 @@ mod tests {
         let mut entry = [0u8; 64];
         entry[4..8].copy_from_slice(&kind.to_le_bytes());
         entry[8..16].copy_from_slice(&flags.to_le_bytes());
+        // Mapped at its file offset plus 0x10000, as a shared object's text
+        // might be.
+        entry[16..24].copy_from_slice(&(offset + 0x10000).to_le_bytes());
         entry[24..32].copy_from_slice(&offset.to_le_bytes());
         entry[32..40].copy_from_slice(&size.to_le_bytes());
         entry
@@ -3244,10 +3448,276 @@ mod tests {
             section(PROGBITS, ALLOC | EXECINSTR, 0x1000, 0x20), // .plt
         ]
         .concat();
+        let at = |index, offset, size| ExecutableSection {
+            index,
+            offset,
+            size,
+            address: offset + 0x10000,
+        };
         assert_eq!(
             executable_sections(&table),
-            vec![(0x400, 0x800), (0x1000, 0x20)]
+            vec![at(2, 0x400, 0x800), at(5, 0x1000, 0x20)]
         );
+    }
+
+    /// A section its mapping symbols speak for is scanned in its code only,
+    /// so a constant table in `.text` whose words form a loop is not counted.
+    /// A section they do not mark, whatever its unwind table says, or one
+    /// that holds a mapping symbol of another kind, is scanned whole and
+    /// labelled unverified.
+    #[test]
+    fn the_census_scans_the_code_the_mapping_symbols_mark() {
+        use crate::aarch64_lse::mapping::CodeEvidence;
+        use crate::aarch64_lse::mapping::MappingSymbol;
+        let text = ExecutableSection {
+            index: 2,
+            offset: 0x400,
+            size: 0x800,
+            address: 0x10400,
+        };
+        let plt = ExecutableSection {
+            index: 5,
+            offset: 0x1000,
+            size: 0x20,
+            address: 0x11000,
+        };
+        let mark = |address, code| MappingSymbol {
+            section: 2,
+            address,
+            code,
+        };
+        // .text: code, a table at 0x10600..0x10700, then code again; .plt
+        // unmarked, in a file without an unwind table.
+        let symbols = CodeEvidence {
+            symbols: vec![
+                mark(0x10400, true),
+                mark(0x10600, false),
+                mark(0x10700, true),
+            ],
+            unsupported: Vec::new(),
+            unwind: None,
+        };
+        assert_eq!(
+            code_file_ranges(&[text, plt], &symbols),
+            (
+                vec![(0x400, 0x600), (0x700, 0xC00), (0x1000, 0x1020)],
+                vec![(0x1000, 0x1020)]
+            )
+        );
+        // No mapping symbols, but FDEs cover two functions of .text: the
+        // unwind table proves nothing, so both sections are scanned whole,
+        // unverified.
+        let unwind = CodeEvidence {
+            symbols: Vec::new(),
+            unsupported: Vec::new(),
+            unwind: Some(vec![(0x10400, 0x10600), (0x10700, 0x10800)]),
+        };
+        let whole = vec![(0x400, 0xC00), (0x1000, 0x1020)];
+        assert_eq!(
+            code_file_ranges(&[text, plt], &unwind),
+            (whole.clone(), whole.clone())
+        );
+        // A `$a` in .text leaves its marks unproven: .text is scanned whole,
+        // unverified, table included.
+        let unsupported = CodeEvidence {
+            unsupported: vec![(2, "$a".to_owned())],
+            ..symbols.clone()
+        };
+        assert_eq!(
+            code_file_ranges(&[text, plt], &unsupported),
+            (whole.clone(), whole.clone())
+        );
+        // Nothing at all, as in a stripped file without an unwind table:
+        // whole sections, unverified.
+        let nothing = CodeEvidence::default();
+        assert_eq!(
+            code_file_ranges(&[text, plt], &nothing),
+            (whole.clone(), whole)
+        );
+        // The scan over those ranges counts the code's loop and not the
+        // table's.
+        let image: Vec<u32> = [LDAXR_X0_X2, ADD_X1_X0_1, STLXR_W3_X1_X2, CBNZ_W3]
+            .into_iter()
+            .cycle()
+            .take(0x800 / 4)
+            .collect();
+        let pairs_in = |ranges: Vec<(u64, u64)>| -> u64 {
+            ranges
+                .into_iter()
+                .filter(|(start, _)| *start < 0xC00)
+                .map(|(start, end)| {
+                    let words =
+                        &image[((start - 0x400) / 4) as usize..((end - 0x400) / 4) as usize];
+                    count_pairs(words.iter().copied())
+                })
+                .sum()
+        };
+        assert_eq!(pairs_in(code_file_ranges(&[text], &nothing).0), 0x800 / 16);
+        assert_eq!(
+            pairs_in(code_file_ranges(&[text], &symbols).0),
+            (0x800 - 0x100) / 16
+        );
+    }
+
+    /// A malformed section header whose offset, or address plus size, runs
+    /// past the end of the address space saturates instead of overflowing
+    /// (the dev and validate profiles check overflow, so this was a panic in
+    /// Detcore on any guest mapping such a file). Its ranges end at
+    /// `u64::MAX`, past the end of any file, where `code_ranges` drops them.
+    #[test]
+    fn a_section_header_past_the_end_of_the_address_space_saturates() {
+        use crate::aarch64_lse::mapping::CodeEvidence;
+        let nothing = CodeEvidence::default();
+        let offset_overflows = ExecutableSection {
+            index: 2,
+            offset: u64::MAX - 0x10,
+            size: 0x100,
+            address: 0x10400,
+        };
+        assert_eq!(
+            code_file_ranges(&[offset_overflows], &nothing),
+            (
+                vec![(u64::MAX - 0x10, u64::MAX)],
+                vec![(u64::MAX - 0x10, u64::MAX)]
+            )
+        );
+        let size_overflows = ExecutableSection {
+            index: 2,
+            offset: 0x10000,
+            size: u64::MAX,
+            address: 0x400,
+        };
+        assert_eq!(
+            code_file_ranges(&[size_overflows], &nothing),
+            (vec![(0x10000, u64::MAX)], vec![(0x10000, u64::MAX)])
+        );
+        // Marked code in such a section saturates the same way.
+        let symbols = CodeEvidence {
+            symbols: vec![crate::aarch64_lse::mapping::MappingSymbol {
+                section: 2,
+                address: 0x10400,
+                code: true,
+            }],
+            unsupported: Vec::new(),
+            unwind: None,
+        };
+        assert_eq!(
+            code_file_ranges(&[offset_overflows], &symbols),
+            (vec![(u64::MAX - 0x10, u64::MAX)], Vec::new())
+        );
+    }
+
+    /// A pair is unverified when any of its words, from its load-exclusive
+    /// to the retry branch after its store, lies in bytes nothing proves are
+    /// code. Two touching sections, the first marked `$x` and the second
+    /// unmarked, are scanned as one range, so a loop can take its load from
+    /// the first and its store from the second: it is reported unverified,
+    /// never verified. The controls: a loop wholly in the marked code is
+    /// verified, one wholly in the unmarked section is unverified, and one
+    /// in a `$d` table is not counted at all.
+    #[test]
+    fn a_pair_is_unverified_when_any_of_its_words_is() {
+        use crate::aarch64_lse::mapping::CodeEvidence;
+        use crate::aarch64_lse::mapping::MappingSymbol;
+        const NOP: u32 = 0xd503_201f;
+        let marked = ExecutableSection {
+            index: 2,
+            offset: 0x400,
+            size: 0x10,
+            address: 0x10400,
+        };
+        let unmarked = ExecutableSection {
+            index: 3,
+            offset: 0x410,
+            size: 0x10,
+            address: 0x10410,
+        };
+        let marks = |code| CodeEvidence {
+            symbols: vec![MappingSymbol {
+                section: 2,
+                address: 0x10400,
+                code,
+            }],
+            unsupported: Vec::new(),
+            unwind: None,
+        };
+        let found = |evidence: &CodeEvidence, words: [u32; 8]| {
+            let image: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            let (ranges, unverified) = code_file_ranges(&[marked, unmarked], evidence);
+            let loops = scan_ranges(&ranges, unverified, |start, end, scan| {
+                scan.push_bytes(&image[(start - 0x400) as usize..(end - 0x400) as usize]);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+            let found = loops.found_in(0, 0x1000);
+            (found.pairs, found.unverified_pairs)
+        };
+        let code = marks(true);
+        // The load-exclusive is the marked section's last word; the store
+        // and its retry branch are the unmarked section's first.
+        let split = [
+            NOP,
+            NOP,
+            NOP,
+            LDAXR_X0_X2,
+            ADD_X1_X0_1,
+            STLXR_W3_X1_X2,
+            CBNZ_W3,
+            NOP,
+        ];
+        assert_eq!(found(&code, split), (1, 1));
+        // Only the retry branch after the store is in the unmarked section.
+        let retry_after = [
+            NOP,
+            LDAXR_X0_X2,
+            ADD_X1_X0_1,
+            STLXR_W3_X1_X2,
+            CBNZ_W3,
+            NOP,
+            NOP,
+            NOP,
+        ];
+        assert_eq!(found(&code, retry_after), (1, 1));
+        let proven = [
+            LDAXR_X0_X2,
+            ADD_X1_X0_1,
+            STLXR_W3_X1_X2,
+            CBNZ_W3,
+            NOP,
+            NOP,
+            NOP,
+            NOP,
+        ];
+        assert_eq!(found(&code, proven), (1, 0));
+        let unproven = [
+            NOP,
+            NOP,
+            NOP,
+            NOP,
+            LDAXR_X0_X2,
+            ADD_X1_X0_1,
+            STLXR_W3_X1_X2,
+            CBNZ_W3,
+        ];
+        assert_eq!(found(&code, unproven), (1, 1));
+        // The first section marked `$d`: its loop is data and not scanned.
+        assert_eq!(found(&marks(false), proven), (0, 0));
+    }
+
+    /// A pair is unverified when its load-exclusive lies in a range scanned
+    /// without evidence.
+    #[test]
+    fn unverified_pairs_are_those_in_unverified_ranges() {
+        let loops = FileLoops {
+            pair_loads: vec![0x400, 0x500, 0x1000],
+            pair_ends: vec![0x40C, 0x50C, 0x100C],
+            counter_reads: Vec::new(),
+            unverified: vec![(0x1000, 0x1020)],
+        };
+        let found = loops.found_in(0, 0x2000);
+        assert_eq!((found.pairs, found.unverified_pairs), (3, 1));
+        let found = loops.found_in(0, 0x1000);
+        assert_eq!((found.pairs, found.unverified_pairs), (2, 0));
     }
 
     #[test]
@@ -3378,6 +3848,7 @@ mod tests {
             found: Found {
                 pairs,
                 counter_reads: 0,
+                unverified_pairs: 0,
             },
             rewrite: Rewrite::default(),
         }
@@ -3676,6 +4147,7 @@ mod tests {
             found: Found {
                 pairs: 0,
                 counter_reads: 1,
+                unverified_pairs: 0,
             },
             rewrite: Rewrite::default(),
         };
