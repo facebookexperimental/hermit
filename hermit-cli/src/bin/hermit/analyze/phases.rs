@@ -4983,6 +4983,19 @@ mod tests {
         );
     }
 
+    fn timing_report_stack(thread: i32, ip: u64) -> PrettyBacktrace {
+        serde_json::from_value(serde_json::json!({
+            "thread_id": thread,
+            "thread_name": null,
+            "frames": [{
+                "frame": { "ip": ip, "is_signal": false },
+                "symbol": null,
+                "locations": []
+            }]
+        }))
+        .unwrap()
+    }
+
     /// --minimize keeps the observed record and writes normalization only
     /// for reading. Its timing report must still reject an opposite-outcome
     /// slice-end replay before using that replay's diagnostic stack.
