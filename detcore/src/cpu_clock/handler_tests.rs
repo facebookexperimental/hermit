@@ -82,6 +82,11 @@ struct CpuClockGuest {
     requests: Mutex<Vec<&'static str>>,
     /// Whether the sibling has exited since the test began.
     sibling_exited: std::sync::atomic::AtomicBool,
+    /// The incarnation of each task number, as the global state's inode
+    /// pool counts births: a number absent here is on its first holder (1).
+    /// A test inserts a higher count to model the kernel giving an exited
+    /// task's number to a new task.
+    incarnations: Mutex<std::collections::HashMap<i32, u32>>,
 }
 
 struct UnusedStack;
@@ -143,10 +148,17 @@ impl GlobalRPC<GlobalState> for CpuClockGuest {
                 let sibling_exited = self
                     .sibling_exited
                     .load(std::sync::atomic::Ordering::SeqCst);
+                let incarnation = self
+                    .incarnations
+                    .lock()
+                    .unwrap()
+                    .get(&named.as_raw())
+                    .copied()
+                    .unwrap_or(1);
                 let answer = match named.as_raw() {
                     SIBLING if sibling_exited => None,
-                    PROCESS | CALLER | SIBLING => Some(DetPid::from_raw(PROCESS)),
-                    OTHER_PROCESS => Some(named),
+                    PROCESS | CALLER | SIBLING => Some((DetPid::from_raw(PROCESS), incarnation)),
+                    OTHER_PROCESS => Some((named, incarnation)),
                     _ => None,
                 };
                 ("process-of", GlobalResponse::CpuClockProcess(answer))
@@ -244,6 +256,7 @@ fn setup() -> (Detcore, CpuClockGuest, (LogicalTime, LogicalTime)) {
         thread: caller,
         requests: Mutex::new(Vec::new()),
         sibling_exited: std::sync::atomic::AtomicBool::new(false),
+        incarnations: Mutex::new(std::collections::HashMap::new()),
     };
     (tool, guest, sibling_time)
 }
@@ -832,4 +845,81 @@ async fn timer_settime_on_a_timer_whose_thread_exited_is_esrch() {
         Some((0, 0)),
         "nothing was armed"
     );
+}
+
+/// A timer binds to the task it was created for, not to its number: once
+/// that task has exited and the kernel has given its number to a new task,
+/// arming or disarming the old timer is ESRCH, however much CPU time the
+/// new task has — Linux retains the `struct pid` object, not the number
+/// (`get_pid`, kernel/time/posix-cpu-timers.c:411; ESRCH at :634). A timer
+/// created after the reuse binds to the new task. The caller's own thread
+/// number is no fast path around the check: the caller may itself be the
+/// new task holding a reused number.
+#[tokio::test]
+async fn timer_settime_after_the_timers_thread_number_is_reused_is_esrch() {
+    let (tool, mut guest, _) = setup();
+    let sibling_timer = create_timer(&tool, &mut guest, thread_clock(SIBLING, 2)).await;
+    let own_timer = create_timer(&tool, &mut guest, thread_clock(CALLER, 2)).await;
+    let arm = |id: i32, nanos: i64| {
+        let value = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: nanos,
+            },
+        };
+        TimerSettime::new()
+            .with_timerid(id)
+            .with_flags(libc::TIMER_ABSTIME)
+            .with_new_value(Some(
+                Addr::from_ptr(&value as *const libc::itimerspec).unwrap(),
+            ))
+            .with_old_value(None)
+    };
+    // Both timers arm against their original tasks (a passed absolute
+    // expiration fires at once), then disarm.
+    for id in [sibling_timer, own_timer] {
+        assert_eq!(
+            tool.handle_timer_settime(&mut guest, arm(id, 1))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            tool.handle_timer_settime(&mut guest, arm(id, 0))
+                .await
+                .unwrap(),
+            0
+        );
+    }
+    // The sibling exits and a new task takes its number; the caller is
+    // replaced by a new task with the caller's number.
+    guest.incarnations.lock().unwrap().insert(SIBLING, 2);
+    guest.incarnations.lock().unwrap().insert(CALLER, 2);
+    for id in [sibling_timer, own_timer] {
+        assert_eq!(
+            errno(tool.handle_timer_settime(&mut guest, arm(id, 1)).await),
+            Errno::ESRCH,
+            "{id}: the old timer must not bind to the new task"
+        );
+        assert_eq!(
+            errno(tool.handle_timer_settime(&mut guest, arm(id, 0)).await),
+            Errno::ESRCH,
+            "{id}: disarming the old timer is ESRCH too"
+        );
+    }
+    // Timers created now bind to the new tasks and arm.
+    for clock in [thread_clock(SIBLING, 2), thread_clock(CALLER, 2)] {
+        let id = create_timer(&tool, &mut guest, clock).await;
+        assert_eq!(
+            tool.handle_timer_settime(&mut guest, arm(id, 1))
+                .await
+                .unwrap(),
+            0,
+            "{clock}"
+        );
+    }
 }

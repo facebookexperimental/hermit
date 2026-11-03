@@ -265,7 +265,7 @@ mod tests {
         // (https://github.com/rrnewton/hermit/pull/4885; revision 20 at its base,
         // renumbered to 33 at the drain rebase after main's landed 32 (the
         // stopless layout on top of 31); digests measured at this head).
-        (33, "956e7e45a14ae3e9", "f013e36743d8d9e6"),
+        (33, "27ebbcc7edd053c2", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

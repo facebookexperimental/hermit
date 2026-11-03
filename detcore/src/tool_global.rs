@@ -6051,7 +6051,13 @@ impl GlobalState {
             GlobalRequest::CpuClockProcess(named) => R::CpuClockProcess(
                 self.lock_rpc_scheduler(false)
                     .await
-                    .cpu_clock_process(named),
+                    .cpu_clock_process(named)
+                    .map(|process| {
+                        (
+                            process,
+                            self.inodes.lock().unwrap().incarnation(named.as_raw()),
+                        )
+                    }),
             ),
             GlobalRequest::PosixTimerThread(process, named) => R::PosixTimerThread(
                 self.lock_rpc_scheduler(false)
@@ -9398,8 +9404,11 @@ pub enum GlobalResponse {
     /// resumes from a grant, once the switch is taken (`crate::post_crash`).
     /// Appended last.
     WithPostCrashBound(std::num::NonZeroU64, Box<GlobalResponse>),
-    /// The answer to `GlobalRequest::CpuClockProcess`. Appended last.
-    CpuClockProcess(Option<DetPid>),
+    /// The answer to `GlobalRequest::CpuClockProcess`: the process the
+    /// named task belongs to, and the incarnation of the named task's ID
+    /// (`InodePool::incarnation`), so a CPU timer can bind to the task it
+    /// was created for and not to a later task reusing its number. Appended last.
+    CpuClockProcess(Option<(DetPid, u32)>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -13623,7 +13632,7 @@ where
 
 /// The process a CPU clock id naming `named` belongs to, if `named` is a live
 /// thread or an existing process (`Scheduler::cpu_clock_process`).
-pub(crate) async fn cpu_clock_process<G, T>(guest: &mut G, named: DetPid) -> Option<DetPid>
+pub(crate) async fn cpu_clock_process<G, T>(guest: &mut G, named: DetPid) -> Option<(DetPid, u32)>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,

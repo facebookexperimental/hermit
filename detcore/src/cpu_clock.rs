@@ -176,14 +176,19 @@ pub(crate) enum ClockLookup {
     Other,
 }
 
-/// Whose CPU time a POSIX timer on a CPU clock counts, by id, as
-/// `timer_create` found it: a thread of the timer's process (the creator
-/// itself or another), the process, or another process.
+/// Whose CPU time a POSIX timer on a CPU clock counts, by id and by
+/// incarnation, as `timer_create` found it: a thread of the timer's process
+/// (the creator itself or another), the process, or another process. The
+/// incarnation is the one `InodePool::incarnation` counted for the task's
+/// number at creation: a later task the kernel gives the same number is a
+/// different task, and the timer must not bind to it (Linux retains the
+/// `struct pid` object, not its number; see
+/// [`Detcore::cpu_timer_task`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum CpuTimerTask {
-    Thread(DetTid),
+    Thread(DetTid, u32),
     OwnProcess,
-    OtherProcess(DetPid),
+    OtherProcess(DetPid, u32),
 }
 
 /// The CPU clock a POSIX timer was created on ([`Detcore::cpu_timer_clock`]).
@@ -235,8 +240,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // it for a signal (`find_vpid`, :73-75): one scheduler query answers
         // both (`Scheduler::cpu_clock_process`).
         match crate::tool_global::cpu_clock_process(guest, named).await {
-            Some(process) if thread && process == detpid => Ok(ClockTask::Sibling(named)),
-            Some(process) if !thread && process == named => Ok(ClockTask::OtherProcess(named)),
+            Some((process, _incarnation)) if thread && process == detpid => {
+                Ok(ClockTask::Sibling(named))
+            }
+            Some((process, _incarnation)) if !thread && process == named => {
+                Ok(ClockTask::OtherProcess(named))
+            }
             _ => Err(Errno::EINVAL.into()),
         }
     }
@@ -300,10 +309,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             .cpu_clock_task(guest, Sysno::timer_create, clock.owner, ClockLookup::Other)
             .await?
         {
-            ClockTask::OwnThread => CpuTimerTask::Thread(guest.thread_state().dettid),
-            ClockTask::Sibling(thread) => CpuTimerTask::Thread(thread),
+            ClockTask::OwnThread => {
+                let thread = guest.thread_state().dettid;
+                CpuTimerTask::Thread(thread, self.cpu_clock_incarnation(guest, thread).await)
+            }
+            ClockTask::Sibling(thread) => {
+                CpuTimerTask::Thread(thread, self.cpu_clock_incarnation(guest, thread).await)
+            }
             ClockTask::OwnProcess => CpuTimerTask::OwnProcess,
-            ClockTask::OtherProcess(process) => CpuTimerTask::OtherProcess(process),
+            ClockTask::OtherProcess(process) => CpuTimerTask::OtherProcess(
+                process,
+                self.cpu_clock_incarnation(guest, process).await,
+            ),
         };
         Ok(CpuTimerClock {
             task,
@@ -311,12 +328,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         })
     }
 
+    /// The incarnation of task number `named` now (`InodePool::incarnation`,
+    /// asked with the same scheduler query that finds its process): how many
+    /// guest tasks have held that number. A task created before any counted
+    /// birth of its number (the run's first tasks) has incarnation 0.
+    async fn cpu_clock_incarnation<G: Guest<Self>>(&self, guest: &mut G, named: DetPid) -> u32 {
+        match crate::tool_global::cpu_clock_process(guest, named).await {
+            Some((_process, incarnation)) => incarnation,
+            None => 0,
+        }
+    }
+
     /// The task a timer on `clock` counts the CPU time of, for the calling
     /// thread of the timer's process, when `timer_settime` arms or disarms it:
     /// ESRCH once that task is gone, a thread that has exited or a process
     /// that has been reaped (`posix_cpu_timer_set`,
-    /// kernel/time/posix-cpu-timers.c:634-643 at v6.16). The caller's own
-    /// thread and process are there; another task is asked about with one
+    /// kernel/time/posix-cpu-timers.c:634-643 at v6.16). Linux retains the
+    /// timer's target as a `struct pid` object (`get_pid`,
+    /// posix-cpu-timers.c:411), so a later task the kernel gives the same
+    /// number cannot rearm it: the stored incarnation must still be the
+    /// number's incarnation, on the caller's own fast path as much as on a
+    /// sibling's or another process's. Another task is asked about with one
     /// scheduler query (`Scheduler::cpu_clock_process`).
     pub(crate) async fn cpu_timer_task<G: Guest<Self>>(
         &self,
@@ -325,19 +357,26 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<ClockTask, Error> {
         let detpid = guest.thread_state().detpid.expect("detpid unset");
         match clock.task {
-            CpuTimerTask::Thread(thread) if thread == guest.thread_state().dettid => {
-                Ok(ClockTask::OwnThread)
-            }
-            CpuTimerTask::OwnProcess => Ok(ClockTask::OwnProcess),
-            CpuTimerTask::Thread(thread) => {
+            CpuTimerTask::Thread(thread, incarnation) if thread == guest.thread_state().dettid => {
                 match crate::tool_global::cpu_clock_process(guest, thread).await {
-                    Some(process) if process == detpid => Ok(ClockTask::Sibling(thread)),
+                    Some((_process, current)) if current == incarnation => Ok(ClockTask::OwnThread),
                     _ => Err(Errno::ESRCH.into()),
                 }
             }
-            CpuTimerTask::OtherProcess(process) => {
+            CpuTimerTask::OwnProcess => Ok(ClockTask::OwnProcess),
+            CpuTimerTask::Thread(thread, incarnation) => {
+                match crate::tool_global::cpu_clock_process(guest, thread).await {
+                    Some((process, current)) if process == detpid && current == incarnation => {
+                        Ok(ClockTask::Sibling(thread))
+                    }
+                    _ => Err(Errno::ESRCH.into()),
+                }
+            }
+            CpuTimerTask::OtherProcess(process, incarnation) => {
                 match crate::tool_global::cpu_clock_process(guest, process).await {
-                    Some(found) if found == process => Ok(ClockTask::OtherProcess(process)),
+                    Some((found, current)) if found == process && current == incarnation => {
+                        Ok(ClockTask::OtherProcess(process))
+                    }
                     _ => Err(Errno::ESRCH.into()),
                 }
             }
