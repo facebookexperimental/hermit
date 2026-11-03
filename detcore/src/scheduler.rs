@@ -18391,7 +18391,6 @@ impl Scheduler {
         }
     }
 
-
     /// The scheduler just began `dettid`'s kernel-run call `call` (a
     /// BACKGROUND commit, which records no event). A recording notes the start
     /// after the events recorded so far
@@ -18449,7 +18448,6 @@ impl Scheduler {
         self.release_replay_priorities_if_exhausted();
     }
 
-
     /// The turn step 3 hands over first in a schedule replay while the thread
     /// the recorded schedule runs next is not queued: the queued turn of a
     /// thread switched away from at a syscall prehook
@@ -18470,7 +18468,6 @@ impl Scheduler {
     /// is queued, since it goes first, and everything outside a schedule
     /// replay. Of several eligible turns, the one queued first goes first.
     fn replay_prehook_handoff(&self) -> Option<DetTid> {
-
         // A record that notes every background start says when each call
         // began (`record_or_replay_background_start`), and none began where
         // it notes none.
@@ -18480,7 +18477,6 @@ impl Scheduler {
                 .as_ref()
                 .is_some_and(Replayer::notes_background_starts)
         {
-
             return None;
         }
         let (next, _) = self.replay_next_resume()?;
@@ -29494,7 +29490,6 @@ mod test {
         assert_eq!(backgrounded.vfork_gated_background_child(), Some(child));
     }
 
-
     /// Only a legacy recording made without replaying a schedule notes its
     /// background starts: neither a schedule replay's own re-record nor a
     /// slice-boundary recording, which keeps no starts, is stamped as noting
@@ -30009,8 +30004,6 @@ mod test {
             assert!(replayer.untaken_background_starts().is_empty(), "{tail:?}");
         }
     }
-
-
 
     /// A schedule replay that switches away from a thread at a syscall prehook
     /// lets that thread's next turn go ahead of the other threads it does not
