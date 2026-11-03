@@ -6823,18 +6823,29 @@ impl Scheduler {
                             // immediate_fatal_exit();
                         }
                     }
-                    // The recorded slice length is the next thread's
-                    // (`timeslices`, handed to it with its grant). The thread
-                    // that switches keeps its own slice end: at a prehook it
-                    // runs on into its call, and taking the next thread's
-                    // length as its own would end a slice its recording did
-                    // not have once the call returned.
+                    // The recorded slice length is the next thread's, handed to
+                    // it with its grant (`timeslices`). The thread that
+                    // switches takes it too. At a prehook it runs on into its
+                    // call, and in the recording its yield there ended its
+                    // slice, so it resumed with a fresh one; the replay sets
+                    // its next timer-ended deadline just before that segment
+                    // (`Continue`), so until then it needs a deadline that
+                    // does not end the segment early. Its earlier deadline,
+                    // set before the yield, can: a static guest's yielding
+                    // thread then ended slices its recording did not have,
+                    // and its clock moved (`a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_one`).
+                    // In a recording without `--chaos` a timer-ended slice is
+                    // the full `--max-timeslice`, the same length as the fresh
+                    // slice the switching thread resumed with. Under `--chaos`
+                    // the two lengths differ; replays of such recordings leave
+                    // them for other reasons too, and which deadline is right
+                    // there is not established.
                     self.timeslices.insert(new_tid, timeslice_remaining);
                     return ConsumeResult {
                         keep_running: !is_now,
                         print_stack,
                         event_ix: ix,
-                        timeslice_remaining: None,
+                        timeslice_remaining,
                     };
                 }
             };
@@ -26596,9 +26607,10 @@ mod test {
                         let consumed = sched.consume_schedevent(&observed);
                         assert!(consumed.keep_running, "the exit grant supplies the handoff");
                         assert_eq!(consumed.event_ix, 0);
-                        // The recorded slice length is the parent's, staged
-                        // for it below; the exiting thread takes none.
-                        assert_eq!(consumed.timeslice_remaining, None);
+                        assert_eq!(
+                            consumed.timeslice_remaining,
+                            (!boundary).then(|| LogicalTime::from_rcbs(123))
+                        );
                         assert_eq!(sched.recorded_event_count, 0);
                     }
                     assert_eq!((sched.turn, sched.committed_time), before);
@@ -27054,13 +27066,13 @@ mod test {
     }
 
     /// A schedule replay's context switch at a prehook stages the next
-    /// thread's recorded slice length for that thread alone (`timeslices`).
-    /// The switching thread runs on into its call with its own slice end.
-    /// Before, it took the next thread's length as its own deadline: once its
-    /// call returned past it, it ended a slice its recording did not have, and
-    /// that scheduler turn's charge moved the clock the guest reads.
+    /// thread's recorded slice length for that thread (`timeslices`) and
+    /// hands the same length to the switching thread, which runs on into its
+    /// call with a deadline past it. Keeping the switching thread's earlier
+    /// deadline instead ended slices its recording did not have
+    /// (`a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_one`).
     #[test]
-    fn a_prehook_context_switch_leaves_the_switching_thread_its_own_slice() {
+    fn a_prehook_context_switch_hands_the_switching_thread_the_recorded_slice() {
         let mut sched = Scheduler::new(&Config::default());
         let (caller, next, following) = (
             DetTid::from_raw(3),
@@ -27074,7 +27086,10 @@ mod test {
         sched.replayer = Some(replayer);
         let consumed = sched.consume_schedevent(&prehook);
         assert!(consumed.keep_running);
-        assert_eq!(consumed.timeslice_remaining, None);
+        assert_eq!(
+            consumed.timeslice_remaining,
+            Some(LogicalTime::from_rcbs(123))
+        );
         assert_eq!(
             sched.timeslices.get(&next),
             Some(&Some(LogicalTime::from_rcbs(123)))
@@ -27102,7 +27117,7 @@ mod test {
             let consumed = sched.consume_schedevent(&prehook);
             assert!(consumed.keep_running);
             assert_eq!(consumed.event_ix, 0);
-            assert_eq!(consumed.timeslice_remaining, None);
+            assert_eq!(consumed.timeslice_remaining, duration);
             assert_eq!(sched.priorities[&caller], REPLAY_DEFERRED_PRIORITY);
             assert_eq!(sched.priorities[&leader], REPLAY_FOREGROUND_PRIORITY);
             assert_eq!(sched.timeslices.get(&leader), Some(&duration));

@@ -681,25 +681,22 @@ async fn replay_continue_installs_a_logical_deadline_without_requiring_a_timer()
 
 /// A schedule replay that switches threads at a syscall prehook, to a thread
 /// whose next recorded slice ends at a timer preemption (a nonempty recorded
-/// duration), leaves the switching thread its own slice end, clock and state.
-/// The prehook is traced through the actual `trace_schedevent`,
-/// `receive_rpc` and replayer path, and the reply is applied by the same code
-/// a guest thread runs; the switching thread runs on into its call, so no
-/// grant is waited for. The recorded duration is staged for the destination
-/// alone (`Scheduler::timeslices`) and nothing desynchronizes. Before, the
-/// reply handed the destination's 123 RCBs to the switching thread, which
-/// installed them as its own slice end (and its maximum): once its call
-/// returned past that point it ended a slice its recording did not have, and
-/// that turn's charge moved the clock the guest reads.
+/// duration), hands that duration to the switching thread as its new slice
+/// end (and maximum), measured from its clock at the prehook, and stages it
+/// for the destination (`Scheduler::timeslices`); the rest of the switching
+/// thread's state, its clock included, is unchanged. The prehook is traced
+/// through the actual `trace_schedevent`, `receive_rpc` and replayer path,
+/// and the reply is applied by the same code a guest thread runs; the
+/// switching thread runs on into its call, so no grant is waited for, and
+/// nothing desynchronizes.
 ///
-/// A real guest replay shows that effect only with slices short enough for a
-/// switch to carry a recorded duration (an explicit `--max-timeslice`). At
-/// main's default bound the switches in such guests carry none, and at an
-/// explicit bound main's replay of them leaves the recording earlier, for
-/// reasons outside this change, with or without it; so the evidence here is
-/// this traced-event path.
+/// The switching thread's earlier slice end is not kept: in the recording its
+/// yield ended that slice, and keeping it ended slices the recording did not
+/// have, which moved the clock of a static guest's yielding thread
+/// (`a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_one`
+/// in hermit-cli's tests).
 #[tokio::test]
-async fn a_prehook_switch_leaves_the_switching_thread_its_own_slice_end() {
+async fn a_prehook_switch_hands_the_switching_thread_the_recorded_slice() {
     const NEXT: DetTid = DetTid::from_raw(18);
     let sample_time =
         crate::types::DetTime::new(&Config::default()).as_nanos() + LogicalTime::from_nanos(70);
@@ -765,11 +762,19 @@ async fn a_prehook_switch_leaves_the_switching_thread_its_own_slice_end() {
     thread.committed_clock_value = 7;
     thread.account_process_cpu_time();
     assert_eq!(thread.thread_logical_time.as_nanos(), sample_time);
-    // The switching thread's own slice, from its recording.
-    let own_end = sample_time + LogicalTime::from_rcbs(4_000);
-    thread.end_of_timeslice = Some(own_end);
-    thread.max_timeslice_end = Some(own_end);
-    let expected = bincode::serde::encode_to_vec(&thread, bincode::config::legacy()).unwrap();
+    // The switching thread's slice end from before its yield.
+    let earlier_end = sample_time + LogicalTime::from_rcbs(4_000);
+    thread.end_of_timeslice = Some(earlier_end);
+    thread.max_timeslice_end = Some(earlier_end);
+    let handed_end = sample_time + LogicalTime::from_rcbs(123);
+    let expected = {
+        let mut expected = thread.clone();
+        expected.end_of_timeslice = Some(handed_end);
+        if config.max_timeslice.is_some() {
+            expected.max_timeslice_end = Some(handed_end);
+        }
+        bincode::serde::encode_to_vec(&expected, bincode::config::legacy()).unwrap()
+    };
     let mut guest = ClockGuest {
         config,
         thread,
@@ -782,18 +787,17 @@ async fn a_prehook_switch_leaves_the_switching_thread_its_own_slice_end() {
     };
     super::super::trace_schedevent(&mut guest, prehook.clone(), false).await;
     assert_eq!(*guest.records.lock().unwrap(), vec![prehook]);
-    assert_eq!(guest.thread.end_of_timeslice, Some(own_end));
-    assert_eq!(guest.thread.max_timeslice_end, Some(own_end));
+    assert_eq!(guest.thread.end_of_timeslice, Some(handed_end));
     assert_eq!(
         bincode::serde::encode_to_vec(&guest.thread, bincode::config::legacy()).unwrap(),
         expected,
-        "the switching thread's clock and state are its own"
+        "only the switching thread's slice end changes"
     );
     let sched = guest.rpc_state.as_ref().unwrap().sched.lock().unwrap();
     assert_eq!(
         sched.timeslices.get(&NEXT),
         Some(&Some(LogicalTime::from_rcbs(123))),
-        "the recorded duration is the next thread's"
+        "the recorded duration is staged for the next thread"
     );
     let replayer = sched.replayer.as_ref().unwrap();
     assert_eq!(replayer.traced_event_count, 1);
