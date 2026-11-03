@@ -543,6 +543,14 @@ int main(int argc, char** argv) {
               .data.ptr.buffer = (binder_uintptr_t)&status,
           },
   };
+  if (role == MANAGER) {
+    // Reply late, so a sender that runs alone (under Hermit, for the
+    // record/replay fixture) is already waiting in its reply read when
+    // the reply arrives: that read is the one that waits, and its
+    // rejoin is what the recording stores. Without the delay the reply
+    // lands first and the sender's read returns in its turn.
+    usleep(100 * 1000);
+  }
   write_commands(fd, &commands, sizeof(commands));
   if (role == MANAGER) {
     return 0;

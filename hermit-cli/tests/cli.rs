@@ -67285,6 +67285,9 @@ fn a_strict_replay_refuses_binder() {
     );
     assert_success(&recorded, &["binder_fd_passing", "ping", "client"]);
     // The supported arrangement (client alone under Hermit) stores its
+    // readmissions; the outside manager delays its reply, so the client's
+    // reply read is the call that waits (without the delay the reply would
+    // land first and the read would return in the client's turn). It
     // readmissions in the record; PR #4761 still refuses the strict replay
     // below because binder reply payloads are not recorded.
     let json: serde_json::Value =
