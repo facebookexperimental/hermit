@@ -1218,20 +1218,18 @@ impl AnalyzeOpts {
             continuation,
             deciding,
             without_event,
-            (
-                |record, len| {
-                    self.prefix_continuation(
-                        "final_target_schedule",
-                        record,
-                        len,
-                        continuation,
-                        |run| self.launch_prefix_trial(run, RunData::launch),
-                    )
-                },
-                |runname, variant, len, position| {
-                    self.prefix_stack(runname, variant, len, position, continuation)
-                },
-            ),
+            |record, len| {
+                self.prefix_continuation(
+                    "final_target_schedule",
+                    record,
+                    len,
+                    continuation,
+                    |run| self.launch_prefix_trial(run, RunData::launch),
+                )
+            },
+            |runname, variant, len, position| {
+                self.prefix_stack(runname, variant, len, position, continuation)
+            },
         )
     }
 
@@ -1246,15 +1244,16 @@ impl AnalyzeOpts {
         continuation: MaybeTimeslice,
         (target_met, deciding): (bool, &Option<PrettyBacktrace>),
         (continued, continued_path): (&[SchedEvent], &Path),
-        (continue_target, stack): (
-            impl FnOnce(&PreemptionRecord, usize) -> anyhow::Result<(CompletedScheduleTrial, PathBuf)>,
-            impl Fn(
-                &str,
-                &PreemptionRecord,
-                usize,
-                usize,
-            ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)>,
-        ),
+        continue_target: impl FnOnce(
+            &PreemptionRecord,
+            usize,
+        ) -> anyhow::Result<(CompletedScheduleTrial, PathBuf)>,
+        stack: impl Fn(
+            &str,
+            &PreemptionRecord,
+            usize,
+            usize,
+        ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)>,
     ) -> anyhow::Result<Option<Report>> {
         let events = schedule.schedevents();
         let thread = events[decision].dettid;
@@ -2661,23 +2660,21 @@ mod tests {
                 None,
                 (true, &None),
                 (&continued, Path::new("final_baseline_schedule.preempts")),
-                (
-                    |_, len| {
-                        assert_eq!(len, 2);
-                        Ok((
-                            CompletedScheduleTrial {
-                                target_met: true,
-                                schedule: events(&[1, 2, 2, 1]),
-                            },
-                            PathBuf::from("final_target_schedule.preempts"),
-                        ))
-                    },
-                    |runname, _, _, _| match runname {
-                        "final_target_next_for_stacktraces" => Ok((next_target_met, None)),
-                        "final_baseline_next_for_stacktraces" => Ok((baseline_met, None)),
-                        other => panic!("unexpected replay {other}"),
-                    },
-                ),
+                |_, len| {
+                    assert_eq!(len, 2);
+                    Ok((
+                        CompletedScheduleTrial {
+                            target_met: true,
+                            schedule: events(&[1, 2, 2, 1]),
+                        },
+                        PathBuf::from("final_target_schedule.preempts"),
+                    ))
+                },
+                |runname, _, _, _| match runname {
+                    "final_target_next_for_stacktraces" => Ok((next_target_met, None)),
+                    "final_baseline_next_for_stacktraces" => Ok((baseline_met, None)),
+                    other => panic!("unexpected replay {other}"),
+                },
             );
             match contradicted {
                 Some(replay) => {
