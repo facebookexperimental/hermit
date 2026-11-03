@@ -1382,7 +1382,7 @@ pub struct RunOpts {
 
     /// Freeze explicitly declared dynamic files for the native trap exec domain.
     /// Static files, scripts, threads, fork and timers remain outside this domain.
-    #[cfg(feature = "native-exec")]
+    #[cfg(any(feature = "native-exec", feature = "native-exec-input-admission"))]
     #[clap(long, value_name = "DECLARATION", requires = "verification")]
     native_exec_inputs: Option<PathBuf>,
 
@@ -8062,7 +8062,7 @@ fn strict_run_refuses_an_inexact_branch_counter_before_it_looks_at_the_program()
 #[test]
 #[cfg(feature = "native-exec")]
 fn native_inputs_refuse_wrong_backend_before_program_or_declaration_access() {
-    for backend in ["dbt", "e9patch", "ptrace", "liteinst"] {
+    for backend in ["ptrace", "liteinst"] {
         let backend_flag = format!("--backend={backend}");
         let global = GlobalOpts::parse_from(["hermit", &backend_flag]);
         let mut options = RunOpts::parse_from([
@@ -8071,7 +8071,8 @@ fn native_inputs_refuse_wrong_backend_before_program_or_declaration_access() {
             "--native-exec-inputs=/nonexistent-native-declaration",
             "/nonexistent-native-guest",
         ]);
-        // Exercise the actual common entry, in builds with or without DBT.
+        // The dedicated DynamoRIO/E9patch frontdoors own the two foreign
+        // cases; they retain their existing, stronger external-adapter refusal.
         // Reaching program/declaration validation or a backend probe instead
         // produces a different error and must fail this control.
         let error = options.main(&global).unwrap_err();
@@ -9741,12 +9742,31 @@ impl RunOpts {
                 "--virtual-cpus is not qualified for executable-selected backend `{name}`"
             )));
         }
-        #[cfg(feature = "native-exec")]
+        #[cfg(any(feature = "native-exec", feature = "native-exec-input-admission"))]
         anyhow::ensure!(
             self.native_exec_inputs.is_none(),
             "an external physical adapter cannot consume a native exec enrollment"
         );
         Ok(())
+    }
+
+    /// An admission-only build can recognize the request, but cannot silently
+    /// run it as ordinary execution. The existing full native-exec build keeps
+    /// its original implementation and refusal order.
+    #[cfg(all(feature = "native-exec-input-admission", not(feature = "native-exec")))]
+    fn refuse_uncompiled_native_exec(&self, backend: Backend) -> Result<(), Error> {
+        if self.native_exec_inputs.is_none() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.application_backend.is_none(),
+            "an external physical adapter cannot consume a native exec enrollment"
+        );
+        anyhow::ensure!(
+            backend == Backend::InGuestTrap,
+            "native exec currently requires in-guest-trap"
+        );
+        anyhow::bail!("native exec execution is not compiled into this executable")
     }
 
     /// Lower `--strace-only` onto exactly the options its help names: `--tmp=/tmp
@@ -10466,7 +10486,7 @@ impl RunOpts {
                 return Err(Error::new(PolicyRefusal)
                     .context("mapped-shared-verification-requires-one-explicit-pair-epoch"));
             }
-            #[cfg(feature = "native-exec")]
+            #[cfg(any(feature = "native-exec", feature = "native-exec-input-admission"))]
             if self.native_exec_inputs.is_some() {
                 return Err(Error::new(PolicyRefusal).context(
                     "--in-guest-exec-stop: exec-stop-runtime-not-ready: native successor verification is not admitted",
@@ -10511,6 +10531,10 @@ impl RunOpts {
         // Refuse those switches before the built-in dispatcher can launch a
         // supervisor, lower a shorthand or read any input.
         self.refuse_unqualified_application_options(A::NONDEFAULT_CPU_PROFILE_REFUSAL)?;
+        // The newly recognized admission-only request must not reach DAP or
+        // another dispatcher before discovering that no execution exists.
+        #[cfg(all(feature = "native-exec-input-admission", not(feature = "native-exec")))]
+        self.refuse_uncompiled_native_exec(global.backend.unwrap_or_default())?;
         // Admission must see the actual global backend before any launch.
         match self
             .dispatch_before_validation(global.backend, std::env::var_os(DAP_LISTEN_INNER_ENV))?
@@ -10661,7 +10685,7 @@ impl RunOpts {
         self.refuse_unqualified_application_options(A::NONDEFAULT_CPU_PROFILE_REFUSAL)?;
         // Static native-option policy belongs before stdin reservation,
         // availability probes, or backend-specific preprocessing/dispatch.
-        #[cfg(feature = "native-exec")]
+        #[cfg(any(feature = "native-exec", feature = "native-exec-input-admission"))]
         if self.native_exec_inputs.is_some() {
             anyhow::ensure!(
                 self.selected_backend() == Backend::InGuestTrap,
@@ -11022,6 +11046,8 @@ impl RunOpts {
     /// Some arguments imply others. This is the place where that validation occurs.
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
+        #[cfg(all(feature = "native-exec-input-admission", not(feature = "native-exec")))]
+        self.refuse_uncompiled_native_exec(self.selected_backend())?;
         self.refuse_virtual_timeout_with_debugger()?;
         self.refuse_unready_exec_stop()?;
         self.refuse_gdbserver_without_a_gdbserver()?;
@@ -12888,6 +12914,8 @@ impl RunOpts {
         global: &GlobalOpts,
         capture_output: bool,
     ) -> Result<(ExitStatus, Option<Output>, Option<detcore::TerminalOutcome>), Error> {
+        #[cfg(all(feature = "native-exec-input-admission", not(feature = "native-exec")))]
+        self.refuse_uncompiled_native_exec(self.selected_backend())?;
         self.refuse_unready_exec_stop()?;
         // Analyze and other in-process callers bypass the outer CLI entry.
         self.refuse_an_invalid_replayed_record()?;
@@ -13089,6 +13117,8 @@ impl RunOpts {
             + 'static,
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
+        #[cfg(all(feature = "native-exec-input-admission", not(feature = "native-exec")))]
+        self.refuse_uncompiled_native_exec(self.selected_backend())?;
         self.refuse_virtual_timeout_with_debugger()?;
         self.refuse_unready_exec_stop()?;
         if !self.namespace_only {
@@ -19107,4 +19137,92 @@ mod tests {
             "the refusal did not say why it refused: {rendered}"
         );
     }
+}
+
+// This private-state control supplements, but does not replace, the real
+// dedicated-executable controls. It does not construct a synthetic adapter.
+#[test]
+#[cfg(feature = "native-exec")]
+fn native_enrollment_external_guard_does_not_create_a_capture() {
+    let mut options = RunOpts::parse_from([
+        "run",
+        "--verify",
+        "--native-exec-inputs=/nonexistent-native-declaration",
+        "/nonexistent-native-guest",
+    ]);
+    options
+        .select_application_backend("native-enrollment-guard-control")
+        .unwrap();
+    let error = options
+        .refuse_unqualified_application_options("unused CPU profile refusal")
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "an external physical adapter cannot consume a native exec enrollment"
+    );
+    assert!(options.native_exec_capture.is_none());
+}
+
+#[test]
+#[cfg(all(feature = "native-exec-input-admission", not(feature = "native-exec")))]
+fn native_admission_only_refuses_before_program_or_declaration_access() {
+    for (backend, expected) in [
+        ("ptrace", "native exec currently requires in-guest-trap"),
+        ("liteinst", "native exec currently requires in-guest-trap"),
+        (
+            "in-guest-trap",
+            "native exec execution is not compiled into this executable",
+        ),
+    ] {
+        let backend_flag = format!("--backend={backend}");
+        let global = GlobalOpts::parse_from(["hermit", &backend_flag]);
+        let mut options = RunOpts::parse_from([
+            "run",
+            "--verify",
+            "--native-exec-inputs=/nonexistent-native-declaration",
+            "/nonexistent-native-guest",
+        ]);
+        let error = options.main(&global).unwrap_err();
+        assert_eq!(error.to_string(), expected, "{backend}: {error:#}");
+    }
+
+    let global = GlobalOpts::parse_from(["hermit"]);
+    let mut options = RunOpts::parse_from([
+        "run",
+        "--verify",
+        "--native-exec-inputs=/nonexistent-native-declaration",
+        "/nonexistent-native-guest",
+    ]);
+    options
+        .select_application_backend("native-enrollment-guard-control")
+        .unwrap();
+    let error = options.main(&global).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "an external physical adapter cannot consume a native exec enrollment"
+    );
+}
+
+#[test]
+#[cfg(all(feature = "native-exec-input-admission", not(feature = "native-exec")))]
+fn native_admission_only_preserves_requests_without_native_enrollment() {
+    let options = RunOpts::parse_from(["run", "/nonexistent-ordinary-guest"]);
+    for backend in [Backend::Ptrace, Backend::Liteinst, Backend::InGuestTrap] {
+        options.refuse_uncompiled_native_exec(backend).unwrap();
+    }
+}
+
+#[test]
+#[cfg(any(feature = "native-exec", feature = "native-exec-input-admission"))]
+fn native_enrollment_still_requires_a_verification_mode() {
+    let error = RunOpts::try_parse_from([
+        "run",
+        "--native-exec-inputs=/nonexistent-native-declaration",
+        "/nonexistent-native-guest",
+    ])
+    .unwrap_err();
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument
+    );
 }
