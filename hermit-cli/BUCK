@@ -15,7 +15,7 @@ hermit_build_env = {
     "CARGO_PKG_VERSION": "0.5.4",
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "3df91c9c71bdc5c77571974cbabfca20183a08de",
+    "HERMIT_REVERIE_PIN": "e520999c018a22374b3a46cebbddfb9aba485e53",
 }
 
 # The shadow release entrypoint supplies these values from Git/Cargo metadata
@@ -36,16 +36,10 @@ release_unstamped = read_root_config("hermit_release", "unstamped", "false") == 
 # whole list because scripts/check-buck-reindeer-features.rs reads only literal
 # `features` lists, never a variable or a concatenation.
 release_features = {"features": [
-    "dbt",
-    "e9patch",
     "liteinst",
-    "sabre",
 ]} if release_unstamped else {"features": [
     "buck-release-provenance",
-    "dbt",
-    "e9patch",
     "liteinst",
-    "sabre",
 ]}
 release_build_env = hermit_build_env if release_unstamped else {
     "CARGO_PKG_VERSION": read_root_config("hermit_release", "version", ""),
@@ -84,30 +78,34 @@ rust_library(
                 "categories": [
                     "development-tools::debugging",
                     "development-tools::testing"
-                ]
+                ],
+                "metadata": {"hermit": {"build-identity": "source"}},
             },
             "dependencies_override": {
                 "dependencies": {
-                    "hermit-test-workdir": {"optional": True},
                     "reverie-inguest": {"default-features": False, "optional": True},
                     "sha2": {"optional": True},
                     "reverie-rpc-transport": {"optional": True},
-                    "reverie-sabre-stats": {"optional": True},
+                },
+                "build-dependencies": {
+                    "libc": {"version": "0.2.186"},
+                    "sha1_smol": {"version": "1.0.1"},
+                    "serde": {"version": "1.0.219", "features": ["derive"]},
+                    "serde_json": {"version": "1.0.140"},
+                    "sha2": {"version": "0.10.9"},
+                    "toml": {"version": "0.8.23"},
                 },
                 "dev-dependencies": {
                     "reverie-inguest": {"default-features": False, "features": ["exec-stop"]},
+                    "toml": {"version": "0.8.23"},
                 },
             },
             "features": {
                 "exec-stop-launcher": ["dep:reverie-inguest", "reverie-inguest/exec-stop", "reverie-inguest/loader-private-runtime"],
                 "default": [],
                 "loader-rcb-observation": ["exec-stop-launcher", "reverie-ptrace/rcb-observation"],
-                "dbt": ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"],
-                "sabre": ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"],
-                "e9patch": [],
                 "liteinst": ["dep:reverie-liteinst", "dep:reverie-rpc-transport"],
                 "native-exec": ["liteinst", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "dep:reverie-inguest", "dep:sha2"],
-                "third-party-backends": ["dbt", "sabre", "e9patch", "liteinst"],
                 "kvm-native-test-support": ["reverie-kvm/native-test-support"],
                 "mm-cancellation-test-support": ["exec-stop-launcher", "liteinst", "detcore/physical-mm-test-support"],
                 "kvm-execution-tests": [],
@@ -122,11 +120,21 @@ rust_library(
         exclude = [
             "src/bin/**/*.rs",
         ],
+    ) + glob(
+        ["src/bin/hermit/**/*.rs"],
+        exclude = ["src/bin/hermit/main.rs"],
     ),
+    test_srcs = glob([
+        "src/bin/**/*.rs",
+        "test-resources/**/*.json",
+        "tests/common/readonly_proc.rs",
+        "tests/fixtures/staged-summary.gitignore",
+    ]),
     crate = "hermit",
     env = hermit_build_env,
-    # LiteInst is an optional cargo feature so the published crate leaves out
-    # reverie-liteinst; the internal build keeps the backend.
+    # The shared application deliberately uses LiteInst in this internal debug
+    # build, unlike Cargo's empty default feature set. Backend cfgs and their app
+    # tests now belong to this library, not the thin executable.
     features = ["liteinst"],
     # iced-x86 decoder tables are process-lifetime globals.
     test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
@@ -165,8 +173,17 @@ rust_library(
         "//hermetic_infra/reverie:reverie-liteinst",
         "//hermetic_infra/reverie:reverie-ptrace",
         "//hermetic_infra/reverie:reverie-rpc-transport",
-        "//hermetic_infra/reverie:reverie-sabre-stats",
         "//hermetic_infra/reverie:safeptrace",
+        "fbsource//third-party/rust:colored",
+        "fbsource//third-party/rust:diff",
+        "fbsource//third-party/rust:num_cpus",
+        "fbsource//third-party/rust:pretty_assertions",
+        "fbsource//third-party/rust:rand",
+        "fbsource//third-party/rust:regex",
+        "fbsource//third-party/rust:serde_yaml",
+        "fbsource//third-party/rust:shell-words",
+        "fbsource//third-party/rust:tracing-appender",
+        "//common/rust/build_info:build_info",
     ],
 )
 
@@ -190,80 +207,45 @@ rust_binary(
                 "categories": [
                     "development-tools::debugging",
                     "development-tools::testing"
-                ]
+                ],
+                "metadata": {"hermit": {"build-identity": "source"}},
             },
             "dependencies_override": {
                 "dependencies": {
-                    "hermit-test-workdir": {"optional": True},
                     "reverie-inguest": {"default-features": False, "optional": True},
                     "sha2": {"optional": True},
                     "reverie-rpc-transport": {"optional": True},
-                    "reverie-sabre-stats": {"optional": True},
+                },
+                "build-dependencies": {
+                    "toml": {"version": "0.8.23"},
                 },
                 "dev-dependencies": {
                     "reverie-inguest": {"default-features": False, "features": ["exec-stop"]},
+                    "toml": {"version": "0.8.23"},
                 },
             },
             "features": {
                 "exec-stop-launcher": ["dep:reverie-inguest", "reverie-inguest/exec-stop", "reverie-inguest/loader-private-runtime"],
                 "default": [],
                 "loader-rcb-observation": ["exec-stop-launcher", "reverie-ptrace/rcb-observation"],
-                "dbt": ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"],
-                "sabre": ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"],
-                "e9patch": [],
                 "liteinst": ["dep:reverie-liteinst", "dep:reverie-rpc-transport"],
                 "native-exec": ["liteinst", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "dep:reverie-inguest", "dep:sha2"],
-                "third-party-backends": ["dbt", "sabre", "e9patch", "liteinst"],
                 "kvm-native-test-support": ["reverie-kvm/native-test-support"],
                 "mm-cancellation-test-support": ["exec-stop-launcher", "liteinst", "detcore/physical-mm-test-support"],
                 "kvm-execution-tests": [],
             },
         },
     },
-    srcs = glob(["src/bin/**/*.rs"]),
+    srcs = glob(["src/bin/hermit/main.rs"]),
     env = hermit_build_env,
+    # Backend cfgs are owned by :libhermit. This thin entry contains only
+    # executable preinitialization and fbinit, so it needs no backend feature list.
     # Signal-handler messages intentionally live for the process lifetime.
     test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
-    test_srcs = glob([
-        "src/bin/**/*.rs",
-        "test-resources/**/*.json",
-        "tests/common/readonly_proc.rs",
-        "tests/fixtures/staged-summary.gitignore",
-    ]),
+    test_srcs = glob(["src/bin/hermit/main.rs"]),
     deps = [
-        "fbsource//third-party/rust:anyhow",
-        "fbsource//third-party/rust:bincode",
-        "fbsource//third-party/rust:clap",
-        "fbsource//third-party/rust:colored",
-        "fbsource//third-party/rust:diff",
-        "fbsource//third-party/rust:dirs",
-        "fbsource//third-party/rust:libc",
-        "fbsource//third-party/rust:nix",
-        "fbsource//third-party/rust:num_cpus",
-        "fbsource//third-party/rust:pretty_assertions",
-        "fbsource//third-party/rust:rand",
-        "fbsource//third-party/rust:rand_pcg",
-        "fbsource//third-party/rust:regex",
-        "fbsource//third-party/rust:serde",
-        "fbsource//third-party/rust:serde_json",
-        "fbsource//third-party/rust:sha2",
-        "fbsource//third-party/rust:serde_yaml",
-        "fbsource//third-party/rust:shell-words",
-        "fbsource//third-party/rust:tempfile",
-        "fbsource//third-party/rust:tokio",
-        "fbsource//third-party/rust:tracing",
-        "fbsource//third-party/rust:tracing-appender",
-        "fbsource//third-party/rust:tracing-subscriber",
-        "fbsource//third-party/rust:uuid",
         ":libhermit",
-        "//common/rust/build_info:build_info",
         "//common/rust/shed/fbinit:fbinit",
-        "//hermetic_infra/hermit/common/test-workdir:hermit-test-workdir",
-        "//hermetic_infra/hermit/detcore:detcore",
-        "//hermetic_infra/hermit/detcore-model:detcore-model",
-        "//hermetic_infra/reverie:reverie",
-        "//hermetic_infra/reverie:reverie-inguest",
-        "//hermetic_infra/reverie:reverie-ptrace",
     ],
 )
 
@@ -277,7 +259,16 @@ rust_library(
         exclude = [
             "src/bin/**/*.rs",
         ],
+    ) + glob(
+        ["src/bin/hermit/**/*.rs"],
+        exclude = ["src/bin/hermit/main.rs"],
     ),
+    test_srcs = glob([
+        "src/bin/**/*.rs",
+        "test-resources/**/*.json",
+        "tests/common/readonly_proc.rs",
+        "tests/fixtures/staged-summary.gitignore",
+    ]),
     crate = "hermit",
     env = release_build_env,
     preferred_linkage = "static",
@@ -293,7 +284,6 @@ rust_library(
         "fbsource//third-party/rust:nix",
         "fbsource//third-party/rust:object",
         "fbsource//third-party/rust:rand_pcg",
-        "fbsource//third-party/rust:reverie-dbt",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:tempfile",
@@ -303,7 +293,6 @@ rust_library(
         "fbsource//third-party/rust:tracing-subscriber",
         "fbsource//third-party/rust:uuid",
         "//hermetic_infra/hermit/detcore:detcore",
-        "//hermetic_infra/hermit/detcore-dbt:detcore-dbt",
         "//hermetic_infra/hermit/detcore-model:detcore-model",
         "//hermetic_infra/hermit/hermit-record:hermit-record",
         "//hermetic_infra/hermit/hermit-record-format:hermit-record-format",
@@ -316,15 +305,24 @@ rust_library(
         "//hermetic_infra/reverie:reverie-liteinst",
         "//hermetic_infra/reverie:reverie-ptrace",
         "//hermetic_infra/reverie:reverie-rpc-transport",
-        "//hermetic_infra/reverie:reverie-sabre-stats",
         "//hermetic_infra/reverie:safeptrace",
+        "fbsource//third-party/rust:colored",
+        "fbsource//third-party/rust:diff",
+        "fbsource//third-party/rust:num_cpus",
+        "fbsource//third-party/rust:pretty_assertions",
+        "fbsource//third-party/rust:rand",
+        "fbsource//third-party/rust:regex",
+        "fbsource//third-party/rust:serde_yaml",
+        "fbsource//third-party/rust:shell-words",
+        "fbsource//third-party/rust:tracing-appender",
+        "//common/rust/build_info:build_info",
     ],
     **release_features
 )
 
 rust_binary(
     name = "_hermit-release",
-    srcs = glob(["src/bin/**/*.rs"]),
+    srcs = glob(["src/bin/hermit/main.rs"]),
     crate = "hermit",
     env = release_build_env,
     link_style = "static_pic",
@@ -337,39 +335,8 @@ rust_binary(
     # The guarded local producer overrides this with its content-bound prebuilt
     # target. CI resolves the default declared pkg-config dependency.
     deps = [release_lzma_target, release_unwind_target] + [
-        "fbsource//third-party/rust:anyhow",
-        "fbsource//third-party/rust:bincode",
-        "fbsource//third-party/rust:clap",
-        "fbsource//third-party/rust:colored",
-        "fbsource//third-party/rust:diff",
-        "fbsource//third-party/rust:dirs",
-        "fbsource//third-party/rust:libc",
-        "fbsource//third-party/rust:nix",
-        "fbsource//third-party/rust:num_cpus",
-        "fbsource//third-party/rust:pretty_assertions",
-        "fbsource//third-party/rust:rand",
-        "fbsource//third-party/rust:rand_pcg",
-        "fbsource//third-party/rust:regex",
-        "fbsource//third-party/rust:reverie-dbt",
-        "fbsource//third-party/rust:serde",
-        "fbsource//third-party/rust:serde_json",
-        "fbsource//third-party/rust:serde_yaml",
-        "fbsource//third-party/rust:shell-words",
-        "fbsource//third-party/rust:tempfile",
-        "fbsource//third-party/rust:tokio",
-        "fbsource//third-party/rust:tracing",
-        "fbsource//third-party/rust:tracing-appender",
-        "fbsource//third-party/rust:tracing-subscriber",
-        "fbsource//third-party/rust:uuid",
         ":_libhermit-release",
-        "//common/rust/build_info:build_info",
         "//common/rust/shed/fbinit:fbinit",
-        "//hermetic_infra/hermit/common/test-workdir:hermit-test-workdir",
-        "//hermetic_infra/hermit/detcore:detcore",
-        "//hermetic_infra/hermit/detcore-dbt:detcore-dbt",
-        "//hermetic_infra/hermit/detcore-model:detcore-model",
-        "//hermetic_infra/reverie:reverie",
-        "//hermetic_infra/reverie:reverie-ptrace",
     ],
     **release_features
 )

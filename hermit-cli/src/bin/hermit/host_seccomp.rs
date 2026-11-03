@@ -100,7 +100,7 @@ pub(crate) fn admit(unsafe_ignore: bool) -> Result<(), Error> {
         // Best effort, like hermit's other warnings: a closed or full stderr
         // must not turn an admitted run into a failure. The INFO record
         // written when tracing starts is the durable trace.
-        crate::tracing::write_stderr_diagnostic(&format!(
+        crate::app::tracing::write_stderr_diagnostic(&format!(
             "WARNING: --unsafe-ignore-host-seccomp: hermit is starting the guest under a seccomp \
              filter it inherited ({}). Hermit neither records nor enforces that filter, so this \
              run may not reproduce wherever the filter differs, for example on a host without \
@@ -119,8 +119,9 @@ fn decide(host: Option<HostSeccomp>, unsafe_ignore: bool) -> Result<Option<HostS
     match host {
         None => Ok(None),
         Some(host) if unsafe_ignore => Ok(Some(host)),
-        Some(host) => Err(Error::new(crate::container::PolicyRefusal).context(format!(
-            "hermit inherited a seccomp filter ({}) from whatever launched it, for example a \
+        Some(host) => Err(
+            Error::new(crate::app::container::PolicyRefusal).context(format!(
+                "hermit inherited a seccomp filter ({}) from whatever launched it, for example a \
              container runtime's default profile, and refuses to start the guest. The filter is \
              an input hermit does not record: it can make system calls fail in ways the guest \
              observes, so the run would not reproduce wherever the filter differs. Run hermit \
@@ -129,8 +130,9 @@ fn decide(host: Option<HostSeccomp>, unsafe_ignore: bool) -> Result<Option<HostS
              `--security-opt seccomp=unconfined`. Or accept a run that may not reproduce by \
              passing --unsafe-ignore-host-seccomp (in a run config: \
              `global: {{unsafe-ignore-host-seccomp: true}}`).",
-            host.describe()
-        ))),
+                host.describe()
+            )),
+        ),
     }
 }
 
@@ -172,7 +174,9 @@ mod tests {
         let host = HostSeccomp::from_status(STATUS).unwrap();
         let error = decide(host, false).unwrap_err();
         assert!(
-            error.root_cause().is::<crate::container::PolicyRefusal>(),
+            error
+                .root_cause()
+                .is::<crate::app::container::PolicyRefusal>(),
             "{error:#}"
         );
         let message = format!("{error:#}");

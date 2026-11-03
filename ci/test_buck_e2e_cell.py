@@ -1468,14 +1468,10 @@ class ContainerChoiceTest(unittest.TestCase):
         self.assertLessEqual(privileged, chosen)
         self.assertIn("c-programs-environment-and-workdir-custom-ptrace", chosen)
         self.assertIn("c-programs-environment-and-workdir-verify-ptrace", chosen)
-        # The DBT adapter takes its own user namespace for its mounts, so a DBT cell needs no
-        # container and no particular route: a kvm test's DBT verify cell runs locally with
-        # its parity reference, and the others go to RE.
-        self.assertEqual(targets["c-programs-cpuid-probe-verify-dbt"]["route"], "local")
-        dbt = {self.slug(c) for c in self.plan if c["backend"] == "dbt" and c["lane"] != "privileged" and c.get("category") not in ("compat", "system-utils")}
-        self.assertTrue(dbt)
-        self.assertFalse(dbt & chosen)
-        self.assertTrue(any(targets[name]["route"] == "re" for name in dbt))
+        # DBT left core with the third-party split (2026-11-02): its cells, and the
+        # container/route checks this test made of them, belong to the external
+        # DynamoRIO owner, so the core plan has none.
+        self.assertFalse([c for c in self.plan if c["backend"] == "dbt"])
         # The test's KVM verify cell (enabled 2026-10-08) also runs locally, so it gets the
         # same pinned-root /test workdir its guest asserts, and so do its in-guest LiteInst
         # verify cells (liteinst and in-guest-trap, enabled the same day).
@@ -1492,9 +1488,13 @@ class ContainerChoiceTest(unittest.TestCase):
 
     def test_local(self) -> None:
         chosen = self.containerized(self.check("local"))
-        dbt = {self.slug(c) for c in self.plan if c["backend"] == "dbt" and c["lane"] != "privileged" and c.get("category") not in ("compat", "system-utils")}
-        self.assertTrue(dbt)
-        self.assertFalse(dbt & chosen)
+        # check() pins each cell's container to its local route; the plan's
+        # privileged cells are among those it containerizes. (The DBT cells
+        # this test also checked left core with DBT in the third-party split.)
+        privileged = {self.slug(c) for c in self.plan if c["lane"] == "privileged"}
+        self.assertTrue(privileged)
+        self.assertLessEqual(privileged, chosen)
+        self.assertFalse([c for c in self.plan if c["backend"] == "dbt"])
 
 
 class ParityRouteTest(unittest.TestCase):
@@ -1539,7 +1539,9 @@ class ParityRouteTest(unittest.TestCase):
         for routing in self.CONFIGS:
             routes = self.routes(routing)
             dbt = sorted(test for test, backend in routes if backend == "dbt")
-            self.assertGreater(len(dbt), 20, routing)
+            # DBT left core with the third-party split (2026-11-02): its cells
+            # belong to the external DynamoRIO owner, so no Buck cell remains.
+            self.assertEqual(len(dbt), 0, routing)
             for test in dbt:
                 if (test, "ptrace") in routes:
                     self.assertEqual(routes[(test, "dbt")], routes[(test, "ptrace")], (routing, test))

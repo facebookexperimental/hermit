@@ -690,7 +690,11 @@ fn write_results(
         .map(|result| cell_row_id(&result.cell))
         .chain(ledger_rows.iter().cloned());
     for id in ids {
-        let result = if failing.contains(&id) { "fail" } else { "pass" };
+        let result = if failing.contains(&id) {
+            "fail"
+        } else {
+            "pass"
+        };
         writeln!(rows, "{id}\t{result}").expect("String writes succeed");
     }
     fs::write(artifacts.join("results.tsv"), rows)
@@ -700,6 +704,7 @@ fn write_results(
 fn run() -> Result<bool, String> {
     let mut repository = std::env::current_dir().map_err(|error| format!("repository: {error}"))?;
     let mut hermit = None;
+    let mut command_bindings = None;
     let mut safehermit = None;
     let mut artifacts = None;
     let mut installation = None;
@@ -722,7 +727,7 @@ fn run() -> Result<bool, String> {
             println!("Usage: conformance.rs --hermit PATH --artifacts DIR [OPTIONS]");
             println!("Defaults to every required backend, root, path, and namespace policy.");
             println!(
-                "Options: --repository DIR --safehermit PATH --installation DIR --backends LIST --roots LIST --paths LIST --policies LIST --descriptor-obligations FILE --descriptor-obligations-sha256 HEX --assert-scope full|launch-migration --executor safehermit|local --jobs N --expected LEDGER --list"
+                "Options: --repository DIR --safehermit PATH --command-bindings FILE --installation DIR --backends LIST --roots LIST --paths LIST --policies LIST --descriptor-obligations FILE --descriptor-obligations-sha256 HEX --assert-scope full|launch-migration --executor safehermit|local --jobs N --expected LEDGER --list"
             );
             println!(
                 "--executor local runs each command as this process's own bounded child, for a runner such as the validation DAG that bounds the whole run itself."
@@ -761,6 +766,11 @@ fn run() -> Result<bool, String> {
         match name {
             "--repository" => repository = PathBuf::from(value),
             "--hermit" => hermit = Some(PathBuf::from(value)),
+            "--command-bindings" => {
+                if command_bindings.replace(PathBuf::from(value)).is_some() {
+                    return Err("--command-bindings is repeated".to_owned());
+                }
+            }
             "--safehermit" => safehermit = Some(PathBuf::from(value)),
             "--artifacts" => artifacts = Some(PathBuf::from(value)),
             "--installation" => installation = Some(PathBuf::from(value)),
@@ -879,6 +889,11 @@ fn run() -> Result<bool, String> {
         return Ok(true);
     }
     let hermit = hermit.ok_or("--hermit is required")?;
+    let command_bindings = command_bindings
+        .or_else(|| std::env::var_os("HERMIT_E2E_COMMAND_BINDINGS").map(PathBuf::from));
+    // Authenticate every requested physical command before fixture compilation
+    // or any guest. No missing owner can become an empty/available result.
+    let commands = driver::CommandBindings::open(command_bindings.as_deref(), &hermit, &cells)?;
     let artifacts = artifacts
         .ok_or("--artifacts is required and must name a fresh ignored/ or target/ directory")?;
     close_inherited_descriptors()?;
@@ -903,6 +918,7 @@ fn run() -> Result<bool, String> {
             descriptor_registry,
         )?
     };
+    let prepared = prepared.with_command_bindings(commands)?;
     let mut matches = true;
     // A backend whose every required cell runs here: only for it can a
     // ledger row be found to describe nothing any more.

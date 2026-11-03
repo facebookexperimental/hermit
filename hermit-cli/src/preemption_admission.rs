@@ -23,7 +23,7 @@ use crate::Backend;
 /// A named, pre-guest refusal of an unsupported preemption setting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsupportedPreemption {
-    backend: Backend,
+    backend: &'static str,
     setting: &'static str,
     missing: MissingCapability,
 }
@@ -52,8 +52,7 @@ impl std::fmt::Display for UnsupportedPreemption {
         write!(
             f,
             "unsupported_preemption: --backend={} refuses {}: {reason}; the guest has not started",
-            self.backend.as_str(),
-            self.setting,
+            self.backend, self.setting,
         )?;
         if self.setting == "--max-timeslice" {
             write!(
@@ -95,7 +94,25 @@ pub fn refuse_unsupported_preemption(
     maximum_requested: bool,
     skid_margin_requested: bool,
 ) -> Result<(), UnsupportedPreemption> {
-    let capabilities = crate::backend_capabilities(backend);
+    refuse_unsupported_preemption_with_capabilities(
+        config,
+        backend.as_str(),
+        crate::backend_capabilities(backend),
+        maximum_requested,
+        skid_margin_requested,
+    )
+}
+
+/// The same admission for an executable's statically declared physical adapter.
+/// The name is diagnostic identity; the supplied capabilities determine policy.
+/// This never launches a runtime or changes the requested configuration.
+pub fn refuse_unsupported_preemption_with_capabilities(
+    config: &Config,
+    backend: &'static str,
+    capabilities: reverie::BackendCapabilities,
+    maximum_requested: bool,
+    skid_margin_requested: bool,
+) -> Result<(), UnsupportedPreemption> {
     if capabilities.delivers_preemption_timer_events {
         if capabilities.provides_guest_backtraces {
             return Ok(());
@@ -151,7 +168,7 @@ pub fn refuse_unsupported_preemption(
 pub struct UnqualifiedAnnotatedReplay {
     /// The selected backend for a command line; `None` for a library launch,
     /// whose configuration is judged on the capabilities it carries.
-    backend: Option<Backend>,
+    backend: Option<&'static str>,
     setting: &'static str,
 }
 
@@ -164,7 +181,7 @@ impl std::fmt::Display for UnqualifiedAnnotatedReplay {
              events; "
         )?;
         match self.backend {
-            Some(backend) => write!(f, "--backend={} {}", backend.as_str(), self.setting)?,
+            Some(backend) => write!(f, "--backend={} {}", backend, self.setting)?,
             None => write!(f, "the launch configuration {}", self.setting)?,
         }
         write!(f, "; the guest has not started")
@@ -187,8 +204,21 @@ pub fn refuse_unqualified_annotated_replay(
     config: &Config,
     backend: Backend,
 ) -> Result<(), UnqualifiedAnnotatedReplay> {
+    refuse_unqualified_annotated_replay_with_capabilities(
+        config,
+        backend.as_str(),
+        crate::backend_capabilities(backend),
+    )
+}
+
+/// Preserve the annotated-replay checks for a statically selected adapter.
+pub fn refuse_unqualified_annotated_replay_with_capabilities(
+    config: &Config,
+    backend: &'static str,
+    capabilities: reverie::BackendCapabilities,
+) -> Result<(), UnqualifiedAnnotatedReplay> {
     let effective = Config {
-        backend: crate::backend_capabilities(backend),
+        backend: capabilities,
         ..config.clone()
     };
     match effective.annotated_priority_replay_unqualified() {
@@ -230,11 +260,14 @@ mod tests {
 
     // KVM left this set with Reverie 9443a6b2, which delivers preemption
     // timer events at exact retired-branch counts.
-    const TIMERLESS: [Backend; 4] = [
-        Backend::Dbt,
-        Backend::Sabre,
-        Backend::Liteinst,
-        Backend::InGuestTrap,
+    const TIMERLESS: [(&str, reverie::BackendCapabilities); 4] = [
+        ("dbt", reverie::BackendCapabilities::DBT),
+        ("sabre", reverie::BackendCapabilities::SABRE),
+        ("liteinst", reverie::BackendCapabilities::LITEINST_IN_GUEST),
+        (
+            "in-guest-trap",
+            reverie::BackendCapabilities::LITEINST_IN_GUEST,
+        ),
     ];
 
     #[test]
@@ -247,12 +280,18 @@ mod tests {
         ] {
             let config = Config::parse_from(args);
             let before = serde_json::to_value(&config).unwrap();
-            for backend in TIMERLESS {
-                let error =
-                    refuse_unsupported_preemption(&config, backend, true, false).unwrap_err();
+            for (backend, capabilities) in TIMERLESS {
+                let error = refuse_unsupported_preemption_with_capabilities(
+                    &config,
+                    backend,
+                    capabilities,
+                    true,
+                    false,
+                )
+                .unwrap_err();
                 assert_eq!(error.setting, "--max-timeslice");
                 let message = error.to_string();
-                assert!(message.contains(backend.as_str()), "{message}");
+                assert!(message.contains(backend), "{message}");
                 assert!(message.contains("unsupported_preemption"), "{message}");
                 assert!(
                     message.contains("pass --max-timeslice=disabled"),
@@ -296,9 +335,15 @@ mod tests {
                     .into_iter()
                     .chain(args),
             );
-            for backend in TIMERLESS {
-                let error =
-                    refuse_unsupported_preemption(&config, backend, true, false).unwrap_err();
+            for (backend, capabilities) in TIMERLESS {
+                let error = refuse_unsupported_preemption_with_capabilities(
+                    &config,
+                    backend,
+                    capabilities,
+                    true,
+                    false,
+                )
+                .unwrap_err();
                 assert_eq!(error.setting, setting);
                 if setting == "--chaos-timeslice-range" {
                     let message = error.to_string();
@@ -309,11 +354,17 @@ mod tests {
             refuse_unsupported_preemption(&config, Backend::Ptrace, true, false).unwrap();
         }
         let config = Config::parse_from(["detcore", "--max-timeslice=disabled"]);
-        for backend in TIMERLESS {
+        for (backend, capabilities) in TIMERLESS {
             assert_eq!(
-                refuse_unsupported_preemption(&config, backend, true, true)
-                    .unwrap_err()
-                    .setting,
+                refuse_unsupported_preemption_with_capabilities(
+                    &config,
+                    backend,
+                    capabilities,
+                    true,
+                    true
+                )
+                .unwrap_err()
+                .setting,
                 "--skid-margin",
             );
         }
@@ -335,8 +386,13 @@ mod tests {
         refuse_unqualified_annotated_replay(&qualified, Backend::Ptrace).unwrap();
         // KVM delivers precise timer events too.
         refuse_unqualified_annotated_replay(&qualified, Backend::Kvm).unwrap();
-        for backend in TIMERLESS {
-            let refusal = refuse_unqualified_annotated_replay(&qualified, backend).unwrap_err();
+        for (backend, capabilities) in TIMERLESS {
+            let refusal = refuse_unqualified_annotated_replay_with_capabilities(
+                &qualified,
+                backend,
+                capabilities,
+            )
+            .unwrap_err();
             assert_eq!(
                 refusal.setting,
                 "cannot deliver Detcore preemption timer events"
@@ -346,7 +402,7 @@ mod tests {
                 message.starts_with("HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE"),
                 "{message}"
             );
-            assert!(message.contains(backend.as_str()), "{message}");
+            assert!(message.contains(backend), "{message}");
         }
         for (flags, setting) in [
             (
@@ -467,13 +523,26 @@ mod tests {
             );
             assert_eq!(serde_json::to_value(&config).unwrap(), before);
             refuse_unsupported_preemption(&config, Backend::Ptrace, true, false).unwrap();
-            refuse_unsupported_preemption(&config, Backend::E9patch, true, false).unwrap();
+            refuse_unsupported_preemption_with_capabilities(
+                &config,
+                "e9patch",
+                reverie::BackendCapabilities::PTRACE,
+                true,
+                false,
+            )
+            .unwrap();
             // The inherited maximum is not a request (`maximum_requested`
             // false), so the stack-trace flag is what a timerless runtime
             // refuses, for its missing timer events.
-            for backend in TIMERLESS {
-                let error =
-                    refuse_unsupported_preemption(&config, backend, false, false).unwrap_err();
+            for (backend, capabilities) in TIMERLESS {
+                let error = refuse_unsupported_preemption_with_capabilities(
+                    &config,
+                    backend,
+                    capabilities,
+                    false,
+                    false,
+                )
+                .unwrap_err();
                 assert_eq!(error.setting, setting, "{backend:?}");
                 assert_eq!(error.missing, MissingCapability::TimerEvents, "{backend:?}");
             }
@@ -521,8 +590,15 @@ mod tests {
                 "--chaos-slowdown-max-factor=4.5",
                 "--chaos-epoch-length-ns=1000",
             ]);
-            for backend in TIMERLESS {
-                refuse_unsupported_preemption(&config, backend, true, false).unwrap();
+            for (backend, capabilities) in TIMERLESS {
+                refuse_unsupported_preemption_with_capabilities(
+                    &config,
+                    backend,
+                    capabilities,
+                    true,
+                    false,
+                )
+                .unwrap();
             }
         }
     }

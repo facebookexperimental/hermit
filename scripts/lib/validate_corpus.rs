@@ -106,29 +106,39 @@ pub fn load(root: &Path, mode: &str, paths: &CorpusPaths) -> Result<Vec<CorpusRo
             })?;
             argv.push(paths.expand(s));
         }
-        if argv.is_empty() {
-            return Err(format!("{} row {i} ({label}): empty argv", file.display()));
+        let mut parsed = CorpusRow {
+            label: label.to_string(),
+            argv,
+            proc: None,
+        };
+        if parsed.argv.is_empty() {
+            return Err(format!(
+                "{} row {i} ({}): empty argv",
+                file.display(),
+                parsed.label
+            ));
         }
-        let proc = match row.get("proc") {
+        parsed.proc = match row.get("proc") {
             None => None,
             Some(value) => {
                 let level = value.as_str().ok_or_else(|| {
                     format!("{} row {i} ({label}): non-string `proc`", file.display())
                 })?;
-                if !matches!(level, "minimal" | "standard") {
-                    return Err(format!(
-                        "{} row {i} ({label}): proc {level:?} is not one of minimal|standard",
-                        file.display()
-                    ));
-                }
                 Some(level.to_string())
             }
         };
-        out.push(CorpusRow {
-            label: label.to_string(),
-            argv,
-            proc,
-        });
+        if let Some(level) = parsed
+            .proc
+            .as_deref()
+            .filter(|level| !matches!(*level, "minimal" | "standard"))
+        {
+            return Err(format!(
+                "{} row {i} ({}): proc {level:?} is not one of minimal|standard",
+                file.display(),
+                parsed.label
+            ));
+        }
+        out.push(parsed);
     }
     if out.is_empty() {
         return Err(format!("{} contained zero rows", file.display()));

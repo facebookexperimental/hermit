@@ -742,6 +742,67 @@ pub fn load_descriptor_registry(
     })
 }
 
+/// Explicit measured command owners. Core selectors retain their original
+/// argv. A non-core selector requires a held actual static frontend and never
+/// falls back to a core --backend option.
+#[derive(Default)]
+pub struct CommandBindings {
+    entries: BTreeMap<String, hermit_manifest_plan::executable_binding::HeldExecutable>,
+}
+impl CommandBindings {
+    pub fn open(path: Option<&Path>, core: &Path, cells: &[Cell]) -> Result<Self, String> {
+        let bindings = Self {
+            entries: hermit_manifest_plan::executable_binding::read_bindings(path)?,
+        };
+        let core = core
+            .canonicalize()
+            .map_err(|error| format!("core command: {error}"))?;
+        for cell in cells {
+            bindings.select(&core, &cell.backend)?;
+        }
+        Ok(bindings)
+    }
+    fn select<'a>(&'a self, core: &'a Path, backend: &str) -> Result<(&'a Path, bool), String> {
+        self.recheck()?;
+        if hermit_manifest_plan::execution_owners::core_backends().contains(backend) {
+            if let Some(binding) = self.entries.get(backend)
+                && binding.identity.executable != core
+            {
+                return Err(format!(
+                    "core selector {backend} changed its retained executable"
+                ));
+            }
+            return Ok((core, false));
+        }
+        let binding = self
+            .entries
+            .get(backend)
+            .ok_or_else(|| format!("required measured command owner for {backend} is absent"))?;
+        let first_party =
+            fs::metadata(core).map_err(|error| format!("core command identity: {error}"))?;
+        if binding.identity.dev == first_party.dev() && binding.identity.ino == first_party.ino() {
+            return Err(format!(
+                "{backend} command owner is the core comparator itself"
+            ));
+        }
+        Ok((&binding.identity.executable, true))
+    }
+    fn recheck(&self) -> Result<(), String> {
+        for binding in self.entries.values() {
+            binding.recheck()?;
+        }
+        Ok(())
+    }
+    fn inventory(&self) -> Result<String, String> {
+        self.recheck()?;
+        Ok(self
+            .entries
+            .iter()
+            .map(|(name, binding)| format!("COMMAND {name} {:?}\n", binding.identity))
+            .collect())
+    }
+}
+
 pub struct Prepared {
     pub repository: PathBuf,
     pub hermit: PathBuf,
@@ -753,6 +814,7 @@ pub struct Prepared {
     input_inventory: String,
     cohort_inputs: BTreeMap<String, CohortInput>,
     descriptor_registry: Option<DescriptorRegistry>,
+    command_bindings: CommandBindings,
 }
 
 // Only ordinary host routes adopt this fixture. Named, covered-root and replay
@@ -1268,7 +1330,7 @@ fn installation_for(
 }
 
 fn input_inventory(prepared: &Prepared) -> Result<String, String> {
-    let mut rows = Vec::new();
+    let mut rows = vec![prepared.command_bindings.inventory()?];
     for (role, path) in [
         ("hermit", &prepared.hermit),
         ("guest", &prepared.guest),
@@ -1829,6 +1891,22 @@ pub fn integration_artifacts(
 }
 
 impl Prepared {
+    pub fn with_command_bindings(mut self, bindings: CommandBindings) -> Result<Self, String> {
+        self.command_bindings = bindings;
+        fs::write(
+            self.artifacts.join("command-bindings.inputs"),
+            self.command_bindings.inventory()?,
+        )
+        .map_err(|error| format!("actual command owner receipt: {error}"))?;
+        self.input_inventory = input_inventory(&self)?;
+        fs::write(
+            self.artifacts.join("installation.inputs"),
+            &self.input_inventory,
+        )
+        .map_err(|error| format!("complete command/resource inventory: {error}"))?;
+        Ok(self)
+    }
+
     pub fn build(
         repository: &Path,
         hermit: &Path,
@@ -2064,6 +2142,7 @@ impl Prepared {
             input_inventory: String::new(),
             cohort_inputs,
             descriptor_registry,
+            command_bindings: CommandBindings::default(),
         };
         fs::write(
             prepared.artifacts.join("installation-root.hex"),
@@ -2362,6 +2441,8 @@ impl Prepared {
         let physical = directory.join("physical");
         let stdout = directory.join("stdout");
         let stderr = directory.join("stderr");
+        let (executable, static_entry) =
+            self.command_bindings.select(&self.hermit, &cell.backend)?;
         let mut arguments: Vec<OsString> = vec![
             "--observe".into(),
             physical.as_os_str().to_owned(),
@@ -2371,10 +2452,12 @@ impl Prepared {
             "--sentinel-directory".into(),
             sentinel.as_os_str().to_owned(),
             "--".into(),
-            self.hermit.as_os_str().to_owned(),
+            executable.as_os_str().to_owned(),
             "--log=info".into(),
-            format!("--backend={}", cell.backend).into(),
         ];
+        if !static_entry {
+            arguments.push(format!("--backend={}", cell.backend).into());
+        }
         let record = cell.path.starts_with("record") || cell.path.starts_with("replay");
         if record {
             arguments.extend([
@@ -2447,6 +2530,7 @@ impl Prepared {
             NATIVE_LIMITS,
             Some(&physical),
         );
+        let command_after = self.command_bindings.recheck();
         let cohort_after =
             cohort.map(|input| input.retain_snapshot(&directory.join("cohort.inputs.after")));
         let code = execution
@@ -2467,6 +2551,12 @@ impl Prepared {
             verification.push(input.assertion(directory, before, after));
         }
         let mut boundary = execution.boundary;
+        if let Err(error) = command_after {
+            boundary = Err(match boundary {
+                Ok(_) => error,
+                Err(previous) => format!("{previous}; {error}"),
+            });
+        }
         let mut hashes = String::new();
         let mut observations = vec![
             stdout,
@@ -2609,6 +2699,88 @@ mod executor_controls {
             expected,
             NATIVE_LIMITS,
         )
+    }
+
+    #[test]
+    fn measured_command_owners_keep_core_argv_and_refuse_missing_changed_or_self_aliases() {
+        use std::os::unix::fs::PermissionsExt;
+        let core = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let empty = CommandBindings::default();
+        assert_eq!(
+            empty.select(&core, "ptrace").unwrap(),
+            (core.as_path(), false)
+        );
+        assert!(
+            empty
+                .select(&core, "external-fixture")
+                .unwrap_err()
+                .contains("absent")
+        );
+        let mut bound = CommandBindings::default();
+        bound.entries.insert(
+            "external-fixture".into(),
+            hermit_manifest_plan::executable_binding::measure(
+                "external-fixture".into(),
+                "actual-fixture".into(),
+                core.clone(),
+                "a".repeat(40),
+            )
+            .unwrap(),
+        );
+        assert!(
+            bound
+                .select(&core, "external-fixture")
+                .unwrap_err()
+                .contains("comparator itself")
+        );
+        struct Remove(PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "isolation-command-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cleanup = Remove(path.clone());
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::io::copy(&mut File::open(&core).unwrap(), &mut output).unwrap();
+        output.sync_all().unwrap();
+        drop(output);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = path.canonicalize().unwrap();
+        bound.entries.insert(
+            "external-fixture".into(),
+            hermit_manifest_plan::executable_binding::measure(
+                "external-fixture".into(),
+                "actual-fixture".into(),
+                path.clone(),
+                "a".repeat(40),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            bound.select(&core, "external-fixture").unwrap(),
+            (path.as_path(), true)
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        assert!(bound.select(&core, "external-fixture").is_err());
+        drop(bound);
+        drop(cleanup);
     }
 
     #[test]

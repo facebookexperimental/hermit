@@ -149,10 +149,6 @@ pub(crate) const WALL_CEILING_EXCEPTIONS: &[(&str, &str)] = &[
         "463 passing runs to 2026-11-02 peaked at a 428-second wall; 1.5 times that needs 642 s",
     ),
     (
-        "test.sabre_examples",
-        "also runs on GitHub-hosted runners, whose wall is unmeasured, so its wall was not lowered (local: 569 runs, largest wall 235 s)",
-    ),
-    (
         "test.hermit_modes",
         "also runs on GitHub-hosted runners, whose wall is unmeasured, so its wall was not lowered (local: 578 runs, largest wall 137 s)",
     ),
@@ -223,14 +219,6 @@ pub(crate) const UNMEASURED_FAMILIES: &[(Family, &str)] = &[
         "the privileged lane, whose hosted-privileged twins and 2400-second critical path are bounded by ci-privileged.yml's 2460-second launcher",
     ),
     (
-        Family::Group("e9patchcompat"),
-        "e9patch-compat-only cells, not run by any retained validation",
-    ),
-    (
-        Family::Group("e9patchcompatprep"),
-        "e9patch-compat-only preparation, not run by any retained validation",
-    ),
-    (
         Family::Group("envelope"),
         "envelope-only nodes, not run by any retained validation",
     ),
@@ -245,10 +233,6 @@ pub(crate) const UNMEASURED_FAMILIES: &[(Family, &str)] = &[
     (
         Family::GroupPrefix("quick-super-"),
         "the quick and super variants, not run by any retained validation",
-    ),
-    (
-        Family::Group("sabrecompat"),
-        "sabre-compat-only nodes, not run by any retained validation",
     ),
     (
         Family::Group("super"),

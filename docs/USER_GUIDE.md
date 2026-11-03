@@ -204,14 +204,12 @@ hermit run --base-env=minimal -e LANG=C --workdir=/tmp -- /bin/pwd
 
 #### Backend Selection
 
-Use `--backend=ptrace|dbt|liteinst|sabre|kvm|e9patch` to select the process
-instrumentation backend.
-It is a global option and belongs before the subcommand, but backend scope is
-command-specific. Every backend supports `run`; KVM also supports `analyze` and
-`bisect`, which launch `run` trials (`hermit --backend=kvm analyze ...`);
-e9patch also supports `record`, and SaBRe also supports `strace`; unsupported
-combinations fail closed. The default is
-`ptrace`, so existing commands are unchanged:
+Use `--backend=ptrace|liteinst|in-guest-trap|kvm` to select the core process
+instrumentation backend. It is a global option and belongs before the
+subcommand, but backend scope is command-specific. KVM also supports `analyze`
+and `bisect`, which launch `run` trials (`hermit --backend=kvm analyze ...`);
+unsupported combinations fail closed. The default is `ptrace`, so existing
+commands are unchanged:
 
 ```bash
 hermit --backend=ptrace run -- /bin/echo hello
@@ -226,9 +224,8 @@ stages), else the one built beside the Hermit executable. Its constructor instal
 the guest process before the program's `main`, and Detcore's global state stays
 in Hermit, reached over a socket. No ptrace tracer sits on the system-call path.
 
-Build the runtime beside a Hermit built with the optional `liteinst` feature,
-which `third-party-backends` includes; a build without it refuses
-`--backend=liteinst`:
+Build the runtime beside a Hermit built with the optional `liteinst` feature;
+a build without it refuses `--backend=liteinst`:
 
 ```bash
 cargo build --locked -p hermit-run --features liteinst --bin hermit
@@ -329,24 +326,23 @@ backends; `--no-namespace` remains available for trusted guests. The in-guest
 runtime reserves `SIGSYS` for itself. This experimental path is not a security
 boundary for intentionally hostile code.
 
-The `dbt`, `sabre`, and `e9patch` selections require optional CLI features as
-well as their runtime resources. Build and stage both with:
+DynamoRIO's static frontend and runtime resources are built and staged by
+[hermit-dynamorio](https://github.com/rrnewton/hermit-dynamorio). SaBRe and
+e9patch are built and staged by
+[hermit-3rdparty-patching](https://github.com/rrnewton/hermit-3rdparty-patching).
+Follow those repositories' maintained frontend, artifact, and validation
+instructions. Their backend selections are unavailable in the core executable;
+a core build never substitutes ptrace for an explicit unavailable selection.
 
-```bash
-cargo build --release --workspace --features hermit-run/third-party-backends
-./target/install_pkg/hermit --backend=dbt run -- /bin/echo hello
-```
-
-For DBT, the default `--network=local` gives each physical execution a fresh
-network namespace with active loopback, including both executions of
+For the external DynamoRIO frontend, the default `--network=local` gives each
+physical execution a fresh network namespace with active loopback, including both executions of
 `--verify`. Each guest and its verification channel share that namespace.
 Newly created guest sockets are isolated from unrelated outer listeners; a
 namespace setup failure stops before the guest runs. Explicit `--network=host`
 shares the caller's network and remains incompatible with `--strict`.
 
-The same executable accepts `--backend=sabre` and `--backend=e9patch`.
-A default `cargo install` does not enable these selections. KVM requires
-read-write `/dev/kvm` access plus a guest-kernel ABI, and an unlimited
+SaBRe and e9patch use their patching repository's static frontends. Core KVM
+requires read-write `/dev/kvm` access plus a guest-kernel ABI, and an unlimited
 address-space limit: it reserves 3 GiB of host address space for every guest
 process, plus 3 GiB for each exec in flight, so Hermit refuses to start it under a finite
 `RLIMIT_AS` (`kvm_address_space_limit`, exit 122; see

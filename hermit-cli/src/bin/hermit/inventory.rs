@@ -21,11 +21,11 @@ use hermit::HermitData;
 use reverie::ExitStatus;
 use serde::Serialize;
 
-use crate::manifest::Kind;
-use crate::manifest::Target;
+use crate::app::manifest::Kind;
+use crate::app::manifest::Target;
 
 /// How many hex digits of an ID `hermit list` shows; any unique prefix of
-/// at least [`crate::manifest::MIN_ID_PREFIX`] names the recording.
+/// at least [`crate::app::manifest::MIN_ID_PREFIX`] names the recording.
 const SHOWN_ID_DIGITS: usize = 8;
 
 /// Command-line options for `hermit list`.
@@ -64,7 +64,7 @@ struct Entry {
     id: String,
     kind: &'static str,
     created: Option<String>,
-    exit: Option<crate::manifest::Exit>,
+    exit: Option<crate::app::manifest::Exit>,
     program: Option<String>,
     args: Vec<String>,
     path: PathBuf,
@@ -73,10 +73,10 @@ struct Entry {
 impl Entry {
     fn exit_text(&self) -> String {
         match &self.exit {
-            Some(crate::manifest::Exit {
+            Some(crate::app::manifest::Exit {
                 code: Some(code), ..
             }) => code.to_string(),
-            Some(crate::manifest::Exit {
+            Some(crate::app::manifest::Exit {
                 signal: Some(signal),
                 ..
             }) => format!("signal {signal}"),
@@ -101,9 +101,9 @@ fn entries(data_dir: &Path) -> Result<Vec<Entry>, Error> {
     let mut entries = Vec::new();
     for id in store.try_recordings()? {
         let directory = data_dir.join(id.to_string());
-        let manifest_path = directory.join(crate::manifest::MANIFEST_NAME);
+        let manifest_path = directory.join(crate::app::manifest::MANIFEST_NAME);
         if manifest_path.is_file() {
-            match crate::manifest::read(&manifest_path) {
+            match crate::app::manifest::read(&manifest_path) {
                 Ok(manifest) => entries.push(Entry {
                     id: manifest.id,
                     kind: manifest.kind.name(),
@@ -186,10 +186,10 @@ impl ShowOpts {
             .recording
             .clone()
             .unwrap_or_else(|| hermit::LAST.into());
-        let file = match crate::manifest::resolve(store.data_dir(), &spec)? {
+        let file = match crate::app::manifest::resolve(store.data_dir(), &spec)? {
             Target::Manifest(path) => {
                 // Refuse what is not a manifest rather than print it as one.
-                crate::manifest::read(&path)?;
+                crate::app::manifest::read(&path)?;
                 path
             }
             Target::Recording { data_dir, id } => {
@@ -217,7 +217,7 @@ impl ShowOpts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest;
+    use crate::app::manifest;
 
     fn write_manifest(data_dir: &Path, kind: Kind, created: &str) -> hermit::Id {
         let id = hermit::Id::unique();

@@ -196,10 +196,7 @@ fn pselect6_wrapper_validation_preserves_pending_signals() {
         .arg("-o")
         .arg(&guest);
     command_output(compile, "pselect validation guest compilation");
-    #[cfg(not(feature = "dbt"))]
     let backends = ["native", "ptrace"];
-    #[cfg(feature = "dbt")]
-    let backends = ["native", "ptrace", "dbt"];
     for backend in backends {
         for mode in ["validation-empty", "validation-pending"] {
             let mut command = if backend == "native" {

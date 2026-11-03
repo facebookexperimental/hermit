@@ -121,6 +121,27 @@ Autopilot replays the latest recording without GDB. For an interactive replay,
 install GDB and use `hermit replay <record-id>`. Run `hermit --help` and the
 subcommand's `--help` for options, output locations and verification reports.
 
+## Registry package identity
+
+The source manifest, including a core-only source build, declares:
+
+```toml
+[package.metadata.hermit]
+build-identity = "source"
+```
+
+When preparing the registry release projection, change that value to
+`"registry"` in its manifest and corresponding autocargo package metadata in
+`hermit-cli/BUCK` before running `cargo package -p hermit-run` or
+`cargo publish -p hermit-run`. Keep both values at `"source"` in the ordinary
+source tree. Cargo preserves this metadata in the packaged manifest.
+Removing backend features is a separate packaging choice and does not change
+the build identity. A missing or invalid identity is a build error.
+
+The build script uses this value only for `cfg(hermit_registry_build)`, which
+selects registry-specific diagnostics. It does not enable backends, change
+version/build report schemas, or mark optional backend sources as excluded.
+
 ## License
 
 BSD-3-Clause. See `LICENSE`.

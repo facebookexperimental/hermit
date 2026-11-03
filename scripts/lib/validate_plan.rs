@@ -56,9 +56,6 @@ pub use hermit_manifest_plan::host_capability::cpuid_faulting_absent;
 pub use hermit_manifest_plan::host_capability::kvm_absent;
 pub use hermit_manifest_plan::host_capability::probe_host_capability;
 
-use crate::validate_corpus;
-use crate::validate_corpus::CorpusPaths;
-
 /// The canonical test epoch the strict compatibility probes pass, from its one
 /// source: `hermit run --strict` refuses an epoch drawn from the host clock.
 #[allow(dead_code)]
@@ -76,18 +73,6 @@ pub const MANIFEST_AUDIT_COMMAND: &str = "target/debug/test-harness validate";
 /// the committed DAG; this value is never a runtime profile rewrite.
 const SYNTHETIC_DEFAULT_CPU_TIMEOUT_S: i64 = 7200;
 
-/// Wall budget for one compatibility probe. Mirrors `STRICT_COMPAT_TIMEOUT=60`
-/// (validate.sh:1091).
-const COMPAT_TIMEOUT_S: i64 = 60;
-/// Extended budget for the two large internal executables under e9patch
-/// (validate.sh:2991).
-const COMPAT_E9PATCH_LARGE_TIMEOUT_S: i64 = 180;
-/// CPU budget for a compatibility probe: these are short guest runs under Hermit,
-/// so a spin is the failure mode a CPU cap catches.
-const COMPAT_CPU_TIMEOUT_S: i64 = 120;
-/// Memory ceiling for a compatibility probe.
-const COMPAT_MEM_BYTES: i64 = 4 * 1024 * 1024 * 1024;
-
 /// Which compatibility corpus a focused mode runs, and how it is labelled.
 ///
 /// One mode remains: the e9patch-compat-only profile's per-program probes from
@@ -99,13 +84,6 @@ pub enum CompatMode {
 }
 
 impl CompatMode {
-    /// The `ci/compat/corpus-<mode>.json` file this mode reads.
-    pub fn corpus_name(self) -> &'static str {
-        match self {
-            CompatMode::E9patch => "e9patch",
-        }
-    }
-
     /// Plain-language name printed per row and in the summary.
     pub fn display_name(self) -> &'static str {
         match self {
@@ -145,14 +123,6 @@ impl CompatMode {
                 v
             }
         }
-    }
-
-    /// Per-row wall budget, reproducing the budget override the bash applies.
-    pub fn timeout_for(self, label: &str) -> i64 {
-        if self == CompatMode::E9patch && matches!(label, "mysql" | "php") {
-            return COMPAT_E9PATCH_LARGE_TIMEOUT_S;
-        }
-        COMPAT_TIMEOUT_S
     }
 }
 
@@ -231,44 +201,6 @@ pub fn shell_quote(arg: &str) -> String {
 pub fn shell_join<I: IntoIterator<Item = S>, S: AsRef<str>>(argv: I) -> String {
     argv.into_iter()
         .map(|a| shell_quote(a.as_ref()))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// A fixture passed as a positional argument to `bash -c` is expanded by the
-/// outer shell, before Hermit clears the guest environment. Keep it double-quoted
-/// so the generated DAG's later `$VALIDATE_RUN_STATE` substitution is expanded
-/// once without word splitting. Literal shell metacharacters in constructed paths
-/// must still survive unchanged; the placeholder is inserted after this quoting.
-fn shell_quote_fixture_operand(path: &str) -> String {
-    let mut quoted = String::from("\"");
-    for ch in path.chars() {
-        if matches!(ch, '\\' | '"' | '$' | '`') {
-            quoted.push('\\');
-        }
-        quoted.push(ch);
-    }
-    quoted.push('"');
-    quoted
-}
-
-fn compat_guest_command(row: &validate_corpus::CorpusRow, paths: &CorpusPaths) -> String {
-    row.argv
-        .iter()
-        .enumerate()
-        .map(|(index, arg)| {
-            // bash -c SCRIPT NAME ARG...: only explicit fixture operands get this
-            // treatment. Never interpolate the script body or alter ordinary argv.
-            if index >= 4
-                && row.argv[0] == "bash"
-                && row.argv[1] == "-c"
-                && Path::new(arg).starts_with(paths.real_compat_fixtures)
-            {
-                shell_quote_fixture_operand(arg)
-            } else {
-                shell_quote(arg)
-            }
-        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -594,90 +526,6 @@ pub fn partition_host_inapplicable(
         ));
     }
     Ok((keep, withheld))
-}
-
-/// Build the compatibility-corpus nodes for one mode.
-///
-/// One DAG node PER PROBE. That is a deliberate change from the bash, which ran
-/// all ~191 probes serially inside a single gate:
-///   * each probe now gets its own wall + CPU + memory box, so one runaway row
-///     cannot consume the whole gate's budget;
-///   * each probe's verdict is a TYPED `StepOutcome`, so the summary table is
-///     built from structured results instead of a scraped TSV; and
-///   * the corpus becomes parallel, which is where a large part of the wall-clock
-///     win in this profile is expected to come from.
-pub fn compat_nodes(
-    root: &Path,
-    mode: CompatMode,
-    hermit_bin: &str,
-    nsswitch: &str,
-    paths: &CorpusPaths,
-    gate_dep: Option<&str>,
-) -> Result<Vec<Step>, String> {
-    let rows = validate_corpus::load(root, mode.corpus_name(), paths)?;
-    let mut out = Vec::new();
-    for row in rows {
-        let mut argv: Vec<String> = vec![hermit_bin.to_string()];
-        argv.extend(mode.run_args(&row.label, nsswitch, row.proc.as_deref()));
-        let wall = mode.timeout_for(&row.label);
-        let description = match mode {
-            CompatMode::E9patch => format!(
-                "One per-program probe of the e9patch-compat-only profile, generated from a row of ci/compat/{}. It runs `target/release/hermit --backend e9patch run --strict --epoch=<canonical test epoch> --verify -- <program>` with stdin from /dev/null. That is e9patch binary-rewriting preprocessing with the ptrace backend, not a backend of its own: Hermit rewrites the guest's main ELF with e9tool and e9patch, then runs the rewritten program on the ptrace backend under strict mode, twice, comparing the runs with the Stripped comparator of plain --verify, so no row establishes L2. The rows range from coreutils such as echo and cat to bash pipelines and tests/compat/real_compat_workload.sh workloads; whoami, groups, pinky, logname, tar and chown also bind the files-only nsswitch.conf over /etc/nsswitch.conf. The profile counts every failure as blocking, for example a rewritten binary that crashes or two runs whose output differs.",
-                mode.corpus_name()
-            ),
-        };
-        // Per-node TMPDIR and bytecode cache: the probes run in parallel
-        // under one validate-owned TMPDIR, and Detcore makes guest-visible
-        // time and pids deterministic, so two probes' `mktemp -d` pick the
-        // SAME name and collide (mkdir Ok in one run, EEXIST in the other),
-        // and one probe's python bytecode cache is visible to the next.
-        // A private directory per probe removes the cross-probe sharing;
-        // the two --verify runs of one probe stay sequential in it. The
-        // `probe-` prefix keeps a label such as `users` from producing a
-        // `/users/` path segment, which the portability checks reject as a
-        // user home directory.
-        let node_tmp = format!(
-            "{}/compat-tmp/probe-{}",
-            paths.validation_tmp_dir,
-            sanitize_job(&row.label)
-        );
-        let node_pycache = format!("{node_tmp}/python-cache");
-        // Exported in the command shell, not through the step's env map:
-        // the runner sets env values literally, so the run-state token in
-        // them would reach Hermit unexpanded and its verification logs
-        // would be created under a directory named after the token.
-        let mut step = node(
-            "compat",
-            &sanitize_job(&row.label),
-            &format!("{} compatibility: {}", mode.display_name(), row.label),
-            format!(
-                "mkdir -p {} {} && export TMPDIR={} PYTHONPYCACHEPREFIX={} && {} {} </dev/null",
-                shell_quote(&node_tmp),
-                shell_quote(&node_pycache),
-                shell_quote(&node_tmp),
-                shell_quote(&node_pycache),
-                shell_join(&argv),
-                compat_guest_command(&row, paths)
-            ),
-            gate_dep.map(|d| vec![d.to_string()]).unwrap_or_default(),
-            wall,
-            COMPAT_CPU_TIMEOUT_S.max(wall),
-            COMPAT_MEM_BYTES,
-        );
-        step.description = description;
-        out.push(step);
-    }
-    if out.is_empty() {
-        return Err(format!("compatibility mode {mode:?} selected zero probes"));
-    }
-    Ok(out)
-}
-
-/// DAG tags are `group.job`, so a job containing `.` would produce an ambiguous
-/// tag. Corpus labels are shell-command names (`c++filt`, `wc-lines`), none of
-/// which contain a dot today, but the mapping is applied rather than assumed.
-pub fn sanitize_job(label: &str) -> String {
-    label.replace('.', "_")
 }
 
 /// Load the complete committed DAG and select one label with its dependency

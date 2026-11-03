@@ -47,6 +47,7 @@ or timed out, 2 for a usage error.
 
 Environment:
   CARGO_TARGET_DIR   Where the generators are built (default: <checkout>/target)
+  HERMIT_SCORECARD_BIN  Optional absolute prepared scorecard executable
 EOF
 }
 
@@ -75,6 +76,17 @@ target=${CARGO_TARGET_DIR:-$root/target}
 [[ $target == /* ]] || target=$PWD/$target
 export CARGO_TARGET_DIR=$target
 bin=$target/debug
+
+# A caller that built this script's exact source may supply its emitted binary.
+# Refuse an invalid explicit input instead of falling back to rust-script.
+scorecard_program=./ci/compat-envelope/scorecard.rs
+if [[ ${HERMIT_SCORECARD_BIN+x} ]]; then
+    if [[ $HERMIT_SCORECARD_BIN != /* || ! -f $HERMIT_SCORECARD_BIN || ! -x $HERMIT_SCORECARD_BIN ]]; then
+        echo "sync-cell-config: HERMIT_SCORECARD_BIN must name an absolute executable file" >&2
+        exit 1
+    fi
+    scorecard_program=$HERMIT_SCORECARD_BIN
+fi
 
 # step SECONDS LABEL COMMAND... — run one step from the checkout root under a
 # timeout, report its wall time, and say what a failure means.
@@ -123,7 +135,7 @@ fi
 step 120 "test-harness sync-cells" "$bin/test-harness" sync-cells "$mode" --repo-root "$root"
 step 120 generate-parity-cells "$bin/generate-parity-cells" "$mode"
 step 900 "scorecard.rs $scorecard" \
-    env HERMIT_MANIFEST_PLAN_BIN="$bin/hermit-manifest-plan" ./ci/compat-envelope/scorecard.rs "$scorecard"
+    env HERMIT_MANIFEST_PLAN_BIN="$bin/hermit-manifest-plan" "$scorecard_program" "$scorecard"
 step 300 generate-validation-dag "$bin/generate-validation-dag" "$mode"
 step 120 "generate-test-footprints --check" "$bin/generate-test-footprints" --check
 

@@ -16,7 +16,7 @@
 //! Podman is the image manager: images are fetched into the local
 //! containers/storage store by `podman pull` (or `hermit oci pull`), and this
 //! module materializes a rootfs by copying the merged overlay layers out of
-//! that store (see [`crate::podman_store`]). Hermit never pulls on the run
+//! that store (see [`crate::app::podman_store`]). Hermit never pulls on the run
 //! path; a reference the store does not hold is refused with the remedy.
 
 use std::path::Path;
@@ -107,7 +107,7 @@ pub(crate) fn canonical_image_ref(image_ref: &str) -> String {
     if candidate.len() == 64 && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
         return candidate.to_ascii_lowercase();
     }
-    if let Ok(Some(store)) = crate::podman_store::PodmanStore::probe()
+    if let Ok(Some(store)) = crate::app::podman_store::PodmanStore::probe()
         && let Ok(resolved) = store.resolve(image_ref)
     {
         return resolved.id;
@@ -356,7 +356,7 @@ fn materialize_via_podman_store(
     cache: &Path,
     rootfs: &Path,
 ) -> Result<bool, Error> {
-    let Some(store) = crate::podman_store::PodmanStore::probe()? else {
+    let Some(store) = crate::app::podman_store::PodmanStore::probe()? else {
         return Ok(false);
     };
     let Ok(resolved) = store.resolve(image_ref) else {
@@ -495,8 +495,8 @@ fn apply_overlay_layer(layer: &Path, rootfs: &Path) -> Result<(), Error> {
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         attempt += 1;
-        if !crate::podman_store::podman_database_locked(&stderr)
-            || !crate::podman_store::wait_for_podman_lock(attempt, started)
+        if !crate::app::podman_store::podman_database_locked(&stderr)
+            || !crate::app::podman_store::wait_for_podman_lock(attempt, started)
         {
             return Err(Error::msg(format!(
                 "cp failed applying overlay layer {} (exit {}): {}",

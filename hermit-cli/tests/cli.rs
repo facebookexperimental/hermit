@@ -9,10 +9,6 @@
 #[path = "common/exec_posix_timers.rs"]
 mod exec_posix_timers;
 
-#[cfg(feature = "dbt")]
-#[path = "common/dbt_placement_probe.rs"]
-mod dbt_placement_probe;
-
 #[path = "common/fault_sites.rs"]
 mod fault_sites;
 
@@ -297,12 +293,6 @@ static TOOL_OUTPUT_PROTECTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SOCKET_DONTWAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SOCKET_ERRQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FATAL_SIGNAL_FUTEX_WAITERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
-#[cfg(feature = "dbt")]
-static CLOCK_RLIMIT_PARITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
-#[cfg(feature = "dbt")]
-static COPIED_SCHEDULER_QUERY_GUEST: OnceLock<PathBuf> = OnceLock::new();
-#[cfg(feature = "dbt")]
-static COPIED_PRIORITY_QUERY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_RT_SIGNAL_PENDING_OBSERVED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -5509,22 +5499,40 @@ fn analyze_rejects_backend_in_its_run_arguments() {
     }
 }
 
-#[test]
-fn run_rejects_unknown_backends_during_argument_parsing() {
-    let args = ["--backend", "unknown", "run", "--", "/bin/true"];
-    let output = hermit(&args);
-
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = stderr(&output);
-    assert!(
-        stderr.contains("invalid value 'unknown'"),
-        "unexpected error:\n{stderr}"
+/// The core executable's `--backend` accepts only its built-in backends. Any
+/// other name, including those of the DBT, SaBRe and e9patch extensions that
+/// left core, is an executable-selected backend, and this executable refuses it
+/// at its dispatch boundary, before the run is parsed: it never substitutes a
+/// built-in backend and never starts the guest. The exact cause after the
+/// shared prefix depends on the environment (an inherited `LD_*` override, or a
+/// build that measured no extension compatibility), so the shared prefix is
+/// what the test pins, together with the hermit-refusal status.
+fn assert_non_core_backend_refused_at_dispatch(args: &[&str]) {
+    let output = hermit(args);
+    assert_hermit_refusal_contains(
+        &output,
+        Refusal::Hermit,
+        &["Executable dispatch refused; no backend was substituted"],
     );
-    for backend in ["ptrace", "dbt", "kvm"] {
-        assert!(
-            stderr.contains(backend),
-            "missing {backend:?} in:\n{stderr}"
-        );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains(NON_CORE_BACKEND_GUEST_MARKER),
+        "{args:?}: the guest ran"
+    );
+}
+
+const NON_CORE_BACKEND_GUEST_MARKER: &str = "non-core-backend-guest-must-not-start";
+
+#[test]
+fn run_refuses_non_core_backends_at_dispatch() {
+    for backend in ["unknown", "dbt", "sabre", "e9patch"] {
+        assert_non_core_backend_refused_at_dispatch(&[
+            "--backend",
+            backend,
+            "run",
+            "--",
+            "/bin/echo",
+            NON_CORE_BACKEND_GUEST_MARKER,
+        ]);
     }
 }
 
@@ -6057,13 +6065,14 @@ fn run_dbt_executes_integrated_backend() {
     assert_success(&output, &args);
 }
 
-/// Only the ptrace backend serves gdb. The KVM, DBT and SaBRe backends used to
-/// take `--gdbserver` and run the guest without a gdbserver, `--strict` runs
+/// Only the ptrace backend serves gdb. The KVM backend used to take
+/// `--gdbserver` and run the guest without a gdbserver, `--strict` runs
 /// included, so the debugger waited on a port nothing served; now the run is
 /// refused before anything starts, naming the remedy, and so is
 /// `--namespace-only`, which runs no tracer. A backend that cannot even start
 /// on this host is refused the same way: the refusal comes before any backend
-/// is probed.
+/// is probed. (The DBT and SaBRe cases left core with those backends; the
+/// in-guest LiteInst backends refuse `--gdbserver` on their own.)
 #[test]
 fn backends_without_a_gdbserver_refuse_gdbserver_before_starting_the_guest() {
     let _guard = hermit_run_guard();
@@ -6078,20 +6087,19 @@ fn backends_without_a_gdbserver_refuse_gdbserver_before_starting_the_guest() {
             .expect("failed to read the taken address")
     );
     let mut cases: Vec<(Vec<&str>, &str, String)> = Vec::new();
-    for backend in ["kvm", "dbt", "sabre"] {
-        for (options, option) in [
-            (&["--gdbserver"][..], "--gdbserver"),
-            (&strict[..], "--gdbserver"),
-            (&[dap_listen.as_str()][..], "--dap-listen"),
-        ] {
-            let mut args = vec!["--backend", backend, "run"];
-            args.extend_from_slice(options);
-            cases.push((
-                args,
-                option,
-                format!("the {backend} backend has none, so no debugger could attach; run it with the ptrace backend: drop --backend={backend}"),
-            ));
-        }
+    let backend = "kvm";
+    for (options, option) in [
+        (&["--gdbserver"][..], "--gdbserver"),
+        (&strict[..], "--gdbserver"),
+        (&[dap_listen.as_str()][..], "--dap-listen"),
+    ] {
+        let mut args = vec!["--backend", backend, "run"];
+        args.extend_from_slice(options);
+        cases.push((
+            args,
+            option,
+            format!("the {backend} backend has none, so no debugger could attach; run it with the ptrace backend: drop --backend={backend}"),
+        ));
     }
     cases.push((
         vec!["run", "--namespace-only", "--gdbserver"],
@@ -6131,8 +6139,9 @@ fn backends_without_a_gdbserver_refuse_gdbserver_before_starting_the_guest() {
 #[test]
 fn timerless_backends_refuse_explicit_preemption_before_starting_the_guest() {
     let _guard = hermit_run_guard();
-    // KVM left the timerless set with Reverie 9443a6b2.
-    for backend in ["dbt", "sabre", "liteinst", "in-guest-trap"] {
+    // KVM left the timerless set with Reverie 9443a6b2; DBT and SaBRe left
+    // core.
+    for backend in ["liteinst", "in-guest-trap"] {
         for requested in [
             vec!["--max-timeslice=200000000"],
             vec!["--preemption-timeout=1000"],
@@ -6385,12 +6394,6 @@ fn dbt_runs_with_a_resolved_or_explicitly_disabled_maximum() {
     if !dbt_unavailable("dbt_runs_with_a_resolved_or_explicitly_disabled_maximum") {
         assert_timerless_default_and_disabled_maximum_run("dbt");
     }
-}
-
-#[test]
-#[cfg(feature = "sabre")]
-fn sabre_runs_with_a_resolved_or_explicitly_disabled_maximum() {
-    assert_timerless_default_and_disabled_maximum_run("sabre");
 }
 
 #[test]
@@ -15914,118 +15917,6 @@ fn run_dbt_verify_returns_with_blocked_stdin_source_after_both_runs() {
 }
 
 #[test]
-#[cfg(feature = "dbt")]
-fn run_dbt_private_placement_preserves_cli_echo() {
-    assert!(!dbt_unavailable(
-        "run_dbt_private_placement_preserves_cli_echo"
-    ));
-    let _guard = hermit_run_guard();
-    let probe = dbt_placement_probe::Probe::new(true);
-    let (install, bind) = probe.launch();
-    let bind = bind.expect("CLI observation needs its explicit writable bind");
-    let observer = format!("LD_PRELOAD={}", probe.observer().display());
-    let args = [
-        "--backend=dbt",
-        "run",
-        bind.as_str(),
-        "--env",
-        observer.as_str(),
-        "--",
-        "/bin/echo",
-        "hello",
-    ];
-    let mut command = hermit_command(&args);
-    command
-        .env("HERMIT_INSTALL_DIR", install)
-        .env("HERMIT_REQUIRE_DBT", "1");
-    let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
-    assert_success(&output, &args);
-    assert_eq!(output.stdout, b"hello\n");
-    probe.assert_zero(1, false);
-}
-
-#[test]
-#[cfg(feature = "dbt")]
-fn run_dbt_private_placement_preserves_stdin_verification() {
-    assert!(!dbt_unavailable(
-        "run_dbt_private_placement_preserves_stdin_verification"
-    ));
-    let _guard = hermit_run_guard();
-    let probe = dbt_placement_probe::Probe::new(true);
-    let (install, bind) = probe.launch();
-    let bind = bind.expect("CLI observation needs its explicit writable bind");
-    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let report_path = root.path().join("verdict.json");
-    let observer = format!("LD_PRELOAD={}", probe.observer().display());
-    let args = [
-        "--backend=dbt",
-        "run",
-        bind.as_str(),
-        "--env",
-        observer.as_str(),
-        "--strict",
-        "--verify",
-        "--verify-strict",
-        "--verify-json",
-        report_path.to_str().unwrap(),
-        "--",
-        "/bin/cat",
-    ];
-    // The existing pipe helper closes its writer after these bytes. Cat must
-    // read that EOF in both executions; output must be emitted only once.
-    let input = b"first\0line\nlast-without-newline\xff";
-    // Same pipe/EOF ownership as hermit_with_stdin, with only child-local staging.
-    let output = hermit_test::hermit_output_with(&format!("hermit {args:?}"), || {
-        let mut command = hermit_command(&args);
-        let mut child = command
-            .env("HERMIT_INSTALL_DIR", install)
-            .env("HERMIT_REQUIRE_DBT", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
-        child
-            .stdin
-            .take()
-            .expect("hermit stdin should be piped")
-            .write_all(input)
-            .expect("failed to write hermit stdin");
-        let output = child
-            .wait_with_output()
-            .unwrap_or_else(|error| panic!("failed to wait for hermit with {args:?}: {error}"));
-        (output, ())
-    })
-    .0;
-    assert_success(&output, &args);
-    assert_eq!(output.stdout, input);
-    let report: serde_json::Value =
-        serde_json::from_slice(&fs::read(report_path).unwrap()).unwrap();
-    assert_eq!(report["verdict"], "matched", "{report}");
-    assert_eq!(report["bitwise_parity"], true, "{report}");
-    assert_eq!(report["comparison"]["strictness"], "canonical");
-    assert_eq!(report["comparison"]["compare_io_buffers"], true);
-    for side in ["left", "right"] {
-        assert_eq!(report["compared_outputs"][side]["exit_code"], 0, "{report}");
-        assert_eq!(
-            report["compared_outputs"][side]["stdout_bytes"],
-            input.len(),
-            "{report}"
-        );
-        assert_eq!(
-            report["compared_outputs"][side]["stdout_sha256"],
-            detcore::Digest::new(input).to_string(),
-            "{report}"
-        );
-        assert!(
-            report["compared_log_messages"][side].as_u64().unwrap() > 0,
-            "{report}"
-        );
-    }
-    probe.assert_zero(2, true);
-}
-
-#[test]
 fn run_dbt_verify_replays_stdin_bytes_and_eof() {
     if dbt_unavailable("run_dbt_verify_replays_stdin_bytes_and_eof") {
         return;
@@ -20186,7 +20077,7 @@ fn run_kvm_reports_the_launcher_s_supplementary_groups() {
 
 #[test]
 fn namespace_only_rejects_every_explicit_backend() {
-    for backend in ["ptrace", "dbt", "kvm"] {
+    for backend in ["ptrace", "liteinst", "in-guest-trap", "kvm"] {
         let args = [
             "--backend",
             backend,
@@ -20477,31 +20368,6 @@ fn backend_accepted_in_global_position() {
 }
 
 #[test]
-fn sabre_backend_validation_honors_command_scope() {
-    let non_run = hermit(&["--backend", "sabre", "record", "list"]);
-    assert_hermit_refusal_contains(
-        &non_run,
-        Refusal::Hermit,
-        &["SaBRe backend", "only through", "strace"],
-    );
-
-    let log = hermit(&[
-        "--backend",
-        "sabre",
-        "--log",
-        "info",
-        "strace",
-        "--",
-        "/bin/true",
-    ]);
-    assert_hermit_refusal_contains(
-        &log,
-        Refusal::Hermit,
-        &["does not support --log or --log-file"],
-    );
-}
-
-#[test]
 fn sabre_rpc_socket_is_hidden_from_proc_environ() {
     let hermit_binary = Path::new(env!("CARGO_BIN_EXE_hermit"));
     let executable_dir = hermit_binary.parent().unwrap();
@@ -20612,14 +20478,15 @@ fn sabre_rpc_socket_ignores_host_tmpdir_hidden_by_container_tmp() {
 
 #[test]
 fn global_position_rejects_unknown_backends() {
-    let args = ["--backend", "unknown", "run", "--", "/bin/true"];
-    let output = hermit(&args);
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = stderr(&output);
-    assert!(
-        stderr.contains("invalid value 'unknown'"),
-        "unexpected error:\n{stderr}"
-    );
+    for backend in ["--backend=unknown", "--backend=dbt"] {
+        assert_non_core_backend_refused_at_dispatch(&[
+            backend,
+            "run",
+            "--",
+            "/bin/echo",
+            NON_CORE_BACKEND_GUEST_MARKER,
+        ]);
+    }
 }
 
 #[test]
@@ -25502,32 +25369,6 @@ fn max_log_bytes_exits_promptly_with_a_vmm_guest_and_stderr_a_full_pipe() {
     .assert_exits_promptly_with_full_unread_stderr(|_| {});
 }
 
-/// `--backend=e9patch` (e9patch preprocessing with the ptrace backend) names
-/// its engagement on stderr before the run starts. For a main executable that
-/// is not ELF there is nothing to rewrite, and the tools are never run. Hermit
-/// still requires both to be executable files before it starts, and no
-/// validation node stages e9patch, so the test names `/bin/false` for each:
-/// had hermit run either, the run would fail rather than reach the cap.
-#[test]
-fn max_log_bytes_exits_promptly_with_e9patch_on_a_script_and_stderr_a_full_pipe() {
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let script = noisy_guest_script(directory.path(), "noisy.sh");
-    CappedRun {
-        global: &["--backend=e9patch"],
-        guest: &[&script],
-        prints: Some(
-            ":: Backend: e9patch preprocessing + ptrace runtime; mapped_sites=0; \
-             main_executable=non-ELF; preprocessing=not-applicable",
-        ),
-        ..CappedRun::default()
-    }
-    .assert_exits_promptly_with_full_unread_stderr(|command| {
-        command
-            .env(hermit::e9patch::E9TOOL_ENV, "/bin/false")
-            .env(hermit::e9patch::E9PATCH_BACKEND_ENV, "/bin/false");
-    });
-}
-
 /// A `--happens-before` spec with one anchor at a function the guest does not
 /// have.
 fn unresolvable_happens_before_spec(directory: &Path) -> String {
@@ -29957,25 +29798,23 @@ fn max_log_bytes_verify_exits_promptly_when_stderr_fills_after_run1() {
 /// the flag instead, with 122 (round-2 review of
 /// https://github.com/rrnewton/hermit/pull/3686, finding 2). LiteInst, which
 /// runs only in-guest, under `--no-namespace` spawns a guest that is not traced
-/// and that no PID namespace contains, DBT is refused in every namespace mode until the cap
-/// is tested ending a run in its container, and KVM's host processes under `--no-namespace` are not
-/// shown to die with hermit. SaBRe under `--no-namespace` hands its guest to the
-/// supervisor worker stopped and untraced, before `PTRACE_O_EXITKILL` binds it
-/// (round-3 review of the same pull request, finding 2). The refusal comes
-/// before backend availability and before any SaBRe artifact is resolved, so it
-/// holds in builds where none of these backends is available. `analyze` and `bisect` trials skip
+/// and that no PID namespace contains, and KVM's host processes under
+/// `--no-namespace` are not shown to die with hermit. (The DBT and SaBRe cases
+/// left core with those backends.) The refusal comes before backend
+/// availability, so it holds in builds where none of these backends is
+/// available. `analyze` and `bisect` trials skip
 /// `run`'s own check, so both refuse `--no-namespace` before any trial, with
 /// KVM and with the default ptrace backend, and bisect before it reads its
-/// schedules (the paths below do not exist). ptrace and e9patch under
-/// `--no-namespace` are refused too (round-4c review, finding 1); their cases,
-/// with the guest's marker and the run without the flag, are in
+/// schedules (the paths below do not exist). ptrace under `--no-namespace` is
+/// refused too (round-4c review, finding 1); its cases, with the guest's
+/// marker and the run without the flag, are in
 /// `max_log_bytes_is_refused_under_no_namespace_on_the_ptrace_runtime`.
 #[test]
 fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
     let _lock = hermit_run_guard();
     /// Arguments and the configuration the refusal must name.
     type Case<'a> = (&'a [&'a str], &'a str);
-    let cases: [Case; 9] = [
+    let cases: [Case; 7] = [
         (
             &[
                 "--max-log-bytes=64K",
@@ -29991,16 +29830,6 @@ fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
         (
             &[
                 "--max-log-bytes=64K",
-                "--backend=dbt",
-                "run",
-                "--",
-                "/bin/true",
-            ],
-            "--backend=dbt",
-        ),
-        (
-            &[
-                "--max-log-bytes=64K",
                 "--backend=kvm",
                 "run",
                 "--no-namespace",
@@ -30008,17 +29837,6 @@ fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
                 "/bin/true",
             ],
             "--backend=kvm and --no-namespace",
-        ),
-        (
-            &[
-                "--max-log-bytes=64K",
-                "--backend=sabre",
-                "run",
-                "--no-namespace",
-                "--",
-                "/bin/true",
-            ],
-            "--backend=sabre and --no-namespace",
         ),
         (
             &[
@@ -30112,12 +29930,12 @@ fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
 /// clone, so under `--no-namespace` the guest is bound to nothing in between.
 /// A charged write can cross the cap there (the outer process's asynchronous
 /// file appender draining a queued record), and exiting 123 would leave the
-/// guest running. So ptrace, and e9patch, whose guest runs on the ptrace
-/// runtime, refuse the flag under `--no-namespace` with 122, with or without
-/// `--log-file`, before the guest exists: the marker it would print is absent.
-/// Without the flag the same command is not refused: ptrace runs the guest,
-/// which prints its marker, and e9patch fails as it always has under
-/// `--no-namespace`, without naming the flag.
+/// guest running. So ptrace, the default or named explicitly, refuses the flag
+/// under `--no-namespace` with 122, with or without `--log-file`, before the
+/// guest exists: the marker it would print is absent. Without the flag the same
+/// command is not refused: ptrace runs the guest, which prints its marker.
+/// (The e9patch case, whose guest also runs on the ptrace runtime, left core
+/// with the e9patch preprocessing.)
 #[test]
 fn max_log_bytes_is_refused_under_no_namespace_on_the_ptrace_runtime() {
     let _lock = hermit_run_guard();
@@ -30126,7 +29944,7 @@ fn max_log_bytes_is_refused_under_no_namespace_on_the_ptrace_runtime() {
     let log = directory.path().join("hermit.log");
     let log = log.to_str().unwrap();
     let guest = ["--", "/bin/sh", "-c", "echo hermit-3686-guest-ran"];
-    for backend in [None, Some("--backend=e9patch")] {
+    for backend in [None, Some("--backend=ptrace")] {
         for log_file in [None, Some(log)] {
             let mut without_flag: Vec<&str> = Vec::new();
             without_flag.extend(backend);
@@ -30172,74 +29990,33 @@ fn max_log_bytes_is_refused_under_no_namespace_on_the_ptrace_runtime() {
                 "{without_flag:?}: {output:?}"
             );
             assert!(!err.contains("--max-log-bytes"), "{without_flag:?}: {err}");
-            if backend.is_none() {
-                assert_eq!(
-                    output.status.code(),
-                    Some(0),
-                    "{without_flag:?}: {output:?}"
-                );
-                assert!(out.contains(MARKER), "{without_flag:?}: {out} {err}");
-            }
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{without_flag:?}: {output:?}"
+            );
+            assert!(out.contains(MARKER), "{without_flag:?}: {out} {err}");
         }
     }
 }
 
-/// `hermit --backend=sabre strace` does not go through `run`. It launches the
-/// SaBRe runner as a plain child of hermit, which no PID namespace,
-/// parent-death signal or ptrace attachment binds to hermit, and the trace
-/// reaches the inherited stderr without passing through hermit's charged
-/// writers. The cap could neither count that trace nor stop the guest, so
-/// hermit refuses the flag there with 122 (round-3 review of
-/// https://github.com/rrnewton/hermit/pull/3686, finding 6). The refusal comes
-/// before any SaBRe artifact is resolved: the HERMIT_SABRE_* variables are
-/// removed below, and resolving them first would fail with "the sabre backend
-/// needs HERMIT_SABRE_RUNNER" instead, in builds with and without SaBRe.
-///
-/// strace on any other backend is not refused. The M1 strace command runs only
-/// on SaBRe, so there it fails exactly as it does without the flag, by asking
-/// for `--backend sabre`, with the same status and the same stderr.
+/// The core executable has no syscall tracer: `strace` is a command of an
+/// executable-selected backend whose adapter supplies one, and only there can
+/// `--max-log-bytes` be unenforceable (the SaBRe case left core with that
+/// backend). So strace on a core backend is not refused for the cap: it fails
+/// exactly as it does without the flag, with the same status and the same
+/// stderr, by saying that this executable does not support syscall tracing.
 #[test]
-fn max_log_bytes_is_refused_for_sabre_strace_and_leaves_other_strace_alone() {
+fn max_log_bytes_leaves_core_strace_alone() {
     let strace = |args: &[&str]| {
         hermit_test::hermit_output(
             "hermit run",
             hermit_command(args)
                 .env_remove("HERMIT_LOG")
                 .env_remove("HERMIT_LOG_FILE")
-                .env_remove("HERMIT_SABRE_RUNNER")
-                .env_remove("HERMIT_SABRE_BINARY")
-                .env_remove("HERMIT_SABRE_PLUGIN")
                 .stdin(Stdio::null()),
         )
     };
-    let args = [
-        "--max-log-bytes=1M",
-        "--backend=sabre",
-        "strace",
-        "/bin/true",
-    ];
-    let refused = strace(&args);
-    let text = stderr(&refused);
-    assert_eq!(
-        refused.status.code(),
-        Some(HERMIT_POLICY_REFUSAL_EXIT),
-        "{args:?}: {refused:?}"
-    );
-    assert!(
-        text.contains(
-            "--max-log-bytes cannot be enforced with strace --backend=sabre: the SaBRe \
-             runner's trace output does not pass through hermit's charged writers, and the \
-             runner is a plain child of hermit with no PID namespace, parent-death signal or \
-             ptrace attachment binding it, so the cap could neither count the trace nor stop \
-             the guest; drop --max-log-bytes"
-        ),
-        "{args:?}: {text}"
-    );
-    assert!(
-        text.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
-        "{args:?}: {text}"
-    );
-
     for backend in [None, Some("--backend=ptrace")] {
         let plain: Vec<&str> = backend.into_iter().chain(["strace", "/bin/true"]).collect();
         let capped: Vec<&str> = ["--max-log-bytes=1M"]
@@ -30248,18 +30025,24 @@ fn max_log_bytes_is_refused_for_sabre_strace_and_leaves_other_strace_alone() {
             .collect();
         let without = strace(&plain);
         let with = strace(&capped);
-        assert_ne!(
-            with.status.code(),
-            Some(HERMIT_POLICY_REFUSAL_EXIT),
-            "{capped:?}: {with:?}"
-        );
         assert_eq!(
             (with.status.code(), stderr(&with)),
             (without.status.code(), stderr(&without)),
             "{capped:?} must fail exactly as {plain:?} does"
         );
+        assert_eq!(
+            with.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{capped:?}: {with:?}"
+        );
         assert!(
-            stderr(&with).contains("the M1 strace command requires `--backend sabre`"),
+            !stderr(&with).contains("--max-log-bytes"),
+            "{capped:?}: the cap was refused: {}",
+            stderr(&with)
+        );
+        assert!(
+            stderr(&with)
+                .contains("executable-selected backend `core` does not support syscall tracing"),
             "{capped:?}: {}",
             stderr(&with)
         );
@@ -36336,6 +36119,9 @@ const FAULT_SITES_DRIVEN_ELSEWHERE: [(&str, &str); 2] = [
 #[test]
 fn no_container_site_is_unreachable_by_the_fault_injector() {
     use sha2::Digest;
+    const LIBRARY: &str = include_str!("../src/lib.rs");
+    const MAIN: &str = include_str!("../src/bin/hermit/main.rs");
+    const APP: &str = include_str!("../src/bin/hermit/mod.rs");
     const RECORD: &str = include_str!("../src/bin/hermit/record_start.rs");
     const CONTAINER: &str = include_str!("../src/bin/hermit/container.rs");
     const OWNER: &str = include_str!("../src/bin/hermit/owned_container.rs");
@@ -36343,8 +36129,44 @@ fn no_container_site_is_unreachable_by_the_fault_injector() {
     const REPLAY: &str = include_str!("../src/bin/hermit/replay.rs");
     const LIFECYCLE: &str = include_str!("../src/bin/hermit/cli_owned_lifecycle.rs");
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/hermit");
-    let sources = fault_sites::source_inventory(&root).expect("complete binary source inventory");
+    let library_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let library_kind = std::fs::symlink_metadata(&library_path)
+        .unwrap()
+        .file_type();
+    assert!(library_kind.is_file() && !library_kind.is_symlink());
+    let library_source = std::fs::read_to_string(&library_path).unwrap();
+    assert_eq!(
+        library_source, LIBRARY,
+        "library source changed since compilation"
+    );
+    assert!(fault_sites::binds_shared_app(&library_source));
+    let app_declaration = "#[path = \"bin/hermit/mod.rs\"]\npub mod app;";
+    assert_eq!(LIBRARY.matches(app_declaration).count(), 1);
+    for replacement in [
+        "#[path = \"bin/hermit/unexamined.rs\"]\npub mod app;",
+        "#[path = \"bin/hermit/../hermit/mod.rs\"]\npub mod app;",
+        "#[cfg(any())]\n#[path = \"bin/hermit/mod.rs\"]\npub mod app;",
+        "#[cfg_attr(unix, path = \"bin/hermit/mod.rs\")]\npub mod app;",
+        "#[path = \"bin/hermit/mod.rs\"]\n#[path = \"bin/hermit/mod.rs\"]\npub mod app;",
+        "pub mod app;",
+        "#[path = \"bin/hermit/mod.rs\"]\nmod app;",
+        "#[path = \"bin/hermit/mod.rs\"]\npub(crate) mod app;",
+        "#[path = \"bin/hermit/mod.rs\"]\npub mod other;",
+        "#[path = \"bin/hermit/mod.rs\"]\npub mod app {}",
+        "include!(\"bin/hermit/mod.rs\");",
+        "// #[path = \"bin/hermit/mod.rs\"] pub mod app;",
+    ] {
+        let mutant = LIBRARY.replacen(app_declaration, replacement, 1);
+        assert_ne!(mutant, LIBRARY);
+        assert!(!fault_sites::binds_shared_app(&mutant), "{replacement}");
+    }
+    let duplicate_app = format!("{LIBRARY}\n{app_declaration}\n");
+    assert!(!fault_sites::binds_shared_app(&duplicate_app));
+    let sources =
+        fault_sites::source_inventory(&root).expect("complete app and binary source inventory");
     for (name, compiled) in [
+        ("main.rs", MAIN),
+        ("mod.rs", APP),
         ("record_start.rs", RECORD),
         ("container.rs", CONTAINER),
         ("owned_container.rs", OWNER),
@@ -36398,6 +36220,10 @@ fn no_container_site_is_unreachable_by_the_fault_injector() {
         "byte-identical inputs must reuse only their pure inspections"
     );
     // These digests bind the exact in-memory bytes parsed above, not a later read.
+    eprintln!(
+        "FAULT_SITE_LIBRARY_SOURCE {}",
+        serde_json::json!({"path": "src/lib.rs", "bytes": library_source.len(), "sha256": format!("{:x}", sha2::Sha256::digest(library_source.as_bytes()))})
+    );
     for (name, source) in &sources {
         eprintln!(
             "FAULT_SITE_SOURCE {}",
@@ -36425,6 +36251,16 @@ fn no_container_site_is_unreachable_by_the_fault_injector() {
     // A newly created nested source is part of the filesystem universe too.
     let fixture = tempfile::tempdir().unwrap();
     std::fs::write(fixture.path().join("main.rs"), &sources["main.rs"]).unwrap();
+    std::fs::write(fixture.path().join("mod.rs"), &sources["mod.rs"]).unwrap();
+    for required in ["main.rs", "mod.rs"] {
+        std::fs::remove_file(fixture.path().join(required)).unwrap();
+        assert!(
+            fault_sites::source_inventory(fixture.path())
+                .unwrap_err()
+                .contains(required)
+        );
+        std::fs::write(fixture.path().join(required), &sources[required]).unwrap();
+    }
     std::fs::create_dir(fixture.path().join("new_module")).unwrap();
     std::fs::write(
         fixture.path().join("new_module/new_caller.rs"),
@@ -36547,6 +36383,7 @@ fn no_container_site_is_unreachable_by_the_fault_injector() {
         ),
         ("container.rs", "fn inject_test_fault(site: &str) {}"),
         ("main.rs", "mod owned_container;"),
+        ("mod.rs", "mod owned_container;"),
     ] {
         let mut changed = sources.clone();
         changed
@@ -36556,6 +36393,17 @@ fn no_container_site_is_unreachable_by_the_fault_injector() {
         assert!(
             check_sources(&changed).is_err(),
             "duplicate declaration: {file}: {extra}"
+        );
+    }
+    // The thin entrypoint and shared root both stay in the production audit.
+    for file in ["main.rs", "mod.rs"] {
+        let mut changed = sources.clone();
+        changed.get_mut(file).unwrap().push_str("\nfn root_boundary_mutant() { super::container::catch_child_panic_at(\"new.uncovered.root\", || Ok(())); }\n");
+        assert!(
+            check_sources(&changed)
+                .unwrap_err()
+                .contains("new.uncovered.root"),
+            "root source escaped coverage: {file}"
         );
     }
 
@@ -36891,6 +36739,11 @@ fn no_container_site_is_unreachable_by_the_fault_injector() {
         fault_sites::source_inventory(&root).unwrap(),
         sources,
         "source inventory changed during guard execution"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&library_path).unwrap(),
+        library_source,
+        "library app binding changed during guard execution"
     );
     let audit = audit.borrow();
     assert!(audit.requests() > audit.inspected_sources());
@@ -38055,52 +37908,48 @@ fn a_malformed_finalize_budget_is_refused() {
 /// own deadline, not hermit's. All five run correctly WITHOUT the flag, so it is
 /// the bound that fails, not the backend.
 ///
-/// ⚠️ `dbt` IS THE LOAD-BEARING CASE. The `RunOpts::main` DBT arm returns
-/// `run_dbt(..)` and never reaches `RunOpts::run`, so the first version of this
-/// check -- placed in `run()` -- covered every backend EXCEPT the one furthest
-/// from working, and dbt still accepted the flag and ran unbounded. Same shape
-/// as the `--namespace-only` second launch path. Move the check back into
-/// `run()` and this cell fails on dbt while the others still pass.
+/// The sabre and dbt cases left core with those backends; the core backend
+/// whose bound is unqualified is kvm. In-guest LiteInst refuses `--timeout`
+/// earlier, by its own name (`run_timeout_refusal_does_not_depend_on_backend_availability`).
 #[test]
 fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
     let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    for backend in ["sabre", "dbt", "kvm"] {
-        let output = hermit_test::hermit_output(
-            "hermit run",
-            hermit_command(&[
-                "--backend",
-                backend,
-                "run",
-                "--timeout",
-                "3",
-                "--",
-                "/bin/echo",
-                "unreachable",
-            ])
-            .stdin(Stdio::null()),
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let backend = "kvm";
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&[
+            "--backend",
+            backend,
+            "run",
+            "--timeout",
+            "3",
+            "--",
+            "/bin/echo",
+            "unreachable",
+        ])
+        .stdin(Stdio::null()),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
-        // EXIT-CLASS: hermit
-        assert_eq!(
-            output.status.code(),
-            Some(122),
-            "`--timeout` on `{backend}` must REFUSE (122), not accept a bound it \
-             cannot enforce. Got {:?}. stderr:\n{stderr}",
-            output.status
-        );
-        assert!(
-            stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
-            "a refusal is hermit working, and must not be reported as a failure. \
-             backend={backend} stderr:\n{stderr}"
-        );
-        assert!(
-            stderr.contains("not qualified"),
-            "the refusal must say the bound is unqualified on this backend, and \
-             point somewhere. backend={backend} stderr:\n{stderr}"
-        );
-    }
+    // EXIT-CLASS: hermit
+    assert_eq!(
+        output.status.code(),
+        Some(122),
+        "`--timeout` on `{backend}` must REFUSE (122), not accept a bound it \
+         cannot enforce. Got {:?}. stderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "a refusal is hermit working, and must not be reported as a failure. \
+         backend={backend} stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("not qualified"),
+        "the refusal must say the bound is unqualified on this backend, and \
+         point somewhere. backend={backend} stderr:\n{stderr}"
+    );
 }
 
 /// In-guest LiteInst (https://github.com/rrnewton/hermit/issues/3520) cannot
@@ -38581,7 +38430,7 @@ fn liteinst_in_guest_verify_compares_the_records_the_guest_forwards() {
 
 /// Run 1's retained verify log of `/bin/true` under `backend`, with one fixed
 /// epoch, kept in `logs`.
-#[cfg(any(feature = "liteinst", feature = "dbt"))]
+#[cfg(feature = "liteinst")]
 fn verify_log_of_true(backend: &str, logs: &Path) -> PathBuf {
     let log_dir = logs.to_str().expect("UTF-8 temporary path");
     // `--log info`, as the e2e harness runs every verify cell: at the default
@@ -38623,30 +38472,6 @@ fn verify_log_of_true(backend: &str, logs: &Path) -> PathBuf {
         panic!("expected one retained run 1 log in {log_dir}, found {golden:?}");
     };
     golden.clone()
-}
-
-/// Under DBT each guest `rdtsc` is answered by Detcore, as under ptrace: the
-/// read is charged and logged ("inbound rdtsc"), and the guest's TSC is
-/// Detcore's virtual clock. Before, the DBT client answered every read from its
-/// own fixed-stride counter, so DBT's run 1 log of `/bin/true` held none of the
-/// 10 rdtsc records ptrace's does.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_rdtsc_is_answered_by_detcore_as_under_ptrace() {
-    let _lock = hermit_run_guard();
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let (ptrace_dir, dbt_dir) = (dir.path().join("ptrace"), dir.path().join("dbt"));
-    fs::create_dir_all(&ptrace_dir).unwrap();
-    fs::create_dir_all(&dbt_dir).unwrap();
-    let ptrace = fs::read_to_string(verify_log_of_true("ptrace", &ptrace_dir)).unwrap();
-    let dbt = fs::read_to_string(verify_log_of_true("dbt", &dbt_dir)).unwrap();
-    let reads = ptrace.matches("inbound rdtsc").count();
-    assert!(reads > 0, "ptrace logged no rdtsc:\n{ptrace}");
-    assert_eq!(
-        dbt.matches("inbound rdtsc").count(),
-        reads,
-        "ptrace:\n{ptrace}\ndbt:\n{dbt}"
-    );
 }
 
 /// Detcore's syscall outputs respect page protection, as the kernel's own
@@ -39620,543 +39445,6 @@ fn concurrent_runs_do_not_share_ipc() {
         );
         assert_eq!(released, "released: yes\n", "{mode}: {holder_stderr}");
     }
-}
-
-/// Under DBT each guest `cpuid` is answered by Detcore, as under ptrace, so
-/// the two print the same CPUID rows (every basic leaf for subleaves 0 to 2 and
-/// every extended leaf), and DBT's `/proc/cpuinfo` lists HLE and RTM exactly
-/// when CPUID does. Before, the DBT client answered from its own copy of the
-/// table: leaf 7 EBX was 0x001807a9 (HLE and RTM cleared) where ptrace's is
-/// 0x00180fb9, and DBT's `/proc/cpuinfo` was the host's.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_cpuid_rows_match_ptrace() {
-    let _lock = hermit_run_guard();
-    let guest = futex_c_guest(&CPUID_TABLE_DUMP_GUEST, "cpuid_table_dump")
-        .to_str()
-        .unwrap()
-        .to_owned();
-    let run = |backend: &str| {
-        let args = [
-            "--backend",
-            backend,
-            "run",
-            "--strict",
-            "--base-env=minimal",
-            "--",
-            guest.as_str(),
-        ];
-        let output = hermit(&args);
-        assert_success(&output, &args);
-        stdout(&output)
-    };
-    let ptrace = run("ptrace");
-    assert!(
-        ptrace.contains("00000007.0: 00000000 00180fb9 00000000 00000000\n"),
-        "{ptrace}"
-    );
-    assert!(!ptrace.contains("MISMATCH"), "{ptrace}");
-    assert_eq!(run("dbt"), ptrace);
-}
-
-/// Under DBT, resource limits and clock resolutions are Detcore's, as under
-/// ptrace, so the two print the same bytes: getrlimit and prlimit64 for every
-/// resource, the errors for an unknown resource and a raised hard limit, a
-/// lowered soft limit read back, and clock_getres and the invalid-clock error
-/// for each clock. The DBT client no longer keeps a limit or clock table of
-/// its own (A8 step 2), so nothing but Detcore can answer these.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_rlimit_and_clock_answers_match_ptrace() {
-    let _lock = hermit_run_guard();
-    let guest = futex_c_guest(&CLOCK_RLIMIT_PARITY_GUEST, "clock_rlimit_parity")
-        .to_str()
-        .unwrap()
-        .to_owned();
-    let run = |backend: &str| {
-        let args = [
-            "--backend",
-            backend,
-            "run",
-            "--strict",
-            "--base-env=minimal",
-            "--",
-            guest.as_str(),
-            "limits",
-        ];
-        let output = hermit(&args);
-        assert_success(&output, &args);
-        stdout(&output)
-    };
-    let ptrace = run("ptrace");
-    assert!(ptrace.contains("rlimit lowered: 0 40 "), "{ptrace}");
-    assert!(
-        ptrace.contains("clock_gettime invalid: -1 EINVAL\n"),
-        "{ptrace}"
-    );
-    assert_eq!(run("dbt"), ptrace);
-}
-
-/// A vfork child's clock read is refused by name under DBT. Ptrace's Detcore
-/// answers it, but a copied DBT child cannot enter Detcore, and the client no
-/// longer answers from a clock of its own (A8 step 2), so strict execution
-/// stops the run rather than let the child read the host's clock. Before, the
-/// client's own counter answered, a second clock beside Detcore's.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_refuses_a_vfork_childs_clock_read_by_name() {
-    let _lock = hermit_run_guard();
-    let guest = futex_c_guest(&CLOCK_RLIMIT_PARITY_GUEST, "clock_rlimit_parity")
-        .to_str()
-        .unwrap()
-        .to_owned();
-    let args = |backend| {
-        [
-            "--backend",
-            backend,
-            "run",
-            "--strict",
-            "--base-env=minimal",
-            "--",
-            guest.as_str(),
-            "vfork-clock",
-        ]
-        .map(str::to_owned)
-    };
-    let ptrace_args = args("ptrace");
-    let ptrace_args: Vec<&str> = ptrace_args.iter().map(String::as_str).collect();
-    let ptrace = hermit(&ptrace_args);
-    assert_success(&ptrace, &ptrace_args);
-    assert_eq!(stdout(&ptrace), "vfork child clock_gettime: ok, exit 0\n");
-
-    let dbt_args = args("dbt");
-    let dbt_args: Vec<&str> = dbt_args.iter().map(String::as_str).collect();
-    let dbt = hermit(&dbt_args);
-    assert!(!dbt.status.success(), "{}", stderr(&dbt));
-    assert!(
-        stderr(&dbt).contains(&format!(
-            "detcore-dbt: unsupported syscall {} in copied child",
-            libc::SYS_clock_gettime
-        )),
-        "{}",
-        stderr(&dbt)
-    );
-}
-
-/// A copied DBT child must refuse a scheduling-policy query in strict mode.
-/// Its non-strict native path and the ordinary shared Detcore answer are distinct.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_refuses_a_vfork_childs_scheduler_policy_query_by_name() {
-    let _lock = hermit_run_guard();
-    let guest = futex_c_guest(&COPIED_SCHEDULER_QUERY_GUEST, "copied_scheduler_query")
-        .to_str()
-        .unwrap();
-    let batch = |mut command: Command| {
-        // SAFETY: the raw syscall only changes this child before exec; it does
-        // not allocate, acquire locks, or alter the test process's policy.
-        unsafe {
-            command.pre_exec(|| {
-                let parameter = libc::sched_param { sched_priority: 0 };
-                if libc::syscall(
-                    libc::SYS_sched_setscheduler,
-                    0,
-                    libc::SCHED_BATCH,
-                    &parameter,
-                ) == -1
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        command
-    };
-    let mut native = Command::new(guest);
-    native.arg("vfork");
-    let native = batch(native)
-        .output()
-        .expect("native SCHED_BATCH vfork control");
-    assert!(native.status.success(), "{native:?}");
-    assert_eq!(
-        stdout(&native),
-        "after sched_getscheduler\nvfork sched_getscheduler: policy=3 errno=0 exit=0\n"
-    );
-    let run = |backend, strictness, mode| {
-        let args = [
-            "--backend",
-            backend,
-            "run",
-            strictness,
-            "--base-env=minimal",
-            "--",
-            guest,
-            mode,
-        ];
-        hermit_test::hermit_output("scheduler policy query", &mut batch(hermit_command(&args)))
-    };
-    // The ordinary shared Tool retains its existing SCHED_OTHER policy even
-    // though the launcher and the native control inherit SCHED_BATCH.
-    for backend in ["dbt", "ptrace"] {
-        let output = run(backend, "--strict", "ordinary");
-        assert!(output.status.success(), "{backend}: {output:?}");
-        assert_eq!(
-            stdout(&output),
-            "ordinary sched_getscheduler: policy=0 errno=0\n"
-        );
-    }
-    let ptrace = run("ptrace", "--strict", "vfork");
-    assert!(ptrace.status.success(), "{ptrace:?}");
-    assert_eq!(
-        stdout(&ptrace),
-        "after sched_getscheduler\nvfork sched_getscheduler: policy=0 errno=0 exit=0\n"
-    );
-    // This full transcript proves actual native policy inheritance; do not
-    // assume that the guest kept the launcher's policy or accept a fixed zero.
-    let passthrough = run("dbt", "--allow-unsupported-syscalls", "vfork");
-    assert!(passthrough.status.success(), "{passthrough:?}");
-    assert_eq!(passthrough.stdout, native.stdout);
-
-    let refused = run("dbt", "--strict", "vfork");
-    assert_eq!(refused.status.code(), Some(101), "{refused:?}");
-    assert!(
-        stderr(&refused).contains("unsupported syscall sched_getscheduler (145) in copied child"),
-        "{refused:?}"
-    );
-    assert!(
-        stderr(&refused).contains(&format!(
-            "detcore-dbt: unsupported syscall {} in copied child",
-            libc::SYS_sched_getscheduler
-        )),
-        "{refused:?}"
-    );
-    assert!(
-        !stdout(&refused).contains("after sched_getscheduler"),
-        "{refused:?}"
-    );
-}
-
-/// A copied child has no shared Tool memory writer for scheduler parameters.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_refuses_a_vfork_childs_scheduler_parameter_query_by_name() {
-    let _lock = hermit_run_guard();
-    let guest = futex_c_guest(&COPIED_SCHEDULER_QUERY_GUEST, "copied_scheduler_query")
-        .to_str()
-        .unwrap();
-    let native = Command::new(guest)
-        .arg("param-vfork")
-        .output()
-        .expect("native sched_getparam vfork control");
-    assert!(native.status.success(), "{native:?}");
-    let vfork_output = "after sched_getparam\n\
-        vfork sched_getparam: result=0 errno=0 priority=0 canaries=1 exit=0\n";
-    assert_eq!(stdout(&native), vfork_output);
-    let run = |backend, strictness, mode| {
-        let args = [
-            "--backend",
-            backend,
-            "run",
-            strictness,
-            "--base-env=minimal",
-            "--",
-            guest,
-            mode,
-        ];
-        hermit_test::hermit_output("scheduler parameter query", &mut hermit_command(&args))
-    };
-    // A zero priority alone does not prove Tool mediation. These complete
-    // target/null transcripts characterize the shared handler's existing
-    // PID-existence and null-pointer limitations, not native Linux semantics.
-    for backend in ["dbt", "ptrace"] {
-        let output = run(backend, "--strict", "param-ordinary");
-        assert!(output.status.success(), "{backend}: {output:?}");
-        assert_eq!(
-            stdout(&output),
-            "ordinary sched_getparam: result=0 errno=0 priority=0 canaries=1\n"
-        );
-        let targets = run(backend, "--strict", "param-targets");
-        assert!(targets.status.success(), "{backend}: {targets:?}");
-        assert_eq!(
-            stdout(&targets),
-            "parameter identities: child=1 parent=1\n\
-             sched_getparam zero: result=0 errno=0 priority=0 canaries=1\n\
-             sched_getparam self: result=0 errno=0 priority=0 canaries=1\n\
-             sched_getparam live: result=0 errno=0 priority=0 canaries=1\n\
-             sched_getparam absent: result=0 errno=0 priority=0 canaries=1\n\
-             sched_getparam negative: result=0 errno=0 priority=0 canaries=1\n\
-             sched_getparam null: result=0 errno=0 priority=324508639 canaries=1\n\
-             sched_getparam bad: result=-1 errno=14 priority=324508639 canaries=1\n\
-             parameter wait: exit=37\nsched-getparam-targets=ok\n"
-        );
-    }
-    let ptrace = run("ptrace", "--strict", "param-vfork");
-    assert!(ptrace.status.success(), "{ptrace:?}");
-    assert_eq!(stdout(&ptrace), vfork_output);
-    let passthrough = run("dbt", "--allow-unsupported-syscalls", "param-vfork");
-    assert!(passthrough.status.success(), "{passthrough:?}");
-    assert_eq!(passthrough.stdout, native.stdout);
-
-    let refused = run("dbt", "--strict", "param-vfork");
-    assert_eq!(refused.status.code(), Some(101), "{refused:?}");
-    assert!(
-        stderr(&refused).contains("unsupported syscall sched_getparam (143) in copied child"),
-        "{refused:?}"
-    );
-    assert!(
-        stderr(&refused).contains(&format!(
-            "detcore-dbt: unsupported syscall {} in copied child",
-            libc::SYS_sched_getparam
-        )),
-        "{refused:?}"
-    );
-    assert!(
-        !stdout(&refused).contains("after sched_getparam"),
-        "{refused:?}"
-    );
-}
-
-/// A copied child must not expose the host affinity mask in strict mode.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_refuses_a_vfork_childs_affinity_query_by_name() {
-    let _lock = hermit_run_guard();
-    let guest = futex_c_guest(&COPIED_SCHEDULER_QUERY_GUEST, "copied_scheduler_query")
-        .to_str()
-        .unwrap();
-    use nix::sched::CpuSet;
-    use nix::sched::sched_getaffinity;
-    use nix::sched::sched_setaffinity;
-    use nix::unistd::Pid;
-
-    // Hermit chooses one CPU from its inherited mask. Give both command
-    // children the same measured singleton so the full native mask is an
-    // independent oracle under identical launch affinity; the test parent
-    // and all guest syscall policies remain unchanged.
-    let inherited = sched_getaffinity(Pid::from_raw(0)).expect("read allowed CPU mask");
-    let cpu = (0..CpuSet::count())
-        .find(|&cpu| inherited.is_set(cpu).unwrap_or(false))
-        .expect("nonempty allowed CPU mask");
-    let mut singleton = CpuSet::new();
-    singleton.set(cpu).expect("allowed CPU fits CpuSet");
-    let same_cpu = |mut command: Command| {
-        // SAFETY: one async-signal-safe syscall with a mask built before fork;
-        // no allocation or mutation of the parent process.
-        unsafe {
-            command.pre_exec(move || {
-                sched_setaffinity(Pid::from_raw(0), &singleton).map_err(std::io::Error::from)
-            });
-        }
-        command
-    };
-    let mut native_command = Command::new(guest);
-    native_command.arg("affinity-vfork");
-    let native = same_cpu(native_command)
-        .output()
-        .expect("native sched_getaffinity vfork control");
-    assert!(native.status.success(), "{native:?}");
-    assert!(
-        stdout(&native).starts_with("after sched_getaffinity\nvfork sched_getaffinity: result="),
-        "{native:?}"
-    );
-    let run = |backend, strictness, mode| {
-        let args = [
-            "--backend",
-            backend,
-            "run",
-            strictness,
-            "--base-env=minimal",
-            "--",
-            guest,
-            mode,
-        ];
-        hermit_test::hermit_output(
-            "scheduler affinity query",
-            &mut same_cpu(hermit_command(&args)),
-        )
-    };
-    // This is the existing shared CPU0 policy, not the native Linux mask.
-    // Its ignored target-existence semantics are unchanged by this guard cut.
-    let mask = format!("01{}{}", "00".repeat(15), "7f".repeat(112));
-    let ordinary_output =
-        format!("ordinary sched_getaffinity: result=16 errno=0 mask={mask} canaries=1\n");
-    for backend in ["dbt", "ptrace"] {
-        let output = run(backend, "--strict", "affinity-ordinary");
-        assert!(output.status.success(), "{backend}: {output:?}");
-        assert_eq!(stdout(&output), ordinary_output);
-    }
-    let ptrace = run("ptrace", "--strict", "affinity-vfork");
-    assert!(ptrace.status.success(), "{ptrace:?}");
-    assert_eq!(
-        stdout(&ptrace),
-        format!(
-            "after sched_getaffinity\nvfork sched_getaffinity: result=16 errno=0 mask={mask} canaries=1\n"
-        )
-    );
-    // The complete measured native transcript includes the raw positive byte
-    // count, all 128 mask/suffix bytes and both canaries; do not hardcode CPU0.
-    let passthrough = run("dbt", "--allow-unsupported-syscalls", "affinity-vfork");
-    assert!(passthrough.status.success(), "{passthrough:?}");
-    assert_eq!(passthrough.stdout, native.stdout);
-
-    let refused = run("dbt", "--strict", "affinity-vfork");
-    assert_eq!(refused.status.code(), Some(101), "{refused:?}");
-    assert!(
-        stderr(&refused).contains("unsupported syscall sched_getaffinity (204) in copied child"),
-        "{refused:?}"
-    );
-    assert!(
-        stderr(&refused).contains(&format!(
-            "detcore-dbt: unsupported syscall {} in copied child",
-            libc::SYS_sched_getaffinity
-        )),
-        "{refused:?}"
-    );
-    assert!(
-        !stdout(&refused).contains("after sched_getaffinity"),
-        "{refused:?}"
-    );
-}
-
-/// A copied DBT child must refuse a priority query in strict mode.
-/// Its non-strict native path and the ordinary shared Detcore answer are distinct.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_refuses_a_vfork_childs_priority_query_by_name() {
-    let _lock = hermit_run_guard();
-    let guest = futex_c_guest(&COPIED_PRIORITY_QUERY_GUEST, "copied_priority_query")
-        .to_str()
-        .unwrap();
-    let nice19 = |mut command: Command| {
-        // SAFETY: the raw syscall only changes this child before exec; it does
-        // not allocate, acquire locks, or alter the test process's policy.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::syscall(libc::SYS_setpriority, libc::PRIO_PROCESS, 0, 19) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        command
-    };
-    let mut native = Command::new(guest);
-    native.arg("vfork");
-    let native = nice19(native)
-        .output()
-        .expect("native nice19 vfork control");
-    assert!(native.status.success(), "{native:?}");
-    assert_eq!(
-        stdout(&native),
-        "after getpriority\nvfork getpriority: raw=1 errno=0 exit=0\n"
-    );
-    let run = |backend, strictness, mode| {
-        let args = [
-            "--backend",
-            backend,
-            "run",
-            strictness,
-            "--base-env=minimal",
-            "--",
-            guest,
-            mode,
-        ];
-        hermit_test::hermit_output("priority query", &mut nice19(hermit_command(&args)))
-    };
-    // The ordinary shared Tool retains raw20 even when native nice19 returns1.
-    for backend in ["dbt", "ptrace"] {
-        let output = run(backend, "--strict", "ordinary");
-        assert!(output.status.success(), "{backend}: {output:?}");
-        assert_eq!(stdout(&output), "ordinary getpriority: raw=20 errno=0\n");
-        let targets = run(backend, "--strict", "ordinary-targets");
-        assert!(targets.status.success(), "{backend}: {targets:?}");
-        assert_eq!(
-            stdout(&targets),
-            "targets identities: child=1 parent=1\n\
-             getpriority zero: raw=20 errno=0\n\
-             getpriority self: raw=20 errno=0\n\
-             getpriority live: raw=20 errno=0\n\
-             getpriority absent: raw=20 errno=0\n\
-             getpriority negative: raw=20 errno=0\n\
-             getpriority invalid-negative: raw=-1 errno=22\n\
-             getpriority invalid-live: raw=-1 errno=22\n\
-             getpriority invalid-absent: raw=-1 errno=22\n\
-             targets wait: exit=37\ngetpriority-targets=ok\n"
-        );
-    }
-    let ptrace = run("ptrace", "--strict", "vfork");
-    assert!(ptrace.status.success(), "{ptrace:?}");
-    assert_eq!(
-        stdout(&ptrace),
-        "after getpriority\nvfork getpriority: raw=20 errno=0 exit=0\n"
-    );
-    // This full transcript proves the copied child actually inherited nice19;
-    // do not assume that launch configuration alone establishes its raw value.
-    let passthrough = run("dbt", "--allow-unsupported-syscalls", "vfork");
-    assert!(passthrough.status.success(), "{passthrough:?}");
-    assert_eq!(passthrough.stdout, native.stdout);
-
-    let refused = run("dbt", "--strict", "vfork");
-    assert_eq!(refused.status.code(), Some(101), "{refused:?}");
-    assert!(
-        stderr(&refused).contains("unsupported syscall getpriority (140) in copied child"),
-        "{refused:?}"
-    );
-    assert!(
-        stderr(&refused).contains(&format!(
-            "detcore-dbt: unsupported syscall {} in copied child",
-            libc::SYS_getpriority
-        )),
-        "{refused:?}"
-    );
-    assert!(
-        !stdout(&refused).contains("after getpriority"),
-        "{refused:?}"
-    );
-}
-
-/// [`cpuinfo_matches_cpuid`] on the DBT backend, whose `/proc/cpuinfo` Detcore
-/// now renders from the table it answers DBT's CPUID from. Before, DBT's guest
-/// did not report CPUID interception, so Detcore left the host's
-/// `/proc/cpuinfo` in place: on an AMD host it read AuthenticAMD while CPUID
-/// read GenuineIntel.
-#[test]
-#[cfg(feature = "dbt")]
-fn run_dbt_cpuinfo_matches_cpuid() {
-    assert_cpuinfo_matches_cpuid(&["--backend=dbt"]);
-}
-
-/// DBT refuses `--cpu-profile x86-64-v3` by name: Detcore answers its CPUID,
-/// but the DBT runtime's configuration carries no CPU profile, so a v3 run
-/// would see the v2 table.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_refuses_cpu_profile_v3_by_name() {
-    let _lock = hermit_run_guard();
-    let args = [
-        "--backend",
-        "dbt",
-        "run",
-        "--cpu-profile",
-        "x86-64-v3",
-        "--",
-        "/bin/true",
-    ];
-    let output = hermit(&args);
-    assert_eq!(
-        output.status.code(),
-        Some(HERMIT_POLICY_REFUSAL_EXIT),
-        "{}",
-        stderr(&output)
-    );
-    assert!(
-        stderr(&output).contains(
-            "--cpu-profile x86-64-v3 refused: --backend=dbt: Detcore answers DBT's CPUID, but \
-             the DBT runtime's configuration carries no CPU profile"
-        ),
-        "{}",
-        stderr(&output)
-    );
 }
 
 /// The coordinator writes the records the in-guest Tool forwards into the log
@@ -41645,21 +40933,24 @@ fn liteinst_in_guest_signals_during_a_blocking_wait4_match_ptrace() {
 /// `--timeout` qualification is a static policy fact, so an UNAVAILABLE
 /// backend must get the same refusal as an available one
 /// (https://github.com/rrnewton/hermit/issues/3418). Before the fix the run
-/// path probed availability first, so a build without the `sabre` feature
+/// path probed availability first, so a build without the backend's feature
 /// answered `class=backend-unavailable` (125) where every other build refused
 /// (122).
 ///
-/// Pointing SaBRe's loader override at a missing file makes the backend
-/// unavailable in EVERY build -- without the feature it is not compiled, with
-/// it there is no loader -- so this case holds whichever features the test
-/// binary was built with. The control run without `--timeout` proves the
-/// premise: the same invocation really does report the backend unavailable.
+/// In-guest LiteInst refuses an unqualified `--timeout` by name. Pointing its
+/// in-guest runtime override at a missing file makes the backend unavailable in
+/// EVERY build -- without the `liteinst` feature it is not compiled, with it
+/// there is no runtime -- so this case holds whichever features the test binary
+/// was built with. `--max-timeslice=disabled` keeps LiteInst's timer refusal
+/// out of the way. The control run without `--timeout` proves the premise: the
+/// same invocation really does report the backend unavailable. (The case this
+/// test first used, SaBRe with a missing loader, left core with that backend.)
 #[test]
 fn run_timeout_refusal_does_not_depend_on_backend_availability() {
     let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let missing_loader = "/nonexistent/hermit-cli-test/sabre";
+    let missing_runtime = "/nonexistent/hermit-cli-test/libdetcore_liteinst.so";
     let run = |timeout: bool| {
-        let mut args = vec!["--backend", "sabre", "run"];
+        let mut args = vec!["--backend", "liteinst", "run", "--max-timeslice=disabled"];
         if timeout {
             args.extend(["--timeout", "3"]);
         }
@@ -41667,7 +40958,7 @@ fn run_timeout_refusal_does_not_depend_on_backend_availability() {
         let output = hermit_test::hermit_output(
             "hermit run",
             hermit_command(&args)
-                .env("HERMIT_SABRE_BINARY", missing_loader)
+                .env(hermit::LITEINST_TOOL_RUNTIME_ENV, missing_runtime)
                 .stdin(Stdio::null()),
         );
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -41679,11 +40970,12 @@ fn run_timeout_refusal_does_not_depend_on_backend_availability() {
     assert_eq!(
         control.status.code(),
         Some(125),
-        "control: without --timeout the sabre backend must be unavailable here. \
+        "control: without --timeout the liteinst backend must be unavailable here. \
          stderr:\n{control_stderr}"
     );
     assert!(
-        control_stderr.contains("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=sabre"),
+        control_stderr
+            .contains("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=liteinst"),
         "control: {control_stderr}"
     );
 
@@ -41698,7 +40990,10 @@ fn run_timeout_refusal_does_not_depend_on_backend_availability() {
         stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
         "{stderr}"
     );
-    assert!(stderr.contains("not qualified"), "{stderr}");
+    assert!(
+        stderr.contains("--timeout has not been qualified for the in-guest runtime"),
+        "{stderr}"
+    );
     assert!(!stderr.contains("backend-unavailable"), "{stderr}");
     assert!(
         refused.stdout.is_empty(),
@@ -41976,73 +41271,12 @@ fn run_kvm_timerfd_virtual_masked_waits_is_refused_by_name() {
     );
 }
 
-// DBT keeps timerfds on virtual time too: its runtime promotes them before a
-// native fork or exec (`promotes_open_files_before_native_lifecycle`). The
-// modes below reach L2 there. abstime, waits, epoll-pwait2 and exec fail on
-// DBT exactly as on ptrace with `--max-timeslice=disabled`: without a
-// preemption timer each syscall advances the virtual clock by milliseconds,
-// so the guest's "5 ms before the deadline" checks see the deadline pass.
-// For the same reason epollet reports its three timers in another order
-// (0 1 2, as ptrace without a timer does, against 1 2 0 with one).
-#[test]
-fn run_dbt_timerfd_virtual_catchup() {
-    timerfd_virtual_time::verify("dbt", "catchup", timerfd_virtual_time::CATCHUP);
-}
-
-#[test]
-fn run_dbt_timerfd_virtual_nonblock() {
-    timerfd_virtual_time::verify("dbt", "nonblock", timerfd_virtual_time::NONBLOCK);
-}
-
-#[test]
-fn run_dbt_timerfd_virtual_zero_timeout() {
-    timerfd_virtual_time::verify("dbt", "zero-timeout", timerfd_virtual_time::ZERO_TIMEOUT);
-}
-
-#[test]
-fn run_dbt_timerfd_virtual_masked_ppoll_expired() {
-    timerfd_virtual_time::verify(
-        "dbt",
-        "masked-ppoll-expired",
-        timerfd_virtual_time::MASKED_PPOLL_EXPIRED,
-    );
-}
-
-/// The forked child and its parent share one timer: the model was promoted
-/// before the native fork.
-#[test]
-fn run_dbt_timerfd_virtual_dup_fork() {
-    timerfd_virtual_time::verify("dbt", "dup-fork", timerfd_virtual_time::DUP_FORK);
-}
-
-#[test]
-fn run_dbt_timerfd_virtual_readv() {
-    timerfd_virtual_time::verify("dbt", "readv", timerfd_virtual_time::READV);
-}
-
-#[test]
-fn run_dbt_timerfd_virtual_sigchld_storm() {
-    timerfd_virtual_time::verify("dbt", "sigchld-storm", timerfd_virtual_time::SIGCHLD_STORM);
-}
-
-/// As on KVM, a masked wait that may wait would wait in the host: refused by
-/// name.
-#[test]
-fn run_dbt_timerfd_virtual_masked_waits_is_refused_by_name() {
-    timerfd_virtual_time::refused(
-        "dbt",
-        "masked-waits",
-        None,
-        "epoll_pwait with a signal mask would wait in the host",
-    );
-}
-
 // In-guest LiteInst keeps timerfds on virtual time too: it performs every
 // fork, process-copying clone and exec only from Detcore's handler for that
 // call, which promotes the description first
 // (`promotes_open_files_before_native_lifecycle`). LiteInst runs without
-// time slices (it cannot deliver a preemption timer yet), so, as on DBT,
-// abstime, waits and epoll-pwait2 fail exactly as on ptrace with
+// time slices (it cannot deliver a preemption timer yet), so abstime, waits
+// and epoll-pwait2 fail exactly as on ptrace with
 // `--max-timeslice=disabled`, and epollet reports its timers in that
 // configuration's order. exec is refused by LiteInst itself (the in-guest
 // backend does not forward execve yet).
@@ -52077,7 +51311,13 @@ fn cpu_profile_v3_refuses_backends_and_flags_it_cannot_qualify() {
     let guest = cpuid_profile_v3_guest().to_str().unwrap().to_owned();
     let cases: [(&[&str], &[&str], &str); 5] = [
         (&["--backend=kvm"], &[], "--backend=kvm"),
-        (&["--backend=dbt"], &[], "carries no CPU profile"),
+        // --max-timeslice=disabled: in-guest LiteInst's own timer refusal
+        // would otherwise come first.
+        (
+            &["--backend=liteinst"],
+            &["--max-timeslice=disabled"],
+            "--backend=liteinst: this backend does not trap CPUID",
+        ),
         (&[], &["--gdbserver"], "--gdbserver"),
         (&[], &["--no-virtualize-cpuid"], "does not virtualize CPUID"),
         (
@@ -55150,17 +54390,6 @@ fn assert_procfs_directory_keeps_its_size(backend: &str) {
 #[test]
 fn a_procfs_directory_keeps_its_size() {
     assert_procfs_directory_keeps_its_size("ptrace");
-}
-
-/// [`assert_procfs_directory_keeps_its_size`] on DBT, where Detcore names no
-/// procfs entries and keeps the host's values for a directory with procfs's
-/// stat fields (`procfs_inode::unprovable_procfs_signature`; Codex and Claude
-/// re-checks of https://github.com/rrnewton/hermit/pull/4369).
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_a_procfs_directory_keeps_its_size() {
-    let _guard = hermit_run_guard();
-    assert_procfs_directory_keeps_its_size("dbt");
 }
 
 /// [`assert_procfs_directory_keeps_its_size`] on KVM.

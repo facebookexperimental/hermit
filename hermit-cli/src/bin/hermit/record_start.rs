@@ -55,7 +55,6 @@ use super::record_envelope::RecordEnvelope;
 use super::run::BaseEnv;
 use super::run::NetworkingMode;
 use super::run::apply_base_environment;
-use super::run::is_elf_file;
 use super::run::parse_assignment;
 use super::run::path_resolution_visits_prefix;
 use super::verify::ComparedRun;
@@ -71,9 +70,17 @@ use super::verify::write_pending_verification_json;
 use super::verify::write_verification_json;
 
 #[derive(Debug)]
-struct E9patchRecordOverlay {
+struct RecordOverlay {
     source: PathBuf,
     target: PathBuf,
+}
+
+type RecordPrepareCallback<'a> = &'a dyn Fn(&Path) -> Result<Option<PathBuf>, Error>;
+
+#[derive(Clone, Copy)]
+struct RecordPreparation<'a> {
+    backend_name: &'static str,
+    prepare: Option<RecordPrepareCallback<'a>>,
 }
 
 static TIMEOUT_MESSAGE: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
@@ -205,7 +212,7 @@ pub struct StartOpts {
     /// fails Reverie's performance-counter validation, as `hermit run --strict` does: the
     /// ptrace record runtime reads its virtual clock and preemption points from that
     /// counter, so a replay could diverge from its recording for a hardware reason
-    /// (https://github.com/rrnewton/hermit/issues/3810). That refusal is the flag's only
+    /// (<https://github.com/rrnewton/hermit/issues/3810>). That refusal is the flag's only
     /// effect. Recording does NOT run under `run --strict`'s configuration: see
     /// `hermit_cli::metadata::record_or_replay_config`, which deliberately sets
     /// `virtualize_time: false`, `deterministic_io: false`, `passthru_opt: true` and
@@ -372,7 +379,7 @@ pub struct StartOpts {
     /// Why this host's retired-branch counter is inexact, if it is. Only the
     /// `--strict` refusal and the warning without `--strict` consult it; tests
     /// replace it to reach both on a host whose counters pass.
-    #[clap(skip = crate::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
+    #[clap(skip = crate::app::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
     inexact_branch_counter: fn() -> Option<String>,
 }
 
@@ -400,80 +407,56 @@ impl StartOpts {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-696): Review /proc magic-link rejection for record overlays.
-    fn resolve_e9patch_record_target(&self) -> Result<PathBuf, Error> {
+    fn resolve_record_target(&self, backend: &str) -> Result<PathBuf, Error> {
         let command = Command::new(self.program());
         let resolved = command.find_program().with_context(|| {
             format!(
-                "Could not resolve program {:?} in PATH for e9patch preprocessing",
+                "Could not resolve program {:?} in PATH for {backend} preprocessing",
                 self.program()
             )
         })?;
         if path_resolution_visits_prefix(&resolved, Path::new("/proc"))? {
             anyhow::bail!(
-                "e9patch cannot safely overlay executable {} because its path resolves through \
+                "{backend} cannot safely overlay executable {} because its path resolves through \
                  /proc; use the executable's stable filesystem path",
                 self.program().display()
             );
         }
         fs::canonicalize(&resolved).with_context(|| {
             format!(
-                "failed to resolve e9patch executable {}",
+                "failed to resolve {backend} executable {}",
                 resolved.display()
             )
         })
     }
 
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-696): Review e9patch record preparation and executable overlaying.
-    fn prepare_e9patch_overlay(
+    fn prepare_record_overlay(
         &self,
         global: &GlobalOpts,
-    ) -> Result<Option<E9patchRecordOverlay>, Error> {
-        if global.backend != Some(Backend::E9patch) {
+        preparation: RecordPreparation<'_>,
+    ) -> Result<Option<RecordOverlay>, Error> {
+        let Some(prepare) = preparation.prepare else {
+            // No optional built-in preprocessor remains here. Preserve the
+            // former unavailable-backend refusal until its CLI enum is retired.
+            if let Some(backend) = global.backend
+                && backend != Backend::Ptrace
+            {
+                backend.ensure_available()?;
+                anyhow::bail!("record preprocessing requires its statically selected executable");
+            }
             return Ok(None);
-        }
-
-        #[cfg(not(feature = "e9patch"))]
-        Backend::E9patch.ensure_available()?;
-        Backend::Ptrace.ensure_available()?;
-        let target = self.resolve_e9patch_record_target()?;
-        if !is_elf_file(&target)? {
-            eprintln!(
-                ":: Backend: e9patch preprocessing + ptrace record runtime; mapped_sites=0; \
-                 main_executable=non-ELF; preprocessing=not-applicable"
-            );
-            return Ok(None);
-        }
-        if let Some(reason) = hermit::e9patch::unavailable_reason() {
-            anyhow::bail!("backend `e9patch` is unavailable: {reason}");
-        }
-
-        let prepared = hermit::e9patch::prepare(&target)?;
-        let rewrite_cache = if prepared.patched_sites == 0 {
-            "not-applicable"
-        } else if prepared.rewrite_cache_hit {
-            "hit"
-        } else {
-            "miss"
         };
-        eprintln!(
-            ":: Backend: e9patch preprocessing + ptrace record runtime; candidate_sites={}; \
-             mapped_sites={}; b0_sites={}; instruction_map_cache={:?}; rewrite_cache={}; \
-             artifact_sha256={}",
-            prepared.candidate_sites,
-            prepared.patched_sites,
-            prepared.b0_sites,
-            prepared.instruction_map_cache_status,
-            rewrite_cache,
-            prepared.artifact_sha256.as_deref().unwrap_or("none"),
-        );
+        Backend::Ptrace.ensure_available()?;
+        self.resolve_and_prepare_record_overlay(preparation.backend_name, prepare)
+    }
 
-        Ok(
-            (prepared.patched_sites != 0).then_some(E9patchRecordOverlay {
-                source: prepared.binary,
-                target,
-            }),
-        )
+    fn resolve_and_prepare_record_overlay(
+        &self,
+        backend: &str,
+        prepare: RecordPrepareCallback<'_>,
+    ) -> Result<Option<RecordOverlay>, Error> {
+        let target = self.resolve_record_target(backend)?;
+        Ok(prepare(&target)?.map(|source| RecordOverlay { source, target }))
     }
 
     /// What the recording stores for its replays to honor.
@@ -552,11 +535,12 @@ impl StartOpts {
     fn recording_container(
         &self,
         global: &GlobalOpts,
+        preparation: RecordPreparation<'_>,
     ) -> Result<(Container, IdentityGuard), Error> {
-        // The rewritten program over its original path: e9patch's own
+        // The rewritten program over its original path: backend-owned
         // mounts, which the guest's mount table leaves out.
         let overlay = self
-            .prepare_e9patch_overlay(global)?
+            .prepare_record_overlay(global, preparation)?
             .map(|overlay| {
                 vec![
                     Mount::bind(&overlay.source, &overlay.target).readonly(),
@@ -585,7 +569,7 @@ impl StartOpts {
         if !self.strict {
             return Ok(());
         }
-        crate::run::refuse_an_inexact_branch_counter(
+        crate::app::run::refuse_an_inexact_branch_counter(
             global.backend.unwrap_or_default(),
             self.inexact_branch_counter,
         )
@@ -605,8 +589,8 @@ impl StartOpts {
         warn: &mut dyn FnMut(&str),
     ) -> Result<(), Error> {
         self.refuse_strict_with_inexact_branch_counter(global)?;
-        if let Some(warning) = crate::run::warning_for_an_inexact_branch_counter(
-            crate::run::CounterReader::Recording,
+        if let Some(warning) = crate::app::run::warning_for_an_inexact_branch_counter(
+            crate::app::run::CounterReader::Recording,
             self.inexact_branch_counter,
         ) {
             warn(&warning);
@@ -614,9 +598,39 @@ impl StartOpts {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        self.main_with_backend(global, &super::core_adapter::CoreApplicationAdapter)
+    }
+
+    pub fn main_with_backend<A: super::backend_hook::BackendAdapter>(
+        &self,
+        global: &GlobalOpts,
+        adapter: &A,
+    ) -> Result<ExitStatus, Error> {
+        let prepare = |target: &Path| adapter.prepare_record_program(target);
+        let preparation = RecordPreparation {
+            backend_name: if A::PREPARES_RECORD {
+                A::NAME
+            } else {
+                global.backend.unwrap_or_default().as_str()
+            },
+            prepare: if A::PREPARES_RECORD {
+                Some(&prepare)
+            } else {
+                None
+            },
+        };
+        self.main_with_preparation(global, preparation)
+    }
+
+    fn main_with_preparation(
+        &self,
+        global: &GlobalOpts,
+        preparation: RecordPreparation<'_>,
+    ) -> Result<ExitStatus, Error> {
         hermit::cpu_profile_admission::check_record_or_replay(self.cpu_profile).map_err(
-            |refusal| Error::new(crate::container::PolicyRefusal).context(refusal.to_string()),
+            |refusal| Error::new(crate::app::container::PolicyRefusal).context(refusal.to_string()),
         )?;
         if self.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3 {
             super::verify::CPU_PROFILE_V3_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -624,26 +638,26 @@ impl StartOpts {
             // once, and the recorder and replayer reuse the result.
             let request = hermit::cpu_profile_admission::record_or_replay_request(false);
             hermit::cpu_profile_admission::admit(&request).map_err(|refusal| {
-                Error::new(crate::container::PolicyRefusal)
+                Error::new(crate::app::container::PolicyRefusal)
                     .context(format!("--cpu-profile x86-64-v3 refused: {refusal}"))
             })?;
         }
         if self.verify {
             validate_log_level(global)?;
-            self.record_verify(global)
+            self.record_verify(global, preparation)
         } else if let Some(directory) = &self.verify_run {
             validate_log_level(global)?;
-            self.record_verify_run(directory, global)
+            self.record_verify_run(directory, global, preparation)
         } else if !self.gdbex.is_empty() {
-            self.admit_branch_counter(global, &mut crate::tracing::write_stderr_diagnostic)?;
-            self.record_verify_debug(global)
+            self.admit_branch_counter(global, &mut crate::app::tracing::write_stderr_diagnostic)?;
+            self.record_verify_debug(global, preparation)
         } else {
-            self.admit_branch_counter(global, &mut crate::tracing::write_stderr_diagnostic)?;
+            self.admit_branch_counter(global, &mut crate::app::tracing::write_stderr_diagnostic)?;
             let hermit = HermitData::from(self.data_dir.as_ref());
             let record_timeout = self.record_timeout();
             let record_options = self.record_options();
 
-            let (mut container, identity_guard) = self.recording_container(global)?;
+            let (mut container, identity_guard) = self.recording_container(global, preparation)?;
 
             // Parent-owned for BOTH deadline and unbounded spellings. No
             // metadata/last-id commit occurs before real successful completion.
@@ -741,19 +755,25 @@ impl StartOpts {
             }
 
             if let Some(outcome) = outcome {
-                return Err(Error::new(crate::container::SchedulerOutcome(outcome)));
+                return Err(Error::new(crate::app::container::SchedulerOutcome(outcome)));
             }
             Ok(recording.exit_status)
         }
     }
 
     /// This is called when `--verify` is passed to the command line.
-    fn record_verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+    fn record_verify(
+        &self,
+        global: &GlobalOpts,
+        preparation: RecordPreparation<'_>,
+    ) -> Result<ExitStatus, Error> {
         // `record start` runs on the ptrace record runtime, whose virtual clock
         // is the retired-branch counter, and installs no PMU configuration of
         // its own, so Reverie's validation can run here.
         if self.verify_json.is_some() {
-            crate::verify::record_exact_branch_counter(crate::run::branch_counter_verdict());
+            crate::app::verify::record_exact_branch_counter(
+                crate::app::run::branch_counter_verdict(),
+            );
         }
         // Stamp an explicit no-result BEFORE any fallible work: the record and
         // replay steps below can fail long before a verdict exists, and a reused
@@ -764,13 +784,14 @@ impl StartOpts {
         }
         // After the pending report carries the counter verdict, so that a
         // refused recording still says which counter it would have read.
-        self.admit_branch_counter(global, &mut crate::tracing::write_stderr_diagnostic)?;
+        self.admit_branch_counter(global, &mut crate::app::tracing::write_stderr_diagnostic)?;
         let strictness = self.verification_strictness();
         let ((global1, log1), (global2, log2)) =
             setup_double_run(global, "record", "replay", strictness)
                 .context("Failed to create verification log files")?;
 
-        let (mut recording_container, record_identity_guard) = self.recording_container(global)?;
+        let (mut recording_container, record_identity_guard) =
+            self.recording_container(global, preparation)?;
 
         eprintln!(":: {}", "Recording...".yellow().bold());
 
@@ -862,6 +883,7 @@ impl StartOpts {
         &self,
         directory: &Path,
         global: &GlobalOpts,
+        preparation: RecordPreparation<'_>,
     ) -> Result<ExitStatus, Error> {
         use super::verify_run;
 
@@ -883,11 +905,17 @@ impl StartOpts {
         run_global.log = Some(super::verify::verification_log_level(
             global.log, strictness, false,
         ));
-        let exact_branch_counter = crate::run::branch_counter_verdict();
+        let exact_branch_counter = crate::app::run::branch_counter_verdict();
         let result = match &first {
             None => self
-                .admit_branch_counter(global, &mut crate::tracing::write_stderr_diagnostic)
-                .and_then(|()| self.record_into(&writer.path(verify_run::RECORDING), &run_global)),
+                .admit_branch_counter(global, &mut crate::app::tracing::write_stderr_diagnostic)
+                .and_then(|()| {
+                    self.record_into(
+                        &writer.path(verify_run::RECORDING),
+                        &run_global,
+                        preparation,
+                    )
+                }),
             Some(first) => {
                 self.replay_from(&first.directory().join(verify_run::RECORDING), &run_global)
             }
@@ -908,17 +936,17 @@ impl StartOpts {
                     },
                     match outcome {
                         Some(outcome) => {
-                            Err(Error::new(crate::container::SchedulerOutcome(outcome)))
+                            Err(Error::new(crate::app::container::SchedulerOutcome(outcome)))
                         }
                         None => Ok(output.status),
                     },
                 )
             }
-            Err(error) => (crate::run::verify_run_outcome_of(&error), Err(error)),
+            Err(error) => (crate::app::run::verify_run_outcome_of(&error), Err(error)),
         };
         writer.commit(&verify_run::VerifyRunRecord {
             schema: verify_run::SCHEMA,
-            backend: global.backend.unwrap_or_default().as_str().to_string(),
+            backend: preparation.backend_name.to_string(),
             comparison: verify_run::RecordedComparison {
                 strictness,
                 diagnostic_full_trace: false,
@@ -945,9 +973,10 @@ impl StartOpts {
         &self,
         data: &Path,
         global: &GlobalOpts,
+        preparation: RecordPreparation<'_>,
     ) -> Result<(reverie::process::Output, Option<detcore::TerminalOutcome>), Error> {
         fs::create_dir(data).with_context(|| format!("creating {}", data.display()))?;
-        let (mut container, identity_guard) = self.recording_container(global)?;
+        let (mut container, identity_guard) = self.recording_container(global, preparation)?;
         eprintln!(":: {}", "Recording...".yellow().bold());
         let record_timeout = self.record_timeout();
         let record_options = self.record_options();
@@ -1022,8 +1051,12 @@ impl StartOpts {
     }
 
     /// This is called when `--verify-with-gdbex` is passed to the command line.
-    fn record_verify_debug(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        let (mut container, identity_guard) = self.recording_container(global)?;
+    fn record_verify_debug(
+        &self,
+        global: &GlobalOpts,
+        preparation: RecordPreparation<'_>,
+    ) -> Result<ExitStatus, Error> {
+        let (mut container, identity_guard) = self.recording_container(global, preparation)?;
 
         eprintln!(":: {}", "Recording...".yellow().bold());
 
@@ -1313,7 +1346,7 @@ pub(crate) fn ended_pair_outcome(
         && recording == replay
         && status.code() == Some(outcome.exit_status())
     {
-        return Err(Error::new(crate::container::SchedulerOutcome(outcome)));
+        return Err(Error::new(crate::app::container::SchedulerOutcome(outcome)));
     }
     Ok(status)
 }
@@ -1349,7 +1382,7 @@ mod tests {
         // invocation, and only the plain one may select autopilot (no GDB).
         use clap::CommandFactory;
         for (command, autopilot) in [(&plain, true), (&gdb, false), (&dap, false)] {
-            let matches = crate::Args::command()
+            let matches = crate::app::Args::command()
                 .try_get_matches_from(shell_words::split(command).unwrap())
                 .unwrap_or_else(|e| panic!("{command}: {e}"));
             let replay = matches.subcommand_matches("replay").expect(command);
@@ -1430,7 +1463,7 @@ mod tests {
             let error = options.main(&global).expect_err(path);
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{path}: {error:#}"
             );
@@ -1542,8 +1575,8 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(
             lines,
-            [crate::run::warning_for_an_inexact_branch_counter(
-                crate::run::CounterReader::Recording,
+            [crate::app::run::warning_for_an_inexact_branch_counter(
+                crate::app::run::CounterReader::Recording,
                 inexact
             )
             .unwrap()]
@@ -1554,7 +1587,7 @@ mod tests {
         assert!(
             result.is_err_and(|error| {
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some()
             }),
             "--strict refuses"
@@ -1567,8 +1600,8 @@ mod tests {
         assert!(result.is_ok() && lines.is_empty(), "{lines:?}");
     }
 
-    /// The refusal needs `--strict` and an inexact counter, and covers e9patch
-    /// preprocessing, which records on the same ptrace runtime and counter.
+    /// The refusal needs `--strict` and an inexact counter, including the common
+    /// ptrace record path before executable-selected e9patch preprocessing.
     #[test]
     fn record_refusal_needs_strict_and_an_inexact_counter() {
         #[derive(clap::Parser)]
@@ -1594,12 +1627,37 @@ mod tests {
             .refuse_strict_with_inexact_branch_counter(&ptrace)
             .unwrap();
 
-        let e9patch = <GlobalOpts as clap::Parser>::parse_from(["hermit", "--backend=e9patch"]);
         options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
+        let prepare_calls = std::cell::Cell::new(0);
+        let prepare = |_target: &Path| -> Result<Option<PathBuf>, Error> {
+            prepare_calls.set(prepare_calls.get() + 1);
+            panic!("an inexact counter reached e9patch record preprocessing");
+        };
         let error = options
-            .refuse_strict_with_inexact_branch_counter(&e9patch)
+            .main_with_preparation(
+                &ptrace,
+                RecordPreparation {
+                    backend_name: "e9patch",
+                    prepare: Some(&prepare),
+                },
+            )
             .unwrap_err();
-        assert!(error.to_string().contains("`e9patch` backend"), "{error:#}");
+        assert!(
+            error
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("`ptrace` backend"), "{error:#}");
+        assert!(
+            error.to_string().contains("SpecLockMap is enabled"),
+            "{error:#}"
+        );
+        assert_eq!(
+            prepare_calls.get(),
+            0,
+            "a refused recording reached preprocessing"
+        );
     }
 
     /// `record start` takes `run`'s networking contract, local by default,
@@ -1795,6 +1853,73 @@ mod tests {
     }
 
     #[test]
+    fn static_record_preparation_uses_the_canonical_target_and_optional_overlay() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("original");
+        let alias = directory.path().join("program-alias");
+        let rewritten = directory.path().join("rewritten");
+        fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&rewritten, b"rewritten image bytes").unwrap();
+        std::os::unix::fs::symlink(&program, &alias).unwrap();
+        let canonical = fs::canonicalize(&program).unwrap();
+        let mut options = start_options(Vec::new());
+        options.program = Some(alias);
+        let calls = RefCell::new(Vec::new());
+        let unchanged = |target: &Path| {
+            calls.borrow_mut().push(target.to_path_buf());
+            Ok(None)
+        };
+        assert!(
+            options
+                .resolve_and_prepare_record_overlay("static-test", &unchanged)
+                .unwrap()
+                .is_none()
+        );
+        let rewrite = |target: &Path| {
+            calls.borrow_mut().push(target.to_path_buf());
+            Ok(Some(rewritten.clone()))
+        };
+        let overlay = options
+            .resolve_and_prepare_record_overlay("static-test", &rewrite)
+            .unwrap()
+            .unwrap();
+        assert_eq!(overlay.target, canonical);
+        assert_eq!(overlay.source, rewritten);
+        assert_eq!(*calls.borrow(), vec![canonical.clone(), canonical]);
+        assert_eq!(fs::read(program).unwrap(), b"#!/bin/sh\nexit 0\n");
+    }
+
+    #[test]
+    fn static_record_preparation_preserves_callback_errors_without_an_overlay() {
+        let options = start_options(Vec::new());
+        let calls = std::cell::Cell::new(0);
+        let prepare = |target: &Path| {
+            assert_eq!(target, fs::canonicalize("/bin/true").unwrap());
+            calls.set(calls.get() + 1);
+            Err(Error::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "record preprocessor refused this actual target",
+            )))
+        };
+        let error = options
+            .resolve_and_prepare_record_overlay("static-test", &prepare)
+            .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied,
+        );
+        assert_eq!(
+            error.to_string(),
+            "record preprocessor refused this actual target"
+        );
+    }
+
+    #[test]
     fn e9patch_record_target_rejects_proc_magic_links() {
         let options = StartOpts {
             program: Some(PathBuf::from("/proc/self/exe")),
@@ -1819,10 +1944,24 @@ mod tests {
             gdbex: Vec::new(),
             inexact_branch_counter: || None,
         };
-        let error = options.resolve_e9patch_record_target().unwrap_err();
+        let error = options.resolve_record_target("e9patch").unwrap_err();
         assert!(
             error.to_string().contains("resolves through /proc"),
             "unexpected error: {error}"
+        );
+        let calls = std::cell::Cell::new(0);
+        let prepare = |_target: &Path| {
+            calls.set(calls.get() + 1);
+            Ok(None)
+        };
+        let error = options
+            .resolve_and_prepare_record_overlay("e9patch", &prepare)
+            .unwrap_err();
+        assert!(error.to_string().contains("resolves through /proc"));
+        assert_eq!(
+            calls.get(),
+            0,
+            "the refused /proc target reached preprocessing"
         );
     }
 }

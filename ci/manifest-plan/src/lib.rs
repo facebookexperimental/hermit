@@ -6,6 +6,7 @@ pub mod ci_selection;
 pub mod cli_help;
 pub mod cpu_evidence;
 pub mod environmental_block;
+pub mod executable_binding;
 mod git_environment;
 pub mod host_capability;
 pub mod imported_results;
@@ -65,3 +66,7 @@ pub mod validation_inventory;
 
 #[path = "../../../hermit-cli/src/verify_run_record.rs"]
 pub mod verify_run_record;
+
+pub mod execution_owners;
+
+pub mod dag_source_ownership;

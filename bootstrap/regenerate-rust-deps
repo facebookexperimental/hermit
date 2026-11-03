@@ -115,14 +115,9 @@ else
   fi
 fi
 
-# Prelude normally assembles a Cargo manifest directory from symlinks. The
-# pinned reverie-dbt build installs native headers and preserves those links,
-# which would leave dangling paths after installation. Patch both independently
-# generated graphs with the same declared copied-directory target, then keep
-# comparing them through every deterministic postprocessing step below.
-materialize_reverie_dbt=$repo_root/scripts/patch-reverie-dbt-buck.rs
-"$materialize_reverie_dbt" "$first_output"
-"$materialize_reverie_dbt" "$third_party_dir/BUCK"
+# Core has no external SDK header-install target. The extension producer owns
+# its actual copied-header materialization and calibration. Deterministic
+# shared-cell alias postprocessing and both-output comparisons stay below.
 
 git diff --exit-code -- Cargo.lock
 

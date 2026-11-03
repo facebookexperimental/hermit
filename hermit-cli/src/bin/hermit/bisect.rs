@@ -86,7 +86,7 @@ pub struct BisectOpts {
 
     /// Why this host's retired-branch counter is inexact, if it is (see
     /// `AnalyzeOpts::inexact_branch_counter`).
-    #[clap(skip = crate::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
+    #[clap(skip = crate::app::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
     inexact_branch_counter: fn() -> Option<String>,
 }
 
@@ -141,7 +141,7 @@ impl BisectOpts {
             branch_counter_warning: None,
             // Bisect runs no endpoint to measure: its replays are bounded by
             // the run arguments' --timeout alone.
-            trial_timeout: crate::analyze::TrialTimeout::Off,
+            trial_timeout: crate::app::analyze::TrialTimeout::Off,
             endpoints: Default::default(),
             time_skip_sources: Default::default(),
         };
@@ -152,11 +152,11 @@ impl BisectOpts {
         analyzer.refuse_outputs_trials_overwrite()?;
         analyzer.refuse_unqualified_trial_timeout()?;
         analyzer.install_trial_pmu_config()?;
-        analyzer.admit_branch_counter(&mut crate::tracing::write_stderr_diagnostic)?;
+        analyzer.admit_branch_counter(&mut crate::app::tracing::write_stderr_diagnostic)?;
         if let Some(notice) =
-            analyzer.small_trial_max_timeslice_notice(crate::run::installed_skid_margin)
+            analyzer.small_trial_max_timeslice_notice(crate::app::run::installed_skid_margin)
         {
-            crate::tracing::write_stderr_diagnostic(&notice);
+            crate::app::tracing::write_stderr_diagnostic(&notice);
         }
 
         let good = read_schedule(&self.good, "good")?;
@@ -173,7 +173,7 @@ impl BisectOpts {
             ("--bad", &self.bad),
         ])?;
         // A trial spliced from either schedule's prefix makes the jumps of
-        // global time that prefix contains (`crate::time_skip_carry`).
+        // global time that prefix contains (`crate::app::time_skip_carry`).
         {
             let mut sources = analyzer.time_skip_sources.lock().unwrap();
             sources.remember(&good);
@@ -208,7 +208,7 @@ fn read_schedule(path: &Path, label: &str) -> anyhow::Result<PreemptionRecord> {
         .map_err(anyhow::Error::msg)
         .with_context(|| format!("--{label} schedule {} failed validation", path.display()))?;
     record.require_faithful_replay().map_err(|error| {
-        anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+        anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
             "--{label} schedule {} cannot supply bisection evidence: {error:#}",
             path.display()
         ))
@@ -233,7 +233,7 @@ mod tests {
     use reverie::syscalls::Sysno;
 
     use super::*;
-    use crate::container::PolicyRefusal;
+    use crate::app::container::PolicyRefusal;
 
     fn search_record(events: Vec<SchedEvent>) -> serde_json::Value {
         let record = PreemptionRecord::from_sched_events(events)
@@ -257,7 +257,7 @@ mod tests {
         let bad_bytes = serde_json::to_vec(bad).unwrap();
         fs::write(&good_path, &good_bytes).unwrap();
         fs::write(&bad_path, &bad_bytes).unwrap();
-        let args = crate::Args::try_parse_from([
+        let args = crate::app::Args::try_parse_from([
             "hermit".to_owned(),
             "bisect".to_owned(),
             format!("--good={}", good_path.display()),
@@ -268,7 +268,7 @@ mod tests {
             "/bin/true".to_owned(),
         ])
         .unwrap();
-        let crate::Subcommand::Bisect(options) = args.command else {
+        let crate::app::Subcommand::Bisect(options) = args.command else {
             panic!("expected bisect")
         };
         let result = options.prepare(&args.global);
@@ -463,15 +463,15 @@ mod tests {
             "--strict",
             "/bin/true",
         ];
-        let args = crate::Args::try_parse_from(argv).unwrap();
-        let crate::Subcommand::Bisect(mut options) = args.command else {
+        let args = crate::app::Args::try_parse_from(argv).unwrap();
+        let crate::app::Subcommand::Bisect(mut options) = args.command else {
             panic!("{argv:?} is not bisect")
         };
         options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
         let error = options.main(&args.global).unwrap_err();
         assert!(
             error
-                .downcast_ref::<crate::container::PolicyRefusal>()
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
                 .is_some(),
             "{error:#}"
         );
@@ -504,8 +504,8 @@ mod tests {
             ];
             argv.extend(run_args);
             argv.push("/bin/true");
-            let args = crate::Args::try_parse_from(&argv).unwrap();
-            let crate::Subcommand::Bisect(options) = args.command else {
+            let args = crate::app::Args::try_parse_from(&argv).unwrap();
+            let crate::app::Subcommand::Bisect(options) = args.command else {
                 panic!("{argv:?} is not bisect")
             };
             options.main(&args.global).unwrap_err()
@@ -560,7 +560,7 @@ mod tests {
             let error = bisect(run_args);
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{run_args:?}: {error:#}"
             );
@@ -589,14 +589,14 @@ mod tests {
             "--timeout=3",
             "/bin/true",
         ];
-        let args = crate::Args::try_parse_from(argv).unwrap();
-        let crate::Subcommand::Bisect(options) = args.command else {
+        let args = crate::app::Args::try_parse_from(argv).unwrap();
+        let crate::app::Subcommand::Bisect(options) = args.command else {
             panic!("{argv:?} is not bisect")
         };
         let error = options.main(&args.global).unwrap_err();
         assert!(
             error
-                .downcast_ref::<crate::container::PolicyRefusal>()
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
                 .is_some(),
             "{error:#}"
         );
@@ -612,7 +612,7 @@ mod tests {
     /// per-process, so the test runs in a process of its own.
     #[test]
     fn bisect_installs_the_replays_skid_margin() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         let argv = [
@@ -624,8 +624,8 @@ mod tests {
             "--skid-margin=4321",
             "/bin/true",
         ];
-        let args = crate::Args::try_parse_from(argv).unwrap();
-        let crate::Subcommand::Bisect(options) = args.command else {
+        let args = crate::app::Args::try_parse_from(argv).unwrap();
+        let crate::app::Subcommand::Bisect(options) = args.command else {
             panic!("{argv:?} is not bisect")
         };
         let error = options.main(&args.global).unwrap_err();
@@ -678,8 +678,8 @@ mod tests {
         let mut argv = vec!["hermit", "bisect", good.as_str(), bad.as_str(), "--"];
         argv.extend(run_args);
         argv.push("/bin/true");
-        let args = crate::Args::try_parse_from(&argv).unwrap();
-        let crate::Subcommand::Bisect(options) = args.command else {
+        let args = crate::app::Args::try_parse_from(&argv).unwrap();
+        let crate::app::Subcommand::Bisect(options) = args.command else {
             panic!("{argv:?} is not bisect")
         };
         let (mut analyzer, _, _) = options.prepare(&args.global)?;
@@ -824,8 +824,8 @@ mod tests {
             let mut argv = vec!["hermit", "bisect", good.as_str(), bad.as_str(), "--"];
             argv.extend(run_args);
             argv.push("/bin/true");
-            let args = crate::Args::try_parse_from(&argv).unwrap();
-            let crate::Subcommand::Bisect(options) = args.command else {
+            let args = super::super::Args::try_parse_from(&argv).unwrap();
+            let super::super::Subcommand::Bisect(options) = args.command else {
                 panic!("{argv:?} is not bisect")
             };
             options
@@ -883,8 +883,8 @@ mod tests {
             let mut argv = vec!["hermit", "bisect", good.as_str(), bad.as_str(), "--"];
             argv.extend(run_args);
             argv.push("/bin/true");
-            let args = crate::Args::try_parse_from(&argv).unwrap();
-            let crate::Subcommand::Bisect(options) = args.command else {
+            let args = crate::app::Args::try_parse_from(&argv).unwrap();
+            let crate::app::Subcommand::Bisect(options) = args.command else {
                 panic!("{argv:?} is not bisect")
             };
             options.prepare(&args.global).map(|_| ())
@@ -963,7 +963,7 @@ mod replay_departure_tests {
                 let error = result.expect_err("bisection must not drop departure provenance");
                 assert!(
                     error
-                        .downcast_ref::<crate::container::PolicyRefusal>()
+                        .downcast_ref::<crate::app::container::PolicyRefusal>()
                         .is_some(),
                     "{error:#}"
                 );

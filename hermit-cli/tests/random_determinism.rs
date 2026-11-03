@@ -67,17 +67,13 @@ fn run_guest(guest: &Path, seed: u64) -> Vec<u8> {
     output.stdout
 }
 
-fn assert_guest_l2(guest: &Path, backend: Option<&str>) {
+fn assert_guest_l2(guest: &Path) {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "10s", "60s"])
         .arg(hermit_test::hermit_binary())
-        .arg("--log=info");
-    if let Some(backend) = backend {
-        command.args(["--backend", backend]);
-    }
-    command.arg("run");
-    command
+        .arg("--log=info")
+        .arg("run")
         .args([
             "--strict",
             "--verify",
@@ -189,17 +185,5 @@ fn random_sources_are_deterministic_under_strict_verify() {
         std::process::id()
     ));
     compile_guest(&guest);
-    assert_guest_l2(&guest, None);
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1060): Review DBT child identity and RNG lifecycle coverage.
-#[test]
-fn dbt_random_sources_are_deterministic_under_strict_verify() {
-    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "random-determinism/dbt-random-sources-{}",
-        std::process::id()
-    ));
-    compile_guest(&guest);
-    assert_guest_l2(&guest, Some("dbt"));
+    assert_guest_l2(&guest);
 }

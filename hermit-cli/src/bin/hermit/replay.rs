@@ -86,8 +86,8 @@ pub struct ReplayOpts {
 
 impl ReplayOpts {
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        use crate::manifest::Kind;
-        use crate::manifest::Target;
+        use crate::app::manifest::Kind;
+        use crate::app::manifest::Target;
 
         if self.dap_listen.is_some() {
             // Before resolving the recording, so a missing adapter is named
@@ -102,10 +102,10 @@ impl ReplayOpts {
         // Every kind of recording has one name and one verb
         // (https://github.com/rrnewton/hermit/issues/4271): a syscall
         // recording replays here; any other reruns from its manifest.
-        let (hermit, id) = match crate::manifest::resolve(store.data_dir(), &spec)? {
+        let (hermit, id) = match crate::app::manifest::resolve(store.data_dir(), &spec)? {
             Target::Recording { data_dir, id } => (HermitData::with_dir(data_dir), id),
             Target::Manifest(path) => {
-                let manifest = crate::manifest::read(&path)?;
+                let manifest = crate::app::manifest::read(&path)?;
                 // Check the saved profile before dispatching any manifest
                 // kind: network/history reruns otherwise bypass the syscall
                 // metadata check below and use this host's unbound CPUID.
@@ -127,9 +127,9 @@ impl ReplayOpts {
                 }
                 // The directory named, as the replayer finds it: its parent
                 // and its name.
-                let directory = std::path::absolute(crate::manifest::directory_of(&path))?;
+                let directory = std::path::absolute(crate::app::manifest::directory_of(&path))?;
                 let (data_dir, id) =
-                    crate::manifest::recording_location(&directory, Some(&manifest.id))?;
+                    crate::app::manifest::recording_location(&directory, Some(&manifest.id))?;
                 (HermitData::with_dir(data_dir), id)
             }
         };
@@ -301,7 +301,7 @@ impl ReplayOpts {
         &self,
         global: &GlobalOpts,
         path: &Path,
-        manifest: &crate::manifest::Manifest,
+        manifest: &crate::app::manifest::Manifest,
         data_dir: &Path,
     ) -> Error {
         use std::os::unix::process::CommandExt;

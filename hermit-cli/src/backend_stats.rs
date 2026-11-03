@@ -21,7 +21,7 @@ const TARGET: &str = "hermit::backend_stats";
 
 /// Collect when something will read the record: the DEBUG report, or the
 /// dispatch record in a requested `--summary-json`.
-pub(crate) fn request(summary_json: &Option<std::path::PathBuf>) -> BackendStatsRequest {
+pub fn request(summary_json: &Option<std::path::PathBuf>) -> BackendStatsRequest {
     BackendStatsRequest::new(
         summary_json.is_some() || tracing::enabled!(target: TARGET, tracing::Level::DEBUG),
     )
@@ -70,6 +70,27 @@ pub(crate) fn report<S>(
 where
     S: BackendStatsSource,
 {
+    report_with_names(
+        selected_backend.as_str(),
+        selected_backend.runtime_name(),
+        request,
+        source,
+    )
+}
+
+/// The same reporting owner for a statically selected physical extension.
+/// Both names are the extension's immutable selected/runtime declaration;
+/// the actual source's own BACKEND_NAME is checked even with collection off.
+/// This reports instrumentation and supplies no verification verdict.
+pub fn report_with_names<S>(
+    selected_backend: &str,
+    runtime_backend: &str,
+    request: BackendStatsRequest,
+    source: &S,
+) -> Option<DispatchStats>
+where
+    S: BackendStatsSource,
+{
     // ⚠️ HOISTED ABOVE THE COLLECTION GATE ON PURPOSE, AND IT MUST STAY THERE.
     // This asks "is the stats source wired to the backend we actually selected?"
     // -- a wiring invariant that is true or false regardless of whether anyone
@@ -81,18 +102,18 @@ where
     // unconditional. Reporting and checking are two different questions; only
     // the first belongs behind the gate.
     assert_eq!(
-        selected_backend.runtime_name(),
+        runtime_backend,
         S::Snapshot::BACKEND_NAME,
         "backend statistics source does not match selected backend"
     );
     let snapshot = request.collect(source)?;
     let dispatch = snapshot.dispatch_stats().map(|mut record| {
-        record.backend = selected_backend.as_str().to_owned();
+        record.backend = selected_backend.to_owned();
         record
     });
     tracing::debug!(
         target: TARGET,
-        backend = %selected_backend.as_str(),
+        backend = %selected_backend,
         stats = %snapshot,
         dispatch = %DisplayDispatch(dispatch.as_ref()),
         "backend run complete",

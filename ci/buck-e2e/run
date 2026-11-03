@@ -153,6 +153,15 @@ collect() { # collect NAME...: append each invocation's test-run id to ids, or e
             tail -20 "$work/$r.log" >&2
             exit 1
         fi
+        # An invocation that ran no tests leaves a test-run id that Tpx keeps no results
+        # for ("Run ID ... not found"), so it gives ingest nothing to read. Since the
+        # third-party split no cell routes to RE (only DBT's did), and hybrid's RE group is
+        # empty. Ingest still needs a row for every plan cell, so a group that should have
+        # run cells and ran none still fails there, naming the cells.
+        if [[ $rc == 0 ]] && grep -aq 'NO TESTS RAN' "$work/$r.log"; then
+            echo "ci/buck-e2e/run: buck2 test ($r) ran no tests; its test-run id $(cat "$work/$r.test_id") has no results to ingest" >&2
+            continue
+        fi
         ids+=("$(cat "$work/$r.test_id")")
         # Read by ingest.py only to name why an execution wrote no row.
         if [[ -s $work/$r.event-log.pb.zst ]]; then
@@ -162,6 +171,10 @@ collect() { # collect NAME...: append each invocation's test-run id to ids, or e
 }
 
 ingest() { # ingest: rows for every invocation in ids, and the cells withheld on RE that run again locally
+    if ((${#ids[@]} == 0)); then
+        echo "ci/buck-e2e/run: no buck2 test invocation ran any test; the run has no verdict" >&2
+        exit 1
+    fi
     python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" --work "$work/artifacts" \
         --local-artifacts "$root/buck-out/v2/test/execution" --withheld-on-re "$work/withheld-on-re" \
         --withheld-retries "$work/withheld-retries" "${failed_logs[@]}" \

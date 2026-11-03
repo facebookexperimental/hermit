@@ -104,6 +104,7 @@ class CargoCacheMounts(unittest.TestCase):
         git_location=None,
         command=None,
         caller_affinity=None,
+        project=None,
         bundle_lower=None,
     ):
         # The wrapper gets this process's environment, as it does in
@@ -116,6 +117,9 @@ class CargoCacheMounts(unittest.TestCase):
         env["PATH"] = str(self.root / "tools") + os.pathsep + env["PATH"]
         env["PINNED_ROOT_CAPTURE"] = str(self.capture)
         forwarded = ["--nextest-calibration"] if calibration else []
+        if project is not None:
+            forwarded += project
+
         if proc_locks_runtime is not None:
             env["XDG_RUNTIME_DIR"] = str(proc_locks_runtime)
             forwarded.append("--proc-locks-runtime")
@@ -151,7 +155,7 @@ class CargoCacheMounts(unittest.TestCase):
                 else lambda: os.sched_setaffinity(0, caller_affinity)
             ),
         )
-        calls = [json.loads(line) for line in self.capture.read_text().splitlines()]
+        calls = [json.loads(line) for line in self.capture.read_text().splitlines()] if self.capture.exists() else []
         return result, calls
 
     def check_image(self, exists_rc):
@@ -191,6 +195,68 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(len(exists), 1)
         self.assertIn("is not present locally", result.stderr)
+    def test_paired_project_keeps_original_core_paths_and_relocates_real_git_metadata(self):
+        env=repository_neutral_env()
+        env.update(GIT_CONFIG_GLOBAL=os.devnull,GIT_CONFIG_NOSYSTEM='1',GIT_OPTIONAL_LOCKS='0')
+        def git(root,*args):
+            result=subprocess.run(['git','-c','user.name=fixture','-c','user.email=fixture@example.invalid','-C',str(root),*args],env=env,capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr)
+            return result.stdout.strip()
+        core=self.root/'source';git(core,'init','-q');(core/'file').write_text('core');git(core,'add','file');git(core,'commit','-qm','core')
+        seed=self.root/'project-seed';seed.mkdir();git(seed,'init','-q');(seed/'file').write_text('project');git(seed,'add','file');git(seed,'commit','-qm','project')
+        project=self.root/'project';git(seed,'worktree','add','--detach',str(project))
+        descriptor=project/'ci/project.json';descriptor.parent.mkdir();graph=project/'ci/graph.json';graph.write_text('{"steps":[]}\n'+' '*65536)
+        descriptor.write_text(json.dumps({'schema':1,'repository':'/project','tools_root':'/src','graph':'/project/ci/graph.json','shared_package':'hermit-run'}))
+        git(project,'add','ci');git(project,'commit','-qm','project inputs')
+        original_head=git(project,'rev-parse','HEAD');original_index=git(project,'ls-files','--stage')
+        result,calls=self.invoke(project=['--project-src',str(project),'--project-out',str(self.root/'project-output'),'--project-descriptor',str(descriptor)])
+        self.assertEqual(result.returncode,0,result.stderr);argv=calls[-1]
+        mounts=[argv[i+1] for i,arg in enumerate(argv) if arg=='--mount']
+        self.assertIn(f'type=bind,source={core},destination=/src,ro=true',mounts)
+        self.assertIn(f'type=bind,source={self.root}/output/target,destination=/src/target',mounts)
+        self.assertIn(f'type=bind,source={project},destination=/project,ro=true',mounts)
+        self.assertIn(f'type=bind,source={self.root}/project-output/target,destination=/project/target',mounts)
+        self.assertIn('CARGO_TARGET_DIR=/project/target',argv);self.assertEqual(argv[argv.index('-w')+1],'/project')
+        overlays=[dict(p.split('=',1) for p in m.split(',')) for m in mounts if 'git-root-configs.' in m]
+        # A linked worktree without extensions.worktreeConfig finds its root
+        # through its .git file, so its shared metadata is mounted where it is
+        # and no private config is bound over it (issue 3920).
+        common=git(project,'rev-parse','--path-format=absolute','--git-common-dir')
+        private=git(project,'rev-parse','--path-format=absolute','--git-dir')
+        self.assertIn(f'type=bind,source={common},destination={common},ro=true',mounts)
+        self.assertIn(f'type=bind,source={private},destination={private},ro=true',mounts)
+        self.assertEqual(overlays,[])
+        proof=json.loads(next((self.root/'project-output').glob('source-binding.*.json')).read_text())
+        self.assertEqual(proof['sources'][1]['head'],original_head);self.assertEqual(proof['sources'][0]['guest'],'/src')
+        self.assertEqual(git(project,'rev-parse','HEAD'),original_head);self.assertEqual(git(project,'ls-files','--stage'),original_index)
+        # A tracked graph link does not give its untracked target source custody.
+        graph.unlink();(graph.parent/'untracked.json').write_text('{"steps":[]}')
+        graph.symlink_to('untracked.json');git(project,'add','ci/graph.json');git(project,'commit','-qm','tracked graph symlink')
+        self.capture.unlink(missing_ok=True)
+        result,calls=self.invoke(project=['--project-src',str(project),'--project-out',str(self.root/'project-output'),'--project-descriptor',str(descriptor)])
+        self.assertEqual(result.returncode,2);self.assertIn('graph has a symlink component',result.stderr)
+        self.assertFalse(any(call and call[0]=='run' for call in calls))
+
+    def test_paired_project_refuses_partial_or_aliasing_inputs_before_any_payload(self):
+        descriptor=self.root/'descriptor.json';descriptor.write_text('{}')
+        for arguments in (['--project-src',str(self.root/'source')],['--project-out',str(self.root/'output')],['--project-src-rw'],['--project-src',str(self.root/'source'),'--project-out',str(self.root/'different-output'),'--project-descriptor',str(descriptor)]):
+            with self.subTest(arguments=arguments):
+                self.capture.unlink(missing_ok=True)
+                result,calls=self.invoke(project=arguments)
+                self.assertNotEqual(result.returncode,0)
+                self.assertFalse(any(call and call[0]=='run' for call in calls))
+                self.assertIn('distinct and non-overlapping' if len(arguments)>2 else 'required together',result.stderr)
+
+        # Cross-owner ancestors are as unsafe as descendants. Same-owner
+        # source/output layouts keep the original admission rules.
+        nested=self.root/'output/project';nested.mkdir(parents=True)
+        separate=self.root/'other-project';separate.mkdir()
+        for source,project_source,output,project_output in [(self.root/'source',nested,self.root/'output',self.root/'other-output'),(self.root/'source',separate,self.root/'core-output',self.root)]:
+            with self.subTest(project_source=project_source,project_output=project_output):
+                self.capture.unlink(missing_ok=True)
+                result,calls=self.invoke(source=str(source),output=str(output),project=['--project-src',str(project_source),'--project-out',str(project_output),'--project-descriptor',str(descriptor)])
+                self.assertEqual(result.returncode,2);self.assertIn('distinct and non-overlapping',result.stderr)
+                self.assertFalse(any(call and call[0]=='run' for call in calls))
 
     def prepare_capture_fixture(self, probe_status=0, resolve_status=0):
         source = self.root / "source"

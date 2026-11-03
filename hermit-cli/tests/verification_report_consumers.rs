@@ -27,83 +27,62 @@ struct Consumer {
     requirement: &'static str,
     invocation: &'static str,
     minimum_invocations: usize,
-    /// The optional component whose sources hold this consumer, when it is not
-    /// first-party. Its leg is a separately named test, so a build that leaves
-    /// that component's sources out reports it as ignored instead of failing or
-    /// silently passing the first-party test.
-    optional_backend: Option<&'static str>,
 }
 
 const CONSUMERS: &[Consumer] = &[
-    Consumer {
-        path: "tests/e9patch/e9patch_corpus.py",
-        requirement: "matched",
-        invocation: "verification_matched(hermit,",
-        minimum_invocations: 2,
-        optional_backend: Some("e9patch"),
-    },
     Consumer {
         path: "tests/e2e/lib/data-handling/common.bash",
         requirement: "matched",
         invocation: "\"$VERIFICATION_REPORT_BIN\" matched \"$verify_report\"",
         minimum_invocations: 1,
-        optional_backend: None,
     },
     Consumer {
         path: "tests/e2e/lib/determinism-stress/common.sh",
         requirement: "matched",
         invocation: "\"$VERIFICATION_REPORT_BIN\" matched \"$verify_report\"",
         minimum_invocations: 1,
-        optional_backend: None,
     },
     Consumer {
         path: "tests/e2e/lib/language-runtimes/run.sh",
         requirement: "matched",
         invocation: "\"$VERIFICATION_REPORT_BIN\" matched \"$verify_report\"",
         minimum_invocations: 1,
-        optional_backend: None,
     },
     Consumer {
         path: "tests/e2e/lib/system-utils/_common.sh",
         requirement: "matched",
         invocation: "\"$VERIFICATION_REPORT_BIN\" matched \"$VERIFY_REPORT\"",
         minimum_invocations: 1,
-        optional_backend: None,
     },
     Consumer {
         path: "tests/qemu-boot/strict_l2_network_test.sh",
         requirement: "canonical-match",
         invocation: "\"$VERIFICATION_REPORT_BIN\" canonical-match \"$verify_report\"",
         minimum_invocations: 1,
-        optional_backend: None,
     },
     Consumer {
         path: "tests/qemu-boot/strict_l2_test.sh",
         requirement: "canonical-match",
         invocation: "\"$VERIFICATION_REPORT_BIN\" canonical-match \"$verify_report\"",
         minimum_invocations: 1,
-        optional_backend: None,
     },
     Consumer {
         path: "tests/qemu-boot/strict_l2_userspace_test.sh",
         requirement: "canonical-match",
         invocation: "\"$VERIFICATION_REPORT_BIN\" canonical-match \"$verify_report\"",
         minimum_invocations: 1,
-        optional_backend: None,
     },
     Consumer {
         path: "tests/standalone/strict_setitimer.sh",
         requirement: "matched",
         invocation: "\"$VERIFICATION_REPORT_BIN\" matched \"$verify_report\"",
         minimum_invocations: 1,
-        optional_backend: None,
     },
     Consumer {
         path: "tests/standalone/strict_timer_create.sh",
         requirement: "matched",
         invocation: "\"$VERIFICATION_REPORT_BIN\" matched \"$verify_report\"",
         minimum_invocations: 1,
-        optional_backend: None,
     },
 ];
 
@@ -394,47 +373,14 @@ fn verdict(requirement: &str, path: &Path) -> std::process::Output {
 fn every_named_consumer_delegates_to_the_shared_typed_reader() {
     let root = root();
     // 10 since tests/backend-parity/run_matrix.py was retired in slice S13 of
-    // https://github.com/rrnewton/hermit/issues/3301.
-    assert_eq!(CONSUMERS.len(), 10, "the published consumer list changed");
-    // Exactly one consumer lives in an optional backend's sources; its leg is
-    // e9patch_consumer_delegates_to_the_shared_typed_reader. Pin the split so no
-    // other consumer can move out of this test unnoticed.
-    let optional: Vec<(&str, &str)> = CONSUMERS
-        .iter()
-        .filter_map(|consumer| {
-            consumer
-                .optional_backend
-                .map(|backend| (consumer.path, backend))
-        })
-        .collect();
-    assert_eq!(
-        optional,
-        [("tests/e9patch/e9patch_corpus.py", "e9patch")],
-        "the optional-backend consumer split changed"
-    );
-    for consumer in CONSUMERS
-        .iter()
-        .filter(|consumer| consumer.optional_backend.is_none())
-    {
+    // https://github.com/rrnewton/hermit/issues/3301; 9 since
+    // tests/e9patch/e9patch_corpus.py left core with the e9patch preprocessing,
+    // which hermit-3rdparty-patching now carries. Every consumer listed here is
+    // first-party and is checked below.
+    assert_eq!(CONSUMERS.len(), 9, "the published consumer list changed");
+    for consumer in CONSUMERS {
         assert_consumer_uses_the_typed_reader(&root, consumer);
     }
-}
-
-// Ordinary OSS builds run this e9patch source-inspection leg. A build that
-// excludes the e9patch sources sets hermit_e9patch_sources_excluded for this
-// test binary and reports this leg as ignored.
-#[test]
-#[cfg_attr(
-    hermit_e9patch_sources_excluded,
-    ignore = "tests/e9patch is not part of this build: the optional e9patch preprocessing sources are excluded"
-)]
-fn e9patch_consumer_delegates_to_the_shared_typed_reader() {
-    let root = root();
-    let consumer = CONSUMERS
-        .iter()
-        .find(|consumer| consumer.optional_backend == Some("e9patch"))
-        .expect("the e9patch consumer is in the published list");
-    assert_consumer_uses_the_typed_reader(&root, consumer);
 }
 
 fn assert_consumer_uses_the_typed_reader(root: &Path, consumer: &Consumer) {

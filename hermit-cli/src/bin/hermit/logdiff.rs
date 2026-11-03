@@ -246,6 +246,34 @@ impl LogDiffCLIOpts {
     /// Compare two `--verify-run` directories (`--verify-json`), or else print
     /// or compare logs ([`Self::main`]).
     pub fn run(&self, global: &GlobalOpts) -> Result<ExitStatus, hermit::Error> {
+        self.run_with_comparator(global, verify_run::compare)
+    }
+
+    pub(super) fn run_with_backend<A: super::backend_hook::BackendAdapter>(
+        &self,
+        global: &GlobalOpts,
+        selected_by_executable: bool,
+        adapter: &A,
+    ) -> Result<ExitStatus, hermit::Error> {
+        if selected_by_executable {
+            self.run_with_comparator(global, |directories, report, allow, logs| {
+                verify_run::compare_for_adapter(directories, report, allow, logs, adapter)
+            })
+        } else {
+            self.run(global)
+        }
+    }
+
+    fn run_with_comparator(
+        &self,
+        global: &GlobalOpts,
+        compare: impl FnOnce(
+            [&Path; 2],
+            Option<&Path>,
+            VerifyAllow,
+            Option<&Path>,
+        ) -> Result<ExitStatus, hermit::Error>,
+    ) -> Result<ExitStatus, hermit::Error> {
         let Some(report) = &self.verify_json else {
             return Ok(self.main(global));
         };
@@ -254,7 +282,7 @@ impl LogDiffCLIOpts {
                 "hermit log-diff --verify-json compares two --verify-run directories",
             ));
         };
-        verify_run::compare(
+        compare(
             [self.file_a.as_path(), file_b.as_path()],
             Some(report),
             self.verify_allow,

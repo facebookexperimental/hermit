@@ -48,7 +48,7 @@ struct RunOutput<'a> {
 }
 struct CapturedExecution<'a> {
     request: &'a mut CaptureRequest,
-    forwarded: Option<&'a mut crate::run::ForwardedDetlogPlan>,
+    forwarded: Option<&'a mut crate::app::run::ForwardedDetlogPlan>,
 }
 
 fn check_mapped_command(command: &Command) -> io::Result<()> {
@@ -68,7 +68,7 @@ unsafe fn run_captured(
     retained: &RetainedImage,
     output: RunOutput<'_>,
     capture: &mut CaptureRequest,
-    forwarded: Option<&mut crate::run::ForwardedDetlogPlan>,
+    forwarded: Option<&mut crate::app::run::ForwardedDetlogPlan>,
 ) -> anyhow::Result<ExitStatus> {
     // SAFETY: identical singleton owner, source and cleanup contract.
     unsafe {
@@ -235,7 +235,7 @@ unsafe fn run_inner_with_capture(
     let handoff_file = memfd_bytes(&[], false)?;
     let channel = match forwarded {
         Some(plan) => Some(plan.open_mapped_in_container()?),
-        None => crate::run::RunOpts::open_forwarded_detlog_channel()?,
+        None => crate::app::run::RunOpts::open_forwarded_detlog_channel()?,
     };
     let (sender, receiver) = channel.ok_or_else(|| rpc("actual DETLOG channel absent"))?;
     let sender = UnixStream::from(sender);
@@ -246,7 +246,7 @@ unsafe fn run_inner_with_capture(
     // Independent SEQPACKET observer; the original DETLOG collector never
     // receives binary diagnostic frames. Both actual sender OFDs are retained.
     let (observer_sender, observer_receiver) =
-        crate::run::RunOpts::open_forwarded_detlog_channel()?
+        crate::app::run::RunOpts::open_forwarded_detlog_channel()?
             .ok_or_else(|| rpc("actual observer channel absent"))?;
     let observer_sender = UnixStream::from(observer_sender);
     let mut observer_receiver = Some(observer_receiver);
@@ -323,7 +323,7 @@ unsafe fn run_inner_with_capture(
             &sender,
             &observer_sender,
         ))?;
-        observer = Some(crate::native_exec_observer::Observer::new(
+        observer = Some(crate::app::native_exec_observer::Observer::new(
             observer_receiver
                 .take()
                 .ok_or_else(|| rpc("observer receiver already consumed"))?,

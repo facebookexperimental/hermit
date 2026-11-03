@@ -24,10 +24,10 @@ use sha2::Digest;
 use sha2::Sha256;
 
 use super::*;
-use crate::mapped_first_admission::runtime_support::WAIT;
-use crate::mapped_first_admission::runtime_support::need;
-use crate::mapped_first_admission::runtime_support::rpc;
-use crate::mapped_first_admission::runtime_support::*;
+use crate::app::mapped_first_admission::runtime_support::WAIT;
+use crate::app::mapped_first_admission::runtime_support::need;
+use crate::app::mapped_first_admission::runtime_support::rpc;
+use crate::app::mapped_first_admission::runtime_support::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MappedCase {
@@ -126,7 +126,7 @@ unsafe fn mapped_packet_control(
     let handoff_a = memfd_bytes(&[], false)?;
     let handoff_b = memfd_bytes(&[], false)?;
     let (sender_a, receiver_a) = if case == MappedCase::Initialize {
-        let (sender, receiver) = crate::run::RunOpts::open_forwarded_detlog_channel()
+        let (sender, receiver) = crate::app::run::RunOpts::open_forwarded_detlog_channel()
             .map_err(rpc)?
             .ok_or_else(|| rpc("actual DETLOG channel absent"))?;
         (UnixStream::from(sender), UnixStream::from(receiver))
@@ -741,7 +741,7 @@ mod retirement_unwind_tests {
 
 #[test]
 fn mapped_genuine_initializer_returns_before_guest() -> io::Result<()> {
-    use crate::mapped_first_admission::runtime_binding::RetainedImage;
+    use crate::app::mapped_first_admission::runtime_binding::RetainedImage;
 
     // The maintained package gate supplies the actual paired resources for the
     // current host/runtime sources. Missing input is a failure, never a skip or

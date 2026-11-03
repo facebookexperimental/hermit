@@ -614,6 +614,23 @@ fn select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
         return full(dag.all_nodes.clone(), reasons);
     }
 
+    dag.expand_selection_aliases(&mut matched);
+
+    // Drop any footprint node that is not in the current DAG (schema drift guard).
+    let unknown_nodes: Vec<String> = matched
+        .iter()
+        .filter(|n| !dag.all_nodes.contains(*n))
+        .cloned()
+        .collect();
+    if !unknown_nodes.is_empty() {
+        reasons.push(format!(
+            "footprint referenced {} node(s) absent from validate.json ({}) → full suite (stale map)",
+            unknown_nodes.len(),
+            unknown_nodes.join(", ")
+        ));
+        return full(dag.all_nodes.clone(), reasons);
+    }
+
     // v1 scope cut: the only scoped (selective) route is DBT-only. Docs-only
     // changes already returned Skip above; every other selective candidate
     // (shared/core code, another backend, a mixed change, a standalone
@@ -631,8 +648,6 @@ fn select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
         return full(dag.all_nodes.clone(), reasons);
     }
 
-    dag.expand_selection_aliases(&mut matched);
-
     // A backend-rule hit must exercise its backend: without any build,
     // test or e2e node in the rule/footprint set itself (dependency
     // closure pulling a build node does not count), fall back to
@@ -642,9 +657,8 @@ fn select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
             node.starts_with("build.") || node.starts_with("test.") || node.starts_with("e2e.")
         })
     {
-        reasons.push(
-            "backend rule matched but selected no build/test/e2e node → full suite".into(),
-        );
+        reasons
+            .push("backend rule matched but selected no build/test/e2e node → full suite".into());
         return full(dag.all_nodes.clone(), reasons);
     }
 
@@ -653,20 +667,6 @@ fn select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
         if dag.all_nodes.contains(*pf) {
             matched.insert((*pf).to_string());
         }
-    }
-    // Drop any footprint node that is not in the current DAG (schema drift guard).
-    let unknown_nodes: Vec<String> = matched
-        .iter()
-        .filter(|n| !dag.all_nodes.contains(*n))
-        .cloned()
-        .collect();
-    if !unknown_nodes.is_empty() {
-        reasons.push(format!(
-            "footprint referenced {} node(s) absent from validate.json ({}) → full suite (stale map)",
-            unknown_nodes.len(),
-            unknown_nodes.join(", ")
-        ));
-        return full(dag.all_nodes.clone(), reasons);
     }
     let closed = dag.close_over_deps(&matched);
     reasons.push(format!(
@@ -904,7 +904,8 @@ fn git_name_status(args: &[&str]) -> Vec<String> {
 }
 
 fn local_changed_files(baseline: &str) -> Vec<String> {
-    let committed = git_name_status(&["diff", "--name-status", "-M", &format!("{baseline}...HEAD")]);
+    let committed =
+        git_name_status(&["diff", "--name-status", "-M", &format!("{baseline}...HEAD")]);
     let mut dirty = git_name_status(&["diff", "--name-status", "-M", "HEAD"]); // staged + unstaged tracked
     // Untracked, respecting .gitignore.
     dirty.extend(git_lines(&["ls-files", "--others", "--exclude-standard"]));
@@ -940,8 +941,7 @@ fn git_text(root: &Path, args: &[&str]) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!text.is_empty()).then_some(text)
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Expand a bare `reverie` gitlink entry into the submodule's inner changed
@@ -949,59 +949,46 @@ fn git_text(root: &Path, args: &[&str]) -> Option<String> {
 /// leaves the bare entry in place, which matches no rule and therefore
 /// forces the full suite (fail-safe).
 fn expand_reverie_pin(root: &Path, files: Vec<String>, base: Option<&str>) -> Vec<String> {
+    expand_reverie_pin_with_query(root, files, base, git_text)
+}
+
+fn expand_reverie_pin_with_query(
+    root: &Path,
+    files: Vec<String>,
+    base: Option<&str>,
+    mut query: impl FnMut(&Path, &[&str]) -> Option<String>,
+) -> Vec<String> {
     if !files.iter().any(|f| f == "reverie") {
         return files;
     }
     let expanded = (|| -> Option<Vec<String>> {
         let old = match base {
             Some(b) => {
-                let mb = git_text(root, &["merge-base", b, "HEAD"])?;
-                git_text(root, &["rev-parse", &format!("{mb}:reverie")])?
+                let mb = query(root, &["merge-base", b, "HEAD"]).filter(|text| !text.is_empty())?;
+                query(root, &["rev-parse", &format!("{mb}:reverie")])
+                    .filter(|text| !text.is_empty())?
             }
-            None => git_text(root, &["rev-parse", "HEAD:reverie"])?,
+            None => query(root, &["rev-parse", "HEAD:reverie"]).filter(|text| !text.is_empty())?,
         };
-        let new = git_text(&root.join("reverie"), &["rev-parse", "HEAD"])
-            .or_else(|| git_text(root, &["rev-parse", "HEAD:reverie"]))?;
+        let submodule = root.join("reverie");
+        let new = query(&submodule, &["rev-parse", "HEAD"]).filter(|text| !text.is_empty())?;
         let mut inner_paths: Vec<String> = Vec::new();
         if old != new {
-            let diff = git_text(
-                &root.join("reverie"),
-                &["diff", "--name-status", "-M", &old, &new],
-            )?;
+            let diff = query(&submodule, &["diff", "--name-status", "-M", &old, &new])?;
             inner_paths.extend(parse_name_status(&diff));
-            // Union dirty reverie edits (tracked + untracked) when the pin
-            // moved: uncommitted work inside the submodule is real delta too.
-            if let Some(dirty) = git_text(
-                &root.join("reverie"),
-                &["diff", "--name-status", "-M", "HEAD"],
-            ) {
-                inner_paths.extend(parse_name_status(&dirty));
-            }
-            if let Some(untracked) = git_text(
-                &root.join("reverie"),
-                &["ls-files", "--others", "--exclude-standard"],
-            ) {
-                inner_paths.extend(
-                    untracked.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string),
-                );
-            }
-        } else {
-            // Uncommitted submodule move: diff the submodule worktree.
-            let diff = git_text(
-                &root.join("reverie"),
-                &["diff", "--name-status", "-M", "HEAD"],
-            )
-            .unwrap_or_default();
-            inner_paths.extend(parse_name_status(&diff));
-            if let Some(untracked) = git_text(
-                &root.join("reverie"),
-                &["ls-files", "--others", "--exclude-standard"],
-            ) {
-                inner_paths.extend(
-                    untracked.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string),
-                );
-            }
         }
+        // Successful empty queries are valid. A failed tracked or untracked
+        // query makes the complete delta unknown, even if the pin moved.
+        let dirty = query(&submodule, &["diff", "--name-status", "-M", "HEAD"])?;
+        inner_paths.extend(parse_name_status(&dirty));
+        let untracked = query(&submodule, &["ls-files", "--others", "--exclude-standard"])?;
+        inner_paths.extend(
+            untracked
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string),
+        );
         let inner: Vec<String> = inner_paths
             .iter()
             .map(|line| format!("reverie/{line}"))
@@ -1376,62 +1363,623 @@ plus shard_count/cell_count/build_* to $GITHUB_OUTPUT.
 // Built-in tests
 // ---------------------------------------------------------------------------
 
-fn self_test() {
-    let mut failures = 0;
-    let mut total = 0;
-    let mut check = |name: &str, cond: bool| {
-        total += 1;
-        if cond {
-            println!("ok   - {name}");
-        } else {
-            println!("FAIL - {name}");
-            failures += 1;
-        }
+// This private fixture-only copy preserves the old selector contract against
+// immutable pre-split data. Production always uses select(), including the
+// current-core bracket and every coarse2033 assertion below. It grants no
+// current external producer or selective-execution credit.
+fn historical_select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
+    let mut reasons = Vec::new();
+
+    // Full-suite result: every node, and every e2e cell (e2e_all).
+    let full = |nodes: BTreeSet<String>, reasons: Vec<String>| Selection {
+        decision: Decision::Full,
+        nodes,
+        e2e_all: true,
+        e2e_backends: BTreeSet::new(),
+        backend_rules: Vec::new(),
+        backend_lanes: Vec::new(),
+        reasons,
     };
 
-    // --- glob matcher ---
-    check("glob exact", glob_match("Cargo.toml", "Cargo.toml"));
-    check(
-        "glob exact not suffix",
-        !glob_match("Cargo.toml", "detcore/Cargo.toml"),
-    );
-    check("glob star segment", glob_match("*.md", "README.md"));
-    check("glob star no cross slash", !glob_match("*.md", "docs/x.md"));
-    check(
-        "glob doublestar suffix",
-        glob_match("docs/**", "docs/a/b/c.md"),
-    );
-    check(
-        "glob doublestar rs",
-        glob_match("**/*.rs", "detcore/src/scheduler.rs"),
-    );
-    check("glob doublestar rs root", glob_match("**/*.rs", "main.rs"));
-    check(
-        "glob dir rs",
-        glob_match("detcore/**/*.rs", "detcore/src/a/b.rs"),
-    );
-    check(
-        "glob dir rs miss",
-        !glob_match("detcore/**/*.rs", "hermit-cli/src/a.rs"),
-    );
-    check(
-        "glob prefix dir",
-        glob_match("detcore-dbt/**", "detcore-dbt/src/lib.rs"),
-    );
-    check(
-        "glob prefix dir file",
-        glob_match("detcore-dbt/**", "detcore-dbt/Cargo.toml"),
-    );
-    check("glob question", glob_match("a?c", "abc"));
-    check("glob mid doublestar", glob_match("a/**/z.c", "a/b/c/z.c"));
-    check("glob mid doublestar empty", glob_match("a/**/z.c", "a/z.c"));
+    if files.is_empty() {
+        return full(
+            dag.all_nodes.clone(),
+            vec!["no changed-file information available → full suite".into()],
+        );
+    }
 
-    // --- selection scenarios ---
-    let root = repo_root();
-    let fp = Footprints::load(&root.join("ci/test-footprints.json"));
-    let dag = Dag::load(&root.join("ci/dag/validate.json"));
-    let shards = Shards::load(&root.join("ci/portable-shards.json"));
-    let plan = Plan::load(&root.join("ci/expected-e2e-plan.json"));
+    let mut matched: BTreeSet<String> = BTreeSet::new();
+    let mut force = false;
+    let mut all_inert = true; // every file is ci_irrelevant with no footprint hit
+    let mut unknown: Vec<String> = Vec::new();
+    let mut e2e_all = false;
+    let mut e2e_backends: BTreeSet<String> = BTreeSet::new();
+
+    for f in files {
+        if matches_any(&fp.force_full, f) {
+            force = true;
+            all_inert = false;
+            reasons.push(format!("{f} → force_full"));
+            continue;
+        }
+        let mut hit = false;
+        for entry in &fp.footprints {
+            if matches_any(&entry.paths, f) {
+                let mut seen = BTreeSet::new();
+                fp.expand(&entry.nodes, &mut matched, &mut seen);
+                if entry.e2e_all {
+                    e2e_all = true;
+                }
+                for b in &entry.e2e_backends {
+                    e2e_backends.insert(b.clone());
+                }
+                hit = true;
+            }
+        }
+        if hit {
+            all_inert = false;
+            continue;
+        }
+        if matches_any(&fp.ci_irrelevant, f) {
+            continue; // inert; leaves all_inert as-is
+        }
+        // Matched no rule at all → unknown → conservative full.
+        unknown.push(f.clone());
+        all_inert = false;
+    }
+
+    if force {
+        return full(dag.all_nodes.clone(), reasons);
+    }
+    if !unknown.is_empty() {
+        reasons.push(format!(
+            "{} unmapped path(s) (e.g. {}) → conservative full suite",
+            unknown.len(),
+            unknown
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        return full(dag.all_nodes.clone(), reasons);
+    }
+    if matched.is_empty() && all_inert {
+        reasons.push("all changed files are CI-irrelevant → skip CI".into());
+        return Selection {
+            decision: Decision::Skip,
+            nodes: BTreeSet::new(),
+            e2e_all: false,
+            e2e_backends: BTreeSet::new(),
+            backend_rules: Vec::new(),
+            backend_lanes: Vec::new(),
+            reasons,
+        };
+    }
+    if matched.is_empty() {
+        // Defensive: no match, not proven inert. Fail safe.
+        reasons.push("no footprint matched but files not proven inert → full suite".into());
+        return full(dag.all_nodes.clone(), reasons);
+    }
+
+    dag.expand_selection_aliases(&mut matched);
+
+    // Selective: add preflight, then close over build deps.
+    for pf in PREFLIGHT {
+        if dag.all_nodes.contains(*pf) {
+            matched.insert((*pf).to_string());
+        }
+    }
+    // Drop any footprint node that is not in the current DAG (schema drift guard).
+    let unknown_nodes: Vec<String> = matched
+        .iter()
+        .filter(|n| !dag.all_nodes.contains(*n))
+        .cloned()
+        .collect();
+    if !unknown_nodes.is_empty() {
+        reasons.push(format!(
+            "footprint referenced {} node(s) absent from validate.json ({}) → full suite (stale map)",
+            unknown_nodes.len(),
+            unknown_nodes.join(", ")
+        ));
+        return full(dag.all_nodes.clone(), reasons);
+    }
+    let closed = dag.close_over_deps(&matched);
+    reasons.push(format!(
+        "{} node(s) selected + deps → {} of {} nodes",
+        matched.len(),
+        closed.len(),
+        dag.all_nodes.len()
+    ));
+    if e2e_all {
+        reasons.push("e2e: all backends (core/CLI/fixture change)".into());
+    } else if !e2e_backends.is_empty() {
+        reasons.push(format!(
+            "e2e: backend-scoped → {}",
+            e2e_backends.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    } else {
+        reasons.push("e2e: no cells (non-e2e change)".into());
+    }
+    Selection {
+        decision: Decision::Selective,
+        nodes: closed,
+        e2e_all,
+        e2e_backends,
+        backend_rules: Vec::new(),
+        backend_lanes: Vec::new(),
+        reasons,
+    }
+}
+
+fn historical_selection_bracket(root: &Path, check: &mut dyn FnMut(&str, bool)) {
+    // Preserve all original selector assertions against their frozen data.
+    // This section does not claim that core builds external packages or SDKs.
+    println!("Historical pre-split selection fixture (no current external-build credit):");
+    let fixture = root.join("ci/testdata/pre-split-selection");
+    let fp = Footprints::load(&fixture.join("test-footprints.json"));
+    let dag = Dag::load(&fixture.join("validate.json"));
+    let shards = Shards::load(&fixture.join("portable-shards.json"));
+    let plan = Plan::load(&fixture.join("expected-e2e-plan.json"));
+
+    check(
+        "every declared shard node resolves in the actual hosted DAG",
+        shards
+            .debug
+            .iter()
+            .chain(&shards.release)
+            .all(|shard| resolved_shard_nodes(shard, &dag).is_ok()),
+    );
+    let alias_fixture = Dag {
+        all_nodes: ["test.exact", "test.exact_on_host", "test.public_on_host"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        deps: BTreeMap::new(),
+    };
+    check(
+        "public selector resolves only its exact hosted counterpart",
+        alias_fixture.resolve_selection_node("test.public") == Some("test.public_on_host"),
+    );
+    check(
+        "literal node wins over a simultaneous hosted counterpart",
+        alias_fixture.resolve_selection_node("test.exact") == Some("test.exact"),
+    );
+    check(
+        "unknown and partial selector names do not resolve",
+        alias_fixture.resolve_selection_node("test.pub").is_none()
+            && alias_fixture
+                .resolve_selection_node("test.public_typo")
+                .is_none(),
+    );
+
+    let docs = historical_select(
+        &fp,
+        &dag,
+        &[
+            "ai_docs/x.md".into(),
+            "docs/y.md".into(),
+            "README.md".into(),
+        ],
+    );
+    check(
+        "docs-only ⇒ skip",
+        docs.decision == Decision::Skip && docs.nodes.is_empty(),
+    );
+
+    let lock = historical_select(&fp, &dag, &["Cargo.lock".into()]);
+    check(
+        "Cargo.lock ⇒ full",
+        lock.decision == Decision::Full && lock.nodes.len() == dag.all_nodes.len(),
+    );
+
+    let toolchain = historical_select(&fp, &dag, &["rust-toolchain.toml".into()]);
+    check("toolchain ⇒ full", toolchain.decision == Decision::Full);
+
+    let ci = historical_select(&fp, &dag, &["ci/dag/validate.json".into()]);
+    check("ci/** ⇒ full", ci.decision == Decision::Full);
+
+    let skill = historical_select(&fp, &dag, &[".claude/skills/benchmark/SKILL.md".into()]);
+    check(
+        "skill change ⇒ selective",
+        skill.decision == Decision::Selective,
+    );
+    check(
+        "skill change runs discovery check",
+        skill.nodes.contains("check.skill_discovery"),
+    );
+    check(
+        "skill change runs rust-script SIGPIPE/cache guard",
+        skill.nodes.contains("check.script_sigpipe"),
+    );
+
+    let dbt = historical_select(&fp, &dag, &["detcore-dbt/src/lib.rs".into()]);
+    check("dbt-only ⇒ selective", dbt.decision == Decision::Selective);
+    check(
+        "dbt-only runs the DBT runtime ABI check",
+        dbt.nodes.contains("check.dbt_runtime_abi_on_host"),
+    );
+    check(
+        "dbt-only runs c-programs DBT cells",
+        dbt.nodes.contains("e2e.manifest_c_programs_on_host"),
+    );
+    check(
+        "dbt-only runs system-utils DBT cells",
+        dbt.nodes.contains("e2e.manifest_system_utils_on_host"),
+    );
+    check(
+        "dbt-only pulls the E2E publisher (the one validate-profile build since 2026-09-30)",
+        dbt.nodes.contains("build.e2e_artifact_on_host"),
+    );
+    check(
+        "dbt-only pulls build.workspace (dep)",
+        dbt.nodes.contains("build.workspace_on_host"),
+    );
+    check(
+        "dbt-only skips the strict compatibility corpus",
+        !dbt.nodes.contains("e2e.manifest_compat_on_host"),
+    );
+    check(
+        "dbt-only skips language_runtimes",
+        !dbt.nodes.contains("e2e.manifest_language_runtimes_on_host"),
+    );
+    check(
+        "dbt-only is a strict subset",
+        dbt.nodes.len() < dag.all_nodes.len(),
+    );
+    check(
+        "dbt-only includes preflight",
+        dbt.nodes.contains("lint.rustfmt"),
+    );
+
+    let core = historical_select(&fp, &dag, &["detcore/src/scheduler.rs".into()]);
+    check(
+        "detcore core ⇒ selective",
+        core.decision == Decision::Selective,
+    );
+    check(
+        "detcore core runs the strict compatibility corpus",
+        core.nodes.contains("e2e.manifest_compat_on_host"),
+    );
+    check(
+        "detcore core runs detcore_unit",
+        core.nodes.contains("test.detcore_unit_on_host"),
+    );
+
+    let mut removed = Dag {
+        all_nodes: dag.all_nodes.clone(),
+        deps: dag.deps.clone(),
+    };
+    check(
+        "actual hosted DBT counterpart is present before removal",
+        removed
+            .all_nodes
+            .remove("e2e.manifest_system_utils_on_host"),
+    );
+    check(
+        "removed footprint counterpart forces full instead of dropping its coverage",
+        historical_select(&fp, &removed, &["detcore-dbt/src/lib.rs".into()]).decision
+            == Decision::Full,
+    );
+    let mut removed = Dag {
+        all_nodes: dag.all_nodes.clone(),
+        deps: dag.deps.clone(),
+    };
+    check(
+        "actual hosted strict compatibility bucket is present before removal",
+        removed.all_nodes.remove("e2e.manifest_compat_on_host"),
+    );
+    check(
+        "a removed strict compatibility bucket forces full",
+        historical_select(&fp, &removed, &["detcore/src/scheduler.rs".into()]).decision
+            == Decision::Full,
+    );
+    let unknown_fp = Footprints {
+        groups: BTreeMap::new(),
+        force_full: vec![],
+        ci_irrelevant: vec![],
+        backend_rules: vec![],
+        footprints: vec![Fp {
+            paths: vec!["fixture/**".into()],
+            nodes: vec!["test.public_typo".into()],
+            e2e_all: false,
+            e2e_backends: vec![],
+        }],
+    };
+    check(
+        "unknown footprint selector forces full",
+        historical_select(&unknown_fp, &alias_fixture, &["fixture/input".into()]).decision
+            == Decision::Full,
+    );
+
+    let workdir = historical_select(&fp, &dag, &["common/test-workdir/src/lib.rs".into()]);
+    check(
+        "shared workdir selects its real non-Cargo application consumer",
+        workdir.decision == Decision::Selective
+            && workdir.nodes.contains("test.applications_e2e_on_host"),
+    );
+    check(
+        "shared workdir retains all-backend E2E affinity",
+        workdir.e2e_all,
+    );
+
+    let unknown = historical_select(&fp, &dag, &["some/brand/new/area/file.py".into()]);
+    check("unknown path ⇒ full", unknown.decision == Decision::Full);
+
+    let mixed = historical_select(
+        &fp,
+        &dag,
+        &["detcore-dbt/src/lib.rs".into(), "README.md".into()],
+    );
+    check(
+        "dbt + docs ⇒ selective (docs inert)",
+        mixed.decision == Decision::Selective,
+    );
+
+    let mixed2 = historical_select(
+        &fp,
+        &dag,
+        &["detcore-dbt/src/lib.rs".into(), "Cargo.lock".into()],
+    );
+    check(
+        "dbt + Cargo.lock ⇒ full (force wins)",
+        mixed2.decision == Decision::Full,
+    );
+
+    let rs_lint = historical_select(&fp, &dag, &["hermit-verify/src/main.rs".into()]);
+    check(
+        "rs change pulls clippy",
+        rs_lint.nodes.contains("lint.clippy_on_host"),
+    );
+
+    // --- shard + e2e cell derivation (footprint → shard-selection layer) ---
+    let total_cells = plan.cells.len();
+    let total_shards = shards.debug.len() + shards.release.len();
+
+    let rp_docs = derive_run_plan(&docs, &shards, &plan, &dag);
+    check("docs ⇒ 0 shards", rp_docs.shards.is_empty());
+    check("docs ⇒ 0 cells", rp_docs.cells.is_empty());
+    check("docs ⇒ no debug build", !rp_docs.build_debug);
+
+    let rp_full = derive_run_plan(&lock, &shards, &plan, &dag);
+    check("full ⇒ all shards", rp_full.shards.len() == total_shards);
+    check("full ⇒ all cells", rp_full.cells.len() == total_cells);
+    // No release shard needs the aux build since test.liteinst_strict and its
+    // liteinst shard were retired (https://github.com/rrnewton/hermit/issues/3520),
+    // so a full run builds aux exactly when the plan has a liteinst cell.
+    let full_needs_aux = plan.cells.iter().any(|c| c.backend == "liteinst")
+        || shards.release.iter().any(|s| s.needs == "aux");
+    check(
+        "full ⇒ all builds",
+        rp_full.build_debug && rp_full.build_dbt && rp_full.build_aux == full_needs_aux,
+    );
+    // Positive control independent of the committed cell population: a
+    // planned liteinst cell must still request the aux build.
+    let liteinst_cell_fixture = Plan {
+        cells: vec![Cell {
+            category: "fixture-l".into(),
+            mode: "run".into(),
+            backend: "liteinst".into(),
+        }],
+    };
+    check(
+        "full with a liteinst cell ⇒ aux build",
+        derive_run_plan(&lock, &shards, &liteinst_cell_fixture, &dag).build_aux,
+    );
+
+    // DBT is a Cargo dependency of hermit. Package-level reverse-dependency
+    // closure therefore includes Hermit's other third-party-backend test
+    // nodes, while explicit backend affinity still limits e2e cells to DBT.
+    let rp_dbt = derive_run_plan(&dbt, &shards, &plan, &dag);
+    check(
+        "dbt ⇒ dbt-runtime-abi shard",
+        rp_dbt.shards.contains(&"dbt-runtime-abi".to_string()),
+    );
+    check(
+        "dbt ⇒ hermit reverse-dep sabre shard",
+        rp_dbt.shards.contains(&"sabre".to_string()),
+    );
+    let expected_dbt_cells = plan
+        .cells
+        .iter()
+        .filter(|cell| cell.backend == "dbt")
+        .count();
+    check(
+        "dbt ⇒ exactly the planned dbt cells",
+        rp_dbt.cells.len() == expected_dbt_cells
+            && rp_dbt.cells.iter().all(|cell| cell.backend == "dbt"),
+    );
+    // The committed plan currently has no DBT cells. Keep a positive control
+    // independent of that population so dropping every DBT cell cannot pass.
+    let mixed_backend_fixture = Plan {
+        cells: vec![
+            Cell {
+                category: "fixture-a".into(),
+                mode: "run".into(),
+                backend: "dbt".into(),
+            },
+            Cell {
+                category: "fixture-a".into(),
+                mode: "run".into(),
+                backend: "ptrace".into(),
+            },
+            Cell {
+                category: "fixture-b".into(),
+                mode: "verify".into(),
+                backend: "dbt".into(),
+            },
+            Cell {
+                category: "fixture-b".into(),
+                mode: "verify".into(),
+                backend: "sabre".into(),
+            },
+        ],
+    };
+    let selected_fixture = derive_run_plan(&dbt, &shards, &mixed_backend_fixture, &dag);
+    check(
+        "dbt fixture ⇒ both DBT identities and no other backend",
+        selected_fixture
+            .cells
+            .iter()
+            .map(Plan::slug)
+            .collect::<Vec<_>>()
+            == vec![
+                "fixture-a__run__dbt".to_string(),
+                "fixture-b__verify__dbt".to_string(),
+            ],
+    );
+    // aux is no longer a reverse dependency of DBT: its one release shard
+    // (liteinst) was retired with test.liteinst_strict (https://github.com/rrnewton/hermit/issues/3520).
+    check(
+        "dbt ⇒ reverse-dep builds dbt, not aux",
+        rp_dbt.build_dbt && !rp_dbt.build_aux,
+    );
+    check(
+        "dbt ⇒ cells are a strict subset",
+        rp_dbt.cells.len() < total_cells,
+    );
+
+    // SaBRe backend change: only sabre cells + sabre shard. SaBRe is archived
+    // (ci/manifest-plan/src/archived.rs), so the committed plan has no SaBRe
+    // cell and the change selects none of its cells; the fixture plan keeps
+    // the backend affinity positive.
+    let sabre = historical_select(&fp, &dag, &["detcore-sabre/src/lib.rs".into()]);
+    let rp_sabre = derive_run_plan(&sabre, &shards, &plan, &dag);
+    check(
+        "sabre ⇒ sabre shard",
+        rp_sabre.shards.contains(&"sabre".to_string()),
+    );
+    check(
+        "sabre ⇒ no e2e cells while SaBRe is archived",
+        !plan.cells.iter().any(|c| c.backend == "sabre") && rp_sabre.cells.is_empty(),
+    );
+    check(
+        "sabre fixture ⇒ only the SaBRe identity",
+        derive_run_plan(&sabre, &shards, &mixed_backend_fixture, &dag)
+            .cells
+            .iter()
+            .map(Plan::slug)
+            .collect::<Vec<_>>()
+            == vec!["fixture-b__verify__sabre".to_string()],
+    );
+    check(
+        "sabre ⇒ build_dbt, not aux",
+        rp_sabre.build_dbt && !rp_sabre.build_aux,
+    );
+
+    // LiteInst runtime staging: hermit-install's build script runs this
+    // script for every Hermit build, and no node is its own consumer since
+    // test.liteinst_strict was retired (https://github.com/rrnewton/hermit/issues/3520),
+    // so the unmatched path must force the complete suite.
+    let liteinst = historical_select(&fp, &dag, &["scripts/stage-liteinst-runtime.sh".into()]);
+    check(
+        "liteinst runtime staging ⇒ full",
+        liteinst.decision == Decision::Full,
+    );
+
+    // Core change: all backends' cells (shared Detcore path).
+    let rp_core = derive_run_plan(&core, &shards, &plan, &dag);
+    check("core ⇒ all e2e cells", rp_core.cells.len() == total_cells);
+    check("core ⇒ e2e_all set", core.e2e_all);
+
+    // Pure standalone-script change: shards but no e2e cells.
+    let rp_scripts = derive_run_plan(&rs_lint, &shards, &plan, &dag);
+    check("hermit-verify ⇒ 0 e2e cells", rp_scripts.cells.is_empty());
+    check(
+        "hermit-verify retains the regular-crates unit-parallel shard",
+        rp_scripts.shards.contains(&"unit-parallel".to_string()),
+    );
+
+    let only_regular = Selection {
+        decision: Decision::Selective,
+        nodes: BTreeSet::from(["test.regular_crates_on_host".into()]),
+        e2e_all: false,
+        e2e_backends: BTreeSet::new(),
+        backend_rules: Vec::new(),
+        backend_lanes: Vec::new(),
+        reasons: vec![],
+    };
+    let regular_plan = derive_run_plan(&only_regular, &shards, &plan, &dag);
+    check(
+        "one hosted regular node selects exactly its original public shard",
+        regular_plan.shards == vec!["unit-parallel".to_string()]
+            && regular_plan.cells.is_empty()
+            && regular_plan.build_debug
+            && !regular_plan.build_dbt
+            && !regular_plan.build_aux,
+    );
+    let mut missing = Dag {
+        all_nodes: dag.all_nodes.clone(),
+        deps: dag.deps.clone(),
+    };
+    check(
+        "actual regular counterpart exists before the missing-shard control",
+        missing.all_nodes.remove("test.regular_crates_on_host"),
+    );
+    let regular_shard = shards
+        .debug
+        .iter()
+        .find(|shard| shard.slug == "unit-parallel")
+        .unwrap();
+    check(
+        "removed declared shard counterpart is refused",
+        resolved_shard_nodes(regular_shard, &missing).is_err(),
+    );
+    let literal_shard = Shard {
+        slug: "literal".into(),
+        needs: String::new(),
+        nodes: vec!["test.exact".into()],
+    };
+    check(
+        "shard resolution also prefers the literal node over another hosted node",
+        resolved_shard_nodes(&literal_shard, &alias_fixture).unwrap()
+            == BTreeSet::from(["test.exact".into()]),
+    );
+
+    // Backend disjointness: the dbt and sabre cell sets never overlap.
+    check(
+        "dbt vs sabre cells disjoint",
+        !rp_dbt.cells.iter().any(|d| {
+            rp_sabre
+                .cells
+                .iter()
+                .any(|s| Plan::slug(d) == Plan::slug(s))
+        }),
+    );
+
+    // --- local-delta merge (pure) ---
+    let merged = merge_delta(
+        vec!["a.rs".into(), "b.rs".into(), " ".into()],
+        vec!["b.rs".into(), "c.rs".into(), "".into()],
+    );
+    check("merge_delta unions", merged == vec!["a.rs", "b.rs", "c.rs"]);
+    check(
+        "merge_delta trims blanks",
+        !merged.iter().any(|s| s.trim().is_empty()),
+    );
+
+    // --- baseline resolution (explicit wins; env fallback is a runtime concern) ---
+    check(
+        "resolve_baseline explicit",
+        resolve_baseline(&Some("deadbeef".into())) == Some("deadbeef".into()),
+    );
+
+    // A resolved baseline feeds the SAME historical_select() path as a PR diff, so the
+    // local delta of a docs-only change must still skip.
+    let local_docs = historical_select(&fp, &dag, &["docs/z.md".into()]);
+    check(
+        "local docs-only ⇒ skip",
+        local_docs.decision == Decision::Skip,
+    );
+}
+
+fn coarse_selection_bracket(root: &Path, check: &mut dyn FnMut(&str, bool)) {
+    println!("Incoming2033 coarse fixture (source contract; no external execution credit):");
+    let fixture = root.join("ci/testdata/coarse-selection-2033");
+    let fp = Footprints::load(&fixture.join("test-footprints.json"));
+    let dag = Dag::load(&fixture.join("validate.json"));
+    let shards = Shards::load(&fixture.join("portable-shards.json"));
+    let plan = Plan::load(&fixture.join("expected-e2e-plan.json"));
 
     check(
         "every declared shard node resolves in the actual hosted DAG",
@@ -1534,8 +2082,11 @@ fn self_test() {
         dbt.nodes.contains("build.workspace_on_host"),
     );
     check(
-        "dbt-only skips compat (no DBT cells in the current plan)",
-        !dbt.nodes.contains("e2e.manifest_compat_on_host"),
+        "dbt-only runs compat (DBT cells present in the coarse fixture)",
+        plan.cells
+            .iter()
+            .any(|cell| cell.backend == "dbt" && cell.category == "compat")
+            && dbt.nodes.contains("e2e.manifest_compat_on_host"),
     );
     check(
         "dbt-only runs language_runtimes (has DBT cells)",
@@ -1876,10 +2427,12 @@ fn self_test() {
     check(
         "dbt cells are a strict subset of the full (sabre-route) set",
         rp_dbt.cells.len() < rp_sabre.cells.len()
-            && rp_dbt
-                .cells
-                .iter()
-                .all(|d| rp_sabre.cells.iter().any(|s| Plan::slug(d) == Plan::slug(s))),
+            && rp_dbt.cells.iter().all(|d| {
+                rp_sabre
+                    .cells
+                    .iter()
+                    .any(|s| Plan::slug(d) == Plan::slug(s))
+            }),
     );
 
     // --- local-delta merge (pure) ---
@@ -1992,8 +2545,7 @@ fn self_test() {
     );
     check(
         "safeptrace-only ⇒ everything (multi-backend crate is core)",
-        select(&fp, &dag, &["reverie/safeptrace/src/lib.rs".into()]).decision
-            == Decision::Full,
+        select(&fp, &dag, &["reverie/safeptrace/src/lib.rs".into()]).decision == Decision::Full,
     );
     check(
         "reverie-inguest-only ⇒ everything (multi-backend crate is core)",
@@ -2003,12 +2555,13 @@ fn self_test() {
     // Rename: both sides counted; core source side forces everything.
     check(
         "parse_name_status counts both rename sides",
-        parse_name_status("R100\treverie/reverie-syscalls/src/x.rs\treverie/reverie-kvm/src/x.rs\nM\tdetcore/src/y.rs\n")
-            == vec![
-                "reverie/reverie-syscalls/src/x.rs".to_string(),
-                "reverie/reverie-kvm/src/x.rs".to_string(),
-                "detcore/src/y.rs".to_string(),
-            ],
+        parse_name_status(
+            "R100\treverie/reverie-syscalls/src/x.rs\treverie/reverie-kvm/src/x.rs\nM\tdetcore/src/y.rs\n",
+        ) == vec![
+            "reverie/reverie-syscalls/src/x.rs".to_string(),
+            "reverie/reverie-kvm/src/x.rs".to_string(),
+            "detcore/src/y.rs".to_string(),
+        ],
     );
     check(
         "rename syscalls→kvm (both sides) ⇒ everything",
@@ -2041,10 +2594,346 @@ fn self_test() {
     };
     check(
         "backend hit with no build/test/e2e node ⇒ full",
-        select(&weak_fp, &dag, &["weak-backend/src/lib.rs".into()]).decision
-            == Decision::Full,
+        select(&weak_fp, &dag, &["weak-backend/src/lib.rs".into()]).decision == Decision::Full,
+    );
+}
+
+fn reverie_pin_query_bracket(check: &mut impl FnMut(&str, bool)) {
+    type Query<'a> = (bool, Vec<&'a str>, Option<&'a str>);
+
+    fn run(queries: &[Query<'_>], expected_queries: usize, base: Option<&str>) -> Vec<String> {
+        let root = Path::new("/selector-query-fixture");
+        let submodule = root.join("reverie");
+        let mut seen = 0;
+        let actual = expand_reverie_pin_with_query(
+            root,
+            vec!["README.md".into(), "reverie".into()],
+            base,
+            |cwd, args| {
+                let (inside, expected_args, result) = &queries[seen];
+                assert_eq!(cwd, if *inside { &submodule } else { root });
+                assert_eq!(args, expected_args.as_slice());
+                seen += 1;
+                result.map(str::to_string)
+            },
+        );
+        assert_eq!(seen, expected_queries);
+        actual
+    }
+
+    let original = vec!["README.md".to_string(), "reverie".to_string()];
+    check(
+        "reverie expansion without gitlink performs no queries",
+        expand_reverie_pin_with_query(
+            Path::new("/selector-query-fixture"),
+            vec!["README.md".into()],
+            Some("baseline"),
+            |_, _| panic!("no gitlink requires no Git query"),
+        ) == vec!["README.md"],
+    );
+    let moved: Vec<Query<'_>> = vec![
+        (false, vec!["merge-base", "baseline", "HEAD"], Some("merge")),
+        (false, vec!["rev-parse", "merge:reverie"], Some("old")),
+        (true, vec!["rev-parse", "HEAD"], Some("new")),
+        (
+            true,
+            vec!["diff", "--name-status", "-M", "old", "new"],
+            Some("M\tcommitted.rs"),
+        ),
+        (true, vec!["diff", "--name-status", "-M", "HEAD"], Some("")),
+        (
+            true,
+            vec!["ls-files", "--others", "--exclude-standard"],
+            Some(""),
+        ),
+    ];
+    check(
+        "moved reverie pin accepts successful empty dirty queries",
+        run(&moved, moved.len(), Some("baseline")) == vec!["README.md", "reverie/committed.rs"],
+    );
+    let mut union = moved.clone();
+    union[3].2 = Some("R100\told.rs\tnew.rs\nM\tshared.rs");
+    union[4].2 = Some("M\tshared.rs\nM\tdirty.rs");
+    union[5].2 = Some("untracked.rs");
+    check(
+        "moved reverie pin unions committed dirty untracked and rename paths",
+        run(&union, union.len(), Some("baseline"))
+            == vec![
+                "README.md",
+                "reverie/dirty.rs",
+                "reverie/new.rs",
+                "reverie/old.rs",
+                "reverie/shared.rs",
+                "reverie/untracked.rs",
+            ],
+    );
+    for (index, name) in [
+        "merge-base",
+        "baseline gitlink",
+        "actual submodule HEAD",
+        "committed diff",
+        "tracked diff",
+        "untracked lookup",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut failed = moved.clone();
+        failed[index].2 = None;
+        check(
+            &format!("moved reverie pin refuses failed {name}"),
+            run(&failed, index + 1, Some("baseline")) == original,
+        );
+    }
+    for (index, name) in ["merge-base", "baseline gitlink", "actual submodule HEAD"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut empty = moved.clone();
+        empty[index].2 = Some("");
+        check(
+            &format!("reverie expansion refuses empty {name}"),
+            run(&empty, index + 1, Some("baseline")) == original,
+        );
+    }
+    let same = vec![
+        moved[0].clone(),
+        moved[1].clone(),
+        (true, vec!["rev-parse", "HEAD"], Some("old")),
+        moved[4].clone(),
+        moved[5].clone(),
+    ];
+    check(
+        "unchanged reverie pin with no inner paths keeps full fallback",
+        run(&same, same.len(), Some("baseline")) == original,
+    );
+    let mut same_dirty = same.clone();
+    same_dirty[3].2 = Some("M\tdirty.rs");
+    same_dirty[4].2 = Some("untracked.rs");
+    check(
+        "unchanged reverie pin includes tracked and untracked edits",
+        run(&same_dirty, same_dirty.len(), Some("baseline"))
+            == vec!["README.md", "reverie/dirty.rs", "reverie/untracked.rs"],
+    );
+    for (index, name) in [(3, "tracked diff"), (4, "untracked lookup")] {
+        let mut failed = same.clone();
+        failed[index].2 = None;
+        check(
+            &format!("unchanged reverie pin refuses failed {name}"),
+            run(&failed, index + 1, Some("baseline")) == original,
+        );
+    }
+    let no_base = vec![
+        (false, vec!["rev-parse", "HEAD:reverie"], Some("old")),
+        same_dirty[2].clone(),
+        same_dirty[3].clone(),
+        same_dirty[4].clone(),
+    ];
+    check(
+        "reverie expansion without baseline uses committed HEAD gitlink",
+        run(&no_base, no_base.len(), None)
+            == vec!["README.md", "reverie/dirty.rs", "reverie/untracked.rs"],
+    );
+}
+
+fn self_test() {
+    let mut failures = 0;
+    let mut total = 0;
+    let mut check = |name: &str, cond: bool| {
+        total += 1;
+        if cond {
+            println!("ok   - {name}");
+        } else {
+            println!("FAIL - {name}");
+            failures += 1;
+        }
+    };
+
+    // --- glob matcher ---
+    check("glob exact", glob_match("Cargo.toml", "Cargo.toml"));
+    check(
+        "glob exact not suffix",
+        !glob_match("Cargo.toml", "detcore/Cargo.toml"),
+    );
+    check("glob star segment", glob_match("*.md", "README.md"));
+    check("glob star no cross slash", !glob_match("*.md", "docs/x.md"));
+    check(
+        "glob doublestar suffix",
+        glob_match("docs/**", "docs/a/b/c.md"),
+    );
+    check(
+        "glob doublestar rs",
+        glob_match("**/*.rs", "detcore/src/scheduler.rs"),
+    );
+    check("glob doublestar rs root", glob_match("**/*.rs", "main.rs"));
+    check(
+        "glob dir rs",
+        glob_match("detcore/**/*.rs", "detcore/src/a/b.rs"),
+    );
+    check(
+        "glob dir rs miss",
+        !glob_match("detcore/**/*.rs", "hermit-cli/src/a.rs"),
+    );
+    check(
+        "glob prefix dir",
+        glob_match("detcore-dbt/**", "detcore-dbt/src/lib.rs"),
+    );
+    check(
+        "glob prefix dir file",
+        glob_match("detcore-dbt/**", "detcore-dbt/Cargo.toml"),
+    );
+    check("glob question", glob_match("a?c", "abc"));
+    check("glob mid doublestar", glob_match("a/**/z.c", "a/b/c/z.c"));
+    check("glob mid doublestar empty", glob_match("a/**/z.c", "a/z.c"));
+
+    // Current core inputs must come from the normal generators. Historical
+    // fixture success cannot substitute for this production graph check.
+    let root = repo_root();
+    let core_fp = Footprints::load(&root.join("ci/test-footprints.json"));
+    let core_dag = Dag::load(&root.join("ci/dag/validate.json"));
+    let core_shards = Shards::load(&root.join("ci/portable-shards.json"));
+    let core_plan = Plan::load(&root.join("ci/expected-e2e-plan.json"));
+    println!("Current generated core selection contract:");
+    check(
+        "current core inputs have real nonempty populations",
+        !core_fp.footprints.is_empty()
+            && !core_dag.all_nodes.is_empty()
+            && !core_shards.debug.is_empty()
+            && !core_plan.cells.is_empty(),
+    );
+    check(
+        "current core shards all resolve in the actual hosted graph",
+        core_shards
+            .debug
+            .iter()
+            .chain(&core_shards.release)
+            .all(|shard| resolved_shard_nodes(shard, &core_dag).is_ok()),
+    );
+    check(
+        "current generated footprint references all resolve",
+        core_fp.footprints.iter().all(|entry| {
+            let mut refs = BTreeSet::new();
+            core_fp.expand(&entry.nodes, &mut refs, &mut BTreeSet::new());
+            refs.iter()
+                .all(|node| core_dag.resolve_selection_node(node).is_some())
+        }),
+    );
+    let policy: Value = serde_json::from_slice(
+        &std::fs::read(root.join("ci/test-footprints-policy.json")).unwrap(),
+    )
+    .unwrap();
+    check(
+        "current core policy resolves its real nodes and contains no removed package rule",
+        ["package_rules", "path_footprints"].iter().all(|key| {
+            policy[*key].as_array().unwrap().iter().all(|rule| {
+                str_vec(&rule["nodes"])
+                    .iter()
+                    .all(|node| core_dag.resolve_selection_node(node).is_some())
+                    && str_vec(&rule["packages"]).iter().all(|package| {
+                        !matches!(
+                            package.as_str(),
+                            "detcore-dbt" | "detcore-dbt-cdylib" | "detcore-sabre"
+                        )
+                    })
+            })
+        }),
+    );
+    check(
+        "current core graph has no external private shard or corpus node",
+        [
+            "check.dbt_runtime_abi",
+            "check.dbt_runtime_abi_on_host",
+            "test.sabre_examples",
+            "test.sabre_examples_on_host",
+            "check.e9patch_corpus",
+        ]
+        .iter()
+        .all(|tag| !core_dag.all_nodes.contains(*tag)),
+    );
+    check(
+        "current core cell plan contains only its owned backends",
+        core_plan
+            .cells
+            .iter()
+            .all(|cell| !matches!(cell.backend.as_str(), "dbt" | "sabre" | "e9patch")),
+    );
+    let core_lock = select(&core_fp, &core_dag, &["Cargo.lock".into()]);
+    let current_full = derive_run_plan(&core_lock, &core_shards, &core_plan, &core_dag);
+    check(
+        "current full selection retains every actual shard and cell",
+        core_lock.decision == Decision::Full
+            && core_lock.nodes == core_dag.all_nodes
+            && current_full.shards.len() == core_shards.debug.len() + core_shards.release.len()
+            && current_full.cells.len() == core_plan.cells.len()
+            && current_full.build_debug
+            && !current_full.build_dbt,
+    );
+    let current_core = select(&core_fp, &core_dag, &["detcore/src/scheduler.rs".into()]);
+    check(
+        "current shared core source retains strict compatibility and unit consumers",
+        current_core.decision == Decision::Full
+            && current_core.nodes == core_dag.all_nodes
+            && current_core.e2e_all
+            && current_core.nodes.contains("test.detcore_unit_on_host")
+            && current_core.nodes.contains("e2e.manifest_compat_on_host")
+            && derive_run_plan(&current_core, &core_shards, &core_plan, &core_dag)
+                .cells
+                .len()
+                == core_plan.cells.len(),
+    );
+    check(
+        "removed core package and corpus paths conservatively select the full current suite",
+        [
+            "detcore-dbt/src/lib.rs",
+            "detcore-dbt-cdylib/src/lib.rs",
+            "detcore-sabre/src/lib.rs",
+            "tests/e9patch/e9patch_corpus.py",
+        ]
+        .iter()
+        .all(|path| {
+            let selected = select(&core_fp, &core_dag, &[(*path).into()]);
+            selected.decision == Decision::Full
+                && selected.nodes == core_dag.all_nodes
+                && selected
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.contains("unmapped path"))
+        }),
+    );
+    let current_unknown = select(&core_fp, &core_dag, &["some/brand/new/area/file.py".into()]);
+    check(
+        "current unknown source path still forces full",
+        current_unknown.decision == Decision::Full
+            && current_unknown
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("unmapped path")),
+    );
+    check(
+        "current inert documentation still requires its positive skip proof",
+        select(&core_fp, &core_dag, &["docs/selection-contract.md".into()]).decision
+            == Decision::Skip,
+    );
+    let mut stale_core = Dag {
+        all_nodes: core_dag.all_nodes.clone(),
+        deps: core_dag.deps.clone(),
+    };
+    let had_consumer = stale_core.all_nodes.remove("test.detcore_unit_on_host");
+    let stale_selection = select(&core_fp, &stale_core, &["detcore/src/scheduler.rs".into()]);
+    check(
+        "current removed footprint consumer fails closed through the real stale-map branch",
+        had_consumer
+            && stale_selection.decision == Decision::Full
+            && stale_selection
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("absent from validate.json")),
     );
 
+    historical_selection_bracket(&root, &mut check);
+    coarse_selection_bracket(&root, &mut check);
+
+    reverie_pin_query_bracket(&mut check);
     println!("\n{total} check(s), {failures} failure(s)");
     if failures > 0 {
         std::process::exit(1);

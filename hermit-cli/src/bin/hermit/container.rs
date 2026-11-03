@@ -501,7 +501,7 @@ impl UserBind {
 /// Say that a user bind's mountinfo rows keep the host source path as their
 /// root: Hermit could not identify them, so the guest can see that path.
 fn warn_unrewritten_bind(target: &Path) {
-    crate::tracing::diagnostic_eprintln!(
+    crate::app::tracing::diagnostic_eprintln!(
         "WARNING: /proc/self/mountinfo shows the host source path of the bind at {}: \
          Hermit could not identify its rows (https://github.com/rrnewton/hermit/issues/4266).",
         target.display()
@@ -1837,7 +1837,7 @@ pub(super) fn image_container(
         ));
     }
     let dev_root = rootfs.join("dev");
-    for node in crate::image::DEV_BIND_TARGETS {
+    for node in crate::app::image::DEV_BIND_TARGETS {
         container.mount(Mount::bind(
             Path::new("/dev").join(node),
             dev_root.join(node),
@@ -3670,7 +3670,7 @@ pub(super) mod declared_inputs {
     mod tests {
         use super::super::super::native_exec_inputs::OpenedGuestRoot;
         use super::*;
-        use crate::container_clone::CheckedClone;
+        use crate::app::container_clone::CheckedClone;
 
         fn requested_copy(path: &[u8], source: &File, executable: bool) -> RootCopy {
             let source_identity = checked_file_identity(source, executable, true).unwrap();
@@ -3736,7 +3736,7 @@ pub(super) mod declared_inputs {
 
         #[test]
         fn actual_readonly_root_backings_group_aliases_and_refuse_changed_owners() {
-            if crate::test_isolation::rerun_alone() {
+            if crate::app::test_isolation::rerun_alone() {
                 return;
             }
             let inputs = data_inputs();
@@ -4145,7 +4145,7 @@ pub(super) mod declared_inputs {
             use std::os::unix::fs::FileTypeExt;
             use std::os::unix::net::UnixListener;
 
-            if crate::test_isolation::rerun_alone() {
+            if crate::app::test_isolation::rerun_alone() {
                 return;
             }
             use super::super::super::native_exec_run::NativeEndpoints;
@@ -4290,7 +4290,7 @@ pub(super) mod declared_inputs {
 
         #[test]
         fn actual_common_container_materializes_readonly_data_and_same_task_proc() {
-            if crate::test_isolation::rerun_alone() {
+            if crate::app::test_isolation::rerun_alone() {
                 return;
             }
             // Filesystem component only: no Tool installation/native filter,
@@ -4962,7 +4962,6 @@ static EXIT_AFTER_PUBLICATION: std::sync::atomic::AtomicBool =
 /// result is published instead of waiting for that thread, with the status
 /// the init returns anyway. Each init is its own process, so this never
 /// affects the caller.
-#[cfg(feature = "dbt")]
 pub(super) fn exit_init_after_publication() {
     EXIT_AFTER_PUBLICATION.store(true, Ordering::Release);
 }
@@ -5870,7 +5869,7 @@ mod readonly_proc;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container_clone::CheckedClone;
+    use crate::app::container_clone::CheckedClone;
 
     /// The `uid=` and `gid=` options go; every other option stays, in order.
     #[test]
@@ -6093,7 +6092,7 @@ mod tests {
     /// init is still running when the budget expires.
     #[test]
     fn a_namespace_init_honours_stop_signals_sent_before_it_arms() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         for signal in CONTAINER_INIT_STOP_SIGNALS {
@@ -6121,7 +6120,7 @@ mod tests {
     /// the wait status `SIG_DFL` would have given it.
     #[test]
     fn the_process_holding_the_bridge_still_dies_from_stop_signals() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         fn hold_the_bridge() -> bool {
@@ -6155,7 +6154,7 @@ mod tests {
     /// what was there before.
     #[test]
     fn the_bridge_leaves_ignored_and_handled_signals_alone_and_restores_the_default() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         extern "C" fn someone_elses_handler(_signal: libc::c_int) {}
@@ -6218,7 +6217,7 @@ mod tests {
     /// the way rather than guessing which of the two it is running in.
     #[test]
     fn the_bridge_is_not_installed_by_a_process_that_is_pid_1() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         fn install_as_pid_1() -> bool {
@@ -6402,7 +6401,7 @@ mod tests {
     /// (`mnt_already_visible`).
     #[test]
     fn the_placeholder_directory_mounts_and_leaves_procfs_mountable() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         let facts = Container::new()
@@ -6431,7 +6430,7 @@ mod tests {
 
     #[test]
     fn default_container_uses_readonly_proc_fallback() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         // The outer child confines the irreversible seccomp filter to this test.
@@ -6449,7 +6448,7 @@ mod tests {
 
     #[test]
     fn image_container_uses_readonly_proc_fallback() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         let rootfs = tempfile::tempdir().unwrap();
@@ -6457,7 +6456,7 @@ mod tests {
         for directory in ["proc", "tmp", "dev/pts"] {
             fs::create_dir_all(rootfs.path().join(directory)).unwrap();
         }
-        for node in crate::image::DEV_BIND_TARGETS {
+        for node in crate::app::image::DEV_BIND_TARGETS {
             File::create(rootfs.path().join("dev").join(node)).unwrap();
         }
 
@@ -6499,7 +6498,7 @@ mod tests {
     /// with both locked flags still present.
     #[test]
     fn image_container_accepts_a_rootfs_on_a_nosuid_nodev_filesystem() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         fn root_mount_flags() -> Result<(bool, bool, bool), String> {
@@ -6530,7 +6529,7 @@ mod tests {
                 for directory in ["proc", "tmp", "dev/pts"] {
                     fs::create_dir_all(rootfs.join(directory)).map_err(|e| e.to_string())?;
                 }
-                for node in crate::image::DEV_BIND_TARGETS {
+                for node in crate::app::image::DEV_BIND_TARGETS {
                     File::create(rootfs.join("dev").join(node)).map_err(|e| e.to_string())?;
                 }
                 fs::create_dir(&tmpfs).map_err(|e| e.to_string())?;
@@ -7241,9 +7240,9 @@ mod tests {
         use std::io::Read as _;
 
         in_isolated_process(move || {
-            let budget = crate::tracing::LogBudget::new(100).map_err(|e| e.to_string())?;
+            let budget = crate::app::tracing::LogBudget::new(100).map_err(|e| e.to_string())?;
             // Only in this isolated process; the harness registers nothing.
-            crate::tracing::register_invocation_log_budget(Some(budget.clone()));
+            crate::app::tracing::register_invocation_log_budget(Some(budget.clone()));
             // SAFETY: `prctl` touches no caller memory; this process is a fresh
             // fork, so the attribute reaches no other test.
             if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } == -1 {
@@ -7287,7 +7286,7 @@ mod tests {
                     }
                     libc::close(marker_fd);
                     let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
-                    let mut writer = crate::tracing::CappedWriter::file(
+                    let mut writer = crate::app::tracing::CappedWriter::file(
                         std::fs::File::from_raw_fd(null),
                         0,
                         Some(budget.clone()),
@@ -7352,7 +7351,7 @@ mod tests {
     /// death signal must not go on to start a guest.
     #[test]
     fn log_cap_crossed_before_the_container_init_arms_stops_the_init() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         let outcome = arm_after_the_parent_crossed(|| arm_container_init_guards().is_ok());
@@ -7363,7 +7362,7 @@ mod tests {
     /// arms in `pre_exec` and then execs the guest itself.
     #[test]
     fn log_cap_crossed_before_the_namespace_only_guest_arms_stops_the_exec() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         let outcome = arm_after_the_parent_crossed(|| arm_namespace_only_guest().is_ok());

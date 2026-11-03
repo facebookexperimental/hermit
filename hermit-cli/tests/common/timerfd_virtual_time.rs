@@ -97,13 +97,11 @@ fn matches(expected: &str, actual: &str) -> bool {
 
 /// Run `mode` under strict verification and require a bitwise match with
 /// stdout matching `expected`.
-/// A private tmpfs working directory, except on DBT, which refuses `--mount`
-/// until a DBT run has been tested with one. The guest writes no file.
+/// A private tmpfs working directory. The guest writes no file.
 /// In-guest LiteInst cannot deliver a preemption timer yet and refuses a run
-/// that keeps one, so it runs without time slices, as DBT always does.
+/// that keeps one, so it runs without time slices.
 fn private_workdir(backend: &str) -> &'static [&'static str] {
     match backend {
-        "dbt" => &[],
         "liteinst" => &[
             "--mount=type=tmpfs,target=/test",
             "--workdir=/test",

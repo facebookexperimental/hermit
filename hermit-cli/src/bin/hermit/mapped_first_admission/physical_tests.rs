@@ -32,7 +32,7 @@ use tokio::io::AsyncWriteExt;
 use super::*;
 
 const WAIT: Duration = Duration::from_secs(10);
-const CHILD: &str = "mapped_first_admission::physical_tests::admission_socket_child";
+const CHILD: &str = "app::mapped_first_admission::physical_tests::admission_socket_child";
 const CHILD_ENV: &str = "HERMIT_MAPPED_ADMISSION_TEST_CONTROL_FD";
 const FRAME_LIMIT: usize = 64 * 1024;
 

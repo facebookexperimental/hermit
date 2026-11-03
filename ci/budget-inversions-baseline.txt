@@ -18,7 +18,6 @@
 # Both are CI policy calls. The guard deliberately does not choose.
 #
 # Format: <node> <declared>s >= <bound>s (<what bounds it>)
-test.sabre_examples 900s >= 900s (job test-release timeout-minutes)
 #
 # REMOVED 2026-08-10, and this is what a shrink looks like:
 #   test.strict_compat 1800s >= 900s (job test-debug timeout-minutes)
@@ -32,3 +31,10 @@ test.sabre_examples 900s >= 900s (job test-release timeout-minutes)
 # The node was deleted with the LiteInst host hybrid
 # (https://github.com/rrnewton/hermit/issues/3520). Its line goes because
 # the node no longer exists; no wall or job timeout changed. 2 -> 1.
+#
+# REMOVED 2026-11-02, and this is NOT a fix:
+#   test.sabre_examples 900s >= 900s (job test-release timeout-minutes)
+# The node left the core DAG with the third-party split: SaBRe moved to
+# hermit-3rdparty-patching, whose own DAG owns the node now. Its line goes
+# because the node no longer exists here; no wall or job timeout changed.
+# 1 -> 0.

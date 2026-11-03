@@ -3181,7 +3181,7 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// can express, which includes every backend's own constant except for
 /// capabilities added after the legacy form froze: those never enter it, as
 /// `record_host_inputs` does not, and read back as their default. There are
-/// eleven. `process_exits_complete_asynchronously` and
+/// thirteen. `process_exits_complete_asynchronously` and
 /// `virtualizes_guest_sigalrm` are true only for in-guest LiteInst, which
 /// never travels through this DBT-only form.
 /// `supports_blocked_wait_signal_interruption`,
@@ -3196,6 +3196,10 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// ptrace value it takes from the starting constant and DBT's value; the
 /// two backends that report false (in-guest LiteInst and KVM) travel
 /// through this form only inside the versioned envelope.
+/// `places_orphans` reads back as false and `publishable_parent_death_signals`
+/// as the empty set, DBT's values; KVM, the one backend that reports
+/// otherwise, travels through this form only inside the versioned envelope
+/// too.
 ///
 /// `cpuid_virtualized_by_backend` supplies no capability either: it said the
 /// backend installed a CPUID policy of its own, which no backend does any
@@ -3485,6 +3489,12 @@ impl LegacyBackendKeys {
         backend.reports_sigreturns = false;
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
+        // Added after the legacy form froze, and false for DBT, the form's
+        // only reader, whose guest threads are host tasks whose exits run
+        // Linux's robust-list walk. KVM, the one backend that reports true,
+        // is preserved exactly only by the versioned envelope of
+        // `encode_backend_config_json`, never by these keys.
+        backend.kernel_never_walks_robust_lists = false;
         // Added after the legacy form froze (Reverie 9443a6b2): it reads
         // back as the starting constant's true, which is also DBT's value,
         // the form's only reader, so a DBT configuration stays exact. The
@@ -3492,6 +3502,13 @@ impl LegacyBackendKeys {
         // preserved exactly only by the versioned envelope of
         // `encode_backend_config_json`, never by these keys.
         backend.provides_guest_backtraces = true;
+        // Added after the legacy form froze (Reverie f614c7c8): false and the
+        // empty set, DBT's values, the form's only reader. KVM, the one
+        // backend that reports otherwise, is preserved exactly only by the
+        // versioned envelope of `encode_backend_config_json`, never by these
+        // keys.
+        backend.places_orphans = false;
+        backend.publishable_parent_death_signals = 0;
         // Added after the legacy form froze (Reverie 1161 made it a `u8`
         // width). The legacy form carries no width for it: by absence it
         // says the bool false, and the minimal width that represents a
@@ -4529,9 +4546,16 @@ mod tests {
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
         backend.reports_sigreturns = false;
+        // Added after the legacy form froze: it reads back as false (see
+        // `LegacyBackendKeys::capabilities`).
+        backend.kernel_never_walks_robust_lists = false;
         // Added after the legacy form froze: it reads back as true (see
         // `LegacyBackendKeys::capabilities`).
         backend.provides_guest_backtraces = true;
+        // Added after the legacy form froze: they read back as false and the
+        // empty set (see `LegacyBackendKeys::capabilities`).
+        backend.places_orphans = false;
+        backend.publishable_parent_death_signals = 0;
         backend.reports_kernel_child_exit_signals = backend.reports_child_exit_publication;
         // The legacy discover_live_file_metadata bit couples three facts.
         backend.rediscovers_descriptors_after_exec = backend.tool_shares_guest_descriptor_table;
@@ -4637,11 +4661,15 @@ mod tests {
         for (name, value) in baseline.as_object().unwrap() {
             let mut edited = baseline.clone();
             // Every capability is a bool except `hardware_watchpoints`, a
-            // `u8` width: flip it to another width (0 is DBT's, so 1).
-            edited[name] = if name == "hardware_watchpoints" {
-                serde_json::Value::from(1u8)
-            } else {
-                serde_json::Value::Bool(!value.as_bool().unwrap())
+            // `u8` width, and `publishable_parent_death_signals`, a `u64`
+            // set of signal bits: flip a bool, and move a number to another
+            // value (DBT's is 0 for both: width 1, and KVM's set).
+            edited[name] = match name.as_str() {
+                "hardware_watchpoints" => serde_json::Value::from(1u8),
+                "publishable_parent_death_signals" => serde_json::Value::from(
+                    BackendCapabilities::KVM.publishable_parent_death_signals,
+                ),
+                _ => serde_json::Value::Bool(!value.as_bool().unwrap()),
             };
             let backend = serde_json::from_value(edited).unwrap();
             let sent = Config {
@@ -5195,8 +5223,10 @@ mod tests {
     /// configuration reads back as false
     /// (`supports_blocked_wait_signal_interruption` and the four split out of
     /// it, `delivers_preemption_timer_events`,
-    /// `runs_guest_code_between_injections`, `reports_sigreturns`) never enter
-    /// it, whatever their
+    /// `runs_guest_code_between_injections`, `reports_sigreturns`,
+    /// `kernel_never_walks_robust_lists`, `places_orphans`, and
+    /// `publishable_parent_death_signals`, which reads back as the empty set)
+    /// never enter it, whatever their
     /// value: the legacy string keeps its bytes, and they read
     /// back as false from both the object and the array form.
     #[test]
@@ -5210,6 +5240,10 @@ mod tests {
         on.backend.delivers_preemption_timer_events = true;
         on.backend.runs_guest_code_between_injections = true;
         on.backend.reports_sigreturns = true;
+        on.backend.kernel_never_walks_robust_lists = true;
+        on.backend.places_orphans = true;
+        on.backend.publishable_parent_death_signals =
+            BackendCapabilities::KVM.publishable_parent_death_signals;
         let json = to_legacy_backend_json(&on).unwrap();
         assert_eq!(json, to_legacy_backend_json(&off).unwrap());
         for key in [
@@ -5221,6 +5255,9 @@ mod tests {
             "delivers_preemption_timer_events",
             "runs_guest_code_between_injections",
             "reports_sigreturns",
+            "kernel_never_walks_robust_lists",
+            "places_orphans",
+            "publishable_parent_death_signals",
         ] {
             assert!(!json.contains(key), "{json}");
         }
@@ -5239,6 +5276,9 @@ mod tests {
             assert!(!backend.delivers_preemption_timer_events);
             assert!(!backend.runs_guest_code_between_injections);
             assert!(!backend.reports_sigreturns);
+            assert!(!backend.kernel_never_walks_robust_lists);
+            assert!(!backend.places_orphans);
+            assert_eq!(backend.publishable_parent_death_signals, 0);
             assert_eq!(backend, legacy_expressible(BackendCapabilities::DBT));
         }
     }
@@ -7468,33 +7508,42 @@ mod tests {
     fn config_fingerprint_sees_the_width_of_every_backend_capability() {
         // `BackendCapabilities` lives in Reverie, outside the fingerprinted
         // sources, so only its encoding can reveal a change to it. Every
-        // field encodes in one byte whatever its value (a bool, or the `u8`
-        // width of `hardware_watchpoints`), so the encoded default carries
-        // every field, and adding, removing or widening one changes the
-        // bytes. A field that is optional would have
+        // field encodes at a fixed width whatever its value (a bool, or the
+        // `u8` width of `hardware_watchpoints`, in one byte; the `u64`
+        // signal set of `publishable_parent_death_signals` in eight), so the
+        // encoded default carries every field, and adding, removing or
+        // widening one changes the bytes. A field that is optional would have
         // to be present in the default, or a change to its width would encode
         // as the same bare `None`; this fails first.
         let config = config_wire_default();
         let fields = serde_json::to_value(config.backend).unwrap();
         let fields = fields.as_object().unwrap();
         // The true widths from the capability table: every field is a bool
-        // except `hardware_watchpoints`, a `u8` count.
+        // except `hardware_watchpoints`, a `u8` count, and
+        // `publishable_parent_death_signals`, a `u64` set of signal bits.
         for (name, value) in fields {
-            if name == "hardware_watchpoints" {
-                let width = value.as_u64().expect("a u8 count encodes as a number");
-                assert!(width <= u64::from(u8::MAX), "{name}={width} exceeds a u8");
-            } else {
-                assert!(value.is_boolean(), "{name}={value} is not a bool");
+            match name.as_str() {
+                "hardware_watchpoints" => {
+                    let width = value.as_u64().expect("a u8 count encodes as a number");
+                    assert!(width <= u64::from(u8::MAX), "{name}={width} exceeds a u8");
+                }
+                "publishable_parent_death_signals" => {
+                    value
+                        .as_u64()
+                        .expect("a u64 signal set encodes as a number");
+                }
+                _ => assert!(value.is_boolean(), "{name}={value} is not a bool"),
             }
         }
         let encode = |config: &Config| {
             bincode::serde::encode_to_vec(config, bincode::config::legacy()).unwrap()
         };
+        // One byte per field, and seven more for the `u64` signal set.
         assert_eq!(
             bincode::serde::encode_to_vec(config.backend, bincode::config::legacy())
                 .unwrap()
                 .len(),
-            fields.len()
+            fields.len() + 7
         );
         // The backend's values are part of the encoded default.
         let flipped = config.clone().with_backend(|backend| {
@@ -7510,6 +7559,12 @@ mod tests {
         });
         assert_eq!(encode(&widened).len(), encode(&config).len());
         assert_ne!(encode(&widened), encode(&config));
+        // The signal set: another set changes the bytes at the same length.
+        let resigned = config
+            .clone()
+            .with_backend(|backend| backend.publishable_parent_death_signals ^= 1 << 63);
+        assert_eq!(encode(&resigned).len(), encode(&config).len());
+        assert_ne!(encode(&resigned), encode(&config));
     }
 
     #[test]

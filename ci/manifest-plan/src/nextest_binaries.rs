@@ -26,7 +26,8 @@ use sha2::Sha256;
 
 pub const SELECTION_ENV: &str = "NEXTEST_PREPARED_BUILD_SELECTION";
 pub const REQUIRED_ENV: &str = "HERMIT_PREPARED_NEXTEST_REQUIRED";
-const RECORD_SCHEMA: u32 = 4;
+const RECORD_SCHEMA: u32 = 5;
+pub const PROJECT_ENV: &str = "HERMIT_NEXTEST_PROJECT";
 pub const GUESTS_ENV: &str = "HERMIT_PREPARED_CARGO_GUESTS";
 pub const LIT_GUESTS_ENV: &str = "HERMIT_PREPARED_LIT_GUESTS";
 pub const CPU_WRAPPER_ENV: &str = "HERMIT_NEXTEST_CPU_WRAPPER_BIN";
@@ -385,6 +386,7 @@ struct SelectionRecord {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct PreparedRecord {
     schema: u32,
+    project: Option<PreparedProject>,
     repository: PathBuf,
     target: PathBuf,
     sources: BTreeMap<PathBuf, String>,
@@ -398,6 +400,166 @@ struct PreparedRecord {
     lit_guests: Vec<FileIdentity>,
     record_workloads: Option<RecordWorkloads>,
     cpu_wrapper: CpuWrapperRecord,
+}
+
+/// A neutral second Cargo project consumes an already-produced core tool
+/// cohort. It never claims the core CPU wrapper belongs to its own Cargo graph.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedProject {
+    descriptor: FileIdentity,
+    graph: FileIdentity,
+    tools_root: PathBuf,
+    core_preparation: FileIdentity,
+    shared_package: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectDescriptor {
+    schema: u32,
+    repository: PathBuf,
+    graph: PathBuf,
+    tools_root: PathBuf,
+    shared_package: String,
+}
+
+fn project(root: &Path) -> Result<Option<PreparedProject>, String> {
+    let Some(path) = std::env::var_os(PROJECT_ENV) else {
+        return Ok(None);
+    };
+    project_at(root, &PathBuf::from(path)).map(Some)
+}
+
+fn project_at(root: &Path, path: &Path) -> Result<PreparedProject, String> {
+    if !path.is_absolute() || path.canonicalize().map_err(|e| e.to_string())? != path {
+        return Err("prepared project descriptor must be an explicit canonical file".into());
+    }
+    let descriptor = file_identity(path, false)?;
+    if descriptor.size > 65536 {
+        return Err("prepared project descriptor exceeds its size bound".into());
+    }
+    let decoded: ProjectDescriptor =
+        serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    if decoded.schema != 1
+        || decoded.repository != root
+        || decoded.shared_package.is_empty()
+        || !decoded.tools_root.is_absolute()
+        || decoded
+            .tools_root
+            .canonicalize()
+            .map_err(|e| e.to_string())?
+            != decoded.tools_root
+        || decoded.tools_root == root
+        || !decoded.graph.is_absolute()
+        || decoded.graph.canonicalize().map_err(|e| e.to_string())? != decoded.graph
+    {
+        return Err(
+            "prepared project has an unknown schema, repository, graph, or tool owner".into(),
+        );
+    }
+    let relative = decoded
+        .graph
+        .strip_prefix(root)
+        .map_err(|_| "prepared project graph is outside its repository")?;
+    // The source identity includes the committed authored graph. A generated
+    // ignored scratch DAG cannot silently supply a second preparation population.
+    git_bytes(
+        root,
+        &[
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            relative.to_str().ok_or("non-UTF-8 project graph")?,
+        ],
+    )?;
+    let graph = file_identity(&decoded.graph, false)?;
+    let core_preparation = file_identity(
+        &decoded
+            .tools_root
+            .join("target/ci/nextest-binaries/current.json"),
+        false,
+    )?;
+    check_identity(&descriptor, false)?;
+    Ok(PreparedProject {
+        descriptor,
+        graph,
+        tools_root: decoded.tools_root,
+        core_preparation,
+        shared_package: decoded.shared_package,
+    })
+}
+
+fn same_core_package(
+    project: &PreparedProject,
+    consumer: &Value,
+    core: &Value,
+) -> Result<(), String> {
+    fn owner(cargo: &Value, package: &str) -> Result<Vec<u8>, String> {
+        let matches = cargo["packages"]
+            .as_array()
+            .ok_or("missing Cargo package map")?
+            .iter()
+            .filter(|row| row["name"].as_str() == Some(package))
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err("shared core package is missing or ambiguous".into());
+        }
+        let manifest = Path::new(string(matches[0], "manifest_path")?);
+        git_bytes(
+            manifest
+                .parent()
+                .ok_or("core package manifest has no directory")?,
+            &["rev-parse", "HEAD", "HEAD^{tree}"],
+        )
+    }
+    if owner(consumer, &project.shared_package)? != owner(core, &project.shared_package)? {
+        return Err("consumer's core source pin/tree differs from its tool cohort".into());
+    }
+    Ok(())
+}
+
+/// Hold the original core producer's shared generation lock. Consumers retain
+/// this guard until their actual Nextest child has joined, alongside their own
+/// project lock. There is no fallback to building a wrapper in a test node.
+fn project_tools(project: Option<&PreparedProject>) -> Result<Option<LockedArtifacts>, String> {
+    let Some(project) = project else {
+        return Ok(None);
+    };
+    let locked = LockedArtifacts::open(&project.tools_root, false)?;
+    check_identity(&project.core_preparation, false)?;
+    let record = locked.current()?;
+    if record.schema != RECORD_SCHEMA
+        || record.project.is_some()
+        || record.repository != project.tools_root
+    {
+        return Err("tool cohort is not the original core preparation owner".into());
+    }
+    check_identity(&record.cargo_metadata, false)?;
+    let cargo = read_json(&record.cargo_metadata.path)?;
+    let target = Path::new(string(&cargo, "target_directory")?);
+    if target != record.target
+        || target.canonicalize().map_err(|e| e.to_string())? != target
+        || record.sources != sources(&cargo, &project.tools_root)?
+        || record.rustc != rustc_identity()?
+    {
+        return Err("core tool cohort has changed source, compiler, or Cargo target".into());
+    }
+    // These are the producer's recorded config inputs, not a claim that two
+    // distinct Cargo projects have the same target-dir/build environment. The
+    // immutable core record retains its actual original build environment;
+    // the consumer's own environment is still checked by verify_record.
+    for (path, identity) in &record.cargo_config {
+        match identity {
+            Some(identity) => check_identity(identity, false)?,
+            None if !path.try_exists().map_err(|e| e.to_string())? => (),
+            None => return Err("core tool cohort Cargo configuration changed".into()),
+        }
+    }
+    verify_cpu_wrapper(&record, &cargo)?;
+    check_identity(&project.core_preparation, false)?;
+    Ok(Some(locked))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -479,6 +641,20 @@ fn cpu_wrapper_artifact(
 }
 
 fn verify_cpu_wrapper(record: &PreparedRecord, cargo: &Value) -> Result<(), String> {
+    if let Some(project) = &record.project {
+        let tools = project_tools(Some(project))?.ok_or("missing prepared tool owner")?;
+        let core = tools.current()?;
+        same_core_package(project, cargo, &read_json(&core.cargo_metadata.path)?)?;
+        if core.cpu_wrapper != record.cpu_wrapper {
+            return Err("project CPU wrapper differs from its core tool cohort".into());
+        }
+        if let Some(configured) = std::env::var_os(CPU_WRAPPER_ENV) {
+            if Path::new(&configured) != record.cpu_wrapper.executable.path {
+                return Err("configured CPU wrapper differs from the prepared executable".into());
+            }
+        }
+        return Ok(());
+    }
     check_identity(&record.cpu_wrapper.metadata, false)?;
     let events =
         fs::read_to_string(&record.cpu_wrapper.metadata.path).map_err(|e| e.to_string())?;
@@ -905,20 +1081,53 @@ pub fn profile_selections(
     root: &Path,
     profile: &str,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
-    let graph = fs::read_to_string(root.join("ci/dag/validate.json")).map_err(|e| e.to_string())?;
+    let prepared_project = project(root)?;
+    let graph_path = prepared_project
+        .as_ref()
+        .map(|project| project.graph.path.clone())
+        .unwrap_or_else(|| root.join("ci/dag/validate.json"));
+    let graph = fs::read_to_string(graph_path).map_err(|e| e.to_string())?;
     let graph = dagrun::io::dag_from_json(&graph).map_err(|e| e.to_string())?;
-    config_selections(&graph, profile)
+    config_selections_for_project(
+        &graph,
+        profile,
+        prepared_project
+            .as_ref()
+            .map(|project| project.descriptor.path.as_path()),
+    )
 }
 
 pub fn config_selections(
     graph: &dagrun::model::DagConfig,
     profile: &str,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
+    config_selections_for_project(graph, profile, None)
+}
+
+fn config_selections_for_project(
+    graph: &dagrun::model::DagConfig,
+    profile: &str,
+    project: Option<&Path>,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
     let selected =
         dagrun::select_steps_by_labels(graph, &[profile.into()]).map_err(|e| e.to_string())?;
     let mut selections = BTreeMap::new();
     for step in selected.steps {
         if let Some(args) = step.env.get(SELECTION_ENV) {
+            let owner = step.env.get(PROJECT_ENV).map(Path::new);
+            if owner.is_some_and(|path| !path.is_absolute()) {
+                return Err(format!(
+                    "{} has a nonabsolute prepared project owner",
+                    step.tag()
+                ));
+            }
+            // The DAG still executes every selected row and enforces its full
+            // dependencies. This producer compiles exactly its own Cargo
+            // project's selections; a different project must provide its own
+            // required preparation record rather than enter the core union.
+            if owner != project {
+                continue;
+            }
             if step.env.get(REQUIRED_ENV).map(String::as_str) != Some("1") {
                 return Err(format!(
                     "{} does not require prepared executables",
@@ -1033,7 +1242,12 @@ fn preparation_build_jobs() -> String {
 
 fn cargo_output(root: &Path, args: &[String], destination: &Path) -> Result<(), PreparationError> {
     let output = fs::File::create(destination).map_err(|e| e.to_string())?;
-    let status = Command::new(root.join("ci/run-with-reverie-dbt-budget.sh"))
+    let prepared_project = project(root)?;
+    let wrapper_root = prepared_project
+        .as_ref()
+        .map(|project| project.tools_root.as_path())
+        .unwrap_or(root);
+    let status = Command::new(wrapper_root.join("ci/run-with-core-build.sh"))
         .arg("cargo")
         .args(args)
         .env("CARGO_BUILD_JOBS", preparation_build_jobs())
@@ -1131,7 +1345,10 @@ fn check_identity(expected: &FileIdentity, executable: bool) -> Result<(), Strin
 }
 
 fn verify_record(root: &Path, record: &PreparedRecord) -> Result<Value, String> {
-    if record.schema != RECORD_SCHEMA || record.repository != root {
+    if record.schema != RECORD_SCHEMA
+        || record.repository != root
+        || record.project != project(root)?
+    {
         return Err("prepared record has the wrong schema or repository".into());
     }
     check_identity(&record.cargo_metadata, false)?;
@@ -1569,6 +1786,8 @@ pub fn unified_selection(
                 .map(|feature| format!("{package}/{feature}")),
         );
     }
+    // The first-party installer is a workspace member. Extension payloads
+    // have their own producers and never enter this feature union.
     let mut union = vec!["--workspace".to_string(), "--all-targets".to_string()];
     if !features.is_empty() {
         union.push("--features".into());
@@ -1846,8 +2065,16 @@ fn selection_metadata(unified: &Value, cargo: &Value, args: &[String]) -> Result
 
 pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
+    let prepared_project = project(&root)?;
+    let tool_owner = project_tools(prepared_project.as_ref())?;
     let selections = profile_selections(&root, profile)?;
-    let cargo_profile = cargo_profile_for(profile);
+    // Each extension selection is listed in its own Cargo project. Core
+    // workspace union/installer requirements remain the unchanged core path.
+    let cargo_profile = if prepared_project.is_some() {
+        None
+    } else {
+        cargo_profile_for(profile)
+    };
     let artifacts = LockedArtifacts::open(&root, true)?;
     let generation = artifacts.root.join(format!(
         "generation-{}-{}",
@@ -1870,6 +2097,10 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         &cargo_path,
     )?;
     let cargo = read_json(&cargo_path)?;
+    if let (Some(project), Some(owner)) = (&prepared_project, &tool_owner) {
+        let core = owner.current()?;
+        same_core_package(project, &cargo, &read_json(&core.cargo_metadata.path)?)?;
+    }
     let before_sources = sources(&cargo, &root)?;
     let before_rustc = rustc_identity()?;
     let before_environment = build_environment();
@@ -1884,7 +2115,15 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     // binaries-metadata is the part of its listing that its Cargo selectors
     // name, and a listing of one selection must keep every executable Cargo
     // listed for it, which checks the matcher against Cargo on every run.
-    for (index, (listing, keys)) in listings(profile, &selections)?.into_iter().enumerate() {
+    let planned_listings = if prepared_project.is_some() {
+        selections
+            .iter()
+            .map(|(key, args)| (args.clone(), vec![key.clone()]))
+            .collect::<Vec<_>>()
+    } else {
+        listings(profile, &selections)?
+    };
+    for (index, (listing, keys)) in planned_listings.into_iter().enumerate() {
         let mut args = vec![
             "nextest".into(),
             "list".into(),
@@ -1963,13 +2202,26 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         }
         _ => None,
     };
-    prepare_cpu_wrapper(
-        &root,
-        &cpu_wrapper_path,
-        unified
-            .as_ref()
-            .map(|(cargo_profile, selection)| (*cargo_profile, selection.as_slice())),
-    )?;
+    if prepared_project.is_none() {
+        prepare_cpu_wrapper(
+            &root,
+            &cpu_wrapper_path,
+            unified
+                .as_ref()
+                .map(|(cargo_profile, selection)| (*cargo_profile, selection.as_slice())),
+        )?;
+    }
+    let cpu_wrapper = match &tool_owner {
+        Some(tool_owner) => tool_owner.current()?.cpu_wrapper,
+        None => CpuWrapperRecord {
+            executable: cpu_wrapper_artifact(
+                &fs::read_to_string(&cpu_wrapper_path).map_err(|e| e.to_string())?,
+                &cargo,
+                &target,
+            )?,
+            metadata: file_identity(&cpu_wrapper_path, false)?,
+        },
+    };
     // Hash only after every Cargo selection has completed. Shared paths may be
     // rebuilt by another selection; every published record names the final files.
     let mut recorded_selections = BTreeMap::new();
@@ -2041,6 +2293,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     };
     let record = PreparedRecord {
         schema: RECORD_SCHEMA,
+        project: prepared_project,
         repository: root.clone(),
         target: target.clone(),
         sources: before_sources,
@@ -2052,14 +2305,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         guests,
         lit_guests,
         record_workloads,
-        cpu_wrapper: CpuWrapperRecord {
-            executable: cpu_wrapper_artifact(
-                &fs::read_to_string(&cpu_wrapper_path).map_err(|e| e.to_string())?,
-                &cargo,
-                &target,
-            )?,
-            metadata: file_identity(&cpu_wrapper_path, false)?,
-        },
+        cpu_wrapper,
     };
     let checked_cargo = verify_record(&root, &record)?;
     for selection in record.selections.values() {
@@ -2115,6 +2361,7 @@ pub fn run(
     }
     let artifacts = LockedArtifacts::open(&root, false)?;
     let record = artifacts.current()?;
+    let tool_owner = project_tools(record.project.as_ref())?;
     let cargo = verify_record(&root, &record)?;
     let selection = verify_selection(&record, &cargo, &parsed.build)?;
     let guests = verify_guests(&record)?;
@@ -2183,6 +2430,7 @@ pub fn run(
     // Keep the shared lock until the child has joined. Preserve Nextest's
     // status; a refusal never becomes an empty or successful test report.
     drop(artifacts);
+    drop(tool_owner);
     Ok(exit_code(status))
 }
 
@@ -2361,20 +2609,25 @@ mod tests {
             unified_selection(&only).unwrap(),
             args("-p hermit-detcore --lib")
         );
+        let featured = selections(&["-p hermit-run --features liteinst --lib --bins"]);
+        assert_eq!(
+            unified_selection(&featured).unwrap(),
+            args("-p hermit-run --features liteinst --lib --bins")
+        );
     }
 
     #[test]
     fn several_selections_unify_to_the_workspace_with_qualified_features() {
         let several = selections(&[
-            "-p hermit-run --features third-party-backends,kvm-native-test-support --lib --bins",
+            "-p hermit-run --features liteinst,kvm-native-test-support --lib --bins",
             "-p hermit-detcore-tests --test tests_misc",
-            "-p hermit-run --features third-party-backends,kvm-execution-tests --lib --test cli",
+            "-p hermit-run --features liteinst,kvm-execution-tests --lib --test cli",
             "--workspace --exclude hermit-run",
         ]);
         assert_eq!(
             unified_selection(&several).unwrap(),
             args(
-                "--workspace --all-targets --features hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/third-party-backends"
+                "--workspace --all-targets --features hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/liteinst"
             )
         );
         let unfeatured = selections(&["-p a --lib", "-p b --test t"]);
@@ -2382,18 +2635,39 @@ mod tests {
             unified_selection(&unfeatured).unwrap(),
             args("--workspace --all-targets")
         );
+        let core = selections(&[
+            "-p hermit-run --features kvm-native-test-support --lib --bins",
+            "-p hermit-detcore-tests --test tests_misc",
+        ]);
+        assert_eq!(
+            unified_selection(&core).unwrap(),
+            args("--workspace --all-targets --features hermit-run/kvm-native-test-support")
+        );
+        let unrelated = selections(&[
+            "-p another-package --features third-party-backends --lib",
+            "-p hermit-run --lib --bins",
+        ]);
+        assert_eq!(
+            unified_selection(&unrelated).unwrap(),
+            args("--workspace --all-targets --features another-package/third-party-backends")
+        );
     }
 
     #[test]
     fn only_validate_profile_profiles_unify_their_listing() {
         let several = selections(&[
             "-p hermit-detcore-tests --test tests_misc",
-            "-p hermit-run --features third-party-backends --test hermit_modes",
+            "-p hermit-run --features liteinst --test hermit_modes",
         ]);
         for profile in ["full", "hosted-portable"] {
             let plan = listings(profile, &several).unwrap();
             assert_eq!(plan.len(), 1, "{profile}");
             assert_eq!(plan[0].0, unified_selection(&several).unwrap());
+            assert_eq!(
+                plan[0].0,
+                args("--workspace --all-targets --features hermit-run/liteinst"),
+                "{profile} must build the full installer with the CLI"
+            );
             assert_eq!(plan[0].1.len(), 2);
         }
         // The dev-profile producers build far less than the workspace, so
@@ -2622,6 +2896,7 @@ mod tests {
             (
                 PreparedRecord {
                     schema: RECORD_SCHEMA,
+                    project: None,
                     repository: self.root.clone(),
                     target: self.target.clone(),
                     sources: BTreeMap::new(),
@@ -3176,6 +3451,87 @@ mod tests {
         fs::rename(&binary, f.target.join("real-test")).unwrap();
         std::os::unix::fs::symlink(f.target.join("real-test"), &binary).unwrap();
         assert!(metadata_binaries(&f.metadata, &f.cargo, &f.target).is_err());
+    }
+
+    #[test]
+    fn project_descriptor_binds_root_tracked_graph_and_original_tool_record() {
+        let f = Fixture::new();
+        let tools = Fixture::new();
+        fs::write(f.root.join("graph.json"), "{\"steps\":[]}").unwrap();
+        git_bytes(&f.root, &["init", "-q"]).unwrap();
+        git_bytes(&f.root, &["add", "graph.json"]).unwrap();
+        let preparation = tools.root.join("target/ci/nextest-binaries/current.json");
+        fs::create_dir_all(preparation.parent().unwrap()).unwrap();
+        fs::write(&preparation, "original fixture record").unwrap();
+        let path = f.root.join("project.json");
+        let mut descriptor = serde_json::json!({"schema":1,"repository":f.root,"graph":f.root.join("graph.json"),"tools_root":tools.root,"shared_package":"fixture"});
+        fs::write(&path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+        let actual = project_at(&f.root, &path).unwrap();
+        assert_eq!(actual.graph.path, f.root.join("graph.json"));
+        fs::write(&preparation, "changed fixture record").unwrap();
+        assert!(project_tools(Some(&actual)).is_err());
+        descriptor["repository"] = serde_json::json!(tools.root);
+        fs::write(&path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+        assert!(project_at(&f.root, &path).is_err());
+        descriptor["repository"] = serde_json::json!(f.root);
+        fs::write(f.root.join("untracked.json"), "{}").unwrap();
+        descriptor["graph"] = serde_json::json!(f.root.join("untracked.json"));
+        fs::write(&path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+        assert!(project_at(&f.root, &path).is_err());
+    }
+
+    #[test]
+    fn project_binding_never_makes_unrecorded_build_options_or_a_missing_core_package_valid() {
+        for option in [
+            "--manifest-path",
+            "--target-dir",
+            "--release",
+            "--cargo-profile",
+        ] {
+            assert!(split_arguments(&argv(&[option, "/different-project"])).is_err());
+        }
+        let f = Fixture::new();
+        let identity = file_identity(&f.root.join("cargo.json"), false);
+        assert!(identity.is_err());
+        let (record, _) = f.selection();
+        let project = PreparedProject {
+            descriptor: record.cargo_metadata.clone(),
+            graph: record.cargo_metadata.clone(),
+            tools_root: f.root.clone(),
+            core_preparation: record.cargo_metadata.clone(),
+            shared_package: "unprovided-core-owner".into(),
+        };
+        assert!(same_core_package(&project, &f.cargo, &f.cargo).is_err());
+        assert!(project_tools(Some(&project)).is_err());
+        let mut graph = dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let mut step = graph
+            .steps
+            .iter()
+            .find(|step| step.env.contains_key(SELECTION_ENV))
+            .unwrap()
+            .clone();
+        step.deps.clear();
+        step.labels = vec!["full".into()];
+        let owner = Path::new("/extension/ci/project.json");
+        step.env
+            .insert(PROJECT_ENV.into(), owner.to_str().unwrap().into());
+        graph.steps = vec![step];
+        assert!(config_selections(&graph, "full").is_err());
+        assert!(config_selections_for_project(&graph, "full", Some(owner)).is_ok());
+        assert!(
+            config_selections_for_project(
+                &graph,
+                "full",
+                Some(Path::new("/different/project.json"))
+            )
+            .is_err()
+        );
+        graph.steps[0].env.remove(REQUIRED_ENV);
+        assert!(config_selections_for_project(&graph, "full", Some(owner)).is_err());
+        graph.steps[0]
+            .env
+            .insert(PROJECT_ENV.into(), "relative/project.json".into());
+        assert!(config_selections_for_project(&graph, "full", Some(owner)).is_err());
     }
 
     #[test]

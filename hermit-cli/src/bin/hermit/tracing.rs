@@ -1060,6 +1060,12 @@ pub(super) fn align_tracing_pid_baseline(backend: Backend) {
         return;
     }
 
+    align_namespace_pid_baseline();
+}
+
+/// Reserve the normal Linux tracing task slot before an external physical
+/// runtime starts coordinator tasks in the fresh PID namespace.
+pub(super) fn align_namespace_pid_baseline() {
     // SAFETY: getpid has no preconditions and cannot fail.
     if unsafe { libc::getpid() } != 1 {
         return;
@@ -1196,7 +1202,7 @@ mod tests {
     use reverie::process::Namespace;
 
     use super::*;
-    use crate::container_clone::CheckedClone;
+    use crate::app::container_clone::CheckedClone;
 
     /// `log_max_bytes` reads the process environment, which libtest's threads
     /// share.
@@ -1305,7 +1311,7 @@ mod tests {
 
     #[test]
     fn synchronous_pid_alignment_matches_the_file_appender_baseline() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         let synchronous_pid = pid_namespace()
@@ -1332,7 +1338,7 @@ mod tests {
 
     #[test]
     fn pid_alignment_succeeds_when_host_thread_creation_is_denied() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         let guest_pid = pid_namespace()
@@ -1349,7 +1355,7 @@ mod tests {
 
     #[test]
     fn kvm_pid_alignment_allocates_no_host_task() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         let next_pid = pid_namespace()
@@ -1836,7 +1842,7 @@ mod tests {
             for run in 0..LOG_CAP_STRESS_RUNS {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
-                        "tracing::tests::the_final_message_is_the_last_line_when_writers_race_the_crossing",
+                        "app::tracing::tests::the_final_message_is_the_last_line_when_writers_race_the_crossing",
                         "--exact",
                         "--nocapture",
                         "--test-threads=1",

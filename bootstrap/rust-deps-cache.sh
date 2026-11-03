@@ -11,9 +11,8 @@
 # Settings that make Reindeer read files or a compiler the key does not cover
 # decline the cache, and an input the helper cannot read is an error; either
 # way the run generates and stores nothing.
-# The postprocessing (patch-reverie-dbt-buck.rs, the shared-cell aliases) reads
-# the reverie submodule, so it is not cached: it runs on the restored BUCK as on
-# a generated one.
+# The postprocessing (the shared-cell aliases) reads the reverie submodule, so
+# it is not cached: it runs on the restored BUCK as on a generated one.
 #
 # The root is resolved as bootstrap/run-pinned-tool resolves its cache, with
 # rust-deps/ beneath it, so a validation service's HERMIT_BUCK2_SHARED_TOOL_CACHE

@@ -86,5 +86,5 @@ impl CheckedClone for Container {
 
 fn before_clone() {
     #[cfg(test)]
-    crate::test_isolation::assert_alone_before_container_clone();
+    crate::app::test_isolation::assert_alone_before_container_clone();
 }

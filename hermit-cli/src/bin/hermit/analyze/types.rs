@@ -265,13 +265,13 @@ pub struct AnalyzeOpts {
     #[clap(skip)]
     pub max_log_bytes: Option<u64>,
     #[clap(skip)]
-    pub log_budget: Option<crate::tracing::LogBudget>,
+    pub log_budget: Option<crate::app::tracing::LogBudget>,
 
     /// Why this host's retired-branch counter is inexact, if it is; handed to
     /// every trial's `RunOpts` for the `--strict` refusal and the warning
     /// without `--strict`. Tests replace it to reach both on a host whose
     /// counters pass.
-    #[clap(skip = crate::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
+    #[clap(skip = crate::app::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
     pub inexact_branch_counter: fn() -> Option<String>,
 
     /// The branch-counter warning `admit_branch_counter` printed before the
@@ -288,9 +288,9 @@ pub struct AnalyzeOpts {
     pub endpoints: EndpointMeasurements,
     /// The jumps of global time of every recorded schedule this invocation
     /// read, which the trial schedules it writes carry
-    /// (`crate::time_skip_carry`). Shared by every copy of these options.
+    /// (`crate::app::time_skip_carry`). Shared by every copy of these options.
     #[clap(skip)]
-    pub time_skip_sources: crate::time_skip_carry::SharedTimeSkipSources,
+    pub time_skip_sources: crate::app::time_skip_carry::SharedTimeSkipSources,
 }
 
 /// `--trial-timeout`.

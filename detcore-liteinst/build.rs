@@ -32,7 +32,7 @@
 //!   the name suffixed with the target triple, `-` spelled `_`; other linkers
 //!   ignore it.
 //!
-//! src/lib.rs compiles detcore-sabre/src/glibc_compat.rs for the symbols that
+//! src/lib.rs compiles common/inguest/glibc_compat.rs for the symbols that
 //! statically linked code would otherwise import at a newer version, and
 //! ci/verify-hermit-e2e-artifact.sh refuses an artifact whose runtime needs
 //! more than glibc 2.34.

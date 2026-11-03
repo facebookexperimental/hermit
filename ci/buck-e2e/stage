@@ -3,8 +3,8 @@
 #
 #   bin/        test-harness + hermit-manifest-plan (release: the debug front door costs
 #               ~0.65 CPU-s per cell, which Buck pays once per cell)
-#   install/    the backend resource bundle (hermit-install: DynamoRIO, SaBRe, e9patch,
-#               liteinst runtime) plus the libunwind runtime closure, published with
+#   install/    the first-party resource bundle (hermit-install and LiteInst runtime)
+#               plus the libunwind runtime closure, published with
 #               ci/publish-hermit-e2e-artifact.sh
 #   hermit      the cargo validate-profile hermit, for -c hermit_e2e.hermit=staged
 #   src/        `git archive HEAD`: the source snapshot cells read (no .git, no submodules)
@@ -72,7 +72,7 @@ fi
 #     so checkout, target and fixture paths are constant;
 #   - CARGO_HOME, which stays where it is, is reached through a symlink at
 #     $HERMIT_BUCK_STAGE_DIR/cargo, so every crate and vendored C source path
-#     (SaBRe's build ignores CFLAGS) is constant too. Remapping it with
+#     is constant too. Remapping it with
 #     RUSTFLAGS instead would not work: Cargo hashes RUSTFLAGS into each
 #     crate's metadata, so a per-run path there changes every symbol hash;
 #   - SOURCE_DATE_EPOCH is HEAD's commit time, which fixes __DATE__/__TIME__;
@@ -224,16 +224,11 @@ stop_background_builds() {
 }
 trap 'stop_background_builds; rm -rf "${tmp:?}"' EXIT
 
-# 1. Binaries: the release harness, the validate-profile hermit and its install bundle.
-# Cargo locks each profile directory (target/release, target/validate), so builds that
-# share one run one at a time. Three run at once instead: the release harness in
-# target/release; the validate-profile hermit, the longest build, in a target directory
-# of its own (its dependencies are built a second time there); and detcore-dbt then the
-# install bundle in target/validate, as before. The two background builds' output is
-# shown once each finishes, so the logs do not interleave. Each command is main's
-# except for the hermit build's --target-dir, so no feature set changes; the hermit
-# binary differs from a target/validate build only in the build-time DynamoRIO paths
-# reverie-dbt bakes in as a fallback (hermit finds its runtime through install_pkg).
+# 1. Binaries: the release harness, the first-party validate-profile hermit
+# and its core install bundle. The release harness, hermit and ordinary LiteInst
+# runtime build in separate profile/target directories while the foreground
+# first-party install build runs. External SDKs/loaders/preprocessors belong to
+# the separately measured extension producers, never this core stage.
 hermit_target_dir=$target_dir/stage-hermit
 # Both target directories exist before any build starts. Cargo creates a missing target
 # directory by renaming a temporary directory onto it, and rename() replaces an empty
@@ -248,7 +243,7 @@ setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --rel
     --target-dir "$target_dir" >"$tmp/release-build.log" 2>&1 &
 release_build=$!
 setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-run --bin hermit \
-    --features hermit-run/third-party-backends --target-dir "$hermit_target_dir" >"$tmp/hermit-build.log" 2>&1 &
+    --features hermit-run/liteinst --target-dir "$hermit_target_dir" >"$tmp/hermit-build.log" 2>&1 &
 hermit_build=$!
 # The ordinary in-guest Detcore runtime in the liteinst-runtime profile: the Cargo
 # command the packaging finalizer below runs, started here so it compiles beside the
@@ -262,13 +257,10 @@ hermit_build=$!
 setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked -p detcore-liteinst --lib --profile liteinst-runtime \
     --target-dir "$target_dir" >"$tmp/liteinst-runtime-build.log" 2>&1 &
 liteinst_build=$!
-"$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p detcore-dbt -p detcore-dbt-cdylib --target-dir "$target_dir"
-# hermit-install's build script stages install_pkg/ next to the profile directories and
-# links libdetcore_sabre.so into it. The ordinary LiteInst resource is finalized
-# below, after the last Cargo invocation; publish-hermit-e2e-artifact.sh requires
-# every one of them. Its hermit link, to ../validate/hermit, resolves once the hermit
-# build is copied there below.
-"$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-install -p detcore-sabre \
+# hermit-install stages only the core resources. The ordinary LiteInst resource
+# is finalized below after every Cargo invocation, and the strict core publisher
+# still requires its complete current receipt and resource inventory.
+"$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-install \
     -p detcore-liteinst --target-dir "$target_dir"
 finish_build() { # finish_build WHAT PID-VARIABLE LOG
     local status=0

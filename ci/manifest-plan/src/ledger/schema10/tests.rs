@@ -462,8 +462,7 @@ fn retained_plan_refuses_changed_selection_policy_and_test_denominators() {
 fn exact_rng_population(cells: &[CellIdentity], count: usize) -> bool {
     let expected = [
         ("verify", "ptrace"),
-        // The complete default fixture is now qualified for DBT verification.
-        ("verify", "dbt"),
+        // The DBT verify cell moved to its DynamoRIO owner with the split.
         ("verify", "kvm"),
         ("replay", "ptrace"),
     ]
@@ -706,7 +705,9 @@ fn generated_plan_populations_preserve_command_policy() {
         .filter(|(_, cell)| cell.test == "c-programs/random-readv-stream")
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    assert_eq!(rng.len(), 4);
+    // verify@ptrace, verify@kvm and replay@ptrace; verify@dbt moved to its
+    // DynamoRIO owner with the split.
+    assert_eq!(rng.len(), 3);
     let mut renamed = raw_expected.clone();
     renamed[rng[0]].test = "c-programs/wrong-rng-identity".into();
     assert!(!exact_rng_population(&renamed, total));

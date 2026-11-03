@@ -117,7 +117,7 @@ pub(crate) fn assert_alone_before_container_clone() {
     assert!(
         in_copy(),
         "this test clones a container in a process it shares with other tests; call \
-         crate::test_isolation::rerun_alone() at its start, so it runs alone in a copy of the \
+         crate::app::test_isolation::rerun_alone() at its start, so it runs alone in a copy of the \
          test binary: {CLONE_HAZARD}"
     );
     // A thread just joined can stay listed for a moment after `join` returns:
@@ -132,7 +132,7 @@ pub(crate) fn assert_alone_before_container_clone() {
     assert!(
         others.is_empty(),
         "this test clones a container while other threads of its process run (IDs {others:?}), \
-         beside the main thread where libtest waits; crate::test_isolation::rerun_alone() gave \
+         beside the main thread where libtest waits; crate::app::test_isolation::rerun_alone() gave \
          it a process of its own, so clone before starting threads: {CLONE_HAZARD}"
     );
 }
@@ -172,7 +172,7 @@ pub(crate) fn assert_alone_before_setting_the_skid_margin() {
         in_copy(),
         "this test records --skid-margin in Reverie's PMU configuration, which a process sets only \
          once, in a process it shares with other tests; call \
-         crate::test_isolation::rerun_alone() at its start, so it runs alone in a copy of the test \
+         crate::app::test_isolation::rerun_alone() at its start, so it runs alone in a copy of the test \
          binary and no other test sets the configuration first"
     );
 }
@@ -192,7 +192,7 @@ mod tests {
     use reverie::process::Container;
 
     use super::*;
-    use crate::container_clone::CheckedClone;
+    use crate::app::container_clone::CheckedClone;
 
     /// How long a forking container child may take before it counts as stuck.
     /// One that can fork finishes within milliseconds.
@@ -369,7 +369,7 @@ mod tests {
         let refused = std::panic::catch_unwind(|| Container::new().checked_run(|| {}));
         let message = panic_message(refused.expect_err("cloned a container outside a copy"));
         assert!(
-            message.contains("call crate::test_isolation::rerun_alone() at its start")
+            message.contains("call crate::app::test_isolation::rerun_alone() at its start")
                 && message.contains("runs no pthread_atfork"),
             "{message}"
         );
@@ -412,12 +412,12 @@ mod tests {
             return;
         }
         let opts =
-            crate::run::RunOpts::parse_from(["fakehermit", "--skid-margin=7777", "fakeprog"]);
+            crate::app::run::RunOpts::parse_from(["fakehermit", "--skid-margin=7777", "fakeprog"]);
         let refused =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| opts.install_pmu_config()));
         let message = panic_message(refused.expect_err("recorded --skid-margin outside a copy"));
         assert!(
-            message.contains("call crate::test_isolation::rerun_alone() at its start"),
+            message.contains("call crate::app::test_isolation::rerun_alone() at its start"),
             "{message}"
         );
         assert!(

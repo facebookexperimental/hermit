@@ -91,8 +91,46 @@ if [[ $build_job_context == launcher ]]; then
     return 0
 fi
 
+# First-party children use the runner-admitted Cargo pool. The DynamoRIO
+# SDK clamp/recipe calibration below belongs only to that extension build.
+if [[ $build_job_context == core-build-child ]]; then
+    if [[ -n ${CARGO_BUILD_JOBS:-} ]]; then
+        CORE_BUILD_RAW_BUILD_JOBS=$CARGO_BUILD_JOBS
+        if [[ ${DAGRUN_IN_SCOPE:-} == 1 ]]; then
+            CORE_BUILD_JOBS_SOURCE=runner-child-cargo-build-jobs
+        else
+            CORE_BUILD_JOBS_SOURCE=inherited-launch-cargo-build-jobs
+        fi
+    else
+        CORE_BUILD_RAW_BUILD_JOBS=$CI_DAG_BUILD_JOBS
+        CORE_BUILD_JOBS_SOURCE=ci-dag-build-jobs-fallback
+    fi
+    if [[ ! $CORE_BUILD_RAW_BUILD_JOBS =~ ^[1-9][0-9]*$ ]]; then
+        echo "configure-build-jobs.sh: selected raw core build width must be a positive integer" >&2
+        return 2
+    fi
+    if ! CORE_BUILD_EFFECTIVE_CPUS=$(nproc); then
+        echo "configure-build-jobs.sh: child nproc observation failed" >&2
+        return 2
+    fi
+    if [[ ! $CORE_BUILD_EFFECTIVE_CPUS =~ ^[1-9][0-9]*$ ]]; then
+        echo "configure-build-jobs.sh: child nproc must return a positive integer" >&2
+        return 2
+    fi
+    # No foreign SDK threshold may become first-party build authority.
+    unset REVERIE_DBT_BUDGET_BOUND_PIN REVERIE_DBT_BUILD_JOBS_SOURCE
+    unset REVERIE_DBT_RAW_BUILD_JOBS REVERIE_DBT_EFFECTIVE_CPUS_SOURCE
+    unset REVERIE_DBT_EFFECTIVE_CPUS REVERIE_DBT_MAX_PARALLEL_JOBS
+    unset REVERIE_DBT_EFFECTIVE_BUILD_JOBS
+    unset REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS REVERIE_DBT_MAX_BUILD_SECONDS
+    export CARGO_BUILD_JOBS=$CORE_BUILD_RAW_BUILD_JOBS
+    export THIRD_PARTY_BUILD_JOBS=$CORE_BUILD_RAW_BUILD_JOBS
+    export CORE_BUILD_RAW_BUILD_JOBS CORE_BUILD_JOBS_SOURCE CORE_BUILD_EFFECTIVE_CPUS
+    return 0
+fi
+
 if [[ $build_job_context != reverie-dbt-budget-child ]]; then
-    echo "configure-build-jobs.sh: expected source mode launcher or reverie-dbt-budget-child" >&2
+    echo "configure-build-jobs.sh: expected source mode launcher, core-build-child or reverie-dbt-budget-child" >&2
     return 2
 fi
 

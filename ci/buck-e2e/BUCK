@@ -21,7 +21,7 @@ oncall("hermit")
 #   release  //hermit-cli:hermit-release, the feature-complete release build (default;
 #            ./run builds it with -c hermit_release.unstamped=true, so it carries no
 #            commit hash and stays cached across commits that change no compiled source)
-#   debug    //hermit-cli:hermit (default features only: no dbt/sabre/e9patch backends)
+#   debug    //hermit-cli:hermit (LiteInst-enabled shared app; no DBT/SaBRe/e9patch)
 #   staged   the staged cargo-built hermit, e.g. to compare against a cargo build
 _HERMIT = {
     "debug": "//hermit-cli:hermit",

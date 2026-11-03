@@ -141,12 +141,11 @@ rest are experimental or specialized. If you are just getting started, use the
 default and skip the rest of this section. See [Architecture](#architecture)
 for how a backend fits into the whole system.
 
-Hermit accepts `--backend=ptrace|dbt|liteinst|in-guest-trap|sabre|kvm|e9patch` as a global
-option before the subcommand. Backend scope is command-specific: every backend
-supports `run`; KVM also supports `analyze` and `bisect`, which launch `run`
-trials; e9patch also supports `record`, and SaBRe also supports `strace`;
-unsupported combinations fail closed. Omitting the option selects `ptrace`, preserving the
-existing behavior:
+The core Hermit executable accepts `--backend=ptrace|liteinst|in-guest-trap|kvm`
+as a global option before the subcommand. Backend scope is command-specific:
+KVM also supports `analyze` and `bisect`, which launch `run` trials;
+unsupported combinations fail closed. Omitting the option selects `ptrace`,
+preserving the existing behavior:
 
 ```bash
 hermit --backend=ptrace run -- /bin/echo hello
@@ -155,9 +154,9 @@ hermit --backend=ptrace run -- /bin/echo hello
 Backend selection fails closed. Hermit never substitutes ptrace after an
 explicit backend request. LiteInst is experimental and runs Detcore inside the
 guest for dynamically linked Linux x86-64 programs. It needs the optional
-`liteinst` CLI feature, which `third-party-backends` includes; a build without
-it refuses `--backend=liteinst`. Build the in-guest runtime beside the Hermit
-executable, or name it with `HERMIT_LITEINST_TOOL_RUNTIME`:
+`liteinst` CLI feature; a build without it refuses `--backend=liteinst`. Build
+the in-guest runtime beside the Hermit executable, or name it with
+`HERMIT_LITEINST_TOOL_RUNTIME`:
 
 ```bash
 cargo build --locked -p hermit-run --features liteinst --bin hermit
@@ -197,26 +196,21 @@ guest process reported. It has the same feature, prerequisites and refusals as `
 run summary's dispatch record is named `in-guest-trap` and reports no patched
 site.
 
-The `dbt`, `sabre`, and `e9patch` selections require optional CLI features as
-well as runtime resources. Build both with:
+DynamoRIO has its own static frontend and runtime packaging in
+[hermit-dynamorio](https://github.com/rrnewton/hermit-dynamorio). SaBRe and
+e9patch are owned by
+[hermit-3rdparty-patching](https://github.com/rrnewton/hermit-3rdparty-patching).
+Use those repositories' maintained build and validation instructions. These
+backends are unavailable in the core CLI and installer; the core never
+substitutes a different runtime for an explicit backend request. KVM requires
+read-write `/dev/kvm` access plus its guest-kernel Linux ABI, and an unlimited
+address-space limit (`ulimit -v`): it reserves 3 GiB of host address space for
+every guest process, plus 3 GiB for each exec in flight, and Hermit refuses to
+start it (exit 122) under a finite `RLIMIT_AS`. Bound its memory with a cgroup
+(`memory.max`) instead.
 
-```bash
-cargo build --release --workspace --features hermit-run/third-party-backends
-./target/install_pkg/hermit --backend=dbt run -- /bin/echo hello
-```
-
-Use the staged executable for these backends; a default `cargo install` does
-not enable them. KVM requires read-write `/dev/kvm` access plus its guest-kernel
-Linux ABI, and an unlimited address-space limit (`ulimit -v`): it reserves 3 GiB
-of host address space for every guest process, plus 3 GiB for each exec in
-flight, and Hermit refuses to start it (exit 122) under a finite `RLIMIT_AS`.
-Bound its memory with a cgroup (`memory.max`) instead.
-
-SaBRe and e9patch preprocessing are **archived** since 2026-10-25: they still
-build and keep per-commit smoke checks, but they get no feature work. SaBRe's
-manifest cells run nightly, in the pressure sweep, rather than per commit;
-e9patch has no manifest cells, and its corpus runs nightly
-(`ci/manifest-plan/src/archived.rs`).
+SaBRe and e9patch preprocessing are **archived** since 2026-10-25. Their
+compatibility corpus and packaging belong to the patching repository.
 
 SaBRe's measured post-0.2 `Stripped` envelope, build instructions, and explicit
 unsupported cases are documented in
@@ -309,10 +303,7 @@ adapter's tests.
 The `order_violation` guest reads shared state without ensuring that another
 thread has published it. Build Hermit and the guest, then run the default
 deterministic schedule twice. The first command rebuilds `target/release/hermit`,
-which `target/install_pkg/hermit` links to, with default features; if you built
-the `dbt`, `sabre`, and `e9patch` backends above, use
-`cargo build --release --workspace --features hermit-run/third-party-backends`
-instead so the rebuild keeps them:
+which `target/install_pkg/hermit` links to, with default first-party features:
 
 ```bash
 cargo build --release -p hermit-run --bin hermit

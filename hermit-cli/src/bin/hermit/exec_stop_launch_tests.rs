@@ -68,7 +68,7 @@ fn initial_strings(context: &exec_stop::EntryContext) -> (Vec<Vec<u8>>, Vec<Vec<
 
 #[test]
 fn shared_exec_stop_preserves_command_inside_the_common_container() {
-    if crate::test_isolation::rerun_alone() {
+    if crate::app::test_isolation::rerun_alone() {
         return;
     }
     use std::os::fd::AsFd;

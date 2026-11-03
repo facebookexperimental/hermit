@@ -97,36 +97,3 @@ fn debug_log_carries_the_report_without_a_summary_file() {
         );
     }
 }
-
-/// No validation node stages e9tool, so this case runs only on request; when
-/// it runs, a missing e9tool is a failure, not a skip.
-#[test]
-#[cfg(feature = "e9patch")]
-#[ignore = "needs HERMIT_E9TOOL, which no validation node stages"]
-fn e9patch_reports_rewrite_sites_and_tracer_dispatch() {
-    assert!(
-        std::env::var_os("HERMIT_E9TOOL").is_some(),
-        "the e9patch dispatch record needs HERMIT_E9TOOL"
-    );
-    // e9tool rewrites only the main executable, so the syscall sites must
-    // live there.
-    let guest = build_guest("guest-static", &["-static"]);
-    let record = dispatch_record(
-        "e9patch",
-        Path::new(env!("CARGO_BIN_EXE_hermit")),
-        &[],
-        &[],
-        &guest,
-    );
-    let candidates = record.sites.candidates.expect("a static ELF is measured");
-    assert!(candidates > 0, "{record}");
-    assert_eq!(
-        record
-            .sites
-            .patched
-            .zip(record.sites.fell_back)
-            .map(|(patched, fell_back)| patched + fell_back),
-        Some(candidates),
-        "{record}"
-    );
-}

@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::container::PolicyRefusal;
+use crate::app::container::PolicyRefusal;
 
 /// How often the budget's watchdog reads the process's memory.
 const WATCH_INTERVAL: Duration = Duration::from_millis(100);
@@ -128,7 +128,7 @@ impl MemoryBudget {
                         && held > budget
                         && !stopped.load(Ordering::Relaxed)
                     {
-                        crate::exit_with_error(refusal(command, held, budget));
+                        crate::app::exit_with_error(refusal(command, held, budget));
                     }
                     std::thread::sleep(WATCH_INTERVAL);
                 }
@@ -310,7 +310,7 @@ mod tests {
     fn the_refusal_names_the_command_its_memory_and_the_budget() {
         let error = refusal("hermit bisect", 9 << 30, 8 << 30);
         assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
-        assert_eq!(crate::failure_exit_code(&error), 122);
+        assert_eq!(crate::app::failure_exit_code(&error), 122);
         let message = format!("{error:#}");
         assert!(
             message.starts_with(

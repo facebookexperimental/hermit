@@ -3275,16 +3275,4 @@ echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGE
 # the unit timeline of its validate-profile build at the width it really ran with.
 # The exit status is the build's; a report that cannot be copied only warns. Unset
 # or empty, nothing changes.
-if [[ -n ${HERMIT_CARGO_TIMINGS_DIR:-} && ${1:-} == cargo && ${2:-} == build ]]; then
-    timings_started=$(date +%s)
-    timings_status=0
-    "$ROOT_DIR/ci/retry-on-compiler-crash.sh" "$@" --timings || timings_status=$?
-    timings_reports=${CARGO_TARGET_DIR:-$ROOT_DIR/target}/cargo-timings
-    if ! mkdir -p -- "$HERMIT_CARGO_TIMINGS_DIR" ||
-        ! find "$timings_reports" -maxdepth 1 -name 'cargo-timing-*.html' -newermt "@$timings_started" \
-            -exec cp -- {} "$HERMIT_CARGO_TIMINGS_DIR/" \; ; then
-        echo "run-with-reverie-dbt-budget.sh: could not keep the cargo --timings report in $HERMIT_CARGO_TIMINGS_DIR (diagnostics only)" >&2
-    fi
-    exit "$timings_status"
-fi
-exec "$ROOT_DIR/ci/retry-on-compiler-crash.sh" "$@"
+exec "$ROOT_DIR/ci/run-build-command.sh" "$@"

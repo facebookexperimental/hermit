@@ -142,8 +142,8 @@ pub(super) struct PendingPacketLease {
 impl PendingPacketLease {
     pub(super) fn new() -> io::Result<Self> {
         // Reuses the existing verify-input producer's memfd creation mechanism.
-        let fd =
-            crate::verify_inputs::new_unsealed_memfd(c"hermit-mapped-initial").map_err(invalid)?;
+        let fd = crate::app::verify_inputs::new_unsealed_memfd(c"hermit-mapped-initial")
+            .map_err(invalid)?;
         let lease = Self {
             file: File::from(fd),
             state: PacketState::default(),

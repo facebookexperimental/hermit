@@ -560,9 +560,10 @@ mod tests {
 
     #[test]
     fn unsupported_preemption_keeps_its_policy_class_across_the_container_boundary() {
-        let refusal = crate::preemption_admission::refuse_unsupported_preemption(
+        let refusal = crate::preemption_admission::refuse_unsupported_preemption_with_capabilities(
             &detcore::Config::default(),
-            crate::Backend::Dbt,
+            "dbt",
+            reverie::BackendCapabilities::DBT,
             true,
             false,
         )

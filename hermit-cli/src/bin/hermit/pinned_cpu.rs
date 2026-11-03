@@ -22,7 +22,7 @@
 //! weight on its own CPU. Beside a CPU-bound task from a cgroup whose load is
 //! concentrated there, each of the run's wakeups waits for that task, and the
 //! run does the same work hundreds of times slower
-//! (https://github.com/rrnewton/hermit/issues/4824). Measured on a 316-CPU
+//! (<https://github.com/rrnewton/hermit/issues/4824>). Measured on a 316-CPU
 //! host: one strict verify of an epoll guest took 1.5 s on an idle CPU and
 //! 15.5 s on a CPU running a busy loop from another cgroup, while the run's
 //! own cgroup kept 24 busy loops on other CPUs. Under a loaded test runner,
@@ -61,7 +61,7 @@
 //! named by `/sys/bus/event_source/devices/<pmu>/cpumask` (on AMD, `amd_l3`
 //! on one CPU per L3 and `amd_df` and `amd_umc` on CPU 0), and ptrace stops
 //! cost several times as much CPU there
-//! (https://github.com/rrnewton/hermit/issues/3265: 7.6-7.9x for a
+//! (<https://github.com/rrnewton/hermit/issues/3265>: 7.6-7.9x for a
 //! ptrace-stop-heavy cell; 2.5x for the epoll verify above on CPU 0). Because
 //! validation and `bin/safehermit` keep runs off those CPUs, they are often
 //! idle, and an idle draw would otherwise favour them. The set is derived as

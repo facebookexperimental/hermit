@@ -104,8 +104,7 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit",
         "test.ignored_syscall_regressions",
-        "test.rr_suite_contract",
-        "test.sabre_examples"
+        "test.rr_suite_contract"
       ],
       "e2e_all": true
     },
@@ -139,18 +138,6 @@
       "e2e_all": true
     },
     {
-      "_why": "The DBT plugin has a runtime-callback ABI check and DBT cells. The retired test.dbt_parity matrix's 28 cases are DBT cells of the c-programs and system-utils manifests since slice S13 of https://github.com/rrnewton/hermit/issues/3301, and check.dbt_runtime_abi lost the test.dbt_parity dependent that used to pull it in. The E2E bucket nodes are not listed here: the generator derives every bucket containing a DBT cell from ci/expected-e2e-plan.json.",
-      "packages": ["detcore-dbt", "detcore-dbt-cdylib"],
-      "nodes": ["check.dbt_runtime_abi"],
-      "e2e_backends": ["dbt"]
-    },
-    {
-      "_why": "The SaBRe plugin has a backend-private release/examples harness and SaBRe cells.",
-      "packages": ["detcore-sabre"],
-      "nodes": ["test.sabre_examples"],
-      "e2e_backends": ["sabre"]
-    },
-    {
       "_why": "The in-guest LiteInst runtime (the detcore-liteinst cdylib) is preloaded at run time by the cli binary's in-guest LiteInst tests and by every liteinst and in-guest-trap guest, a dependency Cargo's graph does not show.",
       "packages": ["detcore-liteinst"],
       "nodes": ["test.cli_on_host"],
@@ -169,11 +156,6 @@
     }
   ],
   "path_footprints": [
-    {
-      "_why": "The e9patch preprocessing corpus and its manual driver moved out of tests/backend-parity in slice S13 of https://github.com/rrnewton/hermit/issues/3301. No validation lane has e9tool, so only the driver's contract test is selected.",
-      "paths": ["tests/e9patch/**"],
-      "nodes": ["check.e9patch_corpus"]
-    },
     {
       "_why": "The identity-fixture mutation guard and the fixtures it plants into moved to tests/c when backend-parity-c was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301).",
       "paths": ["tests/c/**"],
@@ -255,21 +237,6 @@
   ],
   "backend_rules": [
     {
-      "_why": "v1 selective scope: DBT is the only backend with a scoped route. A change confined to the DBT crates runs the common-core nodes in its generated footprint plus every E2E bucket that contains a DBT cell; the generator derives those bucket nodes from ci/expected-e2e-plan.json (cells with backend=dbt), so this list carries only the non-bucket DBT nodes. Reverie paths are relative to the reverie submodule root and apply when a reverie pin bump is expanded to its inner changed files. Residual future work (not v1 routes): scoped kvm, ptrace, liteinst/in-guest-trap, sabre and e9patch-preprocessing routes; any path for those backends, and any mixed, shared or unknown change, selects the full label instead.",
-      "id": "dbt",
-      "paths": ["detcore-dbt/**", "detcore-dbt-cdylib/**"],
-      "reverie_paths": ["reverie-dbt/**"],
-      "backends": ["dbt"],
-      "lanes": ["portable", "privileged"],
-      "extra_nodes": [
-        "build.workspace",
-        "check.dbt_runtime_abi",
-        "test.cli",
-        "test.hermit_integration"
-      ],
-      "tier": "backend"
-    },
-    {
       "_why": "Shared Reverie crates every backend builds on, plus crates whose reverse-dependency closure spans multiple backends (safeptrace, reverie-inguest; enforced by the generator closure check): a pin bump touching any of these (or the reverie workspace manifests) can affect every backend, so selection falls back to the full suite.",
       "id": "reverie-core",
       "paths": [],
@@ -286,8 +253,13 @@
         "Cargo.toml",
         "Cargo.lock"
       ],
-      "backends": ["*"],
-      "lanes": ["portable", "privileged"],
+      "backends": [
+        "*"
+      ],
+      "lanes": [
+        "portable",
+        "privileged"
+      ],
       "extra_nodes": [],
       "tier": "core"
     }

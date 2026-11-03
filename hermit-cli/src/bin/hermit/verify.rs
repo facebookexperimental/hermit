@@ -57,6 +57,178 @@ use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::record_envelope::RecordEnvelopePolicy;
 
+/// The exact native dimensions used by both live adapters and retained-run
+/// comparison. The full validated snapshot stays with the physical adapter.
+pub(super) trait NativeStatistics: std::fmt::Debug {
+    fn intercepted_syscalls(&self) -> u64;
+    fn rewritten_syscalls(&self) -> u64;
+    fn stdin_reads(&self) -> u64;
+    fn memory_hash_fold(&self) -> u64;
+}
+
+pub(super) fn same_native_observable_behavior(
+    first: &impl NativeStatistics,
+    second: &impl NativeStatistics,
+) -> bool {
+    // The counted-branch clock is a separate exact dimension, not an exemption.
+    first.intercepted_syscalls() == second.intercepted_syscalls()
+        && first.rewritten_syscalls() == second.rewritten_syscalls()
+        && first.stdin_reads() == second.stdin_reads()
+        && first.memory_hash_fold() == second.memory_hash_fold()
+}
+
+pub(super) fn native_branch_clock_mismatch(label: &str, first: u64, second: u64) -> Option<String> {
+    (first != second).then(|| {
+        format!(
+            "{label} verification failed: counted-branch clocks differed between runs ({first} != {second}); \
+             the clock is a deterministic function of the executed instruction stream"
+        )
+    })
+}
+
+pub(super) fn native_initialization_record_mismatch(
+    label: &str,
+    first: usize,
+    second: usize,
+) -> Option<String> {
+    (first != second).then(|| {
+        format!(
+            "{label} verification failed: authenticated process-image initialization counts differed between runs ({first} != {second})"
+        )
+    })
+}
+
+#[derive(Debug)]
+pub(super) struct NativeSummaryComparison {
+    failure: Option<String>,
+}
+
+impl NativeSummaryComparison {
+    #[cfg(test)]
+    pub(super) fn compare(
+        first_stats: &impl NativeStatistics,
+        second_stats: &impl NativeStatistics,
+        first_initialization_records: usize,
+        second_initialization_records: usize,
+    ) -> Self {
+        Self::compare_named(
+            "DBT",
+            first_stats,
+            second_stats,
+            first_initialization_records,
+            second_initialization_records,
+        )
+    }
+
+    fn compare_named(
+        label: &str,
+        first_stats: &impl NativeStatistics,
+        second_stats: &impl NativeStatistics,
+        first_initialization_records: usize,
+        second_initialization_records: usize,
+    ) -> Self {
+        let mut failures = Vec::new();
+        if !same_native_observable_behavior(first_stats, second_stats) {
+            failures.push(format!(
+                "{label} verification failed: typed native Detcore statistics differed \
+                 ({first_stats:?} != {second_stats:?})"
+            ));
+        }
+        if let Some(failure) = native_initialization_record_mismatch(
+            label,
+            first_initialization_records,
+            second_initialization_records,
+        ) {
+            failures.push(failure);
+        }
+        Self {
+            failure: (!failures.is_empty()).then(|| failures.join("; ")),
+        }
+    }
+
+    pub(super) fn requires_log_retention(&self) -> bool {
+        self.failure.is_some()
+    }
+
+    pub(super) fn apply(self, outcome: &mut VerificationOutcome) -> Option<String> {
+        if self.failure.is_some() {
+            outcome.verdict = Verdict::Diverged;
+            outcome.no_result_reason = None;
+        }
+        self.failure
+    }
+}
+
+pub(super) fn record_native_branch_clock_comparison(
+    label: &str,
+    outcome: &mut VerificationOutcome,
+    comparison: DbtCountedBranchComparison,
+) -> Option<String> {
+    match native_branch_clock_mismatch(label, comparison.left, comparison.right) {
+        Some(message) => {
+            outcome.dbt_counted_branches = Some(comparison);
+            outcome.verdict = Verdict::Diverged;
+            outcome.no_result_reason = None;
+            Some(message)
+        }
+        None if outcome.verdict == Verdict::NoResult => {
+            // Equal clocks never promote a refused common comparison.
+            outcome.dbt_counted_branches = None;
+            None
+        }
+        None => {
+            outcome.dbt_counted_branches = Some(comparison);
+            None
+        }
+    }
+}
+
+/// Core-owned exact evidence policy, applied around the sole common comparator.
+pub(super) struct NativeEvidenceComparison {
+    label: String,
+    branches: DbtCountedBranchComparison,
+    summary: NativeSummaryComparison,
+}
+
+impl NativeEvidenceComparison {
+    pub(super) fn new(
+        backend: &str,
+        first: &super::backend_hook::NativeFacts,
+        second: &super::backend_hook::NativeFacts,
+    ) -> Self {
+        // Preserve the existing DBT diagnostics and wire field exactly. A new
+        // executable uses its own validated identity, never a fabricated enum.
+        let label = if backend == "dbt" { "DBT" } else { backend }.to_owned();
+        Self {
+            branches: DbtCountedBranchComparison {
+                left: first.counted_branches,
+                right: second.counted_branches,
+            },
+            summary: NativeSummaryComparison::compare_named(
+                &label,
+                first,
+                second,
+                first.initialization_records,
+                second.initialization_records,
+            ),
+            label,
+        }
+    }
+
+    pub(super) fn configure(&self, options: &mut ComparisonOptions) {
+        options.strictness = LogCompareStrictness::Canonical;
+        let mismatch = !self.branches.matched() || self.summary.requires_log_retention();
+        options.keep_logs |= mismatch;
+        options.match_overridden |= mismatch;
+    }
+
+    pub(super) fn apply(self, outcome: &mut VerificationOutcome) -> Vec<String> {
+        let summary = self.summary.apply(outcome);
+        let branches = record_native_branch_clock_comparison(&self.label, outcome, self.branches);
+        branches.into_iter().chain(summary).collect()
+    }
+}
+
 const FAILED_VERIFY_LOG_DIR_PREFIX: &str = "comparison-";
 const FAILED_VERIFY_LOG_PENDING_PREFIX: &str = ".pending-comparison-";
 const FAILED_VERIFY_LOG_RETIRING_PREFIX: &str = ".retiring-comparison-";
@@ -1060,17 +1232,14 @@ pub(crate) fn run_failed_report(
 /// backend whose scheduler runs in this process (DBT) installs it; a backend
 /// whose scheduler runs in a container child reports the same exit as a
 /// container failure.
-#[cfg(feature = "dbt")]
 pub(crate) struct TerminalDeadlockRecording;
 
-#[cfg(feature = "dbt")]
 impl Drop for TerminalDeadlockRecording {
     fn drop(&mut self) {
         detcore::set_terminal_deadlock_hook(None);
     }
 }
 
-#[cfg(feature = "dbt")]
 pub(crate) fn record_terminal_deadlock(
     path: Option<&Path>,
     run: VerificationRun,
@@ -2425,7 +2594,161 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::container_clone::CheckedClone;
+    use crate::app::container_clone::CheckedClone;
+
+    #[test]
+    fn native_facts_preserve_canonical_comparison_and_force_mismatch_retention() {
+        use super::super::backend_hook::NativeFacts;
+        use super::native_branch_policy_tests::typed_outcome;
+
+        let first = NativeFacts {
+            counted_branches: 100,
+            intercepted_syscalls: 7,
+            rewritten_syscalls: 7,
+            stdin_reads: 0,
+            memory_hash_fold: 42,
+            initialization_records: 2,
+            statistics_diagnostic: "native comparison control".to_owned(),
+        };
+        for (branches, images, mismatch, caller_owns_logs, initial_override) in [
+            (100, 2, false, false, false),
+            (101, 2, true, false, false),
+            (100, 3, true, false, false),
+            (100, 2, false, true, false),
+            (101, 2, true, true, false),
+            (100, 3, true, true, false),
+            (100, 2, false, false, true),
+            (101, 2, true, false, true),
+            (100, 3, true, false, true),
+            (100, 2, false, true, true),
+            (101, 2, true, true, true),
+            (100, 3, true, true, true),
+        ] {
+            let second = NativeFacts {
+                counted_branches: branches,
+                initialization_records: images,
+                ..first.clone()
+            };
+            let comparison = NativeEvidenceComparison::new("native-control", &first, &second);
+            let mut options = ComparisonOptions {
+                verbose: false,
+                strictness: LogCompareStrictness::Stripped,
+                compare_logs: true,
+                diagnostic_full_trace: false,
+                compare_io_buffers: true,
+                keep_logs: false,
+                match_overridden: initial_override,
+                failed_log_retention: None,
+                record_envelope: RecordEnvelope::all_records_v1(),
+                virtualize_time: true,
+                caller_owns_logs,
+            };
+            comparison.configure(&mut options);
+            assert_eq!(options.caller_owns_logs, caller_owns_logs);
+            assert_eq!(options.strictness, LogCompareStrictness::Canonical);
+            assert!(options.compare_logs && options.compare_io_buffers && options.virtualize_time);
+            assert_eq!(options.keep_logs, mismatch);
+            assert_eq!(options.match_overridden, initial_override || mismatch);
+            let mut outcome = typed_outcome(Verdict::Matched, 23);
+            let failures = comparison.apply(&mut outcome);
+            assert_eq!(!failures.is_empty(), mismatch);
+            assert_eq!(outcome.verified(), !mismatch);
+            assert_eq!(outcome.guest_status, ExitStatus::Exited(23));
+        }
+    }
+    #[test]
+    fn missing_native_completion_failure_keeps_saved_and_live_run_attribution() {
+        for (run, expected) in [
+            (VerificationRun::Run1, "run1"),
+            (VerificationRun::Run2, "run2"),
+        ] {
+            // The extension's real missing sink/finish control establishes
+            // this exact typed marker and cause through its maintained decoder.
+            // This half exercises the fixed common classifier and publisher;
+            // it does not substitute a synthetic decoder or physical provider.
+            let error = Error::new(hermit::BackendRunFailure)
+                .context("typed whole-process statistics were missing");
+            assert!(error.downcast_ref::<hermit::BackendRunFailure>().is_some());
+            let saved =
+                serde_json::to_value(super::super::run::verify_run_outcome_of(&error)).unwrap();
+            assert_eq!(saved["kind"], "run_failed");
+            assert_eq!(saved["failure"], "backend_failure");
+            assert!(
+                saved["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("typed whole-process statistics were missing")
+            );
+            let report = tempfile::NamedTempFile::new().unwrap();
+            let error = super::super::verify::publish_run_failure(Some(report.path()), run, error);
+            assert!(format!("{error:#}").contains("typed whole-process statistics were missing"));
+            let report: serde_json::Value =
+                serde_json::from_slice(&fs::read(report.path()).unwrap()).unwrap();
+            assert_eq!(report["verdict"], "no_result");
+            assert_eq!(report["no_result_reason"]["kind"], "run_failed");
+            assert_eq!(report["no_result_reason"]["run"], expected);
+            assert_eq!(report["no_result_reason"]["failure"], "backend_failure");
+        }
+    }
+    #[test]
+    fn native_summary_compares_every_non_branch_observation() {
+        use super::super::backend_hook::NativeFacts;
+
+        let native_stats = |counted_branches,
+                            intercepted_syscalls,
+                            rewritten_syscalls,
+                            stdin_reads,
+                            memory_hash_fold| NativeFacts {
+            counted_branches,
+            intercepted_syscalls,
+            rewritten_syscalls,
+            stdin_reads,
+            memory_hash_fold,
+            initialization_records: 0,
+            statistics_diagnostic: "synthetic common comparison observations".to_owned(),
+        };
+        let expected = native_stats(100, 169, 168, 0, 0x4b5e0e70f3050157);
+
+        assert!(!same_native_observable_behavior(
+            &expected,
+            &native_stats(100, 170, 168, 0, 0x4b5e0e70f3050157)
+        ));
+        assert!(!same_native_observable_behavior(
+            &expected,
+            &native_stats(100, 169, 167, 0, 0x4b5e0e70f3050157)
+        ));
+        assert!(!same_native_observable_behavior(
+            &expected,
+            &native_stats(100, 169, 168, 1, 0x4b5e0e70f3050157)
+        ));
+        assert!(!same_native_observable_behavior(
+            &expected,
+            &native_stats(100, 169, 168, 0, 0)
+        ));
+
+        let different_branch_clock = native_stats(101, 169, 168, 0, 0x4b5e0e70f3050157);
+        assert!(
+            same_native_observable_behavior(&expected, &different_branch_clock),
+            "the counted-branch clock has its own typed comparison and must not be folded into \
+             the opaque summary mismatch"
+        );
+        assert!(
+            native_branch_clock_mismatch(
+                "common-control",
+                expected.counted_branches,
+                different_branch_clock.counted_branches,
+            )
+            .is_some()
+        );
+        assert!(
+            native_branch_clock_mismatch(
+                "common-control",
+                expected.counted_branches,
+                expected.counted_branches,
+            )
+            .is_none()
+        );
+    }
 
     /// A report larger than a page reaches a one-page pipe that has room for
     /// its first lines. Written as one write it put nothing there: 3600 bytes
@@ -2711,7 +3034,7 @@ mod tests {
 
     #[test]
     fn real_container_failure_replaces_run1_stamp() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         check_real_container_failure(VerificationRun::Run1);
@@ -2719,7 +3042,7 @@ mod tests {
 
     #[test]
     fn real_container_failure_replaces_run2_stamp_without_claiming_run1_status() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         check_real_container_failure(VerificationRun::Run2);
@@ -2727,7 +3050,7 @@ mod tests {
 
     #[test]
     fn real_container_zero_exit_and_deliberate_stops_remain_distinct() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -2891,7 +3214,7 @@ mod tests {
 
     #[test]
     fn returned_guest_signal_and_unknown_error_do_not_become_container_failure() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -2932,7 +3255,7 @@ mod tests {
 
     #[test]
     fn container_failure_keeps_primary_type_and_secondary_errors() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -3231,7 +3554,7 @@ mod tests {
         drop(reader);
         assert_eq!(
             retention_report_in_child(
-                "verify::tests::log_cap_retention_report_survives_a_stderr_without_a_reader",
+                "app::verify::tests::log_cap_retention_report_survives_a_stderr_without_a_reader",
                 "log cap",
                 &writer,
                 dir.path()
@@ -3268,7 +3591,7 @@ mod tests {
         }
         assert_eq!(
             retention_report_in_child(
-                "verify::tests::log_cap_retention_report_does_not_wait_on_a_full_stderr_pipe",
+                "app::verify::tests::log_cap_retention_report_does_not_wait_on_a_full_stderr_pipe",
                 "log cap",
                 &writer,
                 dir.path()
@@ -3291,7 +3614,7 @@ mod tests {
             let (reader, writer) = retention_stderr_pipe();
             assert_eq!(
                 retention_report_in_child(
-                    "verify::tests::retention_report_reads_as_before_when_stderr_has_room",
+                    "app::verify::tests::retention_report_reads_as_before_when_stderr_has_room",
                     class,
                     &writer,
                     dir.path()
@@ -3745,6 +4068,16 @@ mod tests {
 
     #[test]
     fn production_comparison_callers_bind_truthful_side_labels() {
+        // Production code is what precedes a file's top-level `mod tests`.
+        // The last `#[cfg(test)]` is not that boundary: verify.rs keeps
+        // further test modules after `mod tests`, and the needles below are
+        // spelled out inside this test, which a later boundary would count.
+        let production_of = |source: &'static str| -> &'static str {
+            source
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .expect("production/test boundary")
+                .0
+        };
         for (name, source, left, right) in [
             ("generic run", include_str!("run.rs"), "run 1", "run 2"),
             ("DBT run", include_str!("backends.rs"), "run 1", "run 2"),
@@ -3755,10 +4088,7 @@ mod tests {
                 "the replay",
             ),
         ] {
-            let production = source
-                .rsplit_once("#[cfg(test)]")
-                .expect("production/test boundary")
-                .0;
+            let production = production_of(source);
             for label in [left, right] {
                 let binding = format!("label: \"{label}\"");
                 assert_eq!(
@@ -3769,10 +4099,7 @@ mod tests {
             }
         }
 
-        let production = include_str!("verify.rs")
-            .rsplit_once("#[cfg(test)]")
-            .expect("production/test boundary")
-            .0;
+        let production = production_of(include_str!("verify.rs"));
         assert!(production.contains("side_labels: compared_labels.clone()"));
         assert_eq!(
             production
@@ -5614,5 +5941,300 @@ mod tests {
         assert!(default.ignore_lines.is_empty());
         assert!(!default.skip_commit);
         assert!(!default.skip_detlog);
+    }
+}
+
+// Generic typed branch-clock verdict policy remains owned by the common verifier.
+#[cfg(test)]
+pub(super) mod native_branch_policy_tests {
+    use super::*;
+
+    fn record_branch_clock_comparison(
+        outcome: &mut VerificationOutcome,
+        comparison: DbtCountedBranchComparison,
+    ) -> Option<String> {
+        super::record_native_branch_clock_comparison("DBT", outcome, comparison)
+    }
+
+    pub(crate) fn typed_outcome(verdict: Verdict, guest_exit: i32) -> VerificationOutcome {
+        use super::ComparedLogCounts;
+        use super::ComparisonSpec;
+
+        VerificationOutcome {
+            verdict,
+            no_result_reason: (verdict == Verdict::NoResult).then(|| {
+                super::NoResultReason::ComparisonRefused {
+                    detail: "fixture comparator refusal".into(),
+                }
+            }),
+            refused_log_comparison: (verdict == Verdict::NoResult)
+                .then(|| "fixture comparator refusal".into()),
+            guest_status: ExitStatus::Exited(guest_exit),
+            comparison: ComparisonSpec::new(
+                LogCompareStrictness::Canonical,
+                true,
+                false,
+                true,
+                RecordEnvelope::all_records_v1().policy(),
+                true,
+            ),
+            compared_log_messages: Some(ComparedLogCounts { left: 4, right: 4 }),
+            compared_outputs: {
+                let output = hermit::canonical_verdict::ComparedOutput {
+                    exit_code: Some(guest_exit),
+                    signal: None,
+                    stdout_sha256: "a".repeat(64),
+                    stdout_bytes: 0,
+                    stderr_sha256: "b".repeat(64),
+                    stderr_bytes: 0,
+                };
+                hermit::canonical_verdict::ComparedOutputs {
+                    left: output.clone(),
+                    right: output,
+                }
+            },
+            dbt_counted_branches: None,
+            runtime: None,
+            first_divergent_scheduler_turn: None,
+            first_divergent_record_positions: None,
+            first_divergent_virtual_nanoseconds: None,
+            first_divergent_record: None,
+            first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
+        }
+    }
+
+    #[test]
+    fn equal_branch_clocks_do_not_authorize_a_no_result() {
+        let outcome = typed_outcome(Verdict::NoResult, 23);
+        let comparison = DbtCountedBranchComparison {
+            left: 563_145,
+            right: 563_145,
+        };
+        let verdict_file = tempfile::NamedTempFile::new().unwrap();
+
+        let mut outcome = outcome;
+        let failure = record_branch_clock_comparison(&mut outcome, comparison);
+        write_verification_json(verdict_file.path(), &outcome).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(verdict_file.path()).unwrap()).unwrap();
+
+        assert!(failure.is_none());
+        assert_eq!(outcome.verdict, Verdict::NoResult);
+        assert!(outcome.dbt_counted_branches.is_none());
+        assert_eq!(json["verdict"], "no_result");
+        assert_eq!(json["verified"], false);
+        assert!(json.get("dbt_counted_branches").is_none());
+        let error = outcome.into_exit_status().unwrap_err().to_string();
+        assert!(error.contains("did not reach a verdict"), "{error}");
+    }
+
+    #[test]
+    fn branch_clock_divergence_is_retained_in_the_serialized_typed_verdict() {
+        use super::ComparedLogCounts;
+
+        for initial_verdict in [Verdict::Matched, Verdict::NoResult] {
+            let outcome = typed_outcome(initial_verdict, 0);
+            let comparison = DbtCountedBranchComparison {
+                left: 563_145,
+                right: 563_103,
+            };
+            let verdict_file = tempfile::NamedTempFile::new().unwrap();
+            let mut outcome = outcome;
+            let message = record_branch_clock_comparison(&mut outcome, comparison);
+            write_verification_json(verdict_file.path(), &outcome).unwrap();
+            let message = message.unwrap();
+            let json: serde_json::Value =
+                serde_json::from_slice(&fs::read(verdict_file.path()).unwrap()).unwrap();
+
+            assert!(message.contains("563145 != 563103"), "{message}");
+            assert_eq!(outcome.verdict, Verdict::Diverged);
+            assert_eq!(outcome.dbt_counted_branches, Some(comparison));
+            assert_eq!(json["verdict"], "diverged");
+            assert_eq!(json["verified"], false);
+            assert_eq!(json["bitwise_parity"], false);
+            assert_eq!(json["dbt_counted_branches"]["left"], 563_145);
+            assert_eq!(json["dbt_counted_branches"]["right"], 563_103);
+            assert_eq!(
+                outcome.compared_log_messages,
+                Some(ComparedLogCounts { left: 4, right: 4 })
+            );
+            assert_eq!(
+                outcome.into_exit_status().unwrap(),
+                ExitStatus::Exited(hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT)
+            );
+        }
+    }
+
+    #[test]
+    fn equal_branch_clocks_preserve_match_and_nonzero_guest_status() {
+        let outcome = typed_outcome(Verdict::Matched, 23);
+        let comparison = DbtCountedBranchComparison {
+            left: 563_145,
+            right: 563_145,
+        };
+
+        let mut outcome = outcome;
+        let failure = record_branch_clock_comparison(&mut outcome, comparison);
+        assert!(failure.is_none());
+        let report = super::verification_report(&outcome);
+
+        assert_eq!(outcome.verdict, Verdict::Matched);
+        assert_eq!(report.dbt_counted_branches, Some(comparison));
+        assert!(report.verified);
+        assert!(report.bitwise_parity);
+        assert_eq!(outcome.into_exit_status().unwrap(), ExitStatus::Exited(23));
+    }
+}
+
+#[cfg(test)]
+mod native_initialization_policy_tests {
+    use std::io::Write as _;
+
+    use super::native_branch_policy_tests::typed_outcome;
+    use super::*;
+    const DBT_INITIALIZATION_RECORD: &[u8] =
+        b"1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized\n";
+    #[test]
+    fn native_initialization_record_counts_control_the_terminal_outcome() {
+        use super::super::record_envelope::RecordEnvelopePolicy;
+        use super::super::verify::ComparedLogCounts;
+        use super::super::verify::verification_report;
+
+        fn native_verdict(
+            directory: &Path,
+            left: &[&[u8]],
+            right: &[&[u8]],
+        ) -> VerificationOutcome {
+            let output = reverie::process::Output {
+                status: ExitStatus::Exited(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            };
+            let log = |records: &[&[u8]]| {
+                let (mut file, path) = tempfile::NamedTempFile::new_in(directory)
+                    .unwrap()
+                    .into_parts();
+                for record in records {
+                    file.write_all(record).unwrap();
+                }
+                file.flush().unwrap();
+                path
+            };
+            compare_two_runs(
+                ComparedRun {
+                    output: &output,
+                    log: log(left),
+                    label: "run 1",
+                },
+                ComparedRun {
+                    output: &output,
+                    log: log(right),
+                    label: "run 2",
+                },
+                ComparisonOptions {
+                    verbose: false,
+                    strictness: LogCompareStrictness::Canonical,
+                    compare_logs: true,
+                    diagnostic_full_trace: false,
+                    compare_io_buffers: true,
+                    keep_logs: false,
+                    match_overridden: false,
+                    failed_log_retention: None,
+                    record_envelope: RecordEnvelope::all_records_v1(),
+                    virtualize_time: true,
+                    caller_owns_logs: false,
+                },
+            )
+            .unwrap()
+        }
+
+        let stats = super::super::backend_hook::NativeFacts {
+            counted_branches: 10,
+            intercepted_syscalls: 20,
+            rewritten_syscalls: 5,
+            stdin_reads: 2,
+            memory_hash_fold: 99,
+            initialization_records: 2,
+            statistics_diagnostic: "native initialization policy control".to_owned(),
+        };
+        let equal = NativeSummaryComparison::compare(&stats, &stats, 2, 2);
+        assert!(!equal.requires_log_retention());
+        let mut matched = typed_outcome(Verdict::Matched, 0);
+        assert!(equal.apply(&mut matched).is_none());
+        assert_eq!(matched.verdict, Verdict::Matched);
+
+        let unequal = NativeSummaryComparison::compare(&stats, &stats, 2, 3);
+        assert!(
+            unequal.requires_log_retention(),
+            "an initialization mismatch must retain both evidence logs"
+        );
+        let mut outcome = typed_outcome(Verdict::Matched, 0);
+        let failure = unequal.apply(&mut outcome).unwrap();
+        assert_eq!(outcome.verdict, Verdict::Diverged);
+        assert!(!outcome.verified());
+        assert!(
+            !outcome
+                .into_exit_status()
+                .expect("divergence has a terminal status")
+                .success()
+        );
+        assert!(
+            failure.contains("initialization counts differed"),
+            "{failure}"
+        );
+        assert!(failure.contains("2 != 3"), "{failure}");
+
+        // The extension owns real decode/materialization; this core half keeps
+        // the same exact five materialized bytes and real verdict options. The
+        // comparison counts five INFO records per side, where `records()` alone
+        // holds three, and the report names `all_records_v1`. Moving the child's
+        // initialization record away from the position the collector gives it,
+        // immediately before the child's first record, diverges the verdict
+        // although the guest records and the initialization counts are
+        // unchanged.
+        let parent_first: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: parent record 1\n";
+        let parent_second: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: parent record 2\n";
+        let child: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: child record 1\n";
+        let canonical = [
+            DBT_INITIALIZATION_RECORD,
+            parent_first,
+            parent_second,
+            DBT_INITIALIZATION_RECORD,
+            child,
+        ];
+        let moved = [
+            DBT_INITIALIZATION_RECORD,
+            parent_first,
+            DBT_INITIALIZATION_RECORD,
+            parent_second,
+            child,
+        ];
+        // A diverged comparison keeps its logs, so they must live in a
+        // directory this test removes.
+        let directory = tempfile::tempdir().unwrap();
+
+        let matched = native_verdict(directory.path(), &canonical, &canonical);
+        assert_eq!(matched.verdict, Verdict::Matched);
+        assert_eq!(
+            matched.compared_log_messages,
+            Some(ComparedLogCounts { left: 5, right: 5 }),
+            "the initialization records must be compared with the guest records"
+        );
+        assert_eq!(
+            matched.comparison.record_envelope,
+            RecordEnvelopePolicy::AllRecordsV1
+        );
+        let report = serde_json::to_value(verification_report(&matched)).unwrap();
+        assert_eq!(report["comparison"]["record_envelope"], "all_records_v1");
+        assert_eq!(report["bitwise_parity"], true);
+
+        let diverged = native_verdict(directory.path(), &canonical, &moved);
+        assert_eq!(diverged.verdict, Verdict::Diverged);
+        assert_eq!(
+            diverged.compared_log_messages,
+            Some(ComparedLogCounts { left: 5, right: 5 })
+        );
     }
 }

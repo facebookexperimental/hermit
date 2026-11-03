@@ -32,16 +32,16 @@ use hermit::process::Bind;
 use reverie::process::Output;
 use tracing::metadata::LevelFilter;
 
-use crate::analyze::consts::*;
-use crate::analyze::types::AnalyzeOpts;
-use crate::analyze::types::TRIAL_LOG_FACTOR;
-use crate::analyze::types::TRIAL_LOG_FLOOR;
-use crate::analyze::types::TRIAL_TIMEOUT_FACTOR;
-use crate::analyze::types::TRIAL_TIMEOUT_FLOOR;
-use crate::analyze::types::TrialTimeout;
-use crate::container::RunTimeoutMarker;
-use crate::global_opts::GlobalOpts;
-use crate::run::RunOpts;
+use crate::app::analyze::consts::*;
+use crate::app::analyze::types::AnalyzeOpts;
+use crate::app::analyze::types::TRIAL_LOG_FACTOR;
+use crate::app::analyze::types::TRIAL_LOG_FLOOR;
+use crate::app::analyze::types::TRIAL_TIMEOUT_FACTOR;
+use crate::app::analyze::types::TRIAL_TIMEOUT_FLOOR;
+use crate::app::analyze::types::TrialTimeout;
+use crate::app::container::RunTimeoutMarker;
+use crate::app::global_opts::GlobalOpts;
+use crate::app::run::RunOpts;
 
 /// A single run plus the results of the run, either in memory or on disk.
 pub struct RunData {
@@ -167,7 +167,7 @@ impl RunData {
         path: &Path,
     ) -> anyhow::Result<()> {
         record.require_faithful_replay().map_err(|error| {
-            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+            anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                 "analysis cannot use {} as completed schedule evidence: {error:#}",
                 path.display()
             ))
@@ -370,7 +370,7 @@ impl RunData {
     /// outcome, whether its reason arrived as context or was logged separately.
     fn run_error(&self, error: anyhow::Error, log: Option<&Path>) -> anyhow::Error {
         if error
-            .downcast_ref::<crate::container::PolicyRefusal>()
+            .downcast_ref::<crate::app::container::PolicyRefusal>()
             .is_none()
         {
             return error;
@@ -391,7 +391,7 @@ impl RunData {
     pub fn post_process_events_file(sched_path: &Path, dest: &Path) -> anyhow::Result<()> {
         let mut recording = detcore::preemptions::boundary_recording::Recording::read(sched_path)?;
         recording.require_faithful_replay().map_err(|error| {
-            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+            anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                 "analysis trial at {} omitted a replay change point: {error:#}; \
                  the raw diagnostic record is retained and cannot certify an outcome",
                 sched_path.display()
@@ -572,7 +572,7 @@ impl RunData {
         let matches = RunOpts::command()
             .try_get_matches_from(run_cmd.iter())
             .unwrap_or_else(|error| {
-                if crate::misplaced_backend_argument(&error).is_some() {
+                if crate::app::misplaced_backend_argument(&error).is_some() {
                     // `--backend` is global. Point at the spelling that selects the
                     // trials' backend instead of letting clap suggest the unrelated
                     // `--backend-engagement-json`. clap reports only the flag name,
@@ -748,7 +748,7 @@ impl RunData {
     /// A trial without `--workdir` gives its guest Hermit's working
     /// directory, which is analyze's own; a run of the bare command from
     /// another directory would start its guest there instead
-    /// (https://github.com/rrnewton/hermit/issues/4812). The `cd` keeps that
+    /// (<https://github.com/rrnewton/hermit/issues/4812>). The `cd` keeps that
     /// inherited directory rather than passing it as `--workdir`, which
     /// would name a different one: `--workdir` resolves after the guest's
     /// mounts, so a directory under the guest's private `/tmp` does not
@@ -891,7 +891,7 @@ impl AnalyzeOpts {
         let trial = RunData::get_raw_runopts(self);
         match self.trial_timeout {
             TrialTimeout::Seconds(seconds) if !trial.accepts_run_timeout() => Err(
-                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                     "--trial-timeout={seconds} cannot be enforced: the trials run on a backend \
                      on which `hermit run --timeout` is not qualified. Use --trial-timeout=off \
                      and an outer bound (see docs/TIMEOUT_LADDER.md)."
@@ -918,7 +918,7 @@ impl AnalyzeOpts {
     /// `bisect` make the check here, before any workspace or trial exists.
     /// Without it a trial on a miscounting counter can disagree with another
     /// for a hardware reason and be reported as a race
-    /// (https://github.com/rrnewton/hermit/issues/3810). Unlike `run`, a trial
+    /// (<https://github.com/rrnewton/hermit/issues/3810>). Unlike `run`, a trial
     /// with `--namespace-only` is not exempt: trials never reach the
     /// namespace-only launcher, so they still run on ptrace.
     pub fn refuse_strict_with_inexact_branch_counter(&self) -> anyhow::Result<()> {
@@ -983,7 +983,7 @@ impl AnalyzeOpts {
     ///
     /// A network trace that the run arguments replay (`--replay-networking`)
     /// is reconciled with them: its inputs are released at absolute virtual
-    /// times too (https://github.com/rrnewton/hermit/issues/3875).
+    /// times too (<https://github.com/rrnewton/hermit/issues/3875>).
     ///
     /// Records stored under two different epochs, or an explicit epoch
     /// (`--epoch` or `HERMIT_EPOCH`) that differs from theirs, are refused
@@ -1030,8 +1030,8 @@ impl AnalyzeOpts {
             match recorded {
                 None => recorded = Some(epoch),
                 Some(first) if first != epoch => {
-                    return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(
-                        format!(
+                    return Err(
+                        anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                             "{} was recorded under the virtual-time epoch {} and {source} \
                              under {}. Each record's times are measured from its own epoch, \
                              so no single replay epoch reproduces both. Record both with the \
@@ -1039,8 +1039,8 @@ impl AnalyzeOpts {
                             sources[0],
                             first.to_rfc3339(),
                             epoch.to_rfc3339(),
-                        ),
-                    ));
+                        )),
+                    );
                 }
                 Some(_) => {}
             }
@@ -1059,7 +1059,7 @@ impl AnalyzeOpts {
             return Ok(());
         }
         Err(
-            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+            anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                 "the explicit virtual-time epoch {} (from --epoch or HERMIT_EPOCH) differs from \
                  the epoch {recorded_text} that {} {} recorded under. A record's times are \
                  absolute virtual times measured from its own epoch, so replaying it from \
@@ -1098,7 +1098,7 @@ impl AnalyzeOpts {
             .context("cannot parse the trials' run arguments")?;
         let parsed = RunOpts::from_arg_matches(&matches)?;
         let refuse = |message: String| {
-            Err(anyhow::Error::new(crate::container::PolicyRefusal).context(message))
+            Err(anyhow::Error::new(crate::app::container::PolicyRefusal).context(message))
         };
         let config = &parsed.det_opts.det_config;
         if config.chaos_timeslice_draw == detcore_model::config::ChaosTimesliceDraw::Run {
@@ -1259,7 +1259,7 @@ impl AnalyzeOpts {
     /// Write `record` for a trial to replay, stamped
     /// ([`Self::stamp_trial_record`]). The record carries the jumps of global
     /// time of the recorded schedule whose event prefix its events repeat
-    /// furthest (`crate::time_skip_carry`), so its replay jumps where that
+    /// furthest (`crate::app::time_skip_carry`), so its replay jumps where that
     /// recording did. All sources must share one timing format; mixing
     /// formats cannot preserve their different switch-in charging rules.
     /// An incompatible format or invalid record is refused before writing.
@@ -1299,7 +1299,7 @@ impl AnalyzeOpts {
 
     /// Refuse, before any trial, recordings made under another
     /// `--pipe-wake-latency` than the trials' own, including a different
-    /// latency (https://github.com/rrnewton/hermit/issues/4380). Trials start
+    /// latency (<https://github.com/rrnewton/hermit/issues/4380>). Trials start
     /// through `RunOpts::run`, which skips `hermit run`'s own check, so the
     /// check is made here, as `adopt_recorded_epoch` makes the epoch's. The
     /// run arguments name no record to replay: `refuse_outputs_trials_overwrite`
@@ -1319,7 +1319,7 @@ impl AnalyzeOpts {
             detcore::preemptions::boundary_recording::Recording::read(path)?
                 .require_faithful_replay()
                 .map_err(|error| {
-                    anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                    anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                         "{option} {} cannot supply analysis evidence: {error:#}",
                         path.display()
                     ))
@@ -1331,7 +1331,9 @@ impl AnalyzeOpts {
                 recorded,
                 config.pipe_wake_latency,
             ) {
-                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+                return Err(
+                    anyhow::Error::new(crate::app::container::PolicyRefusal).context(refusal)
+                );
             }
             let recorded = detcore::preemptions::read_recorded_signal_state_copy(path)
                 .map_err(anyhow::Error::msg)?;
@@ -1340,7 +1342,9 @@ impl AnalyzeOpts {
                 recorded,
                 config.signal_state_copy,
             ) {
-                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+                return Err(
+                    anyhow::Error::new(crate::app::container::PolicyRefusal).context(refusal)
+                );
             }
             let recorded = detcore::preemptions::read_recorded_expired_wait_runs_charged_once(path)
                 .map_err(anyhow::Error::msg)?;
@@ -1350,7 +1354,9 @@ impl AnalyzeOpts {
                 Some(self.trial_expired_wait_charge()),
                 true,
             ) {
-                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+                return Err(
+                    anyhow::Error::new(super::super::container::PolicyRefusal).context(refusal)
+                );
             }
             let recorded = detcore::preemptions::read_recorded_cap_preemption_charge(path)
                 .map_err(anyhow::Error::msg)?;
@@ -1359,7 +1365,9 @@ impl AnalyzeOpts {
                 recorded,
                 config.cap_preemption_charge,
             ) {
-                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+                return Err(
+                    anyhow::Error::new(super::super::container::PolicyRefusal).context(refusal)
+                );
             }
         }
         Ok(())
@@ -1394,7 +1402,7 @@ impl AnalyzeOpts {
         // write the same trace path.
         if let Some(path) = trial.record_networking_trace() {
             return Err(
-                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                     "`hermit analyze` and `hermit bisect` refuse --record-networking={} in the \
                      run arguments: it puts every trial on the host network, so the trials \
                      are no longer reproducible, and every trial writes that same trace, so \
@@ -1408,7 +1416,7 @@ impl AnalyzeOpts {
         let refused = trial.options_trials_refuse();
         if !refused.is_empty() {
             return Err(
-                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                     "`hermit analyze` and `hermit bisect` refuse {} in the run arguments: {}. \
                      Remove {} from the run arguments.",
                     refused
@@ -1436,7 +1444,7 @@ impl AnalyzeOpts {
             return Ok(());
         }
         Err(
-            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+            anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                 "`hermit analyze` and `hermit bisect` write each trial's configuration and summary \
              into their workspace, so {} would never be written. Remove {} from the run \
              arguments; the workspace keeps both files for every trial.",
@@ -1467,7 +1475,7 @@ impl AnalyzeOpts {
             return Ok(());
         }
         Err(
-            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+            anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                 "`hermit analyze` and `hermit bisect` cannot apply {} to their trials: each trial \
              starts through `RunOpts::run`, and only `hermit run` itself applies {}. Remove {} \
              from the run arguments, or run the program with `hermit run`.",
@@ -1493,8 +1501,9 @@ mod tests {
     /// set end of timeslice" panic (exit 101).
     #[test]
     fn analyze_replays_only_its_edited_preemption_records_as_edited() {
-        let args = crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
-        let crate::Subcommand::Analyze(mut options) = args.command else {
+        let args =
+            crate::app::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+        let crate::app::Subcommand::Analyze(mut options) = args.command else {
             panic!("not analyze")
         };
         options.apply_global(&args.global);
@@ -1558,8 +1567,8 @@ mod tests {
         };
         let options = || {
             let args =
-                crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+                crate::app::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("not analyze")
             };
             options.apply_global(&args.global);
@@ -1615,9 +1624,9 @@ mod tests {
             let mut argv: Vec<String> = vec!["hermit".into(), "analyze".into()];
             argv.extend(run_args.iter().map(|arg| format!("--run-arg={arg}")));
             argv.extend(["--".into(), "/bin/true".into()]);
-            let args = crate::Args::try_parse_from(&argv)
+            let args = crate::app::Args::try_parse_from(&argv)
                 .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
-            let crate::Subcommand::Analyze(options) = args.command else {
+            let crate::app::Subcommand::Analyze(options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             *options
@@ -1711,7 +1720,7 @@ mod tests {
                 .unwrap_err();
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{error:#}"
             );
@@ -1727,9 +1736,9 @@ mod tests {
     #[test]
     fn log_cap_refusal_reaches_analyze_and_bisect_trials() {
         let options = |argv: &[&str]| {
-            let args = crate::Args::try_parse_from(argv)
+            let args = crate::app::Args::try_parse_from(argv)
                 .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.apply_global(&args.global);
@@ -1791,7 +1800,7 @@ mod tests {
                 .expect_err("the trial's guest could outlive hermit");
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{refused:?}: {error:#}"
             );
@@ -1843,9 +1852,9 @@ mod tests {
     #[test]
     fn strict_trials_refuse_an_inexact_branch_counter() {
         let options = |argv: &[&str], probe: fn() -> Option<String>| {
-            let args = crate::Args::try_parse_from(argv)
+            let args = crate::app::Args::try_parse_from(argv)
                 .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.apply_global(&args.global);
@@ -1889,7 +1898,7 @@ mod tests {
                 .expect_err("a strict trial on an inexact counter");
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{refused:?}: {error:#}"
             );
@@ -1907,7 +1916,7 @@ mod tests {
             (
                 &[
                     "hermit",
-                    "--backend=sabre",
+                    "--backend=liteinst",
                     "analyze",
                     "--",
                     "--strict",
@@ -1941,7 +1950,7 @@ mod tests {
         .expect_err("a strict KVM trial on an inexact counter");
         assert!(
             error
-                .downcast_ref::<crate::container::PolicyRefusal>()
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
                 .is_some(),
             "{error:#}"
         );
@@ -1958,9 +1967,9 @@ mod tests {
     #[test]
     fn trials_without_strict_warn_once_of_an_inexact_branch_counter() {
         let options = |argv: &[&str], probe: fn() -> Option<String>| {
-            let args = crate::Args::try_parse_from(argv)
+            let args = crate::app::Args::try_parse_from(argv)
                 .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.apply_global(&args.global);
@@ -1974,8 +1983,8 @@ mod tests {
             (result, lines)
         };
         let inexact: fn() -> Option<String> = || Some("SpecLockMap is enabled".to_string());
-        let warning = crate::run::warning_for_an_inexact_branch_counter(
-            crate::run::CounterReader::Trials,
+        let warning = crate::app::run::warning_for_an_inexact_branch_counter(
+            crate::app::run::CounterReader::Trials,
             inexact,
         )
         .unwrap();
@@ -2004,7 +2013,7 @@ mod tests {
         assert!(
             result.is_err_and(|error| {
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some()
             }),
             "--strict refuses"
@@ -2019,7 +2028,7 @@ mod tests {
                 (|| None) as fn() -> _,
             ),
             (
-                &["hermit", "--backend=sabre", "analyze", "--", "/bin/true"][..],
+                &["hermit", "--backend=liteinst", "analyze", "--", "/bin/true"][..],
                 unreachable,
             ),
             (
@@ -2050,9 +2059,9 @@ mod tests {
     #[test]
     fn trials_refuse_run_options_only_main_applies() {
         let options = |argv: &[&str]| {
-            let args = crate::Args::try_parse_from(argv)
+            let args = crate::app::Args::try_parse_from(argv)
                 .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.apply_global(&args.global);
@@ -2085,7 +2094,7 @@ mod tests {
                 .expect_err("a dropped run option");
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{argv:?}: {error:#}"
             );
@@ -2142,7 +2151,7 @@ mod tests {
                 .expect_err("an overwritten output");
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{run_args:?}: {error:#}"
             );
@@ -2169,7 +2178,7 @@ mod tests {
             .expect_err("a network recording");
         assert!(
             error
-                .downcast_ref::<crate::container::PolicyRefusal>()
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
                 .is_some(),
             "{error:#}"
         );
@@ -2220,7 +2229,7 @@ mod tests {
                 .expect_err("an option the trials cannot take");
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{run_arg}: {error:#}"
             );
@@ -2246,8 +2255,8 @@ mod tests {
     #[test]
     fn trials_refuse_a_timeout_their_backend_cannot_enforce() {
         let options = |argv: &[&str]| {
-            let args = crate::Args::try_parse_from(argv).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let args = crate::app::Args::try_parse_from(argv).unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.apply_global(&args.global);
@@ -2265,7 +2274,7 @@ mod tests {
         .expect_err("KVM does not enforce --timeout");
         assert!(
             error
-                .downcast_ref::<crate::container::PolicyRefusal>()
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
                 .is_some(),
             "{error:#}"
         );
@@ -2370,14 +2379,14 @@ mod tests {
                 extra,
                 "/bin/true",
             ]);
-            let args = crate::Args::try_parse_from(&argv).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let args = crate::app::Args::try_parse_from(&argv).unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             let error = options.main(&args.global).unwrap_err();
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{argv:?}: {error:#}"
             );
@@ -2397,7 +2406,7 @@ mod tests {
     /// configuration is per-process, so the test runs in a process of its own.
     #[test]
     fn analyze_installs_the_trials_skid_margin() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         let argv = [
@@ -2408,8 +2417,8 @@ mod tests {
             "--skid-margin=4321",
             "/bin/true",
         ];
-        let args = crate::Args::try_parse_from(argv).unwrap();
-        let crate::Subcommand::Analyze(mut options) = args.command else {
+        let args = crate::app::Args::try_parse_from(argv).unwrap();
+        let crate::app::Subcommand::Analyze(mut options) = args.command else {
             panic!("{argv:?} is not analyze")
         };
         // The refusal that follows the preflight, not an earlier one.
@@ -2513,14 +2522,14 @@ mod tests {
         let run = RunData::new_baseline(&options, "timeout-repro".to_owned()).unwrap();
         let repro = run.repro_command();
         assert_eq!(repro.matches(" --timeout=7").count(), 1, "{repro}");
-        let matches = crate::Args::command()
+        let matches = crate::app::Args::command()
             .try_get_matches_from(shell_words::split(&repro).unwrap())
             .unwrap();
-        let args = crate::args_from_matches_with_clock(&matches, || {
+        let args = crate::app::args_from_matches_with_clock(&matches, || {
             panic!("analyzer reproduction must retain its actual fixed input")
         })
         .unwrap();
-        let crate::Subcommand::Run(mut parsed) = args.command else {
+        let crate::app::Subcommand::Run(mut parsed) = args.command else {
             panic!("expected run")
         };
         parsed.validate_args().unwrap();
@@ -2547,15 +2556,15 @@ mod tests {
             "--strict",
             "/bin/true",
         ];
-        let args = crate::Args::try_parse_from(argv).unwrap();
-        let crate::Subcommand::Analyze(mut options) = args.command else {
+        let args = crate::app::Args::try_parse_from(argv).unwrap();
+        let crate::app::Subcommand::Analyze(mut options) = args.command else {
             panic!("{argv:?} is not analyze")
         };
         options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
         let error = options.main(&args.global).unwrap_err();
         assert!(
             error
-                .downcast_ref::<crate::container::PolicyRefusal>()
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
                 .is_some(),
             "{error:#}"
         );
@@ -2578,9 +2587,9 @@ mod tests {
     #[test]
     fn analyze_trials_charge_the_invocations_log_budget() {
         let argv = ["hermit", "--max-log-bytes=4K", "analyze", "--", "/bin/true"];
-        let mut args = crate::Args::try_parse_from(argv).unwrap();
+        let mut args = crate::app::Args::try_parse_from(argv).unwrap();
         args.global.prepare_log_budget().unwrap();
-        let crate::Subcommand::Analyze(mut options) = args.command else {
+        let crate::app::Subcommand::Analyze(mut options) = args.command else {
             panic!("{argv:?} is not analyze")
         };
         options.apply_global(&args.global);
@@ -2608,11 +2617,11 @@ mod tests {
                 "--".to_owned(),
                 "/bin/true".to_owned(),
             ];
-            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let args = crate::app::Args::try_parse_from(&argv).unwrap();
             args.command
                 .validate_backend_scope(args.global.backend)
                 .unwrap_or_else(|error| panic!("{argv:?} must be in scope: {error:#}"));
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.apply_global(&args.global);
@@ -2639,11 +2648,11 @@ mod tests {
 
     /// A trial keeps the maximum its run arguments request: the inherited one, a
     /// disabled one, or an explicit one where the backend delivers timer events
-    /// (KVM, as ptrace); a backend without the timer (SaBRe) refuses the
-    /// explicit request by name.
+    /// (KVM, as ptrace); a backend without the timer (in-guest LiteInst)
+    /// refuses the explicit request by name.
     #[test]
     fn trial_preemption_keeps_the_explicit_maximum_request() {
-        for (backend, delivers_timer) in [("kvm", true), ("sabre", false)] {
+        for (backend, delivers_timer) in [("kvm", true), ("liteinst", false)] {
             for maximum in [
                 None,
                 Some("--max-timeslice=disabled"),
@@ -2653,8 +2662,8 @@ mod tests {
                 let mut argv = vec!["hermit", backend_flag.as_str(), "analyze", "--"];
                 argv.extend(maximum);
                 argv.push("/bin/true");
-                let args = crate::Args::try_parse_from(argv).unwrap();
-                let crate::Subcommand::Analyze(mut options) = args.command else {
+                let args = crate::app::Args::try_parse_from(argv).unwrap();
+                let crate::app::Subcommand::Analyze(mut options) = args.command else {
                     panic!("expected analyze")
                 };
                 options.apply_global(&args.global);
@@ -2665,12 +2674,29 @@ mod tests {
                     let error = result.err().expect("explicit maximum must refuse");
                     assert!(
                         error
-                            .downcast_ref::<crate::container::PolicyRefusal>()
+                            .downcast_ref::<crate::app::container::PolicyRefusal>()
                             .is_some()
                     );
                     assert!(format!("{error:#}").contains(&format!(
                         "unsupported_preemption: --backend={backend} refuses --max-timeslice"
                     )));
+                } else if cfg!(feature = "liteinst") && !delivers_timer && maximum.is_none() {
+                    // The inherited maximum passes the timer check; a build
+                    // with the in-guest runtime then refuses any maximum on
+                    // in-guest LiteInst in its later in-guest check.
+                    let error = result.err().expect("in-guest LiteInst refuses a maximum");
+                    assert!(
+                        error
+                            .downcast_ref::<crate::app::container::PolicyRefusal>()
+                            .is_some(),
+                        "{error:#}"
+                    );
+                    let message = format!("{error:#}");
+                    assert!(
+                        message.contains("pass --max-timeslice=disabled"),
+                        "{message}"
+                    );
+                    assert!(!message.contains("unsupported_preemption"), "{message}");
                 } else {
                     assert_eq!(
                         result
@@ -2805,14 +2831,14 @@ mod tests {
             let run = RunData::new_baseline(&options, "epoch-repro".to_owned()).unwrap();
             let repro = run.repro_command();
             assert_eq!(repro.matches("--epoch=").count(), 1, "{repro}");
-            let matches = crate::Args::command()
+            let matches = crate::app::Args::command()
                 .try_get_matches_from(shell_words::split(&repro).unwrap())
                 .unwrap();
-            let args = crate::args_from_matches_with_clock(&matches, || {
+            let args = crate::app::args_from_matches_with_clock(&matches, || {
                 panic!("analyzer reproduction must retain its actual fixed input")
             })
             .unwrap();
-            let crate::Subcommand::Run(parsed) = args.command else {
+            let crate::app::Subcommand::Run(parsed) = args.command else {
                 panic!("expected run")
             };
             assert_eq!(
@@ -2875,9 +2901,9 @@ mod tests {
 
     #[test]
     fn a_refused_run_keeps_its_type_reason_and_log_location() {
-        use crate::container::LogCapExceeded;
-        use crate::container::PolicyRefusal;
-        use crate::container::RunTimeoutMarker;
+        use crate::app::container::LogCapExceeded;
+        use crate::app::container::PolicyRefusal;
+        use crate::app::container::RunTimeoutMarker;
 
         for (verbose, selfcheck) in [(false, false), (true, false), (false, true)] {
             let dir = tempfile::tempdir().unwrap();
@@ -3130,8 +3156,8 @@ mod tests {
     #[test]
     fn an_unenforceable_trial_timeout_is_refused_and_auto_does_without() {
         let options = |argv: &[&str]| {
-            let args = crate::Args::try_parse_from(argv).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let args = crate::app::Args::try_parse_from(argv).unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.apply_global(&args.global);
@@ -3156,7 +3182,7 @@ mod tests {
                 .expect_err("the runs cannot keep a --timeout");
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{backend}: {error:#}"
             );
@@ -3256,7 +3282,7 @@ mod replay_departure_tests {
     use clap::Parser;
 
     use super::*;
-    use crate::container::PolicyRefusal;
+    use crate::app::container::PolicyRefusal;
 
     #[test]
     fn analysis_refuses_marked_inputs_and_outputs_before_discarding_provenance() {

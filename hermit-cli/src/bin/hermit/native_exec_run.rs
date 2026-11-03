@@ -522,7 +522,7 @@ pub(super) fn shared_input_declaration_fixture() -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container_clone::CheckedClone;
+    use crate::app::container_clone::CheckedClone;
 
     /// Discover inputs only; production Capture still authenticates the full
     /// declared graph against the actual host files and compiled bundle.
@@ -700,7 +700,7 @@ mod tests {
 
         use clap::CommandFactory;
 
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         let cwd = std::env::current_dir().unwrap();
@@ -779,14 +779,16 @@ mod tests {
                     ["--", "/usr/bin/nice", "-n", "1", "/bin/echo", "nice-ok"]
                         .map(std::ffi::OsString::from),
                 );
-                let matches = crate::Args::command().try_get_matches_from(argv).unwrap();
-                let mut args = crate::args_from_matches_with_clock(&matches, || {
+                let matches = crate::app::Args::command()
+                    .try_get_matches_from(argv)
+                    .unwrap();
+                let mut args = crate::app::args_from_matches_with_clock(&matches, || {
                     panic!("explicit epoch must not capture host time")
                 })
                 .unwrap();
-                crate::tracing::enable_log_cap_exit_bound();
+                crate::app::tracing::enable_log_cap_exit_bound();
                 args.global.prepare_log_budget().unwrap();
-                crate::tracing::register_invocation_log_budget(args.global.log_budget());
+                crate::app::tracing::register_invocation_log_budget(args.global.log_budget());
                 args.global.open_log_file().unwrap();
                 let result = args.command.main(&args.global);
                 // A later initialization/exec/verification error stays explicit.
@@ -850,7 +852,7 @@ mod tests {
     fn native_endpoint_directory_meets_stats_policy_under_child_umasks() {
         use std::os::unix::fs::MetadataExt;
 
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         struct RefusePeers;

@@ -20,9 +20,9 @@
 //! `overlay-images/images.json` or `db.sql` directly would bind hermit to an
 //! internal format and is deliberately not done here.
 //!
-//! # Relationship to [`crate::image`]
+//! # Relationship to [`crate::app::image`]
 //!
-//! `buildah` (used by [`crate::image::materialize_rootfs`]) and `podman` share
+//! `buildah` (used by [`crate::app::image::materialize_rootfs`]) and `podman` share
 //! the same graph root, so `--image` already reads this same store. This module
 //! adds the piece that was missing: turning a user-supplied *reference* into a
 //! stable image *identity* before anything is cached against it, plus the

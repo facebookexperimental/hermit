@@ -17,7 +17,7 @@ use std::process::Output;
 use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
 
 /// The prefix of the canonical line Hermit prints when it refuses a run for
-/// PMU skid overshoot: `classify_failure` in hermit-cli/src/bin/hermit/main.rs
+/// PMU skid overshoot: `classify_failure` in hermit-cli/src/bin/hermit/mod.rs
 /// writes `HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot
 /// count=<n>`, the same line the manifest runner requires of a skid attempt
 /// (`skid_overshoot_only_reports` in ci/manifest-plan/src/runner.rs).

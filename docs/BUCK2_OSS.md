@@ -51,12 +51,12 @@ non-host platform targets that the default Hermit binary does not use.
 
 The feature-complete release target is shadow-only: Cargo remains the
 authoritative binary and install/resource producer. First build the Cargo
-release with the optional backends and the revision stamped; the wrapper
+release with first-party LiteInst and the revision stamped; the wrapper
 requires the Cargo binary to name the 12-character `HEAD` revision, and only a
 stamped build embeds one:
 
 ```sh
-HERMIT_STAMP_GIT_SHA=1 cargo build --release --workspace --features hermit-run/third-party-backends
+HERMIT_STAMP_GIT_SHA=1 cargo build --release --workspace --features hermit-run/liteinst
 target/release/stage-detcore-liteinst --git target
 ```
 

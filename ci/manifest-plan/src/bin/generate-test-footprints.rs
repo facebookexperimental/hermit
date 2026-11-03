@@ -670,17 +670,21 @@ fn check_reverie_backend_closure(root: &Path, rules: &[BackendRule]) {
     }
 }
 
-/// E2E bucket nodes that contain at least one DBT cell, derived from
-/// `ci/expected-e2e-plan.json` (cells with `backend == "dbt"` grouped by
-/// `category`). v1 has no hand-picked bucket list: if a category gains or
-/// loses its last DBT cell, the derived set follows. Each bucket is emitted
-/// in both its local and hosted spellings when the DAG knows either.
-fn dbt_bucket_nodes(root: &Path, nodes: &BTreeSet<String>) -> Vec<String> {
+/// Manifest bucket nodes for one explicitly declared backend rule. A declared
+/// owner must have real cells; a graph with no such rule needs no external cells.
+fn manifest_bucket_nodes(
+    root: &Path,
+    nodes: &BTreeSet<String>,
+    backends: &[String],
+) -> Vec<String> {
     let plan = read_json(&root.join("ci/expected-e2e-plan.json"));
     let mut categories = BTreeSet::new();
     if let Some(cells) = plan["cells"].as_array() {
         for cell in cells {
-            if cell["backend"].as_str() == Some("dbt") {
+            if cell["backend"]
+                .as_str()
+                .is_some_and(|backend| backends.iter().any(|name| name == backend))
+            {
                 if let Some(category) = cell["category"].as_str() {
                     categories.insert(category.replace('-', "_"));
                 }
@@ -688,7 +692,9 @@ fn dbt_bucket_nodes(root: &Path, nodes: &BTreeSet<String>) -> Vec<String> {
         }
     }
     if categories.is_empty() {
-        die("ci/expected-e2e-plan.json: no DBT cells; cannot derive DBT buckets");
+        die(format!(
+            "ci/expected-e2e-plan.json: no cells for declared backend rule {backends:?}; cannot derive buckets"
+        ));
     }
     let mut out = Vec::new();
     for category in categories {
@@ -784,17 +790,18 @@ fn generated_footprints(root: &Path) -> Value {
     let (all_nodes, dag_targets) = load_dag_targets(&dag, &packages, &defaults);
     let rules = load_rules(&policy, &packages, &all_nodes);
     let mut backend_rules = load_backend_rules(&policy, &all_nodes);
-    // v1: the DBT route's E2E buckets are derived, never hand-picked.
-    let derived_dbt_buckets = dbt_bucket_nodes(root, &all_nodes);
-    for rule in &mut backend_rules {
-        if rule.id == "dbt" && rule.tier == "backend" {
-            for node in &derived_dbt_buckets {
-                if !rule.extra_nodes.contains(node) {
-                    rule.extra_nodes.push(node.clone());
-                }
+    // Derive buckets only for actual backend-tier rules in this owner. Core
+    // source has no external build rule; external catalogs retain those routes.
+    for rule in backend_rules
+        .iter_mut()
+        .filter(|rule| rule.tier == "backend")
+    {
+        for node in manifest_bucket_nodes(root, &all_nodes, &rule.backends) {
+            if !rule.extra_nodes.contains(&node) {
+                rule.extra_nodes.push(node);
             }
-            rule.extra_nodes.sort();
         }
+        rule.extra_nodes.sort();
     }
     check_reverie_backend_closure(root, &backend_rules);
     let package_paths = load_package_paths(&policy, &packages);
@@ -994,12 +1001,13 @@ mod tests {
             }
         }
         let backend_rules = load_backend_rules(&policy, &nodes);
-        assert!(backend_rules.iter().any(|rule| rule.id == "dbt"));
-        // v1 scope cut: no scoped kvm/ptrace/liteinst/sabre/e9patch routes.
-        for dropped in ["kvm", "ptrace", "liteinst", "sabre", "e9patch"] {
+        assert_eq!(backend_rules.len(), 1);
+        // The core policy declares shared Reverie ownership. External owners
+        // retain their scoped backend rules in their own catalogs.
+        for dropped in ["dbt", "kvm", "ptrace", "liteinst", "sabre", "e9patch"] {
             assert!(
                 !backend_rules.iter().any(|rule| rule.id == dropped),
-                "dropped v1 backend route {dropped} must not reappear"
+                "scoped backend route {dropped} must not reappear in core policy"
             );
         }
         assert!(
@@ -1007,6 +1015,8 @@ mod tests {
                 .iter()
                 .any(|rule| rule.id == "reverie-core" && rule.tier == "core")
         );
+        assert_eq!(backend_rules[0].backends, ["*"]);
+        assert_eq!(backend_rules[0].lanes, ["portable", "privileged"]);
         let shared_runtime = policy["package_rules"]
             .as_array()
             .unwrap()

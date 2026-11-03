@@ -7,7 +7,7 @@
  */
 
 //! Run manifests: the "tiny recording" a `hermit run` leaves when it draws an
-//! input from the host (https://github.com/rrnewton/hermit/issues/4271).
+//! input from the host (<https://github.com/rrnewton/hermit/issues/4271>).
 //!
 //! A run whose every input is given by its options is reproducible from its
 //! command line. A run that takes its virtual-time epoch from the host clock,
@@ -412,7 +412,7 @@ impl Manifest {
         Manifest {
             schema: SCHEMA.to_owned(),
             hermit: Writer {
-                version: crate::version::Version::get().to_owned(),
+                version: crate::app::version::Version::get().to_owned(),
             },
             id: id.to_string(),
             kind,
@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn output_destinations_are_left_out() {
         use clap::CommandFactory;
-        let hermit = crate::Args::command();
+        let hermit = crate::app::Args::command();
         let run = hermit.find_subcommand("run").unwrap();
         let longs = |command: &clap::Command| -> Vec<String> {
             command

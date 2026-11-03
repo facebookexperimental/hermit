@@ -16,7 +16,7 @@ def require(ok, message):
         raise ValueError(message)
 
 
-def verify(install):
+def verify(install, *, core=False):
     resources = Path(install) / "rsrcs"
     runtime = resources / "libdetcore_liteinst.so"
     receipt = resources / "libdetcore_liteinst.package.json"
@@ -26,7 +26,10 @@ def verify(install):
     require(record["schema"] == "hermit-packaged-detcore/v1", "unsupported Detcore packaging receipt")
     pin = record["reverie_pin"]
     require(re.fullmatch("[0-9a-f]{40}", pin), "invalid packaging Reverie pin")
-    require((resources / "sabre.revision").read_text().strip() == pin, "packaged runtimes name different Reverie pins")
+    marker = resources / ("libreverie_liteinst.so.revision" if core else "sabre.revision")
+    if core:
+        require(marker.is_file() and not marker.is_symlink(), "missing core LiteInst revision provenance")
+    require(marker.read_text().strip() == pin, "packaged runtimes name different Reverie pins")
     require(record["profile_name"] == "liteinst-runtime", "unqualified packaging profile")
     profiles = record["profile_objects"]
     require(profiles["liteinst-runtime"]["inherits"] == "validate" and profiles["liteinst-runtime"]["lto"] is False,
@@ -79,8 +82,9 @@ def verify(install):
 
 if __name__ == "__main__":
     try:
-        require(len(sys.argv) == 2, "usage: verify-packaged-detcore.py INSTALL")
-        verify(sys.argv[1])
+        require(len(sys.argv) == 2 or (len(sys.argv) == 3 and sys.argv[1] == "--core"),
+                "usage: verify-packaged-detcore.py [--core] INSTALL")
+        verify(sys.argv[-1], core=len(sys.argv) == 3)
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"verify-packaged-detcore: {error}", file=sys.stderr)
         sys.exit(2)

@@ -1,0 +1,62 @@
+[package]
+name = "hermit-inguest-engine"
+description = "Shared compiled in-guest Detcore engine for ordinary native entry shims."
+version = "0.5.4"
+edition = "2024"
+build = "build.rs"
+license = "BSD-3-Clause"
+repository = "https://github.com/facebookexperimental/hermit"
+publish = false
+
+[lib]
+name = "hermit_inguest_engine"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+bench = false
+
+[[test]]
+name = "loader_state"
+path = "tests/loader_state.rs"
+
+[[test]]
+name = "native_policy"
+path = "tests/native_policy.rs"
+
+[[test]]
+name = "native_config"
+path = "tests/native_config.rs"
+
+[[test]]
+name = "native_log_record"
+path = "tests/native_log_record.rs"
+
+[[test]]
+name = "native_copied_action"
+path = "tests/native_copied_action.rs"
+
+[[test]]
+name = "loader_settings"
+path = "tests/loader_settings.rs"
+
+[features]
+# Diagnostic observations do not choose scheduling/syscall policy or authority.
+default = []
+# Explicit physical fixture observer; ordinary engine builds emit no fixed-address observations.
+native-first-instruction-observer = ["reverie-inguest/native-entry-observer"]
+dispatch-observer = ["detcore/dispatch-observer"]
+
+[dependencies]
+detcore = { package = "hermit-detcore", version = "0.5.4", path = "../detcore" }
+libc = "0.2.186"
+rand = "0.10.2"
+tracing = "0.1.41"
+# One exact core source owns the shared ordinary/native Guest and RPC services.
+# Native compilation and loader qualification remain separate required gates.
+reverie = { package = "reverie-core", version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "e520999c018a22374b3a46cebbddfb9aba485e53" }
+reverie-inguest = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "e520999c018a22374b3a46cebbddfb9aba485e53", default-features = false, features = ["coordinator-rpc", "rcb-clock"] }
+reverie-liteinst = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "e520999c018a22374b3a46cebbddfb9aba485e53", default-features = false }
+reverie-rpc-transport = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "e520999c018a22374b3a46cebbddfb9aba485e53" }
+
+[dev-dependencies]
+serde_json = "1.0.140"

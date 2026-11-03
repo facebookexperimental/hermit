@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "backends": {
+    "native": "core",
+    "ptrace": "core",
+    "kvm": "core",
+    "liteinst": "core",
+    "in-guest-trap": "core",
+    "dbt": "dynamorio",
+    "sabre": "patching"
+  },
+  "run_type_owners": {
+    "sabre-compat-only": "patching"
+  }
+}

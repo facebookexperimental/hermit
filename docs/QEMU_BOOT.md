@@ -29,10 +29,7 @@ between booting and comparing repeated runs is explained under
 
 Run the commands in this guide from the Hermit repository root unless stated
 otherwise. Build Hermit. This rebuilds `target/release/hermit`, which
-`target/install_pkg/hermit` links to, with default features; if you built the
-`dbt`, `sabre`, and `e9patch` backends from the README, use
-`cargo build --release --workspace --features hermit-run/third-party-backends`
-instead so the rebuild keeps them:
+`target/install_pkg/hermit` links to, with default first-party features:
 
 ```bash
 cargo build --release -p hermit-run --bin hermit

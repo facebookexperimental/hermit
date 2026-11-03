@@ -35,7 +35,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde::de::Error as _;
 
-use crate::container_clone::CheckedClone;
+use crate::app::container_clone::CheckedClone;
 
 /// How long the parent waits for the container child to EXIT after it has
 /// published its result, and then waits again after cancelling it.
@@ -574,13 +574,13 @@ mod tests {
             assert_eq!(error.kind(), kind);
             let error = super::super::container::classify_container_result::<()>(Ok(Err(error)))
                 .unwrap_err();
-            assert_eq!(crate::failure_exit_code(&error), code);
-            assert_eq!(crate::classify_failure(&error), marker);
+            assert_eq!(crate::app::failure_exit_code(&error), code);
+            assert_eq!(crate::app::classify_failure(&error), marker);
             assert!(format!("{error:#}").contains("original diagnostic"));
             let primary_display = error.to_string();
             let error = diagnostic(Some(kind)).context(error);
-            assert_eq!(crate::failure_exit_code(&error), code);
-            assert_eq!(crate::classify_failure(&error), marker);
+            assert_eq!(crate::app::failure_exit_code(&error), code);
+            assert_eq!(crate::app::classify_failure(&error), marker);
             assert!(
                 error
                     .to_string()
@@ -612,9 +612,9 @@ mod tests {
             RunError::ExitStatus(ExitStatus::Exited(125)),
         ))
         .unwrap_err();
-        assert_eq!(crate::failure_exit_code(&error), 125);
+        assert_eq!(crate::app::failure_exit_code(&error), 125);
         assert_eq!(
-            crate::classify_failure(&error),
+            crate::app::classify_failure(&error),
             "HERMIT_INTERNAL_FAILURE class=container-child-exit status=Exited(125)"
         );
     }

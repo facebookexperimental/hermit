@@ -14,56 +14,6 @@
   "backend_rules": [
     {
       "backends": [
-        "dbt"
-      ],
-      "extra_nodes": [
-        "build.workspace",
-        "check.dbt_runtime_abi",
-        "e2e.manifest_applications",
-        "e2e.manifest_applications_on_host",
-        "e2e.manifest_bin_c",
-        "e2e.manifest_bin_c_on_host",
-        "e2e.manifest_c_programs",
-        "e2e.manifest_c_programs_on_host",
-        "e2e.manifest_chaos_c",
-        "e2e.manifest_chaos_c_on_host",
-        "e2e.manifest_compat",
-        "e2e.manifest_compat_on_host",
-        "e2e.manifest_data_handling",
-        "e2e.manifest_data_handling_on_host",
-        "e2e.manifest_debugger_c",
-        "e2e.manifest_debugger_c_on_host",
-        "e2e.manifest_determinism_stress",
-        "e2e.manifest_determinism_stress_c",
-        "e2e.manifest_determinism_stress_c_on_host",
-        "e2e.manifest_determinism_stress_on_host",
-        "e2e.manifest_language_runtimes",
-        "e2e.manifest_language_runtimes_on_host",
-        "e2e.manifest_shared_futex_c",
-        "e2e.manifest_shared_futex_c_on_host",
-        "e2e.manifest_system_utils",
-        "e2e.manifest_system_utils_on_host",
-        "e2e.manifest_util_c",
-        "e2e.manifest_util_c_on_host",
-        "test.cli",
-        "test.hermit_integration"
-      ],
-      "id": "dbt",
-      "lanes": [
-        "portable",
-        "privileged"
-      ],
-      "paths": [
-        "detcore-dbt/**",
-        "detcore-dbt-cdylib/**"
-      ],
-      "reverie_paths": [
-        "reverie-dbt/**"
-      ],
-      "tier": "backend"
-    },
-    {
-      "backends": [
         "*"
       ],
       "extra_nodes": [],
@@ -157,7 +107,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-test-workdir`; reverse-dependent closure: detcore-testutils, hermit-cdylib, hermit-detcore-tests, hermit-run, hermit-test-workdir.",
+      "_why": "@generated: Cargo package `hermit-test-workdir`; reverse-dependent closure: detcore-testutils, hermit-detcore-tests, hermit-test-workdir.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -178,22 +128,12 @@
         "e2e.manifest_util_c_on_host",
         "lint.clippy_on_host",
         "lint.rustfmt",
-        "test.app_strict_verify_on_host",
         "test.applications_e2e",
-        "test.arbitrary_binaries_on_host",
-        "test.cli_on_host",
-        "test.command_strict_verify_on_host",
         "test.detcore_misc_on_host",
         "test.detcore_parallel_on_host",
         "test.detcore_time_on_host",
         "test.envelope_levels",
-        "test.hermit_integration_on_host",
-        "test.hermit_modes_on_host",
-        "test.hermit_unit_on_host",
-        "test.ignored_syscall_regressions_on_host",
-        "test.regular_crates_on_host",
-        "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host"
+        "test.regular_crates_on_host"
       ],
       "paths": [
         "common/test-workdir/**/*.rs",
@@ -201,7 +141,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit-cdylib, hermit-detcore, hermit-detcore-tests, hermit-record, hermit-record-format, hermit-replay, hermit-run, hermit-run-kvm, hermit-run-ptrace, hermit-verify.",
+      "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-liteinst, detcore-testutils, hermetic_infra_hermit_tests, hermit-cdylib, hermit-detcore, hermit-detcore-tests, hermit-inguest-engine, hermit-record, hermit-record-format, hermit-replay, hermit-run, hermit-run-kvm, hermit-run-ptrace, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -237,119 +177,12 @@
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
         "test.regular_crates_on_host",
-        "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host"
+        "test.rr_suite_contract_on_host"
       ],
       "paths": [
         "detcore/**",
         "detcore/**/*.rs",
         "detcore/Cargo.toml"
-      ]
-    },
-    {
-      "_why": "@generated: Cargo package `detcore-dbt`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, hermit-cdylib, hermit-run.",
-      "e2e_backends": [
-        "dbt"
-      ],
-      "nodes": [
-        "build.workspace",
-        "build.workspace_on_host",
-        "check.dbt_runtime_abi",
-        "doc.doctests_on_host",
-        "doc.rustdoc_on_host",
-        "e2e.manifest_applications",
-        "e2e.manifest_applications_on_host",
-        "e2e.manifest_bin_c",
-        "e2e.manifest_bin_c_on_host",
-        "e2e.manifest_c_programs",
-        "e2e.manifest_c_programs_on_host",
-        "e2e.manifest_chaos_c",
-        "e2e.manifest_chaos_c_on_host",
-        "e2e.manifest_compat",
-        "e2e.manifest_compat_on_host",
-        "e2e.manifest_data_handling",
-        "e2e.manifest_data_handling_on_host",
-        "e2e.manifest_debugger_c",
-        "e2e.manifest_debugger_c_on_host",
-        "e2e.manifest_determinism_stress",
-        "e2e.manifest_determinism_stress_c",
-        "e2e.manifest_determinism_stress_c_on_host",
-        "e2e.manifest_determinism_stress_on_host",
-        "e2e.manifest_language_runtimes",
-        "e2e.manifest_language_runtimes_on_host",
-        "e2e.manifest_shared_futex_c",
-        "e2e.manifest_shared_futex_c_on_host",
-        "e2e.manifest_system_utils",
-        "e2e.manifest_system_utils_on_host",
-        "e2e.manifest_util_c",
-        "e2e.manifest_util_c_on_host",
-        "lint.clippy_on_host",
-        "lint.rustfmt",
-        "test.app_strict_verify_on_host",
-        "test.arbitrary_binaries_on_host",
-        "test.cli",
-        "test.cli_on_host",
-        "test.command_strict_verify_on_host",
-        "test.hermit_integration",
-        "test.hermit_integration_on_host",
-        "test.hermit_modes_on_host",
-        "test.hermit_unit_on_host",
-        "test.ignored_syscall_regressions_on_host",
-        "test.regular_crates_on_host",
-        "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host"
-      ],
-      "paths": [
-        "detcore-dbt/**/*.rs",
-        "detcore-dbt/Cargo.toml"
-      ]
-    },
-    {
-      "_why": "@generated: Cargo package `detcore-dbt-cdylib`; reverse-dependent closure: detcore-dbt-cdylib.",
-      "e2e_backends": [
-        "dbt"
-      ],
-      "nodes": [
-        "build.workspace",
-        "build.workspace_on_host",
-        "check.dbt_runtime_abi",
-        "doc.doctests_on_host",
-        "doc.rustdoc_on_host",
-        "e2e.manifest_applications",
-        "e2e.manifest_applications_on_host",
-        "e2e.manifest_bin_c",
-        "e2e.manifest_bin_c_on_host",
-        "e2e.manifest_c_programs",
-        "e2e.manifest_c_programs_on_host",
-        "e2e.manifest_chaos_c",
-        "e2e.manifest_chaos_c_on_host",
-        "e2e.manifest_compat",
-        "e2e.manifest_compat_on_host",
-        "e2e.manifest_data_handling",
-        "e2e.manifest_data_handling_on_host",
-        "e2e.manifest_debugger_c",
-        "e2e.manifest_debugger_c_on_host",
-        "e2e.manifest_determinism_stress",
-        "e2e.manifest_determinism_stress_c",
-        "e2e.manifest_determinism_stress_c_on_host",
-        "e2e.manifest_determinism_stress_on_host",
-        "e2e.manifest_language_runtimes",
-        "e2e.manifest_language_runtimes_on_host",
-        "e2e.manifest_shared_futex_c",
-        "e2e.manifest_shared_futex_c_on_host",
-        "e2e.manifest_system_utils",
-        "e2e.manifest_system_utils_on_host",
-        "e2e.manifest_util_c",
-        "e2e.manifest_util_c_on_host",
-        "lint.clippy_on_host",
-        "lint.rustfmt",
-        "test.cli",
-        "test.hermit_integration",
-        "test.regular_crates_on_host"
-      ],
-      "paths": [
-        "detcore-dbt-cdylib/**/*.rs",
-        "detcore-dbt-cdylib/Cargo.toml"
       ]
     },
     {
@@ -373,7 +206,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, detcore-liteinst, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit-cdylib, hermit-detcore, hermit-detcore-tests, hermit-manifest-plan, hermit-record, hermit-record-format, hermit-replay, hermit-run, hermit-run-kvm, hermit-run-ptrace, hermit-verify.",
+      "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-liteinst, detcore-model, detcore-testutils, hermetic_infra_hermit_tests, hermit-cdylib, hermit-detcore, hermit-detcore-tests, hermit-inguest-engine, hermit-manifest-plan, hermit-record, hermit-record-format, hermit-replay, hermit-run, hermit-run-kvm, hermit-run-ptrace, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -410,31 +243,11 @@
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
         "test.regular_crates_on_host",
-        "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host"
+        "test.rr_suite_contract_on_host"
       ],
       "paths": [
         "detcore-model/**/*.rs",
         "detcore-model/Cargo.toml"
-      ]
-    },
-    {
-      "_why": "@generated: Cargo package `detcore-sabre`; reverse-dependent closure: detcore-sabre.",
-      "e2e_backends": [
-        "sabre"
-      ],
-      "nodes": [
-        "build.workspace_on_host",
-        "doc.doctests_on_host",
-        "doc.rustdoc_on_host",
-        "lint.clippy_on_host",
-        "lint.rustfmt",
-        "test.regular_crates_on_host",
-        "test.sabre_examples"
-      ],
-      "paths": [
-        "detcore-sabre/**/*.rs",
-        "detcore-sabre/Cargo.toml"
       ]
     },
     {
@@ -587,8 +400,7 @@
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
         "test.regular_crates_on_host",
-        "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host"
+        "test.rr_suite_contract_on_host"
       ],
       "paths": [
         "hermit-cli/**",
@@ -629,8 +441,7 @@
         "test.hermit_unit",
         "test.ignored_syscall_regressions",
         "test.regular_crates_on_host",
-        "test.rr_suite_contract",
-        "test.sabre_examples"
+        "test.rr_suite_contract"
       ],
       "paths": [
         "hermit-install/**",
@@ -655,8 +466,7 @@
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
         "test.regular_crates_on_host",
-        "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host"
+        "test.rr_suite_contract_on_host"
       ],
       "paths": [
         "hermit-record/**/*.rs",
@@ -680,8 +490,7 @@
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
         "test.regular_crates_on_host",
-        "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host"
+        "test.rr_suite_contract_on_host"
       ],
       "paths": [
         "hermit-record-format/**/*.rs",
@@ -705,8 +514,7 @@
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
         "test.regular_crates_on_host",
-        "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host"
+        "test.rr_suite_contract_on_host"
       ],
       "paths": [
         "hermit-replay/**/*.rs",
@@ -714,7 +522,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-resources`; reverse-dependent closure: detcore-dbt, detcore-dbt-cdylib, hermit-cdylib, hermit-resources, hermit-run.",
+      "_why": "@generated: Cargo package `hermit-resources`; reverse-dependent closure: hermit-cdylib, hermit-resources, hermit-run.",
       "e2e_all": true,
       "nodes": [
         "build.workspace_on_host",
@@ -746,8 +554,7 @@
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
         "test.regular_crates_on_host",
-        "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host"
+        "test.rr_suite_contract_on_host"
       ],
       "paths": [
         "hermit-resources/**/*.rs",
@@ -771,8 +578,7 @@
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
         "test.regular_crates_on_host",
-        "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host"
+        "test.rr_suite_contract_on_host"
       ],
       "paths": [
         "hermit-run-kvm/**/*.rs",
@@ -796,8 +602,7 @@
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
         "test.regular_crates_on_host",
-        "test.rr_suite_contract_on_host",
-        "test.sabre_examples_on_host"
+        "test.rr_suite_contract_on_host"
       ],
       "paths": [
         "hermit-run-ptrace/**/*.rs",
@@ -817,6 +622,21 @@
       "paths": [
         "hermit-verify/**/*.rs",
         "hermit-verify/Cargo.toml"
+      ]
+    },
+    {
+      "_why": "@generated: Cargo package `hermit-inguest-engine`; reverse-dependent closure: hermit-inguest-engine.",
+      "nodes": [
+        "build.workspace_on_host",
+        "doc.doctests_on_host",
+        "doc.rustdoc_on_host",
+        "lint.clippy_on_host",
+        "lint.rustfmt",
+        "test.regular_crates_on_host"
+      ],
+      "paths": [
+        "inguest-engine/**/*.rs",
+        "inguest-engine/Cargo.toml"
       ]
     },
     {
@@ -855,15 +675,6 @@
       "paths": [
         "tests/**/*.rs",
         "tests/Cargo.toml"
-      ]
-    },
-    {
-      "_why": "The e9patch preprocessing corpus and its manual driver moved out of tests/backend-parity in slice S13 of https://github.com/rrnewton/hermit/issues/3301. No validation lane has e9tool, so only the driver's contract test is selected.",
-      "nodes": [
-        "check.e9patch_corpus"
-      ],
-      "paths": [
-        "tests/e9patch/**"
       ]
     },
     {

@@ -19,7 +19,7 @@
 //! takes the window or windows its IDs start in, checked free of host tasks,
 //! and reserves them for its lifetime ([`Reservation`]), so that two Hermit
 //! runs on one host do not start in the same IDs. IDs past those windows are
-//! neither checked nor reserved (https://github.com/rrnewton/hermit/issues/4870).
+//! neither checked nor reserved (<https://github.com/rrnewton/hermit/issues/4870>).
 //!
 //! A run that asks for chosen IDs, with an explicit `--pid-base` or with
 //! `--strict` (whose base, unless given, is half of `pid_max`, a fact of the

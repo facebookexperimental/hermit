@@ -14,7 +14,7 @@ verifier = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verifier)
 
 
-def fixture_receipt(install, pin):
+def fixture_receipt(install, pin, *, core=False):
     resources = Path(install) / "rsrcs"
     runtime = resources / "libdetcore_liteinst.so"
     digest = hashlib.sha256(runtime.read_bytes()).hexdigest()
@@ -46,7 +46,7 @@ def fixture_receipt(install, pin):
         "installed": {"sha256": digest}, "cargo_argv": args,
         "commands": [{"status": 0, "program": "cargo", "arguments": args}],
         "source_close_completed": True}
-    (resources / "sabre.revision").write_text(pin + "\n")
+    (resources / ("libreverie_liteinst.so.revision" if core else "sabre.revision")).write_text(pin + "\n")
     (resources / "libdetcore_liteinst.package.json").write_text(json.dumps(record))
     return record
 
@@ -91,8 +91,52 @@ class ReceiptControls(unittest.TestCase):
                 verifier.verify(install)
 
 
+    def test_core_receipt_binds_profile_feature_artifact_source_close_and_installed_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install = Path(tmp)
+            resources = install / "rsrcs"
+            resources.mkdir()
+            runtime = resources / "libdetcore_liteinst.so"
+            runtime.write_bytes(b"synthetic reader fixture, not an ELF proof")
+            receipt = resources / "libdetcore_liteinst.package.json"
+            good = fixture_receipt(install, "a" * 40, core=True)
+            verifier.verify(install, core=True)
+            marker=resources/'libreverie_liteinst.so.revision'
+            marker.write_text('b'*40+'\n')
+            with self.assertRaisesRegex(ValueError,'different Reverie pins'):
+                verifier.verify(install,core=True)
+            marker.write_text('a'*40+'\n')
+            for field, value in [("profile_name", "validate"), ("source_close_completed", False)]:
+                bad = copy.deepcopy(good)
+                bad[field] = value
+                receipt.write_text(json.dumps(bad))
+                with self.assertRaises(ValueError):
+                    verifier.verify(install, core=True)
+            for section, field, value in [("cargo_artifact", "features", ["allocator-fixture"]),
+                    ("compiled_sources", "reverie_pin", "b" * 40),
+                    ("installed", "sha256", "0" * 64),
+                    ("qualifier_source", "path", "/wrong/proof.rs"),
+                    ("cargo_artifact", "reported_path", "/wrong/libdetcore_liteinst.so"),
+                    ("qualification", "generic_bootstrap", {}),
+                    ("qualification", "allocator_backing", {"success": False}),
+                    ("qualification", "detcore_constructor", {"allocation_length": 232}),
+                    ("commands", 0, {"status": 1})]:
+                bad = copy.deepcopy(good)
+                bad[section][field] = value
+                receipt.write_text(json.dumps(bad))
+                with self.assertRaises(ValueError):
+                    verifier.verify(install, core=True)
+            receipt.write_text(json.dumps(good))
+            runtime.write_bytes(b"changed installed bytes")
+            with self.assertRaises(ValueError):
+                verifier.verify(install, core=True)
+            receipt.unlink()
+            with self.assertRaises(ValueError):
+                verifier.verify(install, core=True)
+
+
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "--write-fixture":
-        fixture_receipt(sys.argv[2], sys.argv[3])
+    if len(sys.argv) == 4 and sys.argv[1] in ("--write-fixture", "--write-core-fixture"):
+        fixture_receipt(sys.argv[2], sys.argv[3], core=sys.argv[1] == "--write-core-fixture")
     else:
         unittest.main()

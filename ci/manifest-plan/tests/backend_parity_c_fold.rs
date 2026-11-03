@@ -26,10 +26,10 @@
 //! 4. The command the c-programs nodes run refuses a selection of zero cells,
 //!    so folding more tests into that node cannot turn it into a vacuous pass.
 //!
-//! Two further checks pin slice S13's DAG edits: every manifest node that
-//! selects a DBT cell and runs in one dagrun with check.dbt_runtime_abi orders
-//! after it, as the retired test.dbt_parity node did, and the privileged
-//! c-programs descriptions name the cells those nodes select.
+//! The privileged c-programs descriptions name the cells those nodes select.
+//! Slice S13's DBT diagnostic-ordering control is maintained by the DynamoRIO
+//! extension in hermit-dynamorio/tests/ci_manifest_ordering.rs, against its
+//! actual generated graph and the shared planner's DynamoRIO population.
 //!
 //! The fold's parent on main is 3f66a249b30fada86b81e722b8e5439ac0789f8e, the
 //! last commit that declared backend-parity-c. Sides 2 and 3 used to pin the
@@ -429,147 +429,11 @@ fn the_c_programs_selector_refuses_zero_cells() {
     assert!(!Path::new(results).exists(), "a refused run wrote results");
 }
 
-/// `(lane, category)` of every committed CI-selected DBT plan cell.
-fn dbt_plan_buckets() -> BTreeSet<(String, String)> {
-    let plan = read_json("ci/expected-e2e-plan.json");
-    plan["cells"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|cell| field(cell, "backend") == "dbt")
-        .map(|cell| (field(cell, "lane").into(), field(cell, "category").into()))
-        .collect()
-}
-
 /// The value after `flag` in a node command, if the flag appears once.
 fn flag_value<'a>(cmd: &'a str, flag: &str) -> Option<&'a str> {
     let mut words = cmd.split_whitespace();
     words.position(|word| word == flag)?;
     words.next()
-}
-
-/// The retired test.dbt_parity node depended on check.dbt_runtime_abi so the
-/// ABI check ran first and named a missing DBT runtime callback before
-/// eager-exit could cancel it. Its cases now run in manifest nodes, so every
-/// manifest node that selects a DBT cell and shares a dagrun profile with the
-/// check has to carry the same ordering, and no other node needs it.
-///
-/// `hosted-portable` is not such a profile: the hosted workflow runs each E2E
-/// node as its own job through ci/run-node.sh, which omits dependencies outside
-/// the job's selection, and the ABI check runs in a separate release-shard job
-/// that an E2E failure cannot cancel. ci/check-shard-coverage.sh refuses an E2E
-/// edge to a node that no earlier hosted job supplies, so the _on_host twins
-/// must not carry it.
-#[test]
-fn every_manifest_node_with_a_dbt_cell_orders_after_the_dbt_runtime_abi_check() {
-    const ABI: &str = "check.dbt_runtime_abi";
-    const HOSTED_PORTABLE: &str = "hosted-portable";
-    let dag = read_json("ci/dag/validate.json");
-    let steps = dag["steps"].as_array().unwrap();
-    let tag = |step: &JsonValue| format!("{}.{}", field(step, "group"), field(step, "job"));
-    let labels = |step: &JsonValue| {
-        step["labels"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|label| label.as_str().unwrap().to_string())
-            .collect::<BTreeSet<_>>()
-    };
-    let abi = steps
-        .iter()
-        .find(|step| tag(step) == ABI)
-        .unwrap_or_else(|| panic!("{ABI} is missing from ci/dag/validate.json"));
-    // Since the one-build change of 2026-09-30 the local check runs in the
-    // pinned root, so hosted-portable runs its own host twin, which the hosted
-    // E2E twins must still not depend on (see above).
-    let hosted_abi = format!("{ABI}_on_host");
-    let hosted = steps
-        .iter()
-        .find(|step| tag(step) == hosted_abi)
-        .unwrap_or_else(|| panic!("{hosted_abi} is missing from ci/dag/validate.json"));
-    assert_eq!(
-        labels(hosted),
-        BTreeSet::from([HOSTED_PORTABLE.to_string()]),
-        "{hosted_abi} left the hosted-portable profile; revisit the _on_host twins"
-    );
-    let abi_labels = labels(abi);
-    assert!(
-        !abi_labels.contains(HOSTED_PORTABLE),
-        "{ABI} is selected by hosted-portable besides its host twin {hosted_abi}"
-    );
-    assert!(!abi_labels.is_empty(), "{ABI} is in no dagrun profile");
-    assert!(
-        !steps.iter().any(|step| {
-            step["deps"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|dep| dep.as_str() == Some(hosted_abi.as_str()))
-        }),
-        "a node depends on {hosted_abi}; the hosted E2E twins must not"
-    );
-    let dbt = dbt_plan_buckets();
-    assert!(!dbt.is_empty(), "the committed plan selects no DBT cell");
-    let mut needs = BTreeSet::new();
-    let mut has = BTreeSet::new();
-    for step in steps {
-        let cmd = field(step, "cmd");
-        if step["deps"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|dep| dep.as_str() == Some(ABI))
-        {
-            has.insert(tag(step));
-        }
-        if !cmd.contains("--ci-only") {
-            continue;
-        }
-        let (Some(lane), Some(category)) =
-            (flag_value(cmd, "--lane"), flag_value(cmd, "--category"))
-        else {
-            continue;
-        };
-        if dbt.contains(&(lane.to_string(), category.to_string()))
-            && !labels(step).is_disjoint(&abi_labels)
-        {
-            needs.insert(tag(step));
-        }
-    }
-    assert_eq!(
-        needs,
-        BTreeSet::from([
-            "e2e.manifest_applications".to_string(),
-            "e2e.manifest_bin_c".to_string(),
-            "e2e.manifest_c_programs".to_string(),
-            "e2e.manifest_chaos_c".to_string(),
-            "e2e.manifest_compat".to_string(),
-            "e2e.manifest_data_handling".to_string(),
-            "e2e.manifest_debugger_c".to_string(),
-            "e2e.manifest_determinism_stress".to_string(),
-            "e2e.manifest_determinism_stress_c".to_string(),
-            "e2e.manifest_language_runtimes".to_string(),
-            "e2e.manifest_shared_futex_c".to_string(),
-            "e2e.manifest_system_utils".to_string(),
-            "e2e.manifest_util_c".to_string(),
-            "privileged-e2e.manifest_applications".to_string(),
-            "privileged-e2e.manifest_c_programs".to_string(),
-            "privileged-e2e.manifest_system_utils".to_string(),
-        ])
-    );
-    // This counted integration target runs real DBT cases outside the
-    // manifest buckets, so it must also wait for the same ABI check.
-    let mut expected_dependents = needs;
-    // The privileged system-utils bucket keeps its ABI ordering even
-    // though its only DBT cells (the sysfs verify cells) are currently
-    // ci-disabled as a named image-mode loss
-    // (https://github.com/rrnewton/hermit/issues/5015); when they are
-    // re-enabled it joins `needs` again without a DAG change.
-    expected_dependents.insert("privileged-e2e.manifest_system_utils".to_string());
-    expected_dependents.insert("test.inherited_terminal_read".to_string());
-    // So does the isolation matrix node that runs the DBT cells.
-    expected_dependents.insert("test.isolation_matrix_dbt_in_guest".to_string());
-    assert_eq!(has, expected_dependents);
 }
 
 /// The privileged c-programs nodes describe their selection by count and

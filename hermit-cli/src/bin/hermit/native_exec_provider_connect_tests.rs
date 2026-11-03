@@ -18,7 +18,7 @@ use sha2::Sha256;
 use super::native_exec_guest_provider as provider;
 use super::native_exec_inputs::InputRole;
 use super::native_exec_inputs::seal_bytes;
-use crate::container_clone::CheckedClone;
+use crate::app::container_clone::CheckedClone;
 
 fn isolated(body: fn()) {
     // No host pathname is unlinked or bound. The production literal resolves
@@ -236,7 +236,7 @@ fn aliases(source: &File) -> usize {
 
 #[test]
 fn actual_provider_socket_remains_unconnected_past_request_deadline_and_close() {
-    if crate::test_isolation::rerun_alone() {
+    if crate::app::test_isolation::rerun_alone() {
         return;
     }
     isolated(|| {
@@ -253,7 +253,7 @@ fn actual_provider_socket_remains_unconnected_past_request_deadline_and_close() 
 
 #[test]
 fn actual_provider_first_exchange_preserves_socket_and_receives_five_sealed_roles() {
-    if crate::test_isolation::rerun_alone() {
+    if crate::app::test_isolation::rerun_alone() {
         return;
     }
     isolated(|| {
@@ -303,7 +303,7 @@ fn actual_provider_first_exchange_preserves_socket_and_receives_five_sealed_role
 
 #[test]
 fn actual_provider_connect_failure_preserves_original_socket() {
-    if crate::test_isolation::rerun_alone() {
+    if crate::app::test_isolation::rerun_alone() {
         return;
     }
     isolated(|| {
@@ -328,7 +328,7 @@ fn actual_provider_connect_failure_preserves_original_socket() {
 
 #[test]
 fn actual_provider_second_exchange_refuses_without_second_request() {
-    if crate::test_isolation::rerun_alone() {
+    if crate::app::test_isolation::rerun_alone() {
         return;
     }
     isolated(|| {
@@ -361,7 +361,7 @@ fn actual_provider_second_exchange_refuses_without_second_request() {
 
 #[test]
 fn actual_provider_malformed_reply_closes_received_descriptors() {
-    if crate::test_isolation::rerun_alone() {
+    if crate::app::test_isolation::rerun_alone() {
         return;
     }
     isolated(|| {

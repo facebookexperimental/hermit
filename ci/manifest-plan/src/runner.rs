@@ -1760,6 +1760,8 @@ pub struct Selection {
     /// hosted profile's expected population omits them by the same list, so an
     /// omitted cell is never counted as a pass.
     pub exclude_backends: Vec<String>,
+    /// Exact source-owned executable population. Identity is unchanged across owners.
+    pub execution_backends: Option<BTreeSet<String>>,
     /// Manifest categories (buckets) whose cells this selection omits. The
     /// committed caller is the quick profile's pinned-root verify smoke, which
     /// omits the host-bound compatibility corpus by
@@ -2529,6 +2531,12 @@ impl ManifestSet {
             }
         }
         cells.sort_by(|a, b| a.id.cmp(&b.id));
+        if let Some(backends) = &selection.execution_backends {
+            if backends.is_empty() {
+                return Err("execution owner has no backends".into());
+            }
+            cells.retain(|cell| backends.contains(cell.id.backend.as_deref().unwrap_or("native")));
+        }
         Ok(cells)
     }
 
@@ -3093,6 +3101,8 @@ fn ci_selection(recipe: &ModeRecipe) -> Result<CiSelection, String> {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CellRunSpec {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_binding: Option<crate::executable_binding::HeldExecutable>,
     pub id: CellId,
     pub lane: String,
     pub category: String,
@@ -3264,6 +3274,8 @@ impl FailureClass {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttemptResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_binding: Option<crate::executable_binding::ExecutableIdentity>,
     pub index: String,
     pub outcome: String,
     pub error_kind: Option<String>,
@@ -3422,6 +3434,10 @@ pub struct CellResult {
     /// different state.
     pub source_tree_dirty: bool,
     pub binary_sha256: Option<String>,
+    /// The separately retained core comparator when physical work uses a
+    /// selected static entry. This never substitutes for that entry's digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparator_binary_sha256: Option<String>,
     /// What the BINARY says about its own origin: the commit it was compiled
     /// from, with a `-dirty` suffix when that tree was dirty.
     ///
@@ -3758,6 +3774,7 @@ impl ScheduledWorkerCapacity {
 
 #[derive(Clone)]
 pub struct RunContext {
+    pub command_bindings: BTreeMap<String, crate::executable_binding::HeldExecutable>,
     pub root: PathBuf,
     pub hermit_bin: PathBuf,
     pub result_root: PathBuf,
@@ -3973,7 +3990,34 @@ impl RunContext {
                 &["record", "start", "--help"],
                 "--verify-strict",
             )?;
+        let command_bindings = crate::executable_binding::read_bindings(
+            std::env::var_os("HERMIT_E2E_COMMAND_BINDINGS")
+                .as_deref()
+                .map(Path::new),
+        )?;
+        for binding in command_bindings.values() {
+            let entry = &binding.identity.executable;
+            if probe_binary_build_sha(entry).as_deref()
+                != Some(binding.identity.binary_build_sha.as_str())
+            {
+                return Err(
+                    "catalog entry's actual version stamp differs from its producer binding".into(),
+                );
+            }
+            if command_help_contains(entry, &["run", "--help"], "--verify-strict")?
+                != run_verify_strict
+                || command_help_contains(entry, &["record", "start", "--help"], "--verify-strict")?
+                    != record_verify_strict
+            {
+                return Err(
+                    "catalog entry and core comparator have different strict invocation contracts"
+                        .into(),
+                );
+            }
+            binding.recheck()?;
+        }
         Ok(Self {
+            command_bindings,
             root,
             hermit_bin,
             result_root,
@@ -4980,6 +5024,43 @@ fn verify_attempt_invocation_error<'a>(
     expects_exit: bool,
     comparator: Comparator,
 ) -> Result<Option<&'a str>, String> {
+    let Some(binding) = &attempt.command_binding else {
+        return verify_selector_attempt_invocation_error(
+            attempt,
+            backend,
+            relaxation_flags,
+            expects_exit,
+            comparator,
+        );
+    };
+    binding.validate()?;
+    if binding.backend != backend {
+        return Err("retained static executable selects a different cell backend".into());
+    }
+    let mut normalized = attempt.clone();
+    normalized.argv =
+        crate::executable_binding::selector_argv(&attempt.argv, &attempt.guest_argv, binding)?;
+    match verify_selector_attempt_invocation_error(
+        &normalized,
+        backend,
+        relaxation_flags,
+        expects_exit,
+        comparator,
+    )? {
+        None => Ok(None),
+        Some("minimal") => Ok(Some("minimal")),
+        Some("standard") => Ok(Some("standard")),
+        Some(other) => Err(format!("unexpected validated proc level {other}")),
+    }
+}
+
+fn verify_selector_attempt_invocation_error<'a>(
+    attempt: &'a AttemptResult,
+    backend: &str,
+    relaxation_flags: &[&str],
+    expects_exit: bool,
+    comparator: Comparator,
+) -> Result<Option<&'a str>, String> {
     // The paired program ([`VERIFY_PAIR_SCRIPT`]): the comparison, then the
     // run command, optionally below the original single sealed-input owner.
     // A mapped image and the host linker cache share that same manifest.
@@ -5762,7 +5843,24 @@ pub fn build_spec(
         }
         mode => return Err(format!("unsupported mode {mode}")),
     };
+    let command_binding = if cell.id.mode == "naked" {
+        None
+    } else {
+        context.command_bindings.get(backend).cloned()
+    };
+    let argv = if let Some(binding) = &command_binding {
+        binding.recheck()?;
+        crate::executable_binding::static_argv(
+            &argv,
+            &context.hermit_bin,
+            &guest_argv,
+            &binding.identity,
+        )?
+    } else {
+        argv
+    };
     Ok(CellRunSpec {
+        command_binding,
         id: cell.id.clone(),
         lane: cell.test.lane.clone(),
         category: cell.category.clone(),
@@ -6559,7 +6657,14 @@ fn execute_spec_until(
             timeout,
         ));
     }
-    let output = execute_process(request, (deadline, remaining_cpu_usec), observations)?;
+    if let Some(binding) = &spec.command_binding {
+        binding.recheck()?;
+    }
+    let output = execute_process(request, (deadline, remaining_cpu_usec), observations);
+    if let Some(binding) = &spec.command_binding {
+        binding.recheck()?;
+    }
+    let output = output?;
     let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
     let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
     let mut outcome = if output.timeout.is_some() || !output.status.success() {
@@ -6575,7 +6680,10 @@ fn execute_spec_until(
     let failure_class_line = stderr.lines().next().unwrap_or_default();
     let producer_class = producer_failure(
         &spec.id.mode,
-        spec.id.backend.as_deref(),
+        spec.command_binding
+            .as_ref()
+            .map(|held| held.identity.producer_backend.as_str())
+            .or(spec.id.backend.as_deref()),
         output.status.success(),
         output.timeout.is_some(),
         &stdout,
@@ -7003,6 +7111,10 @@ fn execute_spec_until(
             .map_err(|e| format!("cannot remove {}: {e}", verify_runs.display()))?;
     }
     Ok(AttemptResult {
+        command_binding: spec
+            .command_binding
+            .as_ref()
+            .map(|held| held.identity.clone()),
         index: index.into(),
         outcome,
         error_kind,
@@ -8530,6 +8642,10 @@ fn cell_timeout_attempt(
         .expect("the typed NotRun report must serialize");
     let report_sha256 = hex_digest(report.as_bytes());
     AttemptResult {
+        command_binding: spec
+            .command_binding
+            .as_ref()
+            .map(|held| held.identity.clone()),
         index: index.into(),
         outcome: "ERROR".into(),
         error_kind: Some(timeout.error_kind().into()),
@@ -9023,6 +9139,28 @@ fn acquire_proc_locks_lease(
         .map_err(|error| format!("proc-locks snapshot lease: {error}"))
 }
 
+fn selected_executable<'a>(
+    context: &'a RunContext,
+    cell: &SelectedCell,
+) -> Option<&'a crate::executable_binding::HeldExecutable> {
+    cell.id
+        .backend
+        .as_deref()
+        .and_then(|backend| context.command_bindings.get(backend))
+}
+
+fn physical_binary_digest(context: &RunContext, cell: &SelectedCell) -> Option<String> {
+    binary_digest(
+        selected_executable(context, cell)
+            .map(|held| held.identity.executable.as_path())
+            .unwrap_or(&context.hermit_bin),
+    )
+}
+
+fn comparator_binary_digest(context: &RunContext, cell: &SelectedCell) -> Option<String> {
+    selected_executable(context, cell).and_then(|_| binary_digest(&context.hermit_bin))
+}
+
 fn run_cell_inner(
     context: &RunContext,
     cell: &SelectedCell,
@@ -9040,6 +9178,17 @@ fn run_cell_inner(
     // Hashed once per process while the file is unchanged (bundle_record.rs);
     // a write or replacement is hashed afresh, here and after the cell.
     let binary_before = binary_digest(&context.hermit_bin);
+    if let Some(held) = selected_executable(context, cell) {
+        held.recheck()?;
+    }
+    let physical_before = physical_binary_digest(context, cell);
+    if let Some(held) = selected_executable(context, cell) {
+        if physical_before.as_deref() != Some(held.identity.sha256.as_str()) {
+            return Err(
+                "selected physical executable differs from its held producer identity".into(),
+            );
+        }
+    }
     if let Some(recorded) = crate::bundle_record::recorded_hermit_sha256()? {
         if binary_before.as_deref() != Some(recorded.as_str()) {
             return Err(format!(
@@ -9366,8 +9515,14 @@ fn run_cell_inner(
         .map(|attempt| attempt.shell_command.clone())
         .unwrap_or_default();
     let test_sha = test_digest(&context.root, &cell.test)?;
-    let binary_sha = binary_digest(&context.hermit_bin);
-    if binary_before.is_some() && binary_before != binary_sha {
+    let comparator_sha = binary_digest(&context.hermit_bin);
+    let binary_sha = physical_binary_digest(context, cell);
+    let selected_changed =
+        selected_executable(context, cell).is_some_and(|held| held.recheck().is_err());
+    if (binary_before.is_some() && binary_before != comparator_sha)
+        || (physical_before.is_some() && physical_before != binary_sha)
+        || selected_changed
+    {
         outcome = "ERROR".into();
         error_kind = Some("infrastructure".into());
         reason = Some("Hermit binary changed while the cell was executing".into());
@@ -9410,9 +9565,16 @@ fn run_cell_inner(
         attempt: context.attempt,
         run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
-        binary_build_sha: context.binary_build_sha.clone(),
+        binary_build_sha: cell
+            .id
+            .backend
+            .as_deref()
+            .and_then(|backend| context.command_bindings.get(backend))
+            .map(|held| held.identity.binary_build_sha.clone())
+            .or_else(|| context.binary_build_sha.clone()),
         source_tree_dirty: context.source_dirty,
         binary_sha256: binary_sha,
+        comparator_binary_sha256: selected_executable(context, cell).and(comparator_sha),
         test_sha256: test_sha,
         test: cell.id.test.clone(),
         category: cell.category.clone(),
@@ -9497,9 +9659,16 @@ pub fn infrastructure_error_result(
         attempt: context.attempt,
         run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
-        binary_build_sha: context.binary_build_sha.clone(),
+        binary_build_sha: cell
+            .id
+            .backend
+            .as_deref()
+            .and_then(|backend| context.command_bindings.get(backend))
+            .map(|held| held.identity.binary_build_sha.clone())
+            .or_else(|| context.binary_build_sha.clone()),
         source_tree_dirty: context.source_dirty,
-        binary_sha256: binary_digest(&context.hermit_bin),
+        binary_sha256: physical_binary_digest(context, cell),
+        comparator_binary_sha256: comparator_binary_digest(context, cell),
         test_sha256: test_digest(&context.root, &cell.test).unwrap_or_default(),
         test: cell.id.test.clone(),
         category: cell.category.clone(),
@@ -9576,9 +9745,17 @@ pub fn host_inapplicable_result(
         attempt: context.attempt,
         run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
-        binary_build_sha: context.binary_build_sha.clone(),
+        binary_build_sha: cell
+            .id
+            .backend
+            .as_deref()
+            .and_then(|backend| context.command_bindings.get(backend))
+            .map(|held| held.identity.binary_build_sha.clone())
+            .or_else(|| context.binary_build_sha.clone()),
         source_tree_dirty: context.source_dirty,
-        binary_sha256: None,
+        binary_sha256: selected_executable(context, cell)
+            .and_then(|_| physical_binary_digest(context, cell)),
+        comparator_binary_sha256: comparator_binary_digest(context, cell),
         test_sha256: test_digest(&context.root, &cell.test).unwrap_or_default(),
         test: cell.id.test.clone(),
         category: cell.category.clone(),
@@ -9702,6 +9879,15 @@ fn argv_selects_sabre(argv: &[String]) -> bool {
         .any(|window| window[0] == "--backend" && window[1] == "sabre")
 }
 
+fn attempt_selects_sabre(attempt: &AttemptResult) -> bool {
+    let Some(binding) = &attempt.command_binding else {
+        return argv_selects_sabre(&attempt.argv);
+    };
+    binding.backend == "sabre"
+        && crate::executable_binding::selector_argv(&attempt.argv, &attempt.guest_argv, binding)
+            .is_ok_and(|argv| argv_selects_sabre(&argv))
+}
+
 /// Why `result`'s recorded execution path is not the eligible one its own
 /// retained attempts decide, if it is not.
 ///
@@ -9740,7 +9926,7 @@ fn retained_path_evidence_error(result: &CellResult) -> Option<String> {
     let sabre = result.backend.as_deref() == Some("sabre");
     for attempt in &result.attempts {
         let index = attempt.index.as_str();
-        if argv_selects_sabre(&attempt.argv) != sabre {
+        if attempt_selects_sabre(attempt) != sabre {
             return Some(format!(
                 "inner attempt {index}'s command line does not select the row's backend {:?}",
                 result.backend
@@ -9769,9 +9955,7 @@ fn retained_path_evidence_error(result: &CellResult) -> Option<String> {
 pub(crate) fn summarize_sabre_path_evidence(
     attempts: &[AttemptResult],
 ) -> Result<Option<JsonValue>, String> {
-    let is_sabre = attempts
-        .iter()
-        .any(|attempt| argv_selects_sabre(&attempt.argv));
+    let is_sabre = attempts.iter().any(attempt_selects_sabre);
     if !is_sabre {
         return Ok(None);
     }
@@ -9800,7 +9984,7 @@ pub(crate) fn summarize_sabre_path_evidence(
         // candidate. Only executions which actually selected SaBRe can emit
         // SaBRe path evidence; counting the ptrace operand would turn every
         // otherwise-valid SaBRe parity measurement into an incomplete path.
-        .filter(|attempt| argv_selects_sabre(&attempt.argv))
+        .filter(|attempt| attempt_selects_sabre(attempt))
         .map(|attempt| {
             if attempt
                 .argv
@@ -13248,7 +13432,22 @@ corpus:
     }
 
     fn verify_spec_of(cell: SelectedCell) -> CellRunSpec {
+        verify_spec_of_with_bindings(cell, BTreeMap::new())
+    }
+
+    fn verify_spec_of_with_bindings(
+        cell: SelectedCell,
+        command_bindings: BTreeMap<String, crate::executable_binding::HeldExecutable>,
+    ) -> CellRunSpec {
+        verify_spec_and_context_of_with_bindings(cell, command_bindings).0
+    }
+
+    fn verify_spec_and_context_of_with_bindings(
+        cell: SelectedCell,
+        command_bindings: BTreeMap<String, crate::executable_binding::HeldExecutable>,
+    ) -> (CellRunSpec, RunContext) {
         let context = RunContext {
+            command_bindings,
             root: PathBuf::from("/repo"),
             hermit_bin: PathBuf::from("/repo/hermit"),
             result_root: PathBuf::from("/repo/results"),
@@ -13275,7 +13474,28 @@ corpus:
             shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
-        build_spec(
+        if let Some(held) = selected_executable(&context, &cell) {
+            let error = infrastructure_error_result(&context, &cell, "fixture".into());
+            let unavailable = host_inapplicable_result(&context, &cell, "fixture".into());
+            assert_eq!(
+                error.binary_sha256.as_deref(),
+                Some(held.identity.sha256.as_str())
+            );
+            assert_eq!(
+                unavailable.binary_sha256.as_deref(),
+                Some(held.identity.sha256.as_str())
+            );
+            assert_eq!(
+                physical_binary_digest(&context, &cell).as_deref(),
+                Some(held.identity.sha256.as_str())
+            );
+            assert_eq!(
+                error.binary_build_sha.as_deref(),
+                Some(held.identity.binary_build_sha.as_str())
+            );
+            assert!(error.attempts.is_empty() && unavailable.attempts.is_empty());
+        }
+        let spec = build_spec(
             &context,
             &cell,
             PathBuf::from("/repo/results/cell"),
@@ -13284,7 +13504,46 @@ corpus:
             None,
             cell.timeout_seconds,
         )
-        .unwrap()
+        .unwrap();
+        (spec, context)
+    }
+
+    #[test]
+    fn selected_static_entry_reaches_build_spec_and_the_original_strict_invocation_validator() {
+        let cell = verify_cell("ptrace", true, BTreeMap::new(), None);
+        let (old, old_context) =
+            verify_spec_and_context_of_with_bindings(cell.clone(), BTreeMap::new());
+        let binding = crate::executable_binding::current_test_binding("ptrace");
+        let (mut spec, context) = verify_spec_and_context_of_with_bindings(
+            cell.clone(),
+            BTreeMap::from([("ptrace".into(), binding.clone())]),
+        );
+        assert_eq!(spec.guest_argv, old.guest_argv);
+        assert_eq!(spec.timeout_seconds, old.timeout_seconds);
+        assert_eq!(
+            cell_timeouts(&context, &cell).unwrap().cpu_seconds,
+            cell_timeouts(&old_context, &cell).unwrap().cpu_seconds
+        );
+        assert_eq!(spec.comparator, old.comparator);
+        assert!(
+            spec.argv
+                .iter()
+                .any(|v| v == binding.identity.executable.to_str().unwrap())
+        );
+        let mut attempt = attempt_with_sabre_evidence("");
+        attempt.argv = std::mem::take(&mut spec.argv);
+        attempt.guest_argv = spec.guest_argv;
+        attempt.command_binding = Some(binding.identity);
+        assert!(
+            verify_attempt_invocation_error(&attempt, "ptrace", &[], false, Comparator::Strict)
+                .is_ok()
+        );
+        let strict = attempt.argv.iter().position(|v| v == "--strict").unwrap();
+        attempt.argv.remove(strict);
+        assert!(
+            verify_attempt_invocation_error(&attempt, "ptrace", &[], false, Comparator::Strict)
+                .is_err()
+        );
     }
 
     /// A probe of a disabled in-guest LiteInst cell runs it with the maximum
@@ -13891,6 +14150,7 @@ esac
             ]
         );
         let context = RunContext {
+            command_bindings: BTreeMap::new(),
             root: root.clone(),
             hermit_bin: PathBuf::from("/repo/hermit"),
             result_root: PathBuf::from("/repo/results"),
@@ -14603,6 +14863,7 @@ esac
 
     fn run_context(root: &Path) -> RunContext {
         RunContext {
+            command_bindings: BTreeMap::new(),
             root: root.into(),
             hermit_bin: root.join("hermit"),
             result_root: root.join("results"),
@@ -15718,6 +15979,7 @@ fi
             std::process::id()
         ));
         let context = RunContext {
+            command_bindings: BTreeMap::new(),
             root: root.clone(),
             hermit_bin: root.join("hermit"),
             result_root: root.join("results"),
@@ -16478,6 +16740,7 @@ fi
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let spec = CellRunSpec {
+            command_binding: None,
             id: CellId {
                 test: "fixture/prelaunch-timeout".into(),
                 mode: "verify".into(),
@@ -17651,6 +17914,7 @@ fi
 
     fn bounded_spec(root: &Path, label: &str, script: &str) -> CellRunSpec {
         CellRunSpec {
+            command_binding: None,
             id: CellId {
                 test: format!("fixture/{label}"),
                 mode: "naked".into(),
@@ -19524,8 +19788,14 @@ int main(int argc, char **argv) {
                 .unwrap()
                 .success()
         );
-        let socket = root.join("phase.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        // Bind a short pathname inside this isolated test child. The C
+        // fixture also runs in root; restore cwd before checking the bind.
+        let previous_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        let socket = Path::new("phase.sock");
+        let listener = UnixListener::bind(socket);
+        std::env::set_current_dir(previous_cwd).unwrap();
+        let listener = listener.unwrap();
         listener.set_nonblocking(true).unwrap();
         let request = ProcessRequest::new(
             InvocationRole::Execution {
@@ -19954,6 +20224,7 @@ int main(int argc, char **argv) {
             host_level: HostLevel::default(),
         };
         let context = RunContext {
+            command_bindings: BTreeMap::new(),
             root: root.clone(),
             hermit_bin: root.join("missing-hermit"),
             result_root: root.join("results"),
@@ -20034,6 +20305,7 @@ int main(int argc, char **argv) {
             host_level: HostLevel::default(),
         };
         let context = RunContext {
+            command_bindings: BTreeMap::new(),
             root: root.clone(),
             hermit_bin: root.join("hermit"),
             result_root: root.join("results"),
@@ -20164,6 +20436,7 @@ int main(int argc, char **argv) {
             host_level: HostLevel::default(),
         };
         let mut context = RunContext {
+            command_bindings: BTreeMap::new(),
             root: root.clone(),
             hermit_bin: root.join("hermit"),
             result_root: root.join("results"),
@@ -20446,6 +20719,7 @@ backends_disabled:
                 host_level: HostLevel::default(),
             };
             let context = RunContext {
+                command_bindings: BTreeMap::new(),
                 root: PathBuf::from("/repo"),
                 hermit_bin: PathBuf::from("/repo/hermit"),
                 result_root: PathBuf::from("/repo/results"),
@@ -20527,6 +20801,7 @@ backends_disabled:
             host_level: HostLevel::default(),
         };
         let context = RunContext {
+            command_bindings: BTreeMap::new(),
             root: PathBuf::from("/repo"),
             hermit_bin: PathBuf::from("/repo/hermit"),
             result_root: PathBuf::from("/repo/results"),
@@ -20590,6 +20865,7 @@ backends_disabled:
             host_level: HostLevel::default(),
         };
         let context = RunContext {
+            command_bindings: BTreeMap::new(),
             root: PathBuf::from("/repo"),
             hermit_bin: PathBuf::from("/repo/hermit"),
             result_root: PathBuf::from("/repo/results"),
@@ -21012,6 +21288,7 @@ backends_disabled:
             host_level: HostLevel::default(),
         };
         let context = RunContext {
+            command_bindings: BTreeMap::new(),
             root: PathBuf::from("/repo"),
             hermit_bin: PathBuf::from("/repo/hermit"),
             result_root: PathBuf::from("/repo/results"),
@@ -21372,6 +21649,7 @@ backends_disabled:
             PathBuf::from(HERMETIC_TEST_WORKDIR)
         });
         let context = RunContext {
+            command_bindings: BTreeMap::new(),
             root: root.clone(),
             hermit_bin: hermit_bin.clone(),
             result_root: scratch.join("results"),
@@ -21513,6 +21791,7 @@ backends_disabled:
             host_level: HostLevel::default(),
         };
         let context = RunContext {
+            command_bindings: BTreeMap::new(),
             root: PathBuf::from("/repo"),
             hermit_bin: PathBuf::from("/repo/hermit"),
             result_root: PathBuf::from("/repo/results"),
@@ -21857,6 +22136,7 @@ backends_disabled:
             binary_build_sha: None,
             source_tree_dirty: false,
             binary_sha256: None,
+            comparator_binary_sha256: None,
             test_sha256: "digest".into(),
             test: "fixture/test".into(),
             category: "fixture".into(),
@@ -22096,6 +22376,7 @@ backends_disabled:
 
     fn attempt_with_sabre_evidence(evidence: &str) -> AttemptResult {
         AttemptResult {
+            command_binding: None,
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
@@ -23134,6 +23415,7 @@ exit "$(cat "$PWD/exit-status")"
         let verdict = dir.join("verdict.json");
         let report = serde_json::to_string(&canonical_verification_report()).unwrap();
         let spec = CellRunSpec {
+            command_binding: None,
             id: CellId {
                 test: "fixture/status".into(),
                 mode: mode.into(),
@@ -23191,6 +23473,7 @@ exit "$(cat "$PWD/exit-status")"
         argv.push(report.unwrap_or("").to_string());
         argv.push(verdict.to_string_lossy().into_owned());
         let spec = CellRunSpec {
+            command_binding: None,
             id: CellId {
                 test: "fixture/backend-availability".into(),
                 mode: "verify".into(),
@@ -25691,6 +25974,7 @@ exit "$(cat "$PWD/exit-status")"
         fs::create_dir_all(&dir).unwrap();
         let verdict = dir.join("verdict.json");
         let spec = CellRunSpec {
+            command_binding: None,
             id: CellId {
                 test: "fixture/expected-exit".into(),
                 mode: "verify".into(),
@@ -27103,6 +27387,7 @@ cp "{}" "$verdict"
         fs::create_dir_all(&dir).unwrap();
         let verdict = dir.join("verdict.json");
         let spec = CellRunSpec {
+            command_binding: None,
             id: CellId {
                 test: "fixture/expected-stdout".into(),
                 mode: "verify".into(),
@@ -28024,6 +28309,7 @@ cp "{}" "$verdict"
         report.no_result_reason = Some(reason);
         let report = serde_json::to_string(&report).unwrap();
         let spec = CellRunSpec {
+            command_binding: None,
             id: CellId {
                 test: "fixture/no-result".into(),
                 mode: "verify".into(),
@@ -28298,6 +28584,7 @@ cp "{}" "$verdict"
         let cell_dir = root.join("cell");
         fs::create_dir_all(cell_dir.join("captures")).unwrap();
         let context = RunContext {
+            command_bindings: BTreeMap::new(),
             root: root.clone(),
             hermit_bin: root.join("hermit"),
             result_root: root.join("results"),
@@ -28360,6 +28647,7 @@ cp "{}" "$verdict"
         let cell_dir = root.join("cell");
         fs::create_dir_all(cell_dir.join("captures")).unwrap();
         let context = RunContext {
+            command_bindings: BTreeMap::new(),
             root: root.clone(),
             hermit_bin: root.join("hermit"),
             result_root: root.join("results"),
@@ -28551,6 +28839,7 @@ cp "{}" "$verdict"
             host_level: HostLevel::default(),
         };
         let context = RunContext {
+            command_bindings: BTreeMap::new(),
             root: root.clone(),
             hermit_bin: root.join("hermit"),
             result_root: root.join("results"),

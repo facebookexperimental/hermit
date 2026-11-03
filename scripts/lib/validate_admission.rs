@@ -2641,7 +2641,7 @@ for entry in Path('/proc/self/fd').iterdir():
 
     #[test]
     fn admission_tee_writes_created_descriptor_even_after_path_swap_and_refuses_receipt() {
-        use std::io::Write;
+        use std::io::{Read, Write};
         let f = Fixture::new();
         let state = VerifiedStateRoot::fixture(&f.0);
         let locator = WorkspaceLocatorV2 {
@@ -2652,13 +2652,21 @@ for entry in Path('/proc/self/fd').iterdir():
         let moved = f.0.join("ignored/validate/actual.log");
         std::fs::rename(f.0.join(&locator.path), &moved).unwrap();
         std::fs::write(f.0.join(&locator.path), b"foreign file\n").unwrap();
-        let mut tee = crate::spawn_durable_tee(&log.file).unwrap();
+        let mut tee =
+            crate::spawn_durable_tee(&log.file, std::process::Stdio::piped()).unwrap();
         tee.stdin
             .take()
             .unwrap()
             .write_all(b"actual descriptor bytes\n")
             .unwrap();
+        let mut stdout = Vec::new();
+        tee.stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut stdout)
+            .unwrap();
         assert!(tee.wait().unwrap().success());
+        assert_eq!(stdout, b"actual descriptor bytes\n");
         assert_eq!(std::fs::read(moved).unwrap(), b"actual descriptor bytes\n");
         assert_eq!(
             std::fs::read(f.0.join(&locator.path)).unwrap(),

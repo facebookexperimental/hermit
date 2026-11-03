@@ -58,6 +58,12 @@ declare -A shards=(
     [ci/compat-envelope/scorecard.rs]=4
 )
 
+# Owner scope: core qualification retains every validate.rs test except this
+# complete DBT-positive case. Its source assertions remain intact; third-party
+# nightly registration and execution are pending, not supplied by this filter.
+core_scope_source=scripts/validate.rs
+third_party_case=validate_evidence::tests::requalification_captures_and_publishes_the_committed_owner_without_full_authority
+
 files=()
 for f in $(git ls-files '*.rs' ':!:third-party/**' ':!:scripts/lib/**'); do
     # Only standalone entrypoints: a rust-script shebang makes the file runnable
@@ -113,7 +119,7 @@ unit_listed=()
 failed_listing=()
 for f in "${files[@]}"; do
     n=${shards[$f]:-1}
-    if [ "$n" -eq 1 ]; then
+    if [ "$n" -eq 1 ] && [ "$f" != "$core_scope_source" ]; then
         unit_file+=("$f")
         unit_label+=("$f")
         unit_names+=('')
@@ -144,6 +150,36 @@ for f in "${files[@]}"; do
         printf 'run-script-tests: %s listed no tests\n' "$f" >"$list.why"
         status=list
     fi
+    if [ "$status" = 0 ] && [ "$f" = "$core_scope_source" ]; then
+        # List before partitioning: never silently defer a missing, duplicate or
+        # substring-colliding identity. Keep every other emitted name, in order.
+        declare -A core_seen_names=()
+        third_party_count=0
+        for name in "${names[@]}"; do
+            if [[ -n ${core_seen_names["$name"]+present} ]]; then
+                printf 'run-script-tests: duplicate core test identity: %s\n' "$name" >"$list.why"
+                status=list
+                break
+            fi
+            core_seen_names["$name"]=1
+            if [ "$name" = "$third_party_case" ]; then
+                third_party_count=$((third_party_count + 1))
+            elif [[ $name == *"$third_party_case"* ]]; then
+                printf 'run-script-tests: ambiguous deferred identity: %s\n' "$name" >"$list.why"
+                status=list
+                break
+            fi
+        done
+        if [ "$status" = 0 ] && [ "$third_party_count" -ne 1 ]; then
+            printf 'run-script-tests: expected exactly one deferred identity %s, found %s\n' \
+                "$third_party_case" "$third_party_count" >"$list.why"
+            status=list
+        fi
+        if [ "$status" = 0 ] && [ "${#names[@]}" -le 1 ]; then
+            printf 'run-script-tests: core scope has no remaining tests\n' >"$list.why"
+            status=list
+        fi
+    fi
     if [ "$status" != 0 ]; then
         printf 'run-script-tests: %s (listing tests)\n' "$f"
         cat -- "$list.stdout"
@@ -159,10 +195,17 @@ for f in "${files[@]}"; do
         names_file=$out/names.${#unit_file[@]}
         : >"$names_file"
         for ((i = k; i < count; i += n)); do
+            if [ "$f" = "$core_scope_source" ] && [ "${names[$i]}" = "$third_party_case" ]; then
+                continue
+            fi
             printf '%s\n' "${names[$i]}" >>"$names_file"
         done
         unit_file+=("$f")
-        unit_label+=("$f (shard $((k + 1)) of ${n}: $(wc -l <"$names_file") of ${count} tests)")
+        if [ "$f" = "$core_scope_source" ]; then
+            unit_label+=("$f (core scope, shard $((k + 1)) of ${n}: $(wc -l <"$names_file") of ${count} tests; one DBT case deferred)")
+        else
+            unit_label+=("$f (shard $((k + 1)) of ${n}: $(wc -l <"$names_file") of ${count} tests)")
+        fi
         unit_names+=("$names_file")
         unit_listed+=("$count")
     done

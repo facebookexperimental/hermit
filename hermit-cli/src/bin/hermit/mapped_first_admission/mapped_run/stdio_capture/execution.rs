@@ -113,8 +113,8 @@ pub(crate) enum CapturePolicy {
 impl CapturePolicy {
     pub(super) fn observation(
         self,
-    ) -> crate::mapped_first_admission::runtime_support::init_trial::ObservationPolicy {
-        use crate::mapped_first_admission::runtime_support::init_trial::ObservationPolicy;
+    ) -> crate::app::mapped_first_admission::runtime_support::init_trial::ObservationPolicy {
+        use crate::app::mapped_first_admission::runtime_support::init_trial::ObservationPolicy;
         match self {
             Self::Full => ObservationPolicy::Production,
             #[cfg(test)]
@@ -142,12 +142,12 @@ impl CapturePolicy {
 pub(crate) struct VerificationCapture<'a> {
     pub command: reverie::process::Command,
     pub config: detcore::Config,
-    pub retained: &'a crate::mapped_first_admission::RetainedImage,
+    pub retained: &'a crate::app::mapped_first_admission::RetainedImage,
     pub records: detcore::detlog::ForwardedRecordSink,
     pub print_summary: bool,
     pub summary_json: &'a Option<std::path::PathBuf>,
     pub policy: CapturePolicy,
-    pub forwarded: &'a mut crate::run::ForwardedDetlogPlan,
+    pub forwarded: &'a mut crate::app::run::ForwardedDetlogPlan,
 }
 
 pub(crate) fn run_verification(
