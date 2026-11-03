@@ -278,45 +278,130 @@ fn describe_bracket(bracket: &PrefixBracket) -> String {
     }
 }
 
+/// `name`, an environment variable's name, as text that keeps every byte, so
+/// that two names never become one: as it is when it is UTF-8 without a
+/// backslash, and otherwise with each byte outside printable ASCII written
+/// `\xNN` and a backslash or quote escaped (`escape_ascii`), which always
+/// leaves a backslash in it.
+fn environment_name(name: &std::ffi::OsStr) -> String {
+    match name.to_str() {
+        Some(text) if !text.contains('\\') => text.to_owned(),
+        _ => std::os::unix::ffi::OsStrExt::as_bytes(name)
+            .escape_ascii()
+            .to_string(),
+    }
+}
+
 /// The command line that continues this analysis in `workspace`: this
 /// invocation's own ([`resume_command_from`]).
 fn resume_command(workspace: &Path) -> String {
-    resume_command_from(
-        std::env::args_os()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect(),
-        workspace,
-    )
+    resume_command_from(std::env::args_os().collect(), workspace)
+}
+
+/// The index in `args`, a `hermit` command line, of its subcommand: the first
+/// argument that is neither one of hermit's own options nor the value one
+/// takes, as hermit's parser defines them (`crate::app::Args`). In `hermit
+/// --log-file analyze analyze ...` it is the second `analyze`. `None` when
+/// there is none before a `--`.
+fn subcommand_index(args: &[std::ffi::OsString]) -> Option<usize> {
+    let command = <crate::app::Args as clap::CommandFactory>::command();
+    let takes_value =
+        |arg: Option<&clap::Arg>| arg.is_some_and(|arg| arg.get_action().takes_values());
+    let mut index = 1;
+    while index < args.len() {
+        // An option is text; anything else is the subcommand's place.
+        let Some(arg) = args[index].to_str() else {
+            return Some(index);
+        };
+        if arg == "--" {
+            return None;
+        }
+        let value_follows = if let Some(long) = arg.strip_prefix("--") {
+            !long.contains('=')
+                && takes_value(command.get_arguments().find(|candidate| {
+                    candidate
+                        .get_long_and_visible_aliases()
+                        .is_some_and(|names| names.contains(&long))
+                }))
+        } else if let Some(shorts) = arg.strip_prefix('-').filter(|shorts| !shorts.is_empty()) {
+            // A cluster of short options: the first that takes a value takes
+            // the rest of the cluster, or the next argument when it ends it.
+            let mut rest = shorts.chars();
+            let mut follows = false;
+            while let Some(short) = rest.next() {
+                if takes_value(command.get_arguments().find(|candidate| {
+                    candidate
+                        .get_short_and_visible_aliases()
+                        .is_some_and(|shorts| shorts.contains(&short))
+                })) {
+                    follows = rest.as_str().is_empty();
+                    break;
+                }
+            }
+            follows
+        } else {
+            return Some(index);
+        };
+        index += if value_follows { 2 } else { 1 };
+    }
+    None
+}
+
+/// `arg` as one word of a shell command: shell-quoted when it is UTF-8, and
+/// otherwise in bash's `$'...'` form, each byte outside printable ASCII as
+/// `\xNN`, so that no byte is lost.
+fn shell_word(arg: &std::ffi::OsStr) -> String {
+    match arg.to_str() {
+        Some(text) => shell_words::quote(text).into_owned(),
+        None => format!(
+            "$'{}'",
+            std::os::unix::ffi::OsStrExt::as_bytes(arg)
+                .iter()
+                .map(|&byte| match byte {
+                    b'\'' => "\\'".to_owned(),
+                    b'\\' => "\\\\".to_owned(),
+                    0x20..=0x7e => char::from(byte).to_string(),
+                    _ => format!("\\x{byte:02x}"),
+                })
+                .collect::<String>()
+        ),
+    }
 }
 
 /// `args`, a command line that runs `hermit analyze`, with
 /// `--resume=WORKSPACE` in place of any `--resume` among analyze's own
-/// options: those after `analyze` and before the first `--` after it, in
-/// either the split or the equals form. Everything from that `--` on, the
-/// `hermit run` arguments and the guest's, is kept as it is, a guest's own
-/// `--resume` among them.
-fn resume_command_from(mut args: Vec<String>, workspace: &Path) -> String {
-    let analyze = args.iter().position(|arg| arg == "analyze");
-    let start = analyze.map_or(0, |at| at + 1);
+/// options: those after the subcommand ([`subcommand_index`]) and before the
+/// first `--` after it, in either the split or the equals form. Everything
+/// else, hermit's own options before the subcommand and from that `--` on
+/// the `hermit run` arguments and the guest's, is kept as it is, a guest's
+/// own `--resume` among them, byte for byte ([`shell_word`]).
+fn resume_command_from(mut args: Vec<std::ffi::OsString>, workspace: &Path) -> String {
+    let start = subcommand_index(&args).map_or(args.len(), |at| at + 1);
     let mut end = args[start..]
         .iter()
-        .position(|arg| arg == "--")
+        .position(|arg| arg.as_os_str() == "--")
         .map_or(args.len(), |at| start + at);
     let mut index = start;
     while index < end {
-        if args[index] == "--resume" {
+        let arg = args[index].to_str();
+        if arg == Some("--resume") {
             let taken = 2.min(end - index);
             args.drain(index..index + taken);
             end -= taken;
-        } else if args[index].starts_with("--resume=") {
+        } else if arg.is_some_and(|arg| arg.starts_with("--resume=")) {
             args.remove(index);
             end -= 1;
         } else {
             index += 1;
         }
     }
-    args.insert(start, format!("--resume={}", workspace.display()));
-    shell_words::join(&args)
+    let mut resume = std::ffi::OsString::from("--resume=");
+    resume.push(workspace.as_os_str());
+    args.insert(start, resume);
+    args.iter()
+        .map(|arg| shell_word(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The guest program `program` on the host: as it is when it names a path,
@@ -2588,7 +2673,7 @@ impl AnalyzeOpts {
                     .iter()
                     .map(|(name, value)| {
                         (
-                            name.to_string_lossy().into_owned(),
+                            environment_name(name),
                             detcore::Digest::new(std::os::unix::ffi::OsStrExt::as_bytes(
                                 value.as_os_str(),
                             ))
@@ -9243,8 +9328,39 @@ mod tests {
     fn the_resume_command_keeps_the_guests_arguments() {
         let args = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
         let resumed = |line: &str| {
-            shell_words::split(&resume_command_from(args(line), Path::new("/ws/new"))).unwrap()
+            let argv = args(line)
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect();
+            shell_words::split(&resume_command_from(argv, Path::new("/ws/new"))).unwrap()
         };
+        // A global option's value can be the word `analyze`: the subcommand
+        // is where hermit's parser finds it, not the first such word.
+        assert_eq!(
+            resumed(
+                "hermit --log-file analyze analyze --prefix-search -- --base-env=minimal -- /bin/prog --resume"
+            ),
+            args(
+                "hermit --log-file analyze analyze --resume=/ws/new --prefix-search -- --base-env=minimal -- /bin/prog --resume"
+            )
+        );
+        assert_eq!(
+            resumed("hermit -l debug analyze --resume=/ws/old -- /bin/prog"),
+            args("hermit -l debug analyze --resume=/ws/new -- /bin/prog")
+        );
+        // A guest argument that is not UTF-8 keeps its bytes.
+        let mut argv: Vec<std::ffi::OsString> = args("hermit analyze -- /bin/prog")
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        argv.push(std::os::unix::ffi::OsStringExt::from_vec(
+            b"x\xffy'z".to_vec(),
+        ));
+        let command = resume_command_from(argv, Path::new("/ws/new"));
+        assert!(
+            command.ends_with(" -- /bin/prog $'x\\xffy\\'z'"),
+            "{command}"
+        );
         assert_eq!(
             resumed(
                 "hermit analyze --resume /ws/old --prefix-search -- --base-env=minimal -- \
@@ -9266,6 +9382,35 @@ mod tests {
         assert_eq!(
             resumed("hermit analyze -- /bin/prog"),
             args("hermit analyze --resume=/ws/new -- /bin/prog")
+        );
+    }
+
+    /// An environment variable's name is kept byte for byte: two names that
+    /// differ only in bytes that are not UTF-8 stay two names, and a resume
+    /// that finds the value under the other one is refused, naming both.
+    #[test]
+    fn guest_environment_names_are_kept_byte_for_byte() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = |bytes: &[u8]| environment_name(std::ffi::OsStr::from_bytes(bytes));
+        assert_eq!(name(b"MODE"), "MODE");
+        assert_eq!(name(b"MODE\xff"), "MODE\\xff");
+        assert_ne!(name(b"MODE\xff"), name(b"MODE\xfe"));
+        // An escaped name keeps a backslash; one written with a backslash is
+        // escaped too, so it cannot read as another name's escape.
+        assert_ne!(name(b"MODE\\xff"), name(b"MODE\xff"));
+        let identity =
+            AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
+                .unwrap()
+                .identity()
+                .unwrap();
+        let holding = |bytes: &[u8]| {
+            let mut identity = identity.clone();
+            identity.guest_env = vec![(name(bytes), "digest of A".to_owned())];
+            identity
+        };
+        assert_eq!(
+            holding(b"MODE\xff").differences(&holding(b"MODE\xfe")),
+            ["the guest environment: MODE\\xfe set, MODE\\xff unset"]
         );
     }
 
