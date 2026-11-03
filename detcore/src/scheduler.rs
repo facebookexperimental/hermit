@@ -16578,7 +16578,9 @@ impl Scheduler {
     ///   or if the parked call is not the logged one.
     ///   With nothing runnable and no readmission due, record spun until a call
     ///   finished; replay waits `REJOIN_STALL_VALVE` for other work to appear
-    ///   (a thread admission, say) and then refuses rather than hang.
+    ///   (a thread admission, say) rather than hang, and then leaves its
+    ///   record (`refuse_rejoin`): a preemption replay goes on as a fresh
+    ///   run, while `hermit replay` is refused.
     ///
     /// By induction on turns, the two schedules agree up to the next logged
     /// turn: everything host-timed before it (poll results, readmissions) is
@@ -16687,7 +16689,17 @@ impl Scheduler {
                 None => "none".to_string(),
             }
         );
-        self.refuse_rejoin_at_the_valve(reason)
+        // A preemption replay can reach this point one turn short of the
+        // logged readmission, because a recording's noncommitted turns
+        // (a blocked `SleepUntil` attempt, say) are not recorded events
+        // and so are not replayed. Refusing there would make such a
+        // record unreplayable, so a preemption replay leaves its record
+        // here (`refuse_rejoin`), as it did before the valve refusals:
+        // it goes on as a fresh run, with the departure marked and
+        // recorded, and ending the run under `--strict` or
+        // `--die-on-desync`. `hermit replay`, which serves calls from
+        // its log and cannot go on, is refused.
+        self.refuse_rejoin(reason)
     }
 
     /// `hermit run` replaying a preemption record that stores readmissions
@@ -16863,8 +16875,10 @@ impl Scheduler {
     /// determinism loss (verification refuses to compare it) and marks the
     /// record it writes, if any, as departed from its source
     /// (`replay_departed_at`, which faithful replay refuses). A replay stalled
-    /// at a readmission for `REJOIN_STALL_VALVE` does not come here: it is
-    /// refused (`refuse_rejoin_at_the_valve`).
+    /// at a due readmission for `REJOIN_STALL_VALVE` does not come here: it
+    /// is refused (`refuse_rejoin_at_the_valve`). One stalled with nothing
+    /// runnable and no readmission due does come here, through
+    /// `refuse_rejoin`.
     fn leave_replayed_record(&mut self, reason: String) {
         tracing::warn!(
             "[step2] stopped following the replayed record's readmissions: {reason}; \
@@ -32753,12 +32767,18 @@ mod test {
 
     /// A replay off its record, where only a readmission could move the
     /// point and a finished call is parked that the record does not readmit
-    /// there, waits out the valve and is then refused, rather than leaving
-    /// the call parked for good (only an indefinite deadline pending), ending
-    /// the run as a deadlock (a finished `rt_sigsuspend` alone), or going on
-    /// as a fresh run would, by host timing.
+    /// there, waits out the valve and then leaves its record, rather than
+    /// leaving the call parked for good (only an indefinite deadline pending)
+    /// or ending the run as a deadlock (a finished `rt_sigsuspend` alone).
+    /// It then goes on as a fresh run, readmitting the call by host timing,
+    /// with the departure marked and recorded (and ending the run under
+    /// `--strict` or `--die-on-desync`, through `leave_replayed_record`).
+    /// Refusing here instead made a record unreplayable whenever the
+    /// recording's noncommitted turns (a blocked `SleepUntil` attempt, say)
+    /// put its logged readmission one turn past the replay's count, as in
+    /// the `blocking-sigsuspend` trace replay.
     #[test]
-    fn a_preemption_replay_off_its_record_is_refused_where_nothing_else_moves() {
+    fn a_preemption_replay_off_its_record_leaves_it_where_nothing_else_moves() {
         let (mut indefinite, op_id) = run_replay_ahead_of_its_record(true);
         indefinite
             .blocked
@@ -32781,9 +32801,10 @@ mod test {
             scheduler.rejoin_stalled_since =
                 std::time::Instant::now().checked_sub(Scheduler::REJOIN_STALL_VALVE);
             assert!(scheduler.step2c_process_io_blockers().is_err(), "{name}");
-            assert!(scheduler.rejoin_refusal.is_some(), "{name}");
-            assert!(scheduler.rejoin_replay.is_some(), "{name}");
-            assert!(!scheduler.run_queue.contains_tid(op_id.tid), "{name}");
+            assert!(scheduler.rejoin_replay.is_none(), "{name}");
+            assert!(scheduler.rejoin_refusal.is_none(), "{name}");
+            assert!(scheduler.step2c_process_io_blockers().is_ok(), "{name}");
+            assert!(scheduler.run_queue.contains_tid(op_id.tid), "{name}");
         }
     }
 
