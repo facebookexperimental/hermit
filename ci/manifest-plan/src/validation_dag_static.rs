@@ -1975,7 +1975,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Batch 1 (PRs 4539/4677/4561/4707) adds two hermit-run units:
     // 1344 + 2 = 1346, from the batch1 validate at 9baea420 carried
     // through the split rebase.
-    ("test.hermit_unit", 1346),
+    ("test.hermit_unit", 1348),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3254,7 +3254,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds 21
     // sync-edge and access-trace units: 3363 + 21 = 3384, measured by the
     // 216dbc929a full validate.
-    ("test.detcore_unit", 3384),
+    ("test.detcore_unit", 3386),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3358,7 +3358,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // received and read on a tight stack is recorded and renumbered: 164.
     // And the in-flight SCM_RIGHTS queue's seventeen scm_rights tests
     // (https://github.com/rrnewton/hermit/issues/4930): 191 + 17 = 208.
-    ("test.detcore_misc", 208),
+    ("test.detcore_misc", 209),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -4628,7 +4628,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
     // Batch 1 adds one cli case: 787 + 1 = 788, from the batch1 validate
     // at 9baea420 carried through the split rebase.
-    ("test.cli", 788),
+    ("test.cli", 789),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5257,7 +5257,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 recount (measured by the 216dbc929a full validate, same
     // growth as test.cli): 699 + 7 = 706.
     // Batch 1 recount (same growth as test.cli): 706 + 1 = 707.
-    ("test.cli_on_host", 707),
+    ("test.cli_on_host", 708),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5373,7 +5373,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same four F0a readdir_order variants: 163.
     // And the same tight-stack received-inotify test: 164.
     // And the same seventeen SCM_RIGHTS queue tests: 191 + 17 = 208.
-    ("test.detcore_misc_on_host", 208),
+    ("test.detcore_misc_on_host", 209),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -5810,7 +5810,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The pipe retry identity regression adds one unit: 3362 + 1 = 3363,
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
-    ("test.detcore_unit_on_host", 3384),
+    ("test.detcore_unit_on_host", 3386),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6229,7 +6229,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Composed source count; re-measure with the compiled inventory.
     // Batch 1 recount (same growth as test.hermit_unit): 1338 + 2 = 1340.
-    ("test.hermit_unit_on_host", 1340),
+    ("test.hermit_unit_on_host", 1342),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
