@@ -1008,6 +1008,42 @@ pub(crate) fn note_blocking(waits: Blocking, process: i32) -> bool {
     first
 }
 
+/// Emit the post-grant receipt for a waiting binder call: the scheduler
+/// has granted its `BlockingExternalIO` request and the native call is
+/// about to run. This is the first point that proves admission — the
+/// earlier `HERMIT_EXTERNAL_INPUT` warning only proves the off-turn route
+/// was chosen, before the request was even submitted. The receipt names
+/// the operation (`ExternalOpId`: thread and per-thread syscall count),
+/// so an outside observer can correlate it with the recorded release.
+pub(crate) fn note_blocking_granted(op_id: crate::resources::ExternalOpId) {
+    GRANTED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    GRANTED_OPS.lock().unwrap().push(op_id);
+    tracing::warn!(
+        "[detcore] HERMIT_BINDER_BLOCKING_GRANTED source=binder dettid={} seq={}: \
+         the blocking grant is received and the native call follows",
+        op_id.tid.as_raw(),
+        op_id.sequence,
+    );
+}
+
+/// Waiting binder calls whose blocking grant was received
+/// (`note_blocking_granted`), by operation, so a test can follow its
+/// own call past other calls in the same process.
+static GRANTED_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GRANTED_OPS: std::sync::Mutex<Vec<crate::resources::ExternalOpId>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// How many post-grant binder receipts this process has emitted.
+pub(crate) fn blocking_granted_calls() -> u64 {
+    GRANTED_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the post-grant receipt for `op_id` has been emitted, for
+/// tests that hold a grant pending and prove none is emitted early.
+pub(crate) fn blocking_granted(op_id: crate::resources::ExternalOpId) -> bool {
+    GRANTED_OPS.lock().unwrap().contains(&op_id)
+}
+
 /// Binder calls that ran as external input (`note_blocking`).
 static EXTERNAL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

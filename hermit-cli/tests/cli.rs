@@ -64515,20 +64515,24 @@ fn binder_guest_output_with(mode: &str, side: BinderSide, hermit_args: &[&str]) 
             under_hermit("manager")
         ),
         // The manager holds its reply at the guest's reply gate until
-        // this script has seen Hermit admit the client's read as a
-        // blocking external call (`HERMIT_EXTERNAL_INPUT` in the run's
-        // own stderr, printed when the call is dispatched off the
-        // turn): only then is the client's read provably the call that
-        // waits, so its rejoin is what a recording stores. The gate
-        // file sits beside the mount, not in Binderfs, which creates
-        // no files. If the admission never comes (a refused call), the
-        // manager's gate wait fails explicitly in its own output.
+        // this script has seen the client's post-grant receipt
+        // (`HERMIT_BINDER_BLOCKING_GRANTED` in the run's own stderr,
+        // emitted after the scheduler grants the read's blocking
+        // request and before the native call runs): only then is the
+        // client's read provably admitted and waiting, so its rejoin
+        // is what a recording stores. The earlier
+        // `HERMIT_EXTERNAL_INPUT` warning would not prove this — it is
+        // printed when the off-turn route is chosen, before the
+        // request is submitted. The gate file sits beside the mount,
+        // not in Binderfs, which creates no files. If the grant never
+        // comes (a refused call), the manager's gate wait fails
+        // explicitly in its own output.
         BinderSide::Client => format!(
             "BINDER_REPLY_GATE={mountpoint}.reply-ok timeout --kill-after 5s 60s {guest} \
              {mountpoint} {mode} manager >{peer_log} 2>&1 & peer=$!; {await_ready}; \
              {} >{mountpoint}.hout 2>{mountpoint}.hlog & hpid=$!; \
              i=0; while kill -0 $hpid 2>/dev/null && [ $i -lt 1200 ]; do \
-             if grep -q \"HERMIT_EXTERNAL_INPUT source=binder\" {mountpoint}.hlog \
+             if grep -q \"HERMIT_BINDER_BLOCKING_GRANTED source=binder\" {mountpoint}.hlog \
              2>/dev/null; then touch {mountpoint}.reply-ok; break; fi; \
              sleep 0.1; i=$((i+1)); done; wait $hpid; status=$?; \
              cat {mountpoint}.hout; cat {mountpoint}.hlog >&2; {reap_peer}; \

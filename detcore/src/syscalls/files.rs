@@ -14654,9 +14654,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         self.note_binder_transaction_of(guest, request);
         let _warned = binder::note_blocking(waits, guest.pid().as_raw());
+        let op_id = crate::resources::ExternalOpId::new(
+            guest.thread_state().dettid,
+            guest.thread_state().stats.syscall_count,
+        );
         Ok((
-            self.record_or_replay_blocking(guest, Syscall::Ioctl(call))
-                .await?,
+            self.record_or_replay_blocking_then(guest, Syscall::Ioctl(call), |_guest| {
+                binder::note_blocking_granted(op_id);
+            })
+            .await?,
             ran,
         ))
     }
@@ -21829,6 +21835,10 @@ mod inject_fstat_scratch {
         /// requests (the turn-release witness). Every other test leaves
         /// this off, so an unexpected scheduler RPC still panics below.
         capture_resource_requests: bool,
+        /// Where set, a `BlockingExternalIO` grant waits for this gate:
+        /// the ordering control holds a grant pending and proves no
+        /// post-grant receipt is emitted before it opens.
+        blocking_grant_gate: Option<std::sync::Arc<tokio::sync::Notify>>,
     }
 
     impl ScriptedGuest {
@@ -21885,6 +21895,7 @@ mod inject_fstat_scratch {
                 determinism_losses: Default::default(),
                 resource_requests: Default::default(),
                 capture_resource_requests: false,
+                blocking_grant_gate: None,
             };
             (tool, guest)
         }
@@ -21959,6 +21970,16 @@ mod inject_fstat_scratch {
                         .lock()
                         .unwrap()
                         .push(resources.resources.keys().cloned().collect());
+                    // The ordering control holds a blocking grant
+                    // pending here: the request is recorded, but the
+                    // grant (and so any post-grant receipt) waits.
+                    if let Some(gate) = &self.blocking_grant_gate
+                        && resources.resources.keys().any(|id| {
+                            matches!(id, crate::resources::ResourceID::BlockingExternalIO(_))
+                        })
+                    {
+                        gate.notified().await;
+                    }
                     return (
                         None,
                         GlobalResponse::RequestResources(crate::tool_global::ResumeStatus::Normal),
@@ -22911,6 +22932,90 @@ mod inject_fstat_scratch {
                 ResourceID::BlockingExternalIO(_) | ResourceID::BlockedExternalContinue(_)
             )),
             "{history:?}"
+        );
+    }
+
+    /// The ordering control for the post-grant receipt: with the
+    /// scheduler's blocking grant held pending, the waiting call has
+    /// submitted its `BlockingExternalIO` request but no post-grant
+    /// receipt (`HERMIT_BINDER_BLOCKING_GRANTED`, counted by
+    /// `blocking_granted_calls`) is emitted and the call does not run.
+    /// Opening the grant emits exactly one receipt, correlated with the
+    /// released operation, before the native call. A receipt emitted at
+    /// route choice (the earlier `HERMIT_EXTERNAL_INPUT` point) would
+    /// already be counted while the grant is pending and fail here.
+    #[tokio::test]
+    async fn a_waiting_binder_calls_receipt_waits_for_its_blocking_grant() {
+        use std::future::Future as _;
+
+        use crate::resources::ResourceID;
+        use crate::syscalls::binder::BinderRun;
+
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (tool, mut guest) = {
+            let (_, mut guest) = ScriptedGuest::new(true, false);
+            model_binder_descriptor(&guest);
+            guest.capture_resource_requests = true;
+            guest.blocking_grant_gate = Some(gate.clone());
+            guest.config.sequentialize_threads = true;
+            guest.ppoll_ready = Some(0);
+            guest.binder_read_consumed = Some(0);
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+            (tool, guest)
+        };
+        // This call's operation, made unique in this process so its
+        // receipt can be followed past other tests' binder calls.
+        guest.thread_state_mut().stats.syscall_count = 4242;
+        let this_op = crate::resources::ExternalOpId::new(guest.thread_state().dettid, 4242);
+        assert!(!crate::syscalls::binder::blocking_granted(this_op));
+        let mut buffer = [0u8; 256];
+        let mut words = [0, 0, 0, 256, 0, buffer.as_mut_ptr() as u64];
+        let argument = words.as_mut_ptr() as usize;
+        let call =
+            syscalls::Ioctl::new()
+                .with_fd(99)
+                .with_request(syscalls::ioctl::Request::Other(
+                    crate::syscalls::binder::BINDER_WRITE_READ as usize,
+                    argument,
+                ));
+        let mut routed = Box::pin(tool.run_binder_call(
+            &mut guest,
+            call,
+            99,
+            crate::syscalls::binder::BINDER_WRITE_READ,
+            argument,
+        ));
+        // Drive the call until it pends on the held grant: every other
+        // step of the scripted guest completes immediately, so a future
+        // still pending after repeated polls is held at the gate, with
+        // its blocking request submitted and ungranted.
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        for _ in 0..100 {
+            assert!(routed.as_mut().poll(&mut cx).is_pending());
+            tokio::task::yield_now().await;
+        }
+        // Still pending, and no receipt has been emitted for it.
+        assert!(
+            !crate::syscalls::binder::blocking_granted(this_op),
+            "a post-grant receipt was emitted before the grant"
+        );
+        // Open the grant: this call's receipt, then the call completes
+        // off the turn alone.
+        gate.notify_one();
+        let routed = routed.await.unwrap();
+        assert_eq!(routed.1, BinderRun::OffTurnAlone);
+        assert!(crate::syscalls::binder::blocking_granted(this_op));
+        // The grant the receipt followed was this call's release.
+        assert!(
+            guest
+                .resource_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .any(|id| matches!(id, ResourceID::BlockingExternalIO(_))),
+            "the receipt was not for a submitted blocking request"
         );
     }
 

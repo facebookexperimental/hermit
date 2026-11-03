@@ -197,6 +197,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
     }
 
+    /// `record_or_replay_blocking`, running `after_grant` once the
+    /// scheduler has granted the blocking request and before the call
+    /// runs natively — the same mask and input-lease semantics, with a
+    /// post-grant receipt point for callers that must prove admission
+    /// happened (a receipt emitted before this point would only prove
+    /// the route was chosen).
+    pub async fn record_or_replay_blocking_then<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        after_grant: impl FnOnce(&mut G),
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid;
+        let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
+        self.record_or_replay_blocking_resource_then(
+            guest,
+            (call, call),
+            ResourceID::BlockingExternalIO(op_id),
+            None,
+            false,
+            after_grant,
+        )
+        .await
+    }
+
     /// `record_or_replay_blocking`, with `run` the call that runs for `call`,
     /// or that replay serves: the scheduler, the checks and the continuation
     /// mask all see `call`. A kernel-run poll's restart is the one such pair:
