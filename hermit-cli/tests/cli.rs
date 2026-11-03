@@ -145,6 +145,7 @@ use hermit::canonical_verdict::Verdict;
 use hermit::canonical_verdict::VerificationReport;
 
 static PIPE_READER_REPLAY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FIRST_SLICE_REPLAY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static ANON_MAPPING_WRITE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -950,6 +951,32 @@ fn pipe_reader_replay_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "pipe-reader-replay guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn first_slice_replay_guest() -> &'static Path {
+    FIRST_SLICE_REPLAY_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("first-slice-replay");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create first-slice-replay guest directory");
+        let guest = build_root.join("first_slice_replay");
+        let output = Command::new("cc")
+            .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/first_slice_replay.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile first-slice-replay guest");
+        assert!(
+            output.status.success(),
+            "first-slice-replay guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -27696,6 +27723,100 @@ fn a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_
             "--max-timeslice={max_timeslice}: {summary}"
         );
     }
+}
+
+/// A schedule replay ends a new thread's first timeslice where the recording
+/// ended it. The guest's new thread computes about 3000 branches before its
+/// first syscall, so under `--chaos --max-timeslice=1000` the recording ends
+/// that thread's first slice at a timer, and for these seeds at least one
+/// such slice is shorter than the longest slice the record holds: the
+/// thread first enters Detcore at that timer stop, through its start grant,
+/// not at a syscall. Each replay must print the recording's line and report
+/// no desync. A replay that gave the starting thread the full slice instead
+/// of its recorded one (the start grant's length dropped, as before this
+/// change) ran past the recorded end and desynchronized 56 to 74 later
+/// events of each seed whose first slice was shorter than the maximum.
+/// Seeds 3, 8 and 9 also record a short first slice but are left out: their
+/// schedule replays desynchronize on main too (61, 1004 and 75 events), and
+/// with this change still 4, 4 and 2, all on the main thread and none on the
+/// new one, at main's schedule-replay departures under `--chaos` at short
+/// slices (<https://github.com/rrnewton/hermit/issues/5104>). They return
+/// when that issue is fixed.
+#[test]
+fn a_schedule_replay_ends_a_new_threads_first_slice_where_the_recording_did() {
+    let program = first_slice_replay_guest()
+        .to_str()
+        .expect("first-slice-replay guest path should be UTF-8");
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut shorter_first_slices = 0;
+    for seed in [1, 7, 10] {
+        let record = dir.path().join(format!("seed-{seed}.json"));
+        let summary = dir.path().join(format!("seed-{seed}.summary.json"));
+        let seed_arg = format!("--seed={seed}");
+        let record_arg = format!("--record-preemptions-to={}", record.display());
+        let replay_arg = format!("--replay-schedule-from={}", record.display());
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let run = |extra: &[&str]| {
+            let mut args = vec![
+                "run",
+                "--strict",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--max-timeslice=1000",
+            ];
+            args.extend_from_slice(extra);
+            args.extend(["--", program]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            stdout(&output)
+        };
+        let recorded = run(&["--chaos", seed_arg.as_str(), record_arg.as_str()]);
+
+        // The new thread, the second one the record names, first appears
+        // as the branches up to a timer stop, before any syscall.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+        let events = parsed["global"].as_array().expect("the record's events");
+        assert!(
+            !events.is_empty(),
+            "seed {seed}: the record holds no events"
+        );
+        let mut threads = Vec::new();
+        for event in events {
+            if !threads.contains(&event["dettid"]) {
+                threads.push(event["dettid"].clone());
+            }
+        }
+        let child = threads
+            .get(1)
+            .unwrap_or_else(|| panic!("seed {seed}: no second thread in {threads:?}"));
+        let first = events
+            .iter()
+            .find(|event| &event["dettid"] == child)
+            .expect("the new thread's first event");
+        assert_eq!(first["op"], "Branch", "seed {seed}: {first}");
+        let longest = events
+            .iter()
+            .filter(|event| event["op"] == "Branch")
+            .filter_map(|event| event["count"].as_u64())
+            .max()
+            .expect("the record's longest slice");
+        if first["count"].as_u64().is_some_and(|count| count < longest) {
+            shorter_first_slices += 1;
+        }
+
+        assert_eq!(
+            run(&[replay_arg.as_str(), summary_arg.as_str()]),
+            recorded,
+            "seed {seed}"
+        );
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+        assert_eq!(summary["schedevent_desynced"], 0, "seed {seed}: {summary}");
+    }
+    assert!(
+        shorter_first_slices > 0,
+        "no seed's recording ended the new thread's first slice before the maximum"
+    );
 }
 
 /// A gate whose BEFORE anchor can never fire, on the only thread left, is a

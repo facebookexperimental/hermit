@@ -637,6 +637,12 @@
       "why": "tests/c/file_timestamp_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: creates files and directories, prints their stat and statx metadata including atime/mtime/ctime/btime and the mtime ORDERING between them, and exercises utimensat fixed and UTIME_NOW, so verify's double run asserts guest-created file timestamps are reproducible without freezing them"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/first_slice_replay.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/first_slice_replay.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test records this guest, whose new thread computes before its first syscall, under --chaos --max-timeslice=1000 for several seeds and replays each schedule with --replay-schedule-from, asserting that the new thread's first recorded slice ends at a timer, that each replay prints the recording's line and that it reports no desync; it remains a guest fixture because a generic manifest cannot compare a recording with its replay."
+    },
+    {
       "disposition": "suite-helper",
       "path": "tests/c/fixture_cpuset_shim.c",
       "runner": "tests/c/fixture_mutation.py",
