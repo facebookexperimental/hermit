@@ -668,12 +668,13 @@ fn require_repeated_outcomes(replays: &[(&str, bool, bool)], inspect: &str) -> a
 }
 
 /// Whether `ran` is the event `expected`, as the scheduler compares them when
-/// it takes a stack: the count and the time aside.
+/// it takes a stack: the count and the time aside, and only instruction
+/// pointers present in the recorded event constrain the observed ones.
 fn same_event(expected: &SchedEvent, ran: &SchedEvent) -> bool {
     expected.dettid == ran.dettid
         && expected.op == ran.op
-        && expected.start_rip == ran.start_rip
-        && expected.end_rip == ran.end_rip
+        && (expected.start_rip.is_none() || expected.start_rip == ran.start_rip)
+        && (expected.end_rip.is_none() || expected.end_rip == ran.end_rip)
 }
 
 /// The first of the first `until` events of `requested` at which `realized`
@@ -1490,16 +1491,14 @@ impl AnalyzeOpts {
                             end: usize,
                             expected: bool|
              -> anyhow::Result<Option<PrettyBacktrace>> {
-                if end == decision {
-                    // A slice of one event ends where it starts. Reuse the
-                    // captured deciding stack; no new replay has an outcome
-                    // to compare with the search.
-                    Ok(deciding.clone())
-                } else {
-                    let (observed, captured) = stack(runname, variant, end + 1, end)?;
-                    require_repeated_outcomes(&[(runname, expected, observed)], runname)?;
-                    Ok(captured)
-                }
+                // Even a one-event slice has this continuation's endpoint:
+                // its operation batch can differ from the target event's,
+                // including after a soft count mismatch in the target
+                // continuation itself. Capture it from its own record and
+                // check the outcome even when no stack was captured.
+                let (observed, captured) = stack(runname, variant, end + 1, end)?;
+                require_repeated_outcomes(&[(runname, expected, observed)], runname)?;
+                Ok(captured)
             };
             let with_end = stack_at(
                 "final_target_slice_end_for_stacktraces",
@@ -3067,10 +3066,10 @@ mod tests {
         }
     }
 
-    /// A one-event slice reuses the already-captured deciding stack. There
-    /// is no new slice-end replay whose outcome could be true or false.
+    /// A one-event slice still belongs to its own continuation. Capture both
+    /// endpoints and retain the separately labelled original deciding stack.
     #[test]
-    fn timing_reports_reuse_single_event_stacks_without_inventing_an_outcome() {
+    fn timing_reports_capture_single_event_slices_from_their_own_records() {
         let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
         for target_is_short in [false, true] {
             let (with, without, ends) = if target_is_short {
@@ -3089,7 +3088,9 @@ mod tests {
                     (true, &deciding),
                     (&without, Path::new("final_baseline_schedule.preempts")),
                     (
-                        |_, _| {
+                        |seen, len| {
+                            assert_eq!(seen, &record);
+                            assert_eq!(len, 2);
                             Ok((
                                 CompletedScheduleTrial {
                                     target_met: true,
@@ -3098,51 +3099,265 @@ mod tests {
                                 PathBuf::from("final_target_schedule.preempts"),
                             ))
                         },
-                        |runname, _, len, position| {
+                        |runname, variant, len, position| {
                             calls.borrow_mut().push(runname.to_owned());
-                            match runname {
+                            let (expected, end, met, stack) = match runname {
                                 "final_target_next_for_stacktraces" => {
-                                    assert_eq!((len, position), (ends[0] + 2, ends[0] + 1));
-                                    Ok((true, Some(timing_report_stack(7, 0x10))))
+                                    (&with, ends[0] + 1, true, timing_report_stack(7, 0x10))
                                 }
                                 "final_baseline_next_for_stacktraces" => {
-                                    assert_eq!((len, position), (ends[1] + 2, ends[1] + 1));
-                                    Ok((false, Some(timing_report_stack(5, 0x10))))
+                                    (&without, ends[1] + 1, false, timing_report_stack(5, 0x10))
                                 }
-                                "final_target_slice_end_for_stacktraces" => {
-                                    assert!(!target_is_short, "the target stack is reused");
-                                    assert_eq!((len, position), (4, 3));
-                                    Ok((true, Some(timing_report_stack(3, 0x30))))
-                                }
+                                "final_target_slice_end_for_stacktraces" => (
+                                    &with,
+                                    ends[0],
+                                    true,
+                                    timing_report_stack(
+                                        3,
+                                        if target_is_short { 0x20 } else { 0x30 },
+                                    ),
+                                ),
                                 "final_baseline_slice_end_for_stacktraces" => {
-                                    assert!(target_is_short, "the baseline stack is reused");
-                                    assert_eq!((len, position), (3, 2));
-                                    Ok((false, Some(timing_report_stack(3, 0x40))))
+                                    (&without, ends[1], false, timing_report_stack(3, 0x40))
                                 }
                                 other => panic!("unexpected replay {other}"),
-                            }
+                            };
+                            assert_eq!(variant.schedevents(), expected);
+                            assert_eq!((len, position), (end + 1, end));
+                            Ok((met, Some(stack)))
                         },
                     ),
                 )
                 .unwrap()
-                .expect("reusing a stack must not fabricate a contradictory replay");
+                .expect("each continuation certifies its own endpoint");
             assert_eq!(
-                calls.borrow().len(),
-                3,
-                "two next-thread and one slice-end replay"
+                *calls.borrow(),
+                [
+                    "final_target_next_for_stacktraces",
+                    "final_baseline_next_for_stacktraces",
+                    "final_target_slice_end_for_stacktraces",
+                    "final_baseline_slice_end_for_stacktraces",
+                ],
+                "two next-thread and two slice-end replays"
             );
             assert_eq!(report.critical_event1.event_index, ends[0]);
             assert_eq!(report.critical_event2.event_index, ends[1]);
-            let reused = if target_is_short {
-                &report.critical_event1.stack
-            } else {
-                &report.critical_event2.stack
-            };
-            assert!(same_frames(
-                reused.as_ref().unwrap(),
-                deciding.as_ref().unwrap()
-            ));
+            assert_eq!(
+                report.critical_event1.stack,
+                Some(timing_report_stack(
+                    3,
+                    if target_is_short { 0x20 } else { 0x30 }
+                ))
+            );
+            assert_eq!(
+                report.critical_event2.stack,
+                Some(timing_report_stack(3, 0x40))
+            );
+            assert_eq!(report.deciding_event.unwrap().stack, deciding);
         }
+    }
+
+    /// Completed, admitted checkpoint-free records can have one-event slices
+    /// at the same index but different operation batches. The target can also
+    /// realize a different count than the original deciding event. Model the
+    /// completed producer through the real file reader, not a native guest.
+    fn single_event_timing_report_for_test(
+        target_count: u32,
+        target_met: bool,
+        baseline_met: bool,
+        captured: bool,
+    ) -> (anyhow::Result<Option<Report>>, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        options.tmp_dir = Some(dir.path().to_path_buf());
+        let source =
+            PreemptionRecord::from_sched_events(branch_events(&[(5, 1), (3, 100), (7, 1), (5, 1)]));
+        source.validate().unwrap();
+        let with = branch_events(&[(5, 1), (3, target_count), (7, 1), (5, 1)]);
+        let without = branch_events(&[(5, 1), (3, 1), (7, 1), (5, 1)]);
+        let (baseline, baseline_path) = recorded_continuation_for_test(
+            &options,
+            "single_event_baseline",
+            &source,
+            1,
+            false,
+            &without,
+        );
+        assert!(!baseline.target_met);
+        let calls = std::cell::RefCell::new(Vec::new());
+        let deciding = Some(timing_report_stack(3, 0x20));
+        let result = options.report_timing_decision_with(
+            &source,
+            1,
+            None,
+            (true, &deciding),
+            (&baseline.schedule, &baseline_path),
+            (
+                |seen, len| {
+                    assert_eq!(seen, &source);
+                    assert_eq!(len, 2);
+                    Ok(recorded_continuation_for_test(
+                        &options,
+                        "single_event_target",
+                        seen,
+                        len,
+                        true,
+                        &with,
+                    ))
+                },
+                |runname, variant, len, position| {
+                    calls.borrow_mut().push(runname.to_owned());
+                    let (expected, prefix_len, end, met, stack) = match runname {
+                        "final_target_next_for_stacktraces" => {
+                            (&with, 2, 2, true, Some(timing_report_stack(7, 0x10)))
+                        }
+                        "final_baseline_next_for_stacktraces" => {
+                            (&without, 1, 2, false, Some(timing_report_stack(7, 0x10)))
+                        }
+                        "final_target_slice_end_for_stacktraces" => (
+                            &with,
+                            2,
+                            1,
+                            target_met,
+                            captured.then(|| {
+                                timing_report_stack(
+                                    3,
+                                    if target_count == 100 { 0x20 } else { 0x30 },
+                                )
+                            }),
+                        ),
+                        "final_baseline_slice_end_for_stacktraces" => (
+                            &without,
+                            1,
+                            1,
+                            baseline_met,
+                            captured.then(|| timing_report_stack(3, 0x40)),
+                        ),
+                        other => panic!("unexpected replay {other}"),
+                    };
+                    variant.validate().unwrap();
+                    assert_eq!(variant.schedevents(), expected);
+                    assert_prefix_metadata(variant, &source, prefix_len);
+                    assert_eq!((len, position), (end + 1, end));
+                    Ok((met, stack))
+                },
+            ),
+        );
+        let retained = PreemptionReader::try_new(&baseline_path)
+            .unwrap()
+            .into_inner();
+        assert_eq!(retained.schedevents(), &without);
+        (result, calls.into_inner())
+    }
+
+    #[test]
+    fn one_event_timing_slices_report_their_own_dynamic_endpoints() {
+        for target_count in [100, 101] {
+            let (result, calls) =
+                single_event_timing_report_for_test(target_count, true, false, true);
+            let report = result
+                .unwrap()
+                .expect("opposite completed outcomes certify the report");
+            assert_eq!(
+                report.critical_event2.stack,
+                Some(timing_report_stack(3, 0x40)),
+                "the one-branch baseline endpoint must not use the target deciding stack"
+            );
+            assert_eq!(
+                report.critical_event1.stack,
+                Some(timing_report_stack(
+                    3,
+                    if target_count == 100 { 0x20 } else { 0x30 }
+                )),
+                "the realized target endpoint must come from its own continued record"
+            );
+            assert_eq!(
+                (
+                    report.critical_event1.event_index,
+                    report.critical_event2.event_index
+                ),
+                (1, 1)
+            );
+            let deciding = report.deciding_event.unwrap();
+            assert_eq!(deciding.event_index, 1);
+            assert_eq!(deciding.stack, Some(timing_report_stack(3, 0x20)));
+            assert!(
+                report.header.contains(&format!(
+                    "runs 1 events ({target_count} retired conditional branches)"
+                )),
+                "{}",
+                report.header
+            );
+            assert!(
+                report
+                    .header
+                    .contains("runs 1 events (1 retired conditional branches)"),
+                "{}",
+                report.header
+            );
+            assert!(
+                !report.header.contains("same stack at both events"),
+                "{}",
+                report.header
+            );
+            assert_eq!(
+                calls,
+                [
+                    "final_target_next_for_stacktraces",
+                    "final_baseline_next_for_stacktraces",
+                    "final_target_slice_end_for_stacktraces",
+                    "final_baseline_slice_end_for_stacktraces",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn one_event_timing_slice_replays_must_repeat_their_own_outcomes() {
+        for (target_met, baseline_met, contradicted, expected_calls) in [
+            (true, true, "final_baseline_slice_end_for_stacktraces", 4),
+            (false, false, "final_target_slice_end_for_stacktraces", 3),
+        ] {
+            for captured in [true, false] {
+                let (result, calls) =
+                    single_event_timing_report_for_test(100, target_met, baseline_met, captured);
+                let error = result
+                    .expect_err(
+                        "a contradictory one-event slice replay cannot certify the decision",
+                    )
+                    .to_string();
+                assert!(
+                    error.contains(&format!("{contradicted} observed the opposite")),
+                    "{error}"
+                );
+                assert!(
+                    error.contains("no opposite-outcome pair was established"),
+                    "{error}"
+                );
+                assert_eq!(calls.len(), expected_calls);
+                assert_eq!(calls.last().unwrap(), contradicted);
+            }
+        }
+        let (result, calls) = single_event_timing_report_for_test(100, true, false, false);
+        let report = result
+            .unwrap()
+            .expect("missing stacks do not invent a contradictory outcome");
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            (
+                report.critical_event1.event_index,
+                report.critical_event2.event_index
+            ),
+            (2, 2)
+        );
+        assert_eq!(
+            report.critical_event1.stack,
+            Some(timing_report_stack(7, 0x10))
+        );
+        assert_eq!(
+            report.critical_event2.stack,
+            Some(timing_report_stack(7, 0x10))
+        );
     }
 
     /// The timing report creates another prefix continuation after the
@@ -4728,6 +4943,107 @@ mod tests {
             departure(&requested, &events(&[3, 5]), 5),
             Some(Departure::Ended { events: 2 })
         );
+    }
+
+    /// An unrecorded RIP is a wildcard, not a departure. This classification
+    /// determines which replay supplies the report's stack, not just wording.
+    #[test]
+    fn recorded_rip_wildcards_preserve_the_replays_stack_source() {
+        let tid = DetTid::from_raw;
+        for (start, end, observed_start, observed_end) in [
+            (None, None, Some(0x1000), None),
+            (None, None, None, Some(0x2000)),
+            (None, None, Some(0x1000), Some(0x2000)),
+            (Some(0x1000), None, Some(0x1000), Some(0x2000)),
+            (None, Some(0x2000), Some(0x1000), Some(0x2000)),
+        ] {
+            let mut requested = events(&[3, 5]);
+            requested[0].start_rip = start.and_then(std::num::NonZeroUsize::new);
+            requested[0].end_rip = end.and_then(std::num::NonZeroUsize::new);
+            let mut observed = requested.clone();
+            observed[0].start_rip = observed_start.and_then(std::num::NonZeroUsize::new);
+            observed[0].end_rip = observed_end.and_then(std::num::NonZeroUsize::new);
+            observed[0].count = 99;
+            let left_schedule = departure(&requested, &observed, 2);
+            assert_eq!(
+                left_schedule, None,
+                "extra unrecorded RIP information is not a departure"
+            );
+            let baseline = StackReplay {
+                met_target: false,
+                stacks: [
+                    Some(timing_report_stack(3, 0x31)),
+                    Some(timing_report_stack(5, 0x51)),
+                ],
+                left_schedule,
+                ran: [Some(tid(3)), Some(tid(5))],
+            };
+            let target = StackReplay {
+                met_target: true,
+                stacks: [
+                    Some(timing_report_stack(5, 0x52)),
+                    Some(timing_report_stack(3, 0x32)),
+                ],
+                left_schedule: None,
+                ran: [Some(tid(5)), Some(tid(3))],
+            };
+            assert_eq!(
+                merge_stacks(&baseline, &target, 1, [tid(3), tid(5)]),
+                [
+                    Some((
+                        timing_report_stack(3, 0x31),
+                        "the baseline replay".to_owned()
+                    )),
+                    Some((
+                        timing_report_stack(5, 0x51),
+                        "the baseline replay".to_owned()
+                    )),
+                ]
+            );
+        }
+        let mut requested = events(&[3, 5]);
+        requested[0].start_rip = std::num::NonZeroUsize::new(0x1000);
+        requested[0].end_rip = std::num::NonZeroUsize::new(0x2000);
+        assert_eq!(departure(&requested, &requested, 2), None);
+        for (start, end) in [
+            (None, Some(0x2000)),
+            (Some(0x1001), Some(0x2000)),
+            (Some(0x1000), None),
+            (Some(0x1000), Some(0x2001)),
+        ] {
+            let mut observed = requested.clone();
+            observed[0].start_rip = start.and_then(std::num::NonZeroUsize::new);
+            observed[0].end_rip = end.and_then(std::num::NonZeroUsize::new);
+            assert_eq!(
+                departure(&requested, &observed, 2),
+                Some(Departure::OtherEvent {
+                    index: 0,
+                    expected: requested[0].clone(),
+                    ran: observed[0].clone(),
+                }),
+                "a specified RIP must still be present and equal"
+            );
+        }
+        for other in [
+            SchedEvent::branches(tid(7), 10),
+            SchedEvent::syscall(
+                tid(3),
+                reverie::syscalls::Sysno::write,
+                detcore_model::schedule::SyscallPhase::Posthook,
+            ),
+        ] {
+            let requested = events(&[3, 5]);
+            let observed = vec![other.clone(), requested[1].clone()];
+            assert_eq!(
+                departure(&requested, &observed, 2),
+                Some(Departure::OtherEvent {
+                    index: 0,
+                    expected: requested[0].clone(),
+                    ran: other,
+                }),
+                "wildcard RIPs do not excuse a changed thread or operation"
+            );
+        }
     }
 
     /// A stack either replay captured is reported, in the passing order, with
