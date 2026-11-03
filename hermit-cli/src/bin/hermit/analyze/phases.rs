@@ -498,8 +498,10 @@ fn check_prefix_len(len: usize, role: &str, unchanged: usize) -> usize {
 /// starts with those events) as its schedule. Refused when the checkpoints do
 /// not fit the edited events, never replayed as a bare schedule: without them
 /// the unchanged events would not end their slices where the run did, and the
-/// check would measure another run than the one it names. The refusal is the
-/// check's error, which its report names.
+/// check would measure another run than the one it names. The refusal is a
+/// [`PolicyRefusal`](crate::app::container::PolicyRefusal) named
+/// `HERMIT_CANDIDATE_CHECK_CHECKPOINTS` (docs/ERROR_CATALOG.md); it is the
+/// check's error, which its report names, and the analysis goes on.
 fn candidate_check_record(
     recorded: &PreemptionRecord,
     unchanged: usize,
@@ -509,11 +511,11 @@ fn candidate_check_record(
         .schedule_prefix(unchanged)
         .with_schedule(edited.to_vec())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "the callback checkpoints of the recording's first {unchanged} events do not fit \
-                 the edited schedule, and replaying it without them would not follow the run it \
-                 checks"
-            )
+            anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
+                "HERMIT_CANDIDATE_CHECK_CHECKPOINTS: the callback checkpoints of the recording's \
+                 first {unchanged} events do not fit the edited schedule, and replaying it without \
+                 them would not follow the run it checks"
+            ))
         })
 }
 
@@ -4713,11 +4715,19 @@ mod tests {
             Some(1)
         );
         // An edit that leaves out an unchanged event the checkpoints name.
-        let error = candidate_check_record(&recorded, 2, &[event(branches(5, 4))])
-            .unwrap_err()
-            .to_string();
+        let error = candidate_check_record(&recorded, 2, &[event(branches(5, 4))]).unwrap_err();
         assert!(
-            error.contains("callback checkpoints of the recording's first 2 events do not fit"),
+            error
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        let error = error.to_string();
+        assert!(
+            error.starts_with(
+                "HERMIT_CANDIDATE_CHECK_CHECKPOINTS: the callback checkpoints of the recording's \
+                 first 2 events do not fit"
+            ),
             "{error}"
         );
     }
