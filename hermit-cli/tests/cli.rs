@@ -46885,6 +46885,7 @@ fn every_test_command_gets_its_own_cache_directory() {
     chosen.env("XDG_CACHE_HOME", "/chosen");
     hermit_test::pin_canonical_epoch(&mut chosen);
     assert_eq!(cache_home(&chosen), Some(PathBuf::from("/chosen")));
+}
 
 #[test]
 fn cpu_profile_v3_cpuinfo_matches_cpuid() {
