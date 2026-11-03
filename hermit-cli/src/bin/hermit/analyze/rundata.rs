@@ -1205,7 +1205,7 @@ impl AnalyzeOpts {
             Some(_) => return Ok(()),
         };
         Err(
-            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+            anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                 "--continuation-timeslice={nanos} is refused: {reason}. Omit it (auto), or pass \
                  a timeslice at least as long as the run's own."
             )),
@@ -3565,7 +3565,7 @@ mod tests {
             let error = refusal(argv).expect_err(reason);
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{error:#}"
             );

@@ -34,7 +34,6 @@ use reverie::process::Output;
 
 use crate::app::analyze::consts::*;
 use crate::app::analyze::rundata::RunData;
-use crate::app::analyze::rundata::TrialEnd;
 use crate::app::analyze::types::AnalyzeOpts;
 use crate::app::analyze::types::ContinuationTimeslice;
 use crate::app::analyze::types::ExitStatusConstraint;
