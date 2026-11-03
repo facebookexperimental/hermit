@@ -1380,8 +1380,22 @@ pub struct RunOpts {
     #[clap(long)]
     in_guest_exec_stop: bool,
 
-    /// Freeze explicitly declared dynamic files for the native trap exec domain.
-    /// Static files, scripts, threads, fork and timers remain outside this domain.
+    #[cfg_attr(
+        feature = "native-exec",
+        doc = "Freeze explicitly declared dynamic files for the native trap exec domain."
+    )]
+    #[cfg_attr(
+        feature = "native-exec",
+        doc = "Static files, scripts, threads, fork and timers remain outside this domain."
+    )]
+    #[cfg_attr(
+        all(feature = "native-exec-input-admission", not(feature = "native-exec")),
+        doc = "Recognize native exec enrollment requests and refuse execution in this admission-only build."
+    )]
+    #[cfg_attr(
+        all(feature = "native-exec-input-admission", not(feature = "native-exec")),
+        doc = "Rebuild hermit-run with --features native-exec, or drop --native-exec-inputs."
+    )]
     #[cfg(any(feature = "native-exec", feature = "native-exec-input-admission"))]
     #[clap(long, value_name = "DECLARATION", requires = "verification")]
     native_exec_inputs: Option<PathBuf>,
@@ -8081,6 +8095,7 @@ fn native_inputs_refuse_wrong_backend_before_program_or_declaration_access() {
             "native exec currently requires in-guest-trap",
             "{backend}: {error:#}"
         );
+        assert_policy_refusal_exit(&error);
         assert!(options.native_exec_capture.is_none());
     }
 }
@@ -9743,10 +9758,11 @@ impl RunOpts {
             )));
         }
         #[cfg(any(feature = "native-exec", feature = "native-exec-input-admission"))]
-        anyhow::ensure!(
-            self.native_exec_inputs.is_none(),
-            "an external physical adapter cannot consume a native exec enrollment"
-        );
+        if self.native_exec_inputs.is_some() {
+            return Err(Error::new(PolicyRefusal)
+                .context("drop --native-exec-inputs, or rebuild hermit-run with --features native-exec and select --backend=in-guest-trap")
+                .context("an external physical adapter cannot consume a native exec enrollment"));
+        }
         Ok(())
     }
 
@@ -9758,15 +9774,19 @@ impl RunOpts {
         if self.native_exec_inputs.is_none() {
             return Ok(());
         }
-        anyhow::ensure!(
-            self.application_backend.is_none(),
-            "an external physical adapter cannot consume a native exec enrollment"
-        );
-        anyhow::ensure!(
-            backend == Backend::InGuestTrap,
-            "native exec currently requires in-guest-trap"
-        );
-        anyhow::bail!("native exec execution is not compiled into this executable")
+        if self.application_backend.is_some() {
+            return Err(Error::new(PolicyRefusal)
+                .context("drop --native-exec-inputs, or rebuild hermit-run with --features native-exec and select --backend=in-guest-trap")
+                .context("an external physical adapter cannot consume a native exec enrollment"));
+        }
+        if backend != Backend::InGuestTrap {
+            return Err(Error::new(PolicyRefusal)
+                .context("select --backend=in-guest-trap and rebuild hermit-run with --features native-exec, or drop --native-exec-inputs")
+                .context("native exec currently requires in-guest-trap"));
+        }
+        Err(Error::new(PolicyRefusal)
+            .context("rebuild hermit-run with --features native-exec, or drop --native-exec-inputs")
+            .context("native exec execution is not compiled into this executable"))
     }
 
     /// Lower `--strace-only` onto exactly the options its help names: `--tmp=/tmp
@@ -10686,11 +10706,10 @@ impl RunOpts {
         // Static native-option policy belongs before stdin reservation,
         // availability probes, or backend-specific preprocessing/dispatch.
         #[cfg(any(feature = "native-exec", feature = "native-exec-input-admission"))]
-        if self.native_exec_inputs.is_some() {
-            anyhow::ensure!(
-                self.selected_backend() == Backend::InGuestTrap,
-                "native exec currently requires in-guest-trap"
-            );
+        if self.native_exec_inputs.is_some() && self.selected_backend() != Backend::InGuestTrap {
+            return Err(Error::new(PolicyRefusal)
+                .context("select --backend=in-guest-trap, or drop --native-exec-inputs")
+                .context("native exec currently requires in-guest-trap"));
         }
         self.refuse_unapplied_config()?;
         self.resolve_preemption_settings()?;
@@ -19139,8 +19158,24 @@ mod tests {
     }
 }
 
-// This private-state control supplements, but does not replace, the real
-// dedicated-executable controls. It does not construct a synthetic adapter.
+#[cfg(all(
+    test,
+    any(feature = "native-exec", feature = "native-exec-input-admission")
+))]
+fn assert_policy_refusal_exit(error: &Error) {
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    assert_eq!(super::failure_exit_code(error), 122, "{error:#}");
+    assert_eq!(
+        super::classify_failure(error),
+        "HERMIT_POLICY_REFUSAL class=policy-refusal",
+        "{error:#}"
+    );
+}
+
+// The first-party split removed dbt/e9patch from the core enum:
+// https://github.com/rrnewton/hermit/commit/ee51613d1cd
+// Their dedicated frontdoors retain the physical owner controls. This
+// private-state selection also checks the real main path without a synthetic adapter.
 #[test]
 #[cfg(feature = "native-exec")]
 fn native_enrollment_external_guard_does_not_create_a_capture() {
@@ -19153,13 +19188,13 @@ fn native_enrollment_external_guard_does_not_create_a_capture() {
     options
         .select_application_backend("native-enrollment-guard-control")
         .unwrap();
-    let error = options
-        .refuse_unqualified_application_options("unused CPU profile refusal")
-        .unwrap_err();
+    let global = GlobalOpts::parse_from(["hermit"]);
+    let error = options.main(&global).unwrap_err();
     assert_eq!(
         error.to_string(),
         "an external physical adapter cannot consume a native exec enrollment"
     );
+    assert_policy_refusal_exit(&error);
     assert!(options.native_exec_capture.is_none());
 }
 
@@ -19184,6 +19219,10 @@ fn native_admission_only_refuses_before_program_or_declaration_access() {
         ]);
         let error = options.main(&global).unwrap_err();
         assert_eq!(error.to_string(), expected, "{backend}: {error:#}");
+        assert_policy_refusal_exit(&error);
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("rebuild hermit-run with --features native-exec"));
+        assert!(diagnostic.contains("drop --native-exec-inputs"));
     }
 
     let global = GlobalOpts::parse_from(["hermit"]);
@@ -19201,6 +19240,18 @@ fn native_admission_only_refuses_before_program_or_declaration_access() {
         error.to_string(),
         "an external physical adapter cannot consume a native exec enrollment"
     );
+    assert_policy_refusal_exit(&error);
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("rebuild hermit-run with --features native-exec"));
+    assert!(diagnostic.contains("drop --native-exec-inputs"));
+
+    // The same words without the marker remain an internal CLI error.
+    let untyped = Error::msg(error.to_string());
+    assert_eq!(super::failure_exit_code(&untyped), 125);
+    assert_eq!(
+        super::classify_failure(&untyped),
+        "HERMIT_INTERNAL_FAILURE class=cli-error"
+    );
 }
 
 #[test]
@@ -19210,11 +19261,29 @@ fn native_admission_only_preserves_requests_without_native_enrollment() {
     for backend in [Backend::Ptrace, Backend::Liteinst, Backend::InGuestTrap] {
         options.refuse_uncompiled_native_exec(backend).unwrap();
     }
+
+    // No enrollment: real main must preserve the existing exec-stop owner
+    // refusal on ptrace, before any nonexistent program can be launched.
+    let global = GlobalOpts::parse_from(["hermit", "--backend=ptrace"]);
+    let mut options =
+        RunOpts::parse_from(["run", "--in-guest-exec-stop", "/nonexistent-ordinary-guest"]);
+    assert!(!options.program_path().exists());
+    let error = options.main(&global).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        concat!(
+            "--in-guest-exec-stop: exec-stop-runtime-not-ready: requires the packaged private runtime, ",
+            "in-guest-trap, and supported direct-run or singleton verification options"
+        )
+    );
+    assert_policy_refusal_exit(&error);
 }
 
 #[test]
 #[cfg(any(feature = "native-exec", feature = "native-exec-input-admission"))]
 fn native_enrollment_still_requires_a_verification_mode() {
+    use clap::CommandFactory;
+
     let error = RunOpts::try_parse_from([
         "run",
         "--native-exec-inputs=/nonexistent-native-declaration",
@@ -19225,4 +19294,25 @@ fn native_enrollment_still_requires_a_verification_mode() {
         error.kind(),
         clap::error::ErrorKind::MissingRequiredArgument
     );
+
+    let command = RunOpts::command();
+    let help = command
+        .get_arguments()
+        .find(|argument| argument.get_id() == "native_exec_inputs")
+        .and_then(|argument| argument.get_help())
+        .expect("the admitted flag has help")
+        .to_string();
+    #[cfg(feature = "native-exec")]
+    {
+        assert!(help.contains("Freeze explicitly declared dynamic files"));
+        assert!(help.contains("Static files, scripts, threads, fork and timers"));
+    }
+    #[cfg(not(feature = "native-exec"))]
+    {
+        assert!(help.contains("Recognize native exec enrollment requests"));
+        assert!(help.contains("refuse execution in this admission-only build"));
+        assert!(help.contains("--features native-exec"));
+        assert!(help.contains("drop --native-exec-inputs"));
+        assert!(!help.contains("Freeze explicitly declared dynamic files"));
+    }
 }

@@ -41,7 +41,7 @@ mm-cancellation-test-support = ["exec-stop-launcher", "liteinst", "detcore/physi
 # Native controls exercise real KVM ownership/RPC helpers without a VM.
 kvm-native-test-support = ["reverie-kvm/native-test-support"]
 liteinst = ["dep:reverie-liteinst", "dep:reverie-rpc-transport"]
-# Parse and refuse native enrollment in executable-selected physical frontends.
+# Recognize native enrollment in the core and executable-selected CLIs.
 # This feature supplies no Capture, native runtime, injection, or launch mechanism.
 native-exec-input-admission = []
 # Explicit native in-guest-trap launch domain; ordinary exec remains unchanged.
