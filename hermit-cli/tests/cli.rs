@@ -27635,16 +27635,19 @@ fn a_schedule_replay_of_a_pipe_reader_whose_writers_exited_is_no_deadlock() {
 /// A schedule replay keeps the clock of a thread that yields beside a
 /// computing one. The static guest, with no libc and no dynamic loader, has
 /// its main task call sched_yield, compute briefly and read CLOCK_MONOTONIC,
-/// 100 times, while a second task made by a raw clone computes; it prints a
-/// digest of the main task's clock reads. Each recording, at an explicit
-/// --max-timeslice of 100 us and of 400 us and without --chaos, has the
-/// main task's prehook switch to the computing task carry that task's
+/// 40 times, while a second task made by a raw clone computes for 1,500,000
+/// iterations, long enough to outlast every yield at both slice lengths; it
+/// prints a digest of the main task's clock reads. Each recording, at an
+/// explicit --max-timeslice of 100 us and of 400 us and without --chaos, has
+/// the main task's prehook switch to the computing task carry that task's
 /// timer-ended slice length, and must replay with no desync and the same
 /// output. Giving the switching thread no slice there, so that it keeps the
 /// deadline it had before its yield, ended slices its recording did not
-/// have: the main task's last clock read came 9.5 ms late at 100 us, with no
-/// desync, and the replay at 400 us desynchronized 25 events. Needs the PMU,
-/// so it runs in privileged-test.pmu_cli_cases.
+/// have: the main task's last clock read came 3.5 ms late at 100 us and
+/// 1.0 ms late at 400 us, with 17 and 19 events desynchronized. The four
+/// runs take about 4.8 s of wall time (4.4 s of CPU) on an Intel Xeon Gold
+/// 6138. Needs the PMU, so it runs in privileged-test.pmu_cli_cases, and
+/// test.cli and test.cli_on_host skip it.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_one() {
@@ -27669,7 +27672,7 @@ fn a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_
                 bound.as_str(),
             ];
             args.extend_from_slice(extra);
-            args.extend(["--", program, "100", "300", "3000000"]);
+            args.extend(["--", program, "40", "300", "1500000"]);
             let output = hermit(&args);
             assert_success(&output, &args);
             stdout(&output)
