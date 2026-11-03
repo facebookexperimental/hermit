@@ -127,6 +127,10 @@ struct Armed {
     signal: i32,
     /// The armed thread's process.
     process: DetPid,
+    /// The thread that took the crash, named in the switch however the
+    /// surviving task's identity is rekeyed afterwards (a non-leader
+    /// exec keeps the survivor under the leader's tid).
+    crashed: DetTid,
 }
 
 /// The scheduler's state of the switch.
@@ -200,7 +204,11 @@ impl PostCrashState {
                 // A crash inside an armed thread's handler keeps the first
                 // arm: the outer handler, whose signal stays blocked until it
                 // returns, is the one still running.
-                self.armed.entry(dtid).or_insert(Armed { signal, process });
+                self.armed.entry(dtid).or_insert(Armed {
+                    signal,
+                    process,
+                    crashed: dtid,
+                });
                 self.lineage.entry(process).or_default().insert(dtid);
                 None
             }
@@ -213,8 +221,12 @@ impl PostCrashState {
                     .lineage
                     .get(&process)
                     .and_then(|crashes| crashes.iter().next().copied());
-                crash.map(|crashed| {
-                    let Armed { signal, process } = self.armed[&crashed];
+                crash.map(|key| {
+                    let Armed {
+                        signal,
+                        process,
+                        crashed,
+                    } = self.armed[&key];
                     self.switch_process(process);
                     (crashed, signal, Some(dtid))
                 })
@@ -880,8 +892,8 @@ mod tests {
         state.transfer_arm(tid(5), tid(3));
         let (_, taken) = step(&mut state, 3, 3, PostCrashEvent::Exec, 12);
         let taken = taken.unwrap();
-        assert_eq!(taken.dtid, tid(3));
-        assert_eq!(taken.exec_by, Some(tid(3)));
+        assert_eq!(taken.dtid, tid(5), "the original crash identity");
+        assert_eq!(taken.exec_by, Some(tid(3)), "the surviving identity");
     }
 
     /// With two threads of one process armed, the switch names the lower

@@ -30284,6 +30284,89 @@ fn a_replay_stuck_off_its_schedule_lets_every_thread_run() {
     );
 }
 
+/// A thread that catches SIGABRT and execs `/bin/true` from its handler
+/// survives the exec under the leader's tid; the post-crash switch must
+/// still be taken (revcodex3 F3 on PR #4867). The worker case names the
+/// crashed worker as the crashed thread and the leader identity it
+/// survives as for the exec; the leader case names one thread for both.
+/// No preemption flags: non-leader exec is refused under recording, so
+/// this runs plain, as the reproducer did.
+#[test]
+fn a_thread_that_execs_from_its_crash_handler_takes_the_post_crash_switch() {
+    let _guard = hermit_run_guard();
+    let compiler = ["cc", "gcc", "clang"]
+        .into_iter()
+        .find(|program| {
+            Command::new(program)
+                .args(["-x", "c", "-fsyntax-only", "-"])
+                .stdin(Stdio::null())
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+        .expect("post-crash worker-exec regression requires cc, gcc, or clang on PATH");
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = process_build_root("post-crash-worker-exec");
+    fs::create_dir_all(&build_root).expect("failed to create post-crash guest directory");
+    let binary = build_root.join("post_crash_worker_exec");
+    let compile = Command::new(compiler)
+        .args(["-O2", "-g", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/post_crash_worker_exec.c"))
+        .args(["-o"])
+        .arg(&binary)
+        .arg("-pthread")
+        .output()
+        .expect("failed to compile post-crash worker-exec guest");
+    assert!(
+        compile.status.success(),
+        "post-crash worker-exec guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let guest = binary.to_str().expect("guest path is UTF-8");
+    for (label, leader, same_identity) in [("worker", false, false), ("leader", true, true)] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let summary = directory.path().join("summary.json");
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let mut args = vec![
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--seed=1",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--max-timeslice=20000",
+            "--post-crash-timeslice=200000000",
+            summary_arg.as_str(),
+            "--",
+            guest,
+        ];
+        if leader {
+            args.push("leader");
+        }
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let summary: RunSummary = serde_json::from_slice(&fs::read(&summary).unwrap()).unwrap();
+        let post_crash = summary
+            .post_crash
+            .unwrap_or_else(|| panic!("{label}: no post-crash summary"));
+        assert_eq!(post_crash.bound, 200_000_000, "{label}");
+        assert_eq!(
+            post_crash.switches.len(),
+            1,
+            "{label}: exactly one switch: {post_crash:?}"
+        );
+        let switch = post_crash.switches[0];
+        assert_eq!(switch.signal, 6, "{label}: SIGABRT");
+        let exec_by = switch.exec_by.expect("the switch is taken at an exec");
+        assert_eq!(
+            switch.dtid == exec_by,
+            same_identity,
+            "{label}: crashed vs exec'ing identity: {switch:?}"
+        );
+    }
+}
+
 /// Under `--replay-exhausted-panic` a replay that leaves its schedule stops
 /// there, as one that runs out of it does, instead of running on unguided:
 /// the container exits with status 1 (`immediate_fatal_exit`), which hermit
