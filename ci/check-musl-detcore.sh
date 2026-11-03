@@ -4,7 +4,7 @@
 # The liteinst runtime staticlib is built for musl by the in-guest producer
 # route, but no validate node builds that target, so a musl-only type error
 # in Detcore (statfs f_type is u64 on musl, i64-typed magics in libc) landed
-# invisibly and blocked devbig030. This checker runs the same cargo check
+# invisibly and blocked the producer's consumers. This checker runs the same cargo check
 # the producer depends on. It only checks; it never builds the staticlib.
 set -euo pipefail
 
