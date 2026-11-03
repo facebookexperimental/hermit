@@ -35,7 +35,7 @@
 //!   applies to its whole process: every crash armed in it switches with it,
 //!   and those crashes' lineages take the bound too;
 //! - an armed thread's handler has returned once the kernel no longer blocks
-//!   its crash signal for it ([`signal_blocked`]). That is read only where the
+//!   its crash signal for it (`signal_blocked`). That is read only where the
 //!   armed thread itself is stopped at a point of its own: each syscall entry,
 //!   before the call runs; each syscall exit or trap, after it completes and
 //!   before the thread can give up its turn there; each end of one of its
