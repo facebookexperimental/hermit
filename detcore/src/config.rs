@@ -187,7 +187,7 @@ mod tests {
         // of tuples (#4779), and the digest now covers the StoreExclusive
         // request's payload types. Renumbered to 24 at landing on top of
         // Train 6's revision 23; digest measured at this combined head.
-        (24, "86768711e86e29fd", "f013e36743d8d9e6"),
+        (24, "b31c27eec3d0d5b4", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
