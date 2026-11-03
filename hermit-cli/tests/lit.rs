@@ -554,6 +554,7 @@ lit_cases! {
     lit_rt_sigprocmask_hermit_run => "rt_sigprocmask/hermit-run.lit",
     lit_timerfd_virtual_time_main => "timerfd_virtual_time/main.c",
     lit_timerfd_virtual_time_hermit_run_strict => "timerfd_virtual_time/hermit-run-strict.lit",
+    lit_chaos_schedule_replay_main => "chaos_schedule_replay/main.rs",
     lit_child_should_inherit_fds_hermit_run => "child_should_inherit_fds/hermit-run.lit",
     lit_child_should_inherit_fds_main => "child_should_inherit_fds/main.rs",
     lit_close_on_exec_hermit_run => "close_on_exec/hermit-run.lit",
