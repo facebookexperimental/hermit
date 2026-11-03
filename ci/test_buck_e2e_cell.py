@@ -200,9 +200,11 @@ for n in os.environ.get("FAKE_DETLOGS", "1" if verdict == "matched" else "12"):
     with open(os.path.join(logs, "run%s_log_detlog" % n), "w") as f:
         f.write("".join("run %s detlog line %d\n" % (n, i) for i in range(int(os.environ.get("FAKE_DETLOG_LINES", "1")))))
 # FAKE_SECOND_ATTEMPT: the harness retried this cell in the same execution.
-# Attempt 1's row gets FAKE_ATTEMPT1_OUTCOME, its verdict file
-# FAKE_VERDICT_1 and its logs FAKE_DETLOGS_1; attempt 2 (the row above,
-# renumbered) keeps the defaults.
+# Like the real harness (runner.rs cell_artifact_path), attempt 2 gets its
+# own artifact directory, "<slug>-attempt-2", and the verify evidence inside
+# it is numbered from 1 again. Attempt 1's row gets FAKE_ATTEMPT1_OUTCOME,
+# its verdict file FAKE_VERDICT_1 and its logs FAKE_DETLOGS; attempt 2's
+# verdict is FAKE_VERDICT_2 and its logs FAKE_DETLOGS_2.
 if os.environ.get("FAKE_SECOND_ATTEMPT"):
     with open(results) as f:
         row = json.loads(f.readline())
@@ -211,9 +213,10 @@ if os.environ.get("FAKE_SECOND_ATTEMPT"):
         f.write(json.dumps(dict(row, outcome=os.environ.get("FAKE_ATTEMPT1_OUTCOME", "FAIL"),
                                 attempt=1)) + "\n")
         f.write(json.dumps(row) + "\n")
-    logs2 = os.path.join(celldir, "verify-logs", "verify-2")
+    celldir2 = celldir + "-attempt-2"
+    logs2 = os.path.join(celldir2, "verify-logs", "verify-1")
     os.makedirs(logs2, exist_ok=True)
-    with open(os.path.join(celldir, "verify-2.json"), "w") as f:
+    with open(os.path.join(celldir2, "verify-1.json"), "w") as f:
         f.write(json.dumps({"verdict": os.environ.get("FAKE_VERDICT_2", verdict)}) + "\n")
     with open(os.path.join(celldir, "verify-1.json"), "w") as f:
         f.write(json.dumps({"verdict": os.environ.get("FAKE_VERDICT_1", "")}) + "\n")
