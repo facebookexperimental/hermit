@@ -199,6 +199,27 @@ if verify_json != "missing":
 for n in os.environ.get("FAKE_DETLOGS", "1" if verdict == "matched" else "12"):
     with open(os.path.join(logs, "run%s_log_detlog" % n), "w") as f:
         f.write("".join("run %s detlog line %d\n" % (n, i) for i in range(int(os.environ.get("FAKE_DETLOG_LINES", "1")))))
+# FAKE_SECOND_ATTEMPT: the harness retried this cell in the same execution.
+# Attempt 1's row gets FAKE_ATTEMPT1_OUTCOME, its verdict file
+# FAKE_VERDICT_1 and its logs FAKE_DETLOGS_1; attempt 2 (the row above,
+# renumbered) keeps the defaults.
+if os.environ.get("FAKE_SECOND_ATTEMPT"):
+    with open(results) as f:
+        row = json.loads(f.readline())
+    row["attempt"] = 2
+    with open(results, "w") as f:
+        f.write(json.dumps(dict(row, outcome=os.environ.get("FAKE_ATTEMPT1_OUTCOME", "FAIL"),
+                                attempt=1)) + "\n")
+        f.write(json.dumps(row) + "\n")
+    logs2 = os.path.join(celldir, "verify-logs", "verify-2")
+    os.makedirs(logs2, exist_ok=True)
+    with open(os.path.join(celldir, "verify-2.json"), "w") as f:
+        f.write(json.dumps({"verdict": os.environ.get("FAKE_VERDICT_2", verdict)}) + "\n")
+    with open(os.path.join(celldir, "verify-1.json"), "w") as f:
+        f.write(json.dumps({"verdict": os.environ.get("FAKE_VERDICT_1", "")}) + "\n")
+    for n in os.environ.get("FAKE_DETLOGS_2", "1"):
+        with open(os.path.join(logs2, "run%s_log_detlog" % n), "w") as f:
+            f.write("run %s detlog line 0\n" % n)
 # FAKE_TPX_RAW replaces the payload with exactly these bytes, after the row and the
 # evidence are written, FAKE_RESULTS_RAW the rows; FAKE_EXIT replaces the exit status.
 if "FAKE_TPX_RAW" in os.environ:
@@ -850,6 +871,22 @@ class CellTest(unittest.TestCase):
     def test_unmatched_passing_verify_needs_both_logs(self) -> None:
         self.assert_evidence(True, FAKE_VERDICT="diverged", FAKE_DETLOGS="12")
         self.assert_evidence(False, FAKE_VERDICT="diverged", FAKE_DETLOGS="1")
+
+    def test_retried_verify_is_judged_on_its_final_attempt(self) -> None:
+        # Attempt 1 skid-overshot: no comparison, no verdict, only its
+        # run 1 log. Attempt 2 matched and kept only the golden log.
+        # The execution is complete on its final attempt's evidence,
+        # exactly as a one-attempt matched pass is.
+        self.assert_evidence(True, FAKE_SECOND_ATTEMPT="1", FAKE_VERDICT_1="",
+                             FAKE_DETLOGS="1", FAKE_DETLOGS_2="1")
+        # A final attempt that kept nothing is still incomplete.
+        self.assert_evidence(False, FAKE_SECOND_ATTEMPT="1", FAKE_VERDICT_1="",
+                             FAKE_DETLOGS="1", FAKE_DETLOGS_2="")
+        # And a final unmatched attempt still needs both of its logs.
+        self.assert_evidence(False, FAKE_SECOND_ATTEMPT="1", FAKE_VERDICT_1="",
+                             FAKE_VERDICT_2="diverged", FAKE_DETLOGS_2="1")
+        self.assert_evidence(True, FAKE_SECOND_ATTEMPT="1", FAKE_VERDICT_1="",
+                             FAKE_VERDICT_2="diverged", FAKE_DETLOGS_2="12")
 
     def test_passing_verify_without_a_readable_verdict_file_is_an_error(self) -> None:
         # Both logs present, so only the verdict file itself can make these incomplete.

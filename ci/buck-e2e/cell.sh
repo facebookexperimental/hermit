@@ -443,17 +443,29 @@ rows=[json.loads(l) for l in open(p) if l.strip()] if os.path.exists(p) else []
 assert all(isinstance(r, dict) for r in rows)
 print(json.dumps({"count": len(rows), "outcome": next((o for o in ("PASS", "FAIL", "ERROR", "HOST-INAPPLICABLE") if o in [r.get("outcome") for r in rows]), None)}))' "$out/results.jsonl" 2>/dev/null) ||
     rows_seen=unreadable
-n_run1=$(find "$A" -maxdepth 1 -name 'cell__verify-logs__*run1_log_*' | wc -l)
-n_run2=$(find "$A" -maxdepth 1 -name 'cell__verify-logs__*run2_log_*' | wc -l)
+# The harness owns retries, so one execution may write several attempts
+# (verify-1, verify-2, ...). The execution's evidence is its FINAL attempt's:
+# judging attempt 1's verdict against every attempt's logs reads a
+# skid-overshoot-then-matched cell (attempt 1 kept no comparison, attempt 2
+# kept only the golden log) as evidence-incomplete even though the final
+# attempt's evidence is exactly what a one-attempt pass leaves.
+final_attempt=$(python3 -c 'import json,os,sys
+p=sys.argv[1]
+rows=[json.loads(l) for l in open(p) if l.strip()] if os.path.exists(p) else []
+attempts=[r.get("attempt") for r in rows if isinstance(r.get("attempt"), int)]
+print(max(attempts) if attempts else 1)' "$out/results.jsonl" 2>/dev/null) || final_attempt=1
+[[ $final_attempt =~ ^[0-9]+$ ]] || final_attempt=1
+n_run1=$(find "$A" -maxdepth 1 -name "cell__verify-logs__verify-${final_attempt}__run1_log_*" | wc -l)
+n_run2=$(find "$A" -maxdepth 1 -name "cell__verify-logs__verify-${final_attempt}__run2_log_*" | wc -l)
 n_detlogs=$((n_run1 + n_run2))
 verdict=$(python3 -c 'import json,sys
-print(json.load(open(sys.argv[1])).get("verdict") or "")' "$A/cell__verify-1.json" 2>/dev/null) || verdict=
+print(json.load(open(sys.argv[1])).get("verdict") or "")' "$A/cell__verify-${final_attempt}.json" 2>/dev/null) || verdict=
 evidence_complete=true
 missing=()
 [[ -s $out/tpx.jsonl ]] || { evidence_complete=false; missing+=(tpx.jsonl); }
 if [[ $outcome == PASS && $MODE == verify ]]; then
     # hermit always writes a verdict; a file without one is not a verify report.
-    [[ -s $A/cell__verify-1.json && -n $verdict ]] || { evidence_complete=false; missing+=(verify-1.json); }
+    [[ -s $A/cell__verify-${final_attempt}.json && -n $verdict ]] || { evidence_complete=false; missing+=(verify-${final_attempt}.json); }
     if [[ $verdict == matched ]]; then
         ((n_run1 == 1 && n_run2 == 0)) || { evidence_complete=false; missing+=(detlogs); }
     else
