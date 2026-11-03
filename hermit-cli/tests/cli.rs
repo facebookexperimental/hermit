@@ -56681,7 +56681,15 @@ fn a_thread_that_has_run_does_not_wait_behind_a_zero_length_sleep_loop() {
 /// While the schedule still dictates the turns, the bounds stay off: a
 /// recording of seed 2, where the first-turn bound holds C to 0.30 s, cut
 /// just after C's first events, replays without a desync and prints what
-/// the recording printed.
+/// the recording printed, both CLOCK_MONOTONIC samples included, each
+/// compared as read rather than only their difference.
+///
+/// A run that records past the end of the schedule it replays writes a
+/// record that omits the continuation's priority change points and keeps
+/// the replayed schedule's charging rules, so its record is marked
+/// incomplete (`replay_departed_at`), and a faithful replay of it is refused
+/// by name (HERMIT_INCOMPLETE_REPLAY_RECORD, exit 122) instead of being
+/// accepted as the run's authority.
 #[test]
 fn a_new_thread_past_a_replayed_schedule_gets_its_first_turn_within_a_second() {
     static GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -56723,6 +56731,55 @@ fn a_new_thread_past_a_replayed_schedule_gets_its_first_turn_within_a_second() {
              for its first turn"
         );
     }
+
+    // A recording of a run past the end of its replayed schedule is marked,
+    // and a faithful replay of it is refused by name.
+    let observed = directory.path().join("observed.json");
+    let record_observed = format!("--record-preemptions-to={}", observed.display());
+    let produced = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "1",
+        &replay_empty,
+        &record_observed,
+        "--",
+        &guest,
+    ]);
+    waited_us(&produced, "the continuation's recording");
+    let observed_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&observed).unwrap()).unwrap();
+    assert!(
+        observed_record["incomplete_preemption_record"]["replay_departed_at"].is_u64(),
+        "a record of a run past the end of its replayed schedule must be marked incomplete"
+    );
+    let replay_observed = format!("--replay-schedule-from={}", observed.display());
+    let consumed = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "1",
+        &replay_observed,
+        "--",
+        &guest,
+    ]);
+    assert_eq!(
+        consumed.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{}",
+        stderr(&consumed)
+    );
+    assert!(
+        stderr(&consumed).contains("HERMIT_INCOMPLETE_REPLAY_RECORD"),
+        "{}",
+        stderr(&consumed)
+    );
 
     // Seed 2's recording, cut just after the new thread's first events, as
     // `hermit analyze` cuts a prefix (`PreemptionRecord::schedule_prefix`).
@@ -56802,6 +56859,8 @@ fn a_new_thread_past_a_replayed_schedule_gets_its_first_turn_within_a_second() {
     let cut_path = directory.path().join("cut.json");
     fs::write(&cut_path, serde_json::to_vec(&record).unwrap()).unwrap();
     let replay_cut = format!("--replay-schedule-from={}", cut_path.display());
+    let cut_summary = directory.path().join("cut-summary.json");
+    let summary_to = format!("--summary-json={}", cut_summary.display());
     let replayed = hermit(&[
         "--log=info",
         "run",
@@ -56812,6 +56871,7 @@ fn a_new_thread_past_a_replayed_schedule_gets_its_first_turn_within_a_second() {
         "--seed",
         "2",
         &replay_cut,
+        &summary_to,
         "--",
         &guest,
     ]);
@@ -56824,11 +56884,18 @@ fn a_new_thread_past_a_replayed_schedule_gets_its_first_turn_within_a_second() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cut_summary).unwrap()).unwrap();
+    assert_eq!(summary["schedevent_desynced"], 0, "{summary}");
+    assert!(
+        summary["schedevent_replayed"].as_u64() > Some(0),
+        "the replay must consume recorded events: {summary}"
+    );
     assert_eq!(
         stdout(&replayed),
         stdout(&recorded),
         "the new thread's first turn falls inside the cut, so the replay must print what the \
-         recording printed"
+         recording printed, each CLOCK_MONOTONIC sample as read"
     );
 }
 

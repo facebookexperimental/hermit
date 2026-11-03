@@ -20881,6 +20881,23 @@ impl Scheduler {
             return;
         }
         self.replay_priorities_released = true;
+        // A run that records past the end of the raw schedule it replays,
+        // where the replay does not record logical priorities (under
+        // `--chaos` or another scheduling heuristic,
+        // `records_logical_replay_priorities`), writes a record that cannot
+        // be replayed faithfully: the continuation draws priorities at its
+        // change points that a raw schedule replay does not record, and the
+        // record keeps the replayed schedule's charging rules (a legacy
+        // record's free switch-in turns) while the continuation's turns are
+        // charged. Mark it, so a faithful replay refuses it by name
+        // (`PreemptionRecord::require_faithful_replay`) rather than accept
+        // it as the run's authority. A replay that records logical
+        // priorities records the continuation's too.
+        if !self.record_logical_replay_priorities
+            && let Some(writer) = self.preemption_writer.as_mut()
+        {
+            writer.mark_replay_departed(self.recorded_event_count);
+        }
         info!(
             "[sched] the replayed schedule {}; every thread takes the default priority",
             if self.schedule_released() {

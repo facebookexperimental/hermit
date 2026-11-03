@@ -16,7 +16,8 @@
  * nanosleep(100 us) until C stops it, or until it has slept 100000 times.
  * C reads CLOCK_MONOTONIC as soon as it runs and stops S. Prints how long,
  * in microseconds, C waited for its first instruction, and how many times
- * S slept.
+ * S slept, and then both CLOCK_MONOTONIC samples as read, so that two runs
+ * compare each sample and not only their difference.
  */
 
 #include <pthread.h>
@@ -32,16 +33,21 @@ static atomic_int stop;
 static atomic_long sleeps;
 static long long created_us;
 static long long first_us;
+static struct timespec created_ts;
+static struct timespec first_ts;
 
-static long long now_us(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+/* CLOCK_MONOTONIC into `*ts`, in microseconds; exits if the call fails. */
+static long long now_us(struct timespec* ts) {
+  if (clock_gettime(CLOCK_MONOTONIC, ts) != 0) {
+    perror("clock_gettime");
+    exit(2);
+  }
+  return (long long)ts->tv_sec * 1000000 + ts->tv_nsec / 1000;
 }
 
 static void* newcomer(void* arg) {
   (void)arg;
-  first_us = now_us();
+  first_us = now_us(&first_ts);
   atomic_store(&stop, 1);
   return NULL;
 }
@@ -54,7 +60,7 @@ static void* sleeper(void* arg) {
       sink += i;
     }
   }
-  created_us = now_us();
+  created_us = now_us(&created_ts);
   if (pthread_create(c, NULL, newcomer, NULL) != 0) {
     perror("pthread_create");
     exit(2);
@@ -79,5 +85,11 @@ int main(void) {
       "new thread waited %lld us; %ld sleeps\n",
       first_us - created_us,
       atomic_load(&sleeps));
+  printf(
+      "created at %lld.%09ld, first turn at %lld.%09ld\n",
+      (long long)created_ts.tv_sec,
+      created_ts.tv_nsec,
+      (long long)first_ts.tv_sec,
+      first_ts.tv_nsec);
   return 0;
 }
