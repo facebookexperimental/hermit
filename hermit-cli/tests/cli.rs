@@ -30691,10 +30691,12 @@ fn a_thread_that_execs_from_its_crash_handler_takes_the_post_crash_switch() {
 /// Each replay also records the events it observed, which says what the
 /// same traced index names in that replay: a case whose recorded retries
 /// differ from the ones the replay makes moves it. The replay's count is the
-/// kernel's, not the schedule's, so at least two of the three cases should
-/// move it. If none does, every replay made the retries its schedule held,
-/// the cases exercise nothing on this host, and the test says so and skips
-/// rather than pass on that evidence.
+/// kernel's, not the schedule's, so at least two of the three cases move it,
+/// and the test requires at least one to: those are the cases in which a
+/// stack taken at the traced index prints at another event. If none moved,
+/// every replay would have made the retries its schedule held, the cases
+/// would exercise nothing, and the test fails rather than pass on that
+/// evidence.
 #[test]
 fn a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries() {
     static GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -30835,16 +30837,13 @@ fn a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries() {
             moved.push(recorded_retries);
         }
     }
-    if moved.is_empty() {
-        eprintln!(
-            "SKIPPED a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries: every \
-             replay made the connect retries its schedule held (0, 1 and 2; the recording made \
-             {}), so no case moved the traced index and the cases exercise nothing on this host. \
-             The count is the kernel's.",
-            retries.len()
-        );
-        return;
-    }
+    assert!(
+        !moved.is_empty(),
+        "every replay made the connect retries its schedule held (0, 1 and 2; the recording \
+         made {}), so no case moved the traced index: the cases exercise nothing, and a pass \
+         would not tell a stack at the schedule position from one at the traced index",
+        retries.len()
+    );
     eprintln!(
         "the recording made {} connect retries; the cases with {moved:?} recorded retries moved \
          the traced index, and the stack printed at the schedule position in all three",
