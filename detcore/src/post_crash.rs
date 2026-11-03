@@ -367,7 +367,28 @@ where
 fn reads_handler_masks(config: &crate::Config) -> bool {
     config.sequentialize_threads
         && config.backend.kernel_signal_state_is_guests
-        && !crate::syscalls::host_signal_state_reads_refused()
+        && !crate::syscalls::refuses_host_signal_state_reads(&config.backend)
+}
+
+/// The refusal, by name, of a run whose `--post-crash-timeslice` switch is
+/// in effect on a backend that cannot see a caught crash's handler return
+/// (`reads_handler_masks`): the switch would then take the default-action
+/// crashes and silently ignore every caught one, and the same guest would
+/// switch on ptrace and not there. Detcore has no handler-lifetime record of
+/// its own that a backend could share instead, so the run is refused before
+/// the guest starts (`GlobalState::initialize`), as unsupported options are.
+/// `None` when the switch is off or the backend reads the guests' masks.
+pub fn admission_refusal(config: &crate::Config) -> Option<String> {
+    config.post_crash_timeslice_in_effect()?;
+    (!reads_handler_masks(config)).then(|| {
+        "--post-crash-timeslice is unsupported on this backend: the switch follows a \
+         caught crash's handler until it returns, which it reads from the guest \
+         threads' kernel signal masks, and this backend's guest threads do not have \
+         their own kernel masks readable (BackendCapabilities::kernel_signal_state_is_guests, \
+         or host /proc signal state reads are refused); run with --backend=ptrace or \
+         without --post-crash-timeslice"
+            .to_owned()
+    })
 }
 
 /// Whether the kernel blocks `signal` for the stopped thread `guest`. A crash
@@ -500,6 +521,43 @@ mod tests {
     const ABRT: i32 = libc::SIGABRT;
     const SEGV: i32 = libc::SIGSEGV;
     const BOUND: u64 = 200_000_000;
+
+    /// A run whose switch is in effect is refused by name, before the guest
+    /// starts, on a backend that cannot read a caught crash's handler mask;
+    /// there a caught crash would otherwise arm nothing, silently, where
+    /// ptrace's run switches. ptrace (and e9patch preprocessing on it) is
+    /// admitted, and so is every backend with the switch off.
+    #[test]
+    fn the_switch_is_refused_by_name_where_handler_masks_cannot_be_read() {
+        let config = |backend: reverie::BackendCapabilities, bound: Option<u64>| {
+            let mut config = crate::Config {
+                post_crash_timeslice: bound.and_then(NonZeroU64::new),
+                max_timeslice: NonZeroU64::new(1_000_000),
+                sequentialize_threads: true,
+                ..Default::default()
+            };
+            config.backend = backend;
+            config
+        };
+        assert_eq!(
+            admission_refusal(&config(reverie::BackendCapabilities::PTRACE, Some(BOUND))),
+            None
+        );
+        for backend in [
+            reverie::BackendCapabilities::LITEINST_IN_GUEST,
+            reverie::BackendCapabilities::SABRE,
+            reverie::BackendCapabilities::DBT,
+            reverie::BackendCapabilities::KVM,
+        ] {
+            let refusal =
+                admission_refusal(&config(backend, Some(BOUND))).expect("the switch is refused");
+            assert!(
+                refusal.contains("--post-crash-timeslice is unsupported on this backend"),
+                "{refusal}"
+            );
+            assert_eq!(admission_refusal(&config(backend, None)), None);
+        }
+    }
 
     fn delivered(signal: i32, default_action: bool) -> PostCrashEvent {
         PostCrashEvent::Delivered {

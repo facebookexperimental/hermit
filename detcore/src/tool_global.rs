@@ -1825,6 +1825,9 @@ impl GlobalState {
         if let Some(refusal) = crate::preemptions::annotated_replay_mode_refusal(cfg) {
             crate::scheduler::exit_on_scheduler_refusal(&refusal);
         }
+        if let Some(refusal) = crate::post_crash::admission_refusal(cfg) {
+            crate::scheduler::exit_on_scheduler_refusal(&refusal);
+        }
         let sched = Arc::new(Mutex::new(Scheduler::new(cfg)));
         let global_time = Arc::new(Mutex::new(GlobalTime::new(cfg)));
         let process_exit_cleanup = ProcessExitCleanup::default();
