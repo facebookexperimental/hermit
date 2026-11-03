@@ -2605,6 +2605,116 @@ mod tests {
         }
     }
 
+    /// Rows copied alone (`clone_preemptions_only`: format 4, marked as rows
+    /// alone) and restated in format 5 (`with_format`) keep the mark, so they
+    /// hold rows only whatever format they state. Through a full decode and
+    /// the real trial writer (`write_trial_record`, which keeps the format of
+    /// a record whose rows hold offsets), the full record's reader and the
+    /// settings reader both say rows only, and the schedule replay guard and
+    /// analyze's input check refuse the written file, as any rows-only
+    /// record. The marked rows in format 4 and the complete format-5
+    /// recording they came from are the controls: rows only, and recorded
+    /// with offsets, which both admit.
+    #[test]
+    fn rows_alone_restated_in_format_five_still_hold_rows_only() {
+        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
+        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
+        use detcore::preemptions::InstructionOffset;
+        use detcore::preemptions::PreemptionWriter;
+        use detcore::preemptions::RecordedOffsets;
+        use detcore::types::DetTid;
+        use detcore::types::LogicalTime;
+
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let mut writer = PreemptionWriter::new(None)
+            .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT));
+        writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
+        writer.insert_reprioritization(
+            tid,
+            LogicalTime::from_nanos(10),
+            18,
+            detcore::DEFAULT_PRIORITY,
+            5,
+            Some(offset),
+        );
+        writer
+            .insert_schedevent(SchedEvent::branches(tid, 22).with_instruction_offset(Some(offset)));
+        writer.insert_schedevent(SchedEvent::branches(tid, 3));
+        let source: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+        source.validate().unwrap();
+        assert_eq!(source.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+        let rows = source.clone_preemptions_only();
+        assert_eq!(rows.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+        let restated = rows.clone().with_format(Some(INSTRUCTION_OFFSET_FORMAT));
+        assert_eq!(restated.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+        restated.validate().unwrap();
+
+        let args = crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+        let crate::Subcommand::Analyze(mut options) = args.command else {
+            panic!("not analyze")
+        };
+        options.apply_global(&args.global);
+        options.time_skip_sources.lock().unwrap().remember(&source);
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("trial.json");
+        for (what, record, expected) in [
+            ("the complete recording", &source, RecordedOffsets::Recorded),
+            ("its rows alone", &rows, RecordedOffsets::RowsOnly),
+            (
+                "its rows alone in format 5",
+                &restated,
+                RecordedOffsets::RowsOnly,
+            ),
+        ] {
+            let decoded: PreemptionRecord = serde_json::from_str(&record.to_string()).unwrap();
+            decoded.validate().unwrap();
+            assert_eq!(decoded.recorded_offsets(), expected, "{what}: decoded");
+            options
+                .write_trial_record(decoded, &output)
+                .unwrap_or_else(|error| panic!("{what}: {error:#}"));
+            let written = PreemptionReader::try_new(&output).unwrap().into_inner();
+            assert_eq!(written.format_version(), record.format_version(), "{what}");
+            assert_eq!(written.recorded_offsets(), expected, "{what}: written");
+            let recorded = detcore::preemptions::read_recorded_offsets(&output).unwrap();
+            assert_eq!(recorded, expected, "{what}: settings");
+            let trial = RunData::get_raw_runopts(&options);
+            let mut replay = trial.det_opts.det_config.clone();
+            replay.chaos = false;
+            let guard = crate::run::instruction_offset_replay_refusal(
+                recorded,
+                true,
+                false,
+                trial.selected_backend(),
+                &replay,
+            );
+            let check = options
+                .clone()
+                .adopt_instruction_offsets(&[("--replay-schedule-from", &output)]);
+            if expected == RecordedOffsets::Recorded {
+                assert_eq!(guard, None, "{what}");
+                check.unwrap_or_else(|error| panic!("{what}: {error:#}"));
+            } else {
+                assert!(
+                    guard.as_deref().is_some_and(|why| why.contains(
+                        "its schedule trace does not record the instruction offsets its rows hold"
+                    )),
+                    "{what}: {guard:?}"
+                );
+                let error = check.unwrap_err();
+                assert!(
+                    error
+                        .downcast_ref::<crate::container::PolicyRefusal>()
+                        .is_some(),
+                    "{what}: {error:#}"
+                );
+            }
+        }
+    }
+
     /// A prefix trial of a recording whose rows carry instruction offsets,
     /// written as `prefix_trial` writes it, keeps the recording's offsets
     /// format whether the prefix keeps no event, the events before the first
