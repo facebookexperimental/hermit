@@ -472,6 +472,157 @@ where
         self.inner.injected_syscalls()
     }
 
+    fn native_operation(&self) -> Option<reverie::native_syscall::NativeOperation> {
+        self.inner.native_operation()
+    }
+
+    fn supports_native_operations(&self) -> bool {
+        self.inner.supports_native_operations()
+    }
+
+    fn bind_native_request<S: SyscallInfo>(
+        &self,
+        operation: &reverie::native_syscall::NativeOperation,
+        syscall: S,
+    ) -> Result<reverie::native_syscall::NativeOperation, Error> {
+        self.inner.bind_native_request(operation, syscall)
+    }
+
+    async fn inject_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: reverie::native_syscall::NativeOperation,
+    ) -> Result<i64, Errno> {
+        self.inner
+            .inject_with_native_operation(syscall, operation)
+            .await
+    }
+
+    async fn inject_restartable_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: reverie::native_syscall::NativeOperation,
+    ) -> Result<i64, Errno> {
+        self.inner
+            .inject_restartable_with_native_operation(syscall, operation)
+            .await
+    }
+
+    async fn tail_inject_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: reverie::native_syscall::NativeOperation,
+    ) -> reverie::Never {
+        self.inner
+            .tail_inject_with_native_operation(syscall, operation)
+            .await
+    }
+
+    async fn inject_observed_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        receipt: reverie::reserved_input::PhysicalInjectionReceipt,
+        operation: reverie::native_syscall::NativeOperation,
+    ) -> Result<Result<i64, Errno>, reverie::reserved_input::InputInjectionError> {
+        self.inner
+            .inject_observed_with_native_operation(syscall, receipt, operation)
+            .await
+    }
+
+    async fn inject_staged_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        scope: &reverie::reserved_input::InputOperationScope,
+        image: reverie::reserved_input::ReservedInputImage,
+        receipt: reverie::reserved_input::PhysicalInjectionReceipt,
+        operation: reverie::native_syscall::NativeOperation,
+    ) -> Result<Result<i64, Errno>, reverie::reserved_input::InputInjectionError> {
+        self.inner
+            .inject_staged_with_native_operation(syscall, scope, image, receipt, operation)
+            .await
+    }
+
+    fn reserved_input_control(&self) -> Option<reverie::reserved_input::ReservedInputControl> {
+        self.inner.reserved_input_control()
+    }
+
+    fn reserved_input_task(&self) -> Option<reverie::reserved_input::InputTaskId> {
+        self.inner.reserved_input_task()
+    }
+
+    fn reserved_input_descriptors(
+        &self,
+    ) -> Result<
+        reverie::reserved_input::InputDescriptorSnapshot,
+        reverie::reserved_input::InputUnavailable,
+    > {
+        self.inner.reserved_input_descriptors()
+    }
+
+    fn reserved_input_process_exit_signal(
+        &self,
+    ) -> Result<i32, reverie::reserved_input::InputUnavailable> {
+        self.inner.reserved_input_process_exit_signal()
+    }
+
+    fn reserved_input_descriptor(
+        &self,
+        fd: i32,
+    ) -> Result<
+        reverie::reserved_input::PinnedInputDescriptor,
+        reverie::reserved_input::InputUnavailable,
+    > {
+        self.inner.reserved_input_descriptor(fd)
+    }
+
+    async fn inject_observed<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        receipt: reverie::reserved_input::PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, reverie::reserved_input::InputInjectionError> {
+        self.inner.inject_observed(syscall, receipt).await
+    }
+
+    async fn inject_staged_input<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        scope: &reverie::reserved_input::InputOperationScope,
+        image: reverie::reserved_input::ReservedInputImage,
+        receipt: reverie::reserved_input::PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, reverie::reserved_input::InputInjectionError> {
+        self.inner
+            .inject_staged_input(syscall, scope, image, receipt)
+            .await
+    }
+
+    fn set_watchpoints(&mut self, specs: &[reverie::WatchSpec]) -> Result<(), reverie::WatchError> {
+        self.inner.set_watchpoints(specs)
+    }
+
+    fn watch_hits_keep_timer_events(&self) -> bool {
+        self.inner.watch_hits_keep_timer_events()
+    }
+
+    fn descriptor_status(&self, fd: i32) -> Result<reverie::DescriptorStatus, reverie::FactError> {
+        self.inner.descriptor_status(fd)
+    }
+
+    fn signal_sets(&self, tid: Pid) -> Result<reverie::SignalSets, reverie::FactError> {
+        self.inner.signal_sets(tid)
+    }
+
+    fn link_path(
+        &self,
+        tid: Pid,
+        link: reverie::PathLink,
+    ) -> Result<reverie::LinkPath, reverie::FactError> {
+        self.inner.link_path(tid, link)
+    }
+
+    fn memory_map(&self, tid: Pid) -> Result<reverie::MemoryMap, reverie::FactError> {
+        self.inner.memory_map(tid)
+    }
+
     fn pidfd_self_spelling(&self) -> PidfdSelfSpelling {
         self.inner.pidfd_self_spelling()
     }
