@@ -1542,7 +1542,55 @@ mod timeout_tests {
             } else {
                 8_000_000_000
             };
+            // Start the whole-run clock after lane setup, not before it.
+            // `run_lane_once` settles the lane log before dispatch, and on an
+            // absent log that settle spends its full 3 s bound; under load
+            // (the 2026-11-03 buck-hybrid red run at 31.4x CPU/wall) even a
+            // seeded log's settle can take seconds. A deadline taken before
+            // that setup lets setup consume the budget, so the scheduler
+            // refuses the lane up front instead of cutting it off mid-run.
+            // Measure the settle here and start the clock only once it has
+            // finished, so the allowance is the budget at dispatch.
+            let setup_started = super::super::monotonic_now_ns().unwrap();
+            let _ = super::super::settled_log_len(&log);
+            let setup_elapsed_ns =
+                super::super::monotonic_now_ns().unwrap() - setup_started;
             let deadline = super::super::monotonic_now_ns().unwrap() + allowance;
+            if cold_log {
+                // This case exercises expiry during setup by construction:
+                // settling the absent log (3 s bound) must spend the whole
+                // 2 s allowance before any node can launch. Fail loudly if
+                // the fixture ever stops doing that, instead of passing
+                // through a different path than the one it names.
+                assert!(
+                    setup_elapsed_ns >= allowance,
+                    "cold cutoff fixture no longer expires during setup: \
+                     log settling took {setup_elapsed_ns} ns, below the \
+                     {allowance} ns allowance"
+                );
+                // And the deadline must still be live when the lane is
+                // entered: expiry has to happen inside the lane's own
+                // setup, not before it. An already-expired deadline would
+                // pass this case silently without exercising that setup.
+                assert!(
+                    super::super::remaining_budget_s(Some(deadline)).unwrap() > 0,
+                    "cold cutoff fixture reached dispatch already expired: \
+                     its deadline must expire inside lane setup, not before (setup_elapsed_ns={setup_elapsed_ns})"
+                );
+            } else {
+                // The scheduler refuses a lane whose remaining budget is at
+                // or below a step's own wall bound. If that ever holds at
+                // dispatch, the fixture is invalid: fail here, loudly,
+                // rather than let a refusal masquerade as a cutoff.
+                let remaining_s =
+                    super::super::remaining_budget_s(Some(deadline)).unwrap();
+                assert!(
+                    remaining_s > 4,
+                    "invalid cutoff fixture: remaining budget {remaining_s} s \
+                     at dispatch is at or below the 4 s step bounds, so the \
+                     scheduler would refuse instead of cutting off"
+                );
+            }
             let result =
                 super::super::run_lane_once(&cfg, 1, true, 0, None, &log, Some(deadline), false);
             assert!(result.run_timed_out && !result.complete);

@@ -21,6 +21,18 @@ from pathlib import Path
 
 WRAPPER = Path(__file__).with_name("run-in-pinned-root.sh")
 
+# Wall bound for one run-in-pinned-root.sh invocation. Measured 2026-11-03
+# on a quiet host at hermit 2baafbdf: the heaviest single test in this file
+# (InheritedGitLocation.test_scratch_repository_tests_ignore_inherited_git_
+# location_variables) used 27.15 CPU-s (9.58 user + 17.57 sys) in 7.77
+# wall-s, and the full 30-test file used 41.65 CPU-s in 23.33 wall-s.
+# Owner labelling: CPU cap about 1.5x the observed CPU (40 CPU-s, at most
+# 60 CPU-s); wall cap 8x the CPU cap (320 s, at most 600 s). The old flat
+# 10 s expired on every wrapper call in the 2026-11-03 buck-hybrid red run
+# at 31.4x CPU/wall. Git fixture calls below keep their 10 s: they are
+# local operations that did not expire in that run.
+WRAPPER_TIMEOUT_S = 320
+
 # Git exports these to hooks and to every `git rebase --exec` step, and they
 # take precedence over `git -C`. Every command below names its repository
 # explicitly, so it runs without them; otherwise a scratch `git init` rewrites
@@ -148,7 +160,7 @@ class CargoCacheMounts(unittest.TestCase):
             env=env,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=WRAPPER_TIMEOUT_S,
             preexec_fn=(
                 None
                 if caller_affinity is None
@@ -175,7 +187,7 @@ class CargoCacheMounts(unittest.TestCase):
             env=env,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=WRAPPER_TIMEOUT_S,
         )
         calls = [json.loads(line) for line in self.capture.read_text().splitlines()]
         return result, [c for c in calls if c[:2] == ["image", "exists"]]
