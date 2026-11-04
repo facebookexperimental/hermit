@@ -4357,7 +4357,7 @@ mod tests {
         let tmp_dir = format!("--tmp-dir={}", parent.path().display());
         let mut options =
             AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
-        options.phase0_initialize().unwrap();
+        let _workspace = options.phase0_initialize(Retention::Remove).unwrap();
         let tid = detcore::types::DetTid::from_raw(3);
         let target = PreemptionRecord::from_sched_events(vec![
             SchedEvent::branches(tid, 10),

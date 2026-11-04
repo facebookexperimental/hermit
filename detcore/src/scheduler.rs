@@ -2742,6 +2742,16 @@ fn stacktrace_stop_reason(index: u64, stopping_ix: Option<u64>, flag: &str) -> S
     }
 }
 
+/// Why a requested schedule position cannot print when the run ends before
+/// the replay consumes the recorded event at that position
+/// (`Scheduler::report_stacktrace_events_the_run_did_not_reach`).
+fn stacktrace_schedule_position_not_reached_reason(position: u64) -> String {
+    format!(
+        "schedule position #{position} was not reached: the run ended before the replay \
+         consumed that recorded event"
+    )
+}
+
 // type ThreadTree = HashMap<DetTid, Vec<DetTid>>;
 #[derive(Debug, Clone, Default)]
 pub struct ThreadTree {
@@ -6892,11 +6902,9 @@ impl Scheduler {
             // recorded event was never consumed, as for an exit pair a
             // flipped schedule cannot run in flipped order) is reported by
             // position, never dropped silently.
-            self.report_unprintable_stacktrace_events(|position| {
-                format!(
-                    "schedule position #{position} was not reached: the run ended                      before the replay consumed that recorded event"
-                )
-            });
+            self.report_unprintable_stacktrace_events(
+                stacktrace_schedule_position_not_reached_reason,
+            );
             return;
         }
         self.report_unprintable_stacktrace_events(|_| {
@@ -27230,6 +27238,11 @@ mod test {
         assert!(
             sched.stacktrace_events.as_mut().unwrap().peek().is_none(),
             "position 2 was reported as not reached, not left pending"
+        );
+        assert_eq!(
+            stacktrace_schedule_position_not_reached_reason(2),
+            "schedule position #2 was not reached: the run ended before the replay consumed \
+             that recorded event"
         );
         // With the flag off the same index would have matched traced
         // event #2 instead: the selector is separate and opt-in, and the

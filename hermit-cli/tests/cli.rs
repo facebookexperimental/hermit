@@ -30673,6 +30673,8 @@ fn a_thread_that_execs_from_its_crash_handler_takes_the_post_crash_switch() {
             "{label}: crashed vs exec'ing identity: {switch:?}"
         );
     }
+}
+
 /// `hermit analyze --prefix-search` takes the stack of its deciding event by
 /// replaying a prefix of the target schedule with that event's schedule
 /// position as the `--stacktrace-event` index. A plain index counts traced
