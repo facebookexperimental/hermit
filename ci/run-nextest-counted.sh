@@ -156,9 +156,9 @@ function nextest_inventory_args {
 
 function emit_libtest_count {
     local events=$1 status=${2:-0} path=${DAGRUN_TEST_COUNTS_PATH:--}
-    local attempts=${3-} binary_map=${4-} cpu_report=${5-}
+    local attempts=${3-} binary_map=${4-} cpu_report=${5-} inventory=${6-}
     local writer_status=0
-    local -a cpu_args=()
+    local -a cpu_args=() inventory_args=()
     if [[ ! -s $events ]]; then
         printf 'run-nextest-counted: typed nextest event stream is empty\n' >&2
         return 2
@@ -170,7 +170,10 @@ function emit_libtest_count {
         fi
         cpu_args=("$attempts" "$binary_map" "$cpu_report")
     fi
-    run_rust_script "$RESULT_WRITER" "$events" "$status" "$path" "${cpu_args[@]}" || writer_status=$?
+    if [[ -n $inventory ]]; then
+        inventory_args=(--inventory "$inventory")
+    fi
+    run_rust_script "$RESULT_WRITER" "${inventory_args[@]}" "$events" "$status" "$path" "${cpu_args[@]}" || writer_status=$?
     if ((writer_status != 0)); then
         printf 'run-nextest-counted: cannot derive typed test results from %s\n' "$events" >&2
         return "$writer_status"
@@ -385,11 +388,11 @@ function run_nextest {
     if ((status == 0)); then
         NEXTEST_EXPECTED_EXECUTED="$listed_count" \
             emit_libtest_count "$events_log" "$status" "$attempts" "$binary_map" \
-            "$cpu_report" || count_status=$?
+            "$cpu_report" "$inventory" || count_status=$?
     else
         (unset NEXTEST_EXPECTED_EXECUTED; \
             emit_libtest_count "$events_log" "$status" "$attempts" "$binary_map" \
-            "$cpu_report") || count_status=$?
+            "$cpu_report" "$inventory") || count_status=$?
     fi
     if [[ -n $skip_file ]]; then
         rm -f "$skip_file"
@@ -404,7 +407,7 @@ function run_nextest {
 
 function self_test {
     local scratch got expected status=0 wall_multiplier cpu_wrapper fixture_binary attempts
-    local binary_map inventory launch_failure=0 ordinary_attempts
+    local binary_map inventory launch_failure=0 inventory_wrong_name=0 ordinary_attempts
     scratch=$(mktemp -d)
     trap 'rm -rf "$scratch"' RETURN
 
@@ -578,14 +581,19 @@ PYEOF
         shift 4
         if [[ $operation == list ]]; then
             printf '%s\n' "$@" >"$scratch/list-arguments"
-            jq -nc --arg executable "$fixture_binary" '{
+            jq -nc --arg executable "$fixture_binary" --argjson launch_failure "$launch_failure" \
+                --argjson inventory_wrong_name "$inventory_wrong_name" '{
                 "rust-suites": {
                     "suite": {
                         "package-name": "suite",
                         "binary-id": "suite",
                         "binary-name": "suite",
                         "kind": "lib",
-                        "binary-path": $executable
+                        "binary-path": $executable,
+                        "testcases": (if $launch_failure == 1 then {} else {
+                            (if $inventory_wrong_name == 1 then "substituted" else "failure" end):
+                                {"ignored":false,"filter-match":{"status":"matches"}}
+                        } end)
                     }
                 }
             }'
@@ -662,7 +670,10 @@ PYEOF
                                 "binary-id": "suite",
                                 "binary-name": "suite",
                                 "kind": "lib",
-                                "binary-path": $executable
+                                "binary-path": $executable,
+                                "testcases": {
+                                    "failure": {"ignored":false,"filter-match":{"status":"matches"}}
+                                }
                             }
                         }
                     }'
@@ -727,6 +738,22 @@ PYEOF
         printf 'run-nextest-counted: temporary nextest config leaked\n' >&2
         return 1
     fi
+
+    # Synthetic mutation: the map and counts still agree, but inventory names
+    # do not. This must reach the result writer through run_nextest and refuse;
+    # omitting --inventory would wrongly publish the ordinary failed result.
+    inventory_wrong_name=1
+    mkdir "$scratch/attribution-attempts"
+    status=0
+    TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/attribution-counts.json" \
+        run_nextest "$scratch/attribution-events" "$wall_multiplier" "$cpu_wrapper" \
+        "$scratch/attribution-attempts" "$binary_map" "$inventory" "$scratch/attribution-cpu.json" \
+        --profile ci -p suite -j 1 --retries 2 -- --skip skipme \
+        >"$scratch/attribution.stdout" 2>"$scratch/attribution.stderr" || status=$?
+    [[ $status == 100 ]] || return 1
+    [[ ! -e $scratch/attribution-counts.json && ! -e $scratch/attribution-cpu.json ]] || return 1
+    grep -q '0 eligible matches' "$scratch/attribution.stderr" || return 1
+    inventory_wrong_name=0
 
     # Preserve the original zero-terminal launch failure separately from the
     # executed exit23 control above. Stderr's twelve failures are not test rows.

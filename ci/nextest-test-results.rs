@@ -25,11 +25,12 @@ use nextest_cpu::AttemptIdentity;
 use nextest_cpu::AttemptRecord;
 use nextest_cpu::BinaryMap;
 use nextest_cpu::CpuReport;
-use nextest_cpu::read_attempt_records;
 use nextest_cpu::listed_count;
+use nextest_cpu::read_attempt_records;
 use nextest_cpu::read_binary_map;
 use nextest_cpu::write_binary_map_atomic;
 use nextest_cpu::write_report_atomic;
+use serde::Deserialize;
 use serde_json::Value;
 
 #[path = "../scripts/lib/rust_script_prelude.rs"]
@@ -43,7 +44,7 @@ mod nextest_cpu;
 
 fn usage() {
     println!(
-        "usage: nextest-test-results.rs EVENTS_JSONL NEXTEST_STATUS OUTPUT_OR_DASH [ATTEMPT_RECORD_DIR BINARY_MAP CPU_REPORT_OR_DASH]\n       nextest-test-results.rs --write-binary-map NEXTEST_INVENTORY_JSON OUTPUT\n       nextest-test-results.rs --listed-count NEXTEST_INVENTORY_JSON"
+        "usage: nextest-test-results.rs [--inventory NEXTEST_INVENTORY_JSON] EVENTS_JSONL NEXTEST_STATUS OUTPUT_OR_DASH [ATTEMPT_RECORD_DIR BINARY_MAP CPU_REPORT_OR_DASH]\n       nextest-test-results.rs --write-binary-map NEXTEST_INVENTORY_JSON OUTPUT\n       nextest-test-results.rs --listed-count NEXTEST_INVENTORY_JSON\n\n--inventory uses the same invocation's list JSON for typed event attribution, never for outcomes or CPU measurements. Without it, overlapping same-name suites refuse."
     );
 }
 
@@ -190,6 +191,126 @@ struct ExpectedTest {
 struct OpenSuite {
     identity: SuiteIdentity,
     test_count: u64,
+    passed: u64,
+    failed: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct InventoryCases {
+    #[serde(rename = "rust-suites")]
+    suites: BTreeMap<String, InventorySuite>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InventorySuite {
+    testcases: BTreeMap<String, InventoryCase>,
+    #[serde(skip)]
+    start_count: u64,
+    #[serde(skip)]
+    ignored_count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct InventoryCase {
+    ignored: bool,
+    #[serde(rename = "filter-match")]
+    filter_match: InventoryFilter,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
+enum InventoryFilter {
+    Matches {},
+    Mismatch { reason: InventoryMismatch },
+}
+
+// Nextest metadata's known mismatch reasons. An unknown classification must
+// refuse rather than silently remove a possible event name from an overlap.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum InventoryMismatch {
+    Ignored,
+    String,
+    Expression,
+    Partition,
+    DefaultFilter,
+    NotBenchmark,
+    RerunAlreadyPassed,
+}
+
+impl InventoryCase {
+    fn eligible(&self, event: &str) -> bool {
+        let executes = matches!(self.filter_match, InventoryFilter::Matches {});
+        let skips = matches!(
+            self.filter_match,
+            InventoryFilter::Mismatch {
+                reason: InventoryMismatch::Ignored
+            }
+        );
+        match event {
+            "started" => executes || skips,
+            "ignored" => skips,
+            "ok" | "failed" => executes,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EventInventory {
+    binary_map: BinaryMap,
+    suites: BTreeMap<String, InventorySuite>,
+}
+
+impl EventInventory {
+    fn from_bytes(bytes: &[u8], cpu_map: Option<&BinaryMap>) -> Result<Self, String> {
+        let binary_map = BinaryMap::from_nextest_inventory(bytes)?;
+        if let Some(cpu_map) = cpu_map {
+            cpu_map.validate()?;
+            if &binary_map != cpu_map {
+                return Err("nextest inventory disagrees with the CPU binary map; supply both from the same invocation".into());
+            }
+        }
+        let mut inventory: InventoryCases = serde_json::from_slice(bytes)
+            .map_err(|error| format!("malformed nextest event inventory: {error}"))?;
+        for suite in inventory.suites.values_mut() {
+            for (name, case) in &suite.testcases {
+                if name.is_empty() {
+                    return Err("nextest inventory testcase name must be nonempty".into());
+                }
+                // The producer counts all ignored cases, even filtered ones,
+                // plus matching nonignored cases. Zero does not exclude
+                // started events for nonignored cases under --ignored.
+                if case.ignored || matches!(case.filter_match, InventoryFilter::Matches {}) {
+                    suite.start_count = suite
+                        .start_count
+                        .checked_add(1)
+                        .ok_or("nextest inventory start count overflows u64")?;
+                }
+                if case.ignored {
+                    suite.ignored_count = suite
+                        .ignored_count
+                        .checked_add(1)
+                        .ok_or("nextest inventory ignored count overflows u64")?;
+                }
+            }
+        }
+        Ok(Self {
+            binary_map,
+            suites: inventory.suites,
+        })
+    }
+
+    fn suite(&self, identity: &SuiteIdentity) -> Result<&InventorySuite, String> {
+        let (_, binary) = self.binary_map.identity_for_suite(
+            &identity.package,
+            &identity.binary,
+            &identity.kind,
+        )?;
+        self.suites.get(binary).ok_or_else(|| {
+            format!("typed nextest suite {identity:?} is absent from the event inventory")
+        })
+    }
 }
 
 fn suite_population(
@@ -246,13 +367,19 @@ fn suite_population(
 }
 
 fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
+    parse_event_text_with_inventory(text, None)
+}
+
+fn parse_event_text_with_inventory(
+    text: &str,
+    inventory: Option<&EventInventory>,
+) -> Result<ParsedEvents, String> {
     let mut results = BTreeMap::new();
     let mut expected_attempts = Vec::new();
     // Test rows carry package/binary but not target kind. Keep every currently
-    // open typed suite by that rendered key so interleaved distinct suites stay
-    // attributable. Two open suites with the same key are ambiguous and must
-    // refuse: no field on their test rows could distinguish them.
-    let mut open_suites = BTreeMap::<(String, String), OpenSuite>::new();
+    // open suite by its full identity. Same rendered keys may overlap only
+    // when same-invocation inventory proves disjoint potential event names.
+    let mut open_suites = BTreeMap::<SuiteIdentity, OpenSuite>::new();
     let mut population_by_suite = BTreeMap::<SuiteIdentity, u64>::new();
     let mut executed_by_suite = BTreeMap::<SuiteIdentity, u64>::new();
     let mut suite_passed = 0u64;
@@ -276,41 +403,81 @@ fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
                 let open = OpenSuite {
                     identity: suite.clone(),
                     test_count: required_u64(&value, "test_count", line_number)?,
+                    passed: 0,
+                    failed: 0,
                 };
-                if let Some(active) = open_suites.insert(key.clone(), open) {
+                if open_suites.contains_key(&suite) {
                     return Err(format!(
-                        "nextest-test-results line {line_number}: suite key {key:?} is ambiguous because {suite:?} started before {active:?} ended"
+                        "nextest-test-results line {line_number}: duplicate active suite identity {suite:?}"
                     ));
                 }
+                if let Some(inventory) = inventory {
+                    let expected = inventory.suite(&suite)?.start_count;
+                    if open.test_count != expected {
+                        return Err(format!(
+                            "nextest-test-results line {line_number}: suite {suite:?} start count {} disagrees with inventory count {expected}",
+                            open.test_count
+                        ));
+                    }
+                }
+                for active in open_suites
+                    .keys()
+                    .filter(|active| active.test_name_key() == key)
+                {
+                    let disjoint = match inventory {
+                        Some(inventory) => {
+                            let left = inventory.suite(&suite)?;
+                            let right = inventory.suite(active)?;
+                            !left.testcases.iter().any(|(name, case)| {
+                                case.eligible("started")
+                                    && right
+                                        .testcases
+                                        .get(name)
+                                        .is_some_and(|case| case.eligible("started"))
+                            })
+                        }
+                        None => false,
+                    };
+                    if !disjoint {
+                        return Err(format!(
+                            "nextest-test-results line {line_number}: suite key {key:?} is ambiguous because {suite:?} started before {active:?} ended; supply same-invocation inventory with disjoint event-eligible names"
+                        ));
+                    }
+                }
+                open_suites.insert(suite, open);
             }
             ("suite", "ok" | "failed") => {
                 let ended = SuiteIdentity::from_event(&value, line_number)?;
                 let key = ended.test_name_key();
-                let started = open_suites.remove(&key).ok_or_else(|| {
-                    format!(
-                        "nextest-test-results line {line_number}: suite {ended:?} ended before its typed start metadata"
-                    )
-                })?;
-                if started.identity != ended {
-                    if started.identity.package == ended.package
-                        && started.identity.binary == ended.binary
-                        && started.identity.kind != ended.kind
-                    {
-                        return Err(format!(
+                let started = open_suites.remove(&ended).ok_or_else(|| {
+                    if let Some(active) = open_suites.keys().find(|active| {
+                        active.test_name_key() == key && active.kind != ended.kind
+                    }) {
+                        format!(
                             "nextest-test-results line {line_number}: suite ({:?}, {:?}) changed kind from {:?} to {:?}",
-                            started.identity.package,
-                            started.identity.binary,
-                            started.identity.kind,
-                            ended.kind
-                        ));
+                            active.package, active.binary, active.kind, ended.kind
+                        )
+                    } else {
+                        format!(
+                            "nextest-test-results line {line_number}: suite {ended:?} ended before its typed start metadata"
+                        )
                     }
-                    return Err(format!(
-                        "nextest-test-results line {line_number}: suite ended as {ended:?} after starting as {:?}",
-                        started.identity
-                    ));
-                }
+                })?;
                 let passed = required_u64(&value, "passed", line_number)?;
                 let failed = required_u64(&value, "failed", line_number)?;
+                if passed != started.passed || failed != started.failed {
+                    let executed = passed
+                        .checked_add(failed)
+                        .ok_or("nextest-test-results: passed + failed overflows u64")?;
+                    let observed = started
+                        .passed
+                        .checked_add(started.failed)
+                        .ok_or("nextest-test-results: episode result count overflows u64")?;
+                    return Err(format!(
+                        "nextest-test-results line {line_number}: episode {ended:?}: typed suite records report {executed} executed test(s), but typed terminal test records report {observed}; passed/failed ({passed}, {failed}) disagree with ({}, {})",
+                        started.passed, started.failed
+                    ));
+                }
                 suite_passed = suite_passed.checked_add(passed).ok_or_else(|| {
                     "nextest-test-results: passed count overflows u64".to_string()
                 })?;
@@ -318,6 +485,14 @@ fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
                     "nextest-test-results: failed count overflows u64".to_string()
                 })?;
                 let ignored = required_u64(&value, "ignored", line_number)?;
+                if let Some(inventory) = inventory {
+                    let expected = inventory.suite(&ended)?.ignored_count;
+                    if ignored != expected {
+                        return Err(format!(
+                            "nextest-test-results line {line_number}: suite {ended:?} ignored count {ignored} disagrees with inventory count {expected}"
+                        ));
+                    }
+                }
                 let population = suite_population(
                     started.test_count,
                     passed,
@@ -340,7 +515,30 @@ fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
             ("test", "started" | "ignored" | "ok" | "failed") => {
                 let name = required_string(&value, "name", line_number)?;
                 let (key, test, attempts) = test_identity(name, line_number)?;
-                let suite = open_suites.get(&key).ok_or_else(|| {
+                let mut candidates = Vec::new();
+                for identity in open_suites
+                    .keys()
+                    .filter(|suite| suite.test_name_key() == key)
+                {
+                    let eligible = match inventory {
+                        Some(inventory) => inventory
+                            .suite(identity)?
+                            .testcases
+                            .get(&test)
+                            .is_some_and(|case| case.eligible(event)),
+                        None => true,
+                    };
+                    if eligible {
+                        candidates.push(identity.clone());
+                    }
+                }
+                if candidates.len() != 1 {
+                    return Err(format!(
+                        "nextest-test-results line {line_number}: test {test:?} event {event:?} names suite {key:?} without one unambiguous open typed suite ({} eligible matches)",
+                        candidates.len()
+                    ));
+                }
+                let suite = open_suites.get_mut(&candidates[0]).ok_or_else(|| {
                     format!(
                         "nextest-test-results line {line_number}: test names suite {key:?} without one unambiguous open typed suite"
                     )
@@ -348,6 +546,14 @@ fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
                 if matches!(event, "started" | "ignored") {
                     continue;
                 }
+                let episode_count = if event == "ok" {
+                    &mut suite.passed
+                } else {
+                    &mut suite.failed
+                };
+                *episode_count = episode_count
+                    .checked_add(1)
+                    .ok_or("nextest-test-results: episode result count overflows u64")?;
                 let id = displayed_test_id(
                     &suite.identity.package,
                     &suite.identity.binary,
@@ -525,10 +731,13 @@ fn reconcile_cpu_attempts(
     Ok(CpuReport::new(run_id, actual.into_values().collect()))
 }
 
-fn parse_events(path: &Path) -> Result<ParsedEvents, String> {
+fn parse_events(path: &Path, inventory: Option<&EventInventory>) -> Result<ParsedEvents, String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("nextest-test-results-read {}: {error}", path.display()))?;
-    parse_event_text(&text)
+    match inventory {
+        Some(inventory) => parse_event_text_with_inventory(&text, Some(inventory)),
+        None => parse_event_text(&text),
+    }
 }
 
 fn parse_u64(value: String, name: &str) -> Result<u64, String> {
@@ -608,13 +817,11 @@ fn parse_skip_sidecar(bytes: &[u8]) -> Result<Vec<SkipMarker>, String> {
     }
     if !bytes.ends_with(b"\n") {
         return Err(
-            "nextest-test-results: skip sidecar ends in a truncated line; refusing to guess"
-                .into(),
+            "nextest-test-results: skip sidecar ends in a truncated line; refusing to guess".into(),
         );
     }
-    let text = std::str::from_utf8(bytes).map_err(|error| {
-        format!("nextest-test-results: skip sidecar is not UTF-8: {error}")
-    })?;
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| format!("nextest-test-results: skip sidecar is not UTF-8: {error}"))?;
     let mut markers: Vec<SkipMarker> = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let line_number = index + 1;
@@ -643,7 +850,10 @@ fn parse_skip_sidecar(bytes: &[u8]) -> Result<Vec<SkipMarker>, String> {
                 "nextest-test-results: skip sidecar line {line_number} has an empty or untrimmed reason"
             ));
         }
-        if markers.iter().any(|marker: &SkipMarker| marker.name == name) {
+        if markers
+            .iter()
+            .any(|marker: &SkipMarker| marker.name == name)
+        {
             return Err(format!(
                 "nextest-test-results: skip sidecar names test {name:?} twice; refusing to guess"
             ));
@@ -737,7 +947,10 @@ fn apply_skip_markers(
             .iter()
             .enumerate()
             .filter(|(_, result)| {
-                let test = result.id.rsplit_once('$').map_or(result.id.as_str(), |(_, test)| test);
+                let test = result
+                    .id
+                    .rsplit_once('$')
+                    .map_or(result.id.as_str(), |(_, test)| test);
                 test == marker.name || test.ends_with(&format!("::{}", marker.name))
             })
             .map(|(index, _)| index)
@@ -818,7 +1031,9 @@ fn run() -> Result<(), ProducerError> {
             .next()
             .ok_or_else(|| "nextest-test-results missing NEXTEST_INVENTORY_JSON".to_string())?;
         if args.next().is_some() {
-            return Err("nextest-test-results listed-count mode received too many arguments".into());
+            return Err(
+                "nextest-test-results listed-count mode received too many arguments".into(),
+            );
         }
         let bytes = fs::read(&inventory)
             .map_err(|error| format!("cannot read nextest inventory {inventory}: {error}"))?;
@@ -841,7 +1056,17 @@ fn run() -> Result<(), ProducerError> {
         let map = BinaryMap::from_nextest_inventory(&bytes)?;
         return write_binary_map_atomic(Path::new(&output), &map).map_err(ProducerError::from);
     }
-    let events = first;
+    let (events, inventory_path) = if first == "--inventory" {
+        let inventory = args.next().ok_or(
+            "nextest-test-results --inventory requires NEXTEST_INVENTORY_JSON before EVENTS_JSONL",
+        )?;
+        let events = args
+            .next()
+            .ok_or("nextest-test-results missing EVENTS_JSONL")?;
+        (events, Some(inventory))
+    } else {
+        (first, None)
+    };
     let status = parse_u64(
         args.next()
             .ok_or_else(|| "nextest-test-results missing NEXTEST_STATUS".to_string())?,
@@ -863,7 +1088,18 @@ fn run() -> Result<(), ProducerError> {
             "nextest-test-results requires ATTEMPT_RECORD_DIR, BINARY_MAP, and CPU_REPORT_OR_DASH together".into(),
         );
     }
-    let parsed = parse_events(Path::new(&events))?;
+    let binary_map = binary_map
+        .as_deref()
+        .map(|path| read_binary_map(Path::new(path)))
+        .transpose()?;
+    let inventory = inventory_path
+        .map(|path| {
+            let bytes = fs::read(&path)
+                .map_err(|error| format!("cannot read nextest inventory {path}: {error}"))?;
+            EventInventory::from_bytes(&bytes, binary_map.as_ref())
+        })
+        .transpose()?;
+    let parsed = parse_events(Path::new(&events), inventory.as_ref())?;
     let schema_5 = schema_5_opted_in()?;
     let markers = read_skip_markers()?;
     if !markers.is_empty() && !schema_5 {
@@ -874,7 +1110,6 @@ fn run() -> Result<(), ProducerError> {
     }
     let cpu_report = match (attempt_records, binary_map, cpu_report) {
         (Some(records), Some(binary_map), Some(output)) => {
-            let binary_map = read_binary_map(Path::new(&binary_map))?;
             let report = reconcile_cpu_attempts(&parsed, Path::new(&records), &binary_map)?;
             Some((report, output))
         }
@@ -981,6 +1216,686 @@ mod tests {
 
     static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
 
+    // Entirely synthetic controls, not a reconstruction of a lost event stream.
+    mod inventory_controls {
+        use serde_json::json;
+
+        use super::*;
+
+        fn case(ignored: bool, reason: Option<&str>) -> Value {
+            let filter = match reason {
+                Some(reason) => json!({"status":"mismatch", "reason":reason}),
+                None => json!({"status":"matches"}),
+            };
+            json!({"ignored":ignored, "filter-match":filter})
+        }
+
+        fn inventory(lib: Value, bin: Value) -> Value {
+            json!({"rust-suites": {
+                "pkg": {"package-name":"pkg", "binary-id":"pkg", "binary-name":"same",
+                    "kind":"lib", "binary-path":"/synthetic/lib", "testcases":lib},
+                "pkg::bin/same": {"package-name":"pkg", "binary-id":"pkg::bin/same", "binary-name":"same",
+                    "kind":"bin", "binary-path":"/synthetic/bin", "testcases":bin}
+            }})
+        }
+
+        fn loaded(value: &Value) -> EventInventory {
+            let bytes = serde_json::to_vec(value).unwrap();
+            let cpu_map = BinaryMap::from_nextest_inventory(&bytes).unwrap();
+            EventInventory::from_bytes(&bytes, Some(&cpu_map)).unwrap()
+        }
+
+        fn start(kind: &str, count: u64) -> Value {
+            json!({"type":"suite", "event":"started", "test_count":count,
+                "nextest":{"crate":"pkg", "test_binary":"same", "kind":kind}})
+        }
+
+        fn end(kind: &str, passed: u64, failed: u64, ignored: u64, filtered: u64) -> Value {
+            json!({"type":"suite", "event":if failed == 0 {"ok"} else {"failed"},
+                "passed":passed, "failed":failed, "ignored":ignored, "filtered_out":filtered,
+                "nextest":{"crate":"pkg", "test_binary":"same", "kind":kind}})
+        }
+
+        fn event(event: &str, test: &str) -> Value {
+            json!({"type":"test", "event":event, "name":format!("pkg::same${test}")})
+        }
+
+        fn text(rows: &[Value]) -> String {
+            rows.iter().map(|row| format!("{row}\n")).collect()
+        }
+
+        fn parse(rows: &[Value], inventory: &EventInventory) -> Result<ParsedEvents, String> {
+            parse_event_text_with_inventory(&text(rows), Some(inventory))
+        }
+
+        fn refuses(rows: &[Value], inventory: &EventInventory, message: &str) {
+            let error = parse(rows, inventory).unwrap_err();
+            assert!(error.contains(message), "expected {message:?}, got {error}");
+        }
+
+        #[test]
+        fn eight_executions_and_one_distinct_ignored_case_in_either_kind_and_order() {
+            // The examined lib8/binignored1 shape, with synthetic names and
+            // terminal populations, not the lost run's raw events.
+            let mut executing = json!({"filtered":case(false, Some("expression"))});
+            for number in 0..8 {
+                executing[format!("runs_{number}")] = case(false, None);
+            }
+            let skipped = json!({"skip":case(true, Some("ignored"))});
+            for reverse_kinds in [false, true] {
+                let (run_kind, skip_kind) = if reverse_kinds {
+                    ("bin", "lib")
+                } else {
+                    ("lib", "bin")
+                };
+                let inv = loaded(&if reverse_kinds {
+                    inventory(skipped.clone(), executing.clone())
+                } else {
+                    inventory(executing.clone(), skipped.clone())
+                });
+                for reverse_starts in [false, true] {
+                    for reverse_ends in [false, true] {
+                        let mut rows = vec![start(run_kind, 8), start(skip_kind, 1)];
+                        if reverse_starts {
+                            rows.swap(0, 1);
+                        }
+                        rows.push(event("started", "skip"));
+                        // Conservative synthetic publication: a producer may
+                        // leave this ignored row queued until a test finishes.
+                        rows.push(event("ignored", "skip"));
+                        for number in 0..8 {
+                            rows.push(event("started", &format!("runs_{number}")));
+                            rows.push(event("ok", &format!("runs_{number}")));
+                        }
+                        let mut ends =
+                            [end(run_kind, 8, 0, 0, 1), end(skip_kind, 0, 0, 1, u64::MAX)];
+                        if reverse_ends {
+                            ends.swap(0, 1);
+                        }
+                        rows.extend(ends);
+                        let parsed = parse(&rows, &inv).unwrap();
+                        assert_eq!((parsed.executed_tests, parsed.filtered_tests), (8, 2));
+                        assert_eq!(parsed.results.len(), 8);
+                        let scratch = Scratch::new();
+                        for (number, expected) in parsed.expected_attempts.iter().enumerate() {
+                            assert_eq!(expected.suite.kind, run_kind);
+                            assert_eq!(expected.test, format!("runs_{number}"));
+                            let cpu_id = if reverse_kinds {
+                                "pkg::bin/same"
+                            } else {
+                                "pkg"
+                            };
+                            write_record(
+                                &scratch.0,
+                                &identified_attempt(
+                                    "pkg",
+                                    cpu_id,
+                                    &expected.test,
+                                    1,
+                                    AttemptCompletion::Exit { code: 0 },
+                                ),
+                            );
+                        }
+                        assert_eq!(
+                            reconcile_cpu_attempts(&parsed, &scratch.0, &inv.binary_map)
+                                .unwrap()
+                                .attempts
+                                .len(),
+                            8
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn zero_count_started_under_ignored_and_complete_empty_overlaps() {
+            let inv = loaded(&inventory(
+                json!({"ordinary":case(false, Some("ignored"))}),
+                json!({}),
+            ));
+            let mut rows = vec![
+                start("lib", 0),
+                start("bin", 0),
+                event("started", "ordinary"),
+                end("bin", 0, 0, 0, 0),
+                // One filtered ordinary case plus the skipped-event running
+                // underflow wraps back to zero in the examined producer.
+                end("lib", 0, 0, 0, 0),
+            ];
+            let parsed = parse(&rows, &inv).unwrap();
+            assert_eq!((parsed.executed_tests, parsed.filtered_tests), (0, 0));
+            assert!(parsed.results.is_empty());
+            // Separately labelled conservative synthetic ignored-row case;
+            // not a claim that finalize flushes a producer's ignored buffer.
+            rows.insert(3, event("ignored", "ordinary"));
+            assert_eq!(parse(&rows, &inv).unwrap(), parsed);
+            refuses(
+                &[start("lib", 0), event("ok", "ordinary")],
+                &inv,
+                "0 eligible matches",
+            );
+            let empty = loaded(&inventory(
+                json!({"a":case(false, Some("expression")), "b":case(false, Some("expression")), "c":case(false, Some("expression"))}),
+                json!({"a":case(false, Some("expression")), "b":case(false, Some("expression"))}),
+            ));
+            let rows = [
+                start("lib", 0),
+                start("bin", 0),
+                end("bin", 0, 0, 0, 2),
+                end("lib", 0, 0, 0, 3),
+            ];
+            assert_eq!(parse(&rows, &empty).unwrap().filtered_tests, 5);
+            assert!(
+                parse_event_text(&text(&rows))
+                    .unwrap_err()
+                    .contains("ambiguous")
+            );
+            refuses(
+                &rows[..2],
+                &empty,
+                "before open suites published terminal events",
+            );
+        }
+
+        #[test]
+        fn positive_disjoint_execution_names_and_shared_ineligible_names() {
+            let inv = loaded(&inventory(
+                json!({"left":case(false, None), "right":case(false, Some("expression"))}),
+                json!({"right":case(false, None), "left":case(false, Some("partition"))}),
+            ));
+            let rows = [
+                start("lib", 1),
+                start("bin", 1),
+                event("ok", "right"),
+                event("ok", "left"),
+                end("lib", 1, 0, 0, 1),
+                end("bin", 1, 0, 0, 1),
+            ];
+            let parsed = parse(&rows, &inv).unwrap();
+            assert_eq!((parsed.executed_tests, parsed.filtered_tests), (2, 2));
+            assert_eq!(
+                parsed.results,
+                vec![
+                    TestResult::new("pkg$left".into(), true, 1).unwrap(),
+                    TestResult::new("pkg::same$right".into(), true, 1).unwrap(),
+                ]
+            );
+        }
+
+        #[test]
+        fn ambiguity_refuses_at_start_even_without_a_test_row() {
+            for right_case in [case(false, None), case(true, Some("ignored"))] {
+                let inv = loaded(&inventory(
+                    json!({"shared":case(false, None)}),
+                    json!({"shared":right_case}),
+                ));
+                refuses(&[start("lib", 1), start("bin", 1)], &inv, "ambiguous");
+            }
+            let zero = loaded(&inventory(
+                json!({"shared":case(false, Some("ignored"))}),
+                json!({"shared":case(false, Some("ignored"))}),
+            ));
+            refuses(&[start("lib", 0), start("bin", 0)], &zero, "ambiguous");
+            for count in [0, 1] {
+                let cases = if count == 0 {
+                    json!({})
+                } else {
+                    json!({"case":case(false, None)})
+                };
+                let inv = loaded(&inventory(cases, json!({})));
+                refuses(
+                    &[start("lib", count), start("lib", count)],
+                    &inv,
+                    "duplicate active suite identity",
+                );
+            }
+        }
+
+        #[test]
+        fn event_specific_membership_and_closed_suite_never_fall_back_to_sibling() {
+            for kind in ["started", "ignored", "ok", "failed"] {
+                let selected = if kind == "ignored" {
+                    case(true, Some("ignored"))
+                } else {
+                    case(false, None)
+                };
+                let inv = loaded(&inventory(
+                    json!({"case":selected}),
+                    json!({"case":case(false, Some("expression"))}),
+                ));
+                let ignored = u64::from(kind == "ignored");
+                refuses(
+                    &[
+                        start("lib", 1),
+                        start("bin", 0),
+                        end("lib", 0, 0, ignored, 0),
+                        event(kind, "case"),
+                    ],
+                    &inv,
+                    "0 eligible matches",
+                );
+            }
+            let inv = loaded(&inventory(
+                json!({
+                    "run":case(false, None), "skip":case(true, Some("ignored")),
+                    "filter":case(false, Some("expression"))
+                }),
+                json!({}),
+            ));
+            for (kind, name) in [
+                ("ok", "skip"),
+                ("failed", "skip"),
+                ("ok", "filter"),
+                ("failed", "filter"),
+                ("started", "filter"),
+                ("ignored", "run"),
+                ("started", "renamed"),
+                ("ok", "run#bogus"),
+            ] {
+                refuses(
+                    &[start("lib", 2), event(kind, name)],
+                    &inv,
+                    "0 eligible matches",
+                );
+            }
+            for suffix in ["0", "18446744073709551616"] {
+                refuses(
+                    &[start("lib", 2), event("ok", &format!("run#{suffix}"))],
+                    &inv,
+                    "retry count",
+                );
+            }
+        }
+
+        #[test]
+        fn malformed_classification_and_inventory_never_enable_fallback() {
+            let original = inventory(json!({"case":case(false, None)}), json!({}));
+            for bad_case in [
+                json!({}),
+                json!({"ignored":false}),
+                json!({"ignored":"false", "filter-match":{"status":"matches"}}),
+                json!({"ignored":false, "filter-match":{"status":"unknown"}}),
+                json!({"ignored":false, "filter-match":{"status":"mismatch"}}),
+                json!({"ignored":false, "filter-match":{"status":"mismatch", "reason":false}}),
+                json!({"ignored":false, "filter-match":{"status":"mismatch", "reason":"unknown"}}),
+                json!({"ignored":false, "filter-match":{"status":"matches", "reason":"ignored"}}),
+            ] {
+                let mut bad = original.clone();
+                bad["rust-suites"]["pkg"]["testcases"]["case"] = bad_case;
+                assert!(
+                    EventInventory::from_bytes(&serde_json::to_vec(&bad).unwrap(), None).is_err(),
+                    "{bad}"
+                );
+            }
+            for bad in [
+                json!({}),
+                json!({"rust-suites":[]}),
+                json!({"rust-suites":{"pkg":{}}}),
+            ] {
+                assert!(
+                    EventInventory::from_bytes(&serde_json::to_vec(&bad).unwrap(), None).is_err()
+                );
+            }
+            assert!(EventInventory::from_bytes(b"not JSON", None).is_err());
+            let mut missing = original.clone();
+            missing["rust-suites"]["pkg"]
+                .as_object_mut()
+                .unwrap()
+                .remove("testcases");
+            assert!(
+                EventInventory::from_bytes(&serde_json::to_vec(&missing).unwrap(), None).is_err()
+            );
+            let empty_name = inventory(json!({"":case(false, None)}), json!({}));
+            assert!(
+                EventInventory::from_bytes(&serde_json::to_vec(&empty_name).unwrap(), None)
+                    .unwrap_err()
+                    .contains("nonempty")
+            );
+            // All known other mismatch reasons are ineligible. Unknown future
+            // reasons must refuse instead of silently removing a candidate.
+            for reason in [
+                "string",
+                "expression",
+                "partition",
+                "default-filter",
+                "not-benchmark",
+                "rerun-already-passed",
+            ] {
+                let inv = loaded(&inventory(
+                    json!({"case":case(false, Some(reason))}),
+                    json!({}),
+                ));
+                refuses(
+                    &[start("lib", 0), event("started", "case")],
+                    &inv,
+                    "0 eligible matches",
+                );
+            }
+        }
+
+        #[test]
+        fn inventory_projection_must_equal_existing_cpu_map() {
+            let original = inventory(json!({"case":case(false, None)}), json!({}));
+            let map = loaded(&original).binary_map;
+            for (field, value) in [
+                ("package-name", "other"),
+                ("binary-name", "other"),
+                ("kind", "test"),
+                ("binary-path", "/synthetic/substituted"),
+                ("binary-id", "other"),
+            ] {
+                let mut bad = original.clone();
+                bad["rust-suites"]["pkg"][field] = json!(value);
+                assert!(
+                    EventInventory::from_bytes(&serde_json::to_vec(&bad).unwrap(), Some(&map))
+                        .is_err(),
+                    "{field}"
+                );
+            }
+            let mut duplicate = original.clone();
+            duplicate["rust-suites"]["pkg::bin/same"]["kind"] = json!("lib");
+            assert!(
+                EventInventory::from_bytes(&serde_json::to_vec(&duplicate).unwrap(), None)
+                    .unwrap_err()
+                    .contains("ambiguous")
+            );
+            let mut invalid_map = map.clone();
+            invalid_map.schema += 1;
+            assert!(
+                EventInventory::from_bytes(
+                    &serde_json::to_vec(&original).unwrap(),
+                    Some(&invalid_map)
+                )
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn start_and_ignored_counts_must_match_but_inventory_never_supplies_results() {
+            let inv = loaded(&inventory(
+                json!({"run":case(false, None), "skip":case(true, Some("expression"))}),
+                json!({}),
+            ));
+            refuses(
+                &[start("lib", 1)],
+                &inv,
+                "start count 1 disagrees with inventory count 2",
+            );
+            refuses(
+                &[start("lib", 2), end("lib", 0, 0, 0, 0)],
+                &inv,
+                "ignored count 0 disagrees",
+            );
+            let parsed = parse(&[start("lib", 2), end("lib", 0, 0, 1, 1)], &inv).unwrap();
+            assert_eq!((parsed.executed_tests, parsed.filtered_tests), (0, 2));
+            assert!(parsed.expected_attempts.is_empty());
+        }
+
+        #[test]
+        fn compensating_cross_suite_and_cross_episode_outcomes_refuse() {
+            let inv = loaded(&inventory(
+                json!({"left":case(false, None)}),
+                json!({"right":case(false, None)}),
+            ));
+            let valid = vec![
+                start("lib", 1),
+                start("bin", 1),
+                event("ok", "left"),
+                event("failed", "right"),
+                end("lib", 1, 0, 0, 0),
+                end("bin", 0, 1, 0, 0),
+            ];
+            assert_eq!(parse(&valid, &inv).unwrap().executed_tests, 2);
+            // Same aggregate totals, swapped per-suite outcomes.
+            let mut swapped = valid.clone();
+            swapped[4] = end("lib", 0, 1, 0, 0);
+            swapped[5] = end("bin", 1, 0, 0, 0);
+            refuses(&swapped, &inv, "passed/failed");
+            let mut stolen = valid.clone();
+            stolen.remove(3);
+            stolen[3] = end("lib", 0, 0, 0, 0);
+            stolen[4] = end("bin", 1, 0, 0, 0);
+            refuses(&stolen, &inv, "episode");
+            // Also protect successive episodes of the same typed identity,
+            // including the existing no-inventory path.
+            let recaps = [
+                start("lib", 1),
+                event("ok", "left"),
+                end("lib", 0, 0, 0, 0),
+                start("lib", 1),
+                end("lib", 1, 0, 0, 0),
+            ];
+            assert!(
+                parse_event_text(&text(&recaps))
+                    .unwrap_err()
+                    .contains("episode")
+            );
+            refuses(&recaps, &inv, "episode");
+        }
+
+        #[test]
+        fn wrong_typed_terminals_duplicates_and_missing_terminals_refuse() {
+            let inv = loaded(&inventory(json!({}), json!({})));
+            for (field, value) in [
+                ("crate", "other"),
+                ("test_binary", "other"),
+                ("kind", "test"),
+            ] {
+                let mut terminal = end("lib", 0, 0, 0, 0);
+                terminal["nextest"][field] = json!(value);
+                assert!(parse(&[start("lib", 0), start("bin", 0), terminal], &inv).is_err());
+            }
+            refuses(&[end("lib", 0, 0, 0, 0)], &inv, "ended before");
+            refuses(
+                &[
+                    start("lib", 0),
+                    end("lib", 0, 0, 0, 0),
+                    end("lib", 0, 0, 0, 0),
+                ],
+                &inv,
+                "ended before",
+            );
+            refuses(
+                &[start("lib", 0), start("bin", 0), end("lib", 0, 0, 0, 0)],
+                &inv,
+                "before open suites",
+            );
+            let inv = loaded(&inventory(json!({"run":case(false, None)}), json!({})));
+            refuses(
+                &[start("lib", 1), event("ok", "run"), event("ok", "run#2")],
+                &inv,
+                "duplicate terminal test id",
+            );
+        }
+
+        #[test]
+        fn partial_recaps_selected_ignored_and_wrapping_keep_exact_population_math() {
+            let inv = loaded(&inventory(
+                json!({"one":case(true, None), "two":case(true, None),
+                "three":case(true, Some("expression"))}),
+                json!({}),
+            ));
+            let rows = [
+                start("lib", 3),
+                start("bin", 0),
+                event("started", "one"),
+                end("lib", 0, 0, 3, 0),
+                start("lib", 3),
+                event("ok", "one"),
+                event("ok", "two#2"),
+                end("lib", 2, 0, 3, u64::MAX - 1),
+                end("bin", 0, 0, 0, 4),
+            ];
+            let parsed = parse(&rows, &inv).unwrap();
+            assert_eq!((parsed.executed_tests, parsed.filtered_tests), (2, 5));
+            assert_eq!(parsed.results[1].attempts, 2);
+            let mut malformed = rows.clone();
+            malformed[7]["filtered_out"] = json!(u64::MAX - 3);
+            refuses(&malformed, &inv, "overflows u64");
+            // Exact all-ignored and smaller wrapped-deficit sentinels.
+            for filtered in [u64::MAX - 2, u64::MAX] {
+                let parsed = parse(
+                    &[
+                        start("lib", 3),
+                        start("bin", 0),
+                        end("lib", 0, 0, 3, filtered),
+                        end("bin", 0, 0, 0, 0),
+                    ],
+                    &inv,
+                )
+                .unwrap();
+                assert_eq!((parsed.executed_tests, parsed.filtered_tests), (0, 3));
+            }
+            // Inventory totals cannot replace the typed recap population.
+            let ordinary = loaded(&inventory(json!({"one":case(false, None)}), json!({})));
+            assert_eq!(
+                parse(
+                    &[start("lib", 1), event("ok", "one"), end("lib", 1, 0, 0, 7)],
+                    &ordinary
+                )
+                .unwrap()
+                .filtered_tests,
+                7
+            );
+        }
+
+        #[test]
+        fn checked_arithmetic_and_population_underflow_remain_refusals() {
+            assert!(
+                suite_population(1, u64::MAX, 1, 0, 0, 1)
+                    .unwrap_err()
+                    .contains("overflows")
+            );
+            assert!(
+                suite_population(1, 2, 0, 1, u64::MAX, 1)
+                    .unwrap_err()
+                    .contains("inconsistent")
+            );
+            assert!(
+                suite_population(1, 0, 0, u64::MAX, 2, 1)
+                    .unwrap_err()
+                    .contains("overflows")
+            );
+            let rows = [
+                start("lib", 1),
+                event("ok", "one"),
+                end("lib", 1, 0, 0, 0),
+                start("lib", 1),
+                event("ok", "two"),
+                end("lib", 1, 0, 0, 0),
+            ];
+            assert!(
+                parse_event_text(&text(&rows))
+                    .unwrap_err()
+                    .contains("exceeding its typed population")
+            );
+        }
+
+        #[test]
+        fn retries_keep_exact_cpu_identity_and_refuse_missing_or_different_outcomes() {
+            let inv = loaded(&inventory(json!({"run":case(false, None)}), json!({})));
+            let parsed = parse(
+                &[
+                    start("lib", 1),
+                    start("bin", 0),
+                    event("ok", "run#2"),
+                    end("bin", 0, 0, 0, 0),
+                    end("lib", 1, 0, 0, 0),
+                ],
+                &inv,
+            )
+            .unwrap();
+            let scratch = Scratch::new();
+            write_record(
+                &scratch.0,
+                &identified_attempt("pkg", "pkg", "run", 1, AttemptCompletion::Exit { code: 23 }),
+            );
+            assert!(
+                reconcile_cpu_attempts(&parsed, &scratch.0, &inv.binary_map)
+                    .unwrap_err()
+                    .contains("missing=")
+            );
+            write_record(
+                &scratch.0,
+                &identified_attempt("pkg", "pkg", "run", 2, AttemptCompletion::Exit { code: 0 }),
+            );
+            assert_eq!(
+                reconcile_cpu_attempts(&parsed, &scratch.0, &inv.binary_map)
+                    .unwrap()
+                    .attempts
+                    .len(),
+                2
+            );
+            let wrong = Scratch::new();
+            for number in [1, 2] {
+                write_record(
+                    &wrong.0,
+                    &identified_attempt(
+                        "pkg",
+                        "pkg",
+                        "run",
+                        number,
+                        AttemptCompletion::Exit { code: 0 },
+                    ),
+                );
+            }
+            assert!(
+                reconcile_cpu_attempts(&parsed, &wrong.0, &inv.binary_map)
+                    .unwrap_err()
+                    .contains("disagree on whether")
+            );
+        }
+
+        #[test]
+        fn stress_identity_is_exact_and_remains_unsupported_for_cpu() {
+            let inv = loaded(&inventory(
+                json!({"run":case(false, None), "skip":case(true, Some("ignored"))}),
+                json!({}),
+            ));
+            let mut rows = Vec::new();
+            for index in [1, 2] {
+                let mut row = start("lib", 2);
+                row["nextest"]["stress_index"] = json!(index);
+                rows.push(row);
+            }
+            for index in [1, 2] {
+                rows.push(json!({"type":"test", "event":"ok", "name":format!("pkg::same@stress-{index}$run")}));
+                let mut row = end("lib", 1, 0, 1, 0);
+                row["nextest"]["stress_index"] = json!(index);
+                rows.push(row);
+            }
+            let parsed = parse(&rows, &inv).unwrap();
+            assert_eq!((parsed.executed_tests, parsed.filtered_tests), (2, 2));
+            assert_eq!(parsed.results[0].id, "pkg@stress-1$run");
+            assert_eq!(parsed.results[1].id, "pkg@stress-2$run");
+            let scratch = Scratch::new();
+            assert!(
+                reconcile_cpu_attempts(&parsed, &scratch.0, &inv.binary_map)
+                    .unwrap_err()
+                    .contains("does not support stress_index")
+            );
+            for bad in [json!(-1), json!("1"), Value::Null] {
+                let mut mutated = rows.clone();
+                mutated[0]["nextest"]["stress_index"] = bad;
+                refuses(&mutated, &inv, "stress_index must be an unsigned integer");
+            }
+            let mut wrong_suffix = rows.clone();
+            wrong_suffix[2]["name"] = json!("pkg::same@stress-3$run");
+            refuses(&wrong_suffix, &inv, "0 eligible matches");
+            let mut wrong_terminal = rows.clone();
+            wrong_terminal[3]["nextest"]["stress_index"] = json!(3);
+            refuses(&wrong_terminal, &inv, "ended before");
+            // Queued ignored rows omit stress in the examined generator.
+            // Refuse that omission; never map it onto a stress suite.
+            refuses(
+                &[rows[0].clone(), event("ignored", "skip")],
+                &inv,
+                "0 eligible matches",
+            );
+        }
+    }
+
     #[test]
     fn only_typed_publication_io_uses_no_result_status() {
         use std::io;
@@ -1057,10 +1972,7 @@ mod tests {
         // A truncated final line, a duplicate, a missing tab, an empty
         // reason, and an overlong line each refuse rather than guess.
         assert!(parse_skip_sidecar(b"HERMIT-TEST-SKIP: a\tb").is_err());
-        assert!(parse_skip_sidecar(
-            b"HERMIT-TEST-SKIP: a\tb\nHERMIT-TEST-SKIP: a\tc\n"
-        )
-        .is_err());
+        assert!(parse_skip_sidecar(b"HERMIT-TEST-SKIP: a\tb\nHERMIT-TEST-SKIP: a\tc\n").is_err());
         assert!(parse_skip_sidecar(b"HERMIT-TEST-SKIP: a b\n").is_err());
         assert!(parse_skip_sidecar(b"HERMIT-TEST-SKIP: a\t\n").is_err());
         assert!(parse_skip_sidecar(b"a\tb\n").is_err());
@@ -1104,16 +2016,20 @@ mod tests {
             name: "fails".into(),
             reason: "no /dev/kvm on this host".into(),
         };
-        assert!(apply_skip_markers(rows.clone(), &[launder])
-            .unwrap_err()
-            .contains("launder"));
+        assert!(
+            apply_skip_markers(rows.clone(), &[launder])
+                .unwrap_err()
+                .contains("launder")
+        );
         let absent = SkipMarker {
             name: "never_ran".into(),
             reason: "no /dev/kvm on this host".into(),
         };
-        assert!(apply_skip_markers(rows.clone(), &[absent])
-            .unwrap_err()
-            .contains("matches 0"));
+        assert!(
+            apply_skip_markers(rows.clone(), &[absent])
+                .unwrap_err()
+                .contains("matches 0")
+        );
         let ambiguous_rows = vec![
             TestResult::new("alpha::tool$case".into(), true, 1).unwrap(),
             TestResult::new("beta::tool$case".into(), true, 1).unwrap(),
@@ -1122,9 +2038,11 @@ mod tests {
             name: "case".into(),
             reason: "no /dev/kvm on this host".into(),
         };
-        assert!(apply_skip_markers(ambiguous_rows, &[ambiguous])
-            .unwrap_err()
-            .contains("matches 2"));
+        assert!(
+            apply_skip_markers(ambiguous_rows, &[ambiguous])
+                .unwrap_err()
+                .contains("matches 2")
+        );
     }
 
     #[test]
@@ -1905,9 +2823,11 @@ mod tests {
         let unknown = String::from_utf8(inventory.to_vec())
             .unwrap()
             .replace("\"matches\"", "\"surprise\"");
-        assert!(listed_count(unknown.as_bytes())
-            .unwrap_err()
-            .contains("unknown Nextest filter status"));
+        assert!(
+            listed_count(unknown.as_bytes())
+                .unwrap_err()
+                .contains("unknown Nextest filter status")
+        );
     }
 
     #[test]
