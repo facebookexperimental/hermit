@@ -681,11 +681,13 @@ pub struct Config {
     #[clap(skip)]
     pub signal_delivery_check_fatal: bool,
 
-    /// `--strict`'s binder policy. A run that makes a binder call is refused
-    /// unless it replays a preemption record that stores where each
-    /// backgrounded call rejoined; `BINDER_FREEZE` and
-    /// `BINDER_SET_CONTEXT_MGR[_EXT]` are refused even then. `hermit run
-    /// --strict` sets it; nothing else does.
+    /// `--strict`'s binder policy: the run never holds a binder descriptor,
+    /// in a fresh run and in a replay alike, as binder reply payloads are not
+    /// recorded (<https://github.com/rrnewton/hermit/issues/5124>). One, or
+    /// a descriptor whose identity cannot be read, is refused where it
+    /// arrives (an open, a receipt, the run's start), and every binder
+    /// request on a descriptor that may be one is refused.
+    /// `hermit run --strict` sets it; nothing else does.
     ///
     /// The host sets it. It has no legacy key: [`to_legacy_backend_json`]
     /// leaves it out and [`from_legacy_backend_json`] reads it back as false.

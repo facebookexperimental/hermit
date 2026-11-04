@@ -4229,6 +4229,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         {
             return Err(reverie::Error::Tool(anyhow::anyhow!(refusal)));
         }
+        // Under --strict on KVM, where no guest descriptor's identity can be
+        // read, a host that offers binder in any form refuses the run before
+        // it starts, a temporary conservative policy
+        // (`syscalls::binder::kvm_strict_binder_admission`).
+        if let Some(refusal) = crate::syscalls::binder::kvm_strict_binder_admission(config) {
+            crate::scheduler::exit_on_scheduler_refusal(&refusal);
+        }
         T::facility_admission(config)
     }
 
@@ -5724,6 +5731,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         self.post_handler_hook_observed(guest, CheckIn::Event, boundary_token)
             .await;
+        // A --strict run never holds a binder descriptor: the run's first
+        // process is checked for one it was started with, before the guest's
+        // first instruction (`Self::refuse_binder_held_at_start`).
+        if guest.is_root_process()
+            && guest.tid() == guest.pid()
+            && !guest.thread_state().past_global_first_execve
+        {
+            Box::pin(self.refuse_binder_held_at_start(guest)).await;
+        }
         Ok(())
     }
 
@@ -7876,14 +7892,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
             // With asynchronous exit completion, a descriptor that would make this
             // guest serve another guest's exit ends the run before anything
-            // observes the result (crate::exit_dependencies).
+            // observes the result (crate::exit_dependencies), as a binder
+            // descriptor does under --strict
+            // (`Detcore::refuse_strict_binder_descriptors`).
             // It reads a received message's descriptors from the call's header,
             // so it reads it as the kernel's view holds it (`EntryImport`).
             // Boxed: it keeps the view across an await, which would otherwise
             // grow every syscall's future (`hot_path_futures_stay_small`).
             if let Ok(ret) = res
                 && let Err(error) =
-                    Box::pin(self.refuse_exit_dependencies_in_view(guest, &call, ret)).await
+                    Box::pin(self.refuse_arrived_descriptors_in_view(guest, &call, ret)).await
             {
                 return Box::pin(self.complete_after_posthook(
                     guest,

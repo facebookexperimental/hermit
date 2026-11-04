@@ -182,24 +182,66 @@ pub fn held_exit_dependency(
     })
 }
 
+/// The descriptors `call`, which returned `ret`, gave the guest, and how:
+/// from an open (`open`, `creat`, which opens an existing device node as
+/// `open` does, `openat`, `openat2`, `open_by_handle_at`), through
+/// `SCM_RIGHTS` (`recvmsg`, `recvmmsg`) or through `pidfd_getfd`. `None` for
+/// a failed call or any other call. A descriptor a `dup`, `fcntl`, `fork` or
+/// `exec` carries over names a description that already arrived.
+pub(crate) fn arrived_descriptors<M: reverie::syscalls::MemoryAccess>(
+    memory: &M,
+    call: &Syscall,
+    ret: i64,
+) -> Option<(Vec<RawFd>, &'static str)> {
+    if ret < 0 {
+        return None;
+    }
+    match call {
+        Syscall::Openat(_) => Some((vec![ret as RawFd], "opened")),
+        #[cfg(target_arch = "x86_64")]
+        Syscall::Open(_) => Some((vec![ret as RawFd], "opened")),
+        #[cfg(target_arch = "x86_64")]
+        _ if call.number() == Sysno::creat => Some((vec![ret as RawFd], "opened")),
+        _ if call.number() == Sysno::openat2 || call.number() == Sysno::open_by_handle_at => {
+            Some((vec![ret as RawFd], "opened"))
+        }
+        _ if call.number() == Sysno::pidfd_getfd => {
+            Some((vec![ret as RawFd], "received through pidfd_getfd"))
+        }
+        Syscall::Recvmsg(_) | Syscall::Recvmmsg(_) => delivered_descriptors(memory, call, ret)
+            .map(|received| (received, "received through SCM_RIGHTS")),
+        _ => None,
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
-    /// [`Self::refuse_exit_dependencies`] with the call's memory as the
-    /// kernel's view of it holds it (`EntryImport::reinstate_returned`), when
-    /// another thread has rewritten it since (`ThreadState::entry_import`),
-    /// and that rewrite restored after: it reads a received message's
-    /// descriptors from the call's header. Fails only if the rewrite cannot
-    /// be restored.
-    pub(crate) async fn refuse_exit_dependencies_in_view<G: Guest<Self>>(
+    /// The checks of a descriptor where it arrives
+    /// ([`arrived_descriptors`]): [`Self::refuse_exit_dependencies`], and
+    /// `--strict`'s refusal of a binder descriptor
+    /// (`Self::refuse_strict_binder_descriptors`). Each runs with the call's
+    /// memory as the kernel's view of it holds it
+    /// (`EntryImport::reinstate_returned`), when another thread has rewritten
+    /// it since (`ThreadState::entry_import`), and that rewrite restored
+    /// after: it reads a received message's descriptors from the call's
+    /// header. Fails only if the rewrite cannot be restored.
+    pub(crate) async fn refuse_arrived_descriptors_in_view<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: &Syscall,
         ret: i64,
     ) -> Result<(), reverie::Error> {
+        if ret < 0
+            || !(self.cfg.backend.process_exits_complete_asynchronously || self.cfg.strict_binder)
+        {
+            return Ok(());
+        }
         let entry = crate::entry_view(guest, call);
         let view = entry
             .as_deref()
             .map(|entry| (entry, entry.reinstate_returned(&mut guest.memory())));
         self.refuse_exit_dependencies(guest, call, ret).await;
+        self.refuse_strict_binder_descriptors(guest, call, ret)
+            .await;
         crate::restore_entry_view(guest, view)
     }
 
@@ -213,24 +255,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: &Syscall,
         ret: i64,
     ) {
-        if !self.cfg.backend.process_exits_complete_asynchronously || ret < 0 {
+        if !self.cfg.backend.process_exits_complete_asynchronously {
             return;
         }
-        let (arrived, how): (Vec<RawFd>, &str) = match call {
-            Syscall::Openat(_) => (vec![ret as RawFd], "opened"),
-            #[cfg(target_arch = "x86_64")]
-            Syscall::Open(_) => (vec![ret as RawFd], "opened"),
-            _ if call.number() == Sysno::openat2 => (vec![ret as RawFd], "opened"),
-            _ if call.number() == Sysno::pidfd_getfd => {
-                (vec![ret as RawFd], "received through pidfd_getfd")
-            }
-            Syscall::Recvmsg(_) | Syscall::Recvmmsg(_) => {
-                let Some(received) = delivered_descriptors(&guest.memory(), call, ret) else {
-                    return;
-                };
-                (received, "received through SCM_RIGHTS")
-            }
-            _ => return,
+        let Some((arrived, how)) = arrived_descriptors(&guest.memory(), call, ret) else {
+            return;
         };
         let pid = guest.pid().as_raw();
         for fd in arrived {

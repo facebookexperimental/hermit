@@ -1862,6 +1862,39 @@ same way, or with the option recorded as `HERMIT_HOST_TIMED_BINDER`. Calls that
 do not wait, such as every read on a descriptor opened `O_NONBLOCK`, run in the
 caller's turn as usual.
 
+A `--strict` run never holds a binder descriptor, in a fresh run and in a
+replay alike: binder reply payloads are not recorded, so no run can repeat
+what a binder call returns (https://github.com/rrnewton/hermit/issues/5124).
+The run ends by name, with the policy-refusal status (122), where a binder
+descriptor would reach the guest: an open of a binder device, a descriptor
+received through `SCM_RIGHTS` or `pidfd_getfd`, or one the run starts with,
+such as a binder device passed as standard input. Hermit tells a binder
+device by the open file (a character device on binderfs, or the misc device
+binder registers without binderfs), never by its path, and through the
+calling thread's own descriptor table. A descriptor whose identity Hermit
+cannot read is refused the same way. That includes a misc device with a
+dynamically assigned minor on a kernel where no binder driver's `devices`
+parameter can be read (`binder` or `binder_linux`), such as
+`/dev/userfaultfd` on a kernel without binder. Other character devices, such
+as `/dev/null`, `/dev/urandom`, terminals, `/dev/fuse` or `/dev/net/tun`, are
+not binder devices. As a backstop, a binder `ioctl` request on a descriptor
+Hermit cannot tell is not a binder device is refused too, before Hermit waits
+for anything or reads the call's argument. Under the KVM backend, guest
+descriptors are not host descriptors Hermit can inspect
+(https://github.com/rrnewton/hermit/issues/5129). So, as a temporary
+conservative policy, a `--strict` run is refused before it starts on a host
+that offers binder in any form, whether or not the guest would use it. That
+means binderfs listed in `/proc/filesystems`, a misc device in `/proc/misc`
+whose name contains "binder" or that the binder driver's `devices` parameter
+names, or a binder descriptor among those Hermit's guest inherits. It is
+refused, too, when any of that, or that parameter, cannot be read, when
+`/sys/module` is not visible as sysfs, where a missing parameter would not
+show that there is no binder driver, or when `/sys/module` lists the binder
+module without its `devices` parameter. The check trusts these host files as
+the kernel presents them; a host that deliberately mounts a substitute over
+them is outside `--strict`'s threat model. Run a guest that uses binder
+without `--strict`.
+
 ### The Guest Hangs
 
 1. Run the command normally to confirm the program itself terminates.

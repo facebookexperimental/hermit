@@ -141,108 +141,542 @@ pub(crate) fn is_binder_request(request: u64) -> bool {
     BINDER_REQUESTS.contains(&(request & 0xffff_ffff))
 }
 
-/// What a run replays, for `--strict`'s binder policy (`strict_refusal`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BinderReplay {
-    /// A fresh run: no record is replayed.
-    Fresh,
-    /// A preemption record that stores no readmissions: one made before they
-    /// were recorded, or one built or edited in memory.
-    WithoutReadmissions,
-    /// A preemption record whose run logged where each backgrounded call
-    /// rejoined: none at all when no call went to the background.
-    WithReadmissions,
+/// The name `include/uapi/linux/android/binder.h` gives `request`, one of
+/// [`BINDER_REQUESTS`], for a refusal.
+fn request_name(request: u64) -> &'static str {
+    const NAMES: [&str; 12] = [
+        "BINDER_WRITE_READ",
+        "BINDER_SET_MAX_THREADS",
+        "BINDER_SET_CONTEXT_MGR",
+        "BINDER_THREAD_EXIT",
+        "BINDER_VERSION",
+        "BINDER_GET_NODE_DEBUG_INFO",
+        "BINDER_GET_NODE_INFO_FOR_REF",
+        "BINDER_SET_CONTEXT_MGR_EXT",
+        "BINDER_FREEZE",
+        "BINDER_GET_FROZEN_INFO",
+        "BINDER_ENABLE_ONEWAY_SPAM_DETECTION",
+        "BINDER_GET_EXTENDED_ERROR",
+    ];
+    BINDER_REQUESTS
+        .iter()
+        .position(|known| *known == request & 0xffff_ffff)
+        .map_or("a binder request", |index| NAMES[index])
 }
 
 /// `--strict`'s binder policy (`Config::strict_binder`) for one `ioctl`
-/// request: why the run must stop, or `None` to let the call run. `replay`
-/// says what the run replays, and is read only for a binder request.
+/// request: why the run must stop, or `None` for a request that is not
+/// binder's.
 ///
-/// - A guest that freezes other processes (`BINDER_FREEZE`) or becomes the
-///   context manager (`BINDER_SET_CONTEXT_MGR[_EXT]`) is a system service
-///   acting on processes outside Hermit: refused, replay or not.
-/// - Any other binder call is refused in a fresh run. A call that waits for
-///   another process finishes when the host's kernel delivers its work, and
-///   which call a process-wide transaction completes is the kernel's choice
-///   too, so no fresh run can promise to repeat. A replay of a record that
-///   stores readmissions holds each call to the turn its recording rejoined
-///   at, and runs.
-pub(crate) fn strict_refusal(
-    request: u64,
-    replay: impl FnOnce() -> BinderReplay,
-) -> Option<String> {
-    let request = request & 0xffff_ffff;
+/// A `--strict` run never holds a binder descriptor: one is refused where it
+/// arrives (by an open, a receipt, or at the run's start), by the open file's
+/// identity ([`identity`]). This request-word refusal is the backstop for a
+/// descriptor whose identity is binder or cannot be told
+/// (`Detcore::binder_entry`); a request on a descriptor known not to be a
+/// binder device is left alone, as the same words name other drivers'
+/// requests.
+///
+/// Every binder request is refused, in a fresh run and in a replay alike.
+/// What a binder call returns, and when, is another process's to decide:
+/// the transactions, replies, reference requests and notices a read takes
+/// are bytes and timing from processes Hermit does not schedule, and Hermit
+/// records none of them, so no run, fresh or replayed, can promise to repeat
+/// a binder call until it does
+/// (<https://github.com/rrnewton/hermit/issues/5124>). A replay's record of
+/// where each backgrounded call rejoined fixes when the call is readmitted,
+/// not what it read. The decision reads only the request word, so it comes
+/// before Detcore waits for anything or reads the call's argument
+/// (`Detcore::binder_entry`).
+pub(crate) fn strict_refusal(request: u64) -> Option<String> {
     if !is_binder_request(request) {
         return None;
     }
-    if request == BINDER_FREEZE {
-        return Some(
-            "--strict refuses BINDER_FREEZE: a guest that freezes another process acts on \
-             processes outside Hermit, whose effects no run can repeat"
-                .to_string(),
-        );
+    Some(format!(
+        "--strict refuses binder ({}): binder reply payloads are not recorded, so no run, fresh \
+         or replayed, can repeat what a binder call returns \
+         (https://github.com/rrnewton/hermit/issues/5124). Run a guest that uses binder without \
+         --strict, where each binder call that waits for another process is reported as \
+         external input",
+        request_name(request)
+    ))
+}
+
+/// What `--strict` can tell of the file a guest descriptor refers to
+/// ([`identity`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Identity {
+    /// A binder device, described for a refusal.
+    Binder(String),
+    /// Not a binder device.
+    NotBinder,
+    /// Detcore cannot tell, and why.
+    Unknown(String),
+}
+
+/// `BINDERFS_SUPER_MAGIC` (include/uapi/linux/magic.h:85 at v6.16): the file
+/// system of every binderfs device, its `binder-control` included. Linux
+/// tells a binderfs device by it (`is_binderfs_device`,
+/// drivers/android/binderfs.c:86), and serves such a device from its inode,
+/// not from its number, so a copy of the node elsewhere does not open binder.
+const BINDERFS_SUPER_MAGIC: i64 = 0x6c6f_6f70;
+
+/// The misc character devices' major number. Without binderfs, Linux
+/// registers each binder device that binder's `devices` parameter names as
+/// a misc device (`binder_init`, drivers/android/binder.c:7068 at v6.16, and
+/// `init_binder_device`, :7029), which any node with its number opens.
+const MISC_MAJOR: u32 = 10;
+
+/// The misc minors no kernel hands out dynamically: binder asks for
+/// `MISC_DYNAMIC_MINOR` (binder.c:7021), which Linux v6.16 allocates above
+/// 255 (`misc_minor_alloc`, drivers/char/misc.c:65-75) and earlier kernels
+/// allocated below 128. A minor in this range is one of the fixed
+/// assignments of include/linux/miscdevice.h (`FUSE_MINOR` 229, `TUN_MINOR`
+/// 200, `KVM_MINOR` 232, …), so its driver is known and is not binder.
+const STATIC_MISC_MINORS: std::ops::RangeInclusive<u32> = 128..=254;
+
+/// The modules a binder driver's `devices` parameter is read from: `binder`,
+/// built in, and `binder_linux`, the name an out-of-tree build loads under,
+/// with the same misc devices.
+const BINDER_MODULES: [&str; 2] = ["binder", "binder_linux"];
+
+/// The first binder driver's `devices` parameter `read` finds
+/// (`/sys/module/<module>/parameters/devices` for each of
+/// [`BINDER_MODULES`]), or `None`.
+pub(crate) fn binder_devices_parameter(read: impl Fn(&str) -> Option<String>) -> Option<String> {
+    BINDER_MODULES
+        .iter()
+        .find_map(|module| read(&format!("/sys/module/{module}/parameters/devices")))
+}
+
+/// Whether the file a descriptor refers to is a binder device, told by the
+/// open file itself, never by a path:
+/// - `stat`: its mode and device number (`fstat`), or `None` when it cannot
+///   be read;
+/// - `file_system`: its file system's magic (`fstatfs`), or `None`;
+/// - `misc`: the contents of `/proc/misc`, which names each misc device by
+///   its minor (`misc_seq_show`, drivers/char/misc.c:101 at v6.16), or
+///   `None`;
+/// - `devices`: the binder driver's `devices` parameter
+///   ([`binder_devices_parameter`]), or `None` when none can be read.
+///
+/// A character device that is not a misc device is never binder's: binder
+/// registers no other (/dev/null, /dev/urandom, terminals and
+/// pseudo-terminals are not). Nor is a misc device with a fixed minor
+/// ([`STATIC_MISC_MINORS`]). A misc device with a dynamic minor is binder's
+/// when the driver's parameter names it; when `/proc/misc` or the parameter
+/// cannot be read, or does not list the minor, it is unknown. Each lookup is
+/// made only when the answer needs it.
+pub(crate) fn identity(
+    stat: Option<(u32, u64)>,
+    file_system: impl FnOnce() -> Option<i64>,
+    misc: impl FnOnce() -> Option<String>,
+    devices: impl FnOnce() -> Option<String>,
+) -> Identity {
+    let Some((mode, rdev)) = stat else {
+        return Identity::Unknown("its file cannot be inspected".into());
+    };
+    if mode & libc::S_IFMT != libc::S_IFCHR {
+        return Identity::NotBinder;
     }
-    if request == BINDER_SET_CONTEXT_MGR || request == BINDER_SET_CONTEXT_MGR_EXT {
-        return Some(
-            "--strict refuses BINDER_SET_CONTEXT_MGR: a guest that becomes binder's context \
-             manager serves processes outside Hermit, whose requests no run can repeat"
-                .to_string(),
-        );
+    match file_system() {
+        Some(BINDERFS_SUPER_MAGIC) => return Identity::Binder("a binderfs device".into()),
+        Some(_) => {}
+        None => return Identity::Unknown("its file system cannot be inspected".into()),
     }
-    match replay() {
-        BinderReplay::WithReadmissions => None,
-        BinderReplay::Fresh => Some(
-            "--strict refuses binder in a fresh run: a binder call that waits for another \
-             process finishes when this host's kernel delivers its work, so the run could not \
-             repeat. To reproduce a run that uses binder exactly, record it without --strict \
-             (hermit run --record-preemptions-to=RECORD ...) and replay the record under \
-             --strict (hermit run --strict --replay-preemptions-from=RECORD ...)"
-                .to_string(),
-        ),
-        BinderReplay::WithoutReadmissions => Some(
-            "--strict refuses binder in a replay of a record that stores no readmissions: a \
-             binder call that goes to the background here would have no recorded turn to \
-             rejoin at, so the replay could not repeat its recording. A record written \
-             before Hermit stored readmissions has none. A record built from events alone, \
-             edited, or cut to a prefix of its schedule (as the records of hermit analyze's \
-             trials are) cannot carry them. To replay binder under \
-             --strict, record the run again without --strict with this Hermit \
-             (hermit run --record-preemptions-to=RECORD ...), which stores them, and replay \
-             that whole record"
-                .to_string(),
-        ),
+    let (major, minor) = (libc::major(rdev), libc::minor(rdev));
+    if major != MISC_MAJOR || STATIC_MISC_MINORS.contains(&minor) {
+        return Identity::NotBinder;
+    }
+    let Some(misc) = misc() else {
+        return Identity::Unknown("/proc/misc cannot be read".into());
+    };
+    let Some(name) = misc.lines().find_map(|line| {
+        let (number, name) = line.trim_start().split_once(' ')?;
+        (number.parse::<u32>().ok()? == minor).then(|| name.trim().to_owned())
+    }) else {
+        return Identity::Unknown(format!(
+            "/proc/misc does not list misc device {major}:{minor}"
+        ));
+    };
+    match devices() {
+        Some(devices) if devices.trim().split(',').any(|device| device == name) => {
+            Identity::Binder(format!(
+                "the binder device {name} (misc device {major}:{minor})"
+            ))
+        }
+        Some(_) => Identity::NotBinder,
+        None => Identity::Unknown(format!(
+            "misc device {name} ({major}:{minor}) has a dynamic minor, and no binder driver's \
+             devices parameter can be read"
+        )),
     }
 }
 
-/// What the run replays (`--replay-preemptions-from`, else
-/// `--replay-schedule-from`), read once per process: every run, `--verify`
-/// half and analyze trial runs in its own (`replay_of`).
-pub(crate) fn binder_replay(cfg: &detcore_model::config::Config) -> BinderReplay {
-    static REPLAY: std::sync::OnceLock<BinderReplay> = std::sync::OnceLock::new();
-    *REPLAY.get_or_init(|| {
-        replay_of(
-            cfg.replay_preemptions_from
-                .as_deref()
-                .or(cfg.replay_schedule_from.as_deref()),
-        )
+/// [`identity`] of the file `fd_link`, a `/proc/<tid>/fd/<n>` entry, refers
+/// to, from host procfs and sysfs.
+pub(crate) fn identity_of(fd_link: &std::path::Path) -> Identity {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let stat = std::fs::metadata(fd_link)
+        .ok()
+        .map(|metadata| (metadata.mode(), metadata.rdev()));
+    identity(
+        stat,
+        || {
+            let path = std::ffi::CString::new(fd_link.as_os_str().as_bytes()).ok()?;
+            // SAFETY: a zeroed `statfs` is a valid value of the plain C struct.
+            let mut file_system: libc::statfs = unsafe { std::mem::zeroed() };
+            // SAFETY: a NUL-terminated path and a buffer this frame owns.
+            let status = unsafe { libc::statfs(path.as_ptr(), &mut file_system) };
+            (status == 0).then_some(file_system.f_type as i64)
+        },
+        || std::fs::read_to_string("/proc/misc").ok(),
+        || binder_devices_parameter(|path| std::fs::read_to_string(path).ok()),
+    )
+}
+
+/// Why a `--strict` run stops at descriptor `fd`, which the guest got `how`
+/// ("opened", "received through SCM_RIGHTS", …) and whose identity is
+/// `identity`: a binder device, or one Detcore cannot tell is not. `None`
+/// for a descriptor known not to be a binder device.
+pub(crate) fn strict_descriptor_refusal(
+    fd: RawFd,
+    how: &str,
+    identity: &Identity,
+) -> Option<String> {
+    let what = match identity {
+        Identity::Binder(what) => format!("is {what}"),
+        Identity::Unknown(why) => {
+            format!("may be a binder device: its identity could not be read ({why})")
+        }
+        Identity::NotBinder => return None,
+    };
+    Some(format!(
+        "--strict refuses binder: descriptor {fd}, {how}, {what}. A --strict run holds no binder \
+         descriptor: binder reply payloads are not recorded, so no run, fresh or replayed, can \
+         repeat what a binder call returns (https://github.com/rrnewton/hermit/issues/5124). Run \
+         a guest that uses binder without --strict"
+    ))
+}
+
+/// The refusal ([`strict_descriptor_refusal`]) of the first of `arrived`,
+/// descriptors a call gave the guest `how`, that `identify` does not know to
+/// be other than a binder device, or `None`.
+pub(crate) fn strict_arrival_refusal(
+    arrived: &[RawFd],
+    how: &str,
+    mut identify: impl FnMut(RawFd) -> Identity,
+) -> Option<String> {
+    arrived
+        .iter()
+        .find_map(|&fd| strict_descriptor_refusal(fd, how, &identify(fd)))
+}
+
+/// The first descriptor listed in `fd_directory`, a `/proc/<tid>/fd`
+/// directory, that `identify` does not know to be other than a binder
+/// device, passing over those `skip` names: its number and identity. A
+/// directory that cannot be listed is an error, never a pass. Listed with
+/// [`crate::util::find_in_directory`], which the in-guest backends can run.
+pub(crate) fn held_binder_descriptor(
+    fd_directory: &std::path::Path,
+    skip: impl Fn(RawFd) -> bool,
+    identify: impl Fn(&std::path::Path) -> Identity,
+) -> std::io::Result<Option<(RawFd, Identity)>> {
+    crate::util::find_in_directory(fd_directory, |name| {
+        let fd: RawFd = name.to_str()?.parse().ok()?;
+        if skip(fd) {
+            return None;
+        }
+        match identify(&fd_directory.join(name)) {
+            Identity::NotBinder => None,
+            identity => Some((fd, identity)),
+        }
     })
 }
 
-/// What replaying the record at `path`, if any, is for `--strict`'s binder
-/// policy. A record says whether its run logged readmissions
-/// (`read_recorded_rejoins` gives `Some` list): one that did stores them even
-/// when none of its calls went to the background, and its replay may use
-/// binder. A record that predates them, was built or edited in memory, or
-/// cannot be read, has none, and neither does one whose readmissions are out
-/// of order, which the scheduler refuses before any guest runs.
-fn replay_of(path: Option<&std::path::Path>) -> BinderReplay {
-    match path {
-        None => BinderReplay::Fresh,
-        Some(path) => match crate::preemptions::read_recorded_rejoins(path) {
-            Ok(Some(_)) => BinderReplay::WithReadmissions,
-            Ok(None) | Err(_) => BinderReplay::WithoutReadmissions,
-        },
+/// What the binder driver's `devices` parameter is on this host
+/// ([`binder_devices_parameter_state`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DevicesParameter {
+    /// The parameters of the [`BINDER_MODULES`] that have one, joined by
+    /// commas.
+    Present(String),
+    /// None of [`BINDER_MODULES`] has one. That proves there is no binder
+    /// driver only where `/sys/module` is visible and lists none of them
+    /// ([`sys_module_binder_modules`]):
+    /// binder declares the parameter readable (`module_param_named(devices,
+    /// …, 0444)`, drivers/android/binder.c:121 at v6.16), so Linux lists it
+    /// under `/sys/module/binder/parameters/` whether binder is built in
+    /// (`param_sysfs_builtin`, kernel/params.c:829) or a module.
+    Missing,
+    /// One exists but cannot be read, and why.
+    Unreadable(String),
+}
+
+/// `SYSFS_MAGIC` (include/uapi/linux/magic.h:90 at v6.16).
+const SYSFS_MAGIC: i64 = 0x6265_6572;
+
+/// Which of [`BINDER_MODULES`] the kernel's own module directory lists, as
+/// `file_system` (the `statfs` magic of `/sys/module`) and `listing` (every
+/// entry it lists, [`directory_entries`]) say; or why `/sys/module` is not
+/// that directory: a missing, unmounted or unreadable `/sys`, or a directory
+/// of another file system standing in for it.
+pub(crate) fn sys_module_binder_modules(
+    file_system: std::io::Result<i64>,
+    listing: std::io::Result<Vec<String>>,
+) -> Result<Vec<&'static str>, String> {
+    match file_system {
+        Ok(SYSFS_MAGIC) => {}
+        Ok(magic) => return Err(format!("/sys/module is not sysfs (file system {magic:#x})")),
+        Err(error) => return Err(format!("/sys/module cannot be inspected ({error})")),
     }
+    let names = listing.map_err(|error| format!("/sys/module cannot be listed ({error})"))?;
+    Ok(BINDER_MODULES
+        .into_iter()
+        .filter(|module| names.iter().any(|name| name == module))
+        .collect())
+}
+
+/// The name of every entry `directory` lists, "." and ".." aside, read with
+/// the raw-syscall walker ([`crate::util::find_in_directory`]) to the end.
+pub(crate) fn directory_entries(directory: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    crate::util::find_in_directory(directory, |name| {
+        if name != "." && name != ".." {
+            names.push(name.to_string_lossy().into_owned());
+        }
+        None::<()>
+    })?;
+    Ok(names)
+}
+
+/// The binder driver's `devices` parameter, from
+/// `/sys/module/<module>/parameters/devices` for each of [`BINDER_MODULES`]
+/// as `read` reads it. A parameter that exists but cannot be read is
+/// [`DevicesParameter::Unreadable`] whatever the others say; one that is
+/// absent (`NotFound`) is passed over.
+pub(crate) fn binder_devices_parameter_state(
+    read: impl Fn(&str) -> std::io::Result<String>,
+) -> DevicesParameter {
+    let mut present = Vec::new();
+    for module in BINDER_MODULES {
+        let path = format!("/sys/module/{module}/parameters/devices");
+        match read(&path) {
+            Ok(devices) => present.push(devices.trim().to_owned()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return DevicesParameter::Unreadable(format!("{path}: {error}")),
+        }
+    }
+    if present.is_empty() {
+        DevicesParameter::Missing
+    } else {
+        DevicesParameter::Present(present.join(","))
+    }
+}
+
+/// Why `--strict` refuses a run on a backend whose guest descriptors are not
+/// host descriptors Detcore can name (KVM) on this host, or `None`.
+///
+/// There no descriptor's identity can be read where it arrives or at the
+/// start (<https://github.com/rrnewton/hermit/issues/5129>). So, as a
+/// temporary conservative policy, strict KVM is refused on any host that
+/// offers binder in any form, whether or not the guest would ever hold a
+/// binder descriptor. The run is refused when:
+/// - `filesystems`, the contents of `/proc/filesystems`, lists binderfs.
+///   That a guest could reach a binderfs instance (one it mounts, or another
+///   mount namespace's through a `/proc/<pid>/root` alias) is not checked:
+///   the registration alone refuses;
+/// - `misc`, the contents of `/proc/misc`, lists a misc device whose name
+///   contains "binder", or one that the binder driver's `devices` parameter
+///   names (`devices`, [`binder_devices_parameter_state`]). The first does
+///   not depend on the parameter, which a binder module loaded under another
+///   name would not have;
+/// - the binder driver's `devices` parameter exists but cannot be read;
+/// - `sys_module`, which of [`BINDER_MODULES`] `/sys/module` lists
+///   ([`sys_module_binder_modules`]), is not `Ok`: there a missing parameter
+///   would not prove that there is no binder driver, which a misc device
+///   named neither like binder's nor by a parameter Hermit can read would
+///   let through;
+/// - `/sys/module` lists one of [`BINDER_MODULES`] whose `devices` parameter
+///   is missing;
+/// - `held`, the first of Hermit's own descriptors, which the guest inherits,
+///   that is not known to be other than a binder device
+///   ([`held_binder_descriptor`]), is not `None`;
+/// - or any of `filesystems`, `misc` or Hermit's descriptor table cannot be
+///   read.
+///
+/// A host with none of these is admitted: no binderfs registered, no misc
+/// device named like binder's or named by a binder driver, a visible
+/// `/sys/module`, and no binder descriptor handed to the guest. One binder
+/// device this lets through remains, on KVM only: one a binder module loaded
+/// under a name other than [`BINDER_MODULES`] registers under a name without
+/// "binder" in it (ptrace refuses it as of unknown identity). Narrowing the
+/// policy to the binder objects a guest can actually reach needs their
+/// identity through the guest, which also accounts for `/proc/<pid>/root`
+/// aliases and closes that remainder: #5129's follow-up.
+///
+/// The check trusts host files as the kernel presents them:
+/// `/proc/filesystems`, `/proc/misc`, `/sys/module` and Hermit's own
+/// descriptor table alike. A host that deliberately mounts a substitute
+/// over any of them (another sysfs subtree bound over `/sys/module`, say)
+/// defeats them all equally. That is outside `--strict`'s threat model,
+/// which guards a run against outside input, not against its host: the
+/// guest cannot mount. Where these files come from belongs to the same
+/// object-identity follow-up.
+pub(crate) fn kvm_strict_binder_refusal(
+    filesystems: Option<&str>,
+    misc: Option<&str>,
+    devices: &DevicesParameter,
+    sys_module: Result<Vec<&'static str>, String>,
+    held: std::io::Result<Option<(RawFd, Identity)>>,
+) -> Option<String> {
+    let reason = 'reason: {
+        let Some(filesystems) = filesystems else {
+            break 'reason "/proc/filesystems cannot be read, so it cannot tell whether the host \
+                           kernel offers binderfs"
+                .to_owned();
+        };
+        if filesystems
+            .lines()
+            .any(|line| line.split_whitespace().last() == Some("binder"))
+        {
+            break 'reason "the host kernel offers binderfs (/proc/filesystems lists binder)"
+                .to_owned();
+        }
+        let Some(misc) = misc else {
+            break 'reason "/proc/misc cannot be read, so it cannot tell whether the host kernel \
+                           has a binder device"
+                .to_owned();
+        };
+        let named: Vec<&str> = match devices {
+            DevicesParameter::Present(devices) => devices.split(',').map(str::trim).collect(),
+            DevicesParameter::Missing | DevicesParameter::Unreadable(_) => Vec::new(),
+        };
+        if let Some(line) = misc.lines().find(|line| {
+            line.trim_start().split_once(' ').is_some_and(|(_, name)| {
+                let name = name.trim();
+                name.contains("binder") || named.contains(&name)
+            })
+        }) {
+            break 'reason format!(
+                "the host kernel has a binder device (/proc/misc: \"{}\")",
+                line.trim()
+            );
+        }
+        if let DevicesParameter::Unreadable(why) = devices {
+            break 'reason format!(
+                "the binder driver's devices parameter cannot be read ({why}), so it cannot tell \
+                 which misc devices are binder's"
+            );
+        }
+        match (sys_module, devices) {
+            (Err(why), _) => {
+                break 'reason format!(
+                    "{why}, so the absence of a binder driver's devices parameter does not \
+                     prove that the host kernel has no binder driver"
+                );
+            }
+            (Ok(listed), DevicesParameter::Missing) if !listed.is_empty() => {
+                break 'reason format!(
+                    "/sys/module lists the binder module ({}) but its devices parameter is \
+                     missing, so it cannot tell which misc devices are binder's",
+                    listed.join(", ")
+                );
+            }
+            (Ok(_), _) => {}
+        }
+        match held {
+            Ok(None) => return None,
+            Ok(Some((fd, Identity::Binder(what)))) => {
+                format!("Hermit's descriptor {fd}, which the guest inherits, is {what}")
+            }
+            Ok(Some((fd, Identity::Unknown(why)))) => format!(
+                "Hermit's descriptor {fd}, which the guest inherits, may be a binder device: its \
+                 identity could not be read ({why})"
+            ),
+            Ok(Some((_, Identity::NotBinder))) => return None,
+            Err(error) => {
+                format!(
+                    "Hermit's own descriptors, which the guest inherits, cannot be listed ({error})"
+                )
+            }
+        }
+    };
+    Some(format!(
+        "--strict refuses binder: {reason}. Under the KVM backend Hermit cannot tell whether a \
+         guest descriptor is a binder device (https://github.com/rrnewton/hermit/issues/5129), and \
+         binder reply payloads are not recorded \
+         (https://github.com/rrnewton/hermit/issues/5124), so, for now, a strict run is admitted \
+         only on a host that offers binder in no form. Use the ptrace backend, or run without \
+         --strict"
+    ))
+}
+
+/// [`kvm_strict_binder_refusal`] for a `--strict` run whose backend's guest
+/// descriptors are not host descriptors Detcore can name
+/// (`procfs_inode::tool_can_name_guest_descriptors`), from host procfs,
+/// sysfs and the calling process's own descriptor table, which the guest
+/// inherits; `None` for any other run. Called before the run starts
+/// (`Detcore::facility_admission`).
+pub(crate) fn kvm_strict_binder_admission(
+    config: &detcore_model::config::Config,
+) -> Option<String> {
+    kvm_strict_binder_admission_with(
+        config,
+        |path| std::fs::read_to_string(path),
+        host_sys_module_binder_modules,
+        || {
+            held_binder_descriptor(
+                std::path::Path::new("/proc/self/fd"),
+                |_| false,
+                identity_of,
+            )
+        },
+    )
+}
+
+/// [`kvm_strict_binder_admission`] with the host's files read by `read` and
+/// the calling process's descriptors checked by `held`, neither used unless
+/// the run is one the check is for.
+fn kvm_strict_binder_admission_with(
+    config: &detcore_model::config::Config,
+    read: impl Fn(&str) -> std::io::Result<String>,
+    sys_module: impl FnOnce() -> Result<Vec<&'static str>, String>,
+    held: impl FnOnce() -> std::io::Result<Option<(RawFd, Identity)>>,
+) -> Option<String> {
+    if !config.strict_binder
+        || crate::procfs_inode::tool_can_name_guest_descriptors(&config.backend)
+    {
+        return None;
+    }
+    let filesystems = read("/proc/filesystems").ok();
+    let misc = read("/proc/misc").ok();
+    let devices = binder_devices_parameter_state(&read);
+    kvm_strict_binder_refusal(
+        filesystems.as_deref(),
+        misc.as_deref(),
+        &devices,
+        sys_module(),
+        held(),
+    )
+}
+
+/// [`sys_module_binder_modules`] of the host's `/sys/module`, from `statfs`
+/// and a listing of every entry.
+fn host_sys_module_binder_modules() -> Result<Vec<&'static str>, String> {
+    let file_system = {
+        // SAFETY: a zeroed `statfs` is a valid value of the plain C struct.
+        let mut file_system: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: a NUL-terminated path and a buffer this frame owns.
+        let status = unsafe { libc::statfs(c"/sys/module".as_ptr(), &mut file_system) };
+        if status == 0 {
+            Ok(file_system.f_type as i64)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    let listing = directory_entries(std::path::Path::new("/sys/module"));
+    sys_module_binder_modules(file_system, listing)
 }
 
 /// Whether `request`, an `ioctl` request word, is `BINDER_WRITE_READ`.
@@ -712,7 +1146,7 @@ fn transaction_descriptors<M: MemoryAccess>(
             // transaction's buffer with BC_FREE_BUFFER, so a record of one
             // would outlive it and describe whatever next takes the number.
             // Left out until Detcore follows those frees
-            // (https://github.com/rrnewton/hermit/issues/ISSUE-FDA).
+            // (https://github.com/rrnewton/hermit/issues/5046).
             Some(BINDER_TYPE_FDA) => {
                 let array = object(index, 32)?;
                 let num_fds = u64_at(&array, 8).ok_or(short)?;
@@ -810,110 +1244,590 @@ mod tests {
         assert_eq!(blocking(0x4004_6205, Some(&reading), None, false), None);
     }
 
-    /// `--strict` refuses every binder call in a fresh run, naming the
-    /// replay route; a replay of a record that stores readmissions may make
-    /// them, except a freeze or becoming the context manager, which are
-    /// refused either way. Another driver's request is left alone, even one
-    /// that shares binder's type byte.
+    /// `--strict` refuses every binder request, whatever the run replays,
+    /// naming the request and the missing piece: binder reply payloads are
+    /// not recorded. Another driver's request is left alone, even one that
+    /// shares binder's type byte. Before, a replay of a record that stored
+    /// readmissions could make binder calls, against peers whose replies it
+    /// did not record.
     #[test]
-    fn strict_refuses_binder_except_in_a_replay_with_readmissions() {
-        use BinderReplay::*;
-        let version = binder_request(3, 9, size_of::<i32>());
-        for request in [BINDER_WRITE_READ, version] {
-            let refusal = strict_refusal(request, || Fresh).unwrap();
-            assert!(refusal.contains("fresh run"), "{refusal}");
-            assert!(refusal.contains("--replay-preemptions-from"), "{refusal}");
-            let refusal = strict_refusal(request, || WithoutReadmissions).unwrap();
-            assert!(refusal.contains("stores no readmissions"), "{refusal}");
-            // It names each kind of record that has none, and what to do.
-            for named in [
-                "written before Hermit stored readmissions",
-                "built from events alone",
-                "prefix of its schedule",
-                "record the run again",
-                "--record-preemptions-to",
-                "whole record",
-            ] {
-                assert!(refusal.contains(named), "{named}: {refusal}");
-            }
-            assert_eq!(strict_refusal(request, || WithReadmissions), None);
+    fn strict_refuses_every_binder_request() {
+        let names = [
+            (BINDER_WRITE_READ, "BINDER_WRITE_READ"),
+            (binder_request(3, 9, size_of::<i32>()), "BINDER_VERSION"),
+            (BINDER_FREEZE, "BINDER_FREEZE"),
+            (BINDER_SET_CONTEXT_MGR, "BINDER_SET_CONTEXT_MGR"),
+            (BINDER_SET_CONTEXT_MGR_EXT, "BINDER_SET_CONTEXT_MGR_EXT"),
+            (binder_request(3, 17, 12), "BINDER_GET_EXTENDED_ERROR"),
+        ];
+        for (request, name) in names {
+            let refusal = strict_refusal(request).unwrap();
+            assert!(
+                refusal.contains(&format!("--strict refuses binder ({name})")),
+                "{refusal}"
+            );
         }
-        for request in [
-            BINDER_FREEZE,
-            BINDER_SET_CONTEXT_MGR,
-            BINDER_SET_CONTEXT_MGR_EXT,
-        ] {
-            for replay in [Fresh, WithoutReadmissions, WithReadmissions] {
-                let refusal = strict_refusal(request, || replay).unwrap();
-                assert!(!refusal.contains("fresh run"), "{refusal}");
-            }
+        for request in BINDER_REQUESTS {
+            let refusal = strict_refusal(request).unwrap_or_else(|| panic!("{request:#x}"));
+            assert!(
+                refusal.contains("binder reply payloads are not recorded")
+                    && refusal.contains("https://github.com/rrnewton/hermit/issues/5124"),
+                "{refusal}"
+            );
+            assert!(
+                !refusal.contains("a binder request)"),
+                "{request:#x}: {refusal}"
+            );
+            // Only the low 32 bits are the request.
+            assert_eq!(
+                strict_refusal(request | 0xffff_ffff_0000_0000),
+                Some(refusal)
+            );
         }
-        // Another driver's requests are not read as binder's, and do not
-        // even look at what the run replays: one with BINDER_VERSION's type
-        // byte and number but another size; dma-buf's
+        // Another driver's requests are not read as binder's: one with
+        // BINDER_VERSION's type byte and number but another size; dma-buf's
         // DMA_BUF_IOCTL_IMPORT_SYNC_FILE, _IOW('b', 3, 8 bytes), which is
-        // also the header's unserved BINDER_SET_IDLE_TIMEOUT; and the unserved
-        // BINDER_SET_IDLE_PRIORITY.
+        // also the header's unserved BINDER_SET_IDLE_TIMEOUT; and the
+        // unserved BINDER_SET_IDLE_PRIORITY.
         for other in [binder_request(3, 9, 8), 0x4008_6203, 0x4004_6206] {
             assert!(!is_binder_request(other), "{other:#x}");
+            assert_eq!(strict_refusal(other), None);
+        }
+    }
+
+    /// A binder device is told by the open file, never by a path: a
+    /// character device on binderfs, whatever its number, or a misc device
+    /// with a dynamic minor that the binder driver's parameter names. Other
+    /// character devices (/dev/null, /dev/zero, /dev/urandom, terminals,
+    /// pseudo-terminals) and fixed-minor misc devices (fuse, tun, kvm) are
+    /// not, with no further lookup. A dynamic-minor misc device whose driver
+    /// cannot be resolved is unknown, as is anything that cannot be read.
+    #[test]
+    fn a_binder_device_is_told_by_its_open_file_never_by_its_path() {
+        let chr = |major, minor| Some((libc::S_IFCHR | 0o600, libc::makedev(major, minor)));
+        let tmpfs = || Some(0x0102_1994_i64);
+        let devtmpfs = || Some(0x0102_1994_i64);
+        let misc = || Some("229 fuse\n256 userfaultfd\n257 binder\n258 hwbinder\n".to_owned());
+        let devices = || Some("binder,hwbinder,vndbinder\n".to_owned());
+        let unread_misc = || -> Option<String> { panic!("read /proc/misc") };
+        let unread_devices = || -> Option<String> { panic!("read devices") };
+        let unread_fs = || -> Option<i64> { panic!("read the file system") };
+
+        let binderfs = identity(
+            chr(511, 3),
+            || Some(BINDERFS_SUPER_MAGIC),
+            unread_misc,
+            unread_devices,
+        );
+        assert_eq!(binderfs, Identity::Binder("a binderfs device".into()));
+        assert_eq!(
+            identity(chr(10, 257), tmpfs, misc, devices),
+            Identity::Binder("the binder device binder (misc device 10:257)".into())
+        );
+        assert_eq!(
+            identity(chr(10, 258), tmpfs, misc, devices),
+            Identity::Binder("the binder device hwbinder (misc device 10:258)".into())
+        );
+        // A dynamic-minor misc device the parameter does not name.
+        assert_eq!(
+            identity(chr(10, 256), tmpfs, misc, devices),
+            Identity::NotBinder
+        );
+        assert_eq!(
+            identity(chr(10, 257), tmpfs, misc, || Some("vndbinder".into())),
+            Identity::NotBinder
+        );
+        // Ordinary character devices, whatever binder's state: /dev/null,
+        // /dev/zero, /dev/urandom, a virtual console, /dev/tty, /dev/ptmx and
+        // a pseudo-terminal; and fixed-minor misc devices: fuse, tun, kvm.
+        for (major, minor) in [
+            (1, 3),
+            (1, 5),
+            (1, 9),
+            (4, 1),
+            (5, 0),
+            (5, 2),
+            (136, 0),
+            (10, 229),
+            (10, 200),
+            (10, 232),
+        ] {
             assert_eq!(
-                strict_refusal(other, || panic!("read the replay for {other:#x}")),
+                identity(chr(major, minor), devtmpfs, unread_misc, unread_devices),
+                Identity::NotBinder,
+                "{major}:{minor}"
+            );
+        }
+        // A regular file, such as binderfs's own logs, and a directory.
+        for mode in [libc::S_IFREG | 0o444, libc::S_IFDIR | 0o755] {
+            assert_eq!(
+                identity(Some((mode, 0)), unread_fs, unread_misc, unread_devices),
+                Identity::NotBinder
+            );
+        }
+        // Unknown: no stat; no file system; for a dynamic-minor misc device,
+        // no /proc/misc, a minor it does not list, or no binder driver's
+        // parameter, so that userfaultfd's device, say, is unknown on a kernel
+        // without one; and that for a low dynamic minor too.
+        for unknown in [
+            identity(None, unread_fs, unread_misc, unread_devices),
+            identity(chr(1, 3), || None, unread_misc, unread_devices),
+            identity(chr(10, 257), tmpfs, || None, unread_devices),
+            identity(chr(10, 300), tmpfs, misc, unread_devices),
+            identity(chr(10, 257), tmpfs, misc, || None),
+            identity(chr(10, 256), tmpfs, misc, || None),
+            identity(chr(10, 60), tmpfs, || Some(" 60 binder\n".into()), || None),
+        ] {
+            assert!(matches!(unknown, Identity::Unknown(_)), "{unknown:?}");
+        }
+        // Through host procfs: /dev/null, /dev/zero, /dev/urandom, a
+        // pseudo-terminal master and a regular file are not binder devices,
+        // and a descriptor that is not open is unknown.
+        let mut open = vec![tempfile::tempfile().unwrap()];
+        for path in ["/dev/null", "/dev/zero", "/dev/urandom", "/dev/ptmx"] {
+            if let Ok(file) = std::fs::File::open(path) {
+                open.push(file);
+            }
+        }
+        for file in &open {
+            let link = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(file));
+            assert_eq!(
+                identity_of(std::path::Path::new(&link)),
+                Identity::NotBinder,
+                "{link}"
+            );
+        }
+        let closed = identity_of(std::path::Path::new("/proc/self/fd/-1"));
+        assert!(matches!(closed, Identity::Unknown(_)), "{closed:?}");
+    }
+
+    /// The binder driver's parameter is read from the built-in driver's
+    /// module, else from `binder_linux`'s, the name an out-of-tree build
+    /// loads under.
+    #[test]
+    fn the_binder_devices_parameter_is_read_from_binder_or_binder_linux() {
+        let only = |module: &'static str| {
+            move |path: &str| {
+                (path == format!("/sys/module/{module}/parameters/devices"))
+                    .then(|| format!("{module}-devices"))
+            }
+        };
+        assert_eq!(
+            binder_devices_parameter(only("binder")),
+            Some("binder-devices".into())
+        );
+        assert_eq!(
+            binder_devices_parameter(only("binder_linux")),
+            Some("binder_linux-devices".into())
+        );
+        assert_eq!(binder_devices_parameter(|_| None), None);
+    }
+
+    /// A call that gives the guest a binder device, or a descriptor whose
+    /// identity cannot be read, is refused by name, naming the descriptor,
+    /// how it arrived and what it is or why it is unknown, whatever came with
+    /// it; a descriptor known not to be a binder device is not.
+    #[test]
+    fn a_strict_run_refuses_the_first_binder_descriptor_a_call_gives_it() {
+        let identify = |fd| match fd {
+            4 => Identity::Binder("a binderfs device".into()),
+            5 => Identity::Unknown("its file cannot be inspected".into()),
+            _ => Identity::NotBinder,
+        };
+        assert_eq!(strict_arrival_refusal(&[3, 6], "opened", identify), None);
+        assert_eq!(strict_arrival_refusal(&[], "opened", identify), None);
+        let reason =
+            strict_arrival_refusal(&[3, 4, 5], "received through SCM_RIGHTS", identify).unwrap();
+        assert!(
+            reason.starts_with(
+                "--strict refuses binder: descriptor 4, received through SCM_RIGHTS, is a \
+                 binderfs device. A --strict run holds no binder descriptor"
+            ) && reason.contains("binder reply payloads are not recorded")
+                && reason.contains("https://github.com/rrnewton/hermit/issues/5124"),
+            "{reason}"
+        );
+        let unknown = strict_arrival_refusal(&[3, 5], "opened", identify).unwrap();
+        assert!(
+            unknown.starts_with(
+                "--strict refuses binder: descriptor 5, opened, may be a binder device: its \
+                 identity could not be read (its file cannot be inspected)."
+            ),
+            "{unknown}"
+        );
+    }
+
+    /// The start check finds a binder descriptor, or one of unknown identity,
+    /// that the process holds, passes over the ones it is told to skip (the
+    /// runtime's own), and fails, never passes, on a descriptor table it
+    /// cannot list.
+    #[test]
+    fn the_start_check_finds_a_held_binder_descriptor_and_fails_on_an_unlistable_table() {
+        let held = tempfile::tempfile().unwrap();
+        let held_fd = std::os::fd::AsRawFd::as_raw_fd(&held);
+        let target = std::fs::read_link(format!("/proc/self/fd/{held_fd}")).unwrap();
+        let held_is = |identity: Identity| {
+            let target = target.clone();
+            move |link: &std::path::Path| {
+                if std::fs::read_link(link).ok().as_ref() == Some(&target) {
+                    identity.clone()
+                } else {
+                    Identity::NotBinder
+                }
+            }
+        };
+        let table = std::path::Path::new("/proc/self/fd");
+        let binder = Identity::Binder("a binderfs device".into());
+        assert_eq!(
+            held_binder_descriptor(table, |_| false, held_is(binder.clone())).unwrap(),
+            Some((held_fd, binder.clone()))
+        );
+        let unknown = Identity::Unknown("its file cannot be inspected".into());
+        assert_eq!(
+            held_binder_descriptor(table, |_| false, held_is(unknown.clone())).unwrap(),
+            Some((held_fd, unknown))
+        );
+        assert_eq!(
+            held_binder_descriptor(table, |fd| fd == held_fd, held_is(binder.clone())).unwrap(),
+            None
+        );
+        assert!(
+            held_binder_descriptor(
+                std::path::Path::new("/proc/self/no-such-table"),
+                |_| false,
+                held_is(binder)
+            )
+            .is_err()
+        );
+    }
+
+    /// Under `--strict` on KVM, where no guest descriptor's identity can be
+    /// read, a run is refused on a host whose kernel offers binder in any
+    /// form: binderfs registered; a misc device named like binder's, with or
+    /// without a binder driver's parameter, or named by that parameter; a
+    /// parameter that exists but cannot be read; an inherited descriptor that
+    /// is a binder device or of unknown identity; and wherever
+    /// `/proc/filesystems`, `/proc/misc` or Hermit's descriptor table cannot
+    /// be read. A kernel without binder is admitted.
+    #[test]
+    fn a_strict_kvm_run_is_refused_on_a_host_that_offers_binder() {
+        let plain = "nodev\tsysfs\nnodev\ttmpfs\n\text4\n";
+        let binderfs = "nodev\tsysfs\nnodev\tbinder\n\text4\n";
+        let misc = "229 fuse\n256 userfaultfd\n";
+        let binder_misc = "229 fuse\n257 hwbinder\n";
+        let custom_misc = "229 fuse\n257 ipc0\n";
+        let present = DevicesParameter::Present("binder,hwbinder,vndbinder".into());
+        let custom = DevicesParameter::Present("ipc0".into());
+        let missing = DevicesParameter::Missing;
+        let unreadable = DevicesParameter::Unreadable("permission denied".into());
+        let refused = |filesystems, misc, devices: &DevicesParameter, held| {
+            kvm_strict_binder_refusal(filesystems, misc, devices, Ok(Vec::new()), held)
+                .unwrap_or_else(|| panic!("{filesystems:?} {misc:?} {devices:?}"))
+        };
+        // Admitted: a kernel without binder, whether or not a binder
+        // driver's parameter is there, and no inherited binder descriptor.
+        for devices in [&present, &missing] {
+            assert_eq!(
+                kvm_strict_binder_refusal(
+                    Some(plain),
+                    Some(misc),
+                    devices,
+                    Ok(Vec::new()),
+                    Ok(None)
+                ),
                 None
             );
         }
-        // Only the low 32 bits are the request.
-        assert!(is_binder_request(BINDER_WRITE_READ | 0xffff_ffff_0000_0000));
+        assert_eq!(
+            kvm_strict_binder_refusal(
+                Some(plain),
+                Some(misc),
+                &missing,
+                Ok(Vec::new()),
+                Ok(Some((0, Identity::NotBinder)))
+            ),
+            None
+        );
+        for (reason, expected) in [
+            (
+                refused(Some(binderfs), Some(misc), &missing, Ok(None)),
+                "the host kernel offers binderfs",
+            ),
+            (
+                refused(Some(plain), Some(binder_misc), &present, Ok(None)),
+                "the host kernel has a binder device (/proc/misc: \"257 hwbinder\")",
+            ),
+            // With no binder driver's parameter, as a binder module loaded
+            // under another name has none, the name alone refuses.
+            (
+                refused(Some(plain), Some(binder_misc), &missing, Ok(None)),
+                "the host kernel has a binder device (/proc/misc: \"257 hwbinder\")",
+            ),
+            (
+                refused(Some(plain), Some(custom_misc), &custom, Ok(None)),
+                "the host kernel has a binder device (/proc/misc: \"257 ipc0\")",
+            ),
+            (
+                refused(Some(plain), Some(misc), &unreadable, Ok(None)),
+                "the binder driver's devices parameter cannot be read (permission denied)",
+            ),
+            // No parameter, and /sys/module not visible: its absence proves
+            // nothing, so a custom-named legacy device ("ipc0") is not let
+            // through.
+            (
+                kvm_strict_binder_refusal(
+                    Some(plain),
+                    Some(custom_misc),
+                    &missing,
+                    Err("/sys/module cannot be inspected (No such file or directory)".into()),
+                    Ok(None),
+                )
+                .unwrap(),
+                "/sys/module cannot be inspected (No such file or directory), so the absence of \
+                 a binder driver's devices parameter does not prove",
+            ),
+            (
+                refused(
+                    Some(plain),
+                    Some(misc),
+                    &present,
+                    Ok(Some((3, Identity::Binder("a binderfs device".into())))),
+                ),
+                "Hermit's descriptor 3, which the guest inherits, is a binderfs device",
+            ),
+            (
+                refused(
+                    Some(plain),
+                    Some(misc),
+                    &present,
+                    Ok(Some((
+                        4,
+                        Identity::Unknown("its file cannot be inspected".into()),
+                    ))),
+                ),
+                "Hermit's descriptor 4, which the guest inherits, may be a binder device",
+            ),
+            (
+                refused(None, Some(misc), &present, Ok(None)),
+                "/proc/filesystems cannot be read",
+            ),
+            (
+                refused(Some(plain), None, &present, Ok(None)),
+                "/proc/misc cannot be read",
+            ),
+            (
+                refused(
+                    Some(plain),
+                    Some(misc),
+                    &present,
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                ),
+                "Hermit's own descriptors, which the guest inherits, cannot be listed",
+            ),
+        ] {
+            assert!(
+                reason.starts_with(&format!("--strict refuses binder: {expected}"))
+                    && reason.contains("https://github.com/rrnewton/hermit/issues/5129")
+                    && reason.contains("https://github.com/rrnewton/hermit/issues/5124"),
+                "{reason}"
+            );
+        }
     }
 
-    /// The record files `--strict`'s binder policy reads: one a run writes
-    /// stores its readmissions even when none of its calls went to the
-    /// background, so its replay may make binder calls. A record without
-    /// them, from a Hermit that did not log them, built from events alone,
-    /// cut to a prefix of its schedule, edited, or unreadable, is refused with
-    /// the advice to record again.
+    /// The binder driver's parameter is read from every one of
+    /// [`BINDER_MODULES`]: present where any has one, missing where none
+    /// has, and unreadable, whatever the others say, where one exists but
+    /// cannot be read.
     #[test]
-    fn a_current_record_without_backgrounded_calls_may_replay_binder_under_strict() {
-        let dir = tempfile::tempdir().unwrap();
-        let version = binder_request(3, 9, size_of::<i32>());
-        let event = crate::types::SchedEvent::branches(crate::types::DetTid::from_raw(3), 7);
-        let mut current = crate::preemptions::PreemptionWriter::new(None);
-        current.insert_schedevent(event.clone());
-        current.insert_schedevent(event.clone());
-        let synthesized =
-            crate::preemptions::PreemptionRecord::from_sched_events(vec![event]).to_string();
-        let current = current.into_string();
-        let whole: crate::preemptions::PreemptionRecord = serde_json::from_str(&current).unwrap();
-        let prefix = whole.schedule_prefix(1).to_string();
-        let edited = whole.clone_preemptions_only().to_string();
-        for (name, text, allowed) in [
-            ("current", current, true),
-            (
-                "legacy",
-                r#"{"per_thread":{},"global":[]}"#.to_string(),
-                false,
-            ),
-            ("synthesized", synthesized, false),
-            ("prefix", prefix, false),
-            ("edited", edited, false),
-            ("unreadable", "not a record".to_string(), false),
-        ] {
-            let path = dir.path().join(format!("{name}.json"));
-            std::fs::write(&path, &text).unwrap();
-            let replay = replay_of(Some(&path));
-            for request in [version, BINDER_WRITE_READ] {
-                let refusal = strict_refusal(request, || replay);
-                if allowed {
-                    assert_eq!(refusal, None, "{name}: {text}");
+    fn the_binder_devices_parameter_tells_missing_from_unreadable() {
+        use std::io::Error;
+        use std::io::ErrorKind;
+        let with = |binder: Result<&'static str, ErrorKind>,
+                    linux: Result<&'static str, ErrorKind>| {
+            move |path: &str| {
+                let answer = if path.contains("/binder_linux/") {
+                    linux
                 } else {
-                    let refusal = refusal.unwrap_or_else(|| panic!("{name}: {text}"));
-                    assert!(
-                        refusal.contains("stores no readmissions"),
-                        "{name}: {refusal}"
-                    );
-                }
+                    binder
+                };
+                answer.map(str::to_owned).map_err(Error::from)
             }
+        };
+        let gone = Err(ErrorKind::NotFound);
+        let denied = Err(ErrorKind::PermissionDenied);
+        assert_eq!(
+            binder_devices_parameter_state(with(gone, gone)),
+            DevicesParameter::Missing
+        );
+        assert_eq!(
+            binder_devices_parameter_state(with(Ok("binder,hwbinder\n"), gone)),
+            DevicesParameter::Present("binder,hwbinder".into())
+        );
+        assert_eq!(
+            binder_devices_parameter_state(with(gone, Ok("binder\n"))),
+            DevicesParameter::Present("binder".into())
+        );
+        for state in [
+            binder_devices_parameter_state(with(denied, gone)),
+            binder_devices_parameter_state(with(gone, denied)),
+            binder_devices_parameter_state(with(Ok("binder"), denied)),
+        ] {
+            assert!(
+                matches!(state, DevicesParameter::Unreadable(_)),
+                "{state:?}"
+            );
         }
-        assert_eq!(replay_of(None), BinderReplay::Fresh);
+    }
+
+    /// The admission check runs only for a `--strict` run on a backend whose
+    /// guest descriptors are not host descriptors (KVM): on a host that
+    /// offers binderfs, a strict KVM run is refused, while a strict ptrace
+    /// run and a KVM run without `--strict` are not checked at all.
+    #[test]
+    fn only_a_strict_kvm_run_is_checked_for_a_host_that_offers_binder() {
+        let binder_host = |path: &str| match path {
+            "/proc/filesystems" => Ok("nodev\tsysfs\nnodev\tbinder\n".to_owned()),
+            "/proc/misc" => Ok("229 fuse\n".to_owned()),
+            _ => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        };
+        let unread = |_: &str| -> std::io::Result<String> { panic!("read a host file") };
+        let config = |strict_binder, backend| detcore_model::config::Config {
+            strict_binder,
+            backend,
+            ..Default::default()
+        };
+        let kvm = config(true, reverie::BackendCapabilities::KVM);
+        let refusal =
+            kvm_strict_binder_admission_with(&kvm, binder_host, || Ok(Vec::new()), || Ok(None))
+                .unwrap();
+        assert!(
+            refusal.contains("the host kernel offers binderfs"),
+            "{refusal}"
+        );
+        for unchecked in [
+            config(true, reverie::BackendCapabilities::PTRACE),
+            config(false, reverie::BackendCapabilities::KVM),
+        ] {
+            assert_eq!(
+                kvm_strict_binder_admission_with(
+                    &unchecked,
+                    unread,
+                    || panic!("inspect /sys/module"),
+                    || panic!("list descriptors")
+                ),
+                None
+            );
+        }
+    }
+
+    /// The admission's own reader, with `/sys/module` listed by the
+    /// production lister ([`directory_entries`]) from a directory laid out
+    /// as the kernel's: on a legacy binder host (binderfs not registered, a
+    /// misc device "ipc0" named by `binder.devices=ipc0`) whose parameter
+    /// paths read as not found:
+    /// - a view that hides sysfs proves nothing, and is refused;
+    /// - a full module view that lists `binder` (past its first entries)
+    ///   with no `devices` parameter is refused by name;
+    /// - a full module view that lists neither `binder` nor `binder_linux`
+    ///   is a host without a binder driver, and is admitted.
+    #[test]
+    fn a_strict_kvm_run_is_refused_unless_sys_module_shows_no_binder_driver() {
+        let host = |path: &str| match path {
+            "/proc/filesystems" => Ok("nodev\tsysfs\nnodev\ttmpfs\n\text4\n".to_owned()),
+            "/proc/misc" => Ok("229 fuse\n 60 ipc0\n".to_owned()),
+            _ => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        };
+        let kvm = detcore_model::config::Config {
+            strict_binder: true,
+            backend: reverie::BackendCapabilities::KVM,
+            ..Default::default()
+        };
+        let modules = |names: &[&str]| {
+            let directory = tempfile::tempdir().unwrap();
+            for name in names {
+                std::fs::create_dir(directory.path().join(name)).unwrap();
+            }
+            directory
+        };
+        let hidden = || {
+            sys_module_binder_modules(
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            )
+        };
+        let refusal = kvm_strict_binder_admission_with(&kvm, host, hidden, || Ok(None)).unwrap();
+        assert!(
+            refusal.starts_with("--strict refuses binder: /sys/module cannot be inspected")
+                && refusal.contains("does not prove that the host kernel has no binder driver"),
+            "{refusal}"
+        );
+        for module in BINDER_MODULES {
+            let view = modules(&["acpi", "kvm", "fuse", "loop", "zswap", module]);
+            let listed =
+                || sys_module_binder_modules(Ok(SYSFS_MAGIC), directory_entries(view.path()));
+            let refusal =
+                kvm_strict_binder_admission_with(&kvm, host, listed, || Ok(None)).unwrap();
+            assert!(
+                refusal.starts_with(&format!(
+                    "--strict refuses binder: /sys/module lists the binder module ({module}) but \
+                     its devices parameter is missing"
+                )),
+                "{refusal}"
+            );
+        }
+        let view = modules(&["acpi", "kvm", "fuse", "loop", "zswap"]);
+        let listed = || sys_module_binder_modules(Ok(SYSFS_MAGIC), directory_entries(view.path()));
+        assert_eq!(
+            kvm_strict_binder_admission_with(&kvm, host, listed, || Ok(None)),
+            None
+        );
+    }
+
+    /// The module directory is listed to its end, every entry named, and
+    /// `/sys/module` counts only as a sysfs directory that lists: not where
+    /// `statfs` fails, not on another file system (an empty tmpfs standing
+    /// in for sysfs), and not where it cannot be listed.
+    #[test]
+    fn sys_module_is_listed_in_full_and_only_as_sysfs() {
+        use std::io::Error;
+        use std::io::ErrorKind;
+        let directory = tempfile::tempdir().unwrap();
+        let mut expected: Vec<String> = (0..40).map(|index| format!("module{index}")).collect();
+        expected.push("binder_linux".into());
+        for name in &expected {
+            std::fs::create_dir(directory.path().join(name)).unwrap();
+        }
+        let mut listed = directory_entries(directory.path()).unwrap();
+        listed.sort();
+        expected.sort();
+        assert_eq!(listed, expected);
+        assert_eq!(
+            sys_module_binder_modules(Ok(SYSFS_MAGIC), Ok(listed)),
+            Ok(vec!["binder_linux"])
+        );
+        assert_eq!(
+            sys_module_binder_modules(Ok(SYSFS_MAGIC), Ok(vec!["kvm".into(), "fuse".into()])),
+            Ok(vec![])
+        );
+        for (file_system, listing, expected) in [
+            (
+                Err(Error::from(ErrorKind::NotFound)),
+                Ok(Vec::new()),
+                "/sys/module cannot be inspected",
+            ),
+            (
+                Ok(0x0102_1994),
+                Ok(Vec::new()),
+                "/sys/module is not sysfs (file system 0x1021994)",
+            ),
+            (
+                Ok(SYSFS_MAGIC),
+                Err(Error::from(ErrorKind::PermissionDenied)),
+                "/sys/module cannot be listed",
+            ),
+        ] {
+            let why = sys_module_binder_modules(file_system, listing).unwrap_err();
+            assert!(why.starts_with(expected), "{why}");
+        }
     }
 
     /// Every binder call that runs as external input is counted, and each

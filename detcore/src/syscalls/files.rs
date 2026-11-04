@@ -14331,11 +14331,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// The first step of every binder call: under `--strict`
     /// (`Config::strict_binder`), the refusal of a request the policy refuses
     /// (`binder::strict_refusal`, which reads only the request word and the
-    /// run's configuration), else the call's snapshot
-    /// (`Self::binder_snapshot`). The refusal comes before the exit-report
-    /// barrier, so a strict run that refuses binder neither waits there nor
-    /// reads the call's argument; only calls strict mode admits are
-    /// snapshotted.
+    /// run's configuration) on a descriptor that is a binder device or whose
+    /// identity cannot be told (`Self::binder_identity`), else the call's
+    /// snapshot (`Self::binder_snapshot`). A binder descriptor is refused
+    /// where it arrives, so this is the backstop; a request on a descriptor
+    /// known not to be binder's goes on, as other drivers share the words.
+    /// The refusal comes before the exit-report barrier, so a strict run that
+    /// refuses binder neither waits there nor reads the call's argument; only
+    /// calls strict mode admits are snapshotted.
     async fn binder_entry<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -14345,14 +14348,120 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<Result<crate::syscalls::binder::Snapshot, String>, Error> {
         use crate::syscalls::binder;
         if guest.config().strict_binder
-            && let Some(reason) =
-                binder::strict_refusal(request, || binder::binder_replay(guest.config()))
+            && let Some(reason) = binder::strict_refusal(request)
+            && self.binder_identity(guest, fd) != binder::Identity::NotBinder
         {
             return Ok(Err(reason));
         }
         Ok(Ok(self
             .binder_snapshot(guest, fd, request, argument)
             .await?))
+    }
+
+    /// What `--strict` can tell of the file the calling thread's descriptor
+    /// `fd` refers to (`binder::identity_of` on `/proc/<tid>/fd/<fd>`): the
+    /// thread's own table, which a thread made without `CLONE_FILES`, or
+    /// after `unshare(CLONE_FILES)`, does not share with its leader. On a
+    /// backend whose guest descriptors are not host descriptors Detcore can
+    /// name (`procfs_inode::tool_can_name_guest_descriptors`, KVM) it cannot
+    /// be told (<https://github.com/rrnewton/hermit/issues/5129>): there a
+    /// strict run is admitted only on a host that offers binder no way in
+    /// (`binder::kvm_strict_binder_admission`).
+    pub(crate) fn binder_identity<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        fd: RawFd,
+    ) -> crate::syscalls::binder::Identity {
+        use crate::syscalls::binder;
+        if !crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend) {
+            return binder::Identity::Unknown(
+                "this backend's guest descriptors are not host descriptors".into(),
+            );
+        }
+        binder::identity_of(Path::new(&format!(
+            "/proc/{}/fd/{fd}",
+            guest.tid().as_raw()
+        )))
+    }
+
+    /// Under `--strict`, end the run, by name, when `call`, which returned
+    /// `ret`, gave the guest a binder descriptor, or one whose identity
+    /// cannot be read: by an open, through `SCM_RIGHTS` or through
+    /// `pidfd_getfd` (`exit_dependencies::arrived_descriptors`), told by the
+    /// open file (`Self::binder_identity`). The guest never resumes holding
+    /// it. On a backend whose guest descriptors are not host descriptors
+    /// (KVM), where no identity can be read, nothing is checked here: a strict
+    /// run is admitted there only on a host that offers binder no way in
+    /// (`binder::kvm_strict_binder_admission`), and the request-word refusal
+    /// at binder calls stays (`Self::binder_entry`;
+    /// <https://github.com/rrnewton/hermit/issues/5129>).
+    pub(crate) async fn refuse_strict_binder_descriptors<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+        ret: i64,
+    ) {
+        if !self.cfg.strict_binder
+            || !crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend)
+        {
+            return;
+        }
+        let Some((arrived, how)) =
+            crate::exit_dependencies::arrived_descriptors(&guest.memory(), call, ret)
+        else {
+            return;
+        };
+        let refusal = crate::syscalls::binder::strict_arrival_refusal(&arrived, how, |fd| {
+            self.binder_identity(&*guest, fd)
+        });
+        if let Some(reason) = refusal {
+            self.refuse_binder_under_strict(guest, reason).await
+        }
+    }
+
+    /// Under `--strict`, end the run, by name, when its first process starts
+    /// holding a binder descriptor, or one whose identity cannot be read
+    /// (`binder::held_binder_descriptor`), as a caller can hand one over as
+    /// standard input. A descriptor table that cannot be listed ends it too:
+    /// the run cannot tell what it holds. The runtime's own descriptors are
+    /// passed over. The table listed is the calling thread's
+    /// (`/proc/<tid>/fd`); at the start that is the first process's leader,
+    /// the only thread there is. On a backend whose guest descriptors are not
+    /// host descriptors (`Self::binder_identity`) nothing is listed here: the
+    /// admission check reads Hermit's own table instead
+    /// (`binder::kvm_strict_binder_admission`;
+    /// <https://github.com/rrnewton/hermit/issues/5129>).
+    pub(crate) async fn refuse_binder_held_at_start<G: Guest<Self>>(&self, guest: &mut G) {
+        use crate::syscalls::binder;
+        if !self.cfg.strict_binder
+            || !crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend)
+        {
+            return;
+        }
+        let table = PathBuf::from(format!("/proc/{}/fd", guest.tid().as_raw()));
+        let held = binder::held_binder_descriptor(
+            &table,
+            |fd| guest.is_runtime_owned_fd(fd),
+            binder::identity_of,
+        );
+        let reason = match held {
+            Ok(None) => return,
+            Ok(Some((fd, identity))) => {
+                match binder::strict_descriptor_refusal(fd, "held when the run started", &identity)
+                {
+                    Some(reason) => reason,
+                    None => return,
+                }
+            }
+            Err(error) => format!(
+                "--strict refuses binder: it cannot tell whether the run starts holding a binder \
+                 descriptor, as {} cannot be listed ({error}). A --strict run holds no binder \
+                 descriptor: binder reply payloads are not recorded \
+                 (https://github.com/rrnewton/hermit/issues/5124)",
+                table.display()
+            ),
+        };
+        self.refuse_binder_under_strict(guest, reason).await
     }
 
     /// End the run with `reason`, a `--strict` refusal of a binder call
@@ -23030,6 +23139,178 @@ mod inject_fstat_scratch {
             assert_eq!(MEMORY_READS.with(|reads| reads.get()), 0, "{request:#x}");
             assert!(guest.injected.is_empty(), "{:?}", guest.injected);
         }
+    }
+
+    /// Under `--strict` every binder call is refused at once, in a replay
+    /// of a record that stores readmissions as in a fresh run: before the
+    /// exit-report barrier, which a retired sibling's report that never
+    /// comes would hold, and before any read of guest memory. What a binder
+    /// call returns is not recorded, so a replay can no more repeat it than a
+    /// fresh run can (https://github.com/rrnewton/hermit/issues/5124).
+    #[tokio::test]
+    async fn a_strict_binder_call_is_refused_at_once_in_a_replay_as_in_a_fresh_run() {
+        use crate::syscalls::binder::BINDER_WRITE_READ;
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("record.json");
+        let writer = crate::preemptions::PreemptionWriter::new(None)
+            .with_format(Some(crate::preemptions::PREEMPTION_RECORD_FORMAT))
+            .noting_background_starts();
+        std::fs::write(&record, writer.into_string()).unwrap();
+        assert!(
+            crate::preemptions::read_recorded_rejoins(&record)
+                .unwrap()
+                .is_some()
+        );
+        let words = [0u64, 0, 0, 256, 0, 0];
+        let own = Pid::from_raw(std::process::id() as i32);
+        for replay in [None, Some(record.clone())] {
+            let (_, mut guest) = ScriptedGuest::new(true, false);
+            guest.config.strict_binder = true;
+            guest.config.replay_preemptions_from = replay.clone();
+            guest.counts_memory_reads = true;
+            // Descriptor -1, which no process holds: its identity cannot be
+            // told, so the request-word refusal applies.
+            guest.backend_ids = Some((own, own));
+            add_task(&guest, 2, 1);
+            {
+                let mut tasks = guest.thread.live_tasks.lock().unwrap();
+                tasks.note_exit(DetTid::from_raw(2));
+                assert!(tasks.commit_thread_exit(DetTid::from_raw(2), DetPid::from_raw(1)));
+            }
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+            MEMORY_READS.with(|reads| reads.set(0));
+            let entry = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tool.binder_entry(&mut guest, -1, BINDER_WRITE_READ, words.as_ptr() as usize),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{replay:?}: waited at the exit-report barrier"));
+            let reason = entry.unwrap().unwrap_err();
+            assert!(
+                reason.starts_with("--strict refuses binder (BINDER_WRITE_READ)")
+                    && reason.contains("binder reply payloads are not recorded"),
+                "{replay:?}: {reason}"
+            );
+            assert!(guest.thread.live_tasks.lock().unwrap().exits_unreported());
+            assert_eq!(MEMORY_READS.with(|reads| reads.get()), 0, "{replay:?}");
+            assert!(guest.injected.is_empty(), "{:?}", guest.injected);
+        }
+    }
+
+    /// Under `--strict`, a binder request word on a descriptor known not to
+    /// be a binder device is not refused: other drivers' requests share the
+    /// words. On a descriptor whose identity cannot be told it is refused, as
+    /// on a binder device, and without `--strict` it is never refused.
+    #[tokio::test]
+    async fn a_strict_binder_request_is_refused_unless_its_descriptor_is_known_not_to_be_binder() {
+        // BINDER_VERSION, _IOWR('b', 9, struct binder_version).
+        let version = 0xc004_6209;
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let known = std::os::fd::AsRawFd::as_raw_fd(&null);
+        let own = Pid::from_raw(std::process::id() as i32);
+        for (strict, fd, refused) in [
+            (true, known, false),
+            (true, -1, true),
+            (false, known, false),
+            (false, -1, false),
+        ] {
+            let (_, mut guest) = ScriptedGuest::new(true, false);
+            guest.config.strict_binder = strict;
+            guest.backend_ids = Some((own, own));
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+            let entry = tool.binder_entry(&mut guest, fd, version, 0).await.unwrap();
+            match (refused, entry) {
+                (true, Err(reason)) => assert!(
+                    reason.starts_with("--strict refuses binder (BINDER_VERSION)"),
+                    "{reason}"
+                ),
+                (false, Ok(_)) => {}
+                (_, other) => panic!("strict {strict}, fd {fd}: {:?}", other.err()),
+            }
+        }
+    }
+
+    /// A descriptor's identity is read through the calling thread's own
+    /// table: a thread that has unshared its table can hold, at a number its
+    /// leader has /dev/null at, a different file. Here the thread's slot is
+    /// empty, so its identity cannot be read: it is refused where it arrives,
+    /// and a strict binder request on it is refused, where the leader's
+    /// /dev/null would have let both through.
+    #[tokio::test]
+    async fn a_descriptors_identity_is_read_from_the_calling_threads_own_table() {
+        use crate::syscalls::binder::Identity;
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&null);
+        let (tid_sender, tid) = std::sync::mpsc::channel();
+        let (done, finish) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // SAFETY: unsharing, then closing in this thread's own table.
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_FILES) }, 0);
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+            tid_sender.send(unsafe { libc::gettid() }).unwrap();
+            finish.recv().unwrap();
+        });
+        let tid = Pid::from_raw(tid.recv().unwrap());
+        let own = Pid::from_raw(std::process::id() as i32);
+        let (_, mut guest) = ScriptedGuest::new(true, false);
+        guest.config.strict_binder = true;
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+        guest.backend_ids = Some((own, own));
+        assert_eq!(tool.binder_identity(&guest, fd), Identity::NotBinder);
+        guest.backend_ids = Some((own, tid));
+        let identity = tool.binder_identity(&guest, fd);
+        assert!(matches!(identity, Identity::Unknown(_)), "{identity:?}");
+        // Where it arrives, as an open's result, it is refused.
+        let arrival = crate::syscalls::binder::strict_arrival_refusal(&[fd], "opened", |fd| {
+            tool.binder_identity(&guest, fd)
+        })
+        .unwrap();
+        assert!(
+            arrival.contains(&format!("descriptor {fd}, opened, may be a binder device")),
+            "{arrival}"
+        );
+        // BINDER_VERSION, _IOWR('b', 9, struct binder_version).
+        let refused = tool
+            .binder_entry(&mut guest, fd, 0xc004_6209, 0)
+            .await
+            .unwrap();
+        assert!(refused.is_err(), "{:?}", refused.ok());
+        done.send(()).unwrap();
+        thread.join().unwrap();
+    }
+
+    /// The descriptors a call gives the guest, which the exit-dependency and
+    /// strict binder checks both inspect where they arrive: an open's
+    /// (`creat` and `open_by_handle_at` included), `pidfd_getfd`'s, and none
+    /// for a failed call or another call.
+    #[test]
+    fn the_descriptors_a_call_gives_the_guest_are_named_with_how_they_arrived() {
+        use crate::exit_dependencies::arrived_descriptors;
+        let memory = reverie::syscalls::LocalMemory::new();
+        let args = |sysno| Syscall::from_raw(sysno, syscalls::SyscallArgs::new(3, 4, 0, 0, 0, 0));
+        assert_eq!(
+            arrived_descriptors(&memory, &args(Sysno::openat), 7),
+            Some((vec![7], "opened"))
+        );
+        assert_eq!(
+            arrived_descriptors(&memory, &args(Sysno::openat2), 8),
+            Some((vec![8], "opened"))
+        );
+        assert_eq!(
+            arrived_descriptors(&memory, &args(Sysno::open_by_handle_at), 6),
+            Some((vec![6], "opened"))
+        );
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            arrived_descriptors(&memory, &args(Sysno::creat), 4),
+            Some((vec![4], "opened"))
+        );
+        assert_eq!(
+            arrived_descriptors(&memory, &args(Sysno::pidfd_getfd), 9),
+            Some((vec![9], "received through pidfd_getfd"))
+        );
+        assert_eq!(arrived_descriptors(&memory, &args(Sysno::openat), -2), None);
+        assert_eq!(arrived_descriptors(&memory, &args(Sysno::dup), 5), None);
     }
 
     /// A ready binder read keeps the turn, with no wait at all, only where
