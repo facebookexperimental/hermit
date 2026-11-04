@@ -121,11 +121,14 @@ pub enum Insn {
     /// LDXP/LDAXP/STXP/STLXP: recognised so they are reported, never rewritten.
     ExclPair,
     /// ADD/SUB/AND/ORR/EOR/BIC, register form with no shift, or immediate form
-    /// with no shift. `rd` is never the zero register here: a flag-setting or
-    /// discarding form decodes as [`Insn::Cmp`] or [`Insn::Other`].
+    /// with no shift, and the flag-setting ADDS/SUBS. `rd` is never the zero
+    /// register here: a form that discards its result decodes as
+    /// [`Insn::Cmp`] or [`Insn::Other`].
     Alu {
         /// The operation.
         op: AluOp,
+        /// Whether it also sets the condition flags (ADDS/SUBS).
+        sets_flags: bool,
         /// 64-bit (`X` registers) rather than 32-bit.
         sf: bool,
         /// The destination.
@@ -287,15 +290,16 @@ pub fn decode(word: u32) -> Insn {
                 rn,
                 operand: Operand::Imm(imm),
             },
-            (false, _, ZR) => Insn::Other,
-            (false, _, _) => Insn::Alu {
+            // CMN, a shifted CMP, or a non-flag-setting form writing SP.
+            (_, _, ZR) => Insn::Other,
+            (sets_flags, _, _) => Insn::Alu {
                 op: if sub { AluOp::Sub } else { AluOp::Add },
+                sets_flags,
                 sf,
                 rd,
                 rn,
                 operand: Operand::Imm(imm),
             },
-            _ => Insn::Other,
         };
     }
     // Add/subtract (shifted register): sf op S 01011 shift(2) 0 Rm imm6 Rn Rd.
@@ -317,15 +321,16 @@ pub fn decode(word: u32) -> Insn {
                 rn,
                 operand: Operand::Reg(rm),
             },
-            (false, _, ZR) => Insn::Other,
-            (false, _, _) => Insn::Alu {
+            // CMN, or a form whose result is discarded.
+            (_, _, ZR) => Insn::Other,
+            (sets_flags, _, _) => Insn::Alu {
                 op: if sub { AluOp::Sub } else { AluOp::Add },
+                sets_flags,
                 sf,
                 rd,
                 rn,
                 operand: Operand::Reg(rm),
             },
-            _ => Insn::Other,
         };
     }
     // Logical (shifted register): sf opc(2) 01010 shift(2) N Rm imm6 Rn Rd.
@@ -350,6 +355,7 @@ pub fn decode(word: u32) -> Insn {
         };
         return Insn::Alu {
             op,
+            sets_flags: false,
             sf,
             rd,
             rn,
@@ -563,12 +569,38 @@ mod tests {
             decode(0x9100_0484),
             Insn::Alu {
                 op: AluOp::Add,
+                sets_flags: false,
                 sf: true,
                 rd: 4,
                 rn: 4,
                 operand: Operand::Imm(1)
             }
         );
+        // subs x9, x9, #1, as Rust's `Arc` drop emits it; adds w8, w8, w10;
+        // cmn x0, #1 still discards its result.
+        assert_eq!(
+            decode(0xf100_0529),
+            Insn::Alu {
+                op: AluOp::Sub,
+                sets_flags: true,
+                sf: true,
+                rd: 9,
+                rn: 9,
+                operand: Operand::Imm(1)
+            }
+        );
+        assert_eq!(
+            decode(0x2b0a_0108),
+            Insn::Alu {
+                op: AluOp::Add,
+                sets_flags: true,
+                sf: false,
+                rd: 8,
+                rn: 8,
+                operand: Operand::Reg(10)
+            }
+        );
+        assert_eq!(decode(0xb100_041f), Insn::Other);
         assert_eq!(
             decode(0xc805_fc64),
             Insn::StoreExcl {
