@@ -5436,6 +5436,37 @@ fn untrap_passthrough_syscalls_is_an_opt_in_refused_where_its_calls_are_counted(
             .expect_err("refused without a timer")
     );
     assert!(message.contains("RCB time"), "{message}");
+
+    // Nor on an executable-selected backend: its built-in enum still reads
+    // as the ptrace default, so the backend comparison above cannot see it.
+    // The inherited positive maximum is retained (no --max-timeslice), so
+    // preemption admission alone would accept the run; the refusal is the
+    // executable-selected qualification check (revcodex2 on PR 4764).
+    let mut application = run_opts_for(&[
+        "hermit",
+        "--backend=dbt",
+        "run",
+        "--untrap-passthrough-syscalls",
+        "--",
+        "fakeprog",
+    ]);
+    assert_eq!(application.application_backend, Some("dbt"));
+    assert_eq!(
+        application.adapter_capabilities,
+        Some(reverie::BackendCapabilities::DBT)
+    );
+    assert_eq!(application.selected_backend(), Backend::Ptrace);
+    assert!(application.det_opts.det_config.max_timeslice.is_some());
+    let error = application
+        .refuse_unqualified_application_options(
+            <super::core_adapter::CoreApplicationAdapter as super::backend_hook::BackendAdapter>::NONDEFAULT_CPU_PROFILE_REFUSAL,
+        )
+        .expect_err("refused on an executable-selected backend");
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    assert_eq!(
+        error.to_string(),
+        "--untrap-passthrough-syscalls is not qualified for executable-selected backend `dbt`"
+    );
 }
 
 /// A preemption record holds a callback for each trapped call the recorded run
@@ -11393,6 +11424,10 @@ impl RunOpts {
             (self.happens_before.is_some(), "--happens-before"),
             (config.futex_wake_yields, "--futex-wake-yields"),
             (config.cap_preemption_charge, "--cap-preemption-charge"),
+            (
+                config.untrap_passthrough_syscalls,
+                "--untrap-passthrough-syscalls",
+            ),
             (config.signal_at.is_some(), "--signal-at"),
             (config.pipe_wake_latency.is_some(), "--pipe-wake-latency"),
             (config.work_span_report.is_some(), "--work-span-report"),
