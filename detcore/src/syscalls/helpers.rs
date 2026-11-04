@@ -596,12 +596,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi(call.name());
             // A later part of a call run in parts files this fresh request
-            // without the guest having resumed since the previous part.
-            rsrc.poll_continues_call_in_parts = guest
+            // without the guest having resumed since the previous part,
+            // which transferred bytes: on the wire it is retry number 1
+            // after progress, not a new call's first attempt, so the
+            // scheduler does not count its grant as guest progress for
+            // the SIGCHLD fence (`Scheduler::unblock_guest`).
+            if guest
                 .thread_state()
                 .call_parts
                 .as_ref()
-                .is_some_and(|parts| parts.progress);
+                .is_some_and(|parts| parts.progress)
+            {
+                rsrc.upgraded_from_attempt = 1;
+                rsrc.previous_attempt_made_progress = true;
+            }
             // Binary record/replay keeps the internal-FD authority captured at
             // entry, as its existing FIFO-open policy requires. Plain runs
             // instead need revocable proof of closed guest membership.

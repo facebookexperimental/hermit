@@ -661,17 +661,6 @@ pub struct Resources {
     /// without this flag.
     #[serde(default)]
     pub(crate) previous_attempt_made_progress: bool,
-    /// Set on an `InternalIOPolling` request that continues a guest syscall
-    /// Detcore is already running in parts (`ThreadState::call_parts` with
-    /// progress): each later part files a fresh request at attempt 0, but
-    /// between parts the guest never resumed - the parts are one syscall.
-    /// The scheduler therefore does not count such a grant as guest
-    /// progress for the SIGCHLD fence, however many parts commit
-    /// (`Scheduler::unblock_guest`). `false` for a request that begins a
-    /// guest syscall, whose first attempt the guest entered from user
-    /// mode.
-    #[serde(default)]
-    pub(crate) poll_continues_call_in_parts: bool,
     /// The `poll_attempt` a skipped retry had when the scheduler replaced it
     /// with a runnable copy whose `poll_attempt` is 0
     /// (`Scheduler::upgrade_polled_to_runnable`): the request is still that
@@ -867,9 +856,6 @@ impl fmt::Debug for Resources {
         if self.previous_attempt_made_progress {
             debug.field("previous_attempt_made_progress", &true);
         }
-        if self.poll_continues_call_in_parts {
-            debug.field("poll_continues_call_in_parts", &true);
-        }
         if self.upgraded_from_attempt != 0 {
             debug.field("upgraded_from_attempt", &self.upgraded_from_attempt);
         }
@@ -942,7 +928,6 @@ impl Resources {
             passes_descriptors_out: false,
             waits_until_nothing_else_can_run: false,
             previous_attempt_made_progress: false,
-            poll_continues_call_in_parts: false,
             upgraded_from_attempt: 0,
             polls_channel: None,
             poll_deadline: None,
@@ -1017,8 +1002,6 @@ impl Resources {
         // A combined operation is a zero-length sleep only if both parts are.
         self.zero_length_sleep &= other.zero_length_sleep;
         self.previous_attempt_made_progress |= other.previous_attempt_made_progress;
-        // A combined operation begins a guest syscall only if both parts do.
-        self.poll_continues_call_in_parts |= other.poll_continues_call_in_parts;
         self.upgraded_from_attempt = self.upgraded_from_attempt.max(other.upgraded_from_attempt);
         // A merged request waits for the earlier of two deadlines.
         self.poll_deadline = match (self.poll_deadline, other.poll_deadline) {

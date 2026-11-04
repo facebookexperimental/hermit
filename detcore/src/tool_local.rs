@@ -8450,7 +8450,6 @@ impl<T> ThreadState<T> {
             passes_descriptors_out: false,
             waits_until_nothing_else_can_run: false,
             previous_attempt_made_progress: false,
-            poll_continues_call_in_parts: false,
             upgraded_from_attempt: 0,
             polls_channel: None,
             poll_deadline: None,

@@ -20640,7 +20640,7 @@ impl Scheduler {
                 self.is_idle_guest_poll(&rs),
                 rs.poll_deadline,
                 Self::is_internal_turn(&rs),
-                Self::retry_number(&rs) == 0 && !rs.poll_continues_call_in_parts,
+                Self::retry_number(&rs) == 0,
             ),
             _ => (
                 false, false, false, false, false, false, false, None, false, false,
@@ -41104,7 +41104,8 @@ mod test {
         for _ in 0..3 {
             let mut part = Resources::new(taker);
             part.insert(ResourceID::InternalIOPolling, Permission::W);
-            part.poll_continues_call_in_parts = true;
+            part.upgraded_from_attempt = 1;
+            part.previous_attempt_made_progress = true;
             grant(&mut scheduler, part);
             assert!(
                 scheduler.blocked.sigchld_fenced.contains_key(&process),
