@@ -26682,6 +26682,58 @@
     },
     {
       "group": "privileged-test",
+      "job": "binder_cli_cases",
+      "desc": "Run the two host-limited Binder CLI cases on a Binderfs-capable host",
+      "description": "a_descriptor_received_in_a_binder_transaction_is_usable and a_blocking_binder_read_does_not_hold_the_guests_turn (PR 4742) need a binder filesystem (CONFIG_ANDROID_BINDERFS) that an unprivileged user and mount namespace may mount, plus a C compiler for their guest. The full-profile hosts' kernels do not carry that filesystem (docs/TESTING_ENVIRONMENTS.md, the binder CLI tests row), so the two cases are #[ignore]d as host-limited and leave test.cli (797 to 795) and test.cli_on_host (716 to 714); this node is their only automatic validation destination. It carries only the privileged label, like the privileged-only KVM nodes: the privileged lane is the lane for kernel-capability cases. No scheduled host runs this node yet: every current validate host's kernel lacks the filesystem, so the node is wired and counted here and its execution waits for a Binderfs-capable privileged host (tracked as P1 dh-ggdbj); the first execution is one run of these two tests inside the devbig030 QEMU Binderfs guest at this head. The command first proves the capability (binder in /proc/filesystems and a trial mount inside an unshared user/mount namespace) and refuses loudly, naming the missing filesystem, when it is absent, rather than reporting a green that measured nothing; the cli_kvm node refuses the same way without /dev/kvm. It then runs exactly the two ignored identities with an exact-name filterset and `-- --ignored`, so the counted population is 2 executed and 0 skipped, enforced by the count pin above. The tests themselves also fail, naming the missing filesystem, when explicitly selected on an incapable host (binder_guest_output_on_a_capable_host), so no route counts a vacuous pass. It runs the shared cli binary privileged-only-build.privileged_tests verifies and, like privileged-test.pmu_cli_cases, holds no integration_test_binaries.cli token: nothing relinks that binary while it runs. No execution is claimed on a host without Binderfs, and no scheduled host runs this node yet.",
+      "labels": [
+        "privileged"
+      ],
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_NEXTEST_FILTER_EXPR --env HERMIT_NEXTEST_RESULTS_SCHEMA --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; bfs=$(mktemp -d); trap '\\''rm -rf \"$bfs\"'\\'' EXIT; if ! grep -qw binder /proc/filesystems || ! unshare --user --map-root-user --mount sh -c \"mount -t binder binder \\\"$bfs\\\"\" 2>/dev/null; then printf '\\''privileged-test.binder_cli_cases: this host cannot mount a binder filesystem (CONFIG_ANDROID_BINDERFS) in an unprivileged user namespace, so the two selected binder CLI cases would not run. Refusing rather than reporting a green that measured nothing; run this node on a Binderfs-capable host (docs/TESTING_ENVIRONMENTS.md).\\n'\\'' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test cli -j 1 -E '\\''test(=a_descriptor_received_in_a_binder_transaction_is_usable) | test(=a_blocking_binder_read_does_not_hold_the_guests_turn)'\\'' -- --ignored'",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 5,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "privileged-test.binder_cli_cases"
+        }
+      ],
+      "integration_test_binaries": [
+        "cli"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-only-build.privileged_tests_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ],
+      "env": {
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test",
+        "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "2",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst\",\"--test\",\"cli\"]"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 600,
+      "cpu_timeout": 300,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 60.0,
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 8589934592,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "privileged-test.binder_cli_cases"
+    },
+    {
+      "group": "privileged-test",
       "job": "pmu_detcore_time_cases",
       "desc": "Run the 36 Detcore time cases that need the PMU (tests_time, serial execution)",
       "description": "The 36 tests_time cases that construct a Config with max_timeslice enabled and therefore exercise ptrace's perf_event_open-backed RCB clock/timer: 28 inherit the 200000000 default through ..Default::default(), the four tod_gettimeofday_delta variants use the testutils BOTTOM, MIDDLE, and TOP configs (5000000) or the default, max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time sets 1000000, rdtsc_inside_a_spinlock_does_not_end_a_target_timeslice sets 2000000, and a_futex_wake_hands_a_contended_mutex_to_the_waiter and a_futex_wake_handoff_is_deterministic set 5000000. Without a PMU each fails with Perf support required. The hosted runner has none, and test.detcore_time_on_host failed exactly these 29 of 31 there (https://github.com/rrnewton/hermit/actions/runs/37143469197, https://github.com/rrnewton/hermit/issues/3663), so they moved here, after privileged-pmu.preemption has shown the PMU works. The filter is the exact complement of test.detcore_time's, which keeps the three cases that disable max_timeslice, so the full label still runs all 39 cases once each, and a case added to tests_time later is selected here until it is placed deliberately. tod_gettimeofday_faulting_tz_pkey_write_disabled_leaves_tv_unchanged also needs memory protection keys: on a host whose CPU flags lack pku or ospke, pkey_alloc returns -1 and the test fails rather than skips. MEASURED 2026-10-03 at hermit c3f7b2bcfa00 on the measurement host recorded for privileged-test.pmu_detcore_time_cases in docs/TESTING_ENVIRONMENTS.md (\"Named measurement hosts\"): five runs of this selection with cargo nextest run -p hermit-detcore-tests --test tests_time -j 1 and this filter, invoked directly rather than through run-nextest-counted.sh, each ran 29 tests with 2 filtered out, in 4.72-5.90 s of wall time (4.15-5.00 s of nextest time), the largest process peaking at 68-76 MB RSS. The hint keeps test.detcore_time's measured whole-target budget (256-MiB scheduling baseline, 1-GiB hard cap, 7 s estimate, 720 s wall limit), which these runs fit inside.",
