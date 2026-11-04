@@ -54,7 +54,10 @@ fn area() -> Area {
 /// the area gained after the snapshot, and a readable truncating open of
 /// a copied file, are refused with `EOPNOTSUPP` in a run that is not
 /// fail-closed (the named refusal/errno policy), without any live read or
-/// truncation; later pure reads still get the copy.
+/// truncation; later pure reads still get the copy. A catalogued file the
+/// snapshot could not copy allows a nonreading `O_PATH` open, as
+/// natively; its `read` fails with `EBADF` and a readable reopen of it
+/// is refused.
 #[test]
 fn a_property_snapshot_serves_every_read_of_the_files_it_copied() {
     let area = area();
@@ -67,15 +70,27 @@ fn a_property_snapshot_serves_every_read_of_the_files_it_copied() {
     // A file the area gained after its snapshot was taken.
     let later = area.live.path().join("u:object_r:later_prop:s0");
     std::fs::write(&later, [9]).unwrap();
+    // A catalogued file the snapshot could not copy.
+    let uncopied = area.live.path().join("u:object_r:uncopied_prop:s0");
+    std::fs::write(&uncopied, [13, 14, 15, 16]).unwrap();
+    let mut snapshot = area.snapshot.clone();
+    let uncopied_metadata = std::fs::metadata(&uncopied).unwrap();
+    snapshot
+        .uncopied_files
+        .push(detcore_model::config::PropertyFile {
+            dev: uncopied_metadata.dev(),
+            ino: uncopied_metadata.ino(),
+            name: "u:object_r:uncopied_prop:s0".to_owned(),
+        });
     let config = detcore::Config {
         max_timeslice: None,
         sequentialize_threads: true,
-        property_snapshot: Some(area.snapshot.clone()),
+        property_snapshot: Some(snapshot),
         ..Default::default()
     };
-    let paths = (file.clone(), link.clone(), later.clone());
+    let paths = (file.clone(), link.clone(), later.clone(), uncopied.clone());
     let guest = move || {
-        let (file, link, later): &(PathBuf, PathBuf, PathBuf) = &paths;
+        let (file, link, later, uncopied): &(PathBuf, PathBuf, PathBuf, PathBuf) = &paths;
         assert_eq!(std::fs::read(file).unwrap(), [5, 6, 7, 8]);
         assert_eq!(std::fs::read(link).unwrap(), [5, 6, 7, 8]);
         // No live bytes under the opt-in: the named errno, not `[9]`.
@@ -90,6 +105,37 @@ fn a_property_snapshot_serves_every_read_of_the_files_it_copied() {
             Some(libc::EOPNOTSUPP)
         );
         assert_eq!(std::fs::read(file).unwrap(), [5, 6, 7, 8]);
+        // F5 boundary: the uncopied file allows a nonreading `O_PATH`
+        // open; reading it is `EBADF`, and a readable reopen through
+        // its descriptor link is refused as its own open.
+        {
+            let c = std::ffi::CString::new(uncopied.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: a valid NUL-terminated path.
+            let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+            assert!(
+                fd >= 0,
+                "uncopied O_PATH: {}",
+                std::io::Error::last_os_error()
+            );
+            let mut byte = [0_u8; 1];
+            // SAFETY: `fd` is open and `byte` is writable for its length.
+            let read = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), byte.len()) };
+            assert_eq!(read, -1, "an O_PATH descriptor reads nothing");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+            let reopen = std::ffi::CString::new(format!("/proc/self/fd/{fd}")).unwrap();
+            // SAFETY: a valid NUL-terminated descriptor-link path.
+            let reopened = unsafe { libc::open(reopen.as_ptr(), libc::O_RDONLY) };
+            assert_eq!(reopened, -1, "a readable reopen must be refused");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EOPNOTSUPP)
+            );
+            // SAFETY: the descriptor opened above.
+            unsafe { libc::close(fd) };
+        }
     };
     detcore_testutils::det_test_fn_with_config(
         true,
@@ -101,6 +147,7 @@ fn a_property_snapshot_serves_every_read_of_the_files_it_copied() {
     // No live execution happened: neither file was truncated.
     assert_eq!(std::fs::metadata(Path::new(&file)).unwrap().len(), 4);
     assert_eq!(std::fs::read(&later).unwrap(), [9]);
+    assert_eq!(std::fs::read(&uncopied).unwrap(), [13, 14, 15, 16]);
 }
 
 /// A file the area gained after its snapshot is refused through every
@@ -110,7 +157,10 @@ fn a_property_snapshot_serves_every_read_of_the_files_it_copied() {
 /// Readable mutations of that late file are refused before they run, so
 /// the host file keeps its bytes and no absent file is created; a
 /// nonreading `O_PATH` open of it still succeeds, as natively, and its
-/// `read` fails with `EBADF`.
+/// `read` fails with `EBADF`. Creation is likewise refused before it
+/// runs where only the kernel-resolved parent is the area: through a
+/// dangling final symlink into the area, and through a retained dirfd
+/// on the area whose spelling has since been replaced.
 #[test]
 fn a_late_property_file_is_refused_through_alias_spellings() {
     let area = area();
@@ -121,10 +171,19 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
     std::fs::write(&later, [9, 10, 11, 12]).unwrap();
     let absent_name = "u:object_r:absent_prop:s0";
     let absent = area.live.path().join(absent_name);
+    // A dangling final symlink, outside the area, naming an absent
+    // file inside it: following it with `O_CREAT` creates in the area.
+    let dangling_name = "u:object_r:dangling_prop:s0";
+    let dangling_target = area.live.path().join(dangling_name);
+    // A name only a retained dirfd on the area can create (below).
+    let retained_name = "u:object_r:retained_prop:s0";
+    let retained_target = area.live.path().join(retained_name);
     // A directory symlink to the area, made outside it.
     let outside = tempfile::tempdir_in(area.live.path().parent().unwrap()).unwrap();
     let alias_dir = outside.path().join("alias-area");
     std::os::unix::fs::symlink(area.live.path(), &alias_dir).unwrap();
+    let dangling_link = outside.path().join("dangling-final");
+    std::os::unix::fs::symlink(&dangling_target, &dangling_link).unwrap();
     let dotdot = area
         .live
         .path()
@@ -144,8 +203,11 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
         ..Default::default()
     };
     let live_dir = area.live.path().to_owned();
+    let outside_dir = outside.path().to_owned();
     let later_host = later.clone();
     let absent_host = absent.clone();
+    let dangling_host = dangling_target.clone();
+    let retained_host = retained_target.clone();
     let guest = move || {
         let expect_refused = |path: &Path, what: &str| {
             let error = std::fs::read(path).unwrap_err();
@@ -180,6 +242,18 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
             &alias_dir.join(absent_name),
             libc::O_RDONLY | libc::O_CREAT | libc::O_EXCL,
             "alias O_CREAT|O_EXCL of an absent file",
+        );
+        // Only the link's target directory is the area here; the
+        // spelled parent is outside it. The host file must stay absent.
+        expect_open_refused(
+            &dangling_link,
+            libc::O_RDONLY | libc::O_CREAT,
+            "dangling final symlink O_CREAT",
+        );
+        expect_open_refused(
+            &dangling_link,
+            libc::O_WRONLY | libc::O_CREAT,
+            "dangling final symlink write-only O_CREAT",
         );
         // F5: a nonreading `O_PATH` open succeeds as natively; reading
         // it is `EBADF`, and a readable reopen through its descriptor
@@ -235,6 +309,33 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
         assert_eq!(bytes, [5, 6, 7, 8]);
         // SAFETY: the descriptor opened above.
         unsafe { libc::close(fd) };
+        // F3: a retained dirfd creates in the directory object it
+        // holds, not in the directory its spelling now names. The
+        // alias is replaced after the descriptor is retained; the
+        // host file in the area must stay absent.
+        {
+            let retained = std::fs::File::open(&alias_dir).unwrap();
+            std::fs::remove_file(&alias_dir).unwrap();
+            std::os::unix::fs::symlink(&outside_dir, &alias_dir).unwrap();
+            let rel = std::ffi::CString::new(retained_name).unwrap();
+            // SAFETY: valid dirfd and NUL-terminated relative path.
+            let fd = unsafe {
+                libc::openat(
+                    retained.as_raw_fd(),
+                    rel.as_ptr(),
+                    libc::O_RDONLY | libc::O_CREAT | libc::O_EXCL,
+                    0o600,
+                )
+            };
+            assert_eq!(fd, -1, "retained-dirfd creation must be refused");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EOPNOTSUPP)
+            );
+            drop(retained);
+            std::fs::remove_file(&alias_dir).unwrap();
+            std::os::unix::fs::symlink(&live_dir, &alias_dir).unwrap();
+        }
         let _ = file;
     };
     detcore_testutils::det_test_fn_with_config(
@@ -244,9 +345,17 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
         detcore_testutils::expect_success,
     );
     // F3 host-side effects: no refused mutation reached the live file,
-    // and the refused creation made no file.
+    // and the refused creations made no file, by any resolution.
     assert_eq!(std::fs::read(&later_host).unwrap(), [9, 10, 11, 12]);
     assert!(!absent_host.exists(), "a refused O_CREAT made a file");
+    assert!(
+        !dangling_host.exists(),
+        "a refused dangling-symlink O_CREAT made a file"
+    );
+    assert!(
+        !retained_host.exists(),
+        "a refused retained-dirfd O_CREAT made a file"
+    );
 }
 
 /// A redirected open serves its copy through a non-`AT_FDCWD` dirfd and

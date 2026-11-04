@@ -5855,13 +5855,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let snapshot = self.cfg.property_snapshot.as_ref()?;
         let in_area = property_area_name(&snapshot.guest_dir, path);
         let pure_read = is_pure_read(call.flags());
-        if !pure_read {
-            if in_area.is_some() && opens_to_change(call.flags()) {
-                self.note_property_write(path);
-            }
-            if !opens_readable(call.flags()) {
-                return None;
-            }
+        if !pure_read && in_area.is_some() && opens_to_change(call.flags()) {
+            self.note_property_write(path);
         }
         let follow = if call.flags().contains(OFlag::O_NOFOLLOW) {
             AtFlags::AT_SYMLINK_NOFOLLOW
@@ -5877,7 +5872,38 @@ impl<T: RecordOrReplay> Detcore<T> {
             None => None,
         };
         let copied = object.and_then(|stat| snapshot.live_file(stat.st_dev, stat.st_ino));
+        // No object: a mutating `O_CREAT` open would create in the
+        // directory the kernel resolves, which need not be the spelled
+        // parent (a dangling final symlink creates in its target's
+        // directory; a retained dirfd creates in the directory object it
+        // holds). Refuse before the real open can create anything there.
         if copied.is_none()
+            && object.is_none()
+            && call.flags().contains(OFlag::O_CREAT)
+            && opens_to_change(call.flags())
+        {
+            let name = match area_parent_name(snapshot, path) {
+                Some(name) => Some(name),
+                None => {
+                    self.creation_in_live_area(guest, call, path, snapshot)
+                        .await
+                }
+            };
+            if let Some(name) = name {
+                return Some(PropertyOpen::Live(format!(
+                    "{name} is in the property area but not in its snapshot"
+                )));
+            }
+        }
+        if !pure_read && !opens_readable(call.flags()) {
+            return None;
+        }
+        // A nonreading open (`O_PATH`, or the reserved access mode) of an
+        // uncopied file reads no live bytes, so it keeps its native
+        // behaviour; only a readable open is refused for having no copy.
+        // A later readable reopen is decided as its own open.
+        if copied.is_none()
+            && opens_readable(call.flags())
             && let Some(file) =
                 object.and_then(|stat| snapshot.known_live_file(stat.st_dev, stat.st_ino))
         {
@@ -5893,24 +5919,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         // the live open can truncate or create anything. `O_PATH` is not
         // readable (`opens_readable`), so it keeps its native success
         // below; a later readable reopen is decided on its own.
-        if opens_readable(call.flags()) {
-            if let Some(stat) = object
-                && let Some(name) = uncatalogued_area_name(snapshot, None, stat.st_dev, stat.st_ino)
-            {
-                return Some(PropertyOpen::Live(format!(
-                    "{name} is in the property area but not in its snapshot"
-                )));
-            }
-            // No object: an `O_CREAT` whose parent resolves into the area
-            // would create a late file there. Refuse it before creation.
-            if object.is_none()
-                && call.flags().contains(OFlag::O_CREAT)
-                && let Some(name) = area_parent_name(snapshot, path)
-            {
-                return Some(PropertyOpen::Live(format!(
-                    "{name} is in the property area but not in its snapshot"
-                )));
-            }
+        if opens_readable(call.flags())
+            && let Some(stat) = object
+            && let Some(name) = uncatalogued_area_name(snapshot, None, stat.st_dev, stat.st_ino)
+        {
+            return Some(PropertyOpen::Live(format!(
+                "{name} is in the property area but not in its snapshot"
+            )));
         }
         match (copied, in_area) {
             (Some(file), _) if !pure_read => Some(PropertyOpen::Live(format!(
@@ -5936,6 +5951,152 @@ impl<T: RecordOrReplay> Detcore<T> {
             (None, Some(name)) => Some(PropertyOpen::Unknown(name.to_string_lossy().into_owned())),
             (None, None) => None,
         }
+    }
+
+    /// Whether the directory the guest kernel resolves for
+    /// `parent` (a pathname resolved from `dirfd`, exactly as the
+    /// pending open will resolve it) is the live property area: an
+    /// injected `O_PATH|O_NOFOLLOW` open of the parent, compared by
+    /// `(st_dev, st_ino)` with the area itself. This binds the decision
+    /// to the directory object the open will use, not to any spelling
+    /// of it, so a retained dirfd whose spelling was replaced and a
+    /// parent reached through symlinks are both decided correctly.
+    async fn resolved_parent_is_area<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        dirfd: RawFd,
+        parent: &[u8],
+        snapshot: &detcore_model::config::PropertySnapshot,
+    ) -> bool {
+        // The scratch lives on the guest stack, whose free capacity is
+        // small; a parent spelling that does not fit is left to the
+        // spelled-parent check the caller already made.
+        const PATH_MAX: usize = 512;
+        if parent.is_empty() || parent.len() >= PATH_MAX {
+            return false;
+        }
+        if guest.stack().await.capacity() < PATH_MAX + 64 {
+            return false;
+        }
+        let mut spelled = [0_u8; PATH_MAX];
+        spelled[..parent.len()].copy_from_slice(parent);
+        let flags = OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+        let opened = crate::syscalls::scratch::inject_with_scratch(guest, spelled, |base| {
+            syscalls::Openat::new()
+                .with_dirfd(dirfd)
+                .with_path(PathPtr::from_ptr(base.as_raw() as *const libc::c_char))
+                .with_flags(flags)
+                .with_mode(None)
+                .into()
+        })
+        .await;
+        let Ok((opened, _)) = opened else {
+            return false;
+        };
+        let Ok(fd) = RawFd::try_from(opened) else {
+            return false;
+        };
+        let dir = self.inject_fstat(guest, fd).await;
+        let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+        match (dir, crate::util::raw_stat(&snapshot.guest_dir)) {
+            (Ok(dir), Ok(area)) => (dir.st_dev, dir.st_ino) == (area.st_dev, area.st_ino),
+            _ => false,
+        }
+    }
+
+    /// The area name an `O_CREAT` open with no existing object would
+    /// create, where the spelled parent (`area_parent_name` on the
+    /// observed spelling) is not the live area. The creating directory
+    /// is resolved in the guest (`resolved_parent_is_area`), from the
+    /// same dirfd the open uses. An open that follows its final
+    /// component (`O_NOFOLLOW` unset, and not `O_CREAT|O_EXCL`, which
+    /// fails `EEXIST` on any link) creates in its final link's target
+    /// directory instead; that directory is resolved the same way from
+    /// the link target read in the guest. `None` where neither
+    /// resolution names the area.
+    async fn creation_in_live_area<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Openat,
+        _observed: &Path,
+        snapshot: &detcore_model::config::PropertySnapshot,
+    ) -> Option<String> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let spelled_ptr = call.path()?;
+        let spelled: PathBuf = spelled_ptr.read(&guest.memory()).ok()?;
+        let bytes = spelled.as_os_str().as_bytes();
+        let (parent, name): (&[u8], &[u8]) = match bytes.iter().rposition(|byte| *byte == b'/') {
+            Some(0) => (b"/".as_slice(), &bytes[1..]),
+            Some(index) => (&bytes[..index], &bytes[index + 1..]),
+            None => (b".".as_slice(), bytes),
+        };
+        if self
+            .resolved_parent_is_area(guest, call.dirfd(), parent, snapshot)
+            .await
+        {
+            return Some(String::from_utf8_lossy(name).into_owned());
+        }
+        let flags = call.flags();
+        if flags.contains(OFlag::O_NOFOLLOW)
+            || (flags.contains(OFlag::O_CREAT) && flags.contains(OFlag::O_EXCL))
+        {
+            return None;
+        }
+        // Final-component probe: the link itself, not its target.
+        let link =
+            Self::inject_lstatat(guest, call.dirfd(), spelled_ptr, [Some(spelled_ptr), None])
+                .await
+                .ok()?;
+        if link.st_mode & libc::S_IFMT != libc::S_IFLNK {
+            return None;
+        }
+        const PATH_PART: usize = 256;
+        const TARGET_PART: usize = 512;
+        if bytes.len() >= PATH_PART || guest.stack().await.capacity() < PATH_PART + TARGET_PART + 64
+        {
+            return None;
+        }
+        let mut buffer = [0_u8; PATH_PART + TARGET_PART];
+        buffer[..bytes.len()].copy_from_slice(bytes);
+        let dirfd = call.dirfd();
+        let linked = crate::syscalls::scratch::inject_with_scratch(guest, buffer, |base| {
+            // SAFETY: the buffer holds a path half and a target half.
+            let target = unsafe { base.add(PATH_PART) };
+            syscalls::Readlinkat::new()
+                .with_dirfd(dirfd)
+                .with_path(PathPtr::from_ptr(base.as_raw() as *const libc::c_char))
+                .with_buf(Some(target.cast::<libc::c_char>()))
+                .with_buf_len(TARGET_PART)
+                .into()
+        })
+        .await
+        .ok()?;
+        let (length, buffer) = linked;
+        let length = usize::try_from(length).ok()?;
+        if length >= TARGET_PART {
+            return None;
+        }
+        let target = &buffer[PATH_PART..PATH_PART + length];
+        let (target_parent, target_name): (&[u8], &[u8]) =
+            match target.iter().rposition(|byte| *byte == b'/') {
+                Some(0) => (b"/".as_slice(), &target[1..]),
+                Some(index) => (&target[..index], &target[index + 1..]),
+                None => (b".".as_slice(), target),
+            };
+        // A relative target is named from the link's own directory.
+        let resolved: Vec<u8> = if target.first() == Some(&b'/') {
+            target_parent.to_vec()
+        } else if target_parent == b"." {
+            parent.to_vec()
+        } else {
+            let mut joined = parent.to_vec();
+            joined.push(b'/');
+            joined.extend_from_slice(target_parent);
+            joined
+        };
+        self.resolved_parent_is_area(guest, call.dirfd(), &resolved, snapshot)
+            .await
+            .then(|| String::from_utf8_lossy(target_name).into_owned())
     }
 
     /// Say once that the guest opens a file of the property area to write,
