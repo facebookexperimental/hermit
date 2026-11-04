@@ -5857,7 +5857,8 @@ impl Scheduler {
                 )
                 .with_uncapped_slices(
                     cfg.replay_preemptions_from.is_some() || uncapped_replay_backstop.is_some(),
-                );
+                )
+                .with_max_timeslice(cfg.max_timeslice);
             // This run's own record lists every switch it takes, possibly
             // none, so its replay can refuse an unrecorded one.
             let writer = if cfg.post_crash_timeslice_in_effect().is_some() {
@@ -22575,6 +22576,9 @@ impl Scheduler {
         if stats.is_empty() {
             return;
         }
+        if let Some(writer) = &mut self.preemption_writer {
+            writer.note_longest_slice(stats.max_ns);
+        }
         self.per_thread_timeslice
             .entry(dettid)
             .or_default()
@@ -26083,6 +26087,31 @@ mod test {
                 }][..]
             )
         );
+    }
+
+    /// The uncapped stamp follows the slices the scheduler actually folded
+    /// from exiting threads: a completed slice past the bound stamps, one
+    /// that fit under it does not, however the traced events are spaced.
+    #[test]
+    fn a_replay_stamps_uncapped_only_when_a_completed_slice_ran_past_the_bound() {
+        let bound = std::num::NonZeroU64::new(1_000_000);
+        let run = |longest: u64| {
+            let mut sched = Scheduler::new(&Config::default());
+            sched.preemption_writer = Some(
+                PreemptionWriter::new(None)
+                    .with_uncapped_slices(true)
+                    .with_max_timeslice(bound),
+            );
+            let mut stats = TimesliceStats::default();
+            stats.record(longest);
+            sched.record_timeslice_stats(DetTid::from_raw(3), stats);
+            let written = sched.preemption_writer.take().unwrap().into_string();
+            serde_json::from_str::<crate::preemptions::PreemptionRecord>(&written)
+                .unwrap()
+                .uncapped_slices()
+        };
+        assert_eq!(run(40), None);
+        assert_eq!(run(9_400_000), Some(0));
     }
 
     /// Under a format-3 record, a replayed switch-in (`TraceReplay` turn) under
