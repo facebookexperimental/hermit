@@ -2543,7 +2543,7 @@ mod tests {
         let path = directory.path().join("legacy.json");
         std::fs::write(&path, br#"{"per_thread":{},"global":[],"extra":1e999}"#).unwrap();
         assert!(read_trace(&path).is_empty());
-        assert!(boundary_recording::Recording::read(&path).is_err());
+        assert!(boundary_recording::Recording::read(&path).is_ok());
         std::fs::write(&path, br#"{"per_thread":{},"global":[]} false"#).unwrap();
         assert!(std::panic::catch_unwind(|| read_trace(&path)).is_err());
         std::fs::write(
@@ -2579,6 +2579,28 @@ mod tests {
             .push(SchedEvent::branches(DetTid::from_raw(3), 1));
         assert!(invalid.summary().is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"retained original");
+    }
+
+    /// The bounded summary is compared evidence on the no-destination path,
+    /// so histories with identical row counts but different recorded
+    /// contents must not collapse to the same description.
+    #[test]
+    fn bounded_summary_distinguishes_equal_count_histories_by_content() {
+        let tid = DetTid::from_raw(3);
+        let summary = |time, rcbs| {
+            let mut writer = PreemptionWriter::new(None);
+            writer.register_thread(tid, DEFAULT_PRIORITY);
+            writer.insert_reprioritization(
+                tid,
+                LogicalTime::from_nanos(time),
+                rcbs,
+                DEFAULT_PRIORITY,
+                20,
+            );
+            writer.summary().unwrap()
+        };
+
+        assert_ne!(summary(100, 10), summary(200, 20));
     }
 
     /// Every streaming write/summary path runs the writer's stopless
@@ -4678,7 +4700,8 @@ impl PreemptionWriter {
     }
 
     /// A bounded description for logs that do not request a complete JSON
-    /// artifact. Counting rows does not serialize or clone the tape.
+    /// artifact. It streams the finalized record to a digest and counts rows
+    /// without allocating its complete serialization or cloning the tape.
     pub(crate) fn summary(mut self) -> Result<String, String> {
         // Like into_string, this consumes the output owner without a later
         // Drop write. Run the same stopless lowering/refusal and boundary
@@ -4688,12 +4711,20 @@ impl PreemptionWriter {
         // below are the record's either way.
         self.flushed = true;
         self.finalize()?;
-        if let Some(records) = &self.boundary_records {
-            boundary_recording::BorrowedEnvelope::new(&self.inner, records)
+        let digest = if let Some(records) = &self.boundary_records {
+            let output = boundary_recording::BorrowedEnvelope::new(&self.inner, records)
                 .map_err(|error| error.to_string())?;
+            streaming::digest_json(&output)
+        } else {
+            streaming::digest_json(&self.inner)
         }
+        .map_err(|error| error.to_string())?;
+        let digest = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         Ok(format!(
-            "{} threads, {} priority/epoch rows, {} legacy event rows, {} boundary-protocol rows",
+            "{} threads, {} priority/epoch rows, {} legacy event rows, {} boundary-protocol rows, sha256:{digest}",
             self.inner.per_thread.len(),
             self.len(),
             self.inner.global.len(),

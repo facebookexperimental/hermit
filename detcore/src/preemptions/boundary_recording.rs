@@ -23,9 +23,6 @@ use detcore_model::schedule::boundary::BorrowedSchedule;
 use detcore_model::schedule::boundary::Schedule;
 use serde::Deserialize;
 use serde::Serialize;
-use serde::de::MapAccess;
-use serde::de::SeqAccess;
-use serde::de::Visitor;
 
 use super::PreemptionRecord;
 
@@ -101,74 +98,10 @@ impl Serialize for BoundaryRecording {
     }
 }
 
-// Unlike a struct-only probe, this accepts every JSON shape that the old Value
-// dispatch accepted. The typed second pass decides whether a legacy sequence
-// is valid. Visit nested numbers/strings too: IgnoredAny alone would accept an
-// out-of-range float or invalid string hidden in a legacy unknown field, which
-// the old Value pass rejected. No tree or complete payload buffer is built.
-struct FormatProbe(bool);
-
-impl<'de> Deserialize<'de> for FormatProbe {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Probe;
-        impl<'de> Visitor<'de> for Probe {
-            type Value = FormatProbe;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a JSON value")
-            }
-            fn visit_unit<E: serde::de::Error>(self) -> Result<FormatProbe, E> {
-                Ok(FormatProbe(false))
-            }
-            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<FormatProbe, E> {
-                Ok(FormatProbe(false))
-            }
-            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<FormatProbe, E> {
-                Ok(FormatProbe(false))
-            }
-            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<FormatProbe, E> {
-                Ok(FormatProbe(false))
-            }
-            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<FormatProbe, E> {
-                Ok(FormatProbe(false))
-            }
-            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<FormatProbe, E> {
-                Ok(FormatProbe(false))
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<FormatProbe, A::Error> {
-                while seq.next_element::<FormatProbe>()?.is_some() {}
-                Ok(FormatProbe(false))
-            }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<FormatProbe, A::Error> {
-                let Some(first) = map.next_key::<String>()? else {
-                    return Ok(FormatProbe(false));
-                };
-                // serde_json's enabled raw_value feature gives Value's first
-                // map key this special interpretation, even in literal input.
-                // Preserve it without constructing its embedded Value tree.
-                if first == "$serde_json::private::RawValue" {
-                    let raw = map.next_value::<String>()?;
-                    return serde_json::from_str(&raw).map_err(serde::de::Error::custom);
-                }
-                let mut present = first == "slice_boundary_recording";
-                map.next_value::<FormatProbe>()?;
-                while let Some(key) = map.next_key::<String>()? {
-                    present |= key == "slice_boundary_recording";
-                    map.next_value::<FormatProbe>()?;
-                }
-                Ok(FormatProbe(present))
-            }
-        }
-        deserializer.deserialize_any(Probe)
-    }
-}
-
 #[cfg(test)]
 impl FormatProbe {
-    /// The byte-slice form of the streaming dispatch probe, through the
-    /// struct marker probe: duplicate top-level markers are rejected, as
-    /// serde rejects duplicate struct fields.
     fn is_boundary_recording(bytes: &[u8]) -> serde_json::Result<bool> {
-        serde_json::from_slice::<MarkerProbe>(bytes).map(|probe| probe.slice_boundary_recording)
+        serde_json::from_slice::<Self>(bytes).map(|probe| probe.slice_boundary_recording)
     }
 }
 
@@ -177,7 +110,7 @@ impl FormatProbe {
 /// millions of events does not cost a JSON tree of it, several times the
 /// size of its text.
 #[derive(Deserialize)]
-struct MarkerProbe {
+struct FormatProbe {
     // A present null must not look like an absent protocol marker.
     #[serde(default, deserialize_with = "marker_present")]
     slice_boundary_recording: bool,
@@ -194,7 +127,7 @@ pub(super) fn read_settings<T: serde::de::DeserializeOwned>(path: &Path) -> Resu
         input: &mut R,
     ) -> anyhow::Result<T> {
         let start = input.stream_position()?;
-        let (probe, digest) = super::streaming::parse_pass::<MarkerProbe, _>(&mut *input)?;
+        let (probe, digest) = super::streaming::parse_pass::<FormatProbe, _>(&mut *input)?;
         input.seek(SeekFrom::Start(start))?;
         if !probe.slice_boundary_recording && !probe.incomplete_preemption_record {
             // Each old metadata reader still deserializes only its own field,
@@ -410,7 +343,7 @@ impl Recording {
         let start = input.stream_position()?;
         let (probe, digest) = super::streaming::parse_pass::<FormatProbe, _>(&mut *input)?;
         input.seek(SeekFrom::Start(start))?;
-        let (recording, typed_digest) = if probe.0 {
+        let (recording, typed_digest) = if probe.slice_boundary_recording {
             let (envelope, digest) = super::streaming::parse_pass::<Envelope, _>(&mut *input)?;
             (Self::Boundaries(envelope.slice_boundary_recording), digest)
         } else {
@@ -759,15 +692,23 @@ mod tests {
     #[test]
     fn streaming_dispatch_preserves_the_original_value_and_typed_contracts() {
         fn original(bytes: &[u8]) -> anyhow::Result<Recording> {
-            let value: serde_json::Value = serde_json::from_slice(bytes)?;
-            if value.get("slice_boundary_recording").is_some() {
-                let envelope: Envelope = serde_json::from_slice(bytes)?;
-                Ok(Recording::Boundaries(envelope.slice_boundary_recording))
-            } else {
-                let record: PreemptionRecord = serde_json::from_slice(bytes)?;
-                record.validate().map_err(anyhow::Error::msg)?;
-                Ok(Recording::Legacy(record))
-            }
+            // The parent dispatch was the derived two-marker struct probe,
+            // followed by typed parsing and the format check. In particular,
+            // unknown values are skipped as IgnoredAny rather than first
+            // being materialized as serde_json::Value.
+            let recording =
+                if serde_json::from_slice::<FormatProbe>(bytes)?.slice_boundary_recording {
+                    let envelope: Envelope = serde_json::from_slice(bytes)?;
+                    Recording::Boundaries(envelope.slice_boundary_recording)
+                } else {
+                    let record: PreemptionRecord = serde_json::from_slice(bytes)?;
+                    record.validate_contents().map_err(anyhow::Error::msg)?;
+                    Recording::Legacy(record)
+                };
+            recording.metadata().validate_format().map_err(|refusal| {
+                anyhow::Error::new(crate::preemptions::RecordFormatRefusal(refusal))
+            })?;
+            Ok(recording)
         }
         let mut inputs: Vec<Vec<u8>> = [
             r#"{"per_thread":{},"global":[]}"#,
@@ -787,21 +728,33 @@ mod tests {
             r#"{"per_thread":{},"global":[]} trailing"#,
             "null", "[]", "false", "3", "\"text\"", "",
         ].into_iter().map(|text| text.as_bytes().to_vec()).collect();
+        inputs.push(
+            format!(
+                "{{\"per_thread\":{{}},\"global\":[],\"extra\":{}0{}}}",
+                "[".repeat(160),
+                "]".repeat(160)
+            )
+            .into_bytes(),
+        );
         inputs.push(sample(false).encode().unwrap());
         inputs.push(sample(true).encode().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("record.json");
         for bytes in &inputs {
             let expected = original(bytes);
-            let actual = Recording::decode(bytes);
-            match (expected, actual) {
-                (Ok(expected), Ok(actual)) => assert_eq!(actual, expected),
-                (Err(_), Err(_)) => {}
-                (expected, actual) => {
-                    panic!("changed acceptance for {bytes:?}: {expected:?} / {actual:?}")
+            std::fs::write(&path, bytes).unwrap();
+            for actual in [Recording::decode(bytes), Recording::read(&path)] {
+                match (&expected, &actual) {
+                    (Ok(expected), Ok(actual)) => assert_eq!(actual, expected),
+                    (Err(_), Err(_)) => {}
+                    (expected, actual) => {
+                        panic!("changed acceptance for {bytes:?}: {expected:?} / {actual:?}")
+                    }
                 }
             }
         }
-        assert!(Recording::decode(br#"[{},[],null,null,null,false]"#).is_ok());
-        assert!(Recording::decode(br#"{"per_thread":{},"global":[],"extra":1e999}"#).is_err());
+        assert!(Recording::decode(br#"[{},[],null,null,null,false]"#).is_err());
+        assert!(Recording::decode(br#"{"per_thread":{},"global":[],"extra":1e999}"#).is_ok());
     }
 
     #[test]

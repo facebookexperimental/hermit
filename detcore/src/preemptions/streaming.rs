@@ -110,6 +110,28 @@ pub(super) fn write_json<T: Serialize + ?Sized, W: Write>(
     Ok(())
 }
 
+/// Hash the exact bytes `write_json` would emit, without allocating them.
+/// This gives log summaries deterministic content evidence for a complete
+/// record while retaining only the fixed-size digest.
+pub(super) fn digest_json<T: Serialize + ?Sized>(value: &T) -> anyhow::Result<[u8; 32]> {
+    struct DigestWriter(Sha256);
+
+    impl Write for DigestWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = DigestWriter(Sha256::new());
+    write_json(&mut writer, value)?;
+    Ok(writer.0.finalize().into())
+}
+
 /// Serialization errors must not truncate an existing destination. A sink
 /// preflight costs another pass, but needs no complete output allocation and
 /// retains descriptor-path support (no rename, seek or temporary destination).
