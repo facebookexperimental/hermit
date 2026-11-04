@@ -1352,7 +1352,9 @@ fn record_span(record: &TraceRecord) -> Option<(EventIndex, EventIndex)> {
         TraceRecord::Signal(signal) => Some((signal.event, signal.event)),
         TraceRecord::Edge(edge) => Some((edge.from.event, edge.to.event)),
         TraceRecord::WatchHit(hit) => Some((hit.after, hit.after)),
-        TraceRecord::Header(_) | TraceRecord::End(_) => None,
+        // A watch summary aggregates a thread's hits at the end of the run;
+        // it is not itself a schedule event, like the header and end lines.
+        TraceRecord::Header(_) | TraceRecord::End(_) | TraceRecord::WatchSummary(_) => None,
     }
 }
 
