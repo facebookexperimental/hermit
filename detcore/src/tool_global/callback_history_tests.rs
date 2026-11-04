@@ -1934,8 +1934,8 @@ async fn a_replayed_callback_slice_end_refreshes_its_slowdown_epoch_without_repl
             // install the wrong factor even if the old factor were refreshed.
             let future = at + Duration::from_nanos(9_000_000);
             thread.install_schedule_deadline(future, logical_slice);
-            if epoch_length != 0 {
-                assert_ne!((elapsed + 9_000_000) / epoch_length, expected_epoch);
+            if let Some(future_epoch) = (elapsed + 9_000_000).checked_div(epoch_length) {
+                assert_ne!(future_epoch, expected_epoch);
             }
             thread.take_pending_chaos_epochs();
             let stats = serde_json::to_value(&thread.stats).unwrap();
