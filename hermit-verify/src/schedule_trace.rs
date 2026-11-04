@@ -250,6 +250,7 @@ impl InterpolateOpts {
         let copy = Self::common_signal_state_copy(&self.file_a, &self.file_b)?;
         let charged_once = Self::common_expired_wait_charge(&self.file_a, &self.file_b)?;
         let first_pass = Self::common_sleep_registration(&self.file_a, &self.file_b)?;
+        let capped = Self::common_cap_preemption_charge(&self.file_a, &self.file_b)?;
         let first_record =
             Recording::read(&self.file_a)?.into_legacy("schedule diff/interpolation")?;
         let second_record =
@@ -281,6 +282,7 @@ impl InterpolateOpts {
                 .with_signal_state_copy(copy)
                 .with_expired_wait_runs_charged_once(charged_once)
                 .with_queued_sleeps_registered_at_first_pass(first_pass)
+                .with_cap_preemption_charge(capped)
         };
         reconciled(first_record)
             .interpolate_events(&reconciled(second_record), requested_schedule)

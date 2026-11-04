@@ -1182,8 +1182,9 @@ impl AccessTraceWriter {
     }
 
     /// Write the header of a trace to `out`.
+    #[cfg(test)]
     pub(crate) fn new(
-        mut out: Box<dyn Write + Send>,
+        out: Box<dyn Write + Send>,
         from: EventIndex,
         max_records: Option<u64>,
         max_bytes: Option<u64>,

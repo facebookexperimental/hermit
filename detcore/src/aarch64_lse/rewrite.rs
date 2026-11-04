@@ -460,7 +460,7 @@ fn swap(
 }
 
 /// `LDxXR Rt, [Rn]; CBNZ Rt, out; STxXR Rs, Rv, [Rn]; CBNZ Rs` stores only
-
+#[allow(clippy::too_many_arguments)]
 fn rmw(
     alu: Insn,
     alu_word: u32,
@@ -545,14 +545,6 @@ fn rmw(
         alu_word,
         zero_status,
     ])
-}
-
-fn width_limit(size: Size) -> u32 {
-    match size {
-        Size::B => 1 << 8,
-        Size::H => 1 << 16,
-        _ => u32::MAX,
-    }
 }
 
 #[cfg(test)]
