@@ -1106,6 +1106,13 @@ hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
   --target-exit-code=any --report-file=analysis.json -- --chaos -- PROGRAM
 ```
 
+Analyze runs every trial under the `--expired-wait-charge` rule of the
+recording it starts from, or `each` for a chaos target it records itself. A
+baseline schedule recorded by a plain `hermit run --record-preemptions-to=...`
+stores `once`, so analyze refuses it beside a chaos target. Re-record it with
+`--expired-wait-charge=each`, or, if it is the target, pass
+`--expired-wait-charge=once` in the run arguments.
+
 ## Common Run Options
 
 ### Scheduling And Determinism
@@ -1124,10 +1131,31 @@ hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
 | `--max-timeslice=N` | Sets the maximum virtual time slice (minimum one scaled RCB) and requires PMU support. |
 | `--max-timeslice=disabled` | Disables PMU timer preemption. |
 | `--preemption-timeout=N` | Deprecated alias for `--max-timeslice=N`. |
+| `--expired-wait-charge=each\|once` | How a run of consecutive turns that each end an expired timed wait is charged while another thread is queued: `once`, one scheduler turn for the run (the default outside race search), or `each`, a turn per wait (the default under `--chaos` or a heuristic that does not select by priority). |
 | `--cap-preemption-charge` | Charges a turn that ends an expired timeslice at most the time its thread ran since its previous turn. |
 | `--chaos-timeslice-range=MIN..MAX` | With `--chaos`, draws each slice's mean log-uniformly from MIN..MAX virtual nanoseconds and caps slices at MAX (the run's `--max-timeslice`). Not with `--chaos-seeded-timeslice`, which draws the maximum instead. |
 | `--chaos-timeslice-draw=run` | Discovery mode: draws the run's `--max-timeslice` once from the range (without one, the recommended 1000..200000000), from the scheduler seed. Fine draws make runs much slower. |
 | `--chaos-timeslice-draw=slice` | The default draw: each slice's mean from `--chaos-timeslice-range`, which it needs; what a range alone does. |
+
+A thread that polls with timed waits shorter than a scheduler turn's charge
+(`--scheduler-turn-cost`) would otherwise burn a full charge of virtual time
+per poll while other threads wait. Under `--expired-wait-charge=once` a run of
+turns that each end an expired wait, by one thread or several, is charged
+once, so time moves as it would while those threads slept. Only a futex wait
+answered `ETIMEDOUT` and a sleep already due count as expired waits; a
+`ppoll`, `epoll_pwait2` or `pselect6` timeout is still charged each time. The
+rule changes the guest-visible clock of such runs, so a recorded schedule
+stores it, a replay that leaves the option out takes the record's, and a
+replay under the other rule is refused. A record that stores no rule replays
+under `each`; that includes schedules written by Hermit builds from the
+middle of the rule's landing (commits `027e47703` to `90bccf201`), which
+charged runs once without storing it. Two changes that came with the rule
+apply to every `--replay-schedule-from` replay, whatever rule it uses: a
+switch the schedule makes to a thread whose timed wait has already passed
+wakes that thread for the switch, and a replay's own switch turns no longer
+count as the previous turn when Hermit decides whether a signal to the
+running thread costs a turn. Both bring a replay closer to its recording, but
+a replay of an older schedule can differ from what an earlier Hermit did.
 
 `--no-sequentialize-threads` is useful for compatibility experiments and
 workloads such as virtual machines that need real host parallelism. It removes

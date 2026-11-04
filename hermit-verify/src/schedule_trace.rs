@@ -239,11 +239,16 @@ impl InterpolateOpts {
         let tmpdir_path = dir.keep();
         eprintln!(":: Temp workspace: {}", tmpdir_path.display());
         let sched_path = tmpdir_path.join(format!("interpolate_{}.events", self.interpolate));
-        next_sched.write_to_disk(&sched_path).unwrap();
+        next_sched
+            .write_to_disk(&sched_path)
+            .map_err(anyhow::Error::msg)?;
 
         Ok(true)
     }
 
+    /// The interpolated schedule, carrying the run settings both input
+    /// schedules were recorded under, which a replay of it must use; inputs
+    /// that disagree on one are refused.
     fn interpolated_record(&self) -> anyhow::Result<PreemptionRecord> {
         let guest_ids = Self::common_guest_ids(&self.file_a, &self.file_b)?;
         let latency = Self::common_pipe_wake_latency(&self.file_a, &self.file_b)?;

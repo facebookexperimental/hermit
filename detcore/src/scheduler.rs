@@ -6889,8 +6889,14 @@ impl Scheduler {
     /// often at the last turn before the switch. Waking the target at its
     /// passed deadline is what the next pass would do anyway, just ahead of
     /// the other due waiters, which the following passes wake as before.
+    ///
+    /// A target owed a deferred SIGCHLD (`sigchld_deferred`) is left alone:
+    /// the recording may have resumed it down that signal's path
+    /// (`step2e_process_signal_deferred`), and a wake here would end its wait
+    /// by the timeout instead, a replay that differs from its recording
+    /// without a desync to say so.
     fn wake_due_replay_target(&mut self, target: DetTid) {
-        if self.run_queue.contains_tid(target) {
+        if self.run_queue.contains_tid(target) || self.blocked.sigchld_deferred.contains(&target) {
             return;
         }
         let Some(deadline) = self.blocked.timed_waiters.thread_deadline(target) else {
@@ -29522,7 +29528,17 @@ mod test {
         let due = DetTid::from_raw(3);
         let ahead = DetTid::from_raw(5);
         let queued = DetTid::from_raw(7);
-        for (tid, deadline) in [(due, at(9_000)), (ahead, at(20_000)), (queued, at(8_000))] {
+        // Due exactly now, as `pop_if_before` counts it.
+        let exact = DetTid::from_raw(9);
+        // Due, but owed a deferred SIGCHLD the recording may have resumed it by.
+        let signaled = DetTid::from_raw(11);
+        for (tid, deadline) in [
+            (due, at(9_000)),
+            (ahead, at(20_000)),
+            (queued, at(8_000)),
+            (exact, at(10_000)),
+            (signaled, at(9_000)),
+        ] {
             queue_request(&mut scheduler, tid, sleep_request(tid, deadline));
             scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
             if tid != queued {
@@ -29530,11 +29546,19 @@ mod test {
                 scheduler.blocked.timed_waiters.insert(deadline, tid);
             }
         }
-        for tid in [due, ahead, queued] {
+        scheduler.blocked.sigchld_deferred.insert(signaled);
+        for tid in [due, ahead, queued, exact, signaled] {
             scheduler.wake_due_replay_target(tid);
         }
         assert!(scheduler.run_queue.contains_tid(due));
         assert_eq!(scheduler.blocked.timed_waiters.thread_deadline(due), None);
+        assert!(scheduler.run_queue.contains_tid(exact));
+        assert_eq!(scheduler.blocked.timed_waiters.thread_deadline(exact), None);
+        assert!(!scheduler.run_queue.contains_tid(signaled));
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(signaled),
+            Some(at(9_000))
+        );
         assert!(!scheduler.run_queue.contains_tid(ahead));
         assert_eq!(
             scheduler.blocked.timed_waiters.thread_deadline(ahead),
@@ -29545,6 +29569,69 @@ mod test {
             scheduler.blocked.timed_waiters.thread_deadline(queued),
             None
         );
+    }
+
+    /// Consuming a recorded event that switches to a thread still in a timed
+    /// wait whose deadline has passed wakes that thread for the switch, at
+    /// the foreground priority: `consume_schedevent` calls
+    /// `wake_due_replay_target` on the switch's target.
+    #[test]
+    fn a_replayed_switch_wakes_its_due_target() {
+        let mut sched = Scheduler::new(&Config::default());
+        sched.committed_time = at(10_000);
+        let running = DetTid::from_raw(3);
+        let target = DetTid::from_raw(5);
+        let first = SchedEvent::syscall(running, Sysno::getpid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(9_000));
+        let next = SchedEvent::syscall(target, Sysno::getpid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(11_000));
+        sched.replayer = Some(Replayer::new(vec![first.clone(), next]));
+        for tid in [running, target] {
+            sched.priorities.insert(tid, DEFAULT_PRIORITY);
+        }
+        queue_request(&mut sched, target, sleep_request(target, at(9_500)));
+        assert!(sched.run_queue.remove_tid(target));
+        sched.blocked.timed_waiters.insert(at(9_500), target);
+
+        let _ = sched.consume_schedevent(&first);
+        assert_eq!(sched.blocked.timed_waiters.thread_deadline(target), None);
+        assert_eq!(
+            sched.run_queue.queued_priority(target),
+            Some(REPLAY_FOREGROUND_PRIORITY)
+        );
+    }
+
+    /// The same replayed switch must NOT wake a due target that is owed a
+    /// deferred SIGCHLD: the recording may have resumed it down that
+    /// signal's path, and waking it here by timeout would diverge from the
+    /// recording without a desync. Removing the `sigchld_deferred` guard in
+    /// `wake_due_replay_target` makes this test fail.
+    #[test]
+    fn a_replayed_switch_leaves_a_deferred_sigchld_target_asleep() {
+        let mut sched = Scheduler::new(&Config::default());
+        sched.committed_time = at(10_000);
+        let running = DetTid::from_raw(3);
+        let target = DetTid::from_raw(5);
+        let first = SchedEvent::syscall(running, Sysno::getpid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(9_000));
+        let next = SchedEvent::syscall(target, Sysno::getpid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(11_000));
+        sched.replayer = Some(Replayer::new(vec![first.clone(), next]));
+        for tid in [running, target] {
+            sched.priorities.insert(tid, DEFAULT_PRIORITY);
+        }
+        queue_request(&mut sched, target, sleep_request(target, at(9_500)));
+        assert!(sched.run_queue.remove_tid(target));
+        sched.blocked.timed_waiters.insert(at(9_500), target);
+        sched.blocked.sigchld_deferred.insert(target);
+
+        let _ = sched.consume_schedevent(&first);
+        assert_eq!(
+            sched.blocked.timed_waiters.thread_deadline(target),
+            Some(at(9_500)),
+            "deferred-SIGCHLD target must stay in its timed wait"
+        );
+        assert!(!sched.run_queue.contains_tid(target));
     }
 
     /// A replay that leaves `--expired-wait-charge` unset charges runs of
@@ -29723,6 +29810,28 @@ mod test {
             advance(false, &[first], &[wait(first), wait(first)]),
             charge,
             "only the waiter itself queued"
+        );
+        // A thread whose old queue entry is pending removal is not waiting
+        // for the CPU, as `are_all_quiesced` counts it.
+        let pending = {
+            let mut sched = Scheduler::new(&config);
+            sched.priorities.insert(worker, DEFAULT_PRIORITY);
+            sched.runqueue_push_back(worker);
+            sched
+                .pending_run_queue_removals
+                .insert(worker, RemovalDisposition::Retire);
+            let time = Mutex::new(GlobalTime::new(&config));
+            let mut before = time.lock().unwrap().as_nanos();
+            for (turn, _) in [wait(first), wait(second)] {
+                before = time.lock().unwrap().as_nanos();
+                sched.expired_wait_grant = Some(turn.tid);
+                sched.bump_global_time(&time, &Ok(turn));
+            }
+            time.lock().unwrap().as_nanos().duration_since(before)
+        };
+        assert_eq!(
+            pending, charge,
+            "only a thread pending removal from the queue besides the waiters"
         );
         assert_eq!(
             advance(true, &[worker], &[wait(first), wait(second)]),
