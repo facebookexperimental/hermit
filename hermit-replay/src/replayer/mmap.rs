@@ -104,27 +104,38 @@ pub(super) const MAPPING_PLACEMENT_REFUSAL: &str = "replay refused: the address 
 /// a recorded mapping that ends where the next mapping starts lands
 /// elsewhere though its range is free.
 ///
-/// `MAP_SHARED_VALIDATE` refuses `MAP_FIXED_NOREPLACE` (`EOPNOTSUPP`: it is
-/// not a legacy flag), so a mapping made with it is placed as `MAP_SHARED`,
-/// and the one flag only `MAP_SHARED_VALIDATE` admits, `MAP_SYNC`, is
-/// dropped. The recording's call already passed that validation. `MAP_SYNC`
-/// makes a DAX file's metadata durable before a write fault completes; it
-/// moves no address and changes no byte the guest reads, and the replay
-/// backing is a temporary file the tracer deletes, where durability means
-/// nothing. Kept, it would fail with `EOPNOTSUPP` on every backing that is
-/// not DAX: a memfd, tmpfs, btrfs, or ext4 and XFS without `-o dax`.
+/// Whether or not the guest asked for a fixed address, a mapping made with
+/// `MAP_SHARED_VALIDATE` is placed as `MAP_SHARED`, and the one flag only
+/// `MAP_SHARED_VALIDATE` admits, `MAP_SYNC`, is dropped (see
+/// [`for_replay_backing`]).
 fn at_recorded_address(flags: MapFlags) -> MapFlags {
+    let flags = for_replay_backing(flags);
     if flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE) {
-        return flags;
+        flags
+    } else {
+        flags | MapFlags::MAP_FIXED_NOREPLACE
     }
+}
+
+/// The flags of a recorded mapping as replay's own memory can take them,
+/// which is not the recorded file. `MAP_SHARED_VALIDATE` refuses
+/// `MAP_FIXED_NOREPLACE` (`EOPNOTSUPP`: it is not a legacy flag), so it
+/// becomes `MAP_SHARED`; the recording's call already passed that
+/// validation. `MAP_SYNC`, which only `MAP_SHARED_VALIDATE` admits, is
+/// dropped. It makes a DAX file's metadata durable before a write fault
+/// completes; it moves no address and changes no byte the guest reads, and
+/// the replay backing is a temporary file the tracer deletes, where
+/// durability means nothing. Kept, it would fail with `EOPNOTSUPP` on every
+/// backing that is not DAX: a memfd, tmpfs, btrfs, or ext4 and XFS without
+/// `-o dax`, with or without `MAP_FIXED`.
+fn for_replay_backing(flags: MapFlags) -> MapFlags {
     let validate = MapFlags::from_bits_retain(libc::MAP_SHARED_VALIDATE);
-    let flags = if flags.contains(validate) {
+    if flags.contains(validate) {
         flags.difference(validate | MapFlags::from_bits_retain(libc::MAP_SYNC))
             | MapFlags::MAP_SHARED
     } else {
         flags
-    };
-    flags | MapFlags::MAP_FIXED_NOREPLACE
+    }
 }
 
 /// The result of placing a replayed mapping at `address` with
@@ -1664,9 +1675,21 @@ mod tests {
             MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
             MapFlags::MAP_SHARED | MapFlags::MAP_FIXED,
             MapFlags::MAP_SHARED | MapFlags::MAP_FIXED_NOREPLACE,
-            MapFlags::from_bits_retain(libc::MAP_SHARED_VALIDATE) | MapFlags::MAP_FIXED,
         ] {
             assert_eq!(at_recorded_address(flags), flags);
+        }
+        // A guest's own MAP_FIXED is kept, but its MAP_SHARED_VALIDATE and
+        // MAP_SYNC are not: the replay backing is not the recorded DAX file.
+        for flags in [
+            libc::MAP_SHARED_VALIDATE | libc::MAP_FIXED,
+            libc::MAP_SHARED_VALIDATE | libc::MAP_FIXED | libc::MAP_SYNC,
+            libc::MAP_SHARED_VALIDATE | libc::MAP_FIXED | libc::MAP_SYNC | libc::MAP_POPULATE,
+        ] {
+            assert_eq!(
+                at_recorded_address(MapFlags::from_bits_retain(flags)).bits(),
+                (flags & libc::MAP_POPULATE) | libc::MAP_SHARED | libc::MAP_FIXED,
+                "{flags:#x}"
+            );
         }
         // MAP_SHARED_VALIDATE becomes MAP_SHARED, and MAP_SYNC, which only
         // MAP_SHARED_VALIDATE admits, is dropped rather than left for plain
