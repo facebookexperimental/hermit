@@ -6,6 +6,7 @@ branches from 0.5.0.
 
 ## 0.5.3 (Unreleased)
 
+- Removed `scripts/update_spreadsheet.rs`: its inputs no longer exist (no `hermit_syscalls.csv` in the tree, and the v1 `../detcore` layout it assumed is gone), and nothing referenced it. Restore with `git show 37ac767f2fe0529eb936bf6771c760fbd3a1185c^:scripts/update_spreadsheet.rs`.
 - Read the calling process's `/proc/.../cmdline` from its current argument
   memory on ptrace and KVM, including rewritten arguments, thread aliases and
   positioned reads. Reading another process's command line remains a KVM gap.
