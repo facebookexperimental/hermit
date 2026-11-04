@@ -1064,6 +1064,91 @@ mod tests {
         }
     }
 
+    /// One reason compare loops are left alone as `compare-exit`, measured
+    /// on this host: on a read-only word, the native loop's load-exclusive
+    /// reads the word and its failed comparison exits without a store,
+    /// while a CAS with the same mismatching expected value faults, because
+    /// its access asks for write permission before it compares. aarch64 only, and it needs
+    /// FEAT_LSE, which every host the rewrite runs on has.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn on_a_read_only_word_a_failed_exclusive_compare_exits_and_a_cas_faults() {
+        assert!(
+            crate::aarch64_lse::host_has_lse_atomics(),
+            "this host cannot run this test: it lacks the FEAT_LSE atomics a CAS needs"
+        );
+        const PAGE: usize = 4096;
+        // SAFETY: a fresh private anonymous page, unmapped at the end.
+        let page = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(page, libc::MAP_FAILED);
+        let word = page.cast::<u64>();
+        // SAFETY: the page is mapped writable and `word` is aligned.
+        unsafe { word.write(7) };
+        // SAFETY: changes only the protection of the page mapped above.
+        assert_eq!(unsafe { libc::mprotect(page, PAGE, libc::PROT_READ) }, 0);
+
+        // ldaxr; cmp; b.ne out; stlxr; cbnz, expecting 0 where the word is 7.
+        let loaded: u64;
+        // SAFETY: reads the mapped word; the store is never reached.
+        unsafe {
+            std::arch::asm!(
+                "2:",
+                "ldaxr {loaded}, [{addr}]",
+                "cmp {loaded}, {expected}",
+                "b.ne 3f",
+                "stlxr {status:w}, {new}, [{addr}]",
+                "cbnz {status:w}, 2b",
+                "3:",
+                addr = in(reg) word,
+                expected = in(reg) 0u64,
+                new = in(reg) 9u64,
+                loaded = out(reg) loaded,
+                status = out(reg) _,
+                options(nostack),
+            );
+        }
+        assert_eq!(loaded, 7);
+
+        // The CAS with the same expected value, in a child, so that its
+        // fault ends the child rather than the test binary.
+        // SAFETY: the child runs only the CAS and `_exit`.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            let mut expected = 0u64;
+            // SAFETY: a CAS on the mapped word; a fault ends the child.
+            unsafe {
+                std::arch::asm!(
+                    ".arch_extension lse",
+                    "casal {expected}, {new}, [{addr}]",
+                    expected = inout(reg) expected,
+                    new = in(reg) 9u64,
+                    addr = in(reg) word,
+                    options(nostack),
+                );
+                libc::_exit(if expected == 7 { 0 } else { 1 });
+            }
+        }
+        let mut status = 0;
+        // SAFETY: waits for the child forked above.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSEGV,
+            "the CAS on a read-only word did not fault: wait status {status:#x}"
+        );
+        // SAFETY: unmaps the page mapped above.
+        assert_eq!(unsafe { libc::munmap(page, PAGE) }, 0);
+    }
+
     #[test]
     fn a_sequence_outside_the_idiom_set_is_left_alone_with_a_reason() {
         for (name, words, reason) in REFUSALS {
