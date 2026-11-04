@@ -87,9 +87,12 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips nothing at this head: 28 is
-    /// PR #4789's, 29 is PR #4884's, 30 is this change's (PR #4728), and
-    /// 31 is PR #4867's and the current revision.
+    /// `GLOBAL_RPC_REVISIONS` therefore skips. Nothing is reserved at this
+    /// head: 28 is https://github.com/rrnewton/hermit/pull/4789's, 29 is
+    /// https://github.com/rrnewton/hermit/pull/4884's, 30 is this change's
+    /// (https://github.com/rrnewton/hermit/pull/4728), 31 is
+    /// https://github.com/rrnewton/hermit/pull/4867's, and 32, this
+    /// change's layout on top of 31's, is the current revision.
     const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
@@ -250,9 +253,14 @@ mod tests {
         // `GlobalResponse::WithPostCrashBound`
         // (https://github.com/rrnewton/hermit/pull/4867; renumbered to 31 at
         // this rebase onto main's pidfd revision 27, skipping reserved
-        // 30 (4728); digest re-measured at the head that also carries
-        // revision 30's definitions).
-        (31, "e178ac33707f23b5", "f013e36743d8d9e6"),
+        // 30 (4728); digest measured at this head).
+        (31, "b4bbaec490287ee5", "f013e36743d8d9e6"),
+        // This change's layout on top of revision 31's: row 30 above names
+        // the definitions as they stood on cf600eb1, before 29 and 31
+        // landed, so the combined definitions append their own revision
+        // here rather than relabel 31 (revopus1's R1 on this change).
+        // Digest measured at this head.
+        (32, "e178ac33707f23b5", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

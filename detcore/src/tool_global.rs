@@ -8004,9 +8004,11 @@ pub enum SignalScope {
 // `ChildSubreaper` pair. 27 is pidfd's `PidfdSelfQualificationRefusal`;
 // 29 is PR 4884's `StoreExclusive` retype, and 31 is PR #4867's `PostCrash`
 // pair (both landed in batch D2).
-/// PR #4728's `SchedEvent::stopless` and `ReplayedSliceEnd` are revision 30,
-/// reserved for this change by the D2 seal; 31 remains the current revision.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 31;
+/// https://github.com/rrnewton/hermit/pull/4728's `SchedEvent::stopless`
+/// and `ReplayedSliceEnd` are revision 30, reserved for this change by the
+/// D2 seal; the combined layout on top of 31 appends revision 32, which is
+/// the current revision.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 32;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
