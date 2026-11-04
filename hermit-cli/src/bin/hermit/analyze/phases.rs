@@ -42,6 +42,10 @@ use crate::app::analyze::types::ContinuationTimeslice;
 use crate::app::analyze::types::ExitStatusConstraint;
 use crate::app::analyze::types::Report;
 use crate::app::analyze::types::ReportCriticalEvent;
+use crate::app::analyze::types::TrialTimeout;
+use crate::app::analyze::workspace::Retention;
+use crate::app::analyze::workspace::Workspace;
+use crate::app::analyze::workspace::note;
 use crate::app::container::RunTimeoutMarker;
 use crate::app::global_opts::GlobalOpts;
 use crate::app::logdiff::LogDiffCLIOpts;
@@ -4977,19 +4981,6 @@ mod tests {
             attempts == 3,
             "{attempts} knock-outs for three interventions"
         );
-    }
-
-    fn timing_report_stack(thread: i32, ip: u64) -> PrettyBacktrace {
-        serde_json::from_value(serde_json::json!({
-            "thread_id": thread,
-            "thread_name": null,
-            "frames": [{
-                "frame": { "ip": ip, "is_signal": false },
-                "symbol": null,
-                "locations": []
-            }]
-        }))
-        .unwrap()
     }
 
     /// --minimize keeps the observed record and writes normalization only
