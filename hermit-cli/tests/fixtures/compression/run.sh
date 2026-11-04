@@ -80,14 +80,21 @@ elif [[ ${COMPRESSION_SOURCE_REVISION+x} ]]; then
   repository_commit=$COMPRESSION_SOURCE_REVISION
   repository_commit_source=explicit
 else
-  command -v git >/dev/null || fail "git is required without COMPRESSION_SOURCE_REVISION"
-  git_root=$(git -C "$repo_root" rev-parse --show-toplevel) ||
+  # Try git first so git checkouts behave exactly as before; fall back to
+  # Sapling so the fixture also runs in a Sapling/Eden checkout (fbsource).
+  if command -v git >/dev/null &&
+    git_root=$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null) &&
+    [[ $git_root -ef $repo_root ]]; then
+    repository_commit=$(git -C "$repo_root" rev-parse HEAD) ||
+      fail "cannot determine source revision; set COMPRESSION_SOURCE_REVISION for staged sources"
+    repository_commit_source=git
+  elif command -v sl >/dev/null &&
+    repository_commit=$(sl --cwd "$repo_root" log -r . -T '{node}' 2>/dev/null) &&
+    [[ -n $repository_commit ]]; then
+    repository_commit_source=sapling
+  else
     fail "cannot determine source revision; set COMPRESSION_SOURCE_REVISION for staged sources"
-  [[ $git_root -ef $repo_root ]] ||
-    fail "source root is not a Git checkout; set COMPRESSION_SOURCE_REVISION for staged sources"
-  repository_commit=$(git -C "$repo_root" rev-parse HEAD) ||
-    fail "cannot determine source revision; set COMPRESSION_SOURCE_REVISION for staged sources"
-  repository_commit_source=git
+  fi
 fi
 
 bzip2_bin=$(command -v bzip2)
