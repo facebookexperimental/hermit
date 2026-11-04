@@ -64461,6 +64461,10 @@ enum BinderSide {
     /// The sender alone, the run's one task, against a context manager that
     /// runs outside Hermit, as Android runs servicemanager.
     Client,
+    /// No binder guest: a shell that exits at once runs under Hermit with a
+    /// binder device as its standard input, opened outside Hermit once the
+    /// guest's context manager, also outside Hermit, has made it.
+    Inherited,
 }
 
 /// Run the binder guest in `mode` on a private binderfs instance this test
@@ -64469,12 +64473,7 @@ enum BinderSide {
 /// outside side's appended to its stderr after a `--- outside Hermit ---`
 /// line; or `None` where the kernel has no binder filesystem or will not
 /// mount one here, saying which. The run is bounded: the failures these
-/// tests pin are hangs.
-fn binder_guest_output(mode: &str, side: BinderSide) -> Option<Output> {
-    binder_guest_output_with(mode, side, &[])
-}
-
-/// [`binder_guest_output`] with `hermit_args` added to `hermit run`'s own.
+/// tests pin are hangs. `hermit_args` are added to `hermit run`'s own.
 fn binder_guest_output_with(mode: &str, side: BinderSide, hermit_args: &[&str]) -> Option<Output> {
     let filesystems = fs::read_to_string("/proc/filesystems").unwrap_or_default();
     if !filesystems
@@ -64521,6 +64520,13 @@ fn binder_guest_output_with(mode: &str, side: BinderSide, hermit_args: &[&str]) 
              exit $status",
             under_hermit("client")
         ),
+        BinderSide::Inherited => format!(
+            "timeout --kill-after 5s 60s {guest} {mountpoint} {mode} manager >{peer_log} 2>&1 & \
+             peer=$!; {await_ready}; timeout --kill-after 5s 120s {hermit} run --base-env=minimal \
+             {} -- /bin/sh -c 'exit 0' <{mountpoint}/binder-fd-passing; status=$?; {reap_peer}; \
+             {report_peer}; exit $status",
+            hermit_args.join(" ")
+        ),
     };
     // A refused mount is told apart from a failed run by a marker on stdout,
     // which neither the guest nor hermit prints.
@@ -64540,12 +64546,22 @@ fn binder_guest_output_with(mode: &str, side: BinderSide, hermit_args: &[&str]) 
     Some(output)
 }
 
-/// [`binder_guest_output`] for a binder test, which is ignored as
+/// [`binder_guest_output_with`] for a binder test, which is ignored as
 /// host-limited (docs/TESTING_ENVIRONMENTS.md): a run that selects it on a
 /// host without a binder filesystem a user namespace may mount fails, naming
 /// that, rather than counting as a pass that never ran.
 fn binder_guest_output_on_a_capable_host(mode: &str, side: BinderSide) -> Output {
-    binder_guest_output(mode, side).unwrap_or_else(|| {
+    binder_guest_output_with_on_a_capable_host(mode, side, &[])
+}
+
+/// [`binder_guest_output_on_a_capable_host`] with `hermit_args` added to
+/// `hermit run`'s own.
+fn binder_guest_output_with_on_a_capable_host(
+    mode: &str,
+    side: BinderSide,
+    hermit_args: &[&str],
+) -> Output {
+    binder_guest_output_with(mode, side, hermit_args).unwrap_or_else(|| {
         panic!(
             "this binder test needs a binder filesystem (CONFIG_ANDROID_BINDERFS) that an \
              unprivileged user and mount namespace may mount, which this host lacks (see the \
@@ -67138,23 +67154,24 @@ fn run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux() {
     );
 }
 
-/// A fresh `--strict` run that uses binder is refused, with the policy
-/// exit, a message naming why, and the replay route: a binder call that waits
-/// for another process finishes when the host's kernel delivers its work, so
-/// no fresh run can promise to repeat. Before, the run went ahead with only a
-/// warning.
+/// A fresh `--strict` run that uses binder is refused where it opens the
+/// binder device, before any binder call, with the policy exit and a message
+/// naming the descriptor and the missing piece: binder reply payloads are not
+/// recorded. The guest is a client alone under Hermit, against a context
+/// manager outside it, as Android runs servicemanager, so the refusal is of an
+/// ordinary client, not of becoming the context manager. Before, the run went
+/// ahead with only a warning.
 #[test]
-fn a_fresh_strict_run_refuses_binder_and_names_the_replay_route() {
+#[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
+fn a_fresh_strict_run_refuses_binder() {
     let epoch = format!("--epoch={}", detcore_model::config::CANONICAL_TEST_EPOCH);
     // Without the preemption timer, a host whose branch counter `--strict`
     // would refuse still reaches the binder call.
-    let Some(output) = binder_guest_output_with(
+    let output = binder_guest_output_with_on_a_capable_host(
         "ping",
-        BinderSide::Both,
+        BinderSide::Client,
         &["--strict", "--max-timeslice=disabled", &epoch],
-    ) else {
-        return;
-    };
+    );
     let log = stderr(&output);
     assert_eq!(
         output.status.code(),
@@ -67162,56 +67179,142 @@ fn a_fresh_strict_run_refuses_binder_and_names_the_replay_route() {
         "{log}"
     );
     assert!(
-        log.contains("--strict refuses binder in a fresh run"),
+        log.contains("--strict refuses binder: descriptor ")
+            && log.contains(", opened, is a binderfs device")
+            && log.contains("binder reply payloads are not recorded")
+            && log.contains("https://github.com/rrnewton/hermit/issues/5124"),
         "{log}"
     );
-    assert!(log.contains("--replay-preemptions-from"), "{log}");
+    assert!(!log.contains("BINDER_"), "{log}");
 }
 
-/// A `--strict` replay of a record that stores where each backgrounded binder
-/// call rejoined may use binder: the replay holds each call to its recorded
-/// turn. The record is made without `--strict`, as the refusal above says.
+/// A `--strict` run that starts holding a binder descriptor is refused before
+/// the guest runs, naming the descriptor: here a binder device, which a
+/// context manager outside Hermit made and serves, that the caller opened and
+/// passes as standard input. A guest could use it with no open or receipt of
+/// its own (an unknown request or a readiness check on it still reaches the
+/// driver). The control: the same run without `--strict` runs to the end.
 #[test]
-fn a_strict_replay_of_a_record_with_readmissions_may_use_binder() {
+#[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
+fn a_strict_run_started_with_a_binder_descriptor_is_refused() {
+    let epoch = format!("--epoch={}", detcore_model::config::CANONICAL_TEST_EPOCH);
+    let strict = binder_guest_output_with_on_a_capable_host(
+        "ping",
+        BinderSide::Inherited,
+        &["--strict", "--max-timeslice=disabled", &epoch],
+    );
+    let log = stderr(&strict);
+    assert_eq!(
+        strict.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{log}"
+    );
+    assert!(
+        log.contains("--strict refuses binder: descriptor ")
+            && log.contains(", held when the run started, is a binderfs device")
+            && log.contains("binder reply payloads are not recorded"),
+        "{log}"
+    );
+
+    let plain =
+        binder_guest_output_with_on_a_capable_host("ping", BinderSide::Inherited, &[&epoch]);
+    assert_eq!(plain.status.code(), Some(0), "{}", stderr(&plain));
+}
+
+/// A `--strict` run is refused where a thread that keeps a descriptor table of
+/// its own opens a binder device, at a number at which its leader's table holds
+/// /dev/null: Hermit reads the descriptor through the calling thread's table,
+/// not its leader's, which would have let the open and the thread's
+/// BINDER_VERSION through. The thread is made without `CLONE_FILES`
+/// (`clone(2)` with `CLONE_THREAD`), so it has a copy of the table of its own.
+/// The control: the same run without `--strict` opens the device and asks its
+/// version.
+#[test]
+#[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
+fn a_strict_run_refuses_a_binder_device_a_thread_opens_in_a_table_of_its_own() {
+    let epoch = format!("--epoch={}", detcore_model::config::CANONICAL_TEST_EPOCH);
+    let strict = binder_guest_output_with_on_a_capable_host(
+        "ownfiles",
+        BinderSide::Client,
+        &["--strict", "--max-timeslice=disabled", &epoch],
+    );
+    let log = stderr(&strict);
+    assert_eq!(
+        strict.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{log}"
+    );
+    assert!(
+        log.contains("--strict refuses binder: descriptor ")
+            && log.contains(", opened, is a binderfs device"),
+        "{log}"
+    );
+    assert!(
+        !stdout(&strict).contains("own table opened the device"),
+        "{}",
+        stdout(&strict)
+    );
+
+    let plain =
+        binder_guest_output_with_on_a_capable_host("ownfiles", BinderSide::Client, &[&epoch]);
+    assert_success(&plain, &["binder_fd_passing", "ownfiles", "client"]);
+    assert!(
+        stdout(&plain).contains("own table opened the device at "),
+        "{}",
+        stdout(&plain)
+    );
+}
+
+/// A `--strict` replay of a record made without it is refused where it opens
+/// the binder device too: the record fixes when each backgrounded call
+/// rejoins, not what a binder call reads, which is not recorded. The record is made by a
+/// client alone under Hermit against a context manager outside it. The
+/// control: the same record replayed without `--strict` runs to the end, so
+/// the refusal is `--strict`'s, not the record's.
+#[test]
+#[ignore = "host-limited: needs a binder filesystem (CONFIG_ANDROID_BINDERFS) mountable in a user namespace and a branch counter --strict accepts; run with --run-ignored only (docs/TESTING_ENVIRONMENTS.md)"]
+fn a_strict_replay_refuses_binder() {
     let epoch = format!("--epoch={}", detcore_model::config::CANONICAL_TEST_EPOCH);
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let record = directory.path().join("binder.json");
     let record_flag = format!("--record-preemptions-to={}", record.display());
-    let Some(recorded) =
-        binder_guest_output_with("ping", BinderSide::Both, &[&epoch, &record_flag])
-    else {
-        return;
-    };
-    assert_success(&recorded, &["binder_fd_passing", "ping"]);
-    let json: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
-    assert!(
-        json["rejoins"]
-            .as_array()
-            .is_some_and(|rejoins| !rejoins.is_empty()),
-        "the recording stored no readmission"
-    );
-    let replay_flag = format!("--replay-preemptions-from={}", record.display());
-    let replayed = binder_guest_output_with(
+    let recorded = binder_guest_output_with_on_a_capable_host(
         "ping",
-        BinderSide::Both,
+        BinderSide::Client,
+        &[&epoch, &record_flag],
+    );
+    assert_success(&recorded, &["binder_fd_passing", "ping", "client"]);
+    let replay_flag = format!("--replay-preemptions-from={}", record.display());
+
+    let strict = binder_guest_output_with_on_a_capable_host(
+        "ping",
+        BinderSide::Client,
         &["--strict", &epoch, &replay_flag],
-    )
-    .expect("binderfs mounted for the recording");
-    // A replay follows the record's preemptions with the branch counter,
-    // which `--strict` refuses on a host where it is not exact.
-    if replayed.status.code() == Some(HERMIT_POLICY_REFUSAL_EXIT)
-        && stderr(&replayed).contains("--strict refuses the `ptrace` backend on this host")
-    {
-        eprintln!(
-            "skipping: --strict refuses this host before any binder call: {}",
-            stderr(&replayed)
-        );
-        return;
-    }
-    assert_success(&replayed, &["binder_fd_passing", "ping", "--strict"]);
+    );
+    let log = stderr(&strict);
+    assert_eq!(
+        strict.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{log}"
+    );
     assert!(
-        !stderr(&replayed).contains("--strict refuses binder"),
+        log.contains("--strict refuses binder: descriptor ")
+            && log.contains(", opened, is a binderfs device")
+            && log.contains("binder reply payloads are not recorded"),
+        "{log}"
+    );
+
+    let replayed = binder_guest_output_with_on_a_capable_host(
+        "ping",
+        BinderSide::Client,
+        &[&epoch, &replay_flag],
+    );
+    assert_success(
+        &replayed,
+        &["binder_fd_passing", "ping", "client", "replay"],
+    );
+    assert!(
+        !stderr(&replayed).contains("--strict refuses"),
         "{}",
         stderr(&replayed)
     );

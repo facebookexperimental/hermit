@@ -10,7 +10,8 @@
 // it in the receiver.
 //
 // Usage: binder_fd_passing <binderfs mount>
-//            [poll|block|ping|exhausted|writeread|threaded] [both|manager|client].
+//            [poll|block|ping|exhausted|writeread|threaded|ownfiles]
+//            [both|manager|client].
 // The guest adds a device of its own to that binderfs instance through its
 // binder-control file (BINDER_CTL_ADD; an existing one is reused), so it needs
 // no default device and no servicemanager.
@@ -39,6 +40,12 @@
 // In "block" and "exhausted" mode the sender sleeps 100 ms first, so the
 // receiver's read is the one that waits. "threaded" is "ping" whose receiver
 // starts a second thread, sharing its descriptor table, before it waits.
+// "ownfiles", for a client, sends nothing: the process opens /dev/null, and a
+// second thread, made without CLONE_FILES (clone(2) with CLONE_THREAD), so
+// with a copy of the descriptor table of its own, closes that number in its
+// table, opens the device there, where it takes the same number, and asks the
+// driver's version; the process then prints "own table opened the device at
+// N". The process's leader keeps /dev/null at N.
 //
 // The parent forks first, so each process opens the device itself and no
 // binder open file is held by both tables. The parent becomes the device's
@@ -58,7 +65,9 @@
 #include <fcntl.h>
 #include <linux/android/binder.h>
 #include <linux/android/binderfs.h>
+#include <linux/futex.h>
 #include <poll.h>
+#include <sched.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -66,6 +75,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -106,6 +116,81 @@ static void* idle_thread(void* unused) {
 static void die(const char* what) {
   fprintf(stderr, "binder_fd_passing: %s: %s\n", what, strerror(errno));
   exit(1);
+}
+
+// "ownfiles": the device a second thread opens in a table of its own, at the
+// number the process's /dev/null holds in the leader's (see the usage). The
+// thread shares the leader's thread pointer (no CLONE_SETTLS), so it makes
+// raw calls only and leaves its results here for the leader.
+static int own_files = 0;
+static const char* own_files_device;
+static int own_files_null = -1;
+static volatile long own_files_fd = -1;
+static volatile int own_files_protocol = -1;
+static volatile const char* own_files_failed;
+static pid_t own_files_tid;
+
+static int own_files_thread(void* unused) {
+  (void)unused;
+  syscall(SYS_close, own_files_null);
+  own_files_fd =
+      syscall(SYS_openat, AT_FDCWD, own_files_device, O_RDWR | O_CLOEXEC, 0);
+  if (own_files_fd < 0) {
+    own_files_failed = "open";
+    return 1;
+  }
+  struct binder_version version;
+  if (syscall(SYS_ioctl, own_files_fd, BINDER_VERSION, &version) < 0) {
+    own_files_failed = "BINDER_VERSION";
+    return 1;
+  }
+  own_files_protocol = version.protocol_version;
+  return 0;
+}
+
+static int own_files_client(void) {
+  static char stack[64 * 1024] __attribute__((aligned(16)));
+  int flags = CLONE_VM | CLONE_FS | CLONE_SIGHAND | CLONE_THREAD |
+      CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
+  if (clone(
+          own_files_thread,
+          stack + sizeof(stack),
+          flags,
+          NULL,
+          &own_files_tid,
+          NULL,
+          &own_files_tid) < 0) {
+    die("clone");
+  }
+  // Linux clears the thread's id, and wakes this wait, when it exits.
+  for (;;) {
+    pid_t tid = __atomic_load_n(&own_files_tid, __ATOMIC_ACQUIRE);
+    if (tid == 0) {
+      break;
+    }
+    syscall(SYS_futex, &own_files_tid, FUTEX_WAIT, tid, NULL, NULL, 0);
+  }
+  if (own_files_failed != NULL) {
+    fprintf(
+        stderr,
+        "binder_fd_passing: the own-table thread's %s failed\n",
+        (const char*)own_files_failed);
+    return 1;
+  }
+  if (own_files_fd != own_files_null) {
+    fprintf(
+        stderr,
+        "binder_fd_passing: the device opened at %ld, not %d\n",
+        own_files_fd,
+        own_files_null);
+    return 1;
+  }
+  printf(
+      "own table opened the device at %ld (protocol %d)\n",
+      own_files_fd,
+      own_files_protocol);
+  fflush(stdout);
+  return 0;
 }
 
 static int open_device(const char* path) {
@@ -275,7 +360,8 @@ static char* add_device(const char* mount, const char* name) {
 
 int main(int argc, char** argv) {
   const char* usage =
-      "usage: %s <binderfs mount> [poll|block|ping|exhausted|writeread|threaded] "
+      "usage: %s <binderfs mount> "
+      "[poll|block|ping|exhausted|writeread|threaded|ownfiles] "
       "[both|manager|client]\n";
   if (argc < 2 || argc > 4) {
     fprintf(stderr, usage, argv[0]);
@@ -311,6 +397,10 @@ int main(int argc, char** argv) {
       nonblocking = 0;
       pass_fd = 0;
       threaded = 1;
+    } else if (strcmp(argv[2], "ownfiles") == 0) {
+      nonblocking = 0;
+      pass_fd = 0;
+      own_files = 1;
     } else if (strcmp(argv[2], "poll") != 0) {
       fprintf(stderr, usage, argv[0]);
       return 2;
@@ -320,6 +410,14 @@ int main(int argc, char** argv) {
     // The manager added the device and became its context manager.
     static char device[4096];
     snprintf(device, sizeof(device), "%s/binder-fd-passing", argv[1]);
+    if (own_files) {
+      own_files_device = device;
+      own_files_null = open("/dev/null", O_RDONLY | O_CLOEXEC);
+      if (own_files_null < 0) {
+        die("open /dev/null");
+      }
+      return own_files_client();
+    }
     int status = client(device);
     if (status == 0) {
       printf("client received its reply\n");
