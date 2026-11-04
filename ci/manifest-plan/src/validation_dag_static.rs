@@ -1988,7 +1988,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // analyze tests: 1254 + 2 = 1256.
     // And analyze::rundata::tests::every_record_written_for_a_trial_states_the_trials_chosen_ids:
     // 1256 + 1 = 1257.
-    ("test.hermit_unit", 1257),
+    // And rundata::tests::a_recorded_target_run_replays_a_workspace_copy_within_an_explicit_bound:
+    // 1257 + 1 = 1258.
+    ("test.hermit_unit", 1258),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4665,7 +4667,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And https://github.com/rrnewton/hermit/pull/4772's
     // no_namespace_bisect_replays_the_schedules_it_writes and
     // no_namespace_minimize_replays_its_candidate_records: 795 + 2 = 797.
-    ("test.cli", 797),
+    // And analyze_replays_a_recorded_target_instead_of_panicking: 797 + 1 = 798.
+    ("test.cli", 798),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5333,7 +5336,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4751: the same host-limited binder gate: 715 - 1 = 714.
     // And the same --no-namespace bisect and --minimize tests, not excluded:
     // 714 + 2 = 716.
-    ("test.cli_on_host", 716),
+    // And the same recorded-target regression test: 716 + 1 = 717.
+    ("test.cli_on_host", 717),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -6336,7 +6340,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
     // And the same two: 1248 + 2 = 1250.
     // And the same trial-record stamping unit: 1250 + 1 = 1251.
-    ("test.hermit_unit_on_host", 1251),
+    // And the same run1-preemptions test: 1251 + 1 = 1252.
+    ("test.hermit_unit_on_host", 1252),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
