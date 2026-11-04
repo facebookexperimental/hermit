@@ -5541,7 +5541,7 @@ mod tests {
         ] {
             options.trial_schedules_uncapped.set(adopted);
             let mut run = options
-                .prefix_trial("prefix_round_001", &target, 2)
+                .prefix_trial("prefix_round_001", &target, 2, None)
                 .unwrap();
             let path = run.sched_path_in().to_path_buf();
             assert_eq!(
