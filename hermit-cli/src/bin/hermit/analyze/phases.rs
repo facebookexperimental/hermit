@@ -5352,8 +5352,6 @@ mod tests {
         assert_eq!(missed, ["  Exit code 121 is not what we're looking for."]);
     }
 
-
-
     /// A report written before the deciding event was reported still reads.
     #[test]
     fn a_report_without_a_deciding_event_reads() {
