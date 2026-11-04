@@ -3646,10 +3646,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// the run there, as for the received descriptor's `fstat`: no readlink
     /// ran, so the other phase could consume an event this one did not.
     ///
-    /// Otherwise it is read in the guest (`readlinkat` of
-    /// `/proc/thread-self/fd/<fd>`, injected). The path and the result share
-    /// one buffer, staged where `inject_fstat` stages its own
-    /// ([`crate::syscalls::scratch::inject_with_scratch`]).
+    /// Where the backend's own `/proc` is not the guest's (KVM), the
+    /// backend's `link_path` fact names it
+    /// (`Detcore::own_descriptor_link_from_fact`). Otherwise it is read in
+    /// the guest (`readlinkat` of `/proc/thread-self/fd/<fd>`, injected).
+    /// The path and the result share one buffer, staged where `inject_fstat`
+    /// stages its own ([`crate::syscalls::scratch::inject_with_scratch`]).
     async fn received_descriptor_link<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3665,6 +3667,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                          and replay: no buffer for its link ({errno})"
                     ))
                 });
+        }
+        // Where the backend's own `/proc` is not the guest's (KVM), its
+        // `link_path` fact names the descriptor (package K slice F2-d0).
+        if let Some(fact) = Self::own_descriptor_link_from_fact(guest, fd) {
+            return Ok(fact.filter(|text| text.len() < LINK_TARGET));
         }
         let mut buffer = [0_u8; LINK_PATH + LINK_TARGET];
         let spelled = format!("/proc/thread-self/fd/{fd}");

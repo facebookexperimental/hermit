@@ -4957,13 +4957,12 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The procfs directory descriptor `dirfd` is open on, where Detcore has
     /// no record of the descriptor, as the guest names it: the kernel's name
-    /// for it (its `/proc/thread-self/fd/N` link, one injected `readlinkat`),
+    /// for it (its `/proc/thread-self/fd/N` link, `Self::descriptor_kernel_link`),
     /// if that is `/proc` or a path below it, with the kernel's numbers of
     /// the task it names taken back to the guest's where the two differ (DBT,
-    /// `Self::translates_procfs_numbers`). Every backend's kernel beneath
-    /// answers that link for the calling thread's own table: the host kernel
-    /// on ptrace and DBT, KVM's provider (`guest_fd_path`), which has one
-    /// table per process. `None` for a descriptor Detcore has a record of, any
+    /// `Self::translates_procfs_numbers`). Every backend answers that link
+    /// for the calling thread's own table: the host kernel on ptrace and DBT,
+    /// KVM's `link_path` fact, which has one table per process. `None` for a descriptor Detcore has a record of, any
     /// other object, a task number no task of the guest's holds, and where
     /// Detcore does not render procfs files (record and replay, after
     /// `chroot`).
@@ -5004,36 +5003,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         if recorded.is_some() {
             return None;
         }
-        const LINK_CAPACITY: usize = 40;
-        const TARGET_CAPACITY: usize = 256;
-        let mut stack = guest.stack().await;
-        let link = stack.push(rendered_procfs::c_string::<LINK_CAPACITY>(
-            format!("/proc/thread-self/fd/{dirfd}").as_bytes(),
-        ));
-        let target = stack.reserve::<[u8; TARGET_CAPACITY]>();
-        let stack_guard = stack.commit().ok()?;
-        let length = guest
-            .inject(
-                syscalls::Readlinkat::new()
-                    .with_dirfd(libc::AT_FDCWD)
-                    .with_path(PathPtr::from_ptr(link.as_raw() as *const libc::c_char))
-                    .with_buf(Some(target.cast::<libc::c_char>()))
-                    .with_buf_len(TARGET_CAPACITY),
-            )
-            .await;
-        let bytes = match length.map(|length| length as usize) {
-            Ok(length) if length < TARGET_CAPACITY => {
-                let mut bytes = vec![0; length];
-                guest
-                    .memory()
-                    .read_exact(target.cast::<u8>(), &mut bytes)
-                    .ok()
-                    .map(|()| bytes)
-            }
-            _ => None,
-        };
-        drop(stack_guard);
-        let text = String::from_utf8(bytes?).ok()?;
+        let bytes = Self::descriptor_kernel_link(guest, dirfd).await?;
+        let text = bytes.into_os_string().into_string().ok()?;
         // The placeholder directory Detcore serves `/proc` and descriptor
         // directories on, which no guest path reaches: the directory the
         // descriptor stands for (`descriptor_directory`).
@@ -5177,15 +5148,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// The path of the directory `climbs` `..` lead to from the calling
     /// thread's working directory, where `getcwd` renders none for it (a
     /// removed directory, or one whose path is longer than `PATH_MAX`), read
-    /// through a descriptor for that directory, three calls injected in the
-    /// thread: an `O_PATH` open of `..` (`climbs` of them), which the
-    /// executor walks from the working directory itself, as Linux's walk
-    /// leaves a removed directory for its parent; a `readlinkat` of that
-    /// descriptor's link (`/proc/thread-self/fd/<it>`, which the executor
-    /// answers from its own descriptor, as for
-    /// `Detcore::received_descriptor_link`); and the descriptor's `close`,
-    /// before the guest runs again, so the guest's next descriptor number
-    /// does not move. Each call's path and buffer are staged as
+    /// through a descriptor for that directory: an `O_PATH` open of `..`
+    /// (`climbs` of them), injected in the thread, which the executor walks
+    /// from the working directory itself, as Linux's walk leaves a removed
+    /// directory for its parent; that descriptor's link, from the backend's
+    /// `link_path` fact where the backend's own `/proc` is not the guest's
+    /// (`Detcore::own_descriptor_link_from_fact`, KVM), and otherwise by an
+    /// injected `readlinkat` of `/proc/thread-self/fd/<it>`; and the
+    /// descriptor's injected `close`, before the guest runs again, so the
+    /// guest's next descriptor number does not move. Each call's path and buffer are staged as
     /// [`Self::read_guest_cwd_for_syscall`] stages `getcwd`'s. `None` where a
     /// call fails, or where the link fills its buffer and may be cut.
     async fn read_climbed_directory<G: Guest<Self>>(
@@ -5213,6 +5184,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         .await
         .ok()?;
         let fd = RawFd::try_from(opened).ok()?;
+        // Where the backend's own `/proc` is not the guest's (KVM), the
+        // backend's `link_path` fact names the descriptor (package K slice
+        // F2-d0).
+        if let Some(fact) = Self::own_descriptor_link_from_fact(guest, fd) {
+            let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+            return fact
+                .filter(|path| path.len() < LINK_TARGET && path.starts_with(b"/"))
+                .map(|path| {
+                    PathBuf::from(
+                        <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(path),
+                    )
+                });
+        }
         let mut buffer = [0_u8; LINK_PATH + LINK_TARGET];
         let link = format!("/proc/thread-self/fd/{fd}");
         buffer[..link.len()].copy_from_slice(link.as_bytes());
@@ -6465,6 +6449,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .as_mut()
                         .expect("a classified procfs file disappeared")
                         .bind_schedstat_thread(thread);
+                }
+                // The path the descriptor's link names, for a per-process
+                // file the backend keeps itself and does not name (the KVM
+                // executor's own `status` and `maps`,
+                // `Detcore::readlink_own_descriptor_fact`): the spelling with
+                // `self` and `thread-self` resolved, as Linux resolves them at
+                // lookup and `d_path` then names the opened file. Named by a
+                // spelling, as `schedstat` above is.
+                if classified_by_spelling
+                    && let Some(name) = crate::syscalls::namespace::procfs_file_link_name(
+                        &procfs_spelling,
+                        self.procfs_caller_ids(guest),
+                    )
+                    && let Some(file) = procfs.as_mut()
+                {
+                    file.bind_link_name(name);
                 }
                 // A process's `maps` lists the address space its task held at
                 // the open: Linux takes the task's memory map then
@@ -7729,9 +7729,8 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The procfs directory that the kernel beneath the backend names for
     /// descriptor `fd`, which this guest thread just opened: its
-    /// `/proc/thread-self/fd/<fd>` link, read by a `readlinkat` injected in
-    /// the guest thread, which the host kernel answers under ptrace and DBT
-    /// and the KVM executor answers for its own `/proc`, if that names a
+    /// `/proc/thread-self/fd/<fd>` link (`Self::descriptor_kernel_link`), if
+    /// that names a
     /// directory Detcore may record (`procfs_directory_link`). `None`
     /// otherwise, and where the guest stack scratch cannot hold the call's
     /// buffers, the call fails, or the link does not fit in 256 bytes: every
@@ -7745,14 +7744,25 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// The `/proc/thread-self/fd/<fd>` link of descriptor `fd`, which this
-    /// guest thread holds, as the kernel beneath the backend reads it (one
-    /// `readlinkat` injected in the guest thread; the host kernel under ptrace
-    /// and DBT, the KVM executor for its own `/proc`). `None` where the guest
-    /// stack scratch cannot hold the call's buffers, the call fails, or the
-    /// link does not fit in 256 bytes.
+    /// guest thread holds, as the backend names it: one `readlinkat` injected
+    /// in the guest thread, which the host kernel answers under ptrace and
+    /// DBT, and where the backend's own `/proc` is not the guest's (KVM) the
+    /// backend's `link_path` fact (`Detcore::own_descriptor_link_from_fact`,
+    /// package K slice F2-d0). `None` where the guest stack scratch cannot
+    /// hold the call's buffers, the call fails, the backend does not name the
+    /// file, or the link does not fit in 256 bytes.
     async fn descriptor_kernel_link<G: Guest<Self>>(guest: &mut G, fd: RawFd) -> Option<PathBuf> {
         const LINK_CAPACITY: usize = 40;
         const TARGET_CAPACITY: usize = 256;
+        if let Some(fact) = Self::own_descriptor_link_from_fact(guest, fd) {
+            return fact
+                .filter(|text| text.len() < TARGET_CAPACITY)
+                .map(|text| {
+                    PathBuf::from(
+                        <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(text),
+                    )
+                });
+        }
         let mut stack = guest.stack().await;
         let link = stack.push(rendered_procfs::c_string::<LINK_CAPACITY>(
             format!("/proc/thread-self/fd/{fd}").as_bytes(),

@@ -2250,13 +2250,21 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The rendered procfs file that descriptor `fd`'s memfd is named for,
     /// read from its link, within the run's `--proc` level
-    /// ([`Self::placeholder_link_within_level`]).
+    /// ([`Self::placeholder_link_within_level`]). The link is the backend's
+    /// `link_path` fact where the backend's own `/proc` is not the guest's
+    /// (`Detcore::own_descriptor_link_from_fact`, KVM), and otherwise the
+    /// kernel's, read in the guest.
     async fn placeholder_named<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
     ) -> Result<Option<&'static Path>, Error> {
         const TARGET_CAPACITY: usize = crate::procfs::PLACEHOLDER_LINK_CAPACITY;
+        if let Some(fact) = Self::own_descriptor_link_from_fact(guest, fd) {
+            return Ok(fact.and_then(|text| {
+                self.placeholder_link_within_level(guest, &text[..text.len().min(TARGET_CAPACITY)])
+            }));
+        }
         let mut stack = guest.stack().await;
         // The calling thread's descriptor, by its own table: `/proc/self/fd`
         // is the thread group leader's, another table once a thread made
@@ -5569,11 +5577,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// The link of descriptor `fd` (`readlinkat` of
-    /// `/proc/thread-self/fd/<fd>`, injected), at most a placeholder's
-    /// (`PLACEHOLDER_LINK_CAPACITY`): `None` where it cannot be read or is
-    /// longer. It takes no descriptor, so it reads a descriptor received into
-    /// the last free slot of a full table. The path and the result share one
-    /// buffer, staged as `inject_fstat` stages its own
+    /// `/proc/thread-self/fd/<fd>`, injected; the backend's `link_path` fact
+    /// where the backend's own `/proc` is not the guest's,
+    /// `Detcore::own_descriptor_link_from_fact`, KVM), at most a
+    /// placeholder's (`PLACEHOLDER_LINK_CAPACITY`): `None` where it cannot be
+    /// read or is longer. It takes no descriptor, so it reads a descriptor
+    /// received into the last free slot of a full table. The path and the
+    /// result share one buffer, staged as `inject_fstat` stages its own
     /// ([`crate::syscalls::scratch::inject_with_scratch`]).
     async fn received_placeholder_link<G: Guest<Self>>(
         &self,
@@ -5582,6 +5592,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Option<Vec<u8>> {
         const LINK_PATH: usize = 32;
         const LINK_TARGET: usize = crate::procfs::PLACEHOLDER_LINK_CAPACITY;
+        if let Some(fact) = Self::own_descriptor_link_from_fact(guest, fd) {
+            return fact.filter(|text| text.len() < LINK_TARGET);
+        }
         let mut buffer = [0_u8; LINK_PATH + LINK_TARGET];
         let spelled = format!("/proc/thread-self/fd/{fd}");
         buffer

@@ -20746,9 +20746,12 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // rustc link refusal and lists the shared file view beside a second
         // thread, the exited-threads fork test and the fork refusal beside a live
         // thread: 129. And package K slice F2-h's
-        // run_kvm_the_callers_own_link_targets_answer_as_linux: 130, matching
-        // the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 130usize),
+        // run_kvm_the_callers_own_link_targets_answer_as_linux: 130. And package K
+        // slice F2-d0's run_kvm_another_threads_directory_links_are_refused_by_name:
+        // 131. And its
+        // run_kvm_descriptor_links_through_a_descriptor_directory_answer_as_linux:
+        // 132, matching the DAG pin in validation_dag_static.
+        ("privileged-only-test.cli_kvm", 132usize),
     ] {
         let step = privileged
             .steps

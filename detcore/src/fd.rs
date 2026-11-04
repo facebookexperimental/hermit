@@ -2171,6 +2171,17 @@ impl DetFd {
         self.with_description(|d| d.procfs = Some(procfs));
     }
 
+    /// The path `readlink` of this descriptor's link gives for the procfs
+    /// file Detcore recorded at its open (`ProcfsFile::link_name`).
+    pub(crate) fn procfs_link_name(&self) -> Option<PathBuf> {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .and_then(ProcfsFile::link_name)
+                .map(Path::to_path_buf)
+        })
+    }
+
     /// The procfs path of a file Detcore opened with no kernel object behind
     /// it (`ProcfsFile::is_rendered`): this descriptor is a placeholder.
     pub(crate) fn procfs_rendered_path(&self) -> Option<&'static Path> {

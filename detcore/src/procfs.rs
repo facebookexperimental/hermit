@@ -1317,6 +1317,23 @@ pub(crate) struct ProcfsFile {
     schedstat_thread: Option<DetTid>,
     #[serde(default)]
     timer_slack_identity: Option<(u64, u64)>,
+    /// For a per-process file opened by a spelling of its task directory, the
+    /// path `readlink` of its descriptor link gives, with the opener's
+    /// `self` and `thread-self` resolved as the lookup resolved them
+    /// ([`ProcfsFile::bind_link_name`]): the name of a file the backend keeps
+    /// itself and does not name (`Detcore::readlink_own_descriptor_fact`).
+    ///
+    /// Never serialized, so the positional bincode encoding of every global
+    /// RPC message that carries a `ProcfsFile` (`ExecFdState` in
+    /// `PrepareExec` and `MarkPastFirstExecve`, through `ExecMapsFile` and
+    /// `ExecProcfsRecord`) stays the one `GLOBAL_RPC_REVISION` names. Its
+    /// only reader is the KVM route (`Detcore::reads_link_facts`), whose
+    /// global RPC hands each message to the global state in memory
+    /// (reverie-kvm's `send_rpc` calls `receive_rpc`), so the name crosses
+    /// an exec there; a peer that encodes the message (an in-guest runtime,
+    /// ptrace's debug round trip) never reads it.
+    #[serde(skip)]
+    link_name: Option<PathBuf>,
     /// Detcore renders this file without the backend opening it: the guest's
     /// descriptor is a placeholder and no kernel bytes exist to capture (see
     /// [`ProcfsFile::rendered_path`]).
@@ -1950,6 +1967,7 @@ impl ProcfsFile {
             bound_thread_identity: None,
             schedstat_thread: None,
             timer_slack_identity: None,
+            link_name: None,
             rendered: false,
             guest_numbers: None,
             mount_view_kernel: None,
@@ -2889,6 +2907,18 @@ impl ProcfsFile {
             }
             _ => unreachable!("non-binding procfs kind requested an opener identity"),
         }
+    }
+
+    /// Record the path `readlink` of this file's descriptor link gives
+    /// (`ProcfsFile::link_name`).
+    pub(crate) fn bind_link_name(&mut self, name: PathBuf) {
+        self.link_name = Some(name);
+    }
+
+    /// The path `readlink` of this file's descriptor link gives, if recorded
+    /// at its open ([`Self::bind_link_name`]).
+    pub(crate) fn link_name(&self) -> Option<&Path> {
+        self.link_name.as_deref()
     }
 
     /// Returns true when this snapshot consumes deterministic random bytes.
@@ -6386,6 +6416,24 @@ fn sanitize_btrfs_commit_stats(contents: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bound link name leaves a `ProcfsFile`'s positional bincode encoding,
+    /// which global RPC messages carry, exactly as it was without one, and a
+    /// decoded file holds none.
+    #[test]
+    fn a_link_name_is_not_on_the_wire() {
+        let plain = ProcfsFile::from_path(Path::new("/proc/self/status")).unwrap();
+        let mut named = plain.clone();
+        named.bind_link_name(PathBuf::from("/proc/3/status"));
+        let encode = |file: &ProcfsFile| {
+            bincode::serde::encode_to_vec(file, bincode::config::legacy()).unwrap()
+        };
+        assert_eq!(encode(&named), encode(&plain));
+        let (decoded, _): (ProcfsFile, usize) =
+            bincode::serde::decode_from_slice(&encode(&named), bincode::config::legacy()).unwrap();
+        assert_eq!(decoded.link_name(), None);
+        assert_eq!(decoded, plain);
+    }
 
     #[test]
     fn recognizes_only_normalized_procfs_paths() {
