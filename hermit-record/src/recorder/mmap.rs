@@ -843,9 +843,11 @@ mod tests {
     /// MAP_ANONYMOUS mapping, which replay makes live with no name, refuses
     /// replay. Opening the file needs CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE
     /// in the initial user namespace (`proc_map_files_get_link`), which a
-    /// Hermit guest's container never has, so this checks the kernel's side
-    /// only where the test holds one.
+    /// Hermit guest's container never has, so the test is ignored: run it
+    /// with `--ignored` as such a user. Without the capability it fails at
+    /// the open rather than passing without checking anything.
     #[test]
+    #[ignore = "needs CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE in the initial user namespace to open /proc/self/map_files"]
     fn a_reopened_zero_object_is_shared_only_when_its_mapping_was_recorded() {
         let rw = std::fs::OpenOptions::new()
             .read(true)
@@ -864,17 +866,12 @@ mod tests {
                     address + 4096
                 ))
         };
-        let zero_file = match reopen(zero) {
-            Ok(file) => file,
-            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
-                eprintln!(
-                    "skipped: opening /proc/self/map_files needs CAP_SYS_ADMIN or \
-                     CAP_CHECKPOINT_RESTORE in the initial user namespace"
-                );
-                return;
-            }
-            Err(error) => panic!("{error}"),
-        };
+        let zero_file = reopen(zero).unwrap_or_else(|error| {
+            panic!(
+                "opening /proc/self/map_files needs CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE \
+                 in the initial user namespace: {error}"
+            )
+        });
         let anonymous_file = reopen(anonymous).unwrap();
         let tid = std::process::id() as i32;
         let capture = |file: &std::fs::File| {
