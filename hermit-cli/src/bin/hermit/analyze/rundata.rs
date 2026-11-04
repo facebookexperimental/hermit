@@ -1504,14 +1504,6 @@ impl AnalyzeOpts {
         RunData::get_raw_runopts(self).prepare_trial_guest_ids_for_inputs(recordings)
     }
 
-    /// Write the schedule `events` for a trial to replay, stamped
-    /// ([`Self::stamp_trial_record`]). The events alone carry no callback
-    /// checkpoints: a schedule analyze edits (a swap, a reordering) has no
-    /// recorded slice ends to keep.
-    pub fn write_trial_schedule(&self, events: Vec<SchedEvent>, path: &Path) -> anyhow::Result<()> {
-        self.write_trial_record(PreemptionRecord::from_sched_events(events), path)
-    }
-
     /// Write `events`, a schedule a search built from the schedules of
     /// `sources`, for a trial to replay, stamped
     /// ([`Self::stamp_trial_record`]), with the callback checkpoints of the
@@ -3606,7 +3598,7 @@ mod tests {
         // As the bisection writes a trial's schedule (`event_level_search`).
         let schedule = workspace.path().join("bisect_round_001.preempts");
         options
-            .write_trial_schedule(events.clone(), &schedule)
+            .write_trial_schedule_from(events.clone(), &[], &schedule)
             .unwrap();
         states_the_trials_ids(&schedule);
         // As the baseline search writes a prefix of the target's record.

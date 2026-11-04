@@ -4518,7 +4518,8 @@ mod tests {
         let tmp_dir = format!("--tmp-dir={}", parent.path().display());
         let mut options =
             AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
-        options.phase0_initialize().unwrap();
+        let retention = options.workspace_retention();
+        let _workspace = options.phase0_initialize(retention).unwrap();
         let branches = |tid: u64, count: u32| {
             serde_json::json!({
                 "dettid": tid, "op": "Branch", "count": count,
