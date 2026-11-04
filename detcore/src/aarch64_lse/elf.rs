@@ -126,6 +126,13 @@ impl FileReport {
             .copied()
             .unwrap_or(0)
     }
+
+    /// The sequences left alone because no mapping symbol this reader accepts
+    /// proves their section's code: [`Self::unmarked`] and
+    /// [`Self::unsupported`] together.
+    pub fn unproven(&self) -> usize {
+        self.unmarked() + self.unsupported()
+    }
 }
 
 fn idiom_name(idiom: Idiom) -> &'static str {
@@ -767,14 +774,14 @@ fn decode_relr(section: &[u8]) -> Vec<(u64, u64)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A minimal aarch64 ELF image: one read-and-execute `PT_LOAD` covering
     /// the file, a `.text` section (index 1) holding `words` at file offset
     /// and address 0x100, and, unless `marks` is `None`, a symbol table
     /// whose mapping symbols are `marks`: (section index, word index, code).
-    fn elf_image(words: &[u32], marks: Option<&[(u16, usize, bool)]>) -> Vec<u8> {
+    pub(crate) fn elf_image(words: &[u32], marks: Option<&[(u16, usize, bool)]>) -> Vec<u8> {
         elf_image_with(words, marks, None)
     }
 
@@ -1034,7 +1041,7 @@ mod tests {
 
     /// nop; ldaxr w8, [x0]; add w8, w8, #1; stlxr w9, w8, [x0];
     /// cbnz w9, <ldaxr>; ret
-    const LOOP: [u32; 6] = [
+    pub(crate) const LOOP: [u32; 6] = [
         0xd503_201f,
         0x885f_fc08,
         0x1100_0508,
@@ -1245,6 +1252,32 @@ mod tests {
         let patched = |name: &[u8]| rewritten(&named(name)).1.patched_total();
         assert_eq!(patched(b"$d\0"), 1);
         assert_eq!(patched(b"$x.f\0"), 2);
+    }
+
+    /// A plan counts as unproven every loop no mapping symbol it accepts
+    /// proves: those of a section nothing marks, and those of a section
+    /// holding a mapping symbol other than `$x` and `$d`. The in-memory
+    /// rewrite names a file by this count (`Rewrite::unmarked`), so a file
+    /// refused for an unsupported mapping symbol is named as one refused for
+    /// having none.
+    #[test]
+    fn a_plan_counts_every_loop_no_accepted_mapping_symbol_proves() {
+        let words: Vec<u32> = LOOP.iter().chain(LOOP.iter()).copied().collect();
+        let plan = |image: &[u8]| plan_bytes(image).unwrap().unwrap().report;
+        let stripped = elf_image_with(&words, None, Some(&[(0, 6)]));
+        assert_eq!(plan(&stripped).unproven(), 2);
+        let mut unsupported = elf_image(&words, Some(&[(1, 0, true), (1, 6, false)]));
+        let strtab = b"\0$x\0$d\0abort\0";
+        let at = unsupported
+            .windows(strtab.len())
+            .position(|window| window == strtab)
+            .unwrap();
+        unsupported[at + 4..at + 6].copy_from_slice(b"$a");
+        let report = plan(&unsupported);
+        assert_eq!(report.unmarked(), 0, "{report:?}");
+        assert_eq!(report.unproven(), 2, "{report:?}");
+        let marked = elf_image(&words, Some(&[(1, 0, true)]));
+        assert_eq!(plan(&marked).unproven(), 0);
     }
 
     /// A file mapping symbols mark is rewritten, whatever its unwind table
