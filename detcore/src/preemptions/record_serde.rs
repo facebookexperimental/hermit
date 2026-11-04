@@ -841,7 +841,7 @@ mod tests {
     /// time.
     #[test]
     fn format_version_round_trips_through_the_record_serde() {
-        let format = crate::preemptions::PREEMPTION_RECORD_FORMAT;
+        let format = crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
         let old = format!(r#"{{"per_thread":{{}},"global":[],"format_version":{format}}}"#);
         let record: PreemptionRecord = serde_json::from_str(&old).unwrap();
         assert_eq!(record.format_version, Some(format));

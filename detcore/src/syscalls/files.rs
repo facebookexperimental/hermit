@@ -24472,7 +24472,7 @@ mod inject_fstat_scratch {
         let dir = tempfile::tempdir().unwrap();
         let record = dir.path().join("record.json");
         let writer = crate::preemptions::PreemptionWriter::new(None)
-            .with_format(Some(crate::preemptions::PREEMPTION_RECORD_FORMAT))
+            .with_format(Some(crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX))
             .noting_background_starts();
         std::fs::write(&record, writer.into_string()).unwrap();
         assert!(

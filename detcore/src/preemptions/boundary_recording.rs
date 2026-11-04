@@ -1104,7 +1104,7 @@ mod tests {
     fn a_boundary_recording_with_background_starts_is_refused_by_name() {
         use crate::preemptions::BACKGROUND_STARTS_FORMAT;
         use crate::preemptions::BackgroundStart;
-        use crate::preemptions::PREEMPTION_RECORD_FORMAT;
+        use crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
         use crate::preemptions::format_without_background_starts;
         let Recording::Boundaries(valid) = sample(true) else {
             unreachable!()
@@ -1147,7 +1147,11 @@ mod tests {
             );
         }
         let boundary_format = |writer: PreemptionWriter| writer.inner.format_version;
-        for format in [BACKGROUND_STARTS_FORMAT, PREEMPTION_RECORD_FORMAT + 1, 0] {
+        for format in [
+            BACKGROUND_STARTS_FORMAT,
+            PREEMPTION_RECORD_FORMAT_MAX + 1,
+            0,
+        ] {
             let expected = format_without_background_starts(Some(format));
             let before = PreemptionWriter::new(None)
                 .with_format(Some(format))
@@ -1166,7 +1170,7 @@ mod tests {
             .noting_background_starts();
         assert_eq!(
             boundary_format(noting),
-            format_without_background_starts(Some(PREEMPTION_RECORD_FORMAT))
+            format_without_background_starts(Some(PREEMPTION_RECORD_FORMAT_MAX))
         );
         let mut noted = PreemptionWriter::new(None).noting_background_starts();
         noted.insert_background_start(DetTid::from_raw(3), 1);

@@ -432,7 +432,7 @@ mod tests {
         // The first format past the newest this Hermit reads.
         let future = format!(
             r#"{{"per_thread":{{}},"global":[],"format_version":{}}}"#,
-            detcore::preemptions::PREEMPTION_RECORD_FORMAT + 1
+            detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX + 1
         );
         let records: [&[u8]; 2] = [
             future.as_bytes(),

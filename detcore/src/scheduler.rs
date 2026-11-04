@@ -121,7 +121,7 @@ use crate::cpu_set::TaskAffinity;
 use crate::cpu_set::TaskCpus;
 use crate::detlog_debug;
 use crate::ivar::Ivar;
-use crate::preemptions::PREEMPTION_RECORD_FORMAT;
+use crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
 use crate::preemptions::PreemptionWriter;
 use crate::preemptions::TimeSkip;
 use crate::preemptions::TimeSkipReason;
@@ -5818,7 +5818,7 @@ impl Scheduler {
             // a schedule replay of a record that notes them re-records in the
             // format below, with the same timing rules.
             let writer =
-                writer.with_format(replayed_format.unwrap_or(Some(PREEMPTION_RECORD_FORMAT)));
+                writer.with_format(replayed_format.unwrap_or(Some(PREEMPTION_RECORD_FORMAT_MAX)));
             // A schedule replay follows the background starts its record
             // notes rather than taking its own, so only a run that replays no
             // schedule notes every start it takes.
@@ -25875,7 +25875,7 @@ mod test {
         let rows_alone = |offset: Option<crate::preemptions::InstructionOffset>| {
             let tid = DetTid::from_raw(3);
             let mut writer = crate::preemptions::PreemptionWriter::new(None)
-                .with_format(Some(crate::preemptions::PREEMPTION_RECORD_FORMAT));
+                .with_format(Some(crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX));
             writer.register_thread(tid, DEFAULT_PRIORITY);
             writer.insert_reprioritization(
                 tid,

@@ -2024,7 +2024,7 @@ mod tests {
         let output = directory.path().join("prefix.json");
         for with_jump in [false, true] {
             let mut writer = PreemptionWriter::new(None)
-                .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT));
+                .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX));
             writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
             writer.insert_reprioritization(
                 tid,
@@ -2319,7 +2319,7 @@ mod tests {
         // A source of a format this Hermit does not read keeps it as a source,
         // so a trial from it states it too and is refused by name, not
         // lowered into a format this Hermit reads.
-        let newer = detcore::preemptions::PREEMPTION_RECORD_FORMAT + 1;
+        let newer = detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX + 1;
         *options.time_skip_sources.lock().unwrap() = Default::default();
         options.time_skip_sources.lock().unwrap().remember(
             &PreemptionRecord::from_sched_events(events.clone()).with_format(Some(newer)),

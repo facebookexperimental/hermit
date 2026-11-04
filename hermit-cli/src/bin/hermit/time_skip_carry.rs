@@ -147,7 +147,7 @@ impl TimeSkipSources {
         Ok(self.formats.first().copied().unwrap_or(
             detcore::preemptions::format_without_background_starts(
                 detcore::preemptions::format_without_instruction_offsets(Some(
-                    detcore::preemptions::PREEMPTION_RECORD_FORMAT,
+                    detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX,
                 )),
             ),
         ))
@@ -360,7 +360,7 @@ mod tests {
         let mut sources = TimeSkipSources::default();
         let current = detcore::preemptions::format_without_background_starts(
             detcore::preemptions::format_without_instruction_offsets(Some(
-                detcore::preemptions::PREEMPTION_RECORD_FORMAT,
+                detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX,
             )),
         );
         assert_eq!(sources.trial_format().unwrap(), current);
@@ -384,7 +384,7 @@ mod tests {
         let tid = DetTid::from_raw(3);
         let rows = |offset: Option<InstructionOffset>| {
             let mut writer = PreemptionWriter::new(None)
-                .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT));
+                .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX));
             writer.register_thread(tid, 1000);
             writer.insert_reprioritization(tid, LogicalTime::from_nanos(10), 18, 1000, 5, offset);
             writer.insert_schedevent(SchedEvent::branches(tid, 20));
