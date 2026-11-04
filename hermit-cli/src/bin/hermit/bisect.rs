@@ -129,15 +129,9 @@ impl BisectOpts {
             execution_context: self.execution_context,
             tmp_dir: None,
             max_memory: self.max_memory,
-<<<<<<< HEAD
             // Bisect keeps its workspace (`bisect_schedule_pair`), and every
             // trial's schedules in it, as it has no --keep-tmp to ask.
             keep_tmp: true,
-=======
-            // Bisect keeps its workspace whatever this says
-            // (`bisect_schedule_pair`).
-            keep_tmp: false,
->>>>>>> 9435bd784d (analyze: remove its workspace on exit unless --keep-tmp)
             success_exit_code: None,
             run_arg: Vec::new(),
             run_args: self.run_args.clone(),
