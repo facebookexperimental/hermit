@@ -6051,7 +6051,8 @@ fn shared_mappings_stdouts(mode: &str) -> [String; 2] {
 /// object it did not record.
 ///
 /// Known divergence from Linux, pinned by the last assertion: Hermit's
-/// `/proc` has no `map_files`, so readlink and open both fail with ENOENT.
+/// `/proc` has no `map_files`, so readlink and open both fail with ENOENT
+/// (<https://github.com/rrnewton/hermit/issues/5143>).
 /// Linux shows the link, `/dev/zero (deleted)`, and refuses the open with
 /// EPERM unless the caller has CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN in the
 /// initial user namespace (`proc_map_files_get_link`, fs/proc/base.c), which

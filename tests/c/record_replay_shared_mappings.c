@@ -85,7 +85,7 @@
  *         what each call gave. It checks nothing itself: natively an
  *         unprivileged run sees the link and gets EPERM, while Hermit's
  *         /proc, a known divergence, has no map_files and both calls fail
- *         with ENOENT.
+ *         with ENOENT (https://github.com/rrnewton/hermit/issues/5143).
  *
  * Usage: record_replay_shared_mappings <mode>
  * Prints one line per check and exits 0 only if every check saw what Linux
