@@ -165,8 +165,8 @@ pub enum Insn {
         /// Byte offset from this instruction.
         offset: i64,
     },
-    /// FEAT_CMPBR compare-and-branch (CB<cc> register/immediate,
-    /// CBB<cc>, CBH<cc>): a PC-relative direct branch whose target the
+    /// FEAT_CMPBR compare-and-branch (`CB<cc>` register/immediate,
+    /// `CBB<cc>`, `CBH<cc>`): a PC-relative direct branch whose target the
     /// entry analysis needs; never part of a supported loop idiom.
     CompareAndBranch {
         /// Byte offset from this instruction (signed imm9, times 4).
