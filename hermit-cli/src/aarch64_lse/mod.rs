@@ -39,8 +39,10 @@ pub use detcore::aarch64_lse::rewrite;
 /// refusal, the direct-entry decoding and the positive allow-list each
 /// changed what the rewrite writes. 4: a sequence a known entry (the
 /// loader's entry, a defined function symbol or an FDE start) points into
-/// is refused, as is a sub-word compare whose head is one.
-pub const REWRITE_FORMAT_VERSION: u32 = 4;
+/// is refused, as is a sub-word compare whose head is one. 5: literal loads
+/// of an FDE entry protect its instruction bytes from rewriting; only ADR
+/// address-taking can use the function-entry exemption.
+pub const REWRITE_FORMAT_VERSION: u32 = 5;
 
 /// Whether this host executes the FEAT_LSE atomics the rewrite emits.
 ///

@@ -389,9 +389,9 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
         .collect();
     // The bytes every `LDR` (literal) and `ADR` in the image's code reaches,
     // sorted: a sequence among them may be a literal pool.
-    // A literal or `ADR` that names a function's own entry is a pointer
-    // to the function, not to data, so it does not refuse that function's
-    // first sequence.
+    // An `ADR` that names a function's own entry takes a pointer to the
+    // function. A literal load reads its instruction bytes even there,
+    // so only the address-taking can allow that function's first sequence.
     let entry_of = |target: u64| {
         functions
             .binary_search_by_key(&target, |(entry, _)| *entry)
@@ -404,10 +404,13 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
             section.code.iter().flat_map(move |(start, end)| {
                 let first = ((start - section.vaddr) / 4) as usize;
                 let last = ((end - section.vaddr) / 4) as usize;
-                mapping::literal_targets(&words[first..last.min(words.len())], *start)
+                mapping::literal_references(&words[first..last.min(words.len())], *start)
             })
         })
-        .filter(|(target, _)| !entry_of(*target))
+        .filter(|reference| {
+            reference.kind != mapping::LiteralKind::Address || !entry_of(reference.range.0)
+        })
+        .map(|reference| reference.range)
         .collect();
     literals.sort_unstable();
     // No addressed-data extents are computed: without mapping symbols a
@@ -1522,6 +1525,65 @@ pub(crate) mod tests {
         assert_eq!(
             report.refused_sites,
             vec![(0x124, "literal-inside-the-sequence".into())]
+        );
+    }
+
+    #[test]
+    fn a_literal_load_of_an_fde_entry_keeps_the_read_bytes() {
+        let words = [
+            0x885f_fc08, // 0x100: ldaxr w8, [x0]
+            0x1100_0508, // add w8, w8, #1
+            0x8809_fc08, // stlxr w9, w8, [x0]
+            0x35ff_ffa9, // cbnz w9, 0x100
+            0xd65f_03c0, // ret
+            0x18ff_ff61, // 0x114: ldr w1, 0x100 (reads code bytes)
+            0xd65f_03c0, // ret
+        ];
+        let marks = [(1, 0, true)];
+        let functions = [(0, 5), (5, 7)];
+
+        // Without a read of its bytes, the marked canonical loop qualifies.
+        let mut control = words;
+        control[5] = 0xd503_201f; // nop
+        let image = elf_image_with(&control, Some(&marks), Some(&functions));
+        let (changed, report) = rewritten(&image);
+        assert_eq!(report.patched_total(), 1, "{report:?}");
+        assert_ne!(changed, image);
+
+        // An FDE never exempts a memory read of the entry's instruction bytes.
+        for unwind in [None, Some(functions.as_slice())] {
+            let image = elf_image_with(&words, Some(&marks), unwind);
+            let plan = plan_bytes(&image).unwrap().unwrap();
+            assert!(plan.patches.is_empty(), "{plan:?}");
+            let (unchanged, report) = rewritten(&image);
+            assert_eq!(unchanged, image, "{report:?}");
+            assert_eq!(report.patched_total(), 0, "{report:?}");
+            assert_eq!(
+                report.refused.get("literal-inside-the-sequence"),
+                Some(&1),
+                "{report:?}"
+            );
+        }
+
+        // ADR takes an address rather than reading bytes. Only a known
+        // function entry qualifies; an address inside the sequence does not.
+        let mut address = words;
+        address[5] = 0x10ff_ff61; // adr x1, 0x100
+        let image = elf_image_with(&address, Some(&marks), Some(&functions));
+        let (changed, report) = rewritten(&image);
+        assert_eq!(report.patched_total(), 1, "{report:?}");
+        assert_ne!(changed, image);
+
+        address[5] = 0x10ff_ff81; // adr x1, 0x104
+        let image = elf_image_with(&address, Some(&marks), Some(&functions));
+        assert!(plan_bytes(&image).unwrap().unwrap().patches.is_empty());
+        let (unchanged, report) = rewritten(&image);
+        assert_eq!(unchanged, image, "{report:?}");
+        assert_eq!(report.patched_total(), 0, "{report:?}");
+        assert_eq!(
+            report.refused.get("literal-inside-the-sequence"),
+            Some(&1),
+            "{report:?}"
         );
     }
 

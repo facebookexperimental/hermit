@@ -682,6 +682,26 @@ pub fn fde_ranges(bytes: &[u8], address: u64) -> Option<Vec<(u64, u64)>> {
 /// inside a function is read this way, so a candidate sequence any of these
 /// reach is data the unwind table took for code.
 pub fn literal_targets(words: &[u32], base: u64) -> Vec<(u64, u64)> {
+    literal_references(words, base)
+        .into_iter()
+        .map(|reference| reference.range)
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum LiteralKind {
+    MemoryRead,
+    Address,
+}
+
+pub(super) struct LiteralReference {
+    pub(super) range: (u64, u64),
+    pub(super) kind: LiteralKind,
+}
+
+/// Keep address-taking distinct from a read of the instruction bytes: only
+/// the former can name a function entry without observing a rewrite there.
+pub(super) fn literal_references(words: &[u32], base: u64) -> Vec<LiteralReference> {
     words
         .iter()
         .enumerate()
@@ -697,13 +717,19 @@ pub fn literal_targets(words: &[u32], base: u64) -> Vec<(u64, u64)> {
                 };
                 let offset = ((((word >> 5) & 0x7_FFFF) << 13) as i32 >> 11) as i64;
                 let target = pc.wrapping_add(offset as u64);
-                Some((target, target.wrapping_add(size)))
+                Some(LiteralReference {
+                    range: (target, target.wrapping_add(size)),
+                    kind: LiteralKind::MemoryRead,
+                })
             } else if word & 0x9F00_0000 == 0x1000_0000 {
                 // ADR: immlo (30:29), immhi (23:5).
                 let imm = ((word >> 5) & 0x7_FFFF) << 2 | ((word >> 29) & 0b11);
                 let offset = ((imm << 11) as i32 >> 11) as i64;
                 let target = pc.wrapping_add(offset as u64);
-                Some((target, target.wrapping_add(4)))
+                Some(LiteralReference {
+                    range: (target, target.wrapping_add(4)),
+                    kind: LiteralKind::Address,
+                })
             } else {
                 None
             }
