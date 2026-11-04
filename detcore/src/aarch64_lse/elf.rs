@@ -387,8 +387,10 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
             None => std::collections::HashSet::new(),
         })
         .collect();
-    // The bytes every `LDR` (literal) and `ADR` in the image's code reaches,
-    // sorted: a sequence among them may be a literal pool.
+    // Collect `LDR` (literal) and `ADR` references from code and unknown
+    // executable ranges. An unproven section stays unchanged, but its readers
+    // can still observe rewritten bytes in a different, marked section.
+    // Proven data contributes no references. Sort the targets below.
     // An `ADR` that names a function's own entry takes a pointer to the
     // function. A literal load reads its instruction bytes even there,
     // so only the address-taking can allow that function's first sequence.
@@ -401,11 +403,19 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
         .iter()
         .filter_map(|section| Some((section, section.words.as_ref()?)))
         .flat_map(|(section, words)| {
-            section.code.iter().flat_map(move |(start, end)| {
-                let first = ((start - section.vaddr) / 4) as usize;
-                let last = ((end - section.vaddr) / 4) as usize;
-                mapping::literal_references(&words[first..last.min(words.len())], *start)
-            })
+            section
+                .code
+                .iter()
+                .chain(&section.unknown)
+                .flat_map(move |(start, end)| {
+                    // Include every word intersecting a possibly executable
+                    // range, even at a partial-word boundary. Decode at that
+                    // word's actual PC, not the possibly unaligned span start.
+                    let first = (((start - section.vaddr) / 4) as usize).min(words.len());
+                    let last = (((end - section.vaddr).div_ceil(4)) as usize).min(words.len());
+                    let pc = section.vaddr + 4 * first as u64;
+                    mapping::literal_references(&words[first..last], pc)
+                })
         })
         .filter(|reference| {
             reference.kind != mapping::LiteralKind::Address || !entry_of(reference.range.0)
@@ -1526,6 +1536,113 @@ pub(crate) mod tests {
             report.refused_sites,
             vec![(0x124, "literal-inside-the-sequence".into())]
         );
+    }
+
+    #[test]
+    fn literal_readers_in_unknown_executable_ranges_protect_other_sections() {
+        let loop_words = [
+            0x885f_fc08, // 0x400100: ldaxr w8, [x0]
+            0x1100_0508, // add w8, w8, #1
+            0x8809_fc08, // stlxr w9, w8, [x0]
+            0x35ff_ffa9, // cbnz w9, 0x400100
+            0xd65f_03c0, // ret
+        ];
+        const LDR: u32 = 0x18ff_f801; // 0x400200: ldr w1, 0x400100
+        const NOP: u32 = 0xd503_201f;
+
+        // Reuse the two-section fixture, replacing only its non-allocated
+        // symbol/string tables. Names are $x=1, $d=4, $a=7. Every reader
+        // layout keeps the first section marked as code.
+        let image_with_reader_marks = |reader: u32, marks: &[(u32, u64)]| {
+            let mut image = elf_image_two_sections(&loop_words, &[reader, 0xd65f_03c0]);
+            let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+            let symtab_header = shoff + 64 * 4;
+            let strtab_header = shoff + 64 * 5;
+            let symtab_at = image.len().next_multiple_of(8);
+            image.resize(symtab_at, 0);
+            image.extend_from_slice(&[0u8; 24]);
+            image.extend_from_slice(&mapping::tests::symbol(1, 0, 1, 0x400100));
+            for &(name, offset) in marks {
+                image.extend_from_slice(&mapping::tests::symbol(name, 0, 2, 0x400200 + offset));
+            }
+            let symtab_len = image.len() - symtab_at;
+            let strtab_at = image.len();
+            let strings = b"\0$x\0$d\0$a\0";
+            image.extend_from_slice(strings);
+            image[symtab_header + 24..symtab_header + 32]
+                .copy_from_slice(&(symtab_at as u64).to_le_bytes());
+            image[symtab_header + 32..symtab_header + 40]
+                .copy_from_slice(&(symtab_len as u64).to_le_bytes());
+            image[symtab_header + 44..symtab_header + 48]
+                .copy_from_slice(&((2 + marks.len()) as u32).to_le_bytes());
+            image[strtab_header + 24..strtab_header + 32]
+                .copy_from_slice(&(strtab_at as u64).to_le_bytes());
+            image[strtab_header + 32..strtab_header + 40]
+                .copy_from_slice(&(strings.len() as u64).to_le_bytes());
+            image
+        };
+
+        let layouts: &[(&str, &[(u32, u64)])] = &[
+            ("marked code", &[(1, 0)]),
+            ("unmarked section", &[]),
+            ("unknown prefix before code", &[(1, 4)]),
+            ("unsupported section", &[(7, 0)]),
+            ("unsupported after code", &[(1, 0), (7, 4)]),
+            ("unsupported after data", &[(4, 0), (7, 4)]),
+            // A boundary through a word cannot hide the instruction that
+            // starts in the unknown prefix; decode it at its actual PC.
+            ("partial unknown word before data", &[(4, 2)]),
+        ];
+        for &(layout, marks) in layouts {
+            // Refusing every image with an unknown section is not the fix:
+            // without a reader, the marked canonical loop still qualifies.
+            let control = image_with_reader_marks(NOP, marks);
+            let control_plan = plan_bytes(&control).unwrap().unwrap();
+            assert_eq!(control_plan.patches.len(), 1, "{layout}: {control_plan:?}");
+            assert_eq!(control_plan.patches[0].offset, 0x100, "{layout}");
+            let (changed, report) = rewritten(&control);
+            assert_eq!(report.patched_total(), 1, "{layout}: {report:?}");
+            assert_ne!(changed, control, "{layout}");
+
+            let image = image_with_reader_marks(LDR, marks);
+            let plan = plan_bytes(&image).unwrap().unwrap();
+            assert!(plan.patches.is_empty(), "{layout}: {plan:?}");
+            let (unchanged, report) = rewritten(&image);
+            assert_eq!(unchanged, image, "{layout}: {report:?}");
+            assert_eq!(report.patched_total(), 0, "{layout}: {report:?}");
+            assert_eq!(
+                report.refused,
+                BTreeMap::from([("literal-inside-the-sequence", 1)]),
+                "{layout}: {report:?}"
+            );
+            assert_eq!(
+                report.refused_sites,
+                vec![(0x400100, "literal-inside-the-sequence".into())],
+                "{layout}: {report:?}"
+            );
+        }
+
+        // A wholly proven $d word that looks like an LDR is data, not a
+        // reader. Scanning every word in every section would break this.
+        let data = image_with_reader_marks(LDR, &[(4, 0)]);
+        let plan = plan_bytes(&data).unwrap().unwrap();
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
+        let (changed, report) = rewritten(&data);
+        assert_eq!(report.patched_total(), 1, "{report:?}");
+        assert!(report.refused.is_empty(), "{report:?}");
+        assert_eq!(changed[0x200..0x208], data[0x200..0x208]);
+        assert_ne!(changed, data);
+
+        // The actual LDR ends immediately before the candidate. Starting a
+        // decoder at the unaligned $x address would move its PC by two bytes
+        // and invent an overlapping read. Range rounding must not do that.
+        let nearby = image_with_reader_marks(0x18ff_f7e1, &[(1, 2)]);
+        let plan = plan_bytes(&nearby).unwrap().unwrap();
+        assert_eq!(plan.patches.len(), 1, "{plan:?}");
+        let (changed, report) = rewritten(&nearby);
+        assert_eq!(report.patched_total(), 1, "{report:?}");
+        assert!(report.refused.is_empty(), "{report:?}");
+        assert_ne!(changed, nearby);
     }
 
     #[test]
