@@ -88,8 +88,8 @@ mod tests {
 
     /// Revisions reserved for a change that is not on this base yet, which
     /// `GLOBAL_RPC_REVISIONS` therefore skips nothing at this head: 28 is
-    /// PR #4789's, 29 is PR #4884's, 31 is PR #4867's, and 30 is this
-    /// change's (PR #4728), appended in landing order below.
+    /// PR #4789's, 29 is PR #4884's, 30 is this change's (PR #4728), and
+    /// 31 is PR #4867's and the current revision.
     const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
@@ -235,22 +235,24 @@ mod tests {
         // main's 27, skipping 28 reserved for the pending 4789 change;
         // digest measured at this head).
         (29, "05a9f7a4ca16cde1", "f013e36743d8d9e6"),
-        // Adds `GlobalRequest::PostCrash`, `GlobalResponse::PostCrash` and
-        // `GlobalResponse::WithPostCrashBound`
-        // (https://github.com/rrnewton/hermit/pull/4867; renumbered to 31 at
-        // this rebase onto main's pidfd revision 27, skipping reserved
-        // 30 (4728); digest measured at this head).
-        (31, "b4bbaec490287ee5", "f013e36743d8d9e6"),
         // `SchedEvent::stopless`, which the event's bincode always writes, and
         // the `ReplayedSliceEnd` that `TraceSchedEventResponse` now carries
         // (https://github.com/rrnewton/hermit/pull/4728; revision 30, reserved
-        // for this change by the D2 seal and appended here in landing order,
-        // after 29 (PR #4884) and 31 (PR #4867)). The digest now also
+        // for this change by the D2 seal while 29 and 31 landed first, so it
+        // sits in numeric order between them; digest measured at the head
+        // where this change stood on cf600eb1). The digest now also
         // covers the event `TraceSchedEvent` carries (domain 4: its fields and
         // its `Serialize`) and the reply's fields (domain 5). #4780 defines
         // domain 4 for the same event; whichever of the two lands second merges
         // the item lists and records the next revision.
-        (30, "e178ac33707f23b5", "f013e36743d8d9e6"),
+        (30, "8b2876baa9a75d3b", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::PostCrash`, `GlobalResponse::PostCrash` and
+        // `GlobalResponse::WithPostCrashBound`
+        // (https://github.com/rrnewton/hermit/pull/4867; renumbered to 31 at
+        // this rebase onto main's pidfd revision 27, skipping reserved
+        // 30 (4728); digest re-measured at the head that also carries
+        // revision 30's definitions).
+        (31, "e178ac33707f23b5", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

@@ -8005,8 +8005,8 @@ pub enum SignalScope {
 // 29 is PR 4884's `StoreExclusive` retype, and 31 is PR #4867's `PostCrash`
 // pair (both landed in batch D2).
 /// PR #4728's `SchedEvent::stopless` and `ReplayedSliceEnd` are revision 30,
-/// reserved for this change by the D2 seal and appended in landing order.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 30;
+/// reserved for this change by the D2 seal; 31 remains the current revision.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 31;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
