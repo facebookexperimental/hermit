@@ -1737,6 +1737,15 @@ pub struct Scheduler {
     /// The sequence number of each thread's latest committed turn: a poller's
     /// failed attempt came no earlier.
     last_commit_at: BTreeMap<DetTid, u64>,
+    /// The sequence number of each thread's latest committed turn that
+    /// resumed guest execution (an ordinary turn, not an InternalIOPolling
+    /// retry or a TraceReplay switch-in; `unblock_guest`): the turns at
+    /// which a pending signal the thread does not block could actually be
+    /// delivered. The SIGCHLD fence's expiry counts only these, since
+    /// internal polling grants run probes with signals blocked and
+    /// administrative replay grants execute nothing, so neither is the
+    /// resume `ptrace_stop` recalculates pending signals at.
+    last_guest_commit_at: BTreeMap<DetTid, u64>,
     /// Set at the commit of a FIFO open's poll, or of an idle guest-state
     /// poller's retry, when nothing else can run but a deadline is due at a
     /// finite time (`unblock_guest`): the next pass moves global time to that
@@ -5901,6 +5910,7 @@ impl Scheduler {
             retired_at: 0,
             guest_state_polled_at: Default::default(),
             last_commit_at: Default::default(),
+            last_guest_commit_at: Default::default(),
             pending_time_skip: None,
             time_skip_mode,
             die_on_time_skip_desync: cfg.die_on_desync,
@@ -11707,8 +11717,16 @@ impl Scheduler {
     }
 
     /// `dtid` committed a turn: a deferred `SIGCHLD` delivery that waited
-    /// behind it (`blocked.sigchld_deferred_behind`) waits behind it no longer.
-    fn sigchld_deferrals_pass(&mut self, dtid: DetTid) {
+    /// behind it (`blocked.sigchld_deferred_behind`) waits behind it no
+    /// longer. Only a turn that resumed guest execution counts
+    /// (`guest_progress`): an InternalIOPolling retry or a TraceReplay
+    /// switch-in is Detcore's own machinery, at points no recording places
+    /// guest progress, and counting one admits the delivery beside work
+    /// that has not run - in replay, at a different event than recorded.
+    fn sigchld_deferrals_pass(&mut self, dtid: DetTid, guest_progress: bool) {
+        if !guest_progress {
+            return;
+        }
         for behind in self.blocked.sigchld_deferred_behind.values_mut() {
             behind.remove(&dtid);
         }
@@ -11756,7 +11774,11 @@ impl Scheduler {
     /// Whether `dtid`'s `InboundSignal` request was filed after `fence` was
     /// set: `dtid` is the thread whose turn set it, whose request follows
     /// that turn's `kill`, or `dtid` has committed a turn since, and filed
-    /// the request after that commit (`BlockedPool::sigchld_fenced`).
+    /// the request after that commit (`BlockedPool::sigchld_fenced`). Any
+    /// commit orders the filing, polling retries included: a parent parked
+    /// in `read` commits only its internal probes between the kill and the
+    /// delivery, and its copy is still the fenced one. Expiry, not filing,
+    /// is what only guest-executing turns count toward.
     fn filed_after_sigchld_fence(&self, dtid: DetTid, fence: &SigchldFence) -> bool {
         dtid == fence.by
             || self
@@ -11796,8 +11818,17 @@ impl Scheduler {
     /// function of the schedule: the commit order, and the mask of a thread
     /// stopped at its request (`thread_signal_mask_for`), which changes only
     /// in its own turns; an unreadable mask counts as not blocking, which only
-    /// drops a mark.
-    fn sigchld_fence_commit(&mut self, dtid: DetTid) {
+    /// drops a mark. Only a turn that resumed guest execution
+    /// (`guest_progress`) can be one of the two turns above: an
+    /// InternalIOPolling retry's probes run with signals privately blocked
+    /// and restore the guest mask without executing the task, and a
+    /// TraceReplay switch-in executes nothing, so in neither did the
+    /// thread return to user mode where a pending copy is delivered.
+    /// Counting them expired the mark while the copy was still pending
+    /// behind a parent's internal read probes, and the delivery fell back
+    /// to waiting for quiescence beside a busy sibling (revastra2 on
+    /// PR 4627). Consumption by call still expires on any turn.
+    fn sigchld_fence_commit(&mut self, dtid: DetTid, guest_progress: bool) {
         let process = self.sigchld_process(dtid);
         if !self.blocked.sigchld_fenced.contains_key(&process) {
             return;
@@ -11807,11 +11838,12 @@ impl Scheduler {
             .thread_signal_mask_for(dtid, libc::SIGCHLD)
             .is_some_and(|mask| mask & bit != 0);
         let by_call = self.may_take_sigchld_by_call(dtid);
-        let ran_on = self
-            .blocked
-            .sigchld_fenced
-            .get_mut(&process)
-            .is_some_and(|fence| !fence.ran.insert(dtid));
+        let ran_on = guest_progress
+            && self
+                .blocked
+                .sigchld_fenced
+                .get_mut(&process)
+                .is_some_and(|fence| !fence.ran.insert(dtid));
         if by_call || (!blocks && ran_on) {
             self.blocked.sigchld_fenced.remove(&process);
         }
@@ -11873,15 +11905,27 @@ impl Scheduler {
             self.readmit_ready_thread(next);
         }
         // In DetTid order, each thread whose delivery has waited behind all
-        // the work that was runnable when it was deferred.
+        // the work that was runnable when it was deferred. Under a schedule
+        // replay the recorded placement is authoritative: a delivery whose
+        // thread the recorded schedule runs next is re-admitted at that
+        // turn even if its bound has not drained, since replay defers the
+        // delivery only when its recorded turn is selected - later, by
+        // replay's administrative grants, than the recording's deferral -
+        // so re-deriving the bound from queue state admits it beside an
+        // extra turn of the work it waited behind and the replay leaves
+        // its schedule (revastra2 F2 on PR 4627).
         let run_queue = &self.run_queue;
+        let recorded_next = self
+            .has_schedule_replay()
+            .then(|| self.replay_next_resume().map(|(next, _)| next))
+            .flatten();
         let waited: Vec<DetTid> = self
             .blocked
             .sigchld_deferred_behind
             .iter_mut()
             .filter_map(|(dtid, behind)| {
                 behind.retain(|ahead| run_queue.holds_work(*ahead));
-                behind.is_empty().then_some(*dtid)
+                (behind.is_empty() || recorded_next == Some(*dtid)).then_some(*dtid)
             })
             .collect();
         for dtid in waited {
@@ -20711,8 +20755,15 @@ impl Scheduler {
         }
         self.last_committed_turn = Some(self.turn);
         self.turn += 1;
-        self.sigchld_deferrals_pass(dtid);
-        self.sigchld_fence_commit(dtid);
+        // A turn that resumed guest execution, not an InternalIOPolling
+        // retry or a TraceReplay switch-in: the turns the SIGCHLD fence
+        // and its bounded deferral count (`last_guest_commit_at`).
+        let guest_progress = !polling_grant && !switch_in;
+        if guest_progress {
+            self.last_guest_commit_at.insert(dtid, self.progress_epoch);
+        }
+        self.sigchld_deferrals_pass(dtid, guest_progress);
+        self.sigchld_fence_commit(dtid, guest_progress);
         let answer = if fatal_alarm {
             SchedResponse::InGuestFatalAlarm
         } else if signaled {
@@ -40727,14 +40778,18 @@ mod test {
         DetTid::from_raw(1)
     }
 
-    /// `tid` commits a turn, as `unblock_guest` records it: a new
-    /// `progress_epoch` as its latest commit, then `sigchld_fence_commit`.
+    /// `tid` commits a guest-executing turn, as `unblock_guest` records it:
+    /// a new `progress_epoch` as its latest commits, then
+    /// `sigchld_fence_commit`.
     fn commit_for_fence(scheduler: &mut Scheduler, tid: DetTid) {
         scheduler.progress_epoch += 1;
         scheduler
             .last_commit_at
             .insert(tid, scheduler.progress_epoch);
-        scheduler.sigchld_fence_commit(tid);
+        scheduler
+            .last_guest_commit_at
+            .insert(tid, scheduler.progress_epoch);
+        scheduler.sigchld_fence_commit(tid, true);
     }
 
     /// [`defer_sigchld_beside_with`] with a fenced copy, as a child killed by
@@ -40764,13 +40819,13 @@ mod test {
         assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
         // One of them has had its turn and is runnable again: still behind
         // the other.
-        scheduler.sigchld_deferrals_pass(first);
+        scheduler.sigchld_deferrals_pass(first, true);
         scheduler.step2e_process_signal_deferred();
         assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
         assert!(!scheduler.run_queue.contains_tid(signaled));
         // Both have: the delivery is re-admitted beside them, and its
         // `InboundSignal` turn is granted rather than deferred again.
-        scheduler.sigchld_deferrals_pass(second);
+        scheduler.sigchld_deferrals_pass(second, true);
         scheduler.step2e_process_signal_deferred();
         assert!(scheduler.blocked.sigchld_deferred.is_empty());
         assert!(scheduler.blocked.sigchld_deferred_behind.is_empty());
@@ -40800,7 +40855,7 @@ mod test {
             scheduler.blocked.sigchld_deferred_behind.get(&signaled),
             Some(&BTreeSet::from([busy]))
         );
-        scheduler.sigchld_deferrals_pass(busy);
+        scheduler.sigchld_deferrals_pass(busy, true);
         scheduler.step2e_process_signal_deferred();
         assert!(scheduler.blocked.sigchld_deferred.is_empty());
         assert!(scheduler.run_queue.contains_tid(signaled));
@@ -40817,7 +40872,7 @@ mod test {
         let mut scheduler = defer_sigchld_beside_with(&[busy], signaled, false);
         assert!(scheduler.blocked.sigchld_deferred_behind.is_empty());
         for _ in 0..3 {
-            scheduler.sigchld_deferrals_pass(busy);
+            scheduler.sigchld_deferrals_pass(busy, true);
             scheduler.step2e_process_signal_deferred();
             assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
         }
@@ -40956,6 +41011,56 @@ mod test {
         let (mut scheduler, process) = fenced();
         scheduler.sigtimedwait_sets.insert(waiter, chld);
         commit_for_fence(&mut scheduler, waiter);
+        assert!(!scheduler.blocked.sigchld_fenced.contains_key(&process));
+    }
+
+    /// The expiry above, through the production commit path
+    /// (`unblock_guest`): the taker's InternalIOPolling grants - a parent
+    /// in `read` whose internal probes run with signals privately blocked
+    /// and restore the guest mask without executing the task - never
+    /// expire the mark, however many commit, because in none did the
+    /// thread return to user mode where the pending copy is delivered.
+    /// Its ordinary turns then expire it on the second, as above.
+    /// Dropping `unblock_guest`'s `sigchld_fence_commit` call, or counting
+    /// polling grants as guest progress, fails this test (revclaude N1 and
+    /// revastra2 F1 on PR 4627).
+    #[test]
+    fn a_fenced_sigchld_survives_polling_grants_through_unblock_guest() {
+        let taker = DetTid::from_raw(100);
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.thread_tree.add_child(taker, taker, true);
+        register_known_thread(&mut scheduler, taker);
+        scheduler.blocked.continuation_masks.insert(taker, Some(0));
+        let process = scheduler.sigchld_process(taker);
+        scheduler.fence_child_exit_sigchld(
+            process,
+            Some(ChildExitNotification::Discard),
+            fence_marker(),
+        );
+        assert!(scheduler.blocked.sigchld_fenced.contains_key(&process));
+        let grant = |scheduler: &mut Scheduler, request: Resources| {
+            queue_request(scheduler, taker, request);
+            // As step 3 selected it: the grant itself does not dequeue.
+            assert!(scheduler.run_queue.remove_tid(taker));
+            let response = scheduler.next_turns[&taker].resp.clone();
+            assert!(scheduler.unblock_guest(taker, &response).is_ok());
+        };
+        for _ in 0..3 {
+            let mut polling = Resources::new(taker);
+            polling.insert(ResourceID::InternalIOPolling, Permission::W);
+            polling.poll_attempt = 1;
+            grant(&mut scheduler, polling);
+            assert!(
+                scheduler.blocked.sigchld_fenced.contains_key(&process),
+                "a polling grant expired the mark"
+            );
+        }
+        grant(&mut scheduler, Resources::new(taker));
+        assert!(
+            scheduler.blocked.sigchld_fenced.contains_key(&process),
+            "its first guest turn may end where it takes the copy"
+        );
+        grant(&mut scheduler, Resources::new(taker));
         assert!(!scheduler.blocked.sigchld_fenced.contains_key(&process));
     }
 

@@ -51899,6 +51899,10 @@ fn a_parents_sigchld_is_not_held_behind_a_sibling_that_never_blocks() {
             "mode=kill exited=0 code=0 signaled=1 sig=9 handled=0\n",
         ),
         (
+            "read",
+            "mode=read exited=0 code=0 signaled=1 sig=9 handled=0\n",
+        ),
+        (
             "exit",
             "mode=exit exited=1 code=0 signaled=0 sig=0 handled=0\n",
         ),
@@ -51957,35 +51961,41 @@ fn a_parents_sigchld_is_not_held_behind_a_sibling_that_never_blocks() {
         );
     }
     // A recorded schedule of a run whose delivery the bound re-admitted
-    // replays to the same output: replay re-admits it at the same turn.
+    // replays to the same output with no desynchronization: replay
+    // re-admits it at the same turn, not beside extra administrative
+    // grants (revastra2 F2 on PR 4627).
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let schedule = directory.path().join("schedule.json");
     let record = format!("--record-preemptions-to={}", schedule.display());
     let replay = format!("--replay-schedule-from={}", schedule.display());
-    for (label, flag) in [("record", record.as_str()), ("replay", replay.as_str())] {
+    for (label, flags) in [
+        ("record", vec![record.as_str()]),
+        ("replay", vec![replay.as_str(), "--die-on-desync"]),
+    ] {
         let run = directory.path().join(label);
         fs::create_dir_all(&run).unwrap();
-        let (status, log) = run_with_deadline(
-            hermit_command(&[
-                "--log=info",
-                "run",
-                "--strict",
-                flag,
-                "--timeout",
-                "60",
-                "--",
-                guest.as_str(),
-                "kill",
-            ]),
-            &run,
-            Duration::from_secs(150),
-            false,
-        );
+        let mut args = vec!["--log=info", "run", "--strict"];
+        args.extend_from_slice(&flags);
+        args.extend_from_slice(&["--timeout", "60", "--", guest.as_str(), "kill"]);
+        let (status, log) =
+            run_with_deadline(hermit_command(&args), &run, Duration::from_secs(150), false);
         // The delivery was re-admitted by the bound, not at a quiescence.
         assert!(
             log.contains("the work runnable at its deferral has run"),
             "{label}: the bound did not re-admit the delivery:\n{log}"
         );
+        if label == "replay" {
+            assert!(
+                log.contains("(0 desynced)") && !log.contains("in a desynced state"),
+                "{label}: the replay left its recorded schedule:\n{}",
+                log.lines()
+                    .filter(
+                        |line| line.contains("desync") || line.contains("expected to be running")
+                    )
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
         let stdout = fs::read_to_string(run.join("deadline-run.stdout"))
             .expect("failed to read the guest's stdout");
         assert_eq!(
@@ -52959,8 +52969,12 @@ fn a_parent_reaps_its_sigkilled_child_beside_a_contender_that_never_blocks() {
     for (seed, delay_us, hold_spins) in [("--seed=3", "20000", "100"), ("--seed=1", "10000", "300")]
     {
         let check = |stdout: &str| {
+            // Only no output at all is an incomplete attempt: a printed
+            // final line must already carry the expected child result, so
+            // a completed wrong result cannot be retried away (revastra2
+            // F4 on PR 4627).
             assert!(
-                stdout.is_empty() || stdout.starts_with("mode=plain "),
+                stdout.is_empty() || stdout.starts_with("mode=plain signaled=1 sig=9 "),
                 "{seed}: a refused attempt printed {stdout:?}"
             );
         };

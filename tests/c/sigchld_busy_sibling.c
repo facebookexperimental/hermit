@@ -10,10 +10,16 @@
  * A parent's SIGCHLD for a child that ends, while a sibling thread stays
  * runnable until the parent has reaped the child.
  *
- * Usage: sigchld_busy_sibling <kill|exit|sigsuspend|kill-unblocked|exit-unblocked>
+ * Usage: sigchld_busy_sibling <kill|read|exit|sigsuspend|kill-unblocked|exit-unblocked>
  *
  * kill:       the child waits in pause(); the parent SIGKILLs it and reaps
  *             it.
+ * read:       the child waits in pause(); the parent blocks in read() on a
+ *             pipe while the sibling SIGKILLs the child, sleeps (letting
+ *             the scheduler's internal read probes commit turns that never
+ *             resume the parent), then writes the byte the read waits for;
+ *             the parent reaps the child. The fenced SIGCHLD copy must
+ *             survive those probe grants (PR 4627 review F1).
  * exit:       the child exits at once; the parent reaps it.
  * sigsuspend: the child exits at once; the parent, which blocks SIGCHLD
  *             from before the fork, waits in sigsuspend() until its SIGCHLD
@@ -43,8 +49,12 @@
 static atomic_int done;
 static atomic_int sibling_started;
 static atomic_int handled;
+static atomic_int parent_in_read;
 static atomic_long yields;
 static int sibling_unblocked;
+static int read_mode;
+static pid_t read_child;
+static int pipefd[2];
 
 static void on_sigchld(int sig) {
   (void)sig;
@@ -60,6 +70,23 @@ static void* sibling(void* arg) {
     pthread_sigmask(SIG_BLOCK, &set, NULL);
   }
   atomic_store(&sibling_started, 1);
+  if (read_mode) {
+    while (!atomic_load(&parent_in_read)) {
+      sched_yield();
+    }
+    for (int i = 0; i < 10; i++) {
+      sched_yield();
+    }
+    if (kill(read_child, SIGKILL) != 0) {
+      _exit(3);
+    }
+    for (int i = 0; i < 10; i++) {
+      usleep(1000);
+    }
+    if (write(pipefd[1], "x", 1) != 1) {
+      _exit(4);
+    }
+  }
   while (!atomic_load(&done)) {
     sched_yield();
     atomic_fetch_add(&yields, 1);
@@ -69,16 +96,21 @@ static void* sibling(void* arg) {
 
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "";
-  int kill_mode =
-      strcmp(mode, "kill") == 0 || strcmp(mode, "kill-unblocked") == 0;
+  read_mode = strcmp(mode, "read") == 0;
+  int kill_mode = read_mode || strcmp(mode, "kill") == 0 ||
+      strcmp(mode, "kill-unblocked") == 0;
   int suspend_mode = strcmp(mode, "sigsuspend") == 0;
   sibling_unblocked = strcmp(mode, "kill-unblocked") == 0 ||
       strcmp(mode, "exit-unblocked") == 0;
   if (!kill_mode && !suspend_mode && strcmp(mode, "exit") != 0 &&
       strcmp(mode, "exit-unblocked") != 0) {
     fprintf(stderr,
-            "usage: %s <kill|exit|sigsuspend|kill-unblocked|exit-unblocked>\n",
+            "usage: %s <kill|read|exit|sigsuspend|kill-unblocked|exit-unblocked>\n",
             argv[0]);
+    return 2;
+  }
+  if (read_mode && pipe(pipefd) != 0) {
+    perror("pipe");
     return 2;
   }
   sigset_t unblocked;
@@ -120,7 +152,15 @@ int main(int argc, char** argv) {
     }
     _exit(0);
   }
-  if (kill_mode && kill(child, SIGKILL) != 0) {
+  read_child = child;
+  if (read_mode) {
+    char c = 0;
+    atomic_store(&parent_in_read, 1);
+    if (read(pipefd[0], &c, 1) != 1 || c != 'x') {
+      perror("read");
+      return 2;
+    }
+  } else if (kill_mode && kill(child, SIGKILL) != 0) {
     perror("kill");
     return 2;
   }
