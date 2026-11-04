@@ -44,7 +44,7 @@ mod nextest_cpu;
 
 fn usage() {
     println!(
-        "usage: nextest-test-results.rs [--inventory NEXTEST_INVENTORY_JSON] EVENTS_JSONL NEXTEST_STATUS OUTPUT_OR_DASH [ATTEMPT_RECORD_DIR BINARY_MAP CPU_REPORT_OR_DASH]\n       nextest-test-results.rs --write-binary-map NEXTEST_INVENTORY_JSON OUTPUT\n       nextest-test-results.rs --listed-count NEXTEST_INVENTORY_JSON\n\n--inventory uses the same invocation's list JSON for typed event attribution, never for outcomes or CPU measurements. Without it, overlapping same-name suites refuse."
+        "usage: nextest-test-results.rs [--inventory NEXTEST_INVENTORY_JSON] EVENTS_JSONL NEXTEST_STATUS OUTPUT_OR_DASH [ATTEMPT_RECORD_DIR BINARY_MAP CPU_REPORT_OR_DASH]\n       nextest-test-results.rs --write-binary-map NEXTEST_INVENTORY_JSON OUTPUT\n       nextest-test-results.rs --listed-count NEXTEST_INVENTORY_JSON\n\n--inventory uses the same invocation's list JSON for typed event attribution, never for outcomes or CPU measurements. It is required with BINARY_MAP. Without a binary map it is optional, and overlapping same-name suites refuse."
     );
 }
 
@@ -1016,8 +1016,7 @@ fn publish_with_recovery(
     }
 }
 
-fn run() -> Result<(), ProducerError> {
-    let mut args = env::args().skip(1);
+fn run(mut args: impl Iterator<Item = String>) -> Result<(), ProducerError> {
     let Some(first) = args.next() else {
         usage();
         return Err("nextest-test-results requires three arguments".into());
@@ -1087,6 +1086,9 @@ fn run() -> Result<(), ProducerError> {
         return Err(
             "nextest-test-results requires ATTEMPT_RECORD_DIR, BINARY_MAP, and CPU_REPORT_OR_DASH together".into(),
         );
+    }
+    if binary_map.is_some() && inventory_path.is_none() {
+        return Err("nextest-test-results requires --inventory when BINARY_MAP is supplied".into());
     }
     let binary_map = binary_map
         .as_deref()
@@ -1193,7 +1195,7 @@ fn run() -> Result<(), ProducerError> {
 
 fn main() -> ExitCode {
     rust_script_prelude::init();
-    match run() {
+    match run(env::args().skip(1)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("nextest-test-results: {error}");
@@ -1893,6 +1895,103 @@ mod tests {
                 &inv,
                 "0 eligible matches",
             );
+        }
+
+        fn check_binary_map_requires_inventory(status: u64) {
+            let scratch = Scratch::new();
+            let records = Scratch::new();
+            let passed = status == 0;
+            let inventory = inventory(json!({"run":case(false, None)}), json!({}));
+            let inventory_bytes = serde_json::to_vec(&inventory).unwrap();
+            let inventory_path = scratch.0.join("inventory.json");
+            fs::write(&inventory_path, &inventory_bytes).unwrap();
+            let map_path = scratch.0.join("binary-map.json");
+            write_binary_map_atomic(
+                &map_path,
+                &BinaryMap::from_nextest_inventory(&inventory_bytes).unwrap(),
+            )
+            .unwrap();
+            let events = scratch.0.join("events.jsonl");
+            fs::write(
+                &events,
+                text(&[
+                    start("lib", 1),
+                    event("started", "run"),
+                    event(if passed { "ok" } else { "failed" }, "run"),
+                    end("lib", u64::from(passed), u64::from(!passed), 0, 0),
+                ]),
+            )
+            .unwrap();
+            let record = identified_attempt(
+                "pkg",
+                "pkg",
+                "run",
+                1,
+                AttemptCompletion::Exit {
+                    code: if passed { 0 } else { 23 },
+                },
+            );
+            write_record(&records.0, &record);
+            let counts = scratch.0.join("counts.json");
+            let cpu = scratch.0.join("cpu.json");
+            let args = vec![
+                events.display().to_string(),
+                status.to_string(),
+                counts.display().to_string(),
+                records.0.display().to_string(),
+                map_path.display().to_string(),
+                cpu.display().to_string(),
+            ];
+            let result = run(args.clone().into_iter());
+            assert_eq!(
+                (
+                    counts.exists(),
+                    structured_test_results_recovery_path(&counts).exists(),
+                    cpu.exists(),
+                ),
+                (false, false, false),
+                "missing inventory published results for nextest status {status}"
+            );
+            let error = result.unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+            assert_eq!(
+                error.to_string(),
+                "nextest-test-results requires --inventory when BINARY_MAP is supplied"
+            );
+
+            // The same otherwise-valid inputs publish when the carrier is present.
+            let mut admitted = vec!["--inventory".into(), inventory_path.display().to_string()];
+            admitted.extend(args.clone());
+            run(admitted.into_iter()).unwrap();
+            let check_counts = |path: &Path| {
+                let report = TestResults::from_json_slice(&fs::read(path).unwrap()).unwrap();
+                assert_eq!((report.executed_tests, report.filtered_tests), (1, 0));
+                let results = report.results.unwrap();
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].id, "pkg$run");
+                assert_eq!(results[0].passed, passed);
+                assert_eq!(results[0].attempts, 1);
+            };
+            check_counts(&counts);
+            let report: CpuReport = serde_json::from_slice(&fs::read(&cpu).unwrap()).unwrap();
+            assert_eq!(report.attempts, vec![record]);
+
+            // The explicit no-map legacy invocation remains supported.
+            let legacy = scratch.0.join("legacy-counts.json");
+            let mut legacy_args = args[..3].to_vec();
+            legacy_args[2] = legacy.display().to_string();
+            run(legacy_args.into_iter()).unwrap();
+            check_counts(&legacy);
+        }
+
+        #[test]
+        fn binary_map_requires_inventory_for_successful_nextest() {
+            check_binary_map_requires_inventory(0);
+        }
+
+        #[test]
+        fn binary_map_requires_inventory_for_failed_nextest() {
+            check_binary_map_requires_inventory(100);
         }
     }
 

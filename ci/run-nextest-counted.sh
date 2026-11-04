@@ -778,7 +778,7 @@ PYEOF
     status=0
     DAGRUN_TEST_COUNTS_PATH="$scratch/launch-wrong-count.json" NEXTEST_EXPECTED_EXECUTED=1 \
         emit_libtest_count "$scratch/launch-events" 100 "$attempts" "$binary_map" \
-        "$scratch/launch-wrong-cpu.json" >"$scratch/launch-wrong.stdout" 2>"$scratch/launch-wrong.stderr" || status=$?
+        "$scratch/launch-wrong-cpu.json" "$inventory" >"$scratch/launch-wrong.stdout" 2>"$scratch/launch-wrong.stderr" || status=$?
     [[ $status == 2 ]] || return 1
     grep -q 'expected 1 tests to execute, saw 0' "$scratch/launch-wrong.stderr" || return 1
     # The refusal must carry the outcome it already knows. Withholding the typed
@@ -790,7 +790,7 @@ PYEOF
     status=0
     DAGRUN_TEST_COUNTS_PATH="$scratch/failed-wrong-count.json" NEXTEST_EXPECTED_EXECUTED=2 \
         emit_libtest_count "$scratch/wrapper-events" 100 "$ordinary_attempts" "$binary_map" \
-        "$scratch/failed-wrong-cpu.json" >"$scratch/failed-wrong.stdout" 2>"$scratch/failed-wrong.stderr" || status=$?
+        "$scratch/failed-wrong-cpu.json" "$inventory" >"$scratch/failed-wrong.stdout" 2>"$scratch/failed-wrong.stderr" || status=$?
     [[ $status == 2 ]] || return 1
     grep -q 'expected 2 tests to execute, saw 1' "$scratch/failed-wrong.stderr" || return 1
     grep -q 'of which 0 passed and 1 failed' "$scratch/failed-wrong.stderr" || return 1
@@ -798,7 +798,7 @@ PYEOF
     status=0
     DAGRUN_TEST_COUNTS_PATH="$scratch/launch-stray-count.json" \
         emit_libtest_count "$scratch/launch-events" 100 "$ordinary_attempts" "$binary_map" \
-        "$scratch/launch-stray-cpu.json" >"$scratch/launch-stray.stdout" 2>"$scratch/launch-stray.stderr" || status=$?
+        "$scratch/launch-stray-cpu.json" "$inventory" >"$scratch/launch-stray.stdout" 2>"$scratch/launch-stray.stderr" || status=$?
     [[ $status == 2 ]] || return 1
     grep -q 'unexpected=' "$scratch/launch-stray.stderr" || return 1
     [[ ! -e $scratch/launch-stray-count.json && ! -e $scratch/launch-stray-cpu.json ]] || return 1
