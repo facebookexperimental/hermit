@@ -3931,6 +3931,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // restarts the backstop, as the recorded run's new slice
                     // had it. Later real grants may update that authority
                     // normally; do not snapshot it here.
+                    // Recording began a slice here, including its slowdown
+                    // epoch. The cursor's future deadline is not this boundary.
+                    // With no logical slice, recording skipped that refresh too.
+                    if self
+                        .cfg
+                        .target_timeslice
+                        .or(self.cfg.max_timeslice)
+                        .is_some()
+                    {
+                        thread.refresh_chaos_epoch(&self.cfg, end_time);
+                    }
                     thread.restart_replay_backstop(&self.cfg);
                     (None, None)
                 } else if let Some(mut observed) = thread.slice_boundary.take() {

@@ -152,6 +152,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/chaos_callback_slowdown.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/chaos_callback_slowdown.c is owned by hermit-cli/tests/cli.rs: run_schedule_replay_ends_check_in_slices_where_the_record_did keeps its original scenario and additionally requires strict schedule record/replay with and without per-thread slowdown, active RCBs, the recorded callback epoch transition, complete schedule/checkpoint consumption and exact guest stdout and virtual times. These paired runs belong to the existing PMU test, not to an independent record-replay workload or manifest cell."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/chaos_last_band_admission.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/chaos_last_band_admission.c is owned by hermit-cli/tests/cli.rs: The integration test a_sigsuspend_wake_beside_a_last_band_worker_lands_at_a_fixed_turn_under_chaos runs this guest under run --strict --chaos --chaos-target-races three times at each of two seeds and requires the progress line each seed fixes, 399 at seed 2 and 0 at seed 4, because main's sigsuspend is armed for the SIGCHLD waiting in the shared queue (https://github.com/rrnewton/hermit/issues/4234); a generic manifest cannot assert a seed-specific progress line across repeated chaos runs."

@@ -9772,6 +9772,68 @@ impl<T> ThreadState<T> {
         );
     }
 
+    /// Refresh the slowdown at a consumed slice boundary without choosing a
+    /// deadline, drawing a priority or resetting slice statistics. A precise
+    /// priority-history replay uses its previous recorded endpoint, even when
+    /// the PMU checked in one RCB early. A schedule callback supplies its actual
+    /// boundary instead of a future deadline already installed by its cursor.
+    /// Ambient slowdown always follows the current elapsed logical time.
+    pub(crate) fn refresh_chaos_epoch(&mut self, cfg: &Config, recorded_boundary: LogicalTime) {
+        let current_ns = self.thread_logical_time.as_nanos();
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1151)
+        // Redraw only at scheduler commit boundaries, keyed to elapsed
+        // deterministic logical time. Replay artifacts take precedence and
+        // restore the exact recorded Q32 factor even without ambient flags.
+        let replay_has_epochs = self
+            .preemption_points
+            .as_ref()
+            .is_some_and(ThreadHistoryIterator::has_chaos_epochs);
+        if replay_has_epochs {
+            // Precise PMU replay deliberately checks in up to one RCB
+            // before the recorded logical boundary. The new slice still
+            // begins at that recorded boundary, so install its factor
+            // against the prior slice's exact target rather than the
+            // slightly-early observed clock. Otherwise a short epoch can
+            // be skipped and the following RCBs receive the wrong weight.
+            let transition = self
+                .preemption_points
+                .as_mut()
+                .and_then(|history| history.advance_chaos_epoch(recorded_boundary));
+            if let Some(transition) = transition {
+                self.install_chaos_epoch(transition, false);
+            }
+        } else if cfg.chaos && cfg.chaos_per_thread_slowdown {
+            let elapsed_ns = self.thread_logical_time.without_starting().as_nanos();
+            let epoch = elapsed_ns
+                .checked_div(cfg.chaos_epoch_length_ns)
+                .unwrap_or(0);
+            let factor = chaos_per_thread_slowdown_factor(
+                cfg.sched_seed(),
+                self.dettid,
+                epoch,
+                cfg.chaos_slowdown_max_factor,
+            );
+            if epoch != self.chaos_epoch {
+                self.install_chaos_epoch(
+                    ChaosEpochTransition {
+                        logical_time: current_ns,
+                        epoch,
+                        factor,
+                    },
+                    true,
+                );
+            } else {
+                self.chaos_slowdown_factor = factor;
+                self.chaos_slowdown_active = true;
+            }
+        } else {
+            self.chaos_slowdown_factor = RcbTimeMultiplier::ONE;
+            self.chaos_slowdown_active = false;
+            self.pending_chaos_epochs.clear();
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     /// `bound`, a configured slice bound, raised to the post-crash bound once
     /// the run has switched to it (`crate::post_crash`). A bound already
@@ -9798,59 +9860,8 @@ impl<T> ThreadState<T> {
         if let Some(timeout_ns) = logical_timeslice {
             let current_ns = self.thread_logical_time.as_nanos();
 
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-1151)
-            // Redraw only at scheduler commit boundaries, keyed to elapsed
-            // deterministic logical time. Replay artifacts take precedence and
-            // restore the exact recorded Q32 factor even without ambient flags.
-            let replay_has_epochs = self
-                .preemption_points
-                .as_ref()
-                .is_some_and(ThreadHistoryIterator::has_chaos_epochs);
-            if replay_has_epochs {
-                // Precise PMU replay deliberately checks in up to one RCB
-                // before the recorded logical boundary. The new slice still
-                // begins at that recorded boundary, so install its factor
-                // against the prior slice's exact target rather than the
-                // slightly-early observed clock. Otherwise a short epoch can
-                // be skipped and the following RCBs receive the wrong weight.
-                let transition_time = self.end_of_timeslice.unwrap_or(current_ns);
-                let transition = self
-                    .preemption_points
-                    .as_mut()
-                    .and_then(|history| history.advance_chaos_epoch(transition_time));
-                if let Some(transition) = transition {
-                    self.install_chaos_epoch(transition, false);
-                }
-            } else if cfg.chaos && cfg.chaos_per_thread_slowdown {
-                let elapsed_ns = self.thread_logical_time.without_starting().as_nanos();
-                let epoch = elapsed_ns
-                    .checked_div(cfg.chaos_epoch_length_ns)
-                    .unwrap_or(0);
-                let factor = chaos_per_thread_slowdown_factor(
-                    cfg.sched_seed(),
-                    self.dettid,
-                    epoch,
-                    cfg.chaos_slowdown_max_factor,
-                );
-                if epoch != self.chaos_epoch {
-                    self.install_chaos_epoch(
-                        ChaosEpochTransition {
-                            logical_time: current_ns,
-                            epoch,
-                            factor,
-                        },
-                        true,
-                    );
-                } else {
-                    self.chaos_slowdown_factor = factor;
-                    self.chaos_slowdown_active = true;
-                }
-            } else {
-                self.chaos_slowdown_factor = RcbTimeMultiplier::ONE;
-                self.chaos_slowdown_active = false;
-                self.pending_chaos_epochs.clear();
-            }
+            let recorded_boundary = self.end_of_timeslice.unwrap_or(current_ns);
+            self.refresh_chaos_epoch(cfg, recorded_boundary);
 
             let mut result = None;
             self.replay_rcb_end = None;
@@ -9967,13 +9978,15 @@ impl<T> ThreadState<T> {
                 }
             } else if !cfg.chaos_draws_schedule() {
                 if self.follows_replayed_schedule(cfg) {
-                    if cfg.no_rcb_time {
+                    if cfg.no_rcb_time && cfg.max_timeslice.is_some() {
                         let length = self
                             .max_slice_length(cfg)
                             .expect("schedule replay with PMU requires a maximum");
                         self.end_of_timeslice = Some(current_ns + Duration::from_nanos(length));
                     } else {
-                        // Branch-event replay will overwrite this deadline when needed.
+                        // The schedule's events and callback checkpoints decide
+                        // the slice end. A cooperative target without a PMU
+                        // maximum does not manufacture a replay backstop.
                         debug!(
                             "[dtid {}] next timeslice (T{}), in replay mode setting timeslice to max (current time {})",
                             self.dettid,
@@ -12497,6 +12510,44 @@ mod timeslice_tests {
         assert_eq!(chaos.end_of_timeslice, plain.end_of_timeslice);
         assert_eq!(chaos.max_timeslice_end, plain.max_timeslice_end);
         assert_eq!(chaos.chaos_prng, generator);
+    }
+
+    /// Disabling the PMU maximum does not disable the cooperative target or
+    /// forbid its schedule replay. Replayed checkpoints own its slice ends;
+    /// after EOF the same configured target owns ordinary slices again.
+    #[test]
+    fn target_only_chaos_schedule_replay_keeps_recorded_boundaries_without_a_pmu_maximum() {
+        for (replay, no_rcb_time) in [(false, true), (true, false), (true, true)] {
+            let mut config = Config {
+                chaos: true,
+                no_rcb_time,
+                max_timeslice: None,
+                target_timeslice: nz(100_000),
+                replay_schedule_from: replay.then(|| "schedule.json".into()),
+                ..Default::default()
+            };
+            config.validate();
+            assert_eq!(config.max_timeslice, None);
+            assert_eq!(config.target_timeslice, nz(100_000));
+            let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+            let generator = state.chaos_prng.clone();
+            assert_eq!(state.next_timeslice(&config), None);
+            assert_eq!(state.max_timeslice_end, None);
+            if replay {
+                assert_eq!(state.end_of_timeslice, Some(LogicalTime::MAX));
+                assert_eq!(state.chaos_prng, generator);
+                state.schedule_replay_over = true;
+                state.next_timeslice(&config);
+                assert_eq!(
+                    state.end_of_timeslice,
+                    Some(state.thread_logical_time.as_nanos() + Duration::from_nanos(100_000))
+                );
+                assert_eq!(state.max_timeslice_end, None);
+                assert_eq!(state.chaos_prng, generator);
+            } else {
+                assert!(state.end_of_timeslice > Some(state.thread_logical_time.as_nanos()));
+            }
+        }
     }
 
     /// At a checkpoint turn that keeps the slice, a schedule replay counts its

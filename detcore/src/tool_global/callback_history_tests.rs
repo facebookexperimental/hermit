@@ -1813,3 +1813,196 @@ async fn a_replayed_checkpoint_that_keeps_the_slice_restarts_its_backstop() {
     .await
     .expect("bounded kept slice at a replayed checkpoint");
 }
+
+/// The recorded callback ended a slice even when the event cursor already
+/// installed a later deadline. Refresh its slowdown at this callback's time,
+/// while retaining that deadline, its ownership, statistics and one turn.
+#[tokio::test]
+async fn a_replayed_callback_slice_end_refreshes_its_slowdown_epoch_without_replacing_its_deadline() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        use reverie::Tool;
+
+        use crate::preemptions::callback_history::{Origin, Site, Startup};
+        use crate::slice_boundary::callbacks::Callback;
+        use crate::tool_local::chaos_per_thread_slowdown_factor;
+        use detcore_model::time::RcbTimeMultiplier;
+
+        for (slowdown, epoch_length, logical_slice) in [
+            (true, 1_000, true),
+            (true, 0, true),
+            (false, 1_000, true),
+            (true, 1_000, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("callback-slowdown.json");
+            let tid = DetTid::from_raw(17);
+            let mut config = Config {
+                sequentialize_threads: true,
+                chaos: true,
+                seed: 3,
+                chaos_per_thread_slowdown: slowdown,
+                chaos_epoch_length_ns: epoch_length,
+                chaos_slowdown_max_factor: 4.0,
+                replay_schedule_from: Some(path.clone()),
+                max_timeslice: logical_slice.then(|| std::num::NonZeroU64::new(5_000_000).unwrap()),
+                target_timeslice: logical_slice.then(|| std::num::NonZeroU64::new(1_000).unwrap()),
+                ..Config::default()
+            }
+            .with_backend(|backend| backend.delivers_preemption_timer_events = true);
+            config.validate();
+            let active = slowdown && logical_slice;
+            let initial_factor = if active {
+                chaos_per_thread_slowdown_factor(config.sched_seed(), tid, 0, 4.0)
+            } else {
+                RcbTimeMultiplier::ONE
+            };
+            let mut clock = crate::ThreadState::new(tid, &config, ()).thread_logical_time;
+            let rcbs = if logical_slice { 1_100 } else { 0 };
+            if logical_slice {
+                clock.add_rcbs_with_multiplier(rcbs, initial_factor);
+            } else {
+                // No maximum also means no RCB clock. A prior syscall has
+                // nevertheless advanced time beyond epoch zero.
+                clock.add_syscall();
+            }
+            let at = clock.as_nanos();
+            let elapsed = clock.without_starting().as_nanos();
+            let expected_epoch = elapsed.checked_div(epoch_length).unwrap_or(0);
+            let expected_factor = if active {
+                chaos_per_thread_slowdown_factor(config.sched_seed(), tid, expected_epoch, 4.0)
+            } else {
+                RcbTimeMultiplier::ONE
+            };
+            if active && epoch_length != 0 {
+                assert!(expected_epoch > 0);
+                assert_ne!(expected_factor, initial_factor);
+            }
+            let callback = if logical_slice {
+                Callback::PmuTimer
+            } else {
+                Callback::Syscall(Sysno::close)
+            };
+            let mut writer = crate::preemptions::PreemptionWriter::new(None);
+            writer.register_thread(tid, DEFAULT_PRIORITY);
+            if logical_slice {
+                writer.insert_schedevent(SchedEvent::branches(tid, u32::try_from(rcbs).unwrap()));
+            }
+            writer.insert_schedevent(other_instructions(tid));
+            writer.insert_schedevent(SchedEvent::syscall(
+                tid,
+                Sysno::close,
+                detcore_model::schedule::SyscallPhase::Prehook,
+            ));
+            writer.insert_reprioritization(tid, at, rcbs, DEFAULT_PRIORITY, DEFAULT_PRIORITY);
+            writer.insert_callback_checkpoint(
+                tid,
+                Origin {
+                    callback,
+                    site: Site::Prehook,
+                    progress: rcbs,
+                    last_op: logical_slice.then_some(Op::Branch),
+                    time: at,
+                    rcbs,
+                },
+            );
+            std::fs::write(&path, writer.into_string()).unwrap();
+            let (config, state, registered, process) = cancellation_test_state_with_config(config);
+            assert_eq!(registered, tid);
+            install_test_registration(&state, tid, Ivar::new());
+            state
+                .past_first_execve
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut thread = crate::ThreadState::new(tid, &config, ());
+            thread.detpid = Some(process);
+            thread.past_global_first_execve = true;
+            thread.next_timeslice(&config);
+            if !logical_slice {
+                assert_eq!((config.target_timeslice, config.max_timeslice), (None, None));
+                assert!(!thread.chaos_slowdown_active);
+                assert_eq!(thread.end_of_timeslice, None);
+                thread.thread_logical_time.add_syscall();
+            }
+            thread.callback_history.install(Startup {
+                checkpoints: state.sched.lock().unwrap().callback_checkpoints[&tid]
+                    .iter()
+                    .cloned()
+                    .collect(),
+                ..Startup::default()
+            });
+            // A previous replay reply may have installed this future end.
+            // It is beyond another epoch, so using it as this boundary would
+            // install the wrong factor even if the old factor were refreshed.
+            let future = at + Duration::from_nanos(9_000_000);
+            thread.install_schedule_deadline(future, logical_slice);
+            if epoch_length != 0 {
+                assert_ne!((elapsed + 9_000_000) / epoch_length, expected_epoch);
+            }
+            thread.take_pending_chaos_epochs();
+            let stats = serde_json::to_value(&thread.stats).unwrap();
+            let generator = thread.chaos_prng.clone();
+            let mut guest = schedule_replay_guest(&state, &config, thread, rcbs);
+            let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+            let mut previous = Err(crate::scheduler::SkipTurn);
+            let (_, commits, skips) = drive_callback_hook(
+                &state,
+                tid,
+                tool.pre_handler_hook_observed(
+                    &mut guest,
+                    logical_slice,
+                    crate::CheckIn::Event,
+                    Some(callback),
+                ),
+                &mut previous,
+            )
+            .await;
+            assert_eq!((commits, skips), (1, 1));
+            assert_eq!(guest.thread.thread_logical_time.as_nanos(), at);
+            assert_eq!(guest.thread.end_of_timeslice, Some(future));
+            assert_eq!(guest.thread.max_timeslice_end, logical_slice.then_some(future));
+            assert_eq!(guest.thread.replay_backstop, None);
+            assert_eq!(serde_json::to_value(&guest.thread.stats).unwrap(), stats);
+            assert_eq!(guest.thread.chaos_prng, generator);
+            assert_eq!(guest.thread.rcb_time_multiplier(), expected_factor);
+            assert_eq!(guest.thread.chaos_slowdown_active, active);
+            if active {
+                assert_eq!(guest.thread.chaos_epoch, expected_epoch);
+            }
+            let transitions = guest.thread.take_pending_chaos_epochs();
+            if active && epoch_length != 0 {
+                assert_eq!(transitions.len(), 1);
+                assert_eq!(transitions[0].logical_time, at);
+                assert_eq!(transitions[0].epoch, expected_epoch);
+                assert_eq!(transitions[0].factor, expected_factor);
+            } else {
+                assert!(transitions.is_empty());
+            }
+            if logical_slice {
+                // Use the real clock-update route, not only the factor field:
+                // these next RCBs must receive the newly installed Q32 weight.
+                let mut expected_clock = guest.thread.thread_logical_time.clone();
+                expected_clock.add_rcbs_with_multiplier(7, expected_factor);
+                guest.reported_rcbs += 7;
+                let events = tool.update_logical_time_rcbs(&mut guest, true).await.unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!((events[0].op, events[0].count), (Op::Branch, 7));
+                assert_eq!(guest.thread.committed_clock_value, 1_107);
+                assert_eq!(
+                    guest.thread.thread_logical_time.as_nanos(),
+                    expected_clock.as_nanos()
+                );
+            } else {
+                assert_eq!(guest.clock_reads, 0);
+            }
+            let scheduler = state.sched.lock().unwrap();
+            assert!(
+                scheduler.callback_checkpoints.values().all(|points| points.is_empty())
+            );
+            assert!(
+                scheduler.replayer.as_ref().unwrap().desync_counts.values()
+                    .all(|counts| counts.soft == 0 && counts.hard == 0)
+            );
+        }
+    })
+    .await
+    .expect("bounded replayed callback slowdown transition");
+}
