@@ -3785,6 +3785,7 @@ mod tests {
                 start_rip: None,
                 end_rip: None,
                 end_time: end.map(LogicalTime::from_nanos),
+                stopless: false,
             });
         }
         let marked = writer.into_string();
