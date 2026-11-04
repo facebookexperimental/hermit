@@ -1967,7 +1967,58 @@ async fn a_replayed_callback_slice_end_refreshes_its_slowdown_epoch_without_repl
             if active {
                 assert_eq!(guest.thread.chaos_epoch, expected_epoch);
             }
-            let transitions = guest.thread.take_pending_chaos_epochs();
+            // The actual priority request transfers the pending transitions
+            // before this hook returns. Observe that captured RPC payload,
+            // not the local buffer it has already drained.
+            let changes: Vec<_> = {
+                let requests = guest.requests.lock().unwrap();
+                requests
+                    .iter()
+                    .filter_map(|request| {
+                        let mut request = request;
+                        while let GlobalRequest::WithForwardedCount(_, inner) = request {
+                            request = inner;
+                        }
+                        match request {
+                            GlobalRequest::RequestResources(resources, _) => Some(resources),
+                            _ => None,
+                        }
+                    })
+                    .flat_map(|request| {
+                        request
+                            .resources
+                            .keys()
+                            .filter_map(move |resource| match resource {
+                                ResourceID::PriorityChangePoint(_, time, rcbs, epochs) => {
+                                    assert_eq!(request.resources.len(), 1);
+                                    Some((
+                                        *time,
+                                        *rcbs,
+                                        epochs.clone(),
+                                        request.callback_checkpoint.clone(),
+                                    ))
+                                }
+                                _ => None,
+                            })
+                    })
+                    .collect()
+            };
+            assert_eq!(changes.len(), 1);
+            let (change_time, change_rcbs, transitions, origin) = &changes[0];
+            assert_eq!(*change_time, at);
+            assert_eq!(*change_rcbs, rcbs);
+            assert_eq!(
+                origin.as_deref(),
+                Some(&Origin {
+                    callback,
+                    site: Site::Prehook,
+                    progress: rcbs,
+                    last_op: logical_slice.then_some(Op::Branch),
+                    time: at,
+                    rcbs,
+                })
+            );
+            assert!(guest.thread.take_pending_chaos_epochs().is_empty());
             if active && epoch_length != 0 {
                 assert_eq!(transitions.len(), 1);
                 assert_eq!(transitions[0].logical_time, at);
