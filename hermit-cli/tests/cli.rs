@@ -30853,6 +30853,80 @@ fn a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries() {
     );
 }
 
+/// A fatal time-skip desync stops away from event consumption and skips the
+/// run summary: a schedule position still requested there is reported at
+/// that stop, not silently discarded with the run (revastra2's finding on
+/// PR #4920's scope cut). The doctored record asks for a jump to logical
+/// time 0 at event 5, which the replay cannot make once global time has
+/// passed it, so `--die-on-desync` bails out long before position 100.
+#[test]
+fn a_fatal_time_skip_desync_reports_an_unreached_schedule_position() {
+    static GUEST: OnceLock<PathBuf> = OnceLock::new();
+    let _guard = hermit_run_guard();
+    let guest = futex_c_guest(&GUEST, "loopback_accept_reader")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let common = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+    ];
+    let recorded = directory.path().join("recorded.json");
+    let record_to = format!("--record-preemptions-to={}", recorded.display());
+    let mut record_args: Vec<&str> = common.to_vec();
+    record_args.extend([record_to.as_str(), "--", guest.as_str()]);
+    let record = hermit(&record_args);
+    assert_success(&record, &record_args);
+    assert_eq!(stdout(&record), "done\n");
+
+    let mut edited: serde_json::Value =
+        serde_json::from_slice(&fs::read(&recorded).unwrap()).unwrap();
+    assert!(
+        edited["global"].as_array().unwrap().len() > 100,
+        "the recording is too short to leave position 100 unreached"
+    );
+    edited["time_skips"] = serde_json::json!([{
+        "event": 5,
+        "target": 0,
+        "reason": "IdleGuestPollers",
+    }]);
+    let input = directory.path().join("time-skip-desync.json");
+    fs::write(&input, serde_json::to_vec(&edited).unwrap()).unwrap();
+
+    let replay_from = format!("--replay-schedule-from={}", input.display());
+    let mut replay_args = vec!["--log=warn"];
+    replay_args.extend(common);
+    replay_args.extend([
+        "--timeout=20",
+        replay_from.as_str(),
+        "--stacktrace-event=100",
+        "--stacktrace-at-schedule-positions",
+        "--die-on-desync",
+        "--",
+        guest.as_str(),
+    ]);
+    let replay = hermit(&replay_args);
+    let log = stderr(&replay);
+    assert_eq!(
+        replay.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "{replay_args:?}:\n{log}"
+    );
+    assert!(
+        log.contains("Replay mode desynchronized from trace, bailing out"),
+        "the replay did not stop at the doctored time skip:\n{log}"
+    );
+    assert!(
+        log.lines().any(|line| line
+            == "Missed stack trace for scheduled event #100 (requested for stderr): the \
+                replay stopped (--die-on-desync) before reaching it"),
+        "position 100 was silently discarded at the fatal stop:\n{log}"
+    );
+}
+
 /// Under `--replay-exhausted-panic` a replay that leaves its schedule stops
 /// there, as one that runs out of it does, instead of running on unguided:
 /// the container exits with status 1 (`immediate_fatal_exit`), which hermit

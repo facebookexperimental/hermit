@@ -6850,9 +6850,13 @@ impl Scheduler {
     /// pending, with `reason` saying why each cannot print. As for an index the
     /// run passed (`try_pop_stacktrace_event`), an index that will never print
     /// is reported rather than dropped silently.
-    fn report_unprintable_stacktrace_events(&mut self, reason: impl Fn(u64) -> String) {
+    fn report_unprintable_stacktrace_events(
+        &mut self,
+        reason: impl Fn(u64) -> String,
+    ) -> Vec<(u64, String)> {
+        let mut reported = Vec::new();
         let Some(iter) = &mut self.stacktrace_events else {
-            return;
+            return reported;
         };
         for (index, _, m_path) in iter.by_ref() {
             let destination = m_path
@@ -6871,7 +6875,9 @@ impl Scheduler {
                 destination,
                 reason,
             );
+            reported.push((index, reason));
         }
+        reported
     }
 
     /// Before a replay stops the run (`--replay-exhausted-panic`,
@@ -6880,10 +6886,28 @@ impl Scheduler {
     /// end, where they would be reported. The stopping event's own index,
     /// `stopping_ix`, is reported too rather than printed, since the stop
     /// comes before the thread could print its stack.
-    fn report_stacktrace_events_at_stop(&mut self, stopping_ix: Option<u64>, flag: &str) {
+    fn report_stacktrace_events_at_stop(
+        &mut self,
+        stopping_ix: Option<u64>,
+        flag: &str,
+    ) -> Vec<(u64, String)> {
         self.report_unprintable_stacktrace_events(|index| {
             stacktrace_stop_reason(index, stopping_ix, flag)
-        });
+        })
+    }
+
+    /// Report every schedule position still requested where a replay is
+    /// about to stop away from event consumption (a fatal time-skip desync,
+    /// a fatal departure from the record's readmissions, or a fatal
+    /// unrecorded background start). Only the opt-in schedule-position
+    /// selector is affected: with it off, those stops report nothing here,
+    /// exactly as they did before it existed.
+    fn report_stacktrace_positions_at_replay_stop(&mut self, flag: &str) -> Vec<(u64, String)> {
+        if self.stacktrace_at_schedule_positions {
+            self.report_stacktrace_events_at_stop(None, flag)
+        } else {
+            Vec::new()
+        }
     }
 
     /// At the end of a run that records or replays a schedule, report every
@@ -6891,35 +6915,34 @@ impl Scheduler {
     /// are discarded as they are reported. Called at the run summary; a run
     /// that ends without one (a non-ptrace backend's `--timeout`, a backend
     /// failure, another immediate exit) does not report them.
-    fn report_stacktrace_events_the_run_did_not_reach(&mut self) {
+    fn report_stacktrace_events_the_run_did_not_reach(&mut self) -> Vec<(u64, String)> {
         if !self.stacktrace_events_counted {
             // `--stacktrace-event` without a recorded or replayed schedule,
             // which counts nothing, as the configuration warned.
-            return;
+            return Vec::new();
         }
         if self.stacktrace_at_schedule_positions {
             // A requested schedule position the replay never reached (its
             // recorded event was never consumed, as for an exit pair a
             // flipped schedule cannot run in flipped order) is reported by
             // position, never dropped silently.
-            self.report_unprintable_stacktrace_events(
+            return self.report_unprintable_stacktrace_events(
                 stacktrace_schedule_position_not_reached_reason,
             );
-            return;
         }
         self.report_unprintable_stacktrace_events(|_| {
             "the run ended before reaching it".to_string()
-        });
+        })
     }
 
     /// Under `--stacktrace-at-schedule-positions`, a released schedule
     /// (`Replayer::release_schedule`) consumes no further position: report
     /// every requested position still pending as missed, at the release,
     /// rather than drop it silently.
-    fn report_schedule_positions_a_release_drops(&mut self) {
+    fn report_schedule_positions_a_release_drops(&mut self) -> Vec<(u64, String)> {
         self.report_unprintable_stacktrace_events(|_| {
             "the replay released its schedule before consuming that position".to_string()
-        });
+        })
     }
 
     /// Under `--replay-schedule-from`, wake the thread the trace switches to
@@ -11483,6 +11506,7 @@ impl Scheduler {
         warn!("[scheduler] schedule replay desynchronized: {complaint}");
         if self.die_on_time_skip_desync {
             eprintln!("Replay mode desynchronized from trace, bailing out: {complaint}");
+            self.report_stacktrace_positions_at_replay_stop("--die-on-desync");
             immediate_fatal_exit();
         }
     }
@@ -16977,6 +17001,7 @@ impl Scheduler {
                 "Replay mode desynchronized from trace, bailing out ({flag}): \
                  HERMIT_REPLAY_LEFT_READMISSIONS: {reason}"
             );
+            self.report_stacktrace_positions_at_replay_stop(flag);
             immediate_fatal_exit();
         }
         if let Some(writer) = self.preemption_writer.as_mut() {
@@ -18876,7 +18901,9 @@ impl Scheduler {
                     call,
                     replayer.pending_background_start()
                 );
-                if replayer.note_unrecorded_background_start(dettid) {
+                let unrecorded_start_is_fatal = replayer.note_unrecorded_background_start(dettid);
+                if unrecorded_start_is_fatal {
+                    self.report_stacktrace_positions_at_replay_stop("--die-on-desync");
                     immediate_fatal_exit();
                 }
             }
@@ -27234,7 +27261,10 @@ mod test {
         // report discards it (with the not-reached line).
         assert_eq!(sched.consume_schedevent(&schedule[0]).print_stack, None);
         assert!(sched.stacktrace_events.as_mut().unwrap().peek().is_some());
-        sched.report_stacktrace_events_the_run_did_not_reach();
+        assert_eq!(
+            sched.report_stacktrace_events_the_run_did_not_reach(),
+            vec![(2, stacktrace_schedule_position_not_reached_reason(2))]
+        );
         assert!(
             sched.stacktrace_events.as_mut().unwrap().peek().is_none(),
             "position 2 was reported as not reached, not left pending"
@@ -27247,6 +27277,40 @@ mod test {
         // With the flag off the same index would have matched traced
         // event #2 instead: the selector is separate and opt-in, and the
         // plain traced-index path is unchanged.
+    }
+
+    /// A replay stop away from event consumption (a fatal time-skip desync,
+    /// a fatal departure from the record's readmissions, or a fatal
+    /// unrecorded background start) reports every pending schedule
+    /// position through `report_stacktrace_positions_at_replay_stop`, and
+    /// reports nothing there with the selector off, as those stops always
+    /// did before it existed.
+    #[test]
+    fn a_replay_stop_away_from_an_event_reports_pending_schedule_positions_only_when_requested() {
+        for positions in [false, true] {
+            let mut sched = Scheduler::new(&Config::default());
+            sched.stacktrace_at_schedule_positions = positions;
+            sched.stacktrace_events = Some(vec![(100, None, None)].into_iter().peekable());
+            let reported = sched.report_stacktrace_positions_at_replay_stop("--die-on-desync");
+            if positions {
+                assert_eq!(
+                    reported,
+                    vec![(
+                        100,
+                        "the replay stopped (--die-on-desync) before reaching it".to_string()
+                    )],
+                    "positions: {positions}"
+                );
+                assert!(sched.stacktrace_events.as_mut().unwrap().peek().is_none());
+            } else {
+                assert!(reported.is_empty(), "positions: {positions}");
+                assert_eq!(
+                    sched.stacktrace_events.as_mut().unwrap().peek(),
+                    Some(&(100, None, None)),
+                    "positions: {positions}; the traced request is untouched here"
+                );
+            }
+        }
     }
 
     /// A thread queued at the deferred replay priority when the recording
