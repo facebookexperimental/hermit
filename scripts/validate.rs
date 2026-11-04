@@ -1274,7 +1274,7 @@ fn usage() -> &'static str {
      \x20 portable-only    Portable build, test, lint, format, and doc gates matching\n\
      \x20                  GitHub-managed portable CI; no PMU or namespace requirements.\n\
      \x20 full             quick plus the complete suite and DBI/KVM gates.\n\
-     \x20 super            Repeat stress probes under moderate oversubscription.\n\
+     \x20 super            Full suite plus the super-only diagnostics and stress probes (nightly tier).\n\
      \x20 --quick          Alias for the quick level.\n\
      \x20 --portable       Alias for the portable-only level.\n\
      \n\
@@ -7725,9 +7725,19 @@ fn super_plan_bracket() -> Result<(), String> {
         "superstress.kvm_available",
         "super-compatprep.fixtures",
         "supercompat.manifest_compat",
+        // The super level is the full+super union (nightly tier): full
+        // representatives must be present beside the super-only nodes.
+        "build.workspace_in_pinned_root",
+        "e2e.manifest_c_programs",
+        "lint.clippy",
     ] {
         if !tags.contains(want) {
             return Err(format!("super plan: node {want} is missing"));
+        }
+    }
+    for reject in ["e2e.manifest_c_programs_on_host", "quick.build"] {
+        if tags.contains(reject) {
+            return Err(format!("super plan: node {reject} must not be selected"));
         }
     }
     // Each stress probe is one node whose repetitions are rows of its
@@ -14558,10 +14568,22 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
                 validate_envelope::L4_REPS_DEFAULT
             ));
         }
+        // The super level is the nightly tier: everything the full label
+        // runs plus the super-only population, in one plan (dev-hermit
+        // ai_docs/2026-11-04-super-tier-design.md §1). Its profile stays
+        // "super" and suite_complete stays false below, so a super run is
+        // never landing authority. Super always takes the Cargo E2E route
+        // here; the Buck selection remains full-only until separately
+        // qualified for the union.
+        let selection_labels: Vec<String> = if label == "super" {
+            vec!["full".into(), "super".into()]
+        } else {
+            vec![label.into()]
+        };
         let mut cfg = if label == "full" && args.e2e_runner != E2E_RUNNER_CARGO {
             hermit_manifest_plan::validation_dag::buck_e2e_selection(&committed)?
         } else {
-            dagrun::select_steps_by_labels(&committed, &[label.into()])?
+            dagrun::select_steps_by_labels(&committed, &selection_labels)?
         };
         let suite_complete = label == "full" && args.selected.is_none();
         let mut selection_mode = if suite_complete { "full" } else { "label" };
@@ -36399,6 +36421,28 @@ mod scorecard_cutover_tests {
                 assert_eq!(dag_to_json(&plan.cfg), dag_to_json(&complete));
             }
         }
+        // The super level is the union of the full and super labels (the
+        // nightly super tier runs everything full runs plus the super-only
+        // population), never full scope: it stays suite-incomplete and
+        // super-mode, and pulls in neither hosted nor quick-only nodes.
+        let temp = tempfile::tempdir().unwrap();
+        let args = parse_argv(&["super".into()]).unwrap();
+        let plan = build_plan(&source, &args, temp.path()).unwrap();
+        let tags: BTreeSet<String> = plan.cfg.steps.iter().map(Step::tag).collect();
+        for want in [
+            "build.workspace_in_pinned_root",
+            "e2e.manifest_c_programs",
+            "lint.clippy",
+            "supercompat.manifest_compat",
+            "superstress.ptrace_strict_verify",
+        ] {
+            assert!(tags.contains(want), "super plan is missing {want}");
+        }
+        for reject in ["e2e.manifest_c_programs_on_host", "quick.build"] {
+            assert!(!tags.contains(reject), "super plan wrongly holds {reject}");
+        }
+        assert!(plan.super_mode);
+        assert!(!plan.suite_complete);
     }
 
     #[test]

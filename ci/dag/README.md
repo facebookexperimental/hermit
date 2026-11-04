@@ -105,7 +105,10 @@ job.
 
 The `mem_race` family and three nonblocking post-DAG diagnostics run in the
 manually dispatched `super` tier so a known host-sensitive hang cannot consume
-the serialized capability lane unexpectedly.
+the serialized capability lane unexpectedly. The `super` *level* selects the
+`full` and `super` labels together (the nightly tier runs everything `full`
+runs plus the super-only population; `--inventory --labels full,super` shows
+that union, while `--labels super` alone shows only the super-only part).
 
 The `Validation Levels` workflow does not launch for pull requests, `main`, or a
 schedule. Its quick, privileged, and super levels remain available by manual

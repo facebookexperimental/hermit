@@ -70,6 +70,9 @@ fi
 case $lane in
     portable) selection_label=hosted-portable ;;
     privileged) selection_label=hosted-privileged ;;
+    # The super level is the full+super union (nightly tier), exactly as
+    # scripts/validate.rs selects it; dagrun --labels takes the list.
+    super) selection_label=full,super ;;
     *) selection_label=$lane ;;
 esac
 
