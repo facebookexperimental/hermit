@@ -1145,10 +1145,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (`/proc/thread-self/status` from such a thread,
     /// `/proc/self/task/<tid>/status`), where Detcore serves the caller's own
     /// task directories ([`Self::serves_task_directories`], package K slice
-    /// K10): Detcore renders no task's `status`, and the KVM executor's
-    /// `/proc` renders its process's alone, which on Linux is the leader's,
-    /// not the thread's (`Pid`, `Name`, its signal and context-switch lines,
-    /// `proc_pid_status`). The leader's own is its process's, which the
+    /// K10), and only where Detcore does not render that thread's `status`
+    /// itself: the KVM executor's `/proc` renders its process's alone, which
+    /// on Linux is the leader's, not the thread's (`Pid`, `Name`, its signal
+    /// and context-switch lines, `proc_pid_status`). Whether Detcore renders
+    /// it is the open's own decision (`Detcore::kept_by_kernel`):
+    /// `Detcore::renders_any_status` and
+    /// `procfs::task_status::renders_task_status` for the thread, which since
+    /// package K item 2b slice 2b-2 holds for every thread with a recorded
+    /// name on KVM. The leader's own is its process's, which the
     /// backend answers ([`Self::own_task_backend_spelling`]). The call's path
     /// is classified as the backend would be given it, by that same
     /// respelling (`..` resolved, empty and `.` components left out:
@@ -1239,6 +1244,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             if !Self::named_tasks_exist(guest, &[status_thread]).await {
                 continue;
             }
+            // A thread whose `status` Detcore renders is served on the
+            // rendered path, by the same predicate as its open
+            // (`Detcore::kept_by_kernel`).
+            if self.renders_any_status() {
+                let task = crate::procfs::BoundTask {
+                    process: own.0,
+                    thread: Some(thread),
+                };
+                let facts = crate::tool_global::task_stat_facts(guest, task).await;
+                if crate::procfs::task_status::renders_task_status(&facts, self.comm_source(), true)
+                {
+                    continue;
+                }
+            }
             return Some(
                 self.refuse_placeholder_call(
                     guest,
@@ -1246,8 +1265,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Errno::EACCES,
                     &format!(
                         "{}, the status of thread {thread} of this process, which is not its \
-                         thread group leader, cannot be served: Detcore renders no task's status \
-                         on this backend, and its procfs renders the process's alone, which \
+                         thread group leader, cannot be served: Detcore renders no status of this \
+                         thread here, and the backend's procfs renders the process's alone, which \
                          Linux gives the leader (https://github.com/rrnewton/hermit/issues/5039)",
                         observed.display()
                     ),

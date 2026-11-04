@@ -422,8 +422,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `..` within the caller's own task tree resolved, the components
     /// before `proc` that name nothing dropped); `guest_bytes` the guest's own
     /// spelling, whose last bytes say whether the link is followed
-    /// ([`past_the_link`]); `link` the guest's `dirfd` and pathname, through
-    /// which a placeholder's name is confirmed.
+    /// ([`past_the_link`]).
     ///
     /// The spellings are those [`super::own_descriptor_link`] names: the
     /// process's table (`/proc/self/fd/N`, `/proc/<pid>/fd/N`, and
@@ -458,7 +457,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         sysno: Sysno,
         (spelled, guest_bytes): (&[u8], &[u8]),
-        link: (i32, Option<PathPtr<'_>>),
         buffer: Option<AddrMut<'_, libc::c_char>>,
         buffer_len: usize,
     ) -> Result<Option<i64>, Error> {
@@ -527,7 +525,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let target = match text {
             Some(text) => {
-                self.descriptor_link_target(guest, descriptor.fd, link, text)
+                self.descriptor_link_target(guest, descriptor.fd, text)
                     .await?
             }
             // An object the backend keeps itself and does not name (the KVM
@@ -557,9 +555,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// The target the guest sees for the caller's descriptor `fd`, whose
-    /// link the backend names `text`: a placeholder's link, confirmed through
-    /// the guest's own spelling at `link`, names the procfs file it stands
-    /// for, as Linux's link names the file; a pipe's or a socket's
+    /// link the backend names `text`: a placeholder's link, confirmed by the
+    /// kernel identity of the descriptor itself (an injected `fstat` of `fd`,
+    /// `placeholder_identity`), names the procfs file it stands for, as
+    /// Linux's link names the file, by every spelling of the link alike; a
+    /// pipe's or a socket's
     /// (`pipe:[<inode>]`, `socket:[<inode>]`, the names `pipefs_dname` and
     /// `sockfs_dname` give an object with no path) names the inode number
     /// Detcore gives the descriptor's file (an inherited standard stream's,
@@ -570,11 +570,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         fd: i32,
-        link: (i32, Option<PathPtr<'_>>),
         text: Vec<u8>,
     ) -> Result<Vec<u8>, Error> {
+        // Confirmed through the descriptor, not the guest's spelling: the
+        // calling thread's spelling, `/proc/<pid>/task/<tid>/fd/N`, names
+        // nothing the KVM executor's `/proc` looks up
+        // (`fd_directory::leader_process_spelling` respells a file of the
+        // leader's directory, not a path below its `fd`), so a stat of it
+        // failed and the placeholder's own name reached the guest. Every
+        // rendered file had that defect; `status`, rendered on KVM since
+        // package K item 2b slice 2b-2, is the one
+        // run_kvm_the_callers_own_link_targets_answer_as_linux reads so.
         if let Some(path) = self.placeholder_link_within_level(guest, &text)
-            && self.placeholder_link_confirmed(guest, link).await
+            && (self.cfg.backend.tool_shares_guest_descriptor_table
+                || self.inject_fstat(guest, fd).await.is_ok_and(|stat| {
+                    crate::syscalls::files::rendered_procfs::placeholder_identity(
+                        stat.st_dev,
+                        stat.st_ino,
+                    )
+                    .is_some()
+                }))
         {
             return Ok(path.as_os_str().as_bytes().to_vec());
         }

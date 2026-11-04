@@ -2126,7 +2126,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Detcore reads it from the backend's fact (KVM, package K slice
         // F2-h).
         if let Some(result) = self
-            .readlink_own_descriptor_fact(guest, sysno, (spelling, bytes), link, buffer, buffer_len)
+            .readlink_own_descriptor_fact(guest, sysno, (spelling, bytes), buffer, buffer_len)
             .await?
         {
             return Ok(Some(result));

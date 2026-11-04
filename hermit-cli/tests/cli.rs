@@ -72460,13 +72460,15 @@ fn the_callers_own_proc_directories_answer_as_linux() {
 /// while the backend's memory map is incomplete, is listed only when its read
 /// can render it (dh-62azc; KVM's map is incomplete today,
 /// https://github.com/rrnewton/reverie/issues/1211).
-/// Then the guest's other modes ([`OWN_DIRECTORY_MODES`]), each of which stops with
-/// the policy's exit and names why: the open of `/proc/self` itself
-/// (`O_PATH|O_NOFOLLOW`), by its plain spelling and through `..`, which
-/// opens the link on Linux and for which this backend has no object; and a
-/// second thread's `status` by a spelling with a `.` component, which this
-/// backend's procfs would answer with its process's (or not at all), not the
-/// thread's.
+/// Then the guest's other modes ([`OWN_DIRECTORY_MODES`]): the open of
+/// `/proc/self` itself (`O_PATH|O_NOFOLLOW`), by its plain spelling and
+/// through `..`, which opens the link on Linux and for which this backend has
+/// no object, stops with the policy's exit and names why; and a second
+/// thread's `status` by a spelling with a `.` component, which Detcore
+/// renders on KVM since package K item 2b slice 2b-2 (before it, this
+/// backend's procfs would have answered with its process's, so it was
+/// refused by name), answers at L2 as natively. Each process and thread
+/// directory lists `status` too, which Linux lists after `auxv`.
 #[test]
 fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
     let test = "run_kvm_the_callers_own_proc_directories_answer_as_linux";
@@ -72479,6 +72481,7 @@ fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
         "task/d",
         "fd/d",
         "auxv/r",
+        "status/r",
         "comm/r",
         "cmdline/r",
         "stat/r",
@@ -72529,18 +72532,26 @@ fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
     let mut wanted = expected("/proc/self", false);
     wanted.extend(expected("/proc/thread-self", true));
     assert_eq!(lines, wanted, "kvm read-listed: every listed name reads");
+    // A second thread's status, by a spelling with a `.`, as natively.
+    for (mode, line) in &OWN_DIRECTORY_MODES[2..] {
+        let native = procfs_own_directory_native(&[mode]);
+        assert!(
+            native.lines().any(|native| native == *line) && native.ends_with("done\n"),
+            "native {mode}: {native}"
+        );
+        assert_eq!(
+            procfs_own_directory_at_l2("kvm", "standard", &[mode]),
+            native,
+            "kvm {mode}"
+        );
+    }
     let guest = procfs_own_directory_guest();
     let link_reason = ["an O_PATH open of /proc/self that does not follow it"; 2];
-    let status_reason = "which is not its thread group leader, cannot be served";
-    for ((mode, _), reasons) in OWN_DIRECTORY_MODES.into_iter().zip([
-        link_reason,
-        link_reason,
-        [
-            "/proc/thread-self/./status, the status of thread",
-            status_reason,
-        ],
-        ["/proc/self/./task/", status_reason],
-    ]) {
+    for ((mode, _), reasons) in OWN_DIRECTORY_MODES[..2]
+        .iter()
+        .copied()
+        .zip([link_reason, link_reason])
+    {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let args = [
             "--backend",
