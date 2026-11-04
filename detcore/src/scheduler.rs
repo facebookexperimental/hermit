@@ -6989,7 +6989,11 @@ impl Scheduler {
                     // the two lengths differ; replays of such recordings leave
                     // them for other reasons too, and which deadline is right
                     // there is not established.
-                    self.timeslices.insert(new_tid, timeslice_remaining);
+                    // A thread the replay switches to takes its first
+                    // timeslice end with a stop: the grant that resumes it
+                    // carries only the length.
+                    self.timeslices
+                        .insert(new_tid, timeslice_remaining.map(|end| end.length));
                     return ConsumeResult {
                         keep_running: !is_now,
                         print_stack,
@@ -27798,7 +27802,7 @@ mod test {
         let consumed = sched.consume_schedevent(&prehook);
         assert!(consumed.keep_running);
         assert_eq!(
-            consumed.timeslice_remaining,
+            consumed.timeslice_remaining.map(|end| end.length),
             Some(LogicalTime::from_rcbs(123))
         );
         assert_eq!(

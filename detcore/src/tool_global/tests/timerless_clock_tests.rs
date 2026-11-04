@@ -712,6 +712,7 @@ async fn a_prehook_switch_hands_the_switching_thread_the_recorded_slice() {
         start_rip: None,
         end_rip: std::num::NonZeroUsize::new(RIP as usize),
         end_time: Some(sample_time),
+        stopless: false,
     };
     // The next thread's slice, ended by a timer preemption as recordings
     // write it: branches with no OtherInstructions after them, then another
@@ -723,6 +724,7 @@ async fn a_prehook_switch_hands_the_switching_thread_the_recorded_slice() {
         start_rip: None,
         end_rip: None,
         end_time: Some(sample_time + LogicalTime::from_rcbs(123)),
+        stopless: false,
     };
     let after = SchedEvent {
         dettid: DetTid::from_raw(19),
@@ -731,6 +733,7 @@ async fn a_prehook_switch_hands_the_switching_thread_the_recorded_slice() {
         start_rip: None,
         end_rip: std::num::NonZeroUsize::new(RIP as usize),
         end_time: Some(sample_time + LogicalTime::from_rcbs(123)),
+        stopless: false,
     };
     let file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
