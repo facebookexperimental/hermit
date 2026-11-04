@@ -5591,6 +5591,45 @@ fn analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names() {
     );
 }
 
+/// `hermit analyze --run1-preemptions` replays the record as the target
+/// run, measured and checked like a seed's run. Before, phase1 returned
+/// the record in a run it never launched and phase3 unwrapped that run's
+/// absent log (exit 101) before any guest ran. A replay of an empty
+/// record under `/bin/true` cannot meet a stdout target it never prints,
+/// so where the replay can launch analyze ends with the recorded-target
+/// error; where it cannot, the launch itself errors. Neither may panic,
+/// and neither may claim no target run was measured.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn analyze_replays_a_recorded_target_instead_of_panicking() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let record = directory.path().join("target.preempts");
+    std::fs::write(&record, "{\"per_thread\":{},\"global\":[]}").unwrap();
+    let run1_preemptions = format!("--run1-preemptions={}", record.display());
+    let tmp_dir = format!("--tmp-dir={}", directory.path().join("ws").display());
+    let analyzed = hermit(&[
+        "analyze",
+        "--prefix-search",
+        "--target-exit-code=0",
+        "--target-stdout=never printed",
+        &run1_preemptions,
+        &tmp_dir,
+        "--",
+        "--chaos",
+        "--",
+        "/bin/true",
+    ]);
+    let log = stderr(&analyzed);
+    assert!(!analyzed.status.success(), "{log}");
+    assert_ne!(analyzed.status.code(), Some(101), "{log}");
+    assert!(!log.contains("panicked at"), "{log}");
+    assert!(!log.contains("runs no target run to measure"), "{log}");
+    if log.contains("did not meet the target criteria") {
+        assert!(log.contains("--seed included"), "{log}");
+    }
+}
+
 /// `--rewrite-exclusives` under `--no-namespace` rewrites in the guest's
 /// memory (there is no mount namespace for the overlay), so the two flags no
 /// longer conflict; asking for the overlay there, or naming overlay files

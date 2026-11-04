@@ -42,7 +42,6 @@ use crate::app::analyze::types::ContinuationTimeslice;
 use crate::app::analyze::types::ExitStatusConstraint;
 use crate::app::analyze::types::Report;
 use crate::app::analyze::types::ReportCriticalEvent;
-use crate::app::analyze::types::TrialTimeout;
 use crate::app::analyze::workspace::Retention;
 use crate::app::analyze::workspace::Workspace;
 use crate::app::analyze::workspace::note;
@@ -1698,7 +1697,7 @@ impl AnalyzeOpts {
     /// Create our workspace and verify the input run matches the criteria, or find one that does.
     /// Returns the results of the target run.
     fn phase1_establish_target_run(&mut self) -> Result<RunData, Error> {
-        let mut run1data = RunData::new_run1_target(self, "run1_target".to_string())?;
+        let run1data = RunData::new_run1_target(self, "run1_target".to_string())?;
         eprintln!(
             // `to_repro` is already a complete `hermit ... run ...` command.
             ":: {} {}",
@@ -1706,27 +1705,26 @@ impl AnalyzeOpts {
             run1data.to_repro()
         );
 
-        if let Some(p) = &self.run1_preemptions {
-            let preempts_path = run1data.preempts_path_out();
-            // Copy preempts to the output location as though they were recorded by this run:
-            std::fs::copy(p, preempts_path).expect("copy file to succeed");
-            if self.trial_timeout == TrialTimeout::Auto {
-                eprintln!(
-                    ":: --run1-preemptions runs no target run to measure, so runs are not \
-                     bounded until analyze replays the record to verify it (not every search \
-                     does); pass --trial-timeout=SECONDS to bound every trial."
-                );
-            }
-            // Careful, returning a NON-launched RunData just to contain the output path.
-            return Ok(run1data);
-        }
-
-        // Translate the seed into a set of preemptions we can work from.
+        // Run the target, from its seed or by replaying --run1-preemptions, and
+        // record the preemptions and schedule the search works from. A replay
+        // of the record is the target run like a seed's: it is measured for the
+        // trial bound, and --selfcheck compares its log.
         let mut run1data = run1data.with_preemption_recording();
         run1data.launch()?;
         self.record_endpoint(&run1data);
 
         if !run1data.is_a_match() {
+            if let Some(record) = &self.run1_preemptions {
+                bail!(
+                    "the replay of --run1-preemptions {} did not meet the target criteria ({}). \
+                     A record replays the same only under the run arguments it was recorded \
+                     with (after `--`), --seed included: it sets the guest's random and fuzz \
+                     seeds and is not stored in the record. --search does not apply to a record; \
+                     to search, pass --run1-seed.",
+                    record.display(),
+                    self.display_criteria()
+                );
+            }
             if self.search {
                 eprintln!(
                     ":: {}",
