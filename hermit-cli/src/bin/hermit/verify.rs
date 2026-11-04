@@ -783,8 +783,10 @@ pub(crate) fn store_exclusive_retries_line(retries: &StoreExclusiveRetries) -> S
         }
     };
     let loops = if retries.loops_left.is_empty() {
-        "No executable file mapping has a load/store-exclusive loop left, so the failures \
-         were in other code"
+        // Only a mapping whose scan succeeded is in the summaries: one that
+        // could not be read, or was unlinked, can hold the failing loop.
+        "No scanned executable file mapping has a known load/store-exclusive loop left; the \
+         failures may be in an unscanned mapping or in other code"
             .to_owned()
     } else {
         let paths: Vec<String> = retries
@@ -6086,12 +6088,12 @@ mod tests {
             ..left
         };
         let line = store_exclusive_retries_line(&elsewhere);
-        // With no loop left in an executable file mapping, no setting is
-        // suggested: the rewrite reaches nothing else.
+        // With no loop left in a scanned executable file mapping, no setting
+        // is suggested, and no cause is ruled out.
         assert!(
             line.ends_with(
-                "No executable file mapping has a load/store-exclusive loop left, so the \
-                 failures were in other code"
+                "No scanned executable file mapping has a known load/store-exclusive loop \
+                 left; the failures may be in an unscanned mapping or in other code"
             ),
             "{line}"
         );
@@ -6103,6 +6105,37 @@ mod tests {
             !store_exclusive_retries_line(&none_left_without_rewrite).contains("setting"),
             "{line}"
         );
+    }
+
+    /// A divergence with counted failures where neither run's summary
+    /// names a loop, scanned or rewritten: a mapping enters them only after
+    /// a successful scan, so an unreadable or unlinked library can hold the
+    /// failing loop. The line names no file and rules nothing out.
+    #[test]
+    fn failures_with_no_scanned_loop_left_do_not_rule_out_an_unscanned_mapping() {
+        let failed = store_exclusive_summary(3, Some(100), &[]);
+        assert!(failed.exclusive_rewrites.is_empty());
+        let retries =
+            store_exclusive_retries(Verdict::Diverged, Some(&failed), Some(&failed), Some(false))
+                .expect("a divergence with counted failures names them");
+        assert!(retries.loops_left.is_empty(), "{retries:?}");
+        let line = store_exclusive_retries_line(&retries);
+        assert!(
+            line.starts_with(
+                "possible cause: run 1 failed 3 of 100 store-exclusives, run 2 failed 3 of 100 \
+                 store-exclusives."
+            ),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(
+                "No scanned executable file mapping has a known load/store-exclusive loop \
+                 left; the failures may be in an unscanned mapping or in other code"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("were in other code"), "{line}");
+        assert!(!line.contains("setting"), "{line}");
     }
 
     #[test]
