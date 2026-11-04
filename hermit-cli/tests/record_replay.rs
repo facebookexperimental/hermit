@@ -6018,6 +6018,28 @@ fn record_replay_shares_a_file_a_forked_child_maps_again() {
 /// `shmem_zero_setup`). Replay used to key every shared mapping by the
 /// descriptor's device and inode, so both mappings were views of one backing
 /// and a store through the first was read through the second.
+/// A guest that reopens its `/dev/zero` mapping's object through
+/// `/proc/self/map_files` finds no such file under Hermit, in record and in
+/// replay: Hermit's `/proc` has no `map_files`, so readlink and open both
+/// fail with ENOENT. (Linux shows the link, and refuses the open with EPERM
+/// unless the caller has CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN in the
+/// initial user namespace, which a Hermit guest, always in a user namespace
+/// of its own, never has.) So a recorded guest never holds a descriptor for a
+/// `/dev/zero` object, and replay neither shares nor splits one it did not
+/// record. The test fails if a guest ever reaches the object: the readlink
+/// line changes if Hermit shows `map_files`, and a line for the reopened
+/// mapping appears if the open succeeds.
+#[test]
+fn record_replay_finds_no_map_files_for_a_dev_zero_object() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "dev-zero-map-files",
+        "dev-zero-map-files: readlink fails with ENOENT\n\
+         dev-zero-map-files: reopen fails with ENOENT\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[test]
 fn record_replay_keeps_two_dev_zero_mappings_apart() {
     let _guard = hermit_record_lock();

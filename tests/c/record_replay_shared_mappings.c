@@ -78,6 +78,13 @@
  *         so the second page, past its end, would fault SIGBUS.
  *   dev-zero-large: maps 32 MiB of /dev/zero and reads its first page and
  *         its last byte, leaving the rest of the new object unfaulted.
+ *   dev-zero-map-files: maps /dev/zero, reads the name of the new object's
+ *         own file through /proc/self/map_files and tries to open it for
+ *         reading and writing, which Linux allows only with CAP_SYS_ADMIN or
+ *         CAP_CHECKPOINT_RESTORE in the initial user namespace, and prints
+ *         each errno. Natively an unprivileged run sees the link and gets
+ *         EPERM. Under Hermit, whose /proc has no map_files, both fail with
+ *         ENOENT.
  *
  * Usage: record_replay_shared_mappings <mode>
  * Prints one line per check and exits 0 only if every check saw what Linux
@@ -513,6 +520,31 @@ static void dev_zero_large(void) {
   printf("dev-zero-large: first page sees %s, last byte %d\n", zero_or_not(view), view[len - 1]);
 }
 
+static void dev_zero_map_files(void) {
+  int fd = open_dev_zero();
+  char* view = map_pages(fd, 0, 1);
+  memcpy(view, "zero", 5);
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/self/map_files/%lx-%lx", (unsigned long)view,
+           (unsigned long)(view + page));
+  char target[64] = "";
+  ssize_t length = readlink(path, target, sizeof(target) - 1);
+  if (length < 0) {
+    printf("dev-zero-map-files: readlink fails with %s\n", strerrorname_np(errno));
+  } else {
+    target[length] = 0;
+    printf("dev-zero-map-files: link names %s\n", target);
+  }
+  int reopened = open(path, O_RDWR | O_CLOEXEC);
+  if (reopened < 0) {
+    printf("dev-zero-map-files: reopen fails with %s\n", strerrorname_np(errno));
+    return;
+  }
+  char* again = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, reopened, 0);
+  check(again != MAP_FAILED, "mmap the reopened object");
+  printf("dev-zero-map-files: reopened mapping sees %s\n", again);
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   page = sysconf(_SC_PAGESIZE);
@@ -567,6 +599,8 @@ int main(int argc, char** argv) {
     dev_zero_offset();
   } else if (strcmp(mode, "dev-zero-large") == 0) {
     dev_zero_large();
+  } else if (strcmp(mode, "dev-zero-map-files") == 0) {
+    dev_zero_map_files();
   } else {
     fprintf(stderr, "unknown mode %s\n", mode);
     return 2;

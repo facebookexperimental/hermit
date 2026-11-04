@@ -230,6 +230,19 @@ const OWN_MMAP_FILE_SYSTEMS: [(i64, &str); 4] = [
 /// device and inode: a later mapping of one of them through its own file
 /// (`/proc/<pid>/map_files`) is recorded as a mapping of that file, which
 /// replay backs with the same memory.
+///
+/// No guest of the `hermit` command reaches that sharing case. Only
+/// `/proc/<pid>/map_files` gives a descriptor for such an object, and
+/// opening it needs CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN in the initial
+/// user namespace (`proc_map_files_get_link`). `hermit record` always runs
+/// its guest in a user namespace of its own, and Hermit's `/proc` has no
+/// `map_files` at all (the guest gets ENOENT;
+/// `record_replay_finds_no_map_files_for_a_dev_zero_object`). The case is
+/// kept for a direct user of this recorder whose guest runs in the initial
+/// namespace with that capability, where dropping it would refuse a mapping
+/// replay can reproduce. The refusal beside it in [`mapped_file`] still
+/// guards a descriptor for an object this recording did not make, such as
+/// one the guest inherited.
 fn recorded_zero_objects() -> MutexGuard<'static, HashSet<(u64, u64)>> {
     static OBJECTS: OnceLock<Mutex<HashSet<(u64, u64)>>> = OnceLock::new();
     OBJECTS
@@ -835,69 +848,6 @@ mod tests {
         assert_eq!(read_only, (node.dev(), node.ino()));
     }
 
-    /// A mapping's own file, opened through `/proc/<pid>/map_files`, is the
-    /// object it maps: a regular file on the shmem mount, `/dev/zero
-    /// (deleted)`, with the inode `/proc/<pid>/maps` shows. The object of a
-    /// recorded `/dev/zero` mapping is recorded as that file, so replay
-    /// shares the two mappings' memory; the object of a MAP_SHARED |
-    /// MAP_ANONYMOUS mapping, which replay makes live with no name, refuses
-    /// replay. Opening the file needs CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE
-    /// in the initial user namespace (`proc_map_files_get_link`), which a
-    /// Hermit guest's container never has, so the test is ignored: run it
-    /// with `--ignored` as such a user. Without the capability it fails at
-    /// the open rather than passing without checking anything.
-    #[test]
-    #[ignore = "needs CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE in the initial user namespace to open /proc/self/map_files"]
-    fn a_reopened_zero_object_is_shared_only_when_its_mapping_was_recorded() {
-        let rw = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/zero")
-            .unwrap();
-        let prot = libc::PROT_READ | libc::PROT_WRITE;
-        let zero = map(rw.as_raw_fd(), libc::MAP_SHARED, prot);
-        let anonymous = map(-1, libc::MAP_SHARED | libc::MAP_ANONYMOUS, prot);
-        let reopen = |address: usize| {
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(format!(
-                    "/proc/self/map_files/{address:x}-{:x}",
-                    address + 4096
-                ))
-        };
-        let zero_file = reopen(zero).unwrap_or_else(|error| {
-            panic!(
-                "opening /proc/self/map_files needs CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE \
-                 in the initial user namespace: {error}"
-            )
-        });
-        let anonymous_file = reopen(anonymous).unwrap();
-        let tid = std::process::id() as i32;
-        let capture = |file: &std::fs::File| {
-            shared_mapping(MapFlags::MAP_SHARED, tid, file.as_raw_fd(), 0).unwrap()
-        };
-        let named = name_zero_mapping(tid, zero, libc::O_RDWR);
-        let object = (named.device, named.inode);
-        let metadata = zero_file.metadata().unwrap();
-        assert_eq!((metadata.dev(), metadata.ino()), object);
-        assert_eq!(
-            capture(&zero_file),
-            Some(Sharing::File(SharedMapping {
-                device: object.0,
-                inode: object.1,
-                offset: 0,
-                access: libc::O_RDWR,
-            }))
-        );
-        match capture(&anonymous_file) {
-            Some(Sharing::Refused(reason)) => {
-                assert!(reason.contains("MAP_SHARED | MAP_ANONYMOUS"), "{reason}")
-            }
-            other => panic!("a reopened anonymous object was not refused: {other:?}"),
-        }
-    }
-
     fn facts(mode: u32, rdev: u64, device: u64, fs_type: i64, target: &str) -> MappedFileFacts {
         MappedFileFacts {
             mode,
@@ -962,6 +912,64 @@ mod tests {
         for (magic, name) in OWN_MMAP_FILE_SYSTEMS {
             let file = facts(regular, 0, 20, magic, "/sys/bus/pci/devices/x/resource0");
             assert!(other(file).contains(&format!("a file on {name}")));
+        }
+        // A reopened object is looked up by its own device and inode, not by
+        // name or by any other object's identity.
+        let looked_up = |file: &MappedFileFacts, recorded: (u64, u64)| {
+            mapped_file(file, shmem, |object| object == recorded)
+        };
+        let object = facts(regular, 0, shmem_dev, TMPFS, ZERO_OBJECT_NAME);
+        assert_eq!(looked_up(&object, (shmem_dev, 77)), MappedFile::Regular);
+        assert!(matches!(
+            looked_up(&object, (shmem_dev, 78)),
+            MappedFile::Other(_)
+        ));
+        assert!(matches!(
+            looked_up(&object, (libc::makedev(0, 2), 77)),
+            MappedFile::Other(_)
+        ));
+    }
+
+    /// The file `/proc/<pid>/map_files` would open for a real mapping, by the
+    /// facts Linux gives it: a regular file, mode 0777 (`__shmem_file_setup`
+    /// makes it `S_IFREG | S_IRWXUGO`), on the shmem mount, named `/dev/zero
+    /// (deleted)`, with the device and inode `/proc/self/maps` shows. Opening
+    /// it needs a capability in the initial user namespace, so its facts are
+    /// built from the mapping's own `maps` line, which needs none. The object
+    /// of a `/dev/zero` mapping this recording named is recorded as that
+    /// file; the object of a `MAP_SHARED | MAP_ANONYMOUS` mapping refuses.
+    #[test]
+    fn a_real_mappings_object_is_classified_as_its_reopened_file_would_be() {
+        const TMPFS: i64 = 0x0102_1994;
+        let rw = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/zero")
+            .unwrap();
+        let prot = libc::PROT_READ | libc::PROT_WRITE;
+        let tid = std::process::id() as i32;
+        let zero = map(rw.as_raw_fd(), libc::MAP_SHARED, prot);
+        let named = name_zero_mapping(tid, zero, libc::O_RDWR);
+        let anonymous = own_object_at(map(-1, libc::MAP_SHARED | libc::MAP_ANONYMOUS, prot));
+        let reopened = |(device, inode): (u64, u64)| MappedFileFacts {
+            mode: libc::S_IFREG | 0o777,
+            rdev: 0,
+            device,
+            inode,
+            fs_type: TMPFS,
+            target: ZERO_OBJECT_NAME.into(),
+        };
+        let shmem = shmem_device();
+        let recorded = |object| recorded_zero_objects().contains(&object);
+        assert_eq!(
+            mapped_file(&reopened((named.device, named.inode)), shmem, recorded),
+            MappedFile::Regular
+        );
+        match mapped_file(&reopened(anonymous), shmem, recorded) {
+            MappedFile::Other(what) => {
+                assert!(what.contains("MAP_SHARED | MAP_ANONYMOUS"), "{what}")
+            }
+            other => panic!("a MAP_SHARED | MAP_ANONYMOUS object was {other:?}"),
         }
     }
 
