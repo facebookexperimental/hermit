@@ -3282,7 +3282,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (3470 + 12 on this base): the counted runner substitutes the compiled
     // population for it, so neither 3482 nor a derived 3497 is a measured
     // nextest count.
-    ("test.detcore_unit", 3491),
+    ("test.detcore_unit", 3492),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5907,7 +5907,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fcd62385f: 3465 + 2 = 3467.
     // And the same unit (same growth as test.detcore_unit, PR #4926): 3469 + 1 = 3470.
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
-    ("test.detcore_unit_on_host", 3491),
+    ("test.detcore_unit_on_host", 3492),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
