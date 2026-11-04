@@ -5442,7 +5442,7 @@ fn untrap_passthrough_syscalls_is_an_opt_in_refused_where_its_calls_are_counted(
     // The inherited positive maximum is retained (no --max-timeslice), so
     // preemption admission alone would accept the run; the refusal is the
     // executable-selected qualification check (revcodex2 on PR 4764).
-    let mut application = run_opts_for(&[
+    let application = run_opts_for(&[
         "hermit",
         "--backend=dbt",
         "run",
