@@ -67,7 +67,7 @@
 //!   pidfd_getfd, or a route not listed here, untracks that pipe. A FIFO
 //!   access, or a pipe description the trace gives no pair identity, from
 //!   any descriptor table, could be a reopen of any pipe through
-//!   /proc/<pid>/fd, so either untracks every pipe. This catch-all also
+//!   `/proc/<pid>/fd`, so either untracks every pipe. This catch-all also
 //!   covers a descriptor Detcore discovers without an open note.
 //! - Types: the catch-all needs every descriptor's type. A trace recorded
 //!   under a setting that can leave a descriptor untyped (metadata
@@ -76,7 +76,7 @@
 //!   ([`untyped_descriptors`]).
 //! - Scope: the run's own processes. A process outside the run (one an end
 //!   is sent to over SCM_RIGHTS, or a host process that opens
-//!   /proc/<pid>/fd) is not traced, and its bytes are out of scope.
+//!   `/proc/<pid>/fd`) is not traced, and its bytes are out of scope.
 //! - Content: an admitted pipe still gives no edge when its bytes are not one
 //!   piece per traced write, put in at its entry, and one consumption per
 //!   traced read: a tee or a vmsplice, packet mode, or a write that waited or
