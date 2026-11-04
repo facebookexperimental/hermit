@@ -1989,6 +1989,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4609 (rebased onto post-split main) adds ten hermit-run units
     // (nine in app::analyze::phases, one in app::analyze::rundata):
     // 1239 + 10 = 1249, measured by nextest list.
+<<<<<<< HEAD
     // And https://github.com/rrnewton/hermit/pull/4772's two no-namespace
     // analyze tests: 1254 + 2 = 1256.
     // And analyze::rundata::tests::every_record_written_for_a_trial_states_the_trials_chosen_ids:
@@ -1996,6 +1997,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And rundata::tests::a_recorded_target_run_replays_a_workspace_copy_within_an_explicit_bound:
     // 1257 + 1 = 1258.
     // PR 4920 (3): the prefix-trial unit: 1258 + 1 = 1259.
+=======
+    // And PR #4743's eight hermit-unit additions on this base (trial-log,
+    // bisection-checkpoint, workspace-source and guest-log units; measured
+    // by nextest list at the rebased head against main 890f7e67:
+    // 1350 -> 1358): 1252 + 8 = 1260.
+>>>>>>> f7678bd7eac (drain 4743: recount the trial-log pins on current main)
     ("test.hermit_unit", 1260),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
@@ -6372,10 +6379,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the hosted CPUID-faulting skip set): 1327 + 2 = 1329.
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
+<<<<<<< HEAD
     // And the same two: 1248 + 2 = 1250.
     // And the same trial-record stamping unit: 1250 + 1 = 1251.
     // And the same run1-preemptions test: 1251 + 1 = 1252.
     // PR 4920 (3): the same unit: 1252 + 1 = 1253.
+=======
+    // And the same eight PR #4743 units as test.hermit_unit: 1246 + 8 = 1254.
+>>>>>>> f7678bd7eac (drain 4743: recount the trial-log pins on current main)
     ("test.hermit_unit_on_host", 1254),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
