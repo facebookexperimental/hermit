@@ -2634,6 +2634,14 @@ mod tests {
                 "--replay-preemptions-from",
             ),
         ] {
+            // Where this host may choose IDs, --no-namespace is admitted and
+            // its trials take chosen IDs (`RunOpts::prepare_trial_guest_ids`).
+            if run_arg == "--no-namespace" && crate::app::guest_ids::may_choose_ids().is_ok() {
+                options(&[run_arg])
+                    .refuse_outputs_trials_overwrite()
+                    .unwrap_or_else(|error| panic!("{run_arg}: {error:#}"));
+                continue;
+            }
             let error = options(&[run_arg])
                 .refuse_outputs_trials_overwrite()
                 .expect_err("an option the trials cannot take");
