@@ -879,19 +879,16 @@ fn emit_full_selection_record(format: &str) {
         return;
     };
     if format == "github" {
-        match std::env::var("GITHUB_OUTPUT") {
-            Ok(path) => {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                {
-                    let _ = f.write_all(record.as_bytes());
-                    return;
-                }
+        if let Ok(path) = std::env::var("GITHUB_OUTPUT") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = f.write_all(record.as_bytes());
+                return;
             }
-            Err(_) => {}
         }
     }
     println!("{record}");
