@@ -6377,45 +6377,64 @@ sys.exit(37)
         refuse(OUTPUT, "the file", text);
     }
 
-    /// The PMU analyze node runs these ignored integrations of
-    /// hermit-cli/tests/analyze.rs by exact name, in both the authored and
-    /// the generated DAG, and its description names them; and the tests
-    /// still exist. A rename or a lost selector fails here, not as a node
-    /// that runs fewer tests than its pin.
+    /// The PMU analyze node retains exactly the six other ignored integrations
+    /// while hello-race pinpointing is excluded for its tracked failure.
     #[test]
     fn the_pmu_analyze_node_runs_the_ignored_analyze_integrations() {
         let source = include_str!("../../../hermit-cli/tests/analyze.rs");
-        for case in [
-            // The workspace change's.
+        let cases = [
+            "bisect_rejects_a_timed_out_replay",
+            "analyze_stops_on_a_refused_trial",
+            "analyze_ends_with_a_refused_target_run",
             "analyze_keeps_its_workspace_after_an_error",
             "analyze_cleans_up_when_a_signal_stops_it",
             "analyze_stops_a_run_whose_init_has_not_armed",
-        ] {
+        ];
+        for case in cases {
             assert!(
                 source.contains(&format!("fn {case}()")),
                 "{case} is not in hermit-cli/tests/analyze.rs"
             );
-            for (origin, dag) in [
-                (
-                    "validation_dag_static",
-                    crate::validation_dag_static::config(),
-                ),
-                (
-                    OUTPUT,
-                    dag_from_json(include_str!("../../dag/validate.json")).unwrap(),
-                ),
-            ] {
-                let step = dag
-                    .steps
-                    .iter()
-                    .find(|step| {
-                        step.tag() == "super.pmu_analyze_hello_race_stress_calibrated_skid"
-                    })
-                    .unwrap();
-                assert!(
-                    step.cmd.contains(&format!("test(={case})")),
-                    "{origin}: {case}"
-                );
+        }
+        assert!(source.contains("fn analyze_hello_race()"));
+        let expected_filter = cases
+            .iter()
+            .map(|case| format!("test(={case})"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        for (origin, dag) in [
+            (
+                "validation_dag_static",
+                crate::validation_dag_static::config(),
+            ),
+            (
+                OUTPUT,
+                dag_from_json(include_str!("../../dag/validate.json")).unwrap(),
+            ),
+        ] {
+            let step = dag
+                .steps
+                .iter()
+                .find(|step| step.tag() == "super.pmu_analyze_hello_race_stress_calibrated_skid")
+                .unwrap();
+            assert_eq!(step.cmd.matches(" -E '").count(), 1, "{origin}");
+            let (_, filter_tail) = step.cmd.rsplit_once(" -E '").unwrap();
+            assert_eq!(
+                filter_tail,
+                format!("{expected_filter}' -- --ignored"),
+                "{origin}"
+            );
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "6", "{origin}");
+            assert!(
+                !step.cmd.contains("test(=analyze_hello_race)"),
+                "{origin}: excluded hello-race must not run"
+            );
+            assert!(
+                step.description
+                    .contains("https://github.com/rrnewton/hermit/issues/5115"),
+                "{origin}: missing exclusion reason"
+            );
+            for case in cases {
                 assert!(
                     step.description.contains(case),
                     "{origin}: {case} description"
