@@ -2433,6 +2433,31 @@ pub(crate) mod tests {
         );
     }
 
+    /// Zero padding in a marked section's unmarked bytes (here, before its
+    /// first `$x`) is UDF #0, which traps and never branches, so the loop
+    /// after it is still rewritten. A word in the same place that may be a
+    /// direct branch with an unknown target refuses every site in the image.
+    #[test]
+    fn zero_padding_in_unmarked_bytes_does_not_refuse_the_image() {
+        for (head, expected) in [(0x0000_0000, 1), (0x0001_0000, 0)] {
+            let mut words = vec![head];
+            words.extend_from_slice(&LOOP);
+            let image = elf_image(&words, Some(&[(1, 1, true)]));
+            let (bytes, report) = rewritten(&image);
+            assert_eq!(report.patched_total(), expected, "{head:#x} {report:?}");
+            if expected == 0 {
+                assert_eq!(bytes, image, "{report:?}");
+                assert_eq!(
+                    report.refused,
+                    BTreeMap::from([("unknown-direct-branch", 1)]),
+                    "{report:?}"
+                );
+            } else {
+                assert_ne!(bytes, image, "{report:?}");
+            }
+        }
+    }
+
     /// A short addressed-data exclusion nested inside a whole-function
     /// exclusion must not shadow it: the candidate after the short range
     /// is still inside the function the unresolved ADRP took for data.

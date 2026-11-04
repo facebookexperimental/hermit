@@ -354,12 +354,24 @@ const REQUIRE_FULLY_DECODED_RANGES: bool = false;
 /// BR/BLR/RET/ERET/DRPS opcodes), which have no computable image
 /// target here. Known direct branches are decoded by `decode` and
 /// never reach this predicate as `Other`.
+///
+/// One encoding in the reserved class is positively known too: UDF
+/// #imm16, bits 31:16 all zero, is permanently undefined (Arm
+/// Architecture Reference Manual for A-profile, DDI 0487, A64 base
+/// instruction UDF, "Permanently Undefined": encoding
+/// `0000 0000 0000 0000 imm16`). It raises an Undefined Instruction
+/// exception and never transfers control to a target, so it cannot
+/// enter a sequence. Zero words are the padding that bytes no mapping
+/// symbol marks are full of.
 pub fn unknown_direct_branch_possible(word: u32) -> bool {
     if insn::decode(word) != Insn::Other {
         return false;
     }
     if REQUIRE_FULLY_DECODED_RANGES {
         return true;
+    }
+    if word >> 16 == 0 {
+        return false;
     }
     match (word >> 25) & 0xf {
         // Positively known non-direct top-level classes (above).
@@ -1032,7 +1044,7 @@ mod tests {
         // branch-group word are each treated as a direct branch with an
         // unknown target: no site in the range rewrites.
         let (_, _, loop_words, _) = CASES[0];
-        for unknown in [0x0000_0000, 0xd700_0000] {
+        for unknown in [0x0001_0000, 0xd700_0000] {
             let mut words = vec![unknown];
             words.extend_from_slice(loop_words);
             let report = plan(&words, BASE);
@@ -1046,6 +1058,28 @@ mod tests {
     }
 
     #[test]
+    fn a_permanently_undefined_word_is_not_a_possible_branch() {
+        // UDF #0 and UDF #0xffff trap and never branch; the reserved-class
+        // words just above them, and an unrecognised branch-group word,
+        // still count as possible direct branches.
+        for (word, possible) in [
+            (0x0000_0000, false),
+            (0x0000_ffff, false),
+            (0x0001_0000, true),
+            (0x0010_0000, true),
+            (0xd700_0000, true),
+        ] {
+            assert_eq!(insn::decode(word), Insn::Other, "{word:#x}");
+            assert_eq!(unknown_direct_branch_possible(word), possible, "{word:#x}");
+            let (_, _, loop_words, _) = CASES[0];
+            let mut words = vec![word];
+            words.extend_from_slice(loop_words);
+            let report = plan(&words, BASE);
+            assert_eq!(report.patched.is_empty(), possible, "{word:#x} {report:?}");
+        }
+    }
+
+    #[test]
     fn every_top_level_class_is_classified_by_the_allow_list() {
         // All sixteen top-level classes (bits 28:25), one representative
         // unrecognised word each: only the positively known non-direct
@@ -1054,7 +1088,7 @@ mod tests {
         // UNALLOCATED classes refuse, as does an unrecognised word in
         // the branch/exception/system group.
         let cases: [(u32, bool); 16] = [
-            (0x0000_0000, true),  // 0000 reserved (SME)
+            (0x0001_0000, true),  // 0000 reserved (SME), not UDF
             (0x0200_0000, true),  // 0001 UNALLOCATED
             (0x0400_0000, true),  // 0010 SVE (not allow-listed)
             (0x0600_0000, true),  // 0011 UNALLOCATED

@@ -49,7 +49,9 @@ pub mod rewrite;
 /// 7: so do the reads through an `ADRP`'s page or an `ADR`'s address: an
 /// access the instruction bounds protects those bytes, and any other use,
 /// or the address held where the scan stops, every executable byte.
-pub const REWRITE_FORMAT_VERSION: u32 = 7;
+/// 8: a UDF #imm16 word, which traps and never branches, no longer refuses
+/// the image.
+pub const REWRITE_FORMAT_VERSION: u32 = 8;
 
 /// Whether this host executes the FEAT_LSE atomics the rewrite emits.
 ///
