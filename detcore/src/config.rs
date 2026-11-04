@@ -294,6 +294,12 @@ mod tests {
         // 4 to 6 because main's 30 took domain 4 for the scheduled event
         // and domain 5 for its reply; digests measured at this head).
         (41, "aeb38079447d34fb", "f013e36743d8d9e6"),
+        // The `StoreExclusive` payload's `Rewrite` says whether a mapping's
+        // file holds loops no mapping symbol proves (`unmarked`), which the
+        // run names in its summary; its fields cross the wire positionally.
+        // Renumbered from 41 to 42 at this rebase onto main's 41 while 33
+        // to 39 remain reserved; digest re-measured at this head.
+        (42, "424f7d348b80d8be", "f013e36743d8d9e6"),
         // Retypes `GlobalRequest::TraceSchedEvent`; adds
         // `GlobalResponse::WithWatchOrder` (#4796). Live-computed as 45 at
         // its rebase onto main's 41, skipping reserved 42 to 44; digest
@@ -330,10 +336,12 @@ mod tests {
     /// The types `GlobalRequest::StoreExclusive` carries, declared in
     /// `store_exclusive.rs` inside its modules. Their fields cross the RPC in
     /// positional bincode as the enums' own do.
-    const STORE_EXCLUSIVE_PAYLOAD: [&str; 3] = [
+    const STORE_EXCLUSIVE_PAYLOAD: [&str; 5] = [
         "pub enum Report {",
         "pub struct ScannedMapping {",
         "pub struct Found {",
+        "pub struct Rewrite {",
+        "pub struct LiveMapping {",
     ];
 
     /// The lines of code, as [`definition`] gives them, of the type that

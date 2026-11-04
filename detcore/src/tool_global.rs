@@ -2945,6 +2945,16 @@ impl GlobalState {
             .unwrap_or_else(PoisonError::into_inner)
             .1
             .clone();
+        // The overlay's files join those the in-memory rewrite named
+        // (`store_exclusive`'s `fill_summary`, above).
+        summary.exclusive_rewrite_unmarked.extend(
+            self.cfg
+                .rewrite_exclusives_unmarked
+                .iter()
+                .map(|path| path.display().to_string()),
+        );
+        summary.exclusive_rewrite_unmarked.sort();
+        summary.exclusive_rewrite_unmarked.dedup();
         //
         // Real time report:
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the
@@ -15605,6 +15615,21 @@ mod tests {
                     stopless_slice_ends: None,
                 })
             );
+        }
+    }
+
+    /// The files the CLI's exclusive rewrite left unchanged for want of
+    /// mapping symbols reach the run's summary from the configuration it was
+    /// handed, and the summary names none when there were none.
+    #[test]
+    fn the_unmarked_rewrite_files_are_named_in_the_summary() {
+        for unmarked in [Vec::new(), vec!["/lib64/libstdc++.so.6".to_owned()]] {
+            let config = Config {
+                rewrite_exclusives_unmarked: unmarked.iter().map(Into::into).collect(),
+                ..Config::default()
+            };
+            let summary = GlobalState::for_tests(&config).into_run_summary().unwrap();
+            assert_eq!(summary.exclusive_rewrite_unmarked, unmarked);
         }
     }
 

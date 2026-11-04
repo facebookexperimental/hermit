@@ -1364,6 +1364,8 @@ fn record_or_replay_config_with_timer_support(
         annotated_priority_replay: false,
         // The first image's link stays the kernel's in record and replay.
         launch_image: None,
+        // `hermit record` has no `--rewrite-exclusives`.
+        rewrite_exclusives_unmarked: Vec::new(),
         // Not measured for record and replay.
         inherited_seccomp: detcore::InheritedSeccomp::Unknown,
         has_uts_namespace: true,

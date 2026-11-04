@@ -1767,14 +1767,19 @@ pub struct RunOpts {
     /// branches again, so the same guest work does not retire the same number
     /// of branches. A single atomic instruction cannot retry. This is
     /// preprocessing for the ptrace backend, not a backend, and anything that
-    /// is not a fully decoded canonical loop is left alone and reported.
+    /// is not a fully decoded canonical loop is left alone and reported. Only
+    /// what ARM mapping symbols mark as code is rewritten, either way: a file
+    /// without them, such as every stripped file, is left unchanged and named
+    /// in the run's diagnostics and its summary.
     ///
     /// Where the guest has a mount namespace, a rewritten copy of the guest
     /// executable (and of each `--rewrite-exclusives-also` file) is
     /// bind-mounted over the original. With `--no-namespace` there is nothing
     /// to carry such an overlay, so the loops of every executable file the
     /// guest maps are rewritten in its memory instead, as each is mapped; see
-    /// `--rewrite-exclusives-mode`.
+    /// `--rewrite-exclusives-mode`. An `--image` guest (and `hermit oci
+    /// run`'s) loads the files of the image's rootfs, which an overlay does
+    /// not reach, so there only the in-memory rewrite applies.
     #[clap(long)]
     pub(crate) rewrite_exclusives: bool,
 
@@ -2344,6 +2349,13 @@ pub struct RunOpts {
     #[clap(skip)]
     exclusive_rewrite_covered: Vec<PathBuf>,
 
+    /// Runtime-only: the guest path of every file `--rewrite-exclusives` left
+    /// unchanged, wholly or in part, because no mapping symbol it accepts
+    /// marks its code (none, or one that is neither `$x` nor `$d`), for
+    /// `Config::rewrite_exclusives_unmarked`.
+    #[clap(skip)]
+    exclusive_rewrite_unmarked: Vec<PathBuf>,
+
     /// Runtime-only: how many of the last `--mount`s and `--bind`s a backend
     /// adapter added to the caller's (`with_dbt_mounts`). They are installed
     /// as a backend's own mounts (`PlannedMount::backend`), which the guest's
@@ -2479,9 +2491,15 @@ pub(super) fn apply_base_environment(
     Ok(())
 }
 
-/// One prepared analysis's key, its overlays, and the guest paths of every
-/// file its overlay rewrite was given.
-type PreparedTrialPreprocessing = (String, Vec<ExecutableOverlayMount>, Vec<PathBuf>);
+/// One prepared analysis's key, its overlays, the guest paths of every
+/// file its overlay rewrite was given, and the files it left unchanged
+/// for want of mapping symbols.
+type PreparedTrialPreprocessing = (
+    String,
+    Vec<ExecutableOverlayMount>,
+    Vec<PathBuf>,
+    Vec<PathBuf>,
+);
 /// The overlays prepared for analyze trials in this process, by
 /// [`RunOpts::trial_preprocessing_key`].
 static PREPARED_TRIAL_PREPROCESSING: std::sync::Mutex<Vec<PreparedTrialPreprocessing>> =
@@ -3687,7 +3705,7 @@ fn analyze_trials_are_refused_before_the_rewrite_cache_is_consulted() {
         ),
         (
             &["--image=example.invalid/guest", "--rewrite-exclusives"][..],
-            "which an --image launch does not mount",
+            "which those mounts do not reach",
         ),
     ] {
         let mut argv = vec!["hermit", "run"];
@@ -3772,6 +3790,138 @@ fn the_exclusive_rewrite_is_retained_in_reproducers() {
             assert!(rendered.contains(mode), "{rendered}");
         }
     }
+}
+
+/// Every path that would prepare the rewrite refuses an image run: the
+/// preparation itself, which each of them reaches
+/// (`prepare_exclusive_rewrite`, also through an analyze trial's
+/// `prepare_trial_preprocessing`), and `RunOpts::run`, the entry a library
+/// caller can use without validating anything.
+#[test]
+fn the_exclusive_rewrite_is_refused_at_every_entry_that_would_prepare_it() {
+    let refusal = "a guest run from an OCI image (--image, hermit oci run)";
+    let image = run_opts_for(&[
+        "hermit",
+        "run",
+        "--image=example.invalid/guest",
+        "--rewrite-exclusives",
+        "--",
+        "/nonexistent/guest",
+    ]);
+
+    let error = image
+        .clone()
+        .prepare_exclusive_rewrite(Backend::Ptrace)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains(refusal), "{error:#}");
+
+    // And so does an analyze trial's preparation, which reaches it.
+    let error = image
+        .clone()
+        .prepare_trial_preprocessing()
+        .expect_err("a trial's preparation must be refused too");
+    assert!(format!("{error:#}").contains(refusal), "{error:#}");
+
+    let global = GlobalOpts::parse_from(["hermit"]);
+    let error = image
+        .run(&global, false)
+        .expect_err("a library caller's run must be refused too");
+    assert!(format!("{error:#}").contains(refusal), "{error:#}");
+
+    // Without the rewrite, none of them is refused for it.
+    let plain = run_opts_for(&[
+        "hermit",
+        "run",
+        "--image=example.invalid/guest",
+        "--",
+        "/nonexistent/guest",
+    ]);
+    // (The preparation still refuses this x86_64 host for want of FEAT_LSE,
+    // which is a different refusal.)
+    if let Err(error) = plain.clone().prepare_exclusive_rewrite(Backend::Ptrace) {
+        assert!(!format!("{error:#}").contains(refusal), "{error:#}");
+    }
+    if let Err(error) = plain.run(&global, false) {
+        assert!(!format!("{error:#}").contains(refusal), "{error:#}");
+    }
+}
+
+/// An OCI image run does not mount the rewritten copies, so the rewrite is
+/// refused in argument validation, by name, before the image is resolved;
+/// without the rewrite the same image run is not refused for it.
+#[test]
+fn the_exclusive_rewrite_is_refused_for_an_image_run() {
+    let refusal = "a guest run from an OCI image (--image, hermit oci run)";
+    let mut image = run_opts_for(&[
+        "hermit",
+        "run",
+        "--image=example.invalid/guest",
+        "--rewrite-exclusives",
+        "--",
+        "/nonexistent/guest",
+    ]);
+    let error = image.validate_args_with_perf_support(true).unwrap_err();
+    assert!(format!("{error:#}").contains(refusal), "{error:#}");
+
+    let mut plain = run_opts_for(&[
+        "hermit",
+        "run",
+        "--image=example.invalid/guest",
+        "--",
+        "/nonexistent/guest",
+    ]);
+    if let Err(error) = plain.validate_args_with_perf_support(true) {
+        assert!(!format!("{error:#}").contains(refusal), "{error:#}");
+    }
+}
+
+/// Trials reuse prepared overlays only for the same inputs: another
+/// `--tmp`, `--workdir`, `--image` or guest environment, or a file whose
+/// bytes changed, is another preparation.
+#[test]
+fn trial_preparations_are_keyed_by_every_input_they_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let library = directory.path().join("liblse.so");
+    std::fs::write(&library, b"first").unwrap();
+    let also = format!("--rewrite-exclusives-also={}", library.display());
+    let key = |extra: &[&str]| {
+        let mut argv = vec!["hermit", "run", "--rewrite-exclusives", &also];
+        argv.extend_from_slice(extra);
+        argv.extend_from_slice(&["--", "/nonexistent/guest"]);
+        run_opts_for(&argv).trial_preprocessing_key()
+    };
+    let plain = key(&[]);
+    assert_eq!(key(&[]), plain, "the same inputs share one preparation");
+    for other in [
+        "--tmp=/var/tmp/elsewhere",
+        "--workdir=/elsewhere",
+        "--image=example.invalid/guest",
+        "--env=PATH=/elsewhere",
+        "--base-env=empty",
+    ] {
+        assert_ne!(key(&[other]), plain, "{other}");
+    }
+    std::fs::write(&library, b"second").unwrap();
+    let changed = key(&[]);
+    assert_ne!(changed, plain, "a file whose bytes changed");
+
+    // The copy carries the source's permissions, so a changed mode is a
+    // different preparation even with the same bytes.
+    let mut mode = std::fs::metadata(&library).unwrap().permissions();
+    mode.set_mode(mode.mode() ^ 0o111);
+    std::fs::set_permissions(&library, mode).unwrap();
+    assert_ne!(key(&[]), changed, "a file whose mode changed");
+
+    // And so is another cache: the copies the key stands for live there.
+    // SAFETY: single-threaded test; the variable is restored below.
+    let home = std::env::var_os("XDG_CACHE_HOME");
+    unsafe { std::env::set_var("XDG_CACHE_HOME", directory.path()) };
+    let elsewhere = key(&[]);
+    match home {
+        Some(home) => unsafe { std::env::set_var("XDG_CACHE_HOME", home) },
+        None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
+    }
+    assert_ne!(elsewhere, key(&[]), "another cache directory");
 }
 
 #[test]
@@ -11692,6 +11842,10 @@ impl RunOpts {
         // another dispatcher before discovering that no execution exists.
         #[cfg(all(feature = "native-exec-input-admission", not(feature = "native-exec")))]
         self.refuse_uncompiled_native_exec(global.backend.unwrap_or_default())?;
+        // Before the dispatch below, which can serve a debug adapter: that
+        // path binds a listener and reads the image's configuration, and
+        // the refusal needs neither.
+        self.refuse_exclusive_rewrite_in_an_image()?;
         // Admission must see the actual global backend before any launch.
         match self
             .dispatch_before_validation(global.backend, std::env::var_os(DAP_LISTEN_INNER_ENV))?
@@ -12076,6 +12230,7 @@ impl RunOpts {
             let program = self.load_and_resolve_happens_before()?;
             self.resolved_happens_before = Some(program);
         }
+
         if self.rewrite_exclusives {
             self.prepare_exclusive_rewrite(backend)?;
         }
@@ -12283,6 +12438,8 @@ impl RunOpts {
         // Callers other than `main` (analyze, oci, tests) reach validation
         // without `dispatch_before_validation`; lowering again is a no-op.
         self.lower_strace_only();
+        // Before the image is resolved, which this refusal does not need.
+        self.refuse_exclusive_rewrite_in_an_image()?;
         self.resolve_image_default_program()?;
         self.refuse_virtual_timeout_with_debugger()?;
         self.refuse_unready_exec_stop()?;
@@ -14043,42 +14200,36 @@ impl RunOpts {
         Ok(())
     }
 
-    pub(super) fn adapter_executable_overlay_plan(
-        &self,
-    ) -> Result<super::backend_hook::ExecutableOverlay, Error> {
-        let (guest, host) = self.resolve_guest_and_host_program()?;
-        let target = self.resolve_executable_overlay_target(&guest, &host)?;
-        Ok(super::backend_hook::ExecutableOverlay {
-            guest,
-            host,
-            target,
-        })
+    /// Refuse `--rewrite-exclusives` for a guest that runs from an OCI image
+    /// (`--image`, and `hermit oci run`, which sets it). The rewritten copies
+    /// are bind-mounted over the host files the guest program resolves to,
+    /// and an image launch builds its own container in the image's
+    /// materialized rootfs, which those mounts do not reach: the guest would
+    /// run its original exclusive loops while the run reported a rewrite.
+    /// The in-memory rewrite writes the guest's own mapped pages, whatever
+    /// file they come from, so it is not refused.
+    pub(crate) fn refuse_exclusive_rewrite_in_an_image(&self) -> Result<(), Error> {
+        self.refuse_exclusive_rewrite_for_image_launch(self.image.is_some())
     }
 
-    pub(super) fn adapter_with_executable_overlay(
+    /// [`Self::refuse_exclusive_rewrite_in_an_image`] where the caller knows
+    /// the guest runs from an image before `--image` says so: `hermit oci
+    /// run` takes its image as a positional argument and resolves it to an
+    /// id later, so its refusal must not wait for that.
+    pub(crate) fn refuse_exclusive_rewrite_for_image_launch(
         &self,
-        plan: &super::backend_hook::ExecutableOverlay,
-        source: Option<&Path>,
-    ) -> Result<Self, Error> {
+        from_image: bool,
+    ) -> Result<(), Error> {
         anyhow::ensure!(
-            self.adapter_executable_overlay_plan()? == *plan,
-            "executable overlay no longer matches the admitted guest/mount resolution"
+            !self.rewrite_exclusives || self.rewrites_exclusives_in_memory() || !from_image,
+            "--rewrite-exclusives-mode=overlay bind-mounts rewritten copies over the host files \
+             the guest loads, and a guest run from an OCI image (--image, hermit oci run) loads \
+             the files of the image's rootfs, which those mounts do not reach, so it would run \
+             its original exclusive loops; rewrite in the guest's memory instead \
+             (--rewrite-exclusives-mode=memory), or rewrite the files the image holds with \
+             `hermit rewrite-exclusives --output-dir`"
         );
-        let overlay = if let Some(source) = source {
-            self.validate_executable_overlay_mount_targets()?;
-            self.validate_executable_overlay_source_visibility(source)?;
-            Some(ExecutableOverlayMount {
-                source: source.to_owned(),
-                target: plan.target.clone(),
-                rewritten: None,
-            })
-        } else {
-            None
-        };
-        let mut options = self.clone();
-        options.prepared_program = Some(plan.guest.clone());
-        options.executable_overlay = overlay;
-        Ok(options)
+        Ok(())
     }
 
     /// Applies to a trial the preprocessing `RunOpts::main` does before a run
@@ -14088,14 +14239,13 @@ impl RunOpts {
     /// images while its printed reproducer, which carries the option, ran the
     /// rewritten ones.
     ///
-    /// Every trial of one analysis shares the program, the
-    /// `--rewrite-exclusives-also` files, the backend, the mounts and binds and
-    /// the working directory and `PATH` the guest program is resolved with, so
-    /// the overlays are prepared once per process for those inputs and reused:
-    /// one rewrite and one report per analysis, not one per trial. The key is
-    /// all of them and whether the rewrite is in memory, so a second analysis
-    /// in one process (as tests run) with other mounts or the other mode
-    /// prepares, and checks, its own.
+    /// Every trial of one analysis shares the inputs the preparation reads
+    /// ([`Self::trial_preprocessing_key`]), so the overlays are prepared once
+    /// per process for those inputs and reused: one rewrite and one report
+    /// per analysis, not one per trial. The key is all of them and whether
+    /// the rewrite is in memory, so a second analysis in one process (as
+    /// tests run) with other mounts, another `/tmp` or working directory, a
+    /// changed file or the other mode prepares, and checks, its own.
     pub(crate) fn prepare_trial_preprocessing(&mut self) -> Result<(), Error> {
         if !self.rewrite_exclusives {
             return Ok(());
@@ -14107,36 +14257,98 @@ impl RunOpts {
         let mut prepared = PREPARED_TRIAL_PREPROCESSING
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((_, overlays, covered)) = prepared.iter().find(|(seen, _, _)| *seen == key) {
+        if let Some((_, overlays, covered, unmarked)) =
+            prepared.iter().find(|(seen, ..)| *seen == key)
+        {
             self.exclusive_rewrite_overlays = overlays.clone();
             self.exclusive_rewrite_covered = covered.clone();
+            self.exclusive_rewrite_unmarked = unmarked.clone();
             return Ok(());
         }
         self.exclusive_rewrite_overlays.clear();
         self.exclusive_rewrite_covered.clear();
+        self.exclusive_rewrite_unmarked.clear();
         self.prepare_exclusive_rewrite(self.selected_backend())?;
         prepared.push((
             key,
             self.exclusive_rewrite_overlays.clone(),
             self.exclusive_rewrite_covered.clone(),
+            self.exclusive_rewrite_unmarked.clone(),
         ));
         Ok(())
     }
 
     /// What decides the overlays one analysis prepares (see
-    /// [`Self::prepare_trial_preprocessing`]).
+    /// [`Self::prepare_trial_preprocessing`]): every input the preparation
+    /// reads. The options that place the guest's files and decide what is
+    /// rewritten: the program, the `--rewrite-exclusives-also` files, the
+    /// backend, the mounts and binds, `--tmp`, `--workdir`, `--image`, the
+    /// guest environment, and the host's working directory and `PATH`. And
+    /// the files those resolve to, as the preparation resolves them, each
+    /// with a digest of its bytes and its permissions: a file that changed
+    /// between two analyses gets a new copy, not the one made from its old
+    /// bytes, and one whose mode changed gets a copy with that mode, which
+    /// the rewritten file carries (`elf::write_rewritten`). A file that does
+    /// not resolve or read keys as its error, which the preparation then
+    /// reports. The cache the copies live in is part of the key too: it
+    /// follows this process's environment
+    /// (`hermit::aarch64_lse::cache_path`), so an overlay prepared under
+    /// another `HOME` or `XDG_CACHE_HOME` names a path this run would not
+    /// write.
     fn trial_preprocessing_key(&self) -> String {
+        let mut files = vec![
+            self.resolve_guest_and_host_program()
+                .and_then(|(guest, host)| {
+                    Ok((self.resolve_executable_overlay_target(&guest, &host)?, host))
+                }),
+        ];
+        files.extend(self.rewrite_exclusives_also.iter().map(|also| {
+            fs::canonicalize(also)
+                .map(|path| (path.clone(), path))
+                .map_err(Error::from)
+        }));
+        let files: Vec<String> = files
+            .into_iter()
+            .map(|file| match file {
+                Ok((guest, host)) => match (fs::read(&host), fs::metadata(&host)) {
+                    (Ok(bytes), Ok(metadata)) => format!(
+                        "{} at {}: {} mode {:o}",
+                        guest.display(),
+                        host.display(),
+                        detcore::Digest::new(&bytes),
+                        metadata.permissions().mode()
+                    ),
+                    (Err(error), _) | (_, Err(error)) => {
+                        format!("{}: {error}", host.display())
+                    }
+                },
+                Err(error) => format!("{error:#}"),
+            })
+            .collect();
         format!(
             "{:?}",
             (
-                &self.program,
-                &self.rewrite_exclusives_also,
-                self.rewrites_exclusives_in_memory(),
-                self.selected_backend(),
-                &self.mount,
-                &self.bind,
-                std::env::current_dir().ok(),
-                std::env::var_os("PATH"),
+                (
+                    &self.program,
+                    &self.rewrite_exclusives_also,
+                    self.rewrites_exclusives_in_memory(),
+                    self.selected_backend(),
+                ),
+                (
+                    &self.mount,
+                    &self.bind,
+                    &self.tmp,
+                    &self.workdir,
+                    &self.image
+                ),
+                (
+                    &self.base_env,
+                    &self.env,
+                    std::env::current_dir().ok(),
+                    std::env::var_os("PATH"),
+                    hermit::aarch64_lse::cache_path(),
+                ),
+                files,
             )
         )
     }
@@ -14145,10 +14357,15 @@ impl RunOpts {
     /// any file named by `--rewrite-exclusives-also`) into content-addressed
     /// copies, and overlay each copy on the path the guest loads it from.
     ///
-    /// The rewrite is a pure function of the input bytes, so the cache key is
-    /// the input digest: two runs of one `--verify` pair, and a replay of a
-    /// recording, map identical bytes.
+    /// The rewrite is a pure function of the input bytes, and each copy is
+    /// named by the bytes it holds
+    /// (`aarch64_lse::cached_rewrite`): two runs of one `--verify` pair, and
+    /// a replay of a recording, map identical bytes, and runs that would map
+    /// different bytes never share a copy.
     fn prepare_exclusive_rewrite(&mut self, backend: Backend) -> Result<(), Error> {
+        // Every preparation, however it was reached, including a library
+        // caller that validated nothing.
+        self.refuse_exclusive_rewrite_in_an_image()?;
         self.validate_exclusive_rewrite(backend)?;
         if self.rewrites_exclusives_in_memory() {
             // Detcore rewrites each executable file mapping as the guest maps
@@ -14182,11 +14399,7 @@ impl RunOpts {
         );
         // An image launch builds its own container, without the overlay
         // mounts, so the guest would run the original code.
-        anyhow::ensure!(
-            in_memory || self.image.is_none(),
-            "--rewrite-exclusives-mode=overlay bind-mounts rewritten copies, which an --image \
-             launch does not mount; use --rewrite-exclusives-mode=memory"
-        );
+        self.refuse_exclusive_rewrite_in_an_image()?;
         // Detcore does the rewrite; --namespace-only runs the guest without it.
         anyhow::ensure!(
             !in_memory || !self.namespace_only,
@@ -14249,25 +14462,16 @@ impl RunOpts {
         for (guest_path, host_path) in files {
             let input = fs::read(&host_path)
                 .with_context(|| format!("reading {} to rewrite", host_path.display()))?;
-            let digest = detcore::Digest::new(&input);
             let name = host_path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "image".to_owned());
-            let output = cache.join(format!(
-                "v{}-{digest}-{name}",
-                hermit::aarch64_lse::REWRITE_FORMAT_VERSION
-            ));
-            // Rewrite into memory first, always: it is the same pure function
-            // of the same bytes, so it is also the check that a cached file
-            // is the one this version of the rewriter would have written. A
-            // cache entry that differs -- an older rewriter's, or anyone
-            // else's -- is replaced rather than mounted.
+            // Rewrite into memory first, always: the cache entry is named by
+            // the bytes it must hold (`aarch64_lse::cached_rewrite`), so a
+            // cached file is mounted only if it is exactly what this rewriter
+            // made of this source.
             let mut rewritten = input.clone();
             let report = hermit::aarch64_lse::elf::rewrite_bytes(&mut rewritten)?;
-            if report.is_some() && fs::read(&output).ok().as_deref() != Some(&rewritten) {
-                hermit::aarch64_lse::elf::write_rewritten(&output, &rewritten, &host_path)?;
-            }
             let Some(report) = report else {
                 crate::app::tracing::diagnostic_eprintln!(
                     ":: Exclusive-loop rewrite: {} is not an aarch64 ELF image; left unchanged",
@@ -14279,10 +14483,46 @@ impl RunOpts {
                 "{}",
                 exclusive_rewrite_planned_line(&guest_path, &report)
             );
-            for (addr, why) in &report.refused_examples {
+            // The first few, as examples; the listing names every one.
+            const LOGGED: usize = 16;
+            for (addr, why) in report.refused_sites.iter().take(LOGGED) {
                 tracing::info!("exclusive loop left alone at {addr:#x}: {why}");
             }
+            if let Some(more) = report.refused_sites.len().checked_sub(LOGGED)
+                && more != 0
+            {
+                tracing::info!(
+                    "{more} more exclusive loops left alone in {}; `hermit rewrite-exclusives \
+                     --list-refusals` lists every one",
+                    guest_path.display()
+                );
+            }
+            // A file nothing marks is named, never left silently: the run's
+            // summary lists it too (`Config::rewrite_exclusives_unmarked`).
+            if report.unmarked() != 0 {
+                crate::app::tracing::diagnostic_eprintln!(
+                    ":: Exclusive-loop rewrite: {} has no mapping symbols ($x, $d) marking its \
+                     code, so its {} exclusive loop(s) there were left as they are",
+                    guest_path.display(),
+                    report.unmarked()
+                );
+                self.exclusive_rewrite_unmarked.push(guest_path.clone());
+            }
+            if report.unsupported() != 0 {
+                crate::app::tracing::diagnostic_eprintln!(
+                    ":: Exclusive-loop rewrite: {} has a mapping symbol other than $x and $d, so \
+                     its {} exclusive loop(s) in the sections it marks were left as they are; \
+                     `hermit rewrite-exclusives --list-refusals` names the symbol",
+                    guest_path.display(),
+                    report.unsupported()
+                );
+                if report.unmarked() == 0 {
+                    self.exclusive_rewrite_unmarked.push(guest_path.clone());
+                }
+            }
             if report.patched_total() != 0 {
+                let output =
+                    hermit::aarch64_lse::cached_rewrite(&cache, &rewritten, &host_path, &name)?;
                 self.validate_executable_overlay_source_visibility(&output)?;
                 self.exclusive_rewrite_overlays
                     .push(ExecutableOverlayMount {
@@ -14293,6 +14533,44 @@ impl RunOpts {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn adapter_executable_overlay_plan(
+        &self,
+    ) -> Result<super::backend_hook::ExecutableOverlay, Error> {
+        let (guest, host) = self.resolve_guest_and_host_program()?;
+        let target = self.resolve_executable_overlay_target(&guest, &host)?;
+        Ok(super::backend_hook::ExecutableOverlay {
+            guest,
+            host,
+            target,
+        })
+    }
+
+    pub(super) fn adapter_with_executable_overlay(
+        &self,
+        plan: &super::backend_hook::ExecutableOverlay,
+        source: Option<&Path>,
+    ) -> Result<Self, Error> {
+        anyhow::ensure!(
+            self.adapter_executable_overlay_plan()? == *plan,
+            "executable overlay no longer matches the admitted guest/mount resolution"
+        );
+        let overlay = if let Some(source) = source {
+            self.validate_executable_overlay_mount_targets()?;
+            self.validate_executable_overlay_source_visibility(source)?;
+            Some(ExecutableOverlayMount {
+                source: source.to_owned(),
+                target: plan.target.clone(),
+                rewritten: None,
+            })
+        } else {
+            None
+        };
+        let mut options = self.clone();
+        options.prepared_program = Some(plan.guest.clone());
+        options.executable_overlay = overlay;
+        Ok(options)
     }
 
     fn write_backend_engagement_after_run(&self) -> Result<(), Error> {
@@ -14359,6 +14637,7 @@ impl RunOpts {
         self.refuse_uncompiled_native_exec(self.selected_backend())?;
         self.refuse_unready_exec_stop()?;
         // Analyze and other in-process callers bypass the outer CLI entry.
+        self.refuse_exclusive_rewrite_in_an_image()?;
         self.refuse_an_invalid_replayed_record()?;
         detcore::preemptions::validate_config_replay_inputs(&self.det_opts.det_config)?;
         <detcore::Detcore as reverie::Tool>::facility_admission(&self.det_opts.det_config)?;
@@ -17394,6 +17673,9 @@ impl RunOpts {
             .then(|| untraced_code_range(self.selected_backend()))
             .flatten();
         config.fatal_core_capture = self.fatal_core_capture();
+        // The files `--rewrite-exclusives` left unchanged for want of
+        // mapping symbols, for the run's summary.
+        config.rewrite_exclusives_unmarked = self.exclusive_rewrite_unmarked.clone();
         // A pure function of the flags, so every trial of an analysis and
         // both runs of a `--verify` pair rewrite alike.
         config.rewrite_exclusives_in_memory = self.rewrites_exclusives_in_memory();

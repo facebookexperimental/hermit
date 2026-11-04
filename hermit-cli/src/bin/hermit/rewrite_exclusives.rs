@@ -31,7 +31,8 @@ pub struct RewriteExclusivesOpts {
     #[clap(long, value_name = "DIR")]
     output_dir: Option<PathBuf>,
 
-    /// List every loop left alone, not just the first few per file.
+    /// List every loop left alone, by address, with the reason. Without it,
+    /// only their counts by reason are printed.
     #[clap(long)]
     list_refusals: bool,
 }
@@ -86,7 +87,7 @@ impl RewriteExclusivesOpts {
                 println!("  skipped {segment}");
             }
             if self.list_refusals {
-                for (addr, why) in &report.refused_examples {
+                for (addr, why) in &report.refused_sites {
                     println!("  at {addr:#x}: {why}");
                 }
             }

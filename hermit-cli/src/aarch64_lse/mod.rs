@@ -28,12 +28,17 @@
 
 pub mod elf;
 pub use detcore::aarch64_lse::insn;
+pub use detcore::aarch64_lse::mapping;
 pub use detcore::aarch64_lse::rewrite;
 
 /// Bumped whenever the rewrite's output for the same input can change. It is
 /// part of the cache key, so a cached artifact from an older rewriter is
-/// never reused.
-pub const REWRITE_FORMAT_VERSION: u32 = 2;
+/// never reused. 3: only code is rewritten, as [`mapping`] tells it from
+/// data; none of the changes since 2 had bumped it, though the canonical
+/// shapes the refusal census added, the conditional compare-and-swap
+/// refusal, the direct-entry decoding and the positive allow-list each
+/// changed what the rewrite writes.
+pub const REWRITE_FORMAT_VERSION: u32 = 3;
 
 /// Whether this host executes the FEAT_LSE atomics the rewrite emits.
 ///
@@ -55,16 +60,20 @@ pub fn host_has_lse_atomics() -> bool {
 
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context;
 
-/// Where rewritten images are cached, created private to this user.
+/// Where rewritten images are cached, without creating or checking
+/// anything: the directory [`cache_dir`] uses. It follows this process's
+/// environment (`XDG_CACHE_HOME`, `HOME`), so a caller that remembers what
+/// it prepared must remember this too.
 ///
 /// Never under `/tmp`: Hermit replaces the guest's `/tmp` with an isolated
-/// directory, so an artifact there would not be visible to the guest that has
-/// to map it.
-pub fn cache_dir() -> anyhow::Result<PathBuf> {
+/// directory, so an artifact there would not be visible to the guest that
+/// has to map it.
+pub fn cache_path() -> PathBuf {
     let base = dirs::cache_dir().map_or_else(
         || PathBuf::from("/var/tmp").join(format!("hermit-{}", nix::unistd::geteuid().as_raw())),
         |dir| dir.join("hermit"),
@@ -77,7 +86,55 @@ pub fn cache_dir() -> anyhow::Result<PathBuf> {
     } else {
         base
     };
-    let dir = base.join("exclusive-rewrites");
+    base.join("exclusive-rewrites")
+}
+
+/// The cache entry holding `rewritten`, the rewrite of `source`, which the
+/// overlay bind-mounts over the path the guest loads `source` from; written
+/// if need be.
+///
+/// The entry is named by everything that decides the bytes the guest maps:
+/// the rewriter's format, a digest of the rewritten bytes themselves, and the
+/// source's permissions, which the copy carries ([`elf::write_rewritten`]);
+/// `name`, the source's file name, is there for a reader. So two runs that
+/// would map different bytes -- two builds of the rewriter, say -- never
+/// share an entry, and what one run checked cannot be replaced by another
+/// run's bytes before it mounts it. Nor is an entry ever written in place: a
+/// missing one, or one that does not hold the bytes and the mode its name
+/// promises, is written whole under a temporary name and renamed over the
+/// name, so a run that already mounted the file it replaces keeps that file.
+pub fn cached_rewrite(
+    cache: &Path,
+    rewritten: &[u8],
+    source: &Path,
+    name: &str,
+) -> anyhow::Result<PathBuf> {
+    let mode = std::fs::metadata(source)
+        .with_context(|| format!("reading the permissions of {}", source.display()))?
+        .permissions()
+        .mode();
+    let entry = cache.join(format!(
+        "v{REWRITE_FORMAT_VERSION}-{}-{:o}-{name}",
+        detcore::Digest::new(rewritten),
+        mode & 0o7777
+    ));
+    let holds_it = std::fs::metadata(&entry)
+        .is_ok_and(|cached| cached.permissions().mode() == mode)
+        && std::fs::read(&entry).is_ok_and(|cached| cached == rewritten);
+    if !holds_it {
+        elf::write_rewritten(&entry, rewritten, source)?;
+    }
+    Ok(entry)
+}
+
+/// Where rewritten images are cached ([`cache_path`]), created private to
+/// this user.
+pub fn cache_dir() -> anyhow::Result<PathBuf> {
+    let dir = cache_path();
+    let base = dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dir.clone());
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create the rewrite cache {}", dir.display()))?;
     // The cache holds images the guest will execute, so every directory this
@@ -102,4 +159,47 @@ pub fn cache_dir() -> anyhow::Result<PathBuf> {
         }
     }
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two rewrites of one source share one cache directory, and each gets
+    /// only its own bytes: entries are named by
+    /// the bytes they hold, written in either order, and a run that holds
+    /// one entry open still reads its bytes after the other run's write.
+    /// An entry that does not hold what its name promises is replaced by
+    /// a new file, not rewritten in place.
+    #[test]
+    fn each_rewrite_maps_only_its_own_bytes_from_one_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let source = directory.path().join("libstripped.so");
+        let original = b"\x7fELF stripped, as the default leaves it".to_vec();
+        let other = b"\x7fELF stripped, another rewrite".to_vec();
+        std::fs::write(&source, &original).unwrap();
+        let entry =
+            |bytes: &[u8]| cached_rewrite(&cache, bytes, &source, "libstripped.so").unwrap();
+        let mapped = entry(&other);
+        let mut held = std::fs::File::open(&mapped).unwrap();
+        let default = entry(&original);
+        assert_ne!(default, mapped);
+        assert_eq!(std::fs::read(&mapped).unwrap(), other);
+        assert_eq!(std::fs::read(&default).unwrap(), original);
+        // An entry that lost its bytes is replaced by a new file; the one a
+        // run holds keeps what it held.
+        std::fs::remove_file(&mapped).unwrap();
+        std::fs::write(&mapped, b"someone else's bytes").unwrap();
+        let mut stale = std::fs::File::open(&mapped).unwrap();
+        assert_eq!(entry(&other), mapped);
+        assert_eq!(std::fs::read(&mapped).unwrap(), other);
+        let mut read = Vec::new();
+        std::io::Read::read_to_end(&mut stale, &mut read).unwrap();
+        assert_eq!(read, b"someone else's bytes");
+        read.clear();
+        std::io::Read::read_to_end(&mut held, &mut read).unwrap();
+        assert_eq!(read, other);
+    }
 }

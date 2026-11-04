@@ -392,6 +392,10 @@ mod model {
         /// Loops the rewrite was asked for and could not write: the guest's
         /// memory or the file could not be read or written. They still retry.
         pub failed: u64,
+        /// Whether the file holds exclusive loops in an executable section no
+        /// mapping symbol marks, which the rewrite leaves as
+        /// `no-mapping-symbols`; those of this range are among `left`.
+        pub unmarked: bool,
     }
 
     impl Rewrite {
@@ -401,6 +405,7 @@ mod model {
                 rewritten: self.rewritten + other.rewritten,
                 left: self.left + other.left,
                 failed: self.failed + other.failed,
+                unmarked: self.unmarked || other.unmarked,
             }
         }
 
@@ -612,11 +617,11 @@ mod model {
         add(
             &mut charge,
             report
-                .refused_examples
+                .refused_sites
                 .capacity()
                 .saturating_mul(size_of::<(u64, String)>()),
         );
-        for (_, why) in &report.refused_examples {
+        for (_, why) in &report.refused_sites {
             add(&mut charge, why.capacity());
         }
         add(
@@ -1397,6 +1402,10 @@ mod runtime {
                 .collect();
             summary.exclusive_rewrite_cache_peak = PLANS.lock().unwrap().peak() as u64;
             summary.counter_reads = self.pairs.counter_reads_per_path();
+            // The files whose loops were left for want of mapping symbols
+            // are named beside those the overlay left
+            // (`Config::rewrite_exclusives_unmarked`).
+            let mut unmarked_files = Vec::new();
             summary.exclusive_rewrites = self
                 .pairs
                 .rewrites_per_path()
@@ -1406,7 +1415,11 @@ mod runtime {
                         rewritten,
                         left,
                         failed,
+                        unmarked,
                     } = rewrite;
+                    if unmarked {
+                        unmarked_files.push(path.clone());
+                    }
                     (
                         path,
                         ExclusiveRewrite {
@@ -1417,6 +1430,7 @@ mod runtime {
                     )
                 })
                 .collect();
+            summary.exclusive_rewrite_unmarked.extend(unmarked_files);
             match self.counts() {
                 Some(Ok(counts)) => summary.store_exclusives = Some(*counts),
                 Some(Err(reason)) => summary.store_exclusives_unavailable = Some(reason.clone()),
@@ -2102,7 +2116,7 @@ mod runtime {
         }
         let mut bytes = Vec::new();
         bytes
-            .try_reserve_exact(stamp.0 as usize)
+            .try_reserve_exact(stamp.0 as usize + 1)
             .map_err(|error| error.to_string())?;
         // Read at most one byte past the bound, so a file that grows while it
         // is read can neither pass the bound nor grow the buffer unchecked.
@@ -2121,6 +2135,7 @@ mod runtime {
         {
             return Err("the file changed while it was read".to_owned());
         }
+        // The plan is a function of the bytes alone, so the cache keys them.
         if let Some(plan) = PLANS.lock().unwrap().get(&bytes) {
             return Ok(plan);
         }
@@ -2163,7 +2178,6 @@ mod runtime {
     /// written page. A shared or writable mapping is left alone. Each
     /// sequence is written whole or not at all ([`write_sequence`]); if the
     /// guest's memory ends up holding neither, the run ends here.
-    #[allow(clippy::too_many_arguments)]
     fn rewrite_mapping(
         tid: Pid,
         path: &Path,
@@ -2294,6 +2308,7 @@ mod runtime {
         // old code that may be running; and so is each sequence split across
         // this mapping's end.
         rewrite.left = left_in_mapping(pairs, rewrite.rewritten, rewrite.failed);
+        rewrite.unmarked = plan.report.unmarked() != 0;
         (rewrite, crossing)
     }
 
@@ -3326,9 +3341,9 @@ mod tests {
             ..FilePlan::default()
         };
         plan.report.patched.insert("rmw", 1);
-        plan.report.refused_examples = Vec::with_capacity(3);
+        plan.report.refused_sites = Vec::with_capacity(3);
         plan.report
-            .refused_examples
+            .refused_sites
             .push((0x10, String::with_capacity(40)));
         let shared = 2 * size_of::<usize>() + size_of::<Option<FilePlan>>();
         let expected = shared
@@ -3702,6 +3717,42 @@ mod tests {
         assert_eq!(at(0x3000, 16), Placement::Outside);
     }
 
+    /// Whether a file holds loops no mapping symbol proves follows its
+    /// ranges into the per-path tally: one range of a file that says so is
+    /// enough, so the run can name the file beside those the overlay left
+    /// (`RunSummary::exclusive_rewrite_unmarked`).
+    #[test]
+    fn a_file_with_unproven_loops_is_named_in_the_tally() {
+        let stripped = "/lib64/libstdc++.so.6";
+        let with = |offset, unmarked| ScannedMapping {
+            rewrite: Rewrite {
+                left: 2,
+                unmarked,
+                ..Rewrite::default()
+            },
+            ..mapping(stripped, offset, 0x1000, 2)
+        };
+        let mut tally = PairTally::default();
+        tally.note(
+            &("0".to_owned(), 1),
+            &[with(0, false), with(0x4000, true)],
+            None,
+        );
+        let rewrites = tally.rewrites_per_path();
+        assert_eq!(
+            rewrites.get(stripped),
+            Some(&Rewrite {
+                rewritten: 0,
+                left: 4,
+                failed: 0,
+                unmarked: true,
+            })
+        );
+        let mut proved = PairTally::default();
+        proved.note(&("0".to_owned(), 1), &[with(0, false)], None);
+        assert!(!proved.rewrites_per_path()[stripped].unmarked);
+    }
+
     /// The in-memory rewrite is tallied like the pairs: summed over one
     /// address space's ranges, the largest sum over address spaces, and only
     /// for the paths it touched.
@@ -3713,6 +3764,7 @@ mod tests {
                 rewritten,
                 left,
                 failed,
+                unmarked: false,
             },
             ..mapping(libc, offset, 0x1000, pairs)
         };
@@ -3739,6 +3791,7 @@ mod tests {
                 rewritten: 17,
                 left: 2,
                 failed: 1,
+                unmarked: false,
             })
         );
         assert!(!rewrites.contains_key("/bin/plain"), "{rewrites:?}");
@@ -3775,6 +3828,7 @@ mod tests {
                 rewritten: 3,
                 left: 3,
                 failed: 0,
+                unmarked: false,
             })
         );
         // With equal remaining exposure, the process with more loops.
@@ -3787,6 +3841,7 @@ mod tests {
                 rewritten: 18,
                 left: 2,
                 failed: 0,
+                unmarked: false,
             })
         );
     }

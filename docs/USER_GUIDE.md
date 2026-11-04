@@ -1391,6 +1391,36 @@ time slice; with `--max-timeslice=disabled`, a thread that never reaches an
 intercepted event can starve its peers. No separate fairness flag is needed for
 the default equal-priority policy.
 
+### Exclusive-Loop Rewrite (aarch64)
+
+On aarch64, a load/store-exclusive retry loop (`LDXR`, then `STXR`, then a
+branch back on failure) retries whenever an exception clears the exclusive
+monitor between the two, so the same work can retire a different number of
+branches. `--rewrite-exclusives` rewrites canonical loops in the guest
+executable into single LSE atomic instructions before the run, which cannot
+retry. It is preprocessing for the ptrace backend, not a backend.
+
+| Option | Effect |
+| --- | --- |
+| `--rewrite-exclusives` | Rewrites the loops it can show are code. |
+| `--rewrite-exclusives-also=FILE` | Also rewrites FILE, a shared library the guest loads. Repeatable. |
+
+Only mapping symbols prove where code is: the AArch64 ELF ABI has the
+assembler mark every switch between code (`$x`) and data (`$d`), so the
+rewrite takes only what they mark as code. A file, or an executable section,
+with no mapping symbols, such as every stripped file, is left unchanged and
+named: the run's diagnostics and its summary (`exclusive_rewrite_unmarked`)
+list it, and `hermit rewrite-exclusives --list-refusals FILE` lists each of
+its loops as `no-mapping-symbols`. A section that holds a mapping symbol of
+another kind (AArch32's `$a` or `$t`, or a `$` name Hermit does not know) is
+not proved by them and is left unchanged, its loops listed as
+`unsupported-mapping-symbol` with the symbol's name.
+
+An unwind table (`.eh_frame`) does not prove code either: it covers whole
+functions, including any table a function branches over or keeps after a call
+that does not return, so a stripped file is left unchanged whatever its unwind
+table covers.
+
 ### Virtual Inputs
 
 | Option | Effect |

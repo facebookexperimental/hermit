@@ -319,6 +319,9 @@ fn report(store: &PodmanStore, image: &ResolvedImage) -> Result<(), Error> {
 impl OciRunOpts {
     fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         self.run.refuse_unready_exec_stop()?;
+        // Every `hermit oci run` runs from an image, so this is refused
+        // before the store is opened or the reference resolved.
+        self.run.refuse_exclusive_rewrite_for_image_launch(true)?;
         // `hermit oci run` takes its image as a positional; the inherited
         // `--image` flag would be a second, unresolved way to say the same
         // thing. Reject the ambiguity rather than silently picking one.
@@ -449,6 +452,42 @@ mod tests {
             }
             other => panic!("expected the run subcommand, got {other:?}"),
         }
+    }
+
+    /// `hermit oci run --rewrite-exclusives` is refused by name before any
+    /// image store is needed, so the refusal holds on a host without one.
+    #[test]
+    fn oci_run_refuses_the_exclusive_rewrite_before_resolving_the_image() {
+        use clap::CommandFactory;
+        let argv = [
+            "hermit",
+            "oci",
+            "run",
+            "--rewrite-exclusives",
+            "example.invalid/image:tag",
+            "--epoch=2000-12-31T23:59:59Z",
+            "--",
+            "/nonexistent-oci-guest",
+        ];
+        let matches = crate::app::Args::command()
+            .try_get_matches_from(argv)
+            .unwrap();
+        let args = crate::app::args_from_matches_with_clock(&matches, || {
+            panic!("an explicit epoch must not sample the host clock")
+        })
+        .unwrap();
+        let crate::app::Subcommand::Oci(oci) = args.command else {
+            panic!("expected oci subcommand");
+        };
+        let OciSubcommand::Run(mut options) = oci.command else {
+            panic!("expected embedded run subcommand");
+        };
+        let error = options.main(&args.global).unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("a guest run from an OCI image (--image, hermit oci run)"),
+            "{error:#}"
+        );
     }
 
     #[test]

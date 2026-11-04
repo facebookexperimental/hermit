@@ -542,6 +542,14 @@ pub struct Config {
     #[clap(skip)]
     pub launch_namespace_mounts: crate::host_input::LaunchNamespaceMounts,
 
+    /// aarch64: the files the run's `--rewrite-exclusives` left unchanged,
+    /// wholly or in part, because no mapping symbol it accepts marks their
+    /// code: none, or one that is neither `$x` nor `$d`. The CLI sets it; the
+    /// run names them in its summary.
+    #[serde(default)]
+    #[clap(skip)]
+    pub rewrite_exclusives_unmarked: Vec<std::path::PathBuf>,
+
     /// The seccomp state the guest inherits from the thread that starts it
     /// ([`InheritedSeccomp`]). The caller that starts the guest states it, as
     /// only the caller knows the filters its launch installs, such as those of
@@ -4187,6 +4195,9 @@ mod legacy_backend_json {
     /// it is never written and reads as unset.
     /// `sleep_registration` too: the scheduler registers sleeps, not the
     /// runtime, so it is never written and reads as unset.
+    /// `rewrite_exclusives_unmarked` came after it as well: the CLI rewrites
+    /// the files before the run and the run's global state reports them, not
+    /// the runtime, so it is never written and reads as empty.
     /// `rewrite_exclusives_in_memory` came after it as well: the in-memory
     /// rewrite of aarch64 exclusive loops is done by the ptrace backend's
     /// global state, and no backend that reads the legacy form does it, so it
@@ -4204,6 +4215,8 @@ mod legacy_backend_json {
     /// `chaos_instruction_offset` came after it as well: the ptrace backend's
     /// precise timer takes its single steps, and `hermit run` refuses it on
     /// every other backend, so it is never written and reads as 0.
+    /// `rewrite_exclusives_unmarked` likewise: it is never written and reads
+    /// as empty.
     const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 57] = [
         "backend",
         "strict_schedule_boundaries",
@@ -4254,6 +4267,7 @@ mod legacy_backend_json {
         "access_trace_max_bytes",
         "replay_continue_fairly",
         "standard_stream_aliases",
+        "rewrite_exclusives_unmarked",
         "rewrite_exclusives_in_memory",
         "count_store_exclusives",
         "stacktrace_at_schedule_positions",
@@ -4415,7 +4429,7 @@ mod legacy_backend_json {
                     | "stacktrace_at_schedule_positions",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is.
-                Some("rewrite_exclusives_overlay") => seed
+                Some("rewrite_exclusives_overlay" | "rewrite_exclusives_unmarked") => seed
                     .deserialize(serde_json::Value::Array(Vec::new()))
                     .map(Some)
                     .map_err(<A::Error as de::Error>::custom),
@@ -4780,7 +4794,8 @@ mod legacy_backend_json {
                 | "chaos_timeslice"
                 | "guest_ids"
                 | "detlog_anon"
-                | "standard_stream_aliases" => Ok(()),
+                | "standard_stream_aliases"
+                | "rewrite_exclusives_unmarked" => Ok(()),
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
@@ -5799,7 +5814,8 @@ mod tests {
                 | "chaos_timeslice"
                 | "guest_ids"
                 | "detlog_anon"
-                | "standard_stream_aliases" => {}
+                | "standard_stream_aliases"
+                | "rewrite_exclusives_unmarked" => {}
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
@@ -5852,7 +5868,7 @@ mod tests {
         // `post_crash_timeslice`, `rewrite_exclusives_in_memory`,
         // `stacktrace_at_schedule_positions`, `count_store_exclusives`,
         // `property_snapshot`, `watch`, `watch_from`, `rewrite_exclusives_overlay`,
-        // `chaos_instruction_offset`
+        // `chaos_instruction_offset`, `rewrite_exclusives_unmarked`
         // and `strict_schedule_boundaries` none: fourteen more keys and
         // fifty-six fewer, so forty-two keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
@@ -5882,6 +5898,33 @@ mod tests {
             .collect();
         let array = serde_json::to_string(&values).unwrap();
         assert!(!from_legacy_backend_json(&array).unwrap().record_host_inputs);
+    }
+
+    /// The files the exclusive rewrite left unchanged never enter the legacy
+    /// form, whatever they are: the legacy string keeps its bytes, and they
+    /// read back as empty from both the object and the array form.
+    #[test]
+    fn the_unmarked_rewrite_files_never_enter_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            rewrite_exclusives_unmarked: vec!["/lib64/libstdc++.so.6".into()],
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("rewrite_exclusives"), "{json}");
+        let back = from_legacy_backend_json(&json).unwrap();
+        assert!(back.rewrite_exclusives_unmarked.is_empty());
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        let back = from_legacy_backend_json(&array).unwrap();
+        assert!(back.rewrite_exclusives_unmarked.is_empty());
     }
 
     /// `process_exits_complete_asynchronously`, added after the legacy form

@@ -18,14 +18,16 @@
 //! branches for the same work.
 //!
 //! [`insn`] holds the decoder and the encoders; [`rewrite`] holds the idioms
-//! and the in-place replacement; [`elf`] applies them to the executable
-//! sections of an ELF file's bytes. All three are pure functions of their
-//! input and compile on every architecture, so their tests run everywhere.
+//! and the in-place replacement; [`elf`] applies them to the code of an ELF
+//! file's executable sections, which [`mapping`] tells from the data those
+//! sections can also hold. All four are pure functions of their input and
+//! compile on every architecture, so their tests run everywhere.
 //! `hermit-cli` writes rewritten files with them; Detcore applies the same
 //! rewrite to a guest's mapped pages.
 
 pub mod elf;
 pub mod insn;
+pub mod mapping;
 pub mod rewrite;
 
 /// Whether this host executes the FEAT_LSE atomics the rewrite emits.

@@ -23121,6 +23121,9 @@ impl Scheduler {
                 // GlobalState takes it from the access trace.
                 watch: None,
                 stdio_changed: Vec::new(),
+                // GlobalState names the files the exclusive rewrite left
+                // unchanged for want of mapping symbols (aarch64).
+                exclusive_rewrite_unmarked: Vec::new(),
             },
             info_reprio_descrip,
         ))

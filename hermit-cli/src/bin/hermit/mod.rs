@@ -90,6 +90,7 @@ mod replay_departure_classification_tests;
 #[cfg(test)]
 use crate::replay_departure_test_fixture;
 mod replay_refusal_note;
+mod rewrite_exclusives;
 mod run;
 mod run_config;
 mod run_timeout;
@@ -253,6 +254,7 @@ use self::logdiff::LogDiffCLIOpts;
 use self::oci::OciOpts;
 use self::record::RecordOpts;
 use self::replay::ReplayOpts;
+use self::rewrite_exclusives::RewriteExclusivesOpts;
 use self::run::GuestProgramFault;
 use self::run::RunOpts;
 use self::strace::StraceOpts;
@@ -584,6 +586,11 @@ enum Subcommand {
     #[clap(name = "instruction-map")]
     InstructionMap(InstructionMapOpts),
 
+    /// Report, and optionally write, the LSE rewrite of an aarch64 ELF file's
+    /// load/store-exclusive retry loops.
+    #[clap(name = "rewrite-exclusives")]
+    RewriteExclusives(RewriteExclusivesOpts),
+
     /// Discover and run OCI images from the local image store.
     #[clap(name = "oci")]
     Oci(Box<OciOpts>),
@@ -681,6 +688,7 @@ impl Subcommand {
             | Subcommand::Version(_)
             | Subcommand::LogDiff(_)
             | Subcommand::InstructionMap(_)
+            | Subcommand::RewriteExclusives(_)
             | Subcommand::VerifyInputs(_) => false,
         }
     }
@@ -792,6 +800,7 @@ impl Subcommand {
             Subcommand::Analyze(x) => x.main(global),
             Subcommand::Bisect(x) => x.main(global),
             Subcommand::InstructionMap(x) => x.main(global),
+            Subcommand::RewriteExclusives(x) => x.main(),
             Subcommand::Oci(x) => x.main(global),
             Subcommand::VerifyInputs(x) => x.main(),
         }
@@ -3088,6 +3097,21 @@ mod tests {
             "--verify with --namespace-only must remain a parse-time conflict; if this now \
              parses, --namespace-only bypasses verify() and needs the pending stamp too"
         );
+    }
+
+    /// `hermit rewrite-exclusives` is a subcommand: the run's diagnostics and
+    /// the rewrite's refusal messages point to its `--list-refusals`, so it
+    /// must parse and dispatch.
+    #[test]
+    fn rewrite_exclusives_is_a_subcommand() {
+        let args = Args::try_parse_from([
+            "hermit",
+            "rewrite-exclusives",
+            "--list-refusals",
+            "/nonexistent/liblse.so",
+        ])
+        .expect("hermit rewrite-exclusives should parse");
+        assert!(matches!(args.command, Subcommand::RewriteExclusives(_)));
     }
 
     /// TOP-LEVEL EXIT 3 -- `RunOpts::main`'s own preflight, entered after the
