@@ -18957,10 +18957,11 @@ impl Scheduler {
         // expiry — writes no row below, so the record's priority history
         // omits a real decision even if the run then finishes exactly
         // with its guide. Mark it here, stickily, for all of them.
-        if self.has_schedule_replay() && !self.record_logical_replay_priorities {
-            if let Some(writer) = &mut self.preemption_writer {
-                writer.mark_replay_departed(self.recorded_event_count);
-            }
+        if self.has_schedule_replay()
+            && !self.record_logical_replay_priorities
+            && let Some(writer) = &mut self.preemption_writer
+        {
+            writer.mark_replay_departed(self.recorded_event_count);
         }
 
         // The global event this change point comes at, for a record that has
