@@ -886,6 +886,16 @@ mod tests {
             Refusal::CompareExit,
         ),
         (
+            "cas_compare_llvm_status_is_destination",
+            &[0xc85ffd4c, 0xeb0b019f, 0x540000a1, 0xc80cfd48, 0x35ffff8c],
+            Refusal::CompareExit,
+        ),
+        (
+            "cas_compare_immediate_halfword",
+            &[0x485ffc20, 0x71001c1f, 0x54000081, 0x4802fc23, 0x35ffff82],
+            Refusal::CompareExit,
+        ),
+        (
             "cas_zero_is_left_alone_compare_exit",
             &[0xc85ffc20, 0xb5000080, 0xc802fc23, 0x35ffffa2],
             Refusal::CompareExit,
