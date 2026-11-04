@@ -164,7 +164,9 @@ fn copied_source_checks(case: &Path, original: &Path, runner: &mut Runner) -> Re
         // native_syscall.rs) and the reserved-input modules
         // (reverie/src/reserved_input/{mod,registry}.rs,
         // reverie-ptrace/src/task/reserved_input.rs): 78 + 5 = 83.
-        83
+        // Reverie a6dba68f7 binds the preparation identity proof
+        // (reverie-liteinst-artifact/src/preparation_identity.rs): 83 + 1 = 84.
+        84
     );
     let alias = case.join("cargo-alias");
     let private_home = case.join("cargo-home");
