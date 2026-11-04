@@ -724,7 +724,7 @@ PYEOF
     [[ $(<"$scratch/reresolve-counts.json") == \
         '{"executed_tests":1,"filtered_tests":0,"results":[{"attempts":1,"id":"suite$failure","result":"fail"}],"schema":2}' ]] || return 1
     attempts="$scratch/wrapper-attempts"
-    grep -q 'period = "86s"' "$scratch/scaled-nextest.toml" || return 1
+    grep -q 'period = "270s"' "$scratch/scaled-nextest.toml" || return 1
     [[ $(grep -c '^run-wrapper = "hermit-per-test-cpu"$' \
         "$scratch/scaled-nextest.toml") == 1 ]] || return 1
     grep -q '^experimental = \["wrapper-scripts"\]$' \
