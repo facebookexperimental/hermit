@@ -5391,6 +5391,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             return Err(Errno::EPROTONOSUPPORT);
         }
         debug!("[dtid {dettid}] predicted death ({status:?}) ends its thread group");
+        // The zombie keeps the death's wait status as its exit code (the
+        // signal, with `0x80` where it dumps core), recorded in this turn,
+        // before the group's `Exit` (`Scheduler::record_exit_code`).
+        if let Some(process) = guest.thread_state().detpid {
+            tool_global::record_exit_code(guest, process, status.into_raw()).await;
+        }
         let state = guest.thread_state();
         let request = state.mk_request(
             ResourceID::Exit {
@@ -5883,6 +5889,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     crash_armed: None,
                     last_grant_deadline: None,
                     published_runtime_private_memory: None,
+                    published_cpu: None,
+                    external_parent_checked: false,
                     last_rcb_timer: None,
                     last_rcb_timer_is_max: false,
                     lone_grant: false,
@@ -8531,6 +8539,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             chaos_epochs: pending_chaos_epochs,
             killed_by_group_signal: signal_ends_thread_group(&exit_status),
             passed_descriptors_out: thread_state.passed_descriptors_out_unreported,
+            wait_status: exit_status.into_raw(),
         };
         if transferred_exec {
             tool_global::retire_exec(

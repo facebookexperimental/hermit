@@ -1420,7 +1420,7 @@ mod event_tests {
             &self,
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
-            let response = match message.2 {
+            let response = match crate::tool_global::without_cpu_publication(message.2) {
                 GlobalRequest::RequestResources(request, _)
                     if request.resources.keys().any(|resource| {
                         matches!(

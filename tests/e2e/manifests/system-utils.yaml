@@ -2182,7 +2182,7 @@ test:
           - ptrace
           - dbt
         backends_disabled:
-          kvm: 'ps opens /proc/self as an O_PATH directory, which KVM''s /proc answers with EACCES (https://github.com/rrnewton/hermit/issues/5039), so ps exits 47 (`Error, do this: mount -t proc proc /proc`) in 3 of 3 KVM verify runs at Hermit 73d15dd6; its process table also needs another process''s /proc/<pid> (https://github.com/rrnewton/hermit/issues/4564)'
+          kvm: 'Needs the rest of package K item 2b (https://github.com/rrnewton/hermit/issues/5063). Slice 2b-1 serves another process''s /proc/<pid> directory, stat and comm, so ps lists every guest process (host procps 3.3.17), but the pinned root''s procps 4.0.6 also reads every process''s status and cmdline, and another process''s cmdline is refused by name until slice 2b-3 (status is slice 2b-2); and /proc/1/stat, the namespace init''s (Hermit''s own process, not a guest), is still EACCES on KVM, so ps leaves out the row ptrace shows for pid 1. The O_PATH /proc/self EACCES once named here (https://github.com/rrnewton/hermit/issues/5039) is gone since slice K10.'
           sabre: Under SaBRe this guest's verify matches, but the harness refuses the run because SaBRe used fallback or native sites for bash and the utilities it runs (https://github.com/rrnewton/hermit/issues/4477)
           liteinst: Under in-guest LiteInst, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)
           in-guest-trap: Under in-guest-trap, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)

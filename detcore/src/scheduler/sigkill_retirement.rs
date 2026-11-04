@@ -560,6 +560,10 @@ impl Scheduler {
             // deadlock check (https://github.com/rrnewton/hermit/issues/3904):
             // a reserved send does not reach the per-send notification.
             self.record_committed_sigkill(victim.tid, Some(victim.process));
+            // The group dies of SIGKILL, which never dumps core: its zombie
+            // keeps the signal as its exit code, recorded at this turn,
+            // where it is retired, not at its host-timed deregistration.
+            self.record_exit_code(victim.process, libc::SIGKILL);
         }
         for victim in &reservation.victims {
             info!(

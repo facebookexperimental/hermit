@@ -6376,6 +6376,18 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) published_runtime_private_memory: Option<(MmId, reverie::RuntimePrivateMemory)>,
 
+    /// The CPU accounting this thread last published to the global state
+    /// (`tool_global::GlobalRequest::WithCpuTime`), which its requests carry
+    /// again only once it has changed.
+    #[serde(skip)]
+    pub(crate) published_cpu: Option<crate::tool_global::CpuPublication>,
+
+    /// Whether this thread has made sure, at a clone, that the global state
+    /// knows its process's guest-visible parent
+    /// (`Detcore::record_external_parent_at_clone`).
+    #[serde(default)]
+    pub(crate) external_parent_checked: bool,
+
     /// Shared memory mappings used to resolve process-shared futex keys.
     pub(crate) memory_metadata: Arc<Mutex<MemoryMetadata>>,
 
@@ -7537,6 +7549,18 @@ impl<T> ThreadState<T> {
             .thread_time(thread)
     }
 
+    /// This thread's own (user, system) time and its process's accounting
+    /// as of this thread's last accounting, which happens at each of its
+    /// syscalls and each RCB commit; read without accounting anything now,
+    /// so the read changes no state (`tool_global::with_cpu_publication`).
+    pub(crate) fn accounted_cpu_times(&self) -> ((LogicalTime, LogicalTime), ProcessCpuSnapshot) {
+        let process = self
+            .process_cpu_time
+            .lock()
+            .expect("process CPU time mutex poisoned");
+        (process.thread_time(self.dettid), process.snapshot)
+    }
+
     /// The own (user, system) time of `thread`, this thread or another of
     /// its process: this thread's now ([`Self::thread_cpu_time`]), another's
     /// as of its last accounting ([`Self::sibling_cpu_time`]).
@@ -7957,6 +7981,8 @@ impl<T> ThreadState<T> {
             crash_armed: None,
             last_grant_deadline: None,
             published_runtime_private_memory: None,
+            published_cpu: None,
+            external_parent_checked: false,
             last_rcb_timer: None,
             last_rcb_timer_is_max: false,
             lone_grant: false,

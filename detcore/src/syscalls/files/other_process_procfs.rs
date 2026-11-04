@@ -11,6 +11,12 @@
 //! backend whose `/proc/<pid>` is not the guest process with that number
 //! (<https://github.com/rrnewton/hermit/issues/4564>).
 //!
+//! Another process's directories, its `stat` and its `comm` Detcore serves
+//! itself since package K item 2b slice 2b-1
+//! (<https://github.com/rrnewton/hermit/issues/5063>:
+//! `descriptor_directory`'s task directories, `procfs::task_stat`); this
+//! module covers the files it does not serve yet.
+//!
 //! Detcore renders a process's `cmdline` for the caller's own process only (it
 //! cannot read another process's memory, which Linux reads at each read), and
 //! answers descriptor links, `fdinfo` and the directories that list them for

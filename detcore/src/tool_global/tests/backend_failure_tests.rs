@@ -525,6 +525,7 @@ async fn unknown_deregistration(
                     chaos_epochs: Vec::new(),
                     killed_by_group_signal: false,
                     passed_descriptors_out: false,
+                    wait_status: 0,
                 }),
             ),
         )
@@ -611,6 +612,7 @@ async fn dbt_missing_physical_id_start_preserves_tombstone_deregistration_accoun
                         chaos_epochs: Vec::new(),
                         killed_by_group_signal: false,
                         passed_descriptors_out: false,
+                        wait_status: 0,
                     }),
                 ),
             )

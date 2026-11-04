@@ -1229,6 +1229,14 @@ impl Scheduler {
                     ExitStatus::from_raw(wait_status),
                 );
             if !settles_committed_group_exit {
+                // A group exit at a delivery boundary is the process's end:
+                // its wait status, the backend's winner in wait(2) encoding
+                // (the signal, with `0x80` where the death dumped core), is
+                // the code its zombie keeps (`Self::record_exit_code`),
+                // recorded here, where the process is retired.
+                if group {
+                    self.record_exit_code(pid, wait_status);
+                }
                 // The exiting process's own live threads; the retire list is
                 // sorted below, so their order here decides nothing.
                 let targets: Vec<DetTid> = if group {

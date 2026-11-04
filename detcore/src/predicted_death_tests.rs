@@ -107,6 +107,12 @@ impl GlobalRPC<GlobalState> for DyingGuest {
                 scheduler.queue_request_for_test(request.tid, request);
                 GlobalResponse::RequestResources(ResumeStatus::Normal)
             }
+            // The zombie's exit code, recorded in the death's turn before its
+            // group `Exit`: answered by the real scheduler.
+            GlobalRequest::RecordExitCode(process, code) => {
+                scheduler.record_exit_code(process, code);
+                GlobalResponse::RecordExitCode(())
+            }
             // A5 step 3c.1e A, IR-15: answered by the real scheduler.
             GlobalRequest::InPidNamespaceInit(dettid) => GlobalResponse::InPidNamespaceInit(
                 scheduler

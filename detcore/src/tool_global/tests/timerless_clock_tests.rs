@@ -57,6 +57,7 @@ impl GlobalRPC<GlobalState> for ClockGuest {
         request: <GlobalState as GlobalTool>::Request,
     ) -> <GlobalState as GlobalTool>::Response {
         let (time, mm, request) = request;
+        let request = crate::tool_global::without_cpu_publication(request);
         assert_eq!(mm, self.thread.mm_id);
         // DetTime's PartialEq compares only nanoseconds: compare all fields.
         assert_eq!(

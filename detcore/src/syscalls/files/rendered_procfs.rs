@@ -3871,17 +3871,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// recorded no argument area for its image (the same backends and stacks
     /// as for `auxv`).
     ///
-    /// And whether `file` is a process's `stat` that the kernel serves:
-    /// another process's (package K slice D4c-1 renders the reader's own
-    /// process's only), or, where the name's source is Detcore's record
-    /// (`Self::comm_source`), the caller's own before a name is recorded
-    /// (`procfs::task_stat::renders_task_stat`).
+    /// And whether `file` is a process's `stat` that the kernel serves: where
+    /// the name's source is Detcore's record (`Self::comm_source`), a task's
+    /// before a name is recorded; any task's of the process table is
+    /// rendered otherwise, whichever process reads it
+    /// (`procfs::task_stat::renders_task_stat`, package K slices D4c-1 and
+    /// 2b-1).
     ///
     /// And whether `file` is a task's `comm` that the kernel serves: every
     /// one where the name's source is the kernel
-    /// ([`Self::kernel_serves_every_comm`]), and elsewhere another process's,
-    /// or the caller's own before a name is recorded
-    /// (`procfs::task_stat::renders_task_comm`, package K slice A+).
+    /// ([`Self::kernel_serves_every_comm`]), and elsewhere a task's before a
+    /// name is recorded (`procfs::task_stat::renders_task_comm`, package K
+    /// slices A+ and 2b-1).
     async fn kept_by_kernel<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3906,14 +3907,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return true;
             }
             let facts = crate::tool_global::task_stat_facts(guest, task).await;
-            let own = self.own_detpid(guest).as_raw();
-            return !crate::procfs::task_stat::renders_task_comm(&facts, own, self.comm_source());
+            return !crate::procfs::task_stat::renders_task_comm(&facts, self.comm_source());
         }
         if file.is_task_stat() {
             let facts = crate::tool_global::task_stat_facts(guest, task).await;
             let own = self.own_detpid(guest).as_raw();
-            let rendered =
-                crate::procfs::task_stat::renders_task_stat(&facts, own, self.comm_source());
+            let rendered = crate::procfs::task_stat::renders_task_stat(&facts, self.comm_source());
             // The guest-visible parent of a process whose real parent is
             // outside the guest's tree (the run's root, and a CLONE_PARENT
             // child of such a process), which no other record of Detcore's
@@ -3921,11 +3920,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             // turn, before any descriptor of its rendered stat exists: a
             // descriptor that reaches another process (across fork or
             // SCM_RIGHTS) renders it (`Scheduler::guest_visible_parent`).
-            // Every rendered stat of a process is opened, or listed, by one of
-            // its own threads, so this runs before any other process can read
-            // one. The global tool ignores it for a process whose model knows
-            // its parent.
+            // Such a process also records it at its first clone
+            // (`Detcore::record_external_parent_at_clone`), before any
+            // process it creates can read its stat; another process's
+            // stat, read before either, shows the parent as 0, the parent
+            // outside the namespace. The global tool ignores it for a
+            // process whose model knows its parent.
             if rendered
+                && facts.process == Some(own)
                 && facts.parent.is_none()
                 && let Ok(parent) = guest.inject(syscalls::Getppid::new()).await
             {
@@ -4256,8 +4258,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///   ([`Self::getppid_numbered_parent`]).
     /// - `rsslim`: the described process's virtual `RLIMIT_RSS`, whoever
     ///   reads it (`procfs::task_stat::TaskStatFacts::rsslim`).
-    /// - The CPU times, for the reader's own process's file
-    ///   ([`Self::stat_cpu_times`]).
+    /// - The CPU times: for the reader's own process's file, its own
+    ///   accounting ([`Self::stat_cpu_times`]); for another process's, what
+    ///   that process last published (`procfs::task_stat::TaskStatFacts::cpu`,
+    ///   package K item 2b slice 2b-1).
+    /// - Whether the reader may trace the task, which `do_task_stat` asks
+    ///   (`procfs::task_stat::TaskStat::permitted`): always within its own
+    ///   thread group, and for another, Detcore's model of
+    ///   `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`
+    ///   ([`Self::io_read_allowed`], the same check a task's `io` makes),
+    ///   asked at each rendering, as Linux asks it at each `show`. A model
+    ///   that cannot decide is its named refusal (`Err`).
     pub(super) async fn rendered_task_stat<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -4308,8 +4319,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let cpu = if own && file.is_task_stat() {
             Self::stat_cpu_times(guest, task)
         } else {
-            crate::procfs::task_stat::TaskCpuTimes::default()
+            facts.cpu
         };
+        let permitted =
+            own || file.is_task_comm() || Self::io_read_allowed(guest, task).await?.is_ok();
         Ok(Some(crate::procfs::task_stat::TaskStat {
             pid: described,
             comm,
@@ -4319,6 +4332,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             rsslim: facts.rsslim,
             processor: facts.cpus.current(guest.config().virtual_cpu_count()),
             cpu,
+            permitted,
         }))
     }
 

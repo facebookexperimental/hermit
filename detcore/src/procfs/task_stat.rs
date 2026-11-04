@@ -10,8 +10,14 @@
 //! D4c-1 of <https://github.com/rrnewton/hermit/issues/4213>), and the minimal
 //! record of task names it falls back on.
 //!
-//! Detcore renders the caller's own process's `stat`, by every spelling, from
-//! its process table, in Linux's 52 fields ([`render_stat`]). Its second field,
+//! Detcore renders every guest task's `stat`, by every spelling, from its
+//! process table, in Linux's 52 fields ([`render_stat`]): the caller's own
+//! process's since slice D4c-1, and since package K item 2b slice 2b-1
+//! (<https://github.com/rrnewton/hermit/issues/5063>) another process's in
+//! the caller's PID namespace too, as Linux serves it to every reader there
+//! (`proc_pid_lookup` and the world-readable `stat`, fs/proc/base.c), with
+//! `do_task_stat`'s `ptrace_may_access` gate on the fields it hides
+//! ([`TaskStat::permitted`]). Its second field,
 //! the task's name (Linux's `task_struct::comm`), comes from one of two
 //! sources, chosen by the backend's declared capability alone
 //! ([`CommSource::of_backend`]):
@@ -46,8 +52,9 @@
 //! (ENOTSUP).
 //!
 //! The `comm` files (package K slice A+): where the name's source is the
-//! record (KVM), Detcore also renders the reader's own process's
-//! `/proc/<pid>/comm`, by every spelling (`self`, its pid, `thread-self`,
+//! record (KVM), Detcore also renders every guest task's `/proc/<pid>/comm`
+//! (the reader's own process's since slice A+, another process's since
+//! slice 2b-1), by every spelling (`self`, a pid, `thread-self`,
 //! `task/<tid>`), from the same record ([`render_comm`],
 //! [`renders_task_comm`]), with the `stat` file's seq_file positioning and
 //! failure policy. Detcore does not write a name: it refuses an open of a
@@ -59,10 +66,11 @@
 //! not (<https://github.com/rrnewton/hermit/issues/4263>), so the record
 //! cannot fall behind a write and the answer depends on neither the host nor
 //! the kernel beneath.
-//! DECLARED: Linux renames the task (`comm_write`). Another process's
-//! `comm` stays the kernel beneath's (the executor's). Where the source is
-//! the kernel (ptrace, DBT, SaBRe, LiteInst), every `comm` file stays the
-//! kernel's, as before, unclassified.
+//! DECLARED: Linux renames the task (`comm_write`), and refuses a write to
+//! another thread group's `comm` with EINVAL at the write; Detcore refuses
+//! the open of either with EACCES. Where the source is the kernel (ptrace,
+//! DBT, SaBRe, LiteInst), every `comm` file stays the kernel's, as before,
+//! unclassified.
 //!
 //! DECLARED, KVM: for the run's root image, the record (from `AT_EXECFN`,
 //! the path the root was launched by) names the task as Linux does, while
@@ -222,6 +230,23 @@ pub struct TaskStatFacts {
     /// The process's virtual soft `RLIMIT_RSS` (`ThreadTree::rss_limits`),
     /// `RLIM_INFINITY` unless it set another.
     pub rsslim: u64,
+    /// The described task's CPU time as its process last published it
+    /// (`Scheduler::publish_cpu_time`): the process's own for a top-level
+    /// file, which counts every thread, exited ones included, one thread's
+    /// own for a file below `task/`, and the process's reaped children's in
+    /// both. Zero for a task that has published none (one that has not yet
+    /// made a request, and so has not run since its clone). What another
+    /// process's `stat` shows; the reader's own process's comes from its
+    /// own accounting, which is never behind.
+    pub cpu: TaskCpuTimes,
+    /// The zombie's exit code as Linux keeps it (fs/proc/array.c:484 and
+    /// :529-530 in 6.17): the wait status, recorded where Detcore learns how
+    /// the process ended (`Scheduler::record_exit_code`). An `exit_group`'s
+    /// status shifted left by 8; the leader's raw `exit` likewise, unless the
+    /// group later dies as a whole; a fatal signal, with `0x80` where the
+    /// death dumped core as the backend reports it; SIGKILL from another
+    /// process. 0 for a live task.
+    pub exit_code: i32,
 }
 
 /// Where a rendered `stat`'s name (field 2) comes from: decided by the
@@ -283,27 +308,38 @@ pub(crate) fn stat_comm(
     }
 }
 
-/// Whether Detcore renders the `stat` of the task `facts` describe for a
-/// reader in process `own`, whose name comes from `source`: only the
-/// reader's own process's (package K slice D4c-1), and where the source is
-/// Detcore's record, only once a name is recorded (a process that has not
-/// exec'd an image Detcore saw has none). Another process's file is the
-/// kernel beneath's: the host kernel's on ptrace and DBT, the provider's
-/// EACCES on KVM.
-pub(crate) fn renders_task_stat(facts: &TaskStatFacts, own: i32, source: CommSource) -> bool {
-    facts.process == Some(own) && (source == CommSource::Kernel || facts.comm.is_some())
+/// Whether Detcore renders the `stat` of the task `facts` describe, whose
+/// name comes from `source`: any task of the guest's process table, the
+/// reader's own process's (package K slice D4c-1) and another process's
+/// (package K item 2b slice 2b-1), as Linux serves every task's `stat` to
+/// every reader in its PID namespace; and where the source is Detcore's
+/// record, only once a name is recorded (a process that has not exec'd an
+/// image Detcore saw has none), whose file stays the kernel beneath's. A
+/// number no process of the table holds is the kernel beneath's to answer
+/// (ENOENT).
+///
+/// Another process's file was the kernel beneath's before 2b-1: on KVM the
+/// provider's EACCES, which made ps and pgrep drop the process from their
+/// table without an error (procps 4.0.6 skips a process whose `stat` open
+/// fails, measured in the pinned root); on ptrace and DBT the kernel's,
+/// sanitized, which showed a zombie as `S` and every other process's CPU
+/// time as 0, where Linux shows `Z` and the time the process's own `stat`
+/// shows.
+pub(crate) fn renders_task_stat(facts: &TaskStatFacts, source: CommSource) -> bool {
+    facts.process.is_some() && (source == CommSource::Kernel || facts.comm.is_some())
 }
 
-/// Whether Detcore renders the `comm` of the task `facts` describe for a
-/// reader in process `own`, whose name comes from `source` (package K slice
-/// A+): only where the source is Detcore's record (the same capability that
-/// chooses `stat`'s name, never a backend's identity), only the reader's own
-/// process's, and only once a name is recorded. Elsewhere the file is the
-/// kernel beneath's: the host kernel's own name on ptrace and DBT, which
-/// Detcore leaves unclassified, and on KVM another process's, or an unnamed
-/// task's, the executor's EACCES.
-pub(crate) fn renders_task_comm(facts: &TaskStatFacts, own: i32, source: CommSource) -> bool {
-    source == CommSource::Record && facts.process == Some(own) && facts.comm.is_some()
+/// Whether Detcore renders the `comm` of the task `facts` describe, whose
+/// name comes from `source` (package K slice A+): only where the source is
+/// Detcore's record (the same capability that chooses `stat`'s name, never a
+/// backend's identity), for any task of the guest's process table (the
+/// reader's own process's since slice A+, another process's since package K
+/// item 2b slice 2b-1), and only once a name is recorded. Elsewhere the file
+/// is the kernel beneath's: the host kernel's own name on ptrace and DBT,
+/// which Detcore leaves unclassified, and on KVM an unnamed task's, the
+/// executor's EACCES.
+pub(crate) fn renders_task_comm(facts: &TaskStatFacts, source: CommSource) -> bool {
+    source == CommSource::Record && facts.process.is_some() && facts.comm.is_some()
 }
 
 /// A task's `comm` file (fs/proc/base.c:1750-1765 `comm_show` in 6.17): its
@@ -323,12 +359,12 @@ pub(crate) fn render_comm(comm: &TaskComm) -> Vec<u8> {
 /// the process's reaped children's (`signal_struct::cutime`, `cstime`) in
 /// both. Detcore's logical CPU accounting, the one `times(2)`,
 /// `getrusage(2)` and the CPU-time clocks report (`crate::cpu_clock`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct TaskCpuTimes {
-    pub(crate) user: LogicalTime,
-    pub(crate) system: LogicalTime,
-    pub(crate) children_user: LogicalTime,
-    pub(crate) children_system: LogicalTime,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCpuTimes {
+    pub user: LogicalTime,
+    pub system: LogicalTime,
+    pub children_user: LogicalTime,
+    pub children_system: LogicalTime,
 }
 
 /// One rendering of a `stat` file, with what its reader adds to the
@@ -356,10 +392,18 @@ pub(crate) struct TaskStat {
     /// CPUs ([`TaskStatFacts::cpus`], `TaskCpus::current`), 0 on the single
     /// CPU without `--virtual-cpus`.
     pub(crate) processor: u32,
-    /// The task's CPU time as of this read, its reader's own process's;
-    /// zero for another process's file, whose accounting Detcore keeps in
-    /// that process's own threads.
+    /// The task's CPU time as of this read: from its reader's own
+    /// accounting for its own process's file, and for another process's,
+    /// what that process last published ([`TaskStatFacts::cpu`]), which,
+    /// with threads sequentialized, is its time where it last stopped.
     pub(crate) cpu: TaskCpuTimes,
+    /// Linux's `ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)` for the
+    /// reader (`do_task_stat`'s `permitted`, fs/proc/array.c:490 in 6.17):
+    /// always for the reader's own thread group, and for another, Detcore's
+    /// model of that check (`Detcore::io_read_allowed`). Where it refuses,
+    /// Linux prints `startcode` and `endcode` as 1 for a task with memory
+    /// and the exit code as 0 ([`render_stat`]).
+    pub(crate) permitted: bool,
 }
 
 /// `stat`'s state letter for a task: `R` for the reader itself, which runs
@@ -406,19 +450,20 @@ fn flags(stat: &TaskStat) -> u64 {
 /// | 5, 6 | pgrp, session | Detcore's model, as `getpgid` and `getsid` answer |
 /// | 7, 8 | tty_nr, tpgid | 0, -1: no controlling terminal |
 /// | 9 | flags | [`flags`] |
-/// | 14, 15 | utime, stime | the task's user and system time ([`TaskCpuTimes`]), in clock ticks; 0 for another process's file |
-/// | 16, 17 | cutime, cstime | its process's reaped children's, in clock ticks; 0 for another process's file |
+/// | 14, 15 | utime, stime | the task's user and system time ([`TaskCpuTimes`]), in clock ticks; another process's as it last published them ([`TaskStatFacts::cpu`]) |
+/// | 16, 17 | cutime, cstime | its process's reaped children's, in clock ticks; another process's as it last published them |
 /// | 18, 19 | priority, nice | 20, 0: nice is inert under Detcore |
 /// | 20 | num_threads | the process's tasks |
 /// | 25 | rsslim | the process's `RLIMIT_RSS` soft limit |
+/// | 26, 27 | startcode, endcode | 0; 1 where the reader is not [`TaskStat::permitted`] and the task has memory (not a zombie), as Linux prints them |
 /// | 38 | exit_signal | the leader's, -1 for another thread |
 /// | 39 | processor | the task's virtual CPU, [`TaskStat::processor`] |
 /// | 40, 41 | rt_priority, policy | 0, 0 (`SCHED_OTHER`) |
-/// | 52 | exit_code | 0 |
+/// | 52 | exit_code | a zombie's recorded exit code ([`TaskStatFacts::exit_code`]) to a permitted reader, else 0 |
 ///
 /// Every other field is 0: the fault counts (10-13), the guest time (43, 44),
 /// `itrealvalue` (21, always 0 in Linux), the start time (22), the memory
-/// sizes and addresses (23, 24, 26-30, 45-51), the four obsolete signal
+/// sizes and addresses (23, 24, 28-30, 45-51), the four obsolete signal
 /// words (31-34, which the sanitizer zeroed on every backend before this),
 /// `wchan` (35), `nswap` and `cnswap` (36, 37) and the block-I/O delay
 /// (42). These are the fields `sanitize_stat` zeroed in the kernel's file
@@ -433,6 +478,15 @@ pub(crate) fn render_stat(stat: &TaskStat) -> Vec<u8> {
     } else {
         -1
     };
+    // `do_task_stat` (fs/proc/array.c:616-617, :660-661 in 6.17): a reader
+    // that may not trace the task sees 1 for the code bounds of a task with
+    // memory, and no exit code. Detcore shows no real address to anyone.
+    let code_bound = if !stat.permitted && !facts.exited {
+        "1"
+    } else {
+        "0"
+    };
+    let exit_code = if stat.permitted { facts.exit_code } else { 0 };
     let fields: [String; 50] = [
         // 3 state
         state(stat).to_string(),
@@ -465,9 +519,9 @@ pub(crate) fn render_stat(stat: &TaskStat) -> Vec<u8> {
         "0".to_owned(),
         // 25 rsslim
         stat.rsslim.to_string(),
-        // 26 startcode .. 37 cnswap
-        "0".to_owned(),
-        "0".to_owned(),
+        // 26 startcode, 27 endcode, 28 startstack .. 37 cnswap
+        code_bound.to_owned(),
+        code_bound.to_owned(),
         "0".to_owned(),
         "0".to_owned(),
         "0".to_owned(),
@@ -495,7 +549,7 @@ pub(crate) fn render_stat(stat: &TaskStat) -> Vec<u8> {
         "0".to_owned(),
         "0".to_owned(),
         // 52 exit_code
-        "0".to_owned(),
+        exit_code.to_string(),
     ];
     line.extend_from_slice(b") ");
     line.extend_from_slice(fields.join(" ").as_bytes());
@@ -521,6 +575,8 @@ mod tests {
             process: Some(7),
             parent: None,
             rsslim: RLIM_INFINITY,
+            cpu: TaskCpuTimes::default(),
+            exit_code: 0,
         }
     }
 
@@ -554,6 +610,7 @@ mod tests {
             rsslim: RLIM_INFINITY,
             processor: 3,
             cpu: TaskCpuTimes::default(),
+            permitted: true,
         };
         let line = render_stat(&stat);
         let (comm, fields) = fields(&line);
@@ -613,6 +670,7 @@ mod tests {
                 children_user: ms(20),
                 children_system: ms(10) + LogicalTime::from_nanos(9_999_999),
             },
+            permitted: true,
         };
         let (_, fields) = fields(&render_stat(&stat));
         assert_eq!(fields[13..17], ["123", "0", "2", "1"], "{fields:?}");
@@ -636,6 +694,7 @@ mod tests {
             rsslim: 4096,
             processor: 0,
             cpu: TaskCpuTimes::default(),
+            permitted: true,
         };
         let (_, sibling_fields) = fields(&render_stat(&sibling));
         assert_eq!(sibling_fields.len(), 52);
@@ -677,6 +736,7 @@ mod tests {
             rsslim: RLIM_INFINITY,
             processor: 0,
             cpu: TaskCpuTimes::default(),
+            permitted: true,
         };
         let line = render_stat(&stat);
         assert!(line.starts_with(b"1 (a)b\n\\\xff c) R 0 "), "{line:?}");
@@ -721,24 +781,26 @@ mod tests {
         );
     }
 
-    /// Only the reader's own process's file is rendered, and where the
-    /// name's source is Detcore's record, only once a name is recorded.
+    /// Every task of the process table's file is rendered, whichever
+    /// process reads it (package K item 2b slice 2b-1), and where the name's
+    /// source is Detcore's record, only once a name is recorded; a number no
+    /// process holds is not.
     #[test]
-    fn only_the_readers_own_named_tasks_are_rendered() {
+    fn every_named_task_of_the_table_is_rendered() {
         use CommSource::Kernel;
         use CommSource::Record;
-        let own = facts();
-        assert!(renders_task_stat(&own, 7, Record));
-        assert!(renders_task_stat(&own, 7, Kernel));
-        assert!(!renders_task_stat(&own, 8, Kernel), "another process's");
-        let unnamed = TaskStatFacts { comm: None, ..own };
-        assert!(!renders_task_stat(&unnamed, 7, Record), "no name at all");
-        assert!(renders_task_stat(&unnamed, 7, Kernel), "the kernel's name");
+        let task = facts();
+        assert!(renders_task_stat(&task, Record));
+        assert!(renders_task_stat(&task, Kernel));
+        let unnamed = TaskStatFacts { comm: None, ..task };
+        assert!(!renders_task_stat(&unnamed, Record), "no name at all");
+        assert!(renders_task_stat(&unnamed, Kernel), "the kernel's name");
         let gone = TaskStatFacts {
             process: None,
-            ..own
+            ..task
         };
-        assert!(!renders_task_stat(&gone, 7, Kernel), "no such process");
+        assert!(!renders_task_stat(&gone, Kernel), "no such process");
+        assert!(!renders_task_stat(&gone, Record), "no such process");
     }
 
     /// A `comm` file is the name, raw, and a newline (`comm_show`): the
@@ -760,24 +822,69 @@ mod tests {
     }
 
     /// Detcore renders a `comm` file only where the name's source is its
-    /// record, only the reader's own process's, and only once a name is
+    /// record, for any task of the process table, and only once a name is
     /// recorded; where the source is the kernel, never (the kernel's file,
     /// unclassified, as before).
     #[test]
-    fn only_the_readers_own_named_comms_are_rendered_and_only_from_the_record() {
+    fn named_comms_are_rendered_only_from_the_record() {
         use CommSource::Kernel;
         use CommSource::Record;
-        let own = facts();
-        assert!(renders_task_comm(&own, 7, Record));
-        assert!(!renders_task_comm(&own, 7, Kernel), "the kernel's file");
-        assert!(!renders_task_comm(&own, 8, Record), "another process's");
-        let unnamed = TaskStatFacts { comm: None, ..own };
-        assert!(!renders_task_comm(&unnamed, 7, Record), "no name at all");
+        let task = facts();
+        assert!(renders_task_comm(&task, Record));
+        assert!(!renders_task_comm(&task, Kernel), "the kernel's file");
+        let unnamed = TaskStatFacts { comm: None, ..task };
+        assert!(!renders_task_comm(&unnamed, Record), "no name at all");
         let gone = TaskStatFacts {
             process: None,
-            ..own
+            ..task
         };
-        assert!(!renders_task_comm(&gone, 7, Record), "no such process");
+        assert!(!renders_task_comm(&gone, Record), "no such process");
+    }
+
+    /// `do_task_stat`'s gate (fs/proc/array.c:490, :616-617, :660-661 in
+    /// 6.17): a permitted reader sees a zombie's exit code and no real code
+    /// bounds (Detcore shows no address); one that may not trace the task
+    /// sees 1 for the code bounds of a task with memory, 0 for a zombie's,
+    /// and no exit code (measured natively: a non-dumpable target read by
+    /// another user shows `1 1` there).
+    #[test]
+    fn stat_hides_the_code_bounds_and_exit_code_from_a_reader_that_may_not_trace() {
+        let live = TaskStat {
+            pid: 8,
+            comm: TaskComm::new(b"other"),
+            facts: facts(),
+            reader_is_task: false,
+            ppid: 3,
+            rsslim: RLIM_INFINITY,
+            processor: 0,
+            cpu: TaskCpuTimes::default(),
+            permitted: true,
+        };
+        let (_, permitted) = fields(&render_stat(&live));
+        assert_eq!(permitted[25..27], ["0", "0"]);
+        let (_, refused) = fields(&render_stat(&TaskStat {
+            permitted: false,
+            ..live
+        }));
+        assert_eq!(refused[25..27], ["1", "1"]);
+        let zombie = TaskStat {
+            facts: TaskStatFacts {
+                exited: true,
+                exit_code: 7 << 8,
+                ..facts()
+            },
+            ..live
+        };
+        let (_, permitted) = fields(&render_stat(&zombie));
+        assert_eq!(permitted[2], "Z");
+        assert_eq!(permitted[25..27], ["0", "0"]);
+        assert_eq!(permitted[51], "1792");
+        let (_, refused) = fields(&render_stat(&TaskStat {
+            permitted: false,
+            ..zombie
+        }));
+        assert_eq!(refused[25..27], ["0", "0"], "a zombie has no memory");
+        assert_eq!(refused[51], "0");
     }
 
     /// The source is the backend's declared capability, and a source that

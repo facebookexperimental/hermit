@@ -68,7 +68,12 @@ impl GlobalRPC<GlobalState> for ExecRpc<'_> {
         request: <GlobalState as GlobalTool>::Request,
     ) -> <GlobalState as GlobalTool>::Response {
         let reconnect = matches!(&request.2, GlobalRequest::ReconnectExec { .. });
-        self.requests.lock().unwrap().push(request.2.clone());
+        self.requests
+            .lock()
+            .unwrap()
+            .push(crate::tool_global::without_cpu_publication(
+                request.2.clone(),
+            ));
         if reconnect && self.gate == Gate::BeforeCommit {
             self.suspend().await;
         }
@@ -450,6 +455,7 @@ fn deregistration(thread: &ThreadState<()>) -> ThreadDeregistration {
         chaos_epochs: Vec::new(),
         killed_by_group_signal: false,
         passed_descriptors_out: thread.passed_descriptors_out_unreported,
+        wait_status: 0,
     }
 }
 

@@ -108,6 +108,7 @@ async fn deregister(state: &GlobalState, thread: &ThreadState<()>) {
                         mm: thread.mm_id,
                         thread_start_entered: true,
                         passed_descriptors_out: false,
+                        wait_status: 0,
                         vfork_origin: None,
                         timeslice_stats: thread.stats.timeslice_stats,
                         syscall_count: thread.stats.syscall_count,

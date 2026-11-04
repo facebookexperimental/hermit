@@ -2223,6 +2223,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         if walks_at_grant {
             guest.thread_state().file_exit_group_for_robust_lists();
         }
+        // The zombie's exit code: SIGKILL, which never dumps core, recorded
+        // in this turn as an exit_group's is (`Scheduler::record_exit_code`).
+        crate::tool_global::record_exit_code(guest, self.detpid, libc::SIGKILL).await;
         let request = guest.thread_state().mk_request(
             ResourceID::Exit {
                 group: true,
@@ -3537,6 +3540,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
             )
             .await;
+        }
+        // The caller's own zombie keeps SIGKILL as its exit code, recorded in
+        // this turn, before the grant that ends its process
+        // (`Scheduler::record_exit_code`).
+        if let Some(process) = guest.thread_state().detpid {
+            crate::tool_global::record_exit_code(guest, process, libc::SIGKILL).await;
         }
         // No backend on which Detcore walks the robust lists itself (KVM,
         // `Self::sigkill_of_own_process_walks_robust_lists`) gets here: such

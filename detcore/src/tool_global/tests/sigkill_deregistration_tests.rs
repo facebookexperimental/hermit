@@ -61,6 +61,7 @@ fn deregistration(tid: DetTid, sigkilled: bool) -> ThreadDeregistration {
         chaos_epochs: Vec::new(),
         killed_by_group_signal: sigkilled,
         passed_descriptors_out: false,
+        wait_status: 0,
     }
 }
 
@@ -152,5 +153,40 @@ async fn a_death_already_accounted_waits_for_nothing() {
             // The reserved victim waits for the kill turn.
             assert!(sched.next_turns.contains_key(&LEADER), "{already}");
         }
+    }
+}
+
+/// A process whose only thread died of a signal that ends its group, as a
+/// fault or an abort does, keeps that death's wait status as its zombie's
+/// exit code (the signal, with `0x80` where it dumped core): recorded from
+/// the deregistration before the thread is retired, so the `stat` that shows
+/// the process exited also shows its code (revopus1's F2 on hermit 5139). A
+/// death by anything else records nothing there: a raw `exit` or an
+/// `exit_group` recorded its code in its own turn.
+#[tokio::test]
+async fn a_signal_death_keeps_its_wait_status_as_the_zombies_exit_code() {
+    for (signaled, wait_status, shown) in [(true, 11 | 0x80, 11 | 0x80), (false, 3 << 8, 0)] {
+        let (state, time) = state();
+        state.sched.lock().unwrap().next_turns.remove(&WORKER);
+        let mut leader = deregistration(LEADER, signaled);
+        leader.wait_status = wait_status;
+        let response = state
+            .receive_rpc(
+                Tid::from_raw(LEADER.as_raw()),
+                (
+                    time,
+                    MmId::initial(LEADER),
+                    GlobalRequest::DeregisterThread(leader),
+                ),
+            )
+            .await;
+        assert_eq!(response, (None, GlobalResponse::DeregisterThread(())));
+        let sched = state.sched.lock().unwrap();
+        assert!(!sched.next_turns.contains_key(&LEADER));
+        assert_eq!(
+            sched.task_stat_facts(LEADER, None).exit_code,
+            shown,
+            "signaled: {signaled}"
+        );
     }
 }

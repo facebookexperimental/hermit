@@ -191,11 +191,12 @@ pub(super) enum OpenedDirectory {
     /// The directory a descriptor link of the caller's (`/proc/self/fd/N`)
     /// reaches: the placeholder directory `N` is.
     Reopened(PlaceholderDirectory),
-    /// One of the caller's own task directories, its process's, one of its
-    /// process's threads' (by its number) or its process's `task` (package K
-    /// slice K10), by any spelling that reaches it
-    /// ([`Detcore::own_task_directory`]).
-    Task(TaskDirectoryKind, i32),
+    /// A task directory of the caller's PID namespace (package K slices K10
+    /// and 2b-1): a process's, one of its threads' (by its number) or its
+    /// `task`, with the process and the thread
+    /// ([`fd_directory::classify_task_directory`]), by any spelling that
+    /// reaches it ([`Detcore::own_task_directory`]).
+    Task(TaskDirectoryKind, i32, i32),
     /// `/proc/self`, or `/proc/thread-self` (`thread`), itself, opened
     /// `O_PATH` without following it: Linux opens the symbolic link, which no
     /// backend Detcore serves the task directories on has, so the open is
@@ -448,6 +449,36 @@ pub(super) struct NamedTask {
     pub(super) process: Option<i32>,
     /// The thread below `task`, if one is named.
     pub(super) thread: Option<i32>,
+}
+
+/// The tasks Linux's walk looks up to reach the task directory `kind` of
+/// `process` (and `thread`, for a thread's), as
+/// [`fd_directory::classify_task_directory`] names it, for a caller whose pid
+/// and tid are `own`: another process by its number (`proc_pid_lookup`), and
+/// a thread of the process other than the caller below `task`
+/// (`proc_task_lookup`), each found only while a task holds that number.
+/// The caller's own process and thread always exist.
+fn directory_tasks(
+    kind: TaskDirectoryKind,
+    process: i32,
+    thread: i32,
+    own: (i32, i32),
+) -> Vec<NamedTask> {
+    let other = (process != own.0).then_some(process);
+    let mut tasks = Vec::new();
+    if other.is_some() {
+        tasks.push(NamedTask {
+            process: other,
+            thread: None,
+        });
+    }
+    if kind == TaskDirectoryKind::Thread && (process, thread) != own {
+        tasks.push(NamedTask {
+            process: other,
+            thread: Some(thread),
+        });
+    }
+    tasks
 }
 
 /// `path`, absolute, with each `..` resolved as Linux's walk resolves it
@@ -973,13 +1004,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         Self::descriptor_directory_caller(guest).is_some()
     }
 
-    /// Whether Detcore serves the caller's own task directories
-    /// ([`PlaceholderDirectory::Task`], package K slice K10) to the caller
-    /// now: where it serves it placeholder directories
-    /// ([`Self::descriptor_directory_caller`]) and the guest's procfs is not
-    /// the kernel's ([`PlaceholderObject::Placeholder`]: KVM, whose executor
-    /// serves no procfs directory). Where it is (ptrace), the kernel serves
-    /// them, and Detcore lists them from its model
+    /// Whether Detcore serves the task directories
+    /// ([`PlaceholderDirectory::Task`]) of its PID namespace to the caller
+    /// now, the caller's own (package K slice K10) and every other process's
+    /// (package K item 2b slice 2b-1): where it serves it placeholder
+    /// directories ([`Self::descriptor_directory_caller`], which a nested PID
+    /// namespace has none of) and the guest's procfs is not the kernel's
+    /// ([`PlaceholderObject::Placeholder`]: KVM, whose executor serves no
+    /// procfs directory). Where it is (ptrace), the kernel serves them, and
+    /// Detcore lists them from its model
     /// (`Detcore::modeled_directory_snapshot`), as before.
     pub(crate) fn serves_task_directories<G: Guest<Self>>(guest: &G) -> bool {
         Self::descriptor_directory_caller(guest).is_some()
@@ -1225,13 +1258,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         None
     }
 
-    /// The caller's own task directory the absolute guest spelling
-    /// `spelling` names ([`fd_directory::classify_task_directory`]), where
-    /// Detcore serves them ([`Self::serves_task_directories`]), with each `..`
-    /// resolved as Linux's walk resolves it over procfs's own directories
-    /// ([`resolved_procfs_dotdot`]): `Some(Ok(kind))`, or `Some(Err(errno))`
-    /// where Linux's walk of the spelling stops first: `ENOENT` at a task it
-    /// names on the way that does not exist ([`Self::named_tasks_exist`]),
+    /// The task directory of the caller's PID namespace the absolute guest
+    /// spelling `spelling` names ([`fd_directory::classify_task_directory`]:
+    /// the caller's own, package K slice K10, or another process's, slice
+    /// 2b-1), where Detcore serves them ([`Self::serves_task_directories`]),
+    /// with each `..` resolved as Linux's walk resolves it over procfs's own
+    /// directories ([`resolved_procfs_dotdot`]): `Some(Ok((kind, process,
+    /// thread)))`, or `Some(Err(errno))` where Linux's walk of the spelling
+    /// stops first: `ENOENT` at a task it names on the way that does not
+    /// exist, the directory's own process and thread included
+    /// ([`Self::named_tasks_exist`]),
     /// and `ELOOP` once it would follow more `self` and `thread-self` links
     /// than `MAXSYMLINKS`, the final one included, which an open or stat that
     /// names the directory follows, after the `followed` links of a respelled
@@ -1241,22 +1277,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         spelling: &Path,
         followed: usize,
-    ) -> Option<Result<(TaskDirectoryKind, i32), Errno>> {
+    ) -> Option<Result<(TaskDirectoryKind, i32, i32), Errno>> {
         if !Self::serves_task_directories(guest) {
             return None;
         }
         let own = Self::descriptor_directory_caller(guest)?;
         let (resolved, mut tasks) = resolved_procfs_dotdot(spelling)
             .unwrap_or_else(|| (spelling.to_path_buf(), Vec::new()));
-        let (kind, thread) = fd_directory::classify_task_directory(&resolved, own)?;
-        // A thread's directory by its number names a thread of the process
-        // only while one holds that number (`proc_task_lookup`).
-        if kind == TaskDirectoryKind::Thread && thread != own.1 {
-            tasks.push(NamedTask {
-                process: None,
-                thread: Some(thread),
-            });
-        }
+        let (kind, process, thread) = fd_directory::classify_task_directory(&resolved, own)?;
+        tasks.extend(directory_tasks(kind, process, thread, own));
         Some(
             Self::procfs_walk(
                 guest,
@@ -1266,7 +1295,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 followed,
             )
             .await
-            .map(|()| (kind, thread)),
+            .map(|()| (kind, process, thread)),
         )
     }
 
@@ -1326,14 +1355,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             || (through_link && names("/"))
             || fd_directory::classify(&resolved, own).is_some()
             || match fd_directory::classify_task_directory(&resolved, own) {
-                Some((TaskDirectoryKind::Thread, thread)) if thread != own.1 => {
-                    tasks.push(NamedTask {
-                        process: None,
-                        thread: Some(thread),
-                    });
+                Some((kind, process, thread)) => {
+                    tasks.extend(directory_tasks(kind, process, thread, own));
                     true
                 }
-                Some(_) => true,
                 None => false,
             };
         if !served {
@@ -1569,7 +1594,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Some(Err(answer));
         }
         if let Some(directory) = Self::own_task_directory(guest, spelling, links).await {
-            return Some(directory.map(|(kind, thread)| OpenedDirectory::Task(kind, thread)));
+            return Some(
+                directory
+                    .map(|(kind, process, thread)| OpenedDirectory::Task(kind, process, thread)),
+            );
         }
         if super::opens_the_link_itself(observed, flags) {
             return None;
@@ -1704,9 +1732,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// The binding of the caller's own task directory `kind`, for a caller
-    /// whose pid and tid are `(pid, tid)`: its task, the caller's process,
-    /// or the caller itself for its thread's directory, with the incarnation
+    /// The binding of the task directory `kind` of process `pid`, with `tid`
+    /// the directory's thread for a thread's directory and the opener
+    /// otherwise ([`fd_directory::classify_task_directory`]): the caller's
+    /// own (package K slice K10) or another process's (slice 2b-1), with the
+    /// incarnation
     /// of each of its numbers now, as Linux binds the directory's inode to
     /// the task at the lookup (`proc_pid_instantiate`, `proc_task_instantiate`).
     async fn task_directory_binding<G: Guest<Self>>(
@@ -2025,8 +2055,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             OpenedDirectory::Root => PlaceholderDirectory::Root,
             OpenedDirectory::Reopened(directory) => directory,
-            OpenedDirectory::Task(kind, thread) => PlaceholderDirectory::Task(
-                self.task_directory_binding(guest, kind, (pid, thread))
+            OpenedDirectory::Task(kind, process, thread) => PlaceholderDirectory::Task(
+                self.task_directory_binding(guest, kind, (process, thread))
                     .await,
             ),
             OpenedDirectory::SelectorLink { thread } => {
@@ -3138,8 +3168,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok((entries, inodes, DirectoryOrder::ProcfsIds))
     }
 
-    /// The entries of the caller's own task directory `binding` as Detcore
-    /// lists it (package K slice K10), and how to key their inode numbers,
+    /// The entries of the task directory `binding` as Detcore lists it, the
+    /// caller's own (package K slice K10) or another process's (slice 2b-1),
+    /// and how to key their inode numbers,
     /// for its placeholder's directory stream: the model's names
     /// (`procfs::listing`, at the run's `--proc` level, the threads as the
     /// scheduler lists them), kept where every answer about the entry is
@@ -3153,7 +3184,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///   `fd` directory it serves (`descriptor_directory`: a process's to
     ///   every thread of it, a thread's to that thread alone, which is the
     ///   reader taking the listing), and a process's `task`, which it serves
-    ///   too;
+    ///   too; in another process's directory, neither its `fd` directory
+    ///   nor its `cmdline`, which Detcore refuses by name there
+    ///   (`other_process_procfs`, until package K item 2b slices 2b-3 and
+    ///   2b-5 serve them);
     /// - in `task`, every thread of the process.
     ///
     /// Every other name in Linux's table is left out, deliberately: on this
@@ -3183,6 +3217,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A thread's descriptor directory Detcore serves to that thread
         // alone (`fd_directory::classify`).
         let reader = guest.thread_state().dettid.as_raw();
+        let others = binding.pid != self.own_detpid(guest).as_raw();
         // `smaps_rollup` only where its read can render it: the backend's
         // memory map of the reader's address space, the one the read renders,
         // is complete (`smaps::smaps_rollup_refusal`, the read's own rule).
@@ -3195,6 +3230,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let kept = |name: &[u8]| match name {
             b"." | b".." => true,
             _ if binding.kind == TaskDirectoryKind::Tasks => true,
+            b"fd" | b"cmdline" if others => false,
             b"fd" => binding.kind == TaskDirectoryKind::Process || binding.tid == reader,
             b"task" => binding.kind == TaskDirectoryKind::Process,
             b"smaps_rollup" if !rollup_readable => false,
@@ -3674,9 +3710,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     return Ok(Some(self.selector_link_metadata(guest, &link).await?));
                 }
                 if let Some(directory) = Self::own_task_directory(guest, &spelling, links).await {
-                    let (kind, thread) = directory?;
+                    let (kind, process, thread) = directory?;
                     let binding = self
-                        .task_directory_binding(guest, kind, (pid, thread))
+                        .task_directory_binding(guest, kind, (process, thread))
                         .await;
                     return Ok(Some(
                         self.placeholder_metadata(

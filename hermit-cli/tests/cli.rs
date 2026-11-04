@@ -70237,6 +70237,143 @@ fn run_kvm_the_callers_own_link_targets_answer_as_linux() {
     assert_eq!(proc_link_targets_at_l2("kvm"), native, "kvm");
 }
 
+static PROC_OTHER_PROCESS_STAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// How many lines the other-process stat guest prints without `--sigkill`.
+const PROC_OTHER_PROCESS_STAT_LINES: usize = 45;
+
+/// The other-process stat guest's arguments on `backend`: `--sigkill` adds a
+/// zombie its parent killed with SIGKILL, which KVM refuses to send (a signal
+/// to another process), so its twin runs without it.
+fn proc_other_process_stat_args(backend: &str) -> &'static [&'static str] {
+    if backend == "kvm" {
+        &[]
+    } else {
+        &["--sigkill"]
+    }
+}
+
+/// `tests/c/proc_other_process_stat.c`'s guest.
+fn proc_other_process_stat_guest() -> &'static Path {
+    compiled_c_guest(&PROC_OTHER_PROCESS_STAT_GUEST, "proc_other_process_stat")
+}
+
+/// The other-process stat guest's transcript run natively, with the lines
+/// that name each answer checked first, so a host that answers otherwise
+/// fails here rather than in the comparison.
+fn proc_other_process_stat_native(backend: &str) -> String {
+    let args = proc_other_process_stat_args(backend);
+    let output = Command::new(proc_other_process_stat_guest())
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the other-process stat guest natively");
+    assert!(output.status.success(), "native: {output:?}");
+    let native = stdout(&output);
+    assert_eq!(
+        native.lines().count(),
+        PROC_OTHER_PROCESS_STAT_LINES + args.len(),
+        "{native}"
+    );
+    for line in [
+        "parent stat (from the child): name=(proc_other_proc) state=S ppid as its getppid=1 exit_code=0",
+        "child stat: pid matches=1 name=(other-child) state=S ppid is parent=1",
+        "child stat: cpu ticks used=1 at least the child's own=1 within one tick=1",
+        "child directory: stat read relative to it=1 same as by path=1",
+        "child task directory lists: <pid>=1 <tid>=1",
+        "thread stat: exit_signal=-1 rt_priority,policy as own=1 exit_code=0",
+        "thread comm by top-level number=other-thread",
+        "zombie stat: pid matches=1 name=(proc_other_proc) state=Z ppid is parent=1",
+        "zombie stat: flags forknoexec=1 exiting=1",
+        "zombie stat: exit_signal=17 rt_priority,policy as own=1 exit_code=1792",
+        "zombie stat: vsize,rss=0,0 startcode..sigcatch zero=1 start_data..env_end zero=1",
+        "raw exit(3) zombie: state=Z si_code=1 si_status=3 exit_code=768 as its waitid shows=1",
+        "failures=0",
+    ] {
+        assert!(
+            native.lines().any(|native| native == line),
+            "{line}: {native}"
+        );
+    }
+    native
+}
+
+/// The other-process stat guest's transcript under Hermit on `backend` at
+/// L2: two runs at bitwise parity under `--verify-strict`, with the same
+/// nonzero number of INFO records compared.
+fn proc_other_process_stat_at_l2(backend: &str) -> String {
+    let guest = proc_other_process_stat_guest();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join(format!("{backend}.json"));
+    let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        &report_arg,
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+    ]
+    .into_iter()
+    .chain(proc_other_process_stat_args(backend).iter().copied())
+    .collect::<Vec<_>>();
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+            .expect("parse the verification report");
+    assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+    let compared = &verdict["compared_log_messages"];
+    assert!(
+        compared["left"].as_u64().is_some_and(|count| count > 0)
+            && compared["left"] == compared["right"],
+        "{backend} compared no INFO messages: {verdict}"
+    );
+    stdout(&output)
+}
+
+/// Another process's `/proc/<pid>/stat`, `task/<tid>/stat` and `comm`
+/// (`tests/c/proc_other_process_stat.c`) on ptrace, at L2, exactly as
+/// natively, every line: by path and relative to a descriptor of the
+/// process's directory (as ps and pgrep read it), a live child's (named by
+/// `PR_SET_NAME`, two threads, CPU time it used, which its parent sees as
+/// the child's own `stat` shows it, within a tick), its thread's (named
+/// too), its parent's read by the child before the parent opened its own
+/// (whose parent is outside the program), and a zombie's (state `Z`,
+/// `PF_EXITING`, its exit code, no memory). Package K item 2b slice 2b-1
+/// renders another process's `stat` from Detcore's process table on every
+/// backend; ptrace showed the kernel's, sanitized, before it, which Linux
+/// does not: a zombie as `S`, and the child's CPU time as 0.
+#[test]
+fn another_processs_stat_and_comm_answer_as_linux() {
+    let native = proc_other_process_stat_native("ptrace");
+    assert_eq!(proc_other_process_stat_at_l2("ptrace"), native, "ptrace");
+}
+
+/// [`another_processs_stat_and_comm_answer_as_linux`] on KVM, at L2, exactly
+/// as natively, every line. Before package K item 2b slice 2b-1 every read
+/// failed: another process's `/proc/<pid>` directory, `stat` and `comm`
+/// with EACCES (the KVM provider's), and a zombie's with ENOENT; Detcore now
+/// serves the directories on placeholders, renders `stat` and `comm` from
+/// its process table, the CPU time each process published with its
+/// requests, its exit records and its comm records, and learns the
+/// program's first process's outside parent at that process's first clone.
+#[test]
+fn run_kvm_another_processs_stat_and_comm_answer_as_linux() {
+    let test = "run_kvm_another_processs_stat_and_comm_answer_as_linux";
+    if kvm_unavailable(test) {
+        return;
+    }
+    let native = proc_other_process_stat_native("kvm");
+    assert_eq!(proc_other_process_stat_at_l2("kvm"), native, "kvm");
+}
+
 /// The link-targets guest's `--directory-links` transcript, line by line:
 /// the caller's own descriptor links read through a link to one of its own
 /// descriptor directories, as Linux answers them (it follows the link to

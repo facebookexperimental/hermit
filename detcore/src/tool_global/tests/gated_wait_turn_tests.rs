@@ -343,8 +343,9 @@ impl GlobalRPC<GlobalState> for TurnGuest {
         &self,
         message: <GlobalState as GlobalTool>::Request,
     ) -> <GlobalState as GlobalTool>::Response {
-        self.rpcs.lock().unwrap().push(message.2.clone());
-        let response = match message.2 {
+        let request = crate::tool_global::without_cpu_publication(message.2);
+        self.rpcs.lock().unwrap().push(request.clone());
+        let response = match request {
             GlobalRequest::RequestResources(ref request, _) => {
                 if request.poll_attempt == 1
                     && request

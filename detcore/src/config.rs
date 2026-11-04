@@ -101,10 +101,11 @@ mod tests {
     /// `HostFileIdentity::content` layout of
     /// https://github.com/rrnewton/hermit/pull/4791, 45 is
     /// https://github.com/rrnewton/hermit/pull/4796's
-    /// `TraceSchedEvent`/`WithWatchOrder` revision, and 46 is
+    /// `TraceSchedEvent`/`WithWatchOrder` revision, 46 is
     /// https://github.com/rrnewton/hermit/pull/4769's
-    /// `PublishInstructionOffset` revision. 47 is this change's
-    /// `StoreExclusive` payload layout and is current.
+    /// `PublishInstructionOffset` revision, 47 is
+    /// https://github.com/rrnewton/hermit/pull/4735's `StoreExclusive`
+    /// payload layout, and 48, package K item 2b slice 2b-1's, is current.
     /// 42 to 44 are queued or advisory claims at this rebase
     /// (42 on drain/4759, 43 for PR 4627, 44 for kvm-2b-3 in the
     /// allocation table). Remove an entry when its change lands, with
@@ -319,6 +320,20 @@ mod tests {
         // (https://github.com/rrnewton/hermit/pull/4769); digest re-measured
         // at this head.
         (47, "3626cafe4551d074", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::WithCpuTime`, which carries a thread's CPU
+        // accounting on its request (`CpuPublication`), and
+        // `GlobalRequest::RecordExitCode` and its response, and gives
+        // `ThreadDeregistration` its `wait_status` (package K item 2b slice
+        // 2b-1, revision 39 allocated by the kvm lane's coordinator, renumbered
+        // 41 at its rebase onto main's 40, skipping reserved 33 to 39, and
+        // renumbered mechanically to 42 at its rebase onto main's 41, to 46
+        // at its rebase onto main's 45, and to 48 at its rebase onto main's
+        // 47, each time the next revision after main's last row). The digest
+        // covers those payload types too (domain 7: `ThreadDeregistration`,
+        // `CpuPublication`, `TaskCpuTimes`), as row 32 extended it to its
+        // own; domain 6 on its old base, moved to 7 because main's 41 took
+        // domain 6 for `HostFileIdentity`. Digest measured at this head.
+        (48, "e40e244635167e09", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -385,6 +400,18 @@ mod tests {
     /// `GlobalRequest::RecordHostInput` carries.
     const HOST_INPUT_WIRE: [&str; 1] = ["pub struct HostFileIdentity {"];
 
+    /// The payload types package K item 2b slice 2b-1 added or changed and
+    /// its variants carry: `DeregisterThread`'s `ThreadDeregistration` (its
+    /// `wait_status`) and `WithCpuTime`'s `CpuPublication`, in tool_global.rs,
+    /// and the `TaskCpuTimes` that holds, in procfs/task_stat.rs. Listed by
+    /// hand, as revision 32 listed its own; covering every serialized
+    /// payload's layout mechanically is minibeads dh-uxyyj.
+    const PROCFS_PAYLOAD_WIRE: [&str; 2] = [
+        "pub struct ThreadDeregistration {",
+        "pub struct CpuPublication {",
+    ];
+    const TASK_CPU_TIMES_WIRE: [&str; 1] = ["pub struct TaskCpuTimes {"];
+
     /// The lines of code of the item `source` declares, unindented, on the
     /// line `header`: the attributes just above it (its derives and serde
     /// attributes decide its encoding), the header, and its body through
@@ -427,15 +454,17 @@ mod tests {
     /// A digest of the code of `GlobalRequest` and `GlobalResponse` in
     /// `source`, of the StoreExclusive payload's types in `payload`, of the
     /// scheduled event's wire items in `schedule`, of the trace reply's
-    /// wire items in `source` and `replayer`, and of the nested wire types
-    /// in `host_input` (`HOST_INPUT_WIRE`): their variants, fields, payload
-    /// types, order and attributes, not their documentation.
+    /// wire items in `source` and `replayer`, of the nested wire types
+    /// in `host_input` (`HOST_INPUT_WIRE`), and of 2b-1's payload types in
+    /// `source` and `task_stat`: their variants, fields, payload types, order
+    /// and attributes, not their documentation.
     fn definition_digest(
         source: &str,
         payload: &str,
         schedule: &str,
         replayer: &str,
         host_input: &str,
+        task_stat: &str,
     ) -> String {
         let request = definition(source, "pub enum GlobalRequest {").join("\n");
         let response = definition(source, "pub enum GlobalResponse {").join("\n");
@@ -451,6 +480,11 @@ mod tests {
         ]
         .join("\n");
         let nested = wire_items(host_input, &HOST_INPUT_WIRE);
+        let procfs = [
+            wire_items(source, &PROCFS_PAYLOAD_WIRE),
+            wire_items(task_stat, &TASK_CPU_TIMES_WIRE),
+        ]
+        .join("\n");
         fnv_domains(&[
             (0, request.as_bytes()),
             (1, response.as_bytes()),
@@ -458,6 +492,7 @@ mod tests {
             (4, event.as_bytes()),
             (5, reply.as_bytes()),
             (6, nested.as_bytes()),
+            (7, procfs.as_bytes()),
         ])
     }
 
@@ -478,7 +513,8 @@ mod tests {
         let schedule = detcore_model::SCHEDULE_RS_SOURCE;
         let replayer = include_str!("scheduler/replayer.rs");
         let host_input = include_str!("../../detcore-model/src/host_input.rs");
-        let digest = definition_digest(source, payload, schedule, replayer, host_input);
+        let task_stat = include_str!("procfs/task_stat.rs");
+        let digest = definition_digest(source, payload, schedule, replayer, host_input, task_stat);
         let resources = include_str!("resources.rs");
         let resources_digest = resources_definition_digest(resources);
         let revision = crate::tool_global::GLOBAL_RPC_REVISION;
@@ -520,7 +556,14 @@ mod tests {
             1,
         );
         assert_eq!(
-            definition_digest(&documented, payload, schedule, replayer, host_input),
+            definition_digest(
+                &documented,
+                payload,
+                schedule,
+                replayer,
+                host_input,
+                task_stat
+            ),
             digest
         );
         let added = source.replacen(
@@ -529,7 +572,7 @@ mod tests {
             1,
         );
         assert_ne!(
-            definition_digest(&added, payload, schedule, replayer, host_input),
+            definition_digest(&added, payload, schedule, replayer, host_input, task_stat),
             digest
         );
         // Retype GlobalRequest's VirtualInotifyCookies wherever it sits: later
@@ -541,7 +584,7 @@ mod tests {
         );
         assert_ne!(retyped, source);
         assert_ne!(
-            definition_digest(&retyped, payload, schedule, replayer, host_input),
+            definition_digest(&retyped, payload, schedule, replayer, host_input, task_stat),
             digest
         );
         // A field added to a payload type changes it too, as this change's
@@ -554,7 +597,7 @@ mod tests {
         );
         assert_ne!(grown, payload);
         assert_ne!(
-            definition_digest(source, &grown, schedule, replayer, host_input),
+            definition_digest(source, &grown, schedule, replayer, host_input, task_stat),
             digest
         );
         let documented = payload.replacen(
@@ -564,7 +607,14 @@ mod tests {
         );
         assert_ne!(documented, payload);
         assert_eq!(
-            definition_digest(source, &documented, schedule, replayer, host_input),
+            definition_digest(
+                source,
+                &documented,
+                schedule,
+                replayer,
+                host_input,
+                task_stat
+            ),
             digest
         );
         // The event `TraceSchedEvent` carries is detcore-model's: a field
@@ -577,7 +627,7 @@ mod tests {
         );
         assert_ne!(grown, schedule);
         assert_ne!(
-            definition_digest(source, payload, &grown, replayer, host_input),
+            definition_digest(source, payload, &grown, replayer, host_input, task_stat),
             digest
         );
         let carried = schedule.replacen(
@@ -587,7 +637,7 @@ mod tests {
         );
         assert_ne!(carried, schedule);
         assert_ne!(
-            definition_digest(source, payload, &carried, replayer, host_input),
+            definition_digest(source, payload, &carried, replayer, host_input, task_stat),
             digest
         );
         let documented = schedule.replacen(
@@ -597,7 +647,14 @@ mod tests {
         );
         assert_ne!(documented, schedule);
         assert_eq!(
-            definition_digest(source, payload, &documented, replayer, host_input),
+            definition_digest(
+                source,
+                payload,
+                &documented,
+                replayer,
+                host_input,
+                task_stat
+            ),
             digest
         );
         // So is the reply: a field added to the replayed slice end it holds,
@@ -609,7 +666,7 @@ mod tests {
         );
         assert_ne!(grown, replayer);
         assert_ne!(
-            definition_digest(source, payload, schedule, &grown, host_input),
+            definition_digest(source, payload, schedule, &grown, host_input, task_stat),
             digest
         );
         let retyped = source.replacen(
@@ -619,7 +676,7 @@ mod tests {
         );
         assert_ne!(retyped, source);
         assert_ne!(
-            definition_digest(&retyped, payload, schedule, replayer, host_input),
+            definition_digest(&retyped, payload, schedule, replayer, host_input, task_stat),
             digest
         );
         let documented = replayer.replacen(
@@ -629,7 +686,14 @@ mod tests {
         );
         assert_ne!(documented, replayer);
         assert_eq!(
-            definition_digest(source, payload, schedule, &documented, host_input),
+            definition_digest(
+                source,
+                payload,
+                schedule,
+                &documented,
+                host_input,
+                task_stat
+            ),
             digest
         );
         // The nested `HostFileIdentity`: a field added, or its encoding's
@@ -641,7 +705,7 @@ mod tests {
         );
         assert_ne!(documented, host_input);
         assert_eq!(
-            definition_digest(source, payload, schedule, replayer, &documented),
+            definition_digest(source, payload, schedule, replayer, &documented, task_stat),
             digest
         );
         let added = host_input.replacen(
@@ -650,7 +714,7 @@ mod tests {
             1,
         );
         assert_ne!(
-            definition_digest(source, payload, schedule, replayer, &added),
+            definition_digest(source, payload, schedule, replayer, &added, task_stat),
             digest
         );
         let renamed = host_input.replacen(
@@ -660,7 +724,7 @@ mod tests {
         );
         assert_ne!(renamed, host_input);
         assert_ne!(
-            definition_digest(source, payload, schedule, replayer, &renamed),
+            definition_digest(source, payload, schedule, replayer, &renamed, task_stat),
             digest
         );
         let rederived = host_input.replacen(
@@ -670,7 +734,46 @@ mod tests {
         );
         assert_ne!(rederived, host_input);
         assert_ne!(
-            definition_digest(source, payload, schedule, replayer, &rederived),
+            definition_digest(source, payload, schedule, replayer, &rederived, task_stat),
+            digest
+        );
+        // And 2b-1's payload types: a field added to `ThreadDeregistration` or
+        // to `TaskCpuTimes` changes the digest; a doc line does not.
+        let grown = source.replacen(
+            "pub struct ThreadDeregistration {\n",
+            "pub struct ThreadDeregistration {\n    pub(crate) added: u32,\n",
+            1,
+        );
+        assert_ne!(grown, source);
+        assert_ne!(
+            definition_digest(&grown, payload, schedule, replayer, host_input, task_stat),
+            digest
+        );
+        let grown = task_stat.replacen(
+            "pub struct TaskCpuTimes {\n",
+            "pub struct TaskCpuTimes {\n    pub added: LogicalTime,\n",
+            1,
+        );
+        assert_ne!(grown, task_stat);
+        assert_ne!(
+            definition_digest(source, payload, schedule, replayer, host_input, &grown),
+            digest
+        );
+        let documented = source.replacen(
+            "pub struct CpuPublication {\n",
+            "pub struct CpuPublication {\n    /// Documentation only.\n",
+            1,
+        );
+        assert_ne!(documented, source);
+        assert_eq!(
+            definition_digest(
+                &documented,
+                payload,
+                schedule,
+                replayer,
+                host_input,
+                task_stat
+            ),
             digest
         );
 

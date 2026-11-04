@@ -286,9 +286,11 @@ pub(crate) fn classify(path: &Path, own: (i32, i32)) -> Option<DescriptorDirecto
     }
 }
 
-/// Which of the caller's own task directories a task-directory placeholder
-/// stands for (package K slice K10, toward
-/// <https://github.com/rrnewton/hermit/issues/5039>).
+/// Which task directory a task-directory placeholder stands for: the
+/// caller's own (package K slice K10, toward
+/// <https://github.com/rrnewton/hermit/issues/5039>), or another process's in
+/// its PID namespace (package K item 2b slice 2b-1,
+/// <https://github.com/rrnewton/hermit/issues/5063>).
 #[derive(
     Debug,
     Clone,
@@ -378,21 +380,24 @@ impl TaskDirectoryBinding {
     }
 }
 
-/// Which of the caller's own task directories the absolute guest path
-/// `path` spells, for a caller whose pid and tid, as the guest numbers them,
-/// are `own`, and the thread for a thread's directory: `/proc/self` or
-/// `/proc/<pid>` its process's, `/proc/thread-self` its own thread's,
-/// `/proc/self/task/<tid>` or `/proc/<pid>/task/<tid>` that of a thread
-/// numbered `<tid>`, which the caller checks is one of its process's, and
-/// `/proc/self/task` or `/proc/<pid>/task` its process's `task`. Empty and
-/// `.` components name nothing, and a final `/` asks for the directory it
-/// is. `None` for any other path: another process's directory, a number
-/// with a leading zero (which names nothing on Linux), and a spelling with
-/// `..` (the caller resolves those first, `resolved_procfs_dotdot`).
+/// Which task directory the absolute guest path `path` spells, for a caller
+/// whose pid and tid, as the guest numbers them, are `own`: the directory,
+/// the process it belongs to, and the thread for a thread's directory (the
+/// caller's own tid for the others, the opener a binding names).
+/// `/proc/self` or `/proc/<n>` a process's (the caller's, or another's:
+/// Linux finds any task by its number there, `proc_pid_lookup`),
+/// `/proc/thread-self` the caller's own thread's, `/proc/self/task/<tid>` or
+/// `/proc/<n>/task/<tid>` that of a thread numbered `<tid>`, and
+/// `/proc/self/task` or `/proc/<n>/task` a process's `task`. The caller checks
+/// that each task a number names exists. Empty and `.` components name
+/// nothing, and a final `/` asks for the directory it is. `None` for any
+/// other path: a number with a leading zero (which names nothing on Linux),
+/// and a spelling with `..` (the caller resolves those first,
+/// `resolved_procfs_dotdot`).
 pub(crate) fn classify_task_directory(
     path: &Path,
     own: (i32, i32),
-) -> Option<(TaskDirectoryKind, i32)> {
+) -> Option<(TaskDirectoryKind, i32, i32)> {
     let mut components = path.components().filter(|c| *c != Component::CurDir);
     if components.next() != Some(Component::RootDir)
         || components.next() != Some(Component::Normal(OsStr::new("proc")))
@@ -412,13 +417,19 @@ pub(crate) fn classify_task_directory(
         }
         name.parse().ok()
     };
-    let own_process = |name: &str| name == "self" || number(name) == Some(own.0);
+    let process = |name: &str| {
+        if name == "self" {
+            Some(own.0)
+        } else {
+            number(name)
+        }
+    };
     match names.as_slice() {
-        [process] if own_process(process) => Some((TaskDirectoryKind::Process, own.1)),
-        ["thread-self"] => Some((TaskDirectoryKind::Thread, own.1)),
-        [process, "task"] if own_process(process) => Some((TaskDirectoryKind::Tasks, own.1)),
-        [process, "task", thread] if own_process(process) => {
-            Some((TaskDirectoryKind::Thread, number(thread)?))
+        [name] if *name == "thread-self" => Some((TaskDirectoryKind::Thread, own.0, own.1)),
+        [name] => Some((TaskDirectoryKind::Process, process(name)?, own.1)),
+        [name, "task"] => Some((TaskDirectoryKind::Tasks, process(name)?, own.1)),
+        [name, "task", thread] => {
+            Some((TaskDirectoryKind::Thread, process(name)?, number(thread)?))
         }
         _ => None,
     }
@@ -855,32 +866,35 @@ mod tests {
         assert_eq!(reopened.lock_key(), keys[1], "the same task's directory");
     }
 
-    /// The caller's own task directories, by every spelling that names one
-    /// without `..` (package K slice K10): a process's by `self` or its
+    /// The task directories, by every spelling that names one without `..`:
+    /// the caller's own (package K slice K10), a process's by `self` or its
     /// number, its own thread's by `thread-self`, any thread's of its
-    /// process by number (which the caller then checks), and `task`.
+    /// process by number, and `task`; and another process's by its number
+    /// (package K item 2b slice 2b-1), which the caller checks exist.
     #[test]
-    fn classifies_the_callers_own_task_directories() {
+    fn classifies_the_task_directories() {
         use TaskDirectoryKind::*;
         let own = (7, 9);
         let classified = |path: &str| classify_task_directory(Path::new(path), own);
-        assert_eq!(classified("/proc/self"), Some((Process, 9)));
-        assert_eq!(classified("/proc/7"), Some((Process, 9)));
-        assert_eq!(classified("/proc/7/"), Some((Process, 9)));
-        assert_eq!(classified("/proc/./self/."), Some((Process, 9)));
-        assert_eq!(classified("//proc//7"), Some((Process, 9)));
-        assert_eq!(classified("/proc/thread-self"), Some((Thread, 9)));
-        assert_eq!(classified("/proc/thread-self/"), Some((Thread, 9)));
-        assert_eq!(classified("/proc/self/task/9"), Some((Thread, 9)));
-        assert_eq!(classified("/proc/7/task/12/"), Some((Thread, 12)));
-        assert_eq!(classified("/proc/self/task"), Some((Tasks, 9)));
-        assert_eq!(classified("/proc/7/task/"), Some((Tasks, 9)));
+        assert_eq!(classified("/proc/self"), Some((Process, 7, 9)));
+        assert_eq!(classified("/proc/7"), Some((Process, 7, 9)));
+        assert_eq!(classified("/proc/7/"), Some((Process, 7, 9)));
+        assert_eq!(classified("/proc/./self/."), Some((Process, 7, 9)));
+        assert_eq!(classified("//proc//7"), Some((Process, 7, 9)));
+        assert_eq!(classified("/proc/thread-self"), Some((Thread, 7, 9)));
+        assert_eq!(classified("/proc/thread-self/"), Some((Thread, 7, 9)));
+        assert_eq!(classified("/proc/self/task/9"), Some((Thread, 7, 9)));
+        assert_eq!(classified("/proc/7/task/12/"), Some((Thread, 7, 12)));
+        assert_eq!(classified("/proc/self/task"), Some((Tasks, 7, 9)));
+        assert_eq!(classified("/proc/7/task/"), Some((Tasks, 7, 9)));
+        assert_eq!(classified("/proc/8"), Some((Process, 8, 9)));
+        assert_eq!(classified("/proc/8/task"), Some((Tasks, 8, 9)));
+        assert_eq!(classified("/proc/8/task/10/."), Some((Thread, 8, 10)));
         for path in [
             "/proc",
-            "/proc/8",
             "/proc/07",
-            "/proc/8/task",
-            "/proc/8/task/9",
+            "/proc/08/task",
+            "/proc/8/task/09",
             "/proc/self/task/09",
             "/proc/self/task/x",
             "/proc/self/fd",

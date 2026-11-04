@@ -65,6 +65,7 @@ fn deregistration(tid: DetTid, mm: MmId, count: u64) -> ThreadDeregistration {
         chaos_epochs: Vec::new(),
         killed_by_group_signal: false,
         passed_descriptors_out: false,
+        wait_status: 0,
     }
 }
 

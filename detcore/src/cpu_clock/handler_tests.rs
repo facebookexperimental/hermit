@@ -119,7 +119,7 @@ impl GlobalRPC<GlobalState> for CpuClockGuest {
         &self,
         message: <GlobalState as GlobalTool>::Request,
     ) -> <GlobalState as GlobalTool>::Response {
-        let request = match message.2 {
+        let request = match crate::tool_global::without_cpu_publication(message.2) {
             GlobalRequest::WithForwardedCount(_, request) => *request,
             request => request,
         };
