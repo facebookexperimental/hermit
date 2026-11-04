@@ -84,10 +84,13 @@ const MIN_DISTINCT_OUTCOMES: usize = 12;
 /// budget (exit 124) at run 33 of 66, after a skid-refused attempt at seed 28.
 /// The costliest group of 11 (yield-then-write, whose syscall-free spinners burn
 /// CPU until a preemption) measured 8.5-9.7 CPU-s in a review's repeats, 8.7 in
-/// a validation, and 14.1 on a host at load 40 or more. Two skid retries of its
-/// costliest run (2.8 CPU-s) keep it under the budget, with little margin on a
-/// loaded host.
-const SKID_ATTEMPTS: u32 = 3;
+/// a validation, and 14.1 on a host at load 40 or more. Skid retries use
+/// the one shared skid budget ([`detcore_model::SKID_RETRY_MAX_ATTEMPTS`]);
+/// under the counted runner each `SKID-RETRY` line earns one more base CPU
+/// budget (the nextest CPU wrapper's skid credits), so the retries no
+/// longer draw on the 22 CPU-s the measurement above budgeted, and the
+/// per-test wall bound still ends the test.
+const SKID_ATTEMPTS: u32 = detcore_model::SKID_RETRY_MAX_ATTEMPTS;
 
 /// Per-run timeout. A healthy run finishes in well under a second; a starved
 /// run would otherwise spin forever. It stays well inside validation's 22 CPU-s

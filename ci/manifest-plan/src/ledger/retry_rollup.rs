@@ -43,9 +43,11 @@ pub struct RetryRecordV1 {
 #[serde(deny_unknown_fields)]
 pub struct RetryRollupV1 {
     pub schema: u32,
-    /// The one e2e bound, from `MAX_ATTEMPTS_PER_CELL`. (The nextest skid
-    /// helper's separate bound of 5 attempts predates this schema and is
-    /// recorded per record, not by this field.)
+    /// The generic e2e bound, from `MAX_ATTEMPTS_PER_CELL`. A skid-only
+    /// history may run to the separate skid budget
+    /// (`MAX_SKID_ATTEMPTS_PER_CELL`, the shared
+    /// `detcore_model::SKID_RETRY_MAX_ATTEMPTS`); such a record's own
+    /// attempt count says so, not this field.
     pub max_attempts_per_test: u64,
     pub total_retries: u64,
     pub retried_tests: u64,
@@ -158,6 +160,37 @@ impl RetryRollupV1 {
     /// Attempts beyond the first are retries; a retried test whose final
     /// outcome is PASS is a flaky pass.
     pub fn from_framework_retries(retries: &FrameworkRetriesV1) -> Self {
+        // Per-attempt values come from the census's retained vectors
+        // when it carries them (one entry per attempt, from the raw
+        // rows). Records written before those fields retain only the
+        // first attempt: for those, first+final is the whole history at
+        // the generic bound of 2, and a longer legacy record's
+        // intermediate attempts are marked unknown (empty outcome, no
+        // class/signature/kind) rather than reconstructed from the
+        // first attempt — copying the first attempt's class onto a
+        // later product attempt would mislabel it as infrastructure.
+        fn retained_or_legacy<T: Clone>(
+            cell: &RetriedCellV1,
+            retained: &[T],
+            first: T,
+            final_at_two: T,
+            legacy_final: T,
+            unknown: T,
+        ) -> Vec<T> {
+            if retained.len() as u64 == cell.attempts {
+                return retained.to_vec();
+            }
+            if cell.attempts <= 1 {
+                return vec![first];
+            }
+            if cell.attempts == 2 {
+                return vec![first, final_at_two];
+            }
+            let mut values = vec![unknown; cell.attempts as usize];
+            values[0] = first;
+            *values.last_mut().expect("attempts >= 3") = legacy_final;
+            values
+        }
         let tests = retries
             .cells
             .iter()
@@ -167,49 +200,50 @@ impl RetryRollupV1 {
                 backend: Some(cell.cell.backend.clone()),
                 attempts: cell.attempts,
                 retries: cell.attempts.saturating_sub(1),
-                // The census retains first and final outcomes; with the
-                // harness bound of 2 attempts that is the whole history.
-                attempt_outcomes: if cell.attempts > 1 {
-                    vec![cell.first_outcome.clone(), cell.final_outcome.clone()]
-                } else {
-                    vec![cell.first_outcome.clone()]
-                },
-                attempt_classes: if cell.attempts > 1 {
-                    vec![
-                        cell.first_failure_class.clone(),
-                        if cell.final_outcome == "PASS" {
-                            None
-                        } else {
-                            cell.first_failure_class.clone()
-                        },
-                    ]
-                } else {
-                    vec![cell.first_failure_class.clone()]
-                },
-                attempt_signatures: if cell.attempts > 1 {
-                    vec![
-                        cell.first_signature.clone(),
-                        if cell.final_outcome == "PASS" {
-                            None
-                        } else {
-                            cell.first_signature.clone()
-                        },
-                    ]
-                } else {
-                    vec![cell.first_signature.clone()]
-                },
-                attempt_error_kinds: if cell.attempts > 1 {
-                    vec![
-                        cell.first_error_kind.clone(),
-                        if cell.final_outcome == "PASS" {
-                            None
-                        } else {
-                            cell.first_error_kind.clone()
-                        },
-                    ]
-                } else {
-                    vec![cell.first_error_kind.clone()]
-                },
+                attempt_outcomes: retained_or_legacy(
+                    cell,
+                    &cell.attempt_outcomes,
+                    cell.first_outcome.clone(),
+                    cell.final_outcome.clone(),
+                    cell.final_outcome.clone(),
+                    String::new(),
+                ),
+                attempt_classes: retained_or_legacy(
+                    cell,
+                    &cell.attempt_failure_classes,
+                    cell.first_failure_class.clone(),
+                    if cell.final_outcome == "PASS" {
+                        None
+                    } else {
+                        cell.first_failure_class.clone()
+                    },
+                    None,
+                    None,
+                ),
+                attempt_signatures: retained_or_legacy(
+                    cell,
+                    &cell.attempt_signatures,
+                    cell.first_signature.clone(),
+                    if cell.final_outcome == "PASS" {
+                        None
+                    } else {
+                        cell.first_signature.clone()
+                    },
+                    None,
+                    None,
+                ),
+                attempt_error_kinds: retained_or_legacy(
+                    cell,
+                    &cell.attempt_error_kinds,
+                    cell.first_error_kind.clone(),
+                    if cell.final_outcome == "PASS" {
+                        None
+                    } else {
+                        cell.first_error_kind.clone()
+                    },
+                    None,
+                    None,
+                ),
                 final_outcome: cell.final_outcome.clone(),
                 flaky_pass: cell.final_outcome == "PASS",
             })
@@ -354,6 +388,69 @@ mod tests {
         );
         let legacy = r#"{"test":"fixture/old","mode":"verify","backend":null,"attempts":1,"retries":0,"attempt_outcomes":["PASS"],"attempt_classes":[null],"final_outcome":"PASS","flaky_pass":false}"#;
         assert!(serde_json::from_str::<RetryRecordV1>(legacy).is_ok());
+    }
+
+    #[test]
+    fn rollup_from_census_keeps_each_attempts_own_class() {
+        // A mixed history (skid, skid, product FAIL) must count its
+        // product attempt as product, never as a third skid: the census
+        // retains every attempt's own class/signature and the rollup
+        // reads those, not the first attempt copied forward.
+        let mixed = RetriedCellV1 {
+            path: "one/results.jsonl".into(),
+            cell: CellIdentity {
+                lane: "portable".into(),
+                category: "fixture".into(),
+                test: "fixture/mixed".into(),
+                mode: "verify".into(),
+                backend: "ptrace".into(),
+            },
+            attempts: 3,
+            first_outcome: "ERROR".into(),
+            first_failure_class: Some("understood_infrastructure_failure".into()),
+            first_error_kind: Some("infrastructure".into()),
+            first_signature: Some("skid_overshoot".into()),
+            first_result: None,
+            first_divergent_scheduler_turn: None,
+            first_divergent_record: None,
+            first_divergent_syscall: None,
+            final_outcome: "FAIL".into(),
+            attempt_outcomes: vec!["ERROR".into(), "ERROR".into(), "FAIL".into()],
+            attempt_failure_classes: vec![
+                Some("understood_infrastructure_failure".into()),
+                Some("understood_infrastructure_failure".into()),
+                Some("product_failure".into()),
+            ],
+            attempt_error_kinds: vec![
+                Some("infrastructure".into()),
+                Some("infrastructure".into()),
+                None,
+            ],
+            attempt_signatures: vec![
+                Some("skid_overshoot".into()),
+                Some("skid_overshoot".into()),
+                Some("unclassified".into()),
+            ],
+        };
+        let census = FrameworkRetriesV1 {
+            schema: 1,
+            retried_cells: 1,
+            retried_cells_final_pass: 0,
+            cells: vec![mixed],
+        };
+        let rollup = RetryRollupV1::from_framework_retries(&census);
+        assert_eq!(rollup.tests[0].attempt_outcomes, ["ERROR", "ERROR", "FAIL"]);
+        assert_eq!(
+            rollup
+                .retries_by_class
+                .get("understood_infrastructure_failure"),
+            Some(&2)
+        );
+        assert_eq!(rollup.retries_by_class.get("product_failure"), Some(&1));
+        assert_eq!(
+            rollup.retries_by_subcategory["understood_infrastructure_failure"]["pmu_skid"],
+            2
+        );
     }
 
     #[test]

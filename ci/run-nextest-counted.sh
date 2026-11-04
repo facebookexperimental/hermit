@@ -546,6 +546,40 @@ assert report["results"] == [
 ]
 PYEOF
 
+    # A skid-infra marker claiming the shared 5-attempt budget reclassifies
+    # the failed row's terminal attempt as an infrastructure error; the row
+    # stays a failure. Without the schema-5 opt-in the writer refuses.
+    printf 'HERMIT-SKID-INFRA: fails\tall 5 attempt(s) exited 122 with `HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2`; verdict SKID-INFRA (not a test failure)\n' \
+        >"$scratch/skid-infra.txt"
+    got=$(HERMIT_NEXTEST_RESULTS_SCHEMA=5 HERMIT_SKID_INFRA_FILE="$scratch/skid-infra.txt" \
+        DAGRUN_TEST_COUNTS_PATH="$scratch/skid-infra-counts.json" \
+        emit_libtest_count "$scratch/failed-events.jsonl" 100)
+    expected=$'running 1 tests\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 3 filtered out'
+    [[ $got == "$expected" ]] || return 1
+    python3 - "$scratch/skid-infra-counts.json" <<'PYEOF' || return 1
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    report = json.load(source)
+assert report["schema"] == 5
+rows = {row["id"]: row for row in report["results"]}
+terminal = rows["suite$fails"]["attempt_results"][-1]
+assert rows["suite$fails"]["result"] == "fail"
+assert terminal["outcome"] == "infrastructure_error"
+assert terminal["detail"].startswith("SKID-INFRA: ")
+PYEOF
+
+    status=0
+    HERMIT_SKID_INFRA_FILE="$scratch/skid-infra.txt" \
+        DAGRUN_TEST_COUNTS_PATH="$scratch/skid-infra-no-optin.json" \
+        emit_libtest_count "$scratch/failed-events.jsonl" 100 \
+        >/dev/null 2>"$scratch/skid-infra-no-optin.stderr" || status=$?
+    [[ $status == 2 ]] || return 1
+    grep -q 'skid-infra markers were recorded' \
+        "$scratch/skid-infra-no-optin.stderr" || return 1
+    [[ ! -e $scratch/skid-infra-no-optin.json ]] || return 1
+
     # The listed count is derived from the inventory: filter-matched
     # testcases only (executed == listed for a successful run).
     jq -nc '{
@@ -834,7 +868,7 @@ PYEOF
     HERMIT_NEXTEST_EVENTS_PATH='' configured_events_path >/dev/null 2>&1 || status=$?
     [[ $status == 2 ]] || return 1
 
-    printf 'run-nextest-counted: self-test PASS (typed counts, executed failure, zero-terminal launch failure, CPU reconciliation, refusal controls, event retention, skip classification)\n'
+    printf 'run-nextest-counted: self-test PASS (typed counts, executed failure, zero-terminal launch failure, CPU reconciliation, refusal controls, event retention, skip classification, skid-infra classification)\n'
 }
 
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
@@ -910,6 +944,17 @@ export HERMIT_SKID_RETRY_RECORD=$skid_retry_record
 # One RetryRecordV1 JSON line per retried test (ledger retry_rollup schema).
 export HERMIT_RETRY_RECORD_FILE="$cpu_measurement_dir/retry-records.jsonl"
 : >"$HERMIT_RETRY_RECORD_FILE" || exit $?
+# A test whose whole skid budget ended in typed skid-overshoot refusals
+# appends one HERMIT-SKID-INFRA line here; the result writer classifies that
+# test's terminal attempt as an infrastructure error (verdict SKID-INFRA,
+# not a test failure) and this count keeps it visible in the log. Wired
+# only for a schema-5 node, like the skip sidecar: the writer refuses a
+# marker it cannot classify, so an unwired helper must not write one.
+HERMIT_SKID_INFRA_FILE="$cpu_measurement_dir/skid-infra.log"
+: >"$HERMIT_SKID_INFRA_FILE" || exit $?
+if [[ ${HERMIT_NEXTEST_RESULTS_SCHEMA:-} == 5 ]]; then
+    export HERMIT_SKID_INFRA_FILE
+fi
 nextest_status=0
 run_nextest "$events_log" "$(configured_wall_timeout_multiplier)" "$cpu_wrapper" \
     "$cpu_attempt_records" "$cpu_binary_map" "$cpu_inventory" "$cpu_report" "$@" \
@@ -925,5 +970,10 @@ if ((retry_records > 0)); then
 fi
 if ((skid_retries > 0)); then
     sed 's/^/run-nextest-counted: skid-overshoot retry: /' "$skid_retry_record" >&2
+fi
+skid_infra=$(wc -l <"$HERMIT_SKID_INFRA_FILE") || exit $?
+printf 'run-nextest-counted: SKID-INFRA count %d\n' "$skid_infra" >&2
+if ((skid_infra > 0)); then
+    sed 's/^HERMIT-SKID-INFRA: /run-nextest-counted: SKID-INFRA: /' "$HERMIT_SKID_INFRA_FILE" >&2
 fi
 exit "$nextest_status"

@@ -32,6 +32,7 @@ mod chosen_exec_timer;
 
 // The binary loads hermit_binary.rs once, through kvm_synchronous_fault, and
 // skid_overshoot.rs once, through hermit_binary.rs.
+use detcore_model::SKID_RETRY_MAX_ATTEMPTS;
 use hermit_test::skid_overshoot;
 use kvm_synchronous_fault::hermit_binary as hermit_test;
 use skid_overshoot::SKID_OVERSHOOT_REFUSAL_PREFIX;
@@ -28970,29 +28971,29 @@ fn run_with_deadline_once(
     (status, stderr)
 }
 
-/// The most `hermit run` attempts a PMU-preempted spinner case makes when its
-/// earlier attempts each end in a typed skid-overshoot refusal
-/// ([`skid_overshoot_refusal`]); see [`run_pmu_spinner_retrying_skid`].
-///
-/// Derived from the measured refusal rate, not chosen. On the AMD EPYC
-/// development host recorded in docs/TESTING_ENVIRONMENTS.md, the
-/// `poll_timeout_vs_spinner` guest built by the pinned validation root's
-/// compiler drew the refusal, with correct guest output every time
-/// (https://github.com/rrnewton/reverie/issues/990), in 3 of 13
-/// privileged-test.pmu_cli_cases attempts in local validation, 5 of 15 direct
-/// runs, 8 of 20 runs of this case inside the pinned root and 11 of 28
-/// attempts of this retrying case inside it: 27 of 76, p = 0.36. With
-/// independent attempts the chance that all `n` attempts refuse is p^n: 4.5%
-/// for 3 attempts, 1.6% for 4 and 0.57% for 5 (1.0% for 5 at the highest
-/// measured rate, p = 0.40).
-///
-/// Each attempt costs 8.2-10.7 CPU-s and 8.4-10.9 s of wall time in that
-/// node, so five attempts need up to about 54 CPU-s and 55 s. The node
-/// therefore scales its per-test CPU budget (22 CPU-s by default) by 4 to 88
-/// CPU-s and its per-test wall bound (57 s by default) by 2 to 114 s, about
-/// 1.6 and 2.1 times what five attempts need; at the defaults a third attempt
-/// would be killed by the CPU budget.
-const SKID_RETRY_MAX_ATTEMPTS: u32 = 5;
+// A PMU-preempted spinner case makes at most
+// `SKID_RETRY_MAX_ATTEMPTS` `hermit run` attempts when its earlier
+// attempts each end in a typed skid-overshoot refusal
+// (`skid_overshoot_refusal`); see `run_pmu_spinner_retrying_skid`.
+//
+// Derived from the measured refusal rate, not chosen. On the AMD EPYC
+// development host recorded in docs/TESTING_ENVIRONMENTS.md, the
+// `poll_timeout_vs_spinner` guest built by the pinned validation root's
+// compiler drew the refusal, with correct guest output every time
+// (https://github.com/rrnewton/reverie/issues/990), in 3 of 13
+// privileged-test.pmu_cli_cases attempts in local validation, 5 of 15 direct
+// runs, 8 of 20 runs of this case inside the pinned root and 11 of 28
+// attempts of this retrying case inside it: 27 of 76, p = 0.36. With
+// independent attempts the chance that all `n` attempts refuse is p^n: 4.5%
+// for 3 attempts, 1.6% for 4 and 0.57% for 5 (1.0% for 5 at the highest
+// measured rate, p = 0.40).
+//
+// Each attempt costs 8.2-10.7 CPU-s and 8.4-10.9 s of wall time in that
+// node, so five attempts need up to about 54 CPU-s and 55 s. The node
+// therefore scales its per-test CPU budget (22 CPU-s by default) by 4 to 88
+// CPU-s and its per-test wall bound (57 s by default) by 2 to 114 s, about
+// 1.6 and 2.1 times what five attempts need; at the defaults a third attempt
+// would be killed by the CPU budget.
 
 /// One finished attempt of [`run_pmu_spinner_retrying_skid`].
 struct SpinnerRun {
@@ -29039,11 +29040,16 @@ fn run_pmu_spinner_retrying_skid(
             };
         };
         if attempt == SKID_RETRY_MAX_ATTEMPTS {
+            // The cap attempt earns the SKID-INFRA verdict only once its
+            // guest stdout passes the same checks a retry requires, so a
+            // refusal beside a wrong result stays an ordinary failure.
+            check_stdout(&stdout);
             eprintln!(
                 "SKID-RETRY LIMIT {test}: attempt {attempt} of at most \
                  {SKID_RETRY_MAX_ATTEMPTS} exited {HERMIT_POLICY_REFUSAL_EXIT} with `{refusal}`; \
                  no further retry is made"
             );
+            skid_overshoot::record_skid_infra(test, refusal, SKID_RETRY_MAX_ATTEMPTS);
             return SpinnerRun {
                 status,
                 stdout,
@@ -29081,16 +29087,34 @@ HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2
 #[test]
 fn skid_retry_record_matches_the_retry_rollup_schema() {
     let record: serde_json::Value =
-        serde_json::from_str(&skid_overshoot::retry_record_json("loop test", 3, true)).unwrap();
+        serde_json::from_str(&skid_overshoot::retry_record_json("loop test", 3, "PASS")).unwrap();
     assert_eq!(record["test"], "loop test");
     assert_eq!(record["attempts"], 3);
     assert_eq!(record["retries"], 2);
     assert_eq!(record["final_outcome"], "PASS");
     assert_eq!(record["flaky_pass"], true);
     let failed: serde_json::Value =
-        serde_json::from_str(&skid_overshoot::retry_record_json("loop test", 2, false)).unwrap();
+        serde_json::from_str(&skid_overshoot::retry_record_json("loop test", 2, "FAIL")).unwrap();
     assert_eq!(failed["flaky_pass"], false);
     assert_eq!(failed["final_outcome"], "FAIL");
+    assert_eq!(failed["attempt_classes"][1], "product_failure");
+    // An exhausted skid budget is its own verdict, never a product
+    // failure: final outcome SKID-INFRA, final class still the skid.
+    let infra: serde_json::Value = serde_json::from_str(&skid_overshoot::retry_record_json(
+        "loop test",
+        5,
+        skid_overshoot::SKID_INFRA_VERDICT,
+    ))
+    .unwrap();
+    assert_eq!(infra["attempts"], 5);
+    assert_eq!(infra["retries"], 4);
+    assert_eq!(infra["final_outcome"], "SKID-INFRA");
+    assert_eq!(infra["flaky_pass"], false);
+    assert_eq!(
+        infra["attempt_outcomes"],
+        serde_json::json!(["ERROR", "ERROR", "ERROR", "ERROR", "SKID-INFRA"])
+    );
+    assert_eq!(infra["attempt_classes"][4], "skid_overshoot");
 }
 
 /// [`retry_typed_skid_refusal`] runs an attempt again only after a typed
@@ -29108,10 +29132,15 @@ fn skid_retry_loop_returns_any_other_failure_at_once() {
         ),
     ] {
         let mut calls = 0;
-        let (attempt, output, ()) = retry_typed_skid_refusal("loop test", 5, || {
-            calls += 1;
-            (skid_retry_output(code, stderr), ())
-        });
+        let (attempt, output, ()) = retry_typed_skid_refusal(
+            "loop test",
+            5,
+            || {
+                calls += 1;
+                (skid_retry_output(code, stderr), ())
+            },
+            &|_| {},
+        );
         assert_eq!((attempt, calls), (1, 1), "exit {code} must not be retried");
         assert_eq!(output.status.code(), Some(code));
     }
@@ -29119,7 +29148,8 @@ fn skid_retry_loop_returns_any_other_failure_at_once() {
 
 /// [`retry_typed_skid_refusal`] retries typed skid refusals up to its bound:
 /// a pass after two refusals is the third attempt, and a refusal at the bound
-/// is returned, not retried, for the caller to fail.
+/// is returned, not retried, with the SKID-INFRA verdict recorded — the
+/// exhaustion is classified, not left for the caller to blame on the test.
 #[test]
 fn skid_retry_loop_retries_only_typed_refusals_up_to_its_bound() {
     // Each retry is recorded for ci/run-nextest-counted.sh's count, and
@@ -29130,36 +29160,49 @@ fn skid_retry_loop_retries_only_typed_refusals_up_to_its_bound() {
     let record = record_dir.path().join("skid-retries.log");
     let credit = record_dir.path().join("skid-credit");
     let retry_records = record_dir.path().join("retry-records.jsonl");
+    let skid_infra = record_dir.path().join("skid-infra.log");
     fs::write(&credit, "").unwrap();
+    fs::write(&skid_infra, "").unwrap();
     // SAFETY: Nextest runs each test in a process of its own, and this test
     // starts no thread before it sets the variables.
     unsafe {
         std::env::set_var(skid_overshoot::SKID_RETRY_RECORD_ENV, &record);
         std::env::set_var(skid_overshoot::SKID_RETRY_CREDIT_ENV, &credit);
         std::env::set_var(skid_overshoot::RETRY_RECORD_ENV, &retry_records);
+        std::env::set_var(skid_overshoot::SKID_INFRA_FILE_ENV, &skid_infra);
     }
     let mut calls = 0;
-    let (attempt, output, ()) = retry_typed_skid_refusal("loop test", 5, || {
-        calls += 1;
-        if calls <= 2 {
+    let (attempt, output, ()) = retry_typed_skid_refusal(
+        "loop test",
+        5,
+        || {
+            calls += 1;
+            if calls <= 2 {
+                (
+                    skid_retry_output(HERMIT_POLICY_REFUSAL_EXIT, SKID_RETRY_REFUSED_STDERR),
+                    (),
+                )
+            } else {
+                (skid_retry_output(0, ""), ())
+            }
+        },
+        &|_| {},
+    );
+    assert_eq!((attempt, calls, output.status.code()), (3, 3, Some(0)));
+
+    let mut calls = 0;
+    let (attempt, output, ()) = retry_typed_skid_refusal(
+        "loop test",
+        5,
+        || {
+            calls += 1;
             (
                 skid_retry_output(HERMIT_POLICY_REFUSAL_EXIT, SKID_RETRY_REFUSED_STDERR),
                 (),
             )
-        } else {
-            (skid_retry_output(0, ""), ())
-        }
-    });
-    assert_eq!((attempt, calls, output.status.code()), (3, 3, Some(0)));
-
-    let mut calls = 0;
-    let (attempt, output, ()) = retry_typed_skid_refusal("loop test", 5, || {
-        calls += 1;
-        (
-            skid_retry_output(HERMIT_POLICY_REFUSAL_EXIT, SKID_RETRY_REFUSED_STDERR),
-            (),
-        )
-    });
+        },
+        &|_| {},
+    );
     assert_eq!(
         (attempt, calls, output.status.code()),
         (5, 5, Some(HERMIT_POLICY_REFUSAL_EXIT))
@@ -29184,6 +29227,93 @@ fn skid_retry_loop_retries_only_typed_refusals_up_to_its_bound() {
             recorded.split_once('\t').map(|(_, line)| line) == Some(credited)
         }),
         "{credits}"
+    );
+    // Only the exhausted run earns the SKID-INFRA verdict: one marker,
+    // named for this test, and the skid budget in its reason. The pass
+    // after retries recorded none.
+    let infra = fs::read_to_string(&skid_infra).expect("the exhaustion was not recorded");
+    let infra_lines = infra.lines().collect::<Vec<_>>();
+    assert_eq!(infra_lines.len(), 1, "{infra}");
+    assert!(
+        infra_lines[0].starts_with(
+            "HERMIT-SKID-INFRA: skid_retry_loop_retries_only_typed_refusals_up_to_its_bound\tall 5 attempt(s) exited 122 with `HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count="
+        ) && infra_lines[0].ends_with("verdict SKID-INFRA (not a test failure)"),
+        "{infra}"
+    );
+    // The retry records agree: a flaky PASS, then SKID-INFRA.
+    let rollup = fs::read_to_string(&retry_records).expect("the retry records were not written");
+    let finals = rollup
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["final_outcome"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(finals, ["PASS", "SKID-INFRA"], "{rollup}");
+
+    // A bound below the shared skid budget is not that budget
+    // exhausted: bounds 1 and 3 record no verdict.
+    for bound in [1, 3] {
+        let (attempt, _, ()) = retry_typed_skid_refusal(
+            "loop test",
+            bound,
+            || {
+                (
+                    skid_retry_output(HERMIT_POLICY_REFUSAL_EXIT, SKID_RETRY_REFUSED_STDERR),
+                    (),
+                )
+            },
+            &|_| {},
+        );
+        assert_eq!(attempt, bound);
+    }
+    // A final skid attempt whose guest stdout differs from the earlier
+    // skid attempts' carries a second outcome: no verdict either.
+    let mut calls = 0;
+    let (attempt, _, ()) = retry_typed_skid_refusal(
+        "loop test",
+        5,
+        || {
+            calls += 1;
+            let mut output =
+                skid_retry_output(HERMIT_POLICY_REFUSAL_EXIT, SKID_RETRY_REFUSED_STDERR);
+            if calls == 5 {
+                output.stdout = b"WRONG STDOUT".to_vec();
+            }
+            (output, ())
+        },
+        &|_| {},
+    );
+    assert_eq!(attempt, 5);
+    // A caller's own final-output check that fails leaves an ordinary
+    // failure and no marker: the check runs before anything records.
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        retry_typed_skid_refusal(
+            "loop test",
+            5,
+            || {
+                (
+                    skid_retry_output(HERMIT_POLICY_REFUSAL_EXIT, SKID_RETRY_REFUSED_STDERR),
+                    (),
+                )
+            },
+            &|output| {
+                assert_eq!(
+                    output.stdout,
+                    b"expected guest output".to_vec(),
+                    "final stdout check"
+                );
+            },
+        )
+    }));
+    assert!(panicked.is_err(), "the caller check must fail the test");
+    let infra = fs::read_to_string(&skid_infra).unwrap();
+    assert_eq!(
+        infra.lines().count(),
+        1,
+        "only the qualifying exhaustion above recorded a verdict: {infra}"
     );
 }
 

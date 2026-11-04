@@ -1403,8 +1403,10 @@ fn canonical_record_replay_command_configured(
     hermit_global: &[&str],
 ) -> String {
     let label = format!("canonical record/replay for {name}");
-    let (attempt, output, (rendered, verdict_path, _dirs)) =
-        retry_typed_skid_refusal(name, max_attempts, || {
+    let (attempt, output, (rendered, verdict_path, _dirs)) = retry_typed_skid_refusal(
+        name,
+        max_attempts,
+        || {
             let data_dir =
                 tempfile::tempdir().expect("failed to create Hermit recording directory");
             let verdict_dir = tempfile::tempdir().expect("failed to create verification directory");
@@ -1437,7 +1439,9 @@ fn canonical_record_replay_command_configured(
                 .output()
                 .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
             (output, (rendered, verdict_path, (data_dir, verdict_dir)))
-        });
+        },
+        &|_| {},
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -5032,7 +5036,7 @@ fn record_masked_epoll_pwait2_whose_timeout_is_in_the_red_zone() {
 /// .config/nextest.toml). So retries are visible only when the test fails,
 /// and a rise in the refusal rate would show only as more failures at the
 /// bound, as for the cli.rs PMU spinner cases.
-const BUSY_SIBLING_SKID_MAX_ATTEMPTS: u32 = 5;
+const BUSY_SIBLING_SKID_MAX_ATTEMPTS: u32 = detcore_model::SKID_RETRY_MAX_ATTEMPTS;
 
 /// A masked zero-timespec epoll_pwait2 beside a sibling that loops without a
 /// system call: the call keeps its turn. In the background it would wait

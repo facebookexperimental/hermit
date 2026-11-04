@@ -415,7 +415,7 @@ fn run_fixture(scenario: Scenario) {
     // run in which another PMU case needed a skid retry
     // (https://github.com/rrnewton/hermit/issues/4397). Five attempts, as
     // 0d7f16f3 and ec49cdd7 allow.
-    const SKID_ATTEMPTS: u32 = 5;
+    const SKID_ATTEMPTS: u32 = detcore_model::SKID_RETRY_MAX_ATTEMPTS;
     for pair in 0..3 {
         let mut attempt = 0;
         let (_, output, (directory, report_path, run2_log)) =
@@ -506,6 +506,7 @@ fn run_fixture(scenario: Scenario) {
                     };
                     (output, (directory, report_path, run2_log))
                 },
+                &|_| {},
             );
         let status = output.status;
         let logs = directory.join("verify-logs");

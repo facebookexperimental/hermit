@@ -807,47 +807,49 @@ struct SkipMarker {
 }
 
 const SKIP_MARKER_PREFIX: &str = "HERMIT-TEST-SKIP: ";
+const SKID_INFRA_MARKER_PREFIX: &str = "HERMIT-SKID-INFRA: ";
 /// One append must stay under PIPE_BUF so parallel test processes cannot
 /// interleave entries in the shared sidecar.
 const SKIP_MARKER_MAX_BYTES: usize = 4096;
 
-fn parse_skip_sidecar(bytes: &[u8]) -> Result<Vec<SkipMarker>, String> {
+fn parse_marker_sidecar(bytes: &[u8], prefix: &str, kind: &str) -> Result<Vec<SkipMarker>, String> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
     if !bytes.ends_with(b"\n") {
-        return Err(
-            "nextest-test-results: skip sidecar ends in a truncated line; refusing to guess".into(),
-        );
+        return Err(format!(
+            "nextest-test-results: {kind} sidecar ends in a truncated line; refusing to guess"
+        ));
     }
-    let text = std::str::from_utf8(bytes)
-        .map_err(|error| format!("nextest-test-results: skip sidecar is not UTF-8: {error}"))?;
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        format!("nextest-test-results: {kind} sidecar is not UTF-8: {error}")
+    })?;
     let mut markers: Vec<SkipMarker> = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let line_number = index + 1;
         if line.len() + 1 > SKIP_MARKER_MAX_BYTES {
             return Err(format!(
-                "nextest-test-results: skip sidecar line {line_number} exceeds {SKIP_MARKER_MAX_BYTES} bytes"
+                "nextest-test-results: {kind} sidecar line {line_number} exceeds {SKIP_MARKER_MAX_BYTES} bytes"
             ));
         }
-        let entry = line.strip_prefix(SKIP_MARKER_PREFIX).ok_or_else(|| {
+        let entry = line.strip_prefix(prefix).ok_or_else(|| {
             format!(
-                "nextest-test-results: skip sidecar line {line_number} lacks the {SKIP_MARKER_PREFIX:?} prefix"
+                "nextest-test-results: {kind} sidecar line {line_number} lacks the {prefix:?} prefix"
             )
         })?;
         let (name, reason) = entry.split_once('\t').ok_or_else(|| {
             format!(
-                "nextest-test-results: skip sidecar line {line_number} has no tab before its reason"
+                "nextest-test-results: {kind} sidecar line {line_number} has no tab before its reason"
             )
         })?;
         if name.is_empty() || name.trim() != name {
             return Err(format!(
-                "nextest-test-results: skip sidecar line {line_number} has an empty or untrimmed test name"
+                "nextest-test-results: {kind} sidecar line {line_number} has an empty or untrimmed test name"
             ));
         }
         if reason.is_empty() || reason.trim() != reason {
             return Err(format!(
-                "nextest-test-results: skip sidecar line {line_number} has an empty or untrimmed reason"
+                "nextest-test-results: {kind} sidecar line {line_number} has an empty or untrimmed reason"
             ));
         }
         if markers
@@ -855,7 +857,7 @@ fn parse_skip_sidecar(bytes: &[u8]) -> Result<Vec<SkipMarker>, String> {
             .any(|marker: &SkipMarker| marker.name == name)
         {
             return Err(format!(
-                "nextest-test-results: skip sidecar names test {name:?} twice; refusing to guess"
+                "nextest-test-results: {kind} sidecar names test {name:?} twice; refusing to guess"
             ));
         }
         markers.push(SkipMarker {
@@ -864,6 +866,14 @@ fn parse_skip_sidecar(bytes: &[u8]) -> Result<Vec<SkipMarker>, String> {
         });
     }
     Ok(markers)
+}
+
+fn parse_skip_sidecar(bytes: &[u8]) -> Result<Vec<SkipMarker>, String> {
+    parse_marker_sidecar(bytes, SKIP_MARKER_PREFIX, "skip")
+}
+
+fn parse_skid_infra_sidecar(bytes: &[u8]) -> Result<Vec<SkipMarker>, String> {
+    parse_marker_sidecar(bytes, SKID_INFRA_MARKER_PREFIX, "skid-infra")
 }
 
 /// The skip markers for this run, when the runner wired the sidecar channel.
@@ -886,6 +896,27 @@ fn read_skip_markers() -> Result<Vec<SkipMarker>, ProducerError> {
         format!("nextest-test-results: cannot read skip sidecar {path}: {error}")
     })?;
     Ok(parse_skip_sidecar(&bytes)?)
+}
+
+/// The skid-infra markers for this run, when the runner wired the sidecar
+/// channel (`HERMIT_SKID_INFRA_FILE`, set by `run-nextest-counted.sh`
+/// beside the skip sidecar for a schema-5 node). An unset variable means
+/// the channel is off and there is nothing to read.
+fn read_skid_infra_markers() -> Result<Vec<SkipMarker>, ProducerError> {
+    let path = match env::var("HERMIT_SKID_INFRA_FILE") {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => return Ok(Vec::new()),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("nextest-test-results HERMIT_SKID_INFRA_FILE is not UTF-8".into());
+        }
+    };
+    if path.is_empty() {
+        return Err("nextest-test-results HERMIT_SKID_INFRA_FILE must not be empty".into());
+    }
+    let bytes = fs::read(&path).map_err(|error| {
+        format!("nextest-test-results: cannot read skid-infra sidecar {path}: {error}")
+    })?;
+    Ok(parse_skid_infra_sidecar(&bytes)?)
 }
 
 /// Whether this node opted into schema-5 structured results.
@@ -983,6 +1014,92 @@ fn apply_skip_markers(
         if result.attempt_results.is_none() {
             result.attempt_results = Some(classified_attempts(result)?);
         }
+    }
+    Ok(results)
+}
+
+/// The one shared skid budget a skid-infra marker must claim to have
+/// exhausted (`detcore_model::SKID_RETRY_MAX_ATTEMPTS`); this producer
+/// links no detcore-model, so the value is pinned here and in its test.
+const SKID_INFRA_ATTEMPTS: u64 = 5;
+
+/// The attempt count a skid-infra marker's reason claims
+/// (`all <n> attempt(s) ...`), or `None` when it names none.
+fn skid_infra_claimed_attempts(reason: &str) -> Option<u64> {
+    reason
+        .strip_prefix("all ")?
+        .split_once(" attempt(s)")?
+        .0
+        .parse()
+        .ok()
+}
+
+/// Classify skid-infra-marked rows' terminal attempts as
+/// infrastructure errors. Runs after [`apply_skip_markers`], so every
+/// row carries classified attempts. A marker naming a test with no
+/// terminal row, more than one row, a passed row or a skipped row
+/// refuses the report: the helper records the marker only after its
+/// whole skid budget ended in typed refusals, and the caller's
+/// assertion on the final refusal is what fails the raw row — a pass
+/// or a skip beside the marker contradicts that, and guessing would
+/// launder it. The row stays a non-pass (the step still fails at this
+/// layer); only its terminal cause changes, from an ordinary failure
+/// to the infrastructure verdict the marker names.
+fn apply_skid_infra_markers(
+    results: Vec<TestResult>,
+    markers: &[SkipMarker],
+) -> Result<Vec<TestResult>, String> {
+    let mut results = results;
+    for marker in markers {
+        let matches: Vec<usize> = results
+            .iter()
+            .enumerate()
+            .filter(|(_, result)| {
+                let test = result.id.rsplit_once('$').map_or(result.id.as_str(), |(_, test)| test);
+                test == marker.name || test.ends_with(&format!("::{}", marker.name))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let [index] = matches.as_slice() else {
+            return Err(format!(
+                "nextest-test-results: skid-infra marker for {:?} matches {} terminal row(s); refusing to guess",
+                marker.name,
+                matches.len()
+            ));
+        };
+        if skid_infra_claimed_attempts(&marker.reason) != Some(SKID_INFRA_ATTEMPTS) {
+            return Err(format!(
+                "nextest-test-results: skid-infra marker for {:?} does not claim the shared skid budget of {SKID_INFRA_ATTEMPTS} attempts (reason {:?}); refusing to reclassify it",
+                marker.name, marker.reason
+            ));
+        }
+        let row = &results[*index];
+        if row.passed || row.is_skipped() {
+            return Err(format!(
+                "nextest-test-results: skid-infra marker for {:?} names a test that did not fail; refusing to reclassify it",
+                marker.name
+            ));
+        }
+        let mut attempts = row.attempt_results.clone().ok_or_else(|| {
+            format!(
+                "nextest-test-results: skid-infra marker for {:?} names a row without classified attempts",
+                marker.name
+            )
+        })?;
+        let terminal = attempts.pop().expect("classified attempts are nonempty");
+        if terminal.outcome != TestAttemptOutcome::Failed {
+            return Err(format!(
+                "nextest-test-results: skid-infra marker for {:?} names a row whose terminal attempt is {}, not a failure",
+                marker.name,
+                terminal.outcome.value()
+            ));
+        }
+        attempts.push(TestAttemptResult::new(
+            row.attempts,
+            TestAttemptOutcome::InfrastructureError,
+            Some(format!("SKID-INFRA: {}", marker.reason)),
+        )?);
+        results[*index] = TestResult::with_attempt_results(row.id.clone(), false, attempts)?;
     }
     Ok(results)
 }
@@ -1110,6 +1227,13 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), ProducerError> {
                 .into(),
         );
     }
+    let skid_infra_markers = read_skid_infra_markers()?;
+    if !skid_infra_markers.is_empty() && !schema_5 {
+        return Err(
+            "nextest-test-results: skid-infra markers were recorded but this node has not opted into schema 5 (HERMIT_NEXTEST_RESULTS_SCHEMA=5); refusing to fold them into ordinary failures"
+                .into(),
+        );
+    }
     let cpu_report = match (attempt_records, binary_map, cpu_report) {
         (Some(records), Some(binary_map), Some(output)) => {
             let report = reconcile_cpu_attempts(&parsed, Path::new(&records), &binary_map)?;
@@ -1119,7 +1243,10 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), ProducerError> {
         _ => unreachable!("argument pairing was checked above"),
     };
     let results = if schema_5 {
-        apply_skip_markers(parsed.results, &markers)?
+        apply_skid_infra_markers(
+            apply_skip_markers(parsed.results, &markers)?,
+            &skid_infra_markers,
+        )?
     } else {
         parsed.results
     };
@@ -2142,6 +2269,105 @@ mod tests {
                 .unwrap_err()
                 .contains("matches 2")
         );
+    }
+
+    #[test]
+    fn skid_infra_markers_reclassify_failed_rows_and_refuse_the_rest() {
+        // Parse: the skid-infra sidecar has the skip sidecar's shape and
+        // strictness, under its own prefix.
+        assert_eq!(
+            parse_skid_infra_sidecar(
+                b"HERMIT-SKID-INFRA: spinner\tall 5 attempt(s) exited 122; verdict SKID-INFRA\n"
+            )
+            .unwrap(),
+            vec![SkipMarker {
+                name: "spinner".into(),
+                reason: "all 5 attempt(s) exited 122; verdict SKID-INFRA".into(),
+            }]
+        );
+        assert!(parse_skid_infra_sidecar(b"HERMIT-TEST-SKIP: a\tb\n").is_err());
+        assert!(parse_skid_infra_sidecar(b"HERMIT-SKID-INFRA: a\tb").is_err());
+
+        let rows = vec![
+            TestResult::new("suite$spinner".into(), false, 1).unwrap(),
+            TestResult::new("suite$runs".into(), true, 1).unwrap(),
+            TestResult::new("suite$fails".into(), false, 1).unwrap(),
+        ];
+        let classified = apply_skip_markers(rows.clone(), &[]).unwrap();
+        let marker = SkipMarker {
+            name: "spinner".into(),
+            reason: "all 5 attempt(s) exited 122; verdict SKID-INFRA (not a test failure)"
+                .into(),
+        };
+        let reclassified = apply_skid_infra_markers(classified, &[marker]).unwrap();
+        // Still a non-pass, but its terminal cause is the infrastructure
+        // verdict, not an ordinary failure; the unmarked failure beside
+        // it stays an ordinary failure.
+        assert!(!reclassified[0].passed && !reclassified[0].is_skipped());
+        let terminal = reclassified[0].attempt_results.as_ref().unwrap().last().unwrap();
+        assert_eq!(terminal.outcome, TestAttemptOutcome::InfrastructureError);
+        assert!(
+            terminal.detail.as_deref().unwrap().starts_with("SKID-INFRA: "),
+            "{terminal:?}"
+        );
+        let other = reclassified[2].attempt_results.as_ref().unwrap().last().unwrap();
+        assert_eq!(other.outcome, TestAttemptOutcome::Failed);
+        // The schema-5 report round-trips with the reclassified attempt.
+        let report = TestResults::skipped(3, 0, reclassified).unwrap();
+        let scratch = Scratch::new();
+        let path = scratch.0.join("skid-infra.json");
+        publish_with_recovery(&report, &path, true).unwrap();
+        assert_eq!(
+            TestResults::from_declared_schema_json_slice(&fs::read(&path).unwrap(), 5).unwrap(),
+            report
+        );
+
+        // A marker for a passed test, an absent test, or a skipped test
+        // each refuse: only a failed row can carry the verdict.
+        let classified = apply_skip_markers(rows.clone(), &[]).unwrap();
+        for (name, needle) in [("runs", "did not fail"), ("never_ran", "matches 0")] {
+            let marker = SkipMarker {
+                name: name.into(),
+                reason: "all 5 attempt(s) exited 122; verdict SKID-INFRA".into(),
+            };
+            assert!(
+                apply_skid_infra_markers(classified.clone(), &[marker])
+                    .unwrap_err()
+                    .contains(needle),
+                "{name}"
+            );
+        }
+        // A marker claiming a bound below the shared skid budget (a
+        // single-attempt probe, a 3-attempt helper) is not an exhaustion.
+        for claimed in ["all 1 attempt(s) exited 122; verdict SKID-INFRA",
+                        "all 3 attempt(s) exited 122; verdict SKID-INFRA",
+                        "verdict SKID-INFRA"] {
+            let marker = SkipMarker {
+                name: "spinner".into(),
+                reason: claimed.into(),
+            };
+            assert!(
+                apply_skid_infra_markers(classified.clone(), &[marker])
+                    .unwrap_err()
+                    .contains("shared skid budget"),
+                "{claimed}"
+            );
+        }
+        let skipped = apply_skip_markers(
+            rows.clone(),
+            &[SkipMarker {
+                name: "runs".into(),
+                reason: "no /dev/kvm on this host".into(),
+            }],
+        )
+        .unwrap();
+        let marker = SkipMarker {
+            name: "runs".into(),
+            reason: "all 5 attempt(s) exited 122; verdict SKID-INFRA".into(),
+        };
+        assert!(apply_skid_infra_markers(skipped, &[marker])
+            .unwrap_err()
+            .contains("did not fail"));
     }
 
     #[test]

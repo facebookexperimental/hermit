@@ -26,7 +26,7 @@ use crate::cli_wrapper::*;
 
 /// Attempts at one iteration while Hermit refuses its runs for PMU skid
 /// overshoot.
-const SKID_ATTEMPTS: u32 = 4;
+const SKID_ATTEMPTS: u32 = detcore_model::SKID_RETRY_MAX_ATTEMPTS;
 
 /// The prefix of the line Hermit prints when it refuses a run for PMU skid
 /// overshoot (`classify_failure` in hermit-cli/src/bin/hermit/main.rs).
@@ -193,7 +193,8 @@ impl ChaosStressOpts {
                         attempt += 1;
                     }
                     RunOutcome::SkidRefused(refusal) => anyhow::bail!(
-                        "Hermit refused run #{i} for PMU skid overshoot on all {SKID_ATTEMPTS} attempts: {refusal}"
+                        "Hermit refused run #{i} for PMU skid overshoot on all {SKID_ATTEMPTS} attempts; verdict {} (not a test failure): {refusal}",
+                        detcore_model::SKID_INFRA_VERDICT
                     ),
                     outcome => break outcome,
                 }

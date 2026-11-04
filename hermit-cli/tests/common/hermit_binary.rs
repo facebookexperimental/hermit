@@ -21,11 +21,12 @@ use std::sync::OnceLock;
 pub mod skid_overshoot;
 
 /// Attempts a Hermit run gets when Hermit refuses it for a late PMU interrupt
-/// (exit 122, `cause=skid-overshoot`). A refusal measures the host's
-/// interrupt latency under load, not the guest
+/// (exit 122, `cause=skid-overshoot`): the one shared skid budget
+/// ([`detcore_model::SKID_RETRY_MAX_ATTEMPTS`]). A refusal measures the
+/// host's interrupt latency under load, not the guest
 /// (https://github.com/rrnewton/hermit/issues/1845).
 #[allow(dead_code)]
-pub const SKID_ATTEMPTS: u32 = 5;
+pub const SKID_ATTEMPTS: u32 = detcore_model::SKID_RETRY_MAX_ATTEMPTS;
 
 /// Run `command` (a direct or timeout-wrapped Hermit command), and run it
 /// again, up to [`SKID_ATTEMPTS`] in all, only after an attempt whose output
@@ -44,12 +45,17 @@ pub fn hermit_output(label: &str, command: &mut Command) -> Output {
 #[allow(dead_code)]
 pub fn hermit_output_attempts(label: &str, max_attempts: u32, command: &mut Command) -> Output {
     pin_canonical_epoch(command);
-    skid_overshoot::retry_typed_skid_refusal(label, max_attempts, || {
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to start {label}: {command:?}: {error}"));
-        (output, ())
-    })
+    skid_overshoot::retry_typed_skid_refusal(
+        label,
+        max_attempts,
+        || {
+            let output = command
+                .output()
+                .unwrap_or_else(|error| panic!("failed to start {label}: {command:?}: {error}"));
+            (output, ())
+        },
+        &|_| {},
+    )
     .1
 }
 
@@ -59,7 +65,8 @@ pub fn hermit_output_attempts(label: &str, max_attempts: u32, command: &mut Comm
 /// the state of the attempt that is returned comes back with it.
 #[allow(dead_code)]
 pub fn hermit_output_with<T>(label: &str, attempt: impl FnMut() -> (Output, T)) -> (Output, T) {
-    let (_, output, kept) = skid_overshoot::retry_typed_skid_refusal(label, SKID_ATTEMPTS, attempt);
+    let (_, output, kept) =
+        skid_overshoot::retry_typed_skid_refusal(label, SKID_ATTEMPTS, attempt, &|_| {});
     (output, kept)
 }
 

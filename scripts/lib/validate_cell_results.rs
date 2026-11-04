@@ -14,6 +14,8 @@ use hermit_manifest_plan::ledger::CellResult as LedgerCellResult;
 use hermit_manifest_plan::ledger::CellResultsArtifact;
 use hermit_manifest_plan::ledger::CellResultsEvidence;
 use hermit_manifest_plan::ledger::CellVerdict;
+use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
+use hermit_manifest_plan::runner::history_past_generic_bound_is_skid_qualified;
 use hermit_manifest_plan::runner::outcome_after_retries;
 use serde_json::Value;
 use sha2::Digest;
@@ -445,6 +447,36 @@ fn cell_verdict(row: &Value) -> Result<CellVerdict, String> {
     hermit_manifest_plan::ledger::cell_verdict_from_source(row)
 }
 
+/// Refuse a retained history past the generic attempt bound unless every
+/// attempt before the final one re-decides as skid-only from its full
+/// retained row (`history_past_generic_bound_is_skid_qualified`). The
+/// outcome-string selector cannot make that distinction, so both retain
+/// paths apply this before selecting.
+fn require_skid_qualified_history(rows: &[(u64, &Value)]) -> Result<(), String> {
+    if rows.iter().map(|(attempt, _)| *attempt).max().unwrap_or(0) <= MAX_ATTEMPTS_PER_CELL {
+        return Ok(());
+    }
+    let full_rows = rows
+        .iter()
+        .map(|(_, row)| {
+            serde_json::from_value::<hermit_manifest_plan::runner::CellResult>((*row).clone())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!(
+                "cell result history past the generic bound is not skid-qualified: row does not decode as a cell result: {error}"
+            )
+        })?;
+    if history_past_generic_bound_is_skid_qualified(&full_rows) {
+        Ok(())
+    } else {
+        Err(format!(
+            "cell result history of {} attempt(s) exceeds the generic maximum of {MAX_ATTEMPTS_PER_CELL} without skid-only evidence for every attempt before the final one",
+            rows.len()
+        ))
+    }
+}
+
 fn sort_key(value: &Value) -> Result<CellIdentity, String> {
     identity(value)
 }
@@ -817,6 +849,9 @@ pub fn retain_snapshot(
         .into_iter()
         .map(|(identity, mut rows)| {
             rows.sort_by_key(|(attempt, _)| *attempt);
+            require_skid_qualified_history(
+                &rows.iter().map(|(a, r)| (*a, r)).collect::<Vec<_>>(),
+            )?;
             let outcome = outcome_after_retries(rows.iter().map(|(attempt, row)| {
                 Ok((*attempt, string(row, "outcome")?))
             }).collect::<Result<Vec<_>, String>>()?)?;
@@ -1167,6 +1202,9 @@ fn retain_v10_with_contract(
         }) {
             return Err("selected cell emitted the retired ptrace reference comparison".into());
         }
+        require_skid_qualified_history(
+            &rows.iter().map(|(a, r)| (*a, r)).collect::<Vec<_>>(),
+        )?;
         let outcome = outcome_after_retries(
             rows.iter()
                 .map(|(attempt, row)| Ok((*attempt, string(row, "outcome")?)))

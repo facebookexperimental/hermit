@@ -94,32 +94,90 @@ pub const SKID_RETRY_RECORD_ENV: &str = "HERMIT_SKID_RETRY_RECORD";
 /// `ci/run-nextest-counted.sh` beside [`SKID_RETRY_RECORD_ENV`].
 pub const RETRY_RECORD_ENV: &str = "HERMIT_RETRY_RECORD_FILE";
 
+/// The distinct verdict when every attempt was a typed skid refusal:
+/// the one shared spelling ([`detcore_model::SKID_INFRA_VERDICT`]).
+pub const SKID_INFRA_VERDICT: &str = detcore_model::SKID_INFRA_VERDICT;
+
+/// The file `ci/run-nextest-counted.sh` collects exhausted-skid tests in,
+/// one `HERMIT-SKID-INFRA: <test>\t<reason>` line each, from which
+/// `ci/nextest-test-results.rs` classifies the failed test's terminal
+/// attempt as an infrastructure error instead of an ordinary failure.
+/// Unset outside that runner.
+pub const SKID_INFRA_FILE_ENV: &str = "HERMIT_SKID_INFRA_FILE";
+
+/// Record that the running test exhausted its skid budget on typed
+/// refusals only: print the `HERMIT-SKID-INFRA` marker for humans and
+/// append it, as one `write()` on an `O_APPEND` descriptor, to the
+/// [`SKID_INFRA_FILE_ENV`] sidecar the counted runner reads. Only
+/// [`skid_overshoot_refusal`]-verified exhaustion reaches this (see
+/// [`retry_typed_skid_refusal`]), so no other failure can claim the
+/// verdict. A marker that cannot be written fails the test, so the
+/// count never under-reports silently.
+pub fn record_skid_infra(name: &str, refusal: &str, max_attempts: u32) {
+    use std::io::Write;
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("unnamed")
+        .to_owned();
+    let reason = format!(
+        "all {max_attempts} attempt(s) exited {HERMIT_POLICY_REFUSAL_EXIT} with `{refusal}`; verdict {SKID_INFRA_VERDICT} (not a test failure)"
+    );
+    eprintln!("SKID-INFRA {name}: {reason}");
+    println!("HERMIT-SKID-INFRA: {test}\t{reason}");
+    let Some(path) = std::env::var_os(SKID_INFRA_FILE_ENV).filter(|path| !path.is_empty()) else {
+        return;
+    };
+    let line = format!("HERMIT-SKID-INFRA: {test}\t{reason}\n");
+    assert!(
+        line.len() < 4096,
+        "skid-infra marker for {test} is {} bytes; keep it under one PIPE_BUF line",
+        line.len()
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap_or_else(|error| panic!("cannot open {SKID_INFRA_FILE_ENV}={path:?}: {error}"));
+    let written = file
+        .write(line.as_bytes())
+        .unwrap_or_else(|error| panic!("cannot write {SKID_INFRA_FILE_ENV}={path:?}: {error}"));
+    assert_eq!(
+        written,
+        line.len(),
+        "a skid-infra marker must land in one write() so parallel appends cannot interleave"
+    );
+}
+
 /// One `RetryRecordV1` JSON line for a test that needed `retries` skid
-/// retries and then finished with `final_pass`.
-pub fn retry_record_json(name: &str, attempts: u64, final_pass: bool) -> String {
+/// retries and then finished with outcome `final_outcome`: `PASS`,
+/// `FAIL`, or [`SKID_INFRA_VERDICT`] when every attempt was a typed skid
+/// refusal (its final class stays `skid_overshoot`, never
+/// `product_failure`).
+pub fn retry_record_json(name: &str, attempts: u64, final_outcome: &str) -> String {
     let retries = attempts.saturating_sub(1);
     let mut outcomes = vec!["ERROR"; retries as usize];
-    outcomes.push(if final_pass { "PASS" } else { "FAIL" });
+    outcomes.push(final_outcome);
     let mut classes: Vec<Option<&str>> = vec![Some("skid_overshoot"); retries as usize];
-    classes.push(if final_pass {
-        None
-    } else {
-        Some("product_failure")
+    classes.push(match final_outcome {
+        "PASS" => None,
+        SKID_INFRA_VERDICT => Some("skid_overshoot"),
+        _ => Some("product_failure"),
     });
     serde_json::json!({
         "test": name, "mode": "nextest", "backend": null,
         "attempts": attempts, "retries": retries,
         "attempt_outcomes": outcomes, "attempt_classes": classes,
-        "final_outcome": if final_pass { "PASS" } else { "FAIL" },
-        "flaky_pass": final_pass && retries > 0,
+        "final_outcome": final_outcome,
+        "flaky_pass": final_outcome == "PASS" && retries > 0,
     })
     .to_string()
 }
 
-/// Append the [`RETRY_RECORD_ENV`] line for a finished retried test.
-fn record_retry(name: &str, attempts: u64, final_pass: bool) {
+/// Append the [`RETRY_RECORD_ENV`] line for a finished retried test. A
+/// `SKID-INFRA` finish is recorded even at one attempt: it is a verdict,
+/// not a retry count.
+fn record_retry(name: &str, attempts: u64, final_outcome: &str) {
     use std::io::Write;
-    if attempts <= 1 {
+    if attempts <= 1 && final_outcome != SKID_INFRA_VERDICT {
         return;
     }
     let Some(path) = std::env::var_os(RETRY_RECORD_ENV).filter(|path| !path.is_empty()) else {
@@ -130,7 +188,7 @@ fn record_retry(name: &str, attempts: u64, final_pass: bool) {
         .create(true)
         .open(&path)
         .unwrap_or_else(|error| panic!("cannot open {RETRY_RECORD_ENV}={path:?}: {error}"));
-    file.write_all(format!("{}\n", retry_record_json(name, attempts, final_pass)).as_bytes())
+    file.write_all(format!("{}\n", retry_record_json(name, attempts, final_outcome)).as_bytes())
         .unwrap_or_else(|error| panic!("cannot write {RETRY_RECORD_ENV}={path:?}: {error}"));
 }
 
@@ -183,17 +241,46 @@ pub fn record_skid_retry(line: &str) {
 /// number and output of the first attempt that is not such a refusal, or of
 /// the last attempt, with whatever `attempt` returned beside its output; the
 /// caller checks that output as it would check a single run. Each retried
-/// attempt prints a `SKID-RETRY` line with its refusal to stderr.
+/// attempt prints a `SKID-RETRY` line with its refusal to stderr. When the
+/// last attempt is also such a refusal the budget is exhausted: the test's
+/// verdict is [`SKID_INFRA_VERDICT`], recorded with [`record_skid_infra`]
+/// before the final output returns to the caller (whose assertion on it
+/// still fails the raw nextest row, which the counted runner then
+/// classifies as an infrastructure error, not a test failure). The
+/// verdict is recorded only when the exhausted bound is the one shared
+/// skid budget ([`detcore_model::SKID_RETRY_MAX_ATTEMPTS`]): a caller
+/// that deliberately runs fewer attempts (a single-attempt probe) has
+/// not exhausted that budget, so its refusal stays an ordinary result
+/// for the caller to fail on. `validate_final` is the caller's own
+/// check of the final refused output (guest stdout/disposition beyond
+/// the typed refusal); it runs before anything is recorded, so a final
+/// output that fails it stays an ordinary failure with no marker. The
+/// skid attempts' guest stdout must also be identical across attempts,
+/// as one deterministic run's refusals produce.
 pub fn retry_typed_skid_refusal<T>(
     name: &str,
     max_attempts: u32,
     mut attempt: impl FnMut() -> (Output, T),
+    validate_final: &dyn Fn(&Output),
 ) -> (u32, Output, T) {
+    let mut first_skid_stdout: Option<Vec<u8>> = None;
     for number in 1..=max_attempts {
         let (output, kept) = attempt();
-        if number < max_attempts {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if let Some(refusal) = skid_overshoot_refusal(output.status.code(), &stderr) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Some(refusal) = skid_overshoot_refusal(output.status.code(), &stderr) {
+            let refusal = refusal.to_owned();
+            // Every skid attempt of one deterministic run produces the
+            // same guest stdout; a final attempt whose stdout differs
+            // from the first skid attempt's carries a second outcome
+            // beside the refusal and earns no verdict.
+            let stdout_stable = match &first_skid_stdout {
+                None => {
+                    first_skid_stdout = Some(output.stdout.clone());
+                    true
+                }
+                Some(first) => *first == output.stdout,
+            };
+            if number < max_attempts {
                 let line = format!(
                     "SKID-RETRY {name}: attempt {number} of at most {max_attempts} exited \
                      {HERMIT_POLICY_REFUSAL_EXIT} with `{refusal}`; running again \
@@ -203,8 +290,27 @@ pub fn retry_typed_skid_refusal<T>(
                 record_skid_retry(&line);
                 continue;
             }
+            if max_attempts == detcore_model::SKID_RETRY_MAX_ATTEMPTS && stdout_stable {
+                // The caller's own check of the final output runs before
+                // anything is recorded: a check that panics leaves an
+                // ordinary failure and no marker.
+                validate_final(&output);
+                record_skid_infra(name, &refusal, max_attempts);
+                record_retry(name, u64::from(number), SKID_INFRA_VERDICT);
+            } else {
+                record_retry(name, u64::from(number), "FAIL");
+            }
+            return (number, output, kept);
         }
-        record_retry(name, u64::from(number), output.status.code() == Some(0));
+        record_retry(
+            name,
+            u64::from(number),
+            if output.status.code() == Some(0) {
+                "PASS"
+            } else {
+                "FAIL"
+            },
+        );
         return (number, output, kept);
     }
     unreachable!("the last attempt always returns")

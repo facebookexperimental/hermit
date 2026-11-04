@@ -4073,7 +4073,29 @@ impl RunContext {
 }
 
 /// One initial execution plus one retry, scoped to one selected cell.
+/// This is the generic per-cell retry bound (product, timeout and
+/// host-input causes); a typed skid-overshoot-only history has its own
+/// separate budget ([`MAX_SKID_ATTEMPTS_PER_CELL`]).
 pub const MAX_ATTEMPTS_PER_CELL: u64 = 2;
+
+/// Attempts a cell whose every attempt is a typed PMU skid overshoot and
+/// nothing else ([`skid_overshoot_only_reports`]) gets in all: the one
+/// shared skid budget ([`detcore_model::SKID_RETRY_MAX_ATTEMPTS`]),
+/// separate from the generic [`MAX_ATTEMPTS_PER_CELL`] bound. A history
+/// may run past the generic bound only while every attempt so far is
+/// skid-only; the first non-skid attempt returns the cell to the generic
+/// bound. Exhausting this budget selects the [`SKID_INFRA_VERDICT`]
+/// verdict, not a test failure.
+pub const MAX_SKID_ATTEMPTS_PER_CELL: u64 = detcore_model::SKID_RETRY_MAX_ATTEMPTS as u64;
+
+/// The selected verdict of a cell whose attempts were all typed PMU skid
+/// overshoots and nothing else: the host's interrupt latency refused
+/// every measurement, so the cell produced no product result. The one
+/// shared spelling ([`detcore_model::SKID_INFRA_VERDICT`]). Per-attempt
+/// rows keep their `ERROR` infrastructure classification (every raw-row
+/// reader accepts an `infrastructure_error` report only on that
+/// classification); this names what the whole history selected.
+pub const SKID_INFRA_VERDICT: &str = detcore_model::SKID_INFRA_VERDICT;
 
 /// Select the outcome that the framework reports for one cell's complete
 /// attempt history.
@@ -4093,9 +4115,18 @@ pub fn outcome_after_retries<'a>(
     let mut saw_host_inapplicable = false;
 
     for (attempt, outcome) in attempts {
-        if attempt > MAX_ATTEMPTS_PER_CELL {
+        // The hard ceiling is the skid budget: a history past the generic
+        // [`MAX_ATTEMPTS_PER_CELL`] bound is produced only by skid-only
+        // retries. This selector sees outcome strings only, so it cannot
+        // check that evidence itself: readers must first apply
+        // `history_past_generic_bound_is_skid_qualified` to the full rows
+        // (the harness, import policy, framework census and validate's
+        // cell-results reader do; `cell_result_after_retries` applies it
+        // internally). Selection itself is unchanged — a product failure
+        // anywhere in a long history still selects FAIL.
+        if attempt > MAX_SKID_ATTEMPTS_PER_CELL {
             return Err(format!(
-                "cell result attempt {attempt} exceeds the shared maximum of {MAX_ATTEMPTS_PER_CELL}"
+                "cell result attempt {attempt} exceeds the shared maximum of {MAX_SKID_ATTEMPTS_PER_CELL}"
             ));
         }
         if attempt != expected_attempt {
@@ -4144,10 +4175,97 @@ pub fn outcome_after_retries<'a>(
     })
 }
 
+/// Termination grace per attempt in the generic lifecycle wall below,
+/// the same 10 s the validate and pressure headroom proofs allow.
+pub const SKID_LIFECYCLE_GRACE_SECONDS: u64 = 10;
+
+/// The wall-clock lifecycle the generic attempt bound was sized
+/// against for one cell: [`MAX_ATTEMPTS_PER_CELL`] attempts, each with
+/// two wall windows (preparation + execution, the non-prebuilt worst
+/// case) at the cell's `timeout_seconds`, plus grace per attempt.
+/// Skid retries past the generic bound must fit inside this same
+/// lifecycle, so raising the skid attempt count never widens the
+/// enclosing node timeout any node's headroom proof was sized on:
+/// fast skid-prone cells get all five attempts, a cell whose attempts
+/// each burn their full wall window stops at the generic bound.
+pub fn generic_lifecycle_wall_ms(timeout_seconds: u64) -> u128 {
+    u128::from(MAX_ATTEMPTS_PER_CELL)
+        * (2 * u128::from(timeout_seconds) + u128::from(SKID_LIFECYCLE_GRACE_SECONDS))
+        * 1000
+}
+
+/// The cumulative measured wall time of `results`, or `None` when any
+/// row that reached execution recorded no duration.
+fn cumulative_duration_ms(results: &[CellResult]) -> Option<u128> {
+    results
+        .iter()
+        .map(|result| result.duration_ms)
+        .sum::<Option<u128>>()
+}
+
+/// Whether a history past the generic [`MAX_ATTEMPTS_PER_CELL`] bound is
+/// admitted by retained skid-only evidence: every attempt before the
+/// final one must re-decide as skid-only
+/// ([`skid_overshoot_only_reports`]) and the whole history's measured
+/// wall time must fit the generic lifecycle
+/// ([`generic_lifecycle_wall_ms`]) — exactly the conditions under
+/// which the harness launched each attempt past the generic bound. A
+/// history at or below the generic bound needs no such evidence.
+/// Raw-row readers that select an outcome from outcome strings alone
+/// (`outcome_after_retries`) must apply this check (or select through
+/// [`cell_result_after_retries`], which applies it) before admitting a
+/// longer history.
+pub fn history_past_generic_bound_is_skid_qualified(results: &[CellResult]) -> bool {
+    let Some(last_attempt) = results.iter().map(|result| result.attempt).max() else {
+        return true;
+    };
+    if last_attempt <= MAX_ATTEMPTS_PER_CELL {
+        return true;
+    }
+    let Some(last) = results.iter().max_by_key(|result| result.attempt) else {
+        return true;
+    };
+    let Some(cumulative) = cumulative_duration_ms(results) else {
+        return false;
+    };
+    cumulative <= generic_lifecycle_wall_ms(last.timeout_seconds)
+        && results
+            .iter()
+            .filter(|result| result.attempt < last_attempt)
+            .all(|result| skid_overshoot_only_reports(result).is_some())
+}
+
+/// Whether one more skid attempt of the cell whose history ends in
+/// `results` can start without the history leaving the generic
+/// lifecycle: the measured wall so far plus one full attempt window
+/// (two wall windows at the cell's timeout, plus grace) must fit
+/// [`generic_lifecycle_wall_ms`]. An attempt with no recorded duration
+/// is charged its full timeout, never zero.
+pub fn skid_retry_within_generic_lifecycle(results: &[CellResult]) -> bool {
+    let Some(last) = results.iter().max_by_key(|result| result.attempt) else {
+        return true;
+    };
+    let timeout_ms = u128::from(last.timeout_seconds) * 1000;
+    let spent: u128 = results
+        .iter()
+        .map(|result| result.duration_ms.unwrap_or(timeout_ms))
+        .sum();
+    let reserve = 2 * timeout_ms + u128::from(SKID_LIFECYCLE_GRACE_SECONDS) * 1000;
+    spent + reserve <= generic_lifecycle_wall_ms(last.timeout_seconds)
+}
+
 /// Return the framework result row that carries the outcome selected by
 /// [`outcome_after_retries`]. All attempt rows remain in `results.jsonl`; this
-/// row is the one used for the cell's JUnit and summary entry.
+/// row is the one used for the cell's JUnit and summary entry. A history
+/// past the generic bound is refused unless it is skid-qualified
+/// ([`history_past_generic_bound_is_skid_qualified`]).
 pub fn cell_result_after_retries(results: &[CellResult]) -> Result<&CellResult, String> {
+    if !history_past_generic_bound_is_skid_qualified(results) {
+        return Err(format!(
+            "cell result history of {} attempt(s) exceeds the generic maximum of {MAX_ATTEMPTS_PER_CELL} without skid-only evidence for every attempt before the final one",
+            results.len()
+        ));
+    }
     let outcome = outcome_after_retries(
         results
             .iter()
@@ -4461,6 +4579,22 @@ pub fn skid_overshoot_only_reports(result: &CellResult) -> Option<u64> {
         reports.checked_add(attempt_skid_overshoot_reports(
             attempt, declared, accepted, backend, comparator,
         )?)
+    })
+}
+
+/// The total number of `HERMIT_SKID_OVERSHOOT` reports behind a cell's
+/// complete attempt history, when, and only when, every attempt in the
+/// history is skid-only ([`skid_overshoot_only_reports`]): the cell's
+/// selected verdict is [`SKID_INFRA_VERDICT`]. Any other history — a
+/// pass, a product failure, an ordinary infrastructure error, a mixed
+/// history — returns `None`, so a real failure beside a skid can never
+/// be reported as skid infrastructure.
+pub fn skid_infra_reports(results: &[CellResult]) -> Option<u64> {
+    if results.is_empty() {
+        return None;
+    }
+    results.iter().try_fold(0u64, |reports, result| {
+        reports.checked_add(skid_overshoot_only_reports(result)?)
     })
 }
 
@@ -11716,6 +11850,24 @@ mod tests {
             outcome_after_retries([(1, "HOST-INAPPLICABLE")]).unwrap(),
             "HOST-INAPPLICABLE"
         );
+        // A skid-budget history runs past the generic bound: selection is
+        // unchanged, so a late pass recovers and a product failure
+        // anywhere still wins over later infrastructure errors.
+        assert_eq!(
+            outcome_after_retries([
+                (1, "ERROR"),
+                (2, "ERROR"),
+                (3, "ERROR"),
+                (4, "ERROR"),
+                (5, "PASS")
+            ])
+            .unwrap(),
+            "PASS"
+        );
+        assert_eq!(
+            outcome_after_retries([(1, "ERROR"), (2, "ERROR"), (3, "FAIL"), (4, "ERROR")]).unwrap(),
+            "FAIL"
+        );
     }
 
     #[test]
@@ -11733,8 +11885,15 @@ mod tests {
             ),
             (vec![(1, "UNKNOWN")], "unknown outcome \"UNKNOWN\""),
             (
-                vec![(1, "FAIL"), (2, "ERROR"), (3, "PASS")],
-                "exceeds the shared maximum of 2",
+                vec![
+                    (1, "FAIL"),
+                    (2, "ERROR"),
+                    (3, "ERROR"),
+                    (4, "ERROR"),
+                    (5, "ERROR"),
+                    (6, "PASS"),
+                ],
+                "exceeds the shared maximum of 5",
             ),
         ] {
             let error = outcome_after_retries(attempts).unwrap_err();
@@ -11777,6 +11936,55 @@ mod tests {
             (selected.outcome.as_str(), selected.attempt, attempts),
             ("PASS", 1, 1)
         );
+    }
+
+    #[test]
+    fn selected_retry_row_refuses_a_long_history_without_skid_evidence() {
+        // A pure product history past the generic bound must not select
+        // PASS through the widened skid ceiling: no row carries skid-only
+        // evidence, so the selector refuses it by name.
+        let mut product = Vec::new();
+        for (attempt, outcome) in [(1, "FAIL"), (2, "FAIL"), (3, "PASS")] {
+            let mut row = cell_result_that_located_nothing();
+            row.outcome = outcome.into();
+            row.attempt = attempt;
+            product.push(row);
+        }
+        let error = cell_result_after_retries(&product).unwrap_err();
+        assert!(error.contains("without skid-only evidence"), "{error:?}");
+        assert!(!history_past_generic_bound_is_skid_qualified(&product));
+        // At the generic bound the same rows need no skid evidence.
+        assert!(history_past_generic_bound_is_skid_qualified(&product[..2]));
+    }
+
+    #[test]
+    fn selected_retry_row_admits_a_proven_five_skid_history() {
+        // The qualifying direction: five attempts that each re-decide as
+        // skid-only from their retained evidence are admitted past the
+        // generic bound and select their infrastructure ERROR.
+        let skid_row = |attempt: u64| {
+            let mut row = verify_row_from_attempts(vec![attempt_from_script(
+                "ptrace",
+                &format!("printf %s \"$1\" > \"$2\"; {SKID_STDERR}; exit 122"),
+                Some(&skid_report(2)),
+            )]);
+            row.attempt = attempt;
+            row
+        };
+        let history: Vec<CellResult> = (1..=5).map(skid_row).collect();
+        assert!(history_past_generic_bound_is_skid_qualified(&history));
+        assert_eq!(skid_infra_reports(&history), Some(10));
+        let (selected, attempts) = cell_result_and_attempts_after_retries(&history).unwrap();
+        assert_eq!(
+            (selected.outcome.as_str(), selected.attempt, attempts),
+            ("ERROR", 5, 5)
+        );
+        // One product attempt in place of a skid attempt disqualifies
+        // the whole long history.
+        let mut mixed = history.clone();
+        mixed[2].outcome = "FAIL".into();
+        assert!(!history_past_generic_bound_is_skid_qualified(&mixed));
+        assert_eq!(skid_infra_reports(&mixed), None);
     }
 
     fn recipe(ci: bool) -> TestRecipe {

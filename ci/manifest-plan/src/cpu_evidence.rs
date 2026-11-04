@@ -878,7 +878,7 @@ impl CellCpuObservationsV1 {
             "empty cell binding",
         )?;
         require(
-            b.outer_attempt > 0 && b.outer_attempt <= crate::runner::MAX_ATTEMPTS_PER_CELL,
+            b.outer_attempt > 0 && b.outer_attempt <= crate::runner::MAX_SKID_ATTEMPTS_PER_CELL,
             "outer attempt out of range",
         )?;
         if let Some(backend) = nullable(&b.backend) {
@@ -1118,7 +1118,7 @@ impl CellCpuHistoryV1 {
         require(self.version == 1, "unknown history version")?;
         require(
             !self.attempts.is_empty()
-                && self.attempts.len() as u64 <= crate::runner::MAX_ATTEMPTS_PER_CELL,
+                && self.attempts.len() as u64 <= crate::runner::MAX_SKID_ATTEMPTS_PER_CELL,
             "history attempt population out of range",
         )?;
         require(

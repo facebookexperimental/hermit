@@ -60,7 +60,7 @@ mod skid_overshoot;
 
 /// Attempts at one case when its Hermit runs are refused for PMU skid
 /// overshoot, as hermit-cli's tests allow (`hermit_test::hermit_output`).
-const SKID_ATTEMPTS: u32 = 5;
+const SKID_ATTEMPTS: u32 = detcore_model::SKID_RETRY_MAX_ATTEMPTS;
 
 /// Wall bound for one hermit-verify run, which runs Hermit twice.
 const VERIFY_TIMEOUT: &str = "240s";
@@ -278,31 +278,36 @@ fn run_replay_with(binary: &Path, scenario: Option<&str>, mode: Mode, hermit_arg
         directory
     });
     let mut attempt = 0;
-    let (_, _, output) = skid_overshoot::retry_typed_skid_refusal(&name, SKID_ATTEMPTS, || {
-        attempt += 1;
-        if let Some(directory) = &artifact_directory {
-            let directory = directory.join(format!("attempt-{attempt}"));
-            std::fs::create_dir(&directory).unwrap_or_else(|error| {
-                panic!(
-                    "failed to reserve attempt artifacts {}: {error}",
-                    directory.display()
-                )
-            });
-            command.env("TEST_RESULT_ARTIFACTS_DIR", directory);
-        }
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
-        let judged = match refused_run_stderr(&output) {
-            Some(stderr) => Output {
-                status: ExitStatus::from_raw(detcore_model::HERMIT_POLICY_REFUSAL_EXIT << 8),
-                stdout: Vec::new(),
-                stderr: stderr.into_bytes(),
-            },
-            None => output.clone(),
-        };
-        (judged, output)
-    });
+    let (_, _, output) = skid_overshoot::retry_typed_skid_refusal(
+        &name,
+        SKID_ATTEMPTS,
+        || {
+            attempt += 1;
+            if let Some(directory) = &artifact_directory {
+                let directory = directory.join(format!("attempt-{attempt}"));
+                std::fs::create_dir(&directory).unwrap_or_else(|error| {
+                    panic!(
+                        "failed to reserve attempt artifacts {}: {error}",
+                        directory.display()
+                    )
+                });
+                command.env("TEST_RESULT_ARTIFACTS_DIR", directory);
+            }
+            let output = command
+                .output()
+                .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+            let judged = match refused_run_stderr(&output) {
+                Some(stderr) => Output {
+                    status: ExitStatus::from_raw(detcore_model::HERMIT_POLICY_REFUSAL_EXIT << 8),
+                    stdout: Vec::new(),
+                    stderr: stderr.into_bytes(),
+                },
+                None => output.clone(),
+            };
+            (judged, output)
+        },
+        &|_| {},
+    );
     assert!(
         output.status.success(),
         "{rendered} did not replay its recording\n{}",

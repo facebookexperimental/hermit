@@ -59,6 +59,41 @@ const _: () = assert!(
     "a refusal exiting 0 would report success"
 );
 
+/// Attempts a test harness gives a Hermit run refused only for a typed PMU
+/// skid overshoot (exit [`HERMIT_POLICY_REFUSAL_EXIT`],
+/// `cause=skid-overshoot`): one initial attempt plus four skid retries.
+/// In the manifest runner the attempts past the generic retry bound are
+/// additionally wall-bounded to that bound's lifecycle, so this count
+/// never widens an enclosing node timeout.
+///
+/// A skid refusal measures the host's PMU interrupt latency under load,
+/// not the guest (<https://github.com/rrnewton/hermit/issues/1845>), so its
+/// budget is separate from every generic retry budget (nextest's own
+/// retries, the manifest runner's per-cell retry). Every harness that
+/// retries such a refusal spells the bound from this one constant — the
+/// integration-test helper, the manifest runner's skid budget and the
+/// nextest CPU wrapper's retry credits (bound − 1) — instead of keeping a
+/// copy each. Exhausting it is a distinct infrastructure verdict
+/// (`SKID-INFRA`), never a test failure.
+///
+/// It lives here for the reason [`HERMIT_POLICY_REFUSAL_EXIT`] does: the
+/// integration tests, `hermit-verify` and the manifest-plan runner all
+/// depend on `detcore-model`, and on no common test crate.
+pub const SKID_RETRY_MAX_ATTEMPTS: u32 = 5;
+
+/// The distinct verdict a harness selects when the skid budget
+/// ([`SKID_RETRY_MAX_ATTEMPTS`]) is exhausted by typed skid-overshoot
+/// refusals and nothing else: the host refused every measurement, so
+/// there is no product result and no test failure. Spelled identically
+/// in the manifest runner, the nextest counted output and the
+/// validate-run verdict built on them.
+pub const SKID_INFRA_VERDICT: &str = "SKID-INFRA";
+
+const _: () = assert!(
+    SKID_RETRY_MAX_ATTEMPTS == 5,
+    "the skid budget is five attempts everywhere; a copy drifting from it is the defect this removes"
+);
+
 /// Exit status for a run that DEADLOCKED UNDER HERMIT'S MODEL: Detcore's
 /// scheduler found every remaining guest thread blocked on something no later
 /// turn can supply (its "Deadlock detected" report) and ended the run.

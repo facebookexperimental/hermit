@@ -91,9 +91,10 @@ const DYNAMIC_LIBRARY_PATH_ENV: &str = "LD_LIBRARY_PATH";
 // than the retry running on what the refused attempt left over. Nextest's
 // per-test wall limit still bounds the whole test.
 const SKID_RETRY_CREDIT_ENV: &str = "HERMIT_SKID_RETRY_CREDIT";
-/// The helper makes at most five attempts, so at most four retries earn a
-/// budget.
-const MAX_SKID_RETRY_CREDITS: u64 = 4;
+/// Derived from the one shared skid budget
+/// ([`detcore_model::SKID_RETRY_MAX_ATTEMPTS`]): at most bound − 1
+/// retries earn a budget.
+const MAX_SKID_RETRY_CREDITS: u64 = detcore_model::SKID_RETRY_MAX_ATTEMPTS as u64 - 1;
 const INFRASTRUCTURE_EXIT: u8 = 70;
 const CPU_TIMEOUT_EXIT: u8 = 124;
 const NON_SIGNAL_CAUSE_RESERVED: i32 = -1;
