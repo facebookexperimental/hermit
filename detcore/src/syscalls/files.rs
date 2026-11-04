@@ -21838,7 +21838,8 @@ mod inject_fstat_scratch {
         /// Where set, a `BlockingExternalIO` grant waits for this gate:
         /// the ordering control holds a grant pending and proves no
         /// post-grant receipt is emitted before it opens.
-        blocking_grant_gate: Option<std::sync::Arc<tokio::sync::Notify>>,
+        blocking_grant_gate:
+            Option<futures::future::Shared<futures::channel::oneshot::Receiver<()>>>,
     }
 
     impl ScriptedGuest {
@@ -21978,7 +21979,7 @@ mod inject_fstat_scratch {
                             matches!(id, crate::resources::ResourceID::BlockingExternalIO(_))
                         })
                     {
-                        gate.notified().await;
+                        let _ = gate.clone().await;
                     }
                     return (
                         None,
@@ -22948,15 +22949,17 @@ mod inject_fstat_scratch {
     async fn a_waiting_binder_calls_receipt_waits_for_its_blocking_grant() {
         use std::future::Future as _;
 
+        use futures::FutureExt as _;
+
         use crate::resources::ResourceID;
         use crate::syscalls::binder::BinderRun;
 
-        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (gate_open, gate_wait) = futures::channel::oneshot::channel::<()>();
         let (tool, mut guest) = {
             let (_, mut guest) = ScriptedGuest::new(true, false);
             model_binder_descriptor(&guest);
             guest.capture_resource_requests = true;
-            guest.blocking_grant_gate = Some(gate.clone());
+            guest.blocking_grant_gate = Some(gate_wait.shared());
             guest.config.sequentialize_threads = true;
             guest.ppoll_ready = Some(0);
             guest.binder_read_consumed = Some(0);
@@ -23002,7 +23005,7 @@ mod inject_fstat_scratch {
         );
         // Open the grant: this call's receipt, then the call completes
         // off the turn alone.
-        gate.notify_one();
+        let _ = gate_open.send(());
         let routed = routed.await.unwrap();
         assert_eq!(routed.1, BinderRun::OffTurnAlone);
         assert!(crate::syscalls::binder::blocking_granted(this_op));
@@ -23128,7 +23131,6 @@ mod inject_fstat_scratch {
     /// read off the turn as if alone beside it.
     #[tokio::test]
     async fn a_task_a_backend_reports_after_its_native_clone_counts_for_the_binder_rule() {
-        use crate::syscalls::binder::BinderRun;
         for (flags, named, announced) in [
             (reverie::syscalls::CloneFlags::empty(), "(task 4)", true),
             (
@@ -23728,7 +23730,6 @@ mod inject_fstat_scratch {
     #[tokio::test]
     async fn a_merged_shared_mapping_or_a_late_mem_writer_beside_another_task_is_refused_or_marked()
     {
-        use crate::syscalls::binder::BinderRun;
         type Setup<'a> = &'a dyn Fn(&mut ScriptedGuest);
         let cases: [(&str, Setup); 2] = [
             (
