@@ -20640,7 +20640,7 @@ impl Scheduler {
                 self.is_idle_guest_poll(&rs),
                 rs.poll_deadline,
                 Self::is_internal_turn(&rs),
-                Self::retry_number(&rs) == 0,
+                Self::retry_number(&rs) == 0 && !rs.poll_continues_call_in_parts,
             ),
             _ => (
                 false, false, false, false, false, false, false, None, false, false,
@@ -20767,8 +20767,10 @@ impl Scheduler {
         // syscall (a delivery point for a pending unblocked signal) and a
         // successful polling syscall (a ready `epoll_wait` is the common
         // case) completes and returns to user mode on exactly such a
-        // grant, never taking a retry. The turns the SIGCHLD fence and
-        // its bounded deferral count (`last_guest_commit_at`).
+        // grant, never taking a retry - unless the attempt only continues
+        // a call already running in parts, between whose parts the guest
+        // never resumed. The turns the SIGCHLD fence and its bounded
+        // deferral count (`last_guest_commit_at`).
         let guest_progress = !switch_in && (!polling_grant || first_poll_attempt);
         if guest_progress {
             self.last_guest_commit_at.insert(dtid, self.progress_epoch);
@@ -41094,6 +41096,24 @@ mod test {
             !scheduler.blocked.sigchld_fenced.contains_key(&process),
             "first polling attempts are guest progress"
         );
+        // But first attempts that only continue a call already running in
+        // parts (a multipart readv's later parts file fresh attempt-0
+        // requests with the guest never resumed between parts) are not:
+        // however many commit, the mark survives (revastra2 F6).
+        let (mut scheduler, process) = fenced();
+        for _ in 0..3 {
+            let mut part = Resources::new(taker);
+            part.insert(ResourceID::InternalIOPolling, Permission::W);
+            part.poll_continues_call_in_parts = true;
+            grant(&mut scheduler, part);
+            assert!(
+                scheduler.blocked.sigchld_fenced.contains_key(&process),
+                "a continuation part expired the mark"
+            );
+        }
+        grant(&mut scheduler, Resources::new(taker));
+        grant(&mut scheduler, Resources::new(taker));
+        assert!(!scheduler.blocked.sigchld_fenced.contains_key(&process));
     }
 
     /// Two more routes by which a fenced copy goes without a delivery taking

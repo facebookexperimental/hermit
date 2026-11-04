@@ -595,6 +595,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrc = Resources::new(guest.thread_state().dettid);
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi(call.name());
+            // A later part of a call run in parts files this fresh request
+            // without the guest having resumed since the previous part.
+            rsrc.poll_continues_call_in_parts = guest
+                .thread_state()
+                .call_parts
+                .as_ref()
+                .is_some_and(|parts| parts.progress);
             // Binary record/replay keeps the internal-FD authority captured at
             // entry, as its existing FIFO-open policy requires. Plain runs
             // instead need revocable proof of closed guest membership.
