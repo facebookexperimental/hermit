@@ -3293,7 +3293,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler a_replayed_switch_wakes_its_due_target, restored from
     // https://github.com/rrnewton/hermit/pull/4889: 3492 + 2 = 3494
     // (wake unit + deferred-SIGCHLD negative arm).
-    ("test.detcore_unit", 3521),
+    ("test.detcore_unit", 3524),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4674,7 +4674,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // no_namespace_minimize_replays_its_candidate_records: 795 + 2 = 797.
     // And analyze_replays_a_recorded_target_instead_of_panicking: 797 + 1 = 798.
     // PR 4920 (3): prefix-stack and fatal-time-skip cases: 798 + 2 = 800.
-    ("test.cli", 798),
+    ("test.cli", 800),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5353,7 +5353,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 714 + 2 = 716.
     // And the same recorded-target regression test: 716 + 1 = 717.
     // PR 4920 (3): the same two cases: 717 + 2 = 719.
-    ("test.cli_on_host", 717),
+    ("test.cli_on_host", 719),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5944,7 +5944,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unit (same growth as test.detcore_unit, PR #4926): 3469 + 1 = 3470.
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
-    ("test.detcore_unit_on_host", 3521),
+    ("test.detcore_unit_on_host", 3524),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
