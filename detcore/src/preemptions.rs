@@ -807,14 +807,20 @@ impl PreemptionRecord {
         }
     }
 
-    /// The refusal for a record whose `stopless` marks its format may not
-    /// hold, or `None` if it may: after lowering, a remaining mark is one
-    /// whose slice end would have become invisible without it, so the
-    /// record is refused rather than lossy (`validate_format` states the
-    /// same refusal on read).
+    /// The refusal for a record whose `stopless` marks it may not hold, or
+    /// `None` if it may: after lowering, a remaining mark is one whose
+    /// slice end would have become invisible without it, so the record is
+    /// refused rather than lossy (`validate_format` and
+    /// `validate_contents` state the same refusals on read).
     fn stopless_lowering_refusal(&self) -> Result<(), String> {
         let stopless = self.global.iter().filter(|event| event.stopless).count();
-        if stopless > 0
+        if stopless > 0 && self.background_starts_unnoted {
+            Err(format!(
+                "the preemption record says it notes no background starts \
+                 (background_starts_unnoted) but marks {stopless} timeslice ends taken \
+                 without a stop (`stopless`), which only a record that notes its starts holds"
+            ))
+        } else if stopless > 0
             && self
                 .format_version
                 .is_none_or(|format| format < STOPLESS_SLICE_ENDS_FORMAT)
@@ -1239,8 +1245,10 @@ impl PreemptionRecord {
     /// Hermit that predates the offsets must go on refusing, and says it
     /// notes no starts by its mark (`background_starts_unnoted`, set by
     /// `raise_format`), as [`PREEMPTION_RECORD_FORMAT`] describes. Either way
-    /// it drops its `stopless` marks, which only a record that notes its
-    /// starts holds (`forget_stopless_marks_below_their_format`).
+    /// it drops the `stopless` marks its ends stay visible without, which
+    /// only a record that notes its starts holds; a mark whose end would
+    /// become invisible is kept for validation to refuse
+    /// (`forget_stopless_marks_below_their_format`).
     fn forget_background_starts(&mut self) {
         self.background_starts.clear();
         self.background_starts_unnoted = false;
@@ -3906,6 +3914,114 @@ mod tests {
         );
     }
 
+    /// The combined lowering: a `stopless` end that only its mark keeps
+    /// visible (a marked Branch the guest reached a same-thread check-in
+    /// from, as in `a_lowering_that_would_hide_a_stopless_end_is_refused`)
+    /// in a record whose rows hold an instruction offset. Dropping its
+    /// background starts keeps `INSTRUCTION_OFFSET_ROWS_FORMAT` with the
+    /// flag, at or above `STOPLESS_SLICE_ENDS_FORMAT`, so the format alone
+    /// no longer refuses the kept mark: the conversion must still refuse,
+    /// through the flag, rather than clear the mark and silently remove
+    /// the slice end (its grant and virtual-time charge). Clearing every
+    /// mark under the flag, visible or not, makes each refusal below
+    /// validate instead and this test fails. The same end followed by a
+    /// Branch stays visible without its mark and still lowers.
+    #[test]
+    fn a_record_that_drops_its_starts_refuses_an_invisible_stopless_end() {
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 8,
+            instructions: 2,
+        };
+        let check_in = SchedEvent {
+            dettid: tid,
+            op: Op::OtherInstructions,
+            count: 1,
+            start_rip: None,
+            end_rip: None,
+            end_time: None,
+            stopless: false,
+        };
+        let marks =
+            |record: &PreemptionRecord| record.global.iter().filter(|event| event.stopless).count();
+        let writer_with = |noting: bool, invisible: bool| {
+            let mut writer = PreemptionWriter::new(None);
+            if noting {
+                writer = writer.noting_background_starts();
+            }
+            writer.register_thread(tid, DEFAULT_PRIORITY);
+            writer.insert_reprioritization(
+                tid,
+                LogicalTime::from_nanos(10),
+                10,
+                DEFAULT_PRIORITY,
+                5,
+                Some(offset),
+            );
+            writer.insert_schedevent(SchedEvent::branches(tid, 10).taken_without_stop());
+            writer.insert_background_start(tid, 1);
+            if invisible {
+                writer.insert_schedevent(check_in.clone());
+            }
+            writer.insert_schedevent(SchedEvent::branches(tid, 20));
+            writer
+        };
+
+        let run: PreemptionRecord =
+            serde_json::from_str(&writer_with(true, true).into_string()).unwrap();
+        run.validate().unwrap();
+        assert_eq!(run.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+        assert!(run.notes_background_starts());
+        assert_eq!((marks(&run), run.background_starts().len()), (1, 1));
+        // The whole prefix keeps the starts, the mark and the claim.
+        run.schedule_prefix(3).validate().unwrap();
+        // Each transform that drops the starts and keeps the rows keeps
+        // the invisible mark too, and validation refuses it by the flag.
+        let mut edited = run.clone();
+        edited.schedevents_iter_mut().for_each(|_| ());
+        for (what, record) in [
+            ("a shorter prefix", run.schedule_prefix(2)),
+            ("an edit", edited),
+        ] {
+            assert_eq!(
+                record.format_version(),
+                Some(INSTRUCTION_OFFSET_ROWS_FORMAT),
+                "{what}"
+            );
+            assert!(record.background_starts_unnoted, "{what}");
+            assert_eq!(marks(&record), 1, "{what}: the mark is kept");
+            let refusal = record.validate().unwrap_err();
+            assert!(
+                refusal.contains("background_starts_unnoted") && refusal.contains("stopless"),
+                "{what}: {refusal}"
+            );
+        }
+        // A writer that notes no starts, raised by its offset row,
+        // recording the same sequence is refused at flush.
+        let refusal = writer_with(false, true)
+            .serialized_string()
+            .expect_err("a writer that would hide the end must refuse");
+        assert!(
+            refusal.contains("background_starts_unnoted") && refusal.contains("stopless"),
+            "{refusal}"
+        );
+
+        // Control: the same end followed by a Branch stays visible
+        // without its mark, so dropping the starts clears it and the
+        // record still validates, at the offsets' format with the flag.
+        let visible: PreemptionRecord =
+            serde_json::from_str(&writer_with(true, false).into_string()).unwrap();
+        let lowered = visible.schedule_prefix(1);
+        lowered.validate().unwrap();
+        assert!(lowered.background_starts_unnoted);
+        assert_eq!(marks(&lowered), 0);
+        let plain: PreemptionRecord =
+            serde_json::from_str(&writer_with(false, false).into_string()).unwrap();
+        plain.validate().unwrap();
+        assert!(plain.background_starts_unnoted);
+        assert_eq!(marks(&plain), 0);
+    }
+
     #[test]
     fn a_record_that_drops_its_background_starts_keeps_its_offsets_format_and_says_so() {
         let below = format_without_background_starts(Some(BACKGROUND_STARTS_FORMAT));
@@ -5815,7 +5931,8 @@ impl PreemptionWriter {
     }
 
     /// Drop the `stopless` marks this writer may not hold (below
-    /// [`STOPLESS_SLICE_ENDS_FORMAT`]) and refuse the record if a mark's
+    /// [`STOPLESS_SLICE_ENDS_FORMAT`], or noting no background starts at
+    /// the offsets' format) and refuse the record if a mark's
     /// slice end would become invisible without it
     /// (`PreemptionRecord::forget_stopless_marks_below_their_format`):
     /// such a record is invalid in its format, and writing it would
