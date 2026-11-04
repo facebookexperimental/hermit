@@ -1455,6 +1455,23 @@ pub(crate) fn resolved_at_fdcwd_path(pid: i32, path: &Path) -> Option<PathBuf> {
     Some(Path::new("/").join(guest_cwd).join(path))
 }
 
+/// Re-spell a refused timer-slack open as the read-only inode witness it is.
+///
+/// A timer-slack descriptor never carries guest I/O: reads, writes and seeks
+/// are served from the virtual thread state, and the host descriptor only
+/// witnesses the task incarnation that was open at bind time. A read-only
+/// `/proc` mount (reverie's fallback when a fresh `proc` mount is refused)
+/// therefore rejects an access mode Detcore never exercises, which would make
+/// a guest's virtual timer slack depend on the host's mount flags.
+fn timer_slack_witness_open(path: &Path, call: syscalls::Openat) -> Option<syscalls::Openat> {
+    if !ProcfsFile::from_path(path).is_some_and(|procfs| procfs.is_timer_slack()) {
+        return None;
+    }
+    let flags = call.flags();
+    (flags.bits() & libc::O_ACCMODE != libc::O_RDONLY)
+        .then(|| call.with_flags(flags & !OFlag::from_bits_truncate(libc::O_ACCMODE)))
+}
+
 /// [`resolved_at_fdcwd_path`] where the kernel cannot render the working
 /// directory of process `pid` into its link because its path is longer than
 /// `PATH_MAX`, which Linux still walks `..` out of. A spelling whose leading
@@ -5856,10 +5873,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             None => match launched_exe {
                 Some(exe) => self.open_launched_exe(guest, call, exe.as_deref()).await,
-                None => self
-                    .record_or_replay(guest, Syscall::Openat(call))
-                    .await
-                    .map_err(Error::from),
+                None => {
+                    let first = self.record_or_replay(guest, Syscall::Openat(call)).await;
+                    match first {
+                        Err(Errno::EROFS) => {
+                            match timer_slack_witness_open(&observed_path, call) {
+                                Some(witness) => self
+                                    .record_or_replay(guest, Syscall::Openat(witness))
+                                    .await
+                                    .map_err(Error::from),
+                                None => Err(Error::from(Errno::EROFS)),
+                            }
+                        }
+                        other => other.map_err(Error::from),
+                    }
+                }
             },
         };
 
