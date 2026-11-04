@@ -152,7 +152,7 @@ fn refusal_name(reason: &Refusal) -> &'static str {
         Refusal::AddressedData => "addressed-data-inside-the-sequence",
         Refusal::NoMappingSymbols => "no-mapping-symbols",
         Refusal::UnsupportedMappingSymbol(_) => "unsupported-mapping-symbol",
-        Refusal::ConditionalCas => "conditional-cas",
+        Refusal::CompareExit => "compare-exit",
         Refusal::UnknownDirectBranch => "unknown-direct-branch",
     }
 }
@@ -406,7 +406,7 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
     // No addressed-data extents are computed: without mapping symbols a
     // section is unproven and left alone, so no data exclusion is needed.
     let extents: Vec<(u64, u64)> = Vec::new();
-    // Compare idioms are left alone as conditional-cas whether or not any
+    // Compare idioms are left alone as compare-exit whether or not any
     // other section holds a store-exclusive, so no external-store scan is
     // needed here.
     //
@@ -1852,7 +1852,7 @@ mod tests {
             "{report:?}"
         );
         // The same image entered at its first instruction is still a
-        // compare idiom, left alone as conditional-cas.
+        // compare idiom, left alone as compare-exit.
         let mut entered_at_head = elf_image(&words, Some(&[(1, 0, true)]));
         entered_at_head[24..32].copy_from_slice(&0x100u64.to_le_bytes());
         let (bytes, report) = rewritten(&entered_at_head);
@@ -1860,7 +1860,7 @@ mod tests {
         assert_eq!(report.patched_total(), 0, "{report:?}");
         assert_eq!(
             report.refused,
-            BTreeMap::from([("conditional-cas", 1)]),
+            BTreeMap::from([("compare-exit", 1)]),
             "{report:?}"
         );
     }
@@ -1909,14 +1909,14 @@ mod tests {
             "{report:?}"
         );
         // With no entry at the head the extension runs, but a compare
-        // idiom is still left alone as conditional-cas.
+        // idiom is still left alone as compare-exit.
         let image = elf_image(&words, Some(&[(1, 0, true)]));
         let (bytes, report) = rewritten(&image);
         assert_eq!(bytes, image, "{report:?}");
         assert_eq!(report.patched_total(), 0, "{report:?}");
         assert_eq!(
             report.refused,
-            BTreeMap::from([("conditional-cas", 1)]),
+            BTreeMap::from([("compare-exit", 1)]),
             "{report:?}"
         );
     }
@@ -1982,22 +1982,14 @@ mod tests {
         let (bytes, report) = rewritten(&image);
         assert_eq!(bytes, image, "{report:?}");
         assert_eq!(report.patched_total(), 0, "{report:?}");
-        assert_eq!(
-            report.refused.get("conditional-cas"),
-            Some(&1),
-            "{report:?}"
-        );
+        assert_eq!(report.refused.get("compare-exit"), Some(&1), "{report:?}");
         // The same loop with no store in the other section is also left
         // alone: compare idioms are not rewritten at all.
         let image = elf_image_two_sections(&first, &[0xd503_201f]);
         let (bytes, report) = rewritten(&image);
         assert_eq!(bytes, image, "{report:?}");
         assert_eq!(report.patched_total(), 0, "{report:?}");
-        assert_eq!(
-            report.refused.get("conditional-cas"),
-            Some(&1),
-            "{report:?}"
-        );
+        assert_eq!(report.refused.get("compare-exit"), Some(&1), "{report:?}");
     }
 
     /// Nested FDEs, direct data: data addressed inside both an enclosing
@@ -2071,25 +2063,25 @@ mod tests {
             0xd65f_03c0,
         ];
         // With the extension in the code the compare is still left
-        // alone as conditional-cas.
+        // alone as compare-exit.
         let whole = elf_image(&words, Some(&[(1, 0, true)]));
         let (bytes, report) = rewritten(&whole);
         assert_eq!(bytes, whole, "{report:?}");
         assert_eq!(report.patched_total(), 0, "{report:?}");
         assert_eq!(
             report.refused,
-            BTreeMap::from([("conditional-cas", 1)]),
+            BTreeMap::from([("compare-exit", 1)]),
             "{report:?}"
         );
         // The zero-extension is data: the compare is not rewritten
-        // either; as a compare idiom it is left alone as conditional-cas.
+        // either; as a compare idiom it is left alone as compare-exit.
         let split = elf_image(&words, Some(&[(1, 0, false), (1, 1, true)]));
         let (bytes, report) = rewritten(&split);
         assert_eq!(bytes, split);
         assert_eq!(report.patched_total(), 0, "{report:?}");
         assert_eq!(
             report.refused,
-            BTreeMap::from([("conditional-cas", 1)]),
+            BTreeMap::from([("compare-exit", 1)]),
             "{report:?}"
         );
     }

@@ -35,7 +35,7 @@
 //! the atomic rather than at the store, order the same memory accesses.
 //!
 //! Compare idioms (`CasCompare`, `CasZero`) are matched but never rewritten:
-//! they are always left alone as `conditional-cas`. A `CAS` in their place would
+//! they are always left alone as `compare-exit`. A `CAS` in their place would
 //! differ from the original exactly where the comparison fails, where the
 //! original never executes its store-exclusive: `CASAL` keeps its release
 //! semantics there, and its write-permission check faults on a read-only word
@@ -88,13 +88,16 @@ pub enum Refusal {
     /// an indirect branch's target (a jump table, a landing pad) is not
     /// known here.
     BranchIntoSequence,
-    /// A conditional compare-and-swap loop (`CasZero` or `CasCompare`):
-    /// the original stores only when its comparison matches, so on a
-    /// read-only word a mismatch exits without any store, while a CAS
-    /// asks for write permission before it compares and would fault.
-    /// No same-length replacement preserves that, so the loop is left
-    /// as it is.
-    ConditionalCas,
+    /// The sequence is a compare idiom (CAS): its failing-comparison exit
+    /// leaves the load-exclusive's reservation in place in the original,
+    /// and any store-exclusive that exit can reach could consume that
+    /// reservation. The replacement's single atomic creates no
+    /// reservation, so such a store would silently stop storing. Which
+    /// executable bytes a compare exit can reach cannot be proved from
+    /// section flags alone (an executable mapping, not `SHF_EXECINSTR`,
+    /// decides what can execute), so every compare idiom is left alone
+    /// as `compare-exit`, without a rewrite, by construction.
+    CompareExit,
     /// The idiom matched but its registers break an assumption the
     /// replacement needs; the string names which one.
     Registers(&'static str),
@@ -204,9 +207,10 @@ pub fn plan_with_entries(
 }
 
 /// The same, also told whether code outside this range holds a
-/// store-exclusive. Retained for caller compatibility; it decides
-/// nothing: every compare idiom is left alone as `conditional-cas`,
-/// whether or not any other store-exclusive is known.
+/// store-exclusive. Retained for caller compatibility; it no longer
+/// decides anything: compare idioms are left alone as `compare-exit`
+/// whether or not any other store-exclusive is known, because the set
+/// of executable bytes a compare exit can reach is not proved.
 ///
 /// The entry protection fails closed: a word in the range that might be a
 /// direct branch with an unknown target
@@ -273,21 +277,22 @@ pub fn plan_section(
                         let interior_entered = (start + 1..start + site.words.len()).any(|i| {
                             targets.contains(&addr(i)) || known_entries.contains(&addr(i))
                         });
-                        // A compare idiom stores only when its comparison
-                        // matches, while a CAS asks for write permission
-                        // before it compares, so no compare idiom is
-                        // rewritten.
-                        let conditional_cas =
-                            matches!(site.idiom, Idiom::CasCompare | Idiom::CasZero);
+                        // A compare idiom's failing exit keeps the original's
+                        // exclusive reservation; the replacement creates
+                        // none, and a store-exclusive that exit reaches could
+                        // consume that reservation. Coverage of every such
+                        // store cannot be proved, so compare idioms are
+                        // left alone unconditionally.
+                        let compare_exit = matches!(site.idiom, Idiom::CasCompare | Idiom::CasZero);
                         if interior_entered {
                             report.refused.push(RefusedSite {
                                 addr: addr(index),
                                 reason: Refusal::BranchIntoSequence,
                             });
-                        } else if conditional_cas {
+                        } else if compare_exit {
                             report.refused.push(RefusedSite {
                                 addr: addr(index),
-                                reason: Refusal::ConditionalCas,
+                                reason: Refusal::CompareExit,
                             });
                         } else {
                             report.patched.push(site);
@@ -876,14 +881,14 @@ mod tests {
             Refusal::Undecoded,
         ),
         (
-            "cas_compare_is_left_alone_conditional_cas",
+            "cas_compare_is_left_alone_compare_exit",
             &[0xc85ffc66, 0xeb0400df, 0x54000081, 0xc807fc62, 0x35ffff87],
-            Refusal::ConditionalCas,
+            Refusal::CompareExit,
         ),
         (
-            "cas_zero_is_left_alone_conditional_cas",
+            "cas_zero_is_left_alone_compare_exit",
             &[0xc85ffc20, 0xb5000080, 0xc802fc23, 0x35ffffa2],
-            Refusal::ConditionalCas,
+            Refusal::CompareExit,
         ),
     ];
 
@@ -1141,11 +1146,11 @@ mod tests {
         words.extend_from_slice(&loop_words);
         let report = plan(&words, BASE);
         // The zero-extension proof passes, but a compare idiom is left
-        // alone as conditional-cas in any case.
+        // alone as compare-exit in any case.
         assert_eq!(report.patched, vec![], "{report:?}");
         assert_eq!(
             report.refused.first().map(|r| r.reason.clone()),
-            Some(Refusal::ConditionalCas)
+            Some(Refusal::CompareExit)
         );
 
         // Without the zero extension the same loop stays refused.
@@ -1172,14 +1177,14 @@ mod tests {
 
         // A branch to the zero extension itself is what the real helpers do,
         // and it keeps the proof: the extension still runs, so the only
-        // refusal is conditional-cas.
+        // refusal is compare-exit.
         let mut words = vec![0x1400_0001u32, 0x5300_1c10];
         words.extend_from_slice(&loop_words);
         let report = plan(&words, BASE);
         assert_eq!(report.patched, vec![], "{report:?}");
         assert_eq!(
             report.refused.first().map(|r| r.reason.clone()),
-            Some(Refusal::ConditionalCas)
+            Some(Refusal::CompareExit)
         );
 
         // An outside branch to the head also refuses it when it comes from
@@ -1216,14 +1221,14 @@ mod tests {
             Some(Refusal::BranchIntoSequence)
         );
         // The same entry at the sequence's head is its ordinary start; a
-        // compare idiom is still left alone as conditional-cas.
+        // compare idiom is still left alone as compare-exit.
         let mut entries = HashSet::new();
         entries.insert(BASE);
         let report = plan_with_entries(&original, BASE, &HashSet::new(), &entries);
         assert_eq!(report.patched, vec![], "{report:?}");
         assert_eq!(
             report.refused.first().map(|r| r.reason.clone()),
-            Some(Refusal::ConditionalCas)
+            Some(Refusal::CompareExit)
         );
     }
 
@@ -1254,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn a_conditional_cas_that_exports_its_reservation_is_refused() {
+    fn a_compare_exit_that_exports_its_reservation_is_refused() {
         // ldaxr x0,[x2]; cbnz x0,out; stlxr w3,x1,[x2]; cbnz w3,loop;
         // out: stlxr w4,x1,[x2] -- the original's failing-compare exit
         // reaches `out` holding the ldaxr's reservation, so the outside
@@ -1273,7 +1278,7 @@ mod tests {
             report
                 .refused
                 .iter()
-                .any(|r| r.reason == Refusal::ConditionalCas),
+                .any(|r| r.reason == Refusal::CompareExit),
             "{report:?}"
         );
         // Without the outside store the same loop is also left alone:
@@ -1284,7 +1289,7 @@ mod tests {
             report
                 .refused
                 .iter()
-                .any(|r| r.reason == Refusal::ConditionalCas),
+                .any(|r| r.reason == Refusal::CompareExit),
             "{report:?}"
         );
 
@@ -1298,7 +1303,7 @@ mod tests {
             report
                 .refused
                 .iter()
-                .any(|r| r.reason == Refusal::ConditionalCas),
+                .any(|r| r.reason == Refusal::CompareExit),
             "{report:?}"
         );
     }
@@ -1312,13 +1317,13 @@ mod tests {
             report
                 .refused
                 .iter()
-                .any(|r| r.reason == Refusal::ConditionalCas),
+                .any(|r| r.reason == Refusal::CompareExit),
             "{report:?}"
         );
     }
 
     #[test]
-    fn a_conditional_cas_is_refused_when_another_section_holds_a_store() {
+    fn a_compare_exit_is_refused_when_another_section_holds_a_store() {
         // The same CasZero loop as above, told a store-exclusive exists in
         // another executable section: a section boundary does not clear
         // the monitor, so the outside store could still consume the
@@ -1330,7 +1335,7 @@ mod tests {
             report
                 .refused
                 .iter()
-                .any(|r| r.reason == Refusal::ConditionalCas),
+                .any(|r| r.reason == Refusal::CompareExit),
             "{report:?}"
         );
         // Told there is none, the same loop is still left alone.
@@ -1341,7 +1346,7 @@ mod tests {
             report
                 .refused
                 .iter()
-                .any(|r| r.reason == Refusal::ConditionalCas),
+                .any(|r| r.reason == Refusal::CompareExit),
             "{report:?}"
         );
     }
