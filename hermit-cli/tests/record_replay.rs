@@ -5872,6 +5872,14 @@ fn record_replay_refuses_a_shared_mapping_over_an_occupied_recorded_range() {
     assert_occupied_range_refused("shared");
 }
 
+/// The occupied range again for `MAP_SHARED_VALIDATE`, which replay places
+/// as `MAP_SHARED | MAP_FIXED_NOREPLACE`.
+#[test]
+fn record_replay_refuses_a_shared_validate_mapping_over_an_occupied_recorded_range() {
+    let _guard = hermit_record_lock();
+    assert_occupied_range_refused("validate");
+}
+
 #[test]
 fn record_replay_refuses_a_private_file_mapping_over_an_occupied_recorded_range() {
     let _guard = hermit_record_lock();
