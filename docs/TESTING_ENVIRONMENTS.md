@@ -223,6 +223,7 @@ erasing the host; this table is where the erased identities go back.
 
 | lane / node | measured on | what was measured |
 | --- | --- | --- |
+| `privileged` lane, node `privileged-test.binder_cli_cases` | `devbig030` | First execution of the original two host-limited binder CLI tests inside a QEMU Binderfs guest (binder IPC plus binderfs kernel): the six host-limited binder CLI cases passed 6/6 at the PR 4742 head then current; see the binder CLI tests rows below |
 | `FINALIZE_BUDGET` in `hermit-cli/src/bin/hermit/owned_container.rs` | `devbig030` | Publication-to-reap latency of trace-level `hermit run --record-preemptions-to` of rustbin_heap_ptrs through safehermit, 10,782 runs at 1-1264 concurrent: max 1.52s (316 concurrent plus 316 CPU stress workers); https://github.com/rrnewton/hermit/issues/3414 |
 | `privileged` lane, node `test.cli_kvm` | `devbig014` | `/dev/kvm` mode 666; `open(O_RDWR)` succeeds; `KVM_GET_API_VERSION` = 12; `hermit --backend kvm run` exits 0 |
 | `privileged` lane, cell `applications/kvm-python-examples` | `devbig014`, `devbig030` | Retained passing validations measured 14.87-56.51 seconds; the same SHA measured 16.29 and 39.85 seconds respectively, so 15-second and 30-second bounds both cut valid L2 work |
