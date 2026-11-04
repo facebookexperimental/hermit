@@ -20624,6 +20624,7 @@ impl Scheduler {
             idle_poll,
             own_poll_deadline,
             switch_in,
+            first_poll_attempt,
         ) = match self
             .next_turns
             .get(&dtid)
@@ -20639,8 +20640,11 @@ impl Scheduler {
                 self.is_idle_guest_poll(&rs),
                 rs.poll_deadline,
                 Self::is_internal_turn(&rs),
+                Self::retry_number(&rs) == 0,
             ),
-            _ => (false, false, false, false, false, false, false, None, false),
+            _ => (
+                false, false, false, false, false, false, false, None, false, false,
+            ),
         };
         let guest_state_poll = polling_grant && guest_state_only;
         // Whether this grant ends a timed wait at its deadline
@@ -20755,10 +20759,17 @@ impl Scheduler {
         }
         self.last_committed_turn = Some(self.turn);
         self.turn += 1;
-        // A turn that resumed guest execution, not an InternalIOPolling
-        // retry or a TraceReplay switch-in: the turns the SIGCHLD fence
-        // and its bounded deferral count (`last_guest_commit_at`).
-        let guest_progress = !polling_grant && !switch_in;
+        // A turn that resumed guest execution: not a TraceReplay
+        // switch-in, and not an InternalIOPolling retry of a call already
+        // attempted - those probes run with signals privately blocked and
+        // restore the guest mask without executing the task. A polling
+        // call's first attempt is guest progress: the guest entered its
+        // syscall (a delivery point for a pending unblocked signal) and a
+        // successful polling syscall (a ready `epoll_wait` is the common
+        // case) completes and returns to user mode on exactly such a
+        // grant, never taking a retry. The turns the SIGCHLD fence and
+        // its bounded deferral count (`last_guest_commit_at`).
+        let guest_progress = !switch_in && (!polling_grant || first_poll_attempt);
         if guest_progress {
             self.last_guest_commit_at.insert(dtid, self.progress_epoch);
         }
@@ -41015,29 +41026,38 @@ mod test {
     }
 
     /// The expiry above, through the production commit path
-    /// (`unblock_guest`): the taker's InternalIOPolling grants - a parent
+    /// (`unblock_guest`): the taker's InternalIOPolling retries - a parent
     /// in `read` whose internal probes run with signals privately blocked
     /// and restore the guest mask without executing the task - never
     /// expire the mark, however many commit, because in none did the
     /// thread return to user mode where the pending copy is delivered.
-    /// Its ordinary turns then expire it on the second, as above.
-    /// Dropping `unblock_guest`'s `sigchld_fence_commit` call, or counting
-    /// polling grants as guest progress, fails this test (revclaude N1 and
-    /// revastra2 F1 on PR 4627).
+    /// Its ordinary turns then expire it on the second, as above, and so
+    /// do first attempts of polling calls: a successful `epoll_wait`
+    /// completes and returns to user mode on its first attempt and never
+    /// takes a retry, so counting no polling grant at all would leave a
+    /// delivery bounded by work that keeps completing such calls waiting
+    /// forever (revastra2 F5). Dropping `unblock_guest`'s
+    /// `sigchld_fence_commit` call, or counting retries as guest
+    /// progress, fails this test (revclaude N1 and revastra2 F1/F5 on
+    /// PR 4627).
     #[test]
     fn a_fenced_sigchld_survives_polling_grants_through_unblock_guest() {
         let taker = DetTid::from_raw(100);
-        let mut scheduler = Scheduler::new(&Config::default());
-        scheduler.thread_tree.add_child(taker, taker, true);
-        register_known_thread(&mut scheduler, taker);
-        scheduler.blocked.continuation_masks.insert(taker, Some(0));
-        let process = scheduler.sigchld_process(taker);
-        scheduler.fence_child_exit_sigchld(
-            process,
-            Some(ChildExitNotification::Discard),
-            fence_marker(),
-        );
-        assert!(scheduler.blocked.sigchld_fenced.contains_key(&process));
+        let fenced = || {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.thread_tree.add_child(taker, taker, true);
+            register_known_thread(&mut scheduler, taker);
+            scheduler.blocked.continuation_masks.insert(taker, Some(0));
+            let process = scheduler.sigchld_process(taker);
+            scheduler.fence_child_exit_sigchld(
+                process,
+                Some(ChildExitNotification::Discard),
+                fence_marker(),
+            );
+            assert!(scheduler.blocked.sigchld_fenced.contains_key(&process));
+            (scheduler, process)
+        };
+        let (mut scheduler, process) = fenced();
         let grant = |scheduler: &mut Scheduler, request: Resources| {
             queue_request(scheduler, taker, request);
             // As step 3 selected it: the grant itself does not dequeue.
@@ -41062,6 +41082,18 @@ mod test {
         );
         grant(&mut scheduler, Resources::new(taker));
         assert!(!scheduler.blocked.sigchld_fenced.contains_key(&process));
+        // First attempts of polling calls count the same way: two of them
+        // expire the mark, as two ordinary turns do.
+        let (mut scheduler, process) = fenced();
+        for _ in 0..2 {
+            let mut first = Resources::new(taker);
+            first.insert(ResourceID::InternalIOPolling, Permission::W);
+            grant(&mut scheduler, first);
+        }
+        assert!(
+            !scheduler.blocked.sigchld_fenced.contains_key(&process),
+            "first polling attempts are guest progress"
+        );
     }
 
     /// Two more routes by which a fenced copy goes without a delivery taking

@@ -51903,6 +51903,10 @@ fn a_parents_sigchld_is_not_held_behind_a_sibling_that_never_blocks() {
             "mode=read exited=0 code=0 signaled=1 sig=9 handled=0\n",
         ),
         (
+            "epoll",
+            "mode=epoll exited=0 code=0 signaled=1 sig=9 handled=0\n",
+        ),
+        (
             "exit",
             "mode=exit exited=1 code=0 signaled=0 sig=0 handled=0\n",
         ),

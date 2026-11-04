@@ -10,7 +10,7 @@
  * A parent's SIGCHLD for a child that ends, while a sibling thread stays
  * runnable until the parent has reaped the child.
  *
- * Usage: sigchld_busy_sibling <kill|read|exit|sigsuspend|kill-unblocked|exit-unblocked>
+ * Usage: sigchld_busy_sibling <kill|read|epoll|exit|sigsuspend|kill-unblocked|exit-unblocked>
  *
  * kill:       the child waits in pause(); the parent SIGKILLs it and reaps
  *             it.
@@ -20,6 +20,11 @@
  *             resume the parent), then writes the byte the read waits for;
  *             the parent reaps the child. The fenced SIGCHLD copy must
  *             survive those probe grants (PR 4627 review F1).
+ * epoll:      like kill, but the sibling's never-blocking loop is a
+ *             successful epoll_wait on a permanently writable pipe
+ *             instead of sched_yield: each completed polling call is
+ *             guest progress the bounded delivery counts, so the parent
+ *             is still re-admitted (PR 4627 review F5).
  * exit:       the child exits at once; the parent reaps it.
  * sigsuspend: the child exits at once; the parent, which blocks SIGCHLD
  *             from before the fork, waits in sigsuspend() until its SIGCHLD
@@ -42,6 +47,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -53,6 +59,7 @@ static atomic_int parent_in_read;
 static atomic_long yields;
 static int sibling_unblocked;
 static int read_mode;
+static int epoll_mode;
 static pid_t read_child;
 static int pipefd[2];
 
@@ -70,6 +77,20 @@ static void* sibling(void* arg) {
     pthread_sigmask(SIG_BLOCK, &set, NULL);
   }
   atomic_store(&sibling_started, 1);
+  int epfd = -1;
+  struct epoll_event ev;
+  if (epoll_mode) {
+    int ready_pipe[2];
+    if (pipe(ready_pipe) != 0) {
+      _exit(5);
+    }
+    epfd = epoll_create1(0);
+    ev.events = EPOLLOUT;
+    ev.data.fd = ready_pipe[1];
+    if (epfd < 0 || epoll_ctl(epfd, EPOLL_CTL_ADD, ready_pipe[1], &ev) != 0) {
+      _exit(6);
+    }
+  }
   if (read_mode) {
     while (!atomic_load(&parent_in_read)) {
       sched_yield();
@@ -88,7 +109,13 @@ static void* sibling(void* arg) {
     }
   }
   while (!atomic_load(&done)) {
-    sched_yield();
+    if (epoll_mode) {
+      if (epoll_wait(epfd, &ev, 1, -1) != 1) {
+        _exit(7);
+      }
+    } else {
+      sched_yield();
+    }
     atomic_fetch_add(&yields, 1);
   }
   return NULL;
@@ -97,7 +124,8 @@ static void* sibling(void* arg) {
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "";
   read_mode = strcmp(mode, "read") == 0;
-  int kill_mode = read_mode || strcmp(mode, "kill") == 0 ||
+  epoll_mode = strcmp(mode, "epoll") == 0;
+  int kill_mode = read_mode || epoll_mode || strcmp(mode, "kill") == 0 ||
       strcmp(mode, "kill-unblocked") == 0;
   int suspend_mode = strcmp(mode, "sigsuspend") == 0;
   sibling_unblocked = strcmp(mode, "kill-unblocked") == 0 ||
@@ -105,7 +133,7 @@ int main(int argc, char** argv) {
   if (!kill_mode && !suspend_mode && strcmp(mode, "exit") != 0 &&
       strcmp(mode, "exit-unblocked") != 0) {
     fprintf(stderr,
-            "usage: %s <kill|read|exit|sigsuspend|kill-unblocked|exit-unblocked>\n",
+            "usage: %s <kill|read|epoll|exit|sigsuspend|kill-unblocked|exit-unblocked>\n",
             argv[0]);
     return 2;
   }
