@@ -1825,6 +1825,12 @@
       "why": "tests/c/pollers_beside_worker.c is owned by hermit-cli/tests/cli.rs: The integration test a_worker_is_not_held_off_by_futex_waits_that_time_out runs this guest under run --strict --chaos and requires the compute-bound worker to finish with its longest gap under 5 s of virtual time beside four pollers whose 10 us futex waits time out; a generic manifest cannot express the measured bound, and the case needs the PMU timer, so it runs in privileged-test.pmu_cli_cases."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/post_crash_worker_exec.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/post_crash_worker_exec.c is owned by hermit-cli/tests/cli.rs: the Rust CLI integration test a_thread_that_execs_from_its_crash_handler_takes_the_post_crash_switch compiles this guest, whose worker or leader thread catches SIGABRT and execs /bin/true from its handler, and requires the exec survivor to take the post-crash switch under the leader's identity in both cases (PR #4867); it remains a guest fixture because its CLI test checks the exact post-crash behaviour of strict runs."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/ppoll_readv.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
