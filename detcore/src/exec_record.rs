@@ -808,7 +808,7 @@ pub fn program_interpreter(path: &Path) -> Result<Option<PathBuf>, &'static str>
         }
         let field = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().unwrap());
         let size = field(32);
-        if size < 2 || size > PAGE_SIZE {
+        if !(2..=PAGE_SIZE).contains(&size) {
             return Err("a PT_INTERP shorter than two bytes or larger than a page");
         }
         let mut name = vec![0_u8; size as usize];
