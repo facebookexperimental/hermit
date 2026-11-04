@@ -5686,6 +5686,198 @@ fn shared_mapping_replay_refuses_metadata_retagged_as_0x199() {
     );
 }
 
+/// The length of the memfd mapping the `placement-*` modes of
+/// `tests/c/record_replay_shared_mappings.c` make: 4 MiB and 5 pages, which
+/// no other mapping of the workload has.
+const PLACEMENT_LEN: usize = (1024 + 5) * 4096;
+
+/// How replay names a recorded mapping whose range the replayed guest
+/// already maps (`MAPPING_PLACEMENT_REFUSAL` in hermit-replay).
+const MAPPING_PLACEMENT_REFUSAL: &str = "replay refused: the address range a recorded \
+    mapping occupied is already mapped in the replayed guest";
+
+/// Rewrites the recorded address of the one successful mmap of `len`
+/// recorded bytes in `recording`'s root event stream to `address`. The
+/// stream is decoded and encoded again with the record format's own reader
+/// and writer; an address has a fixed width, so the stream keeps its size.
+fn rewrite_recorded_mmap_address(recording: &Path, len: usize, address: usize) {
+    use hermit_record_format::event::SyscallEvent;
+    use hermit_record_format::event_stream::EventReader;
+    use hermit_record_format::event_stream::EventStreamId;
+    use hermit_record_format::event_stream::EventWriter;
+
+    let root = EventStreamId::root();
+    let mut reader = EventReader::open(recording, &root).expect("open the root event stream");
+    let mut events = Vec::new();
+    while let Ok(event) = reader.next_event() {
+        events.push(event);
+    }
+    let mut debug_events = Vec::new();
+    while let Ok(event) = reader.next_debug_event() {
+        debug_events.push(event);
+    }
+    drop(reader);
+    let mut rewritten = 0;
+    for event in &mut events {
+        if let Ok(SyscallEvent::Mmap(mmap)) = &mut event.event
+            && mmap.buf.len() == len
+        {
+            mmap.addr = address;
+            rewritten += 1;
+        }
+    }
+    assert_eq!(rewritten, 1, "mmap events of {len} recorded bytes");
+
+    let scratch = tempfile::tempdir().expect("create the rewritten stream's directory");
+    let mut writer = EventWriter::create(scratch.path(), &root).expect("create the stream");
+    for event in events {
+        writer.push_event(event).expect("write an event");
+    }
+    for event in debug_events {
+        writer.push_debug_event(event).expect("write a debug event");
+    }
+    writer.finish().expect("finish the rewritten stream");
+    for entry in fs::read_dir(scratch.path().join("thread")).unwrap() {
+        let entry = entry.unwrap();
+        let original = recording.join("thread").join(entry.file_name());
+        assert_eq!(
+            fs::metadata(&original).unwrap().len(),
+            entry.metadata().unwrap().len(),
+            "{} changed size when rewritten",
+            original.display()
+        );
+        fs::copy(entry.path(), &original).unwrap();
+    }
+}
+
+/// Records `tests/c/record_replay_shared_mappings.c placement-<kind>`,
+/// rewrites the recorded address of its memfd mapping to the address the
+/// guest printed for `target` (`hole` or `occupant`), and replays it.
+/// Returns what the recording printed and the replay's output.
+fn replay_placement(kind: &str, target: &str) -> (String, Output) {
+    let data = tempfile::tempdir().expect("create placement recording directory");
+    let mode = format!("placement-{kind}");
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=off",
+            "record",
+            "start",
+            "--record-timeout=30",
+            "--data-dir",
+        ])
+        .arg(data.path())
+        .arg("--")
+        .arg(&workload("c_record_replay_shared_mappings").path)
+        .arg(&mode);
+    let recorded = command_output(record, "placement recording");
+    let recorded = String::from_utf8(recorded.stdout).expect("placement output is UTF-8");
+    assert!(
+        recorded.contains(&format!("{mode}: mapping reads ")) && !recorded.contains("FAILED"),
+        "{recorded}"
+    );
+    let prefix = format!("{mode}: {target} 0x");
+    let address = recorded
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .and_then(|hex| usize::from_str_radix(hex, 16).ok())
+        .unwrap_or_else(|| panic!("no {target} address in {recorded}"));
+
+    let id = fs::read_to_string(data.path().join("last")).expect("recording ID");
+    rewrite_recorded_mmap_address(&data.path().join(id.trim()), PLACEMENT_LEN, address);
+
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "replay", "--autopilot", "--data-dir"])
+        .arg(data.path());
+    let replayed = hermit_test::hermit_output(&format!("{replay:?}"), &mut replay);
+    (recorded, replayed)
+}
+
+/// A recorded mapping whose range is free in the replayed guest is placed
+/// there, though Linux would not take the address as a hint. The range is
+/// the guest's hole, directly below a `MAP_GROWSDOWN` mapping whose guard
+/// gap keeps Linux from placing anything there without a fixed address,
+/// just as a file system that aligns large mappings refused the free
+/// recorded range of the JDK's 142 MB `lib/modules` mapping, flush below
+/// the next mapping, in compat/java [replay/ptrace]. Replay passed the
+/// recorded address as a hint and failed its "Failed to inject mmap at
+/// desired address" assertion.
+fn assert_placed_in_free_range(kind: &str) {
+    let (recorded, replayed) = replay_placement(kind, "hole");
+    assert!(
+        recorded.contains(&format!(
+            "placement-{kind}: a hint at the hole is refused\n"
+        )),
+        "precondition not met: Linux took a hint at the hole below the MAP_GROWSDOWN \
+         mapping (is the kernel booted with stack_guard_gap=0?), so this replay cannot \
+         show that replay places a mapping Linux would move: {recorded}"
+    );
+    assert!(
+        replayed.status.success(),
+        "replay into the free recorded range failed: {}\nstderr:\n{}",
+        replayed.status,
+        String::from_utf8_lossy(&replayed.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&replayed.stdout), recorded);
+}
+
+/// A recorded mapping whose range the replayed guest already maps, here an
+/// anonymous mapping of its own of the same 4 MiB size, is refused by name
+/// with the kernel's `EEXIST`. Replay used to pass the recorded address as
+/// a hint, so Linux put the mapping elsewhere and replay failed its "Failed
+/// to inject mmap at desired address" assertion instead.
+fn assert_occupied_range_refused(kind: &str) {
+    let (_, replayed) = replay_placement(kind, "occupant");
+    let stderr = String::from_utf8_lossy(&replayed.stderr);
+    assert!(
+        !replayed.status.success(),
+        "replay over an occupied range succeeded: {stderr}"
+    );
+    assert!(stderr.contains(MAPPING_PLACEMENT_REFUSAL), "{stderr}");
+    assert!(
+        stderr.contains("MAP_FIXED_NOREPLACE failed with EEXIST"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Failed to inject mmap"), "{stderr}");
+}
+
+#[test]
+fn record_replay_places_a_shared_mapping_in_its_free_recorded_range() {
+    let _guard = hermit_record_lock();
+    assert_placed_in_free_range("shared");
+}
+
+/// `MAP_SHARED_VALIDATE` refuses `MAP_FIXED_NOREPLACE` with `EOPNOTSUPP`;
+/// replay places such a mapping as `MAP_SHARED`.
+#[test]
+fn record_replay_places_a_shared_validate_mapping_in_its_free_recorded_range() {
+    let _guard = hermit_record_lock();
+    assert_placed_in_free_range("validate");
+}
+
+#[test]
+fn record_replay_places_a_private_file_mapping_in_its_free_recorded_range() {
+    let _guard = hermit_record_lock();
+    assert_placed_in_free_range("private");
+}
+
+#[test]
+fn record_replay_refuses_a_shared_mapping_over_an_occupied_recorded_range() {
+    let _guard = hermit_record_lock();
+    assert_occupied_range_refused("shared");
+}
+
+#[test]
+fn record_replay_refuses_a_private_file_mapping_over_an_occupied_recorded_range() {
+    let _guard = hermit_record_lock();
+    assert_occupied_range_refused("private");
+}
+
 /// The replay of `tests/c/record_replay_shared_mappings.c` in `mode`, which
 /// both phases must print as `expected`, as a native run prints it. Replay
 /// backs each recorded shared file with one file of its own and maps every

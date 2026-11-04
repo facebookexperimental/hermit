@@ -85,6 +85,65 @@ pub(super) fn refuse(step: &str, error: impl Display) -> ! {
     panic!("{SHARED_MAPPING_REFUSAL}: {step}: {error}")
 }
 
+/// How replay refuses a recorded file mapping it cannot put at the address
+/// the recording gave it, because the replayed guest already maps part of
+/// that range (`EEXIST`). Anywhere else the guest would find the mapping at
+/// another address than it was given while recording.
+pub(super) const MAPPING_PLACEMENT_REFUSAL: &str = "replay refused: the address range \
+    a recorded mapping occupied is already mapped in the replayed guest";
+
+/// The flags that put a replayed file mapping exactly at its recorded
+/// address. A guest that asked for a fixed address keeps what it asked for:
+/// `MAP_FIXED` replaced the mappings in the range while recording, and does
+/// so again. Every other mapping gets `MAP_FIXED_NOREPLACE`. The recorded
+/// address must not be a hint: Linux takes a free hint only where its own
+/// placement agrees, and a file system that aligns large mappings
+/// (`thp_get_unmapped_area`) asks for the length plus 2 MiB at the hint, so
+/// a recorded mapping that ends where the next mapping starts lands
+/// elsewhere though its range is free.
+///
+/// `MAP_SHARED_VALIDATE` refuses `MAP_FIXED_NOREPLACE` (`EOPNOTSUPP`: it is
+/// not a legacy flag), so a mapping made with it is placed as `MAP_SHARED`,
+/// and the one flag only `MAP_SHARED_VALIDATE` admits, `MAP_SYNC`, is
+/// dropped. The recording's call already passed that validation. `MAP_SYNC`
+/// makes a DAX file's metadata durable before a write fault completes; it
+/// moves no address and changes no byte the guest reads, and the replay
+/// backing is a temporary file the tracer deletes, where durability means
+/// nothing. Kept, it would fail with `EOPNOTSUPP` on every backing that is
+/// not DAX: a memfd, tmpfs, btrfs, or ext4 and XFS without `-o dax`.
+fn at_recorded_address(flags: MapFlags) -> MapFlags {
+    if flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE) {
+        return flags;
+    }
+    let validate = MapFlags::from_bits_retain(libc::MAP_SHARED_VALIDATE);
+    let flags = if flags.contains(validate) {
+        flags.difference(validate | MapFlags::from_bits_retain(libc::MAP_SYNC))
+            | MapFlags::MAP_SHARED
+    } else {
+        flags
+    };
+    flags | MapFlags::MAP_FIXED_NOREPLACE
+}
+
+/// The result of placing a replayed mapping at `address` with
+/// [`at_recorded_address`]'s flags: `EEXIST` is a range the guest already
+/// maps, refused by name. A kernel older than `MAP_FIXED_NOREPLACE` (4.17)
+/// treats it as a hint and may map elsewhere, which is refused the same way.
+fn placed_at(result: Result<i64, Errno>, address: usize, len: usize) -> Result<i64, Errno> {
+    let end = address.saturating_add(len);
+    match result {
+        Err(Errno::EEXIST) => panic!(
+            "{MAPPING_PLACEMENT_REFUSAL}: [{address:#x}, {end:#x}): mmap with \
+             MAP_FIXED_NOREPLACE failed with EEXIST"
+        ),
+        Ok(ptr) if ptr as usize != address => panic!(
+            "{MAPPING_PLACEMENT_REFUSAL}: [{address:#x}, {end:#x}): the kernel mapped it \
+             at {ptr:#x} instead"
+        ),
+        result => result,
+    }
+}
+
 /// Failed mappings retain their recorded errno. A successful shared mapping
 /// must name its file before replay can create any mapping in the guest.
 fn replay_mmap_event(event: Result<MmapEvent, Errno>, flags: MapFlags) -> Result<MmapEvent, Errno> {
@@ -854,22 +913,17 @@ impl Replayer {
         // Write permission is also needed to be able to write the recorded
         // bytes to the mapping. After the data has been written, it can be
         // reset to the original protection value with a call to `mprotect`.
-        let ptr = guest
+        let mapped = guest
             .inject_with_retry(
                 syscall
                     .with_addr(Some(addr.cast::<libc::c_void>().into()))
                     .with_prot(prot | ProtFlags::PROT_WRITE)
-                    .with_flags(flags | MapFlags::MAP_ANONYMOUS)
+                    .with_flags(at_recorded_address(flags | MapFlags::MAP_ANONYMOUS))
                     .with_fd(-1)
                     .with_offset(0),
             )
-            .await?;
-
-        // Make sure we got the pointer we wanted.
-        assert_eq!(
-            ptr as usize, event.addr,
-            "Failed to inject mmap at desired address"
-        );
+            .await;
+        let ptr = placed_at(mapped, event.addr, len)?;
 
         // Fill in the memory map.
         guest.memory().write_exact(addr.cast(), &event.buf).unwrap();
@@ -953,7 +1007,12 @@ impl Replayer {
         // This is safe since we only record non-NULL pointers.
         let addr = unsafe { AddrMut::<libc::c_void>::from_raw_unchecked(address) };
         let mapped = guest
-            .inject_with_retry(syscall.with_addr(Some(addr.into())).with_fd(view.fd))
+            .inject_with_retry(
+                syscall
+                    .with_addr(Some(addr.into()))
+                    .with_flags(at_recorded_address(syscall.flags()))
+                    .with_fd(view.fd),
+            )
             .await;
         self.close_guest_descriptor(guest, view.fd).await;
         if let Some(limit) = view.restore {
@@ -961,11 +1020,8 @@ impl Replayer {
                 .await
                 .unwrap_or_else(|errno| refuse("restore the descriptor limit", errno));
         }
-        let ptr = mapped.unwrap_or_else(|errno| refuse("map the backing", errno));
-        assert_eq!(
-            ptr as usize, address,
-            "Failed to inject mmap at desired address"
-        );
+        let ptr = placed_at(mapped, address, syscall.len())
+            .unwrap_or_else(|errno| refuse("map the backing", errno));
         note_view(file, tid, address);
         ptr
     }
@@ -1585,6 +1641,69 @@ mod tests {
     use std::os::unix::fs::OpenOptionsExt;
 
     use super::*;
+
+    /// A guest's own fixed placement is kept; every other replayed mapping
+    /// is fixed at its recorded address without replacing a live mapping.
+    #[test]
+    fn a_replayed_mapping_is_fixed_at_its_recorded_address() {
+        for flags in [
+            MapFlags::MAP_PRIVATE,
+            MapFlags::MAP_SHARED,
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+        ] {
+            assert_eq!(
+                at_recorded_address(flags),
+                flags | MapFlags::MAP_FIXED_NOREPLACE
+            );
+        }
+        for flags in [
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+            MapFlags::MAP_SHARED | MapFlags::MAP_FIXED,
+            MapFlags::MAP_SHARED | MapFlags::MAP_FIXED_NOREPLACE,
+            MapFlags::from_bits_retain(libc::MAP_SHARED_VALIDATE) | MapFlags::MAP_FIXED,
+        ] {
+            assert_eq!(at_recorded_address(flags), flags);
+        }
+        // MAP_SHARED_VALIDATE becomes MAP_SHARED, and MAP_SYNC, which only
+        // MAP_SHARED_VALIDATE admits, is dropped rather than left for plain
+        // MAP_SHARED to ignore.
+        for flags in [
+            libc::MAP_SHARED_VALIDATE,
+            libc::MAP_SHARED_VALIDATE | libc::MAP_SYNC,
+            libc::MAP_SHARED_VALIDATE | libc::MAP_SYNC | libc::MAP_POPULATE,
+        ] {
+            assert_eq!(
+                at_recorded_address(MapFlags::from_bits_retain(flags)).bits(),
+                (flags & libc::MAP_POPULATE) | libc::MAP_SHARED | libc::MAP_FIXED_NOREPLACE,
+                "{flags:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_occupied_or_moved_placement_is_refused_by_name() {
+        let refusal = |result| {
+            let refusal = std::panic::catch_unwind(|| placed_at(result, 0x20_0000, 0x40_0000))
+                .expect_err("a misplaced mapping must refuse replay");
+            refusal.downcast_ref::<String>().unwrap().clone()
+        };
+        let occupied = refusal(Err(Errno::EEXIST));
+        assert!(
+            occupied.starts_with(MAPPING_PLACEMENT_REFUSAL),
+            "{occupied}"
+        );
+        assert!(occupied.contains("[0x200000, 0x600000)"), "{occupied}");
+        assert!(occupied.contains("EEXIST"), "{occupied}");
+        let moved = refusal(Ok(0x80_0000));
+        assert!(moved.starts_with(MAPPING_PLACEMENT_REFUSAL), "{moved}");
+        assert!(moved.contains("at 0x800000 instead"), "{moved}");
+
+        assert_eq!(placed_at(Ok(0x20_0000), 0x20_0000, 0x1000), Ok(0x20_0000));
+        assert_eq!(
+            placed_at(Err(Errno::ENOMEM), 0x20_0000, 0x1000),
+            Err(Errno::ENOMEM)
+        );
+    }
 
     #[test]
     fn a_successful_shared_mmap_requires_a_recorded_identity() {

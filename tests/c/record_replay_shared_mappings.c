@@ -54,6 +54,17 @@
  *         socketpair, sendmsg, recvmsg or prlimit64, then maps the memfd
  *         twice. Linux installs it; Hermit refuses every filter
  *         (EOPNOTSUPP), in record and in replay.
+ *   placement-shared, placement-validate, placement-private: maps a 4 MiB
+ *         + 5 page memfd read-only, MAP_SHARED, MAP_SHARED_VALIDATE or
+ *         MAP_PRIVATE, and reads it. First it makes an anonymous mapping of
+ *         the same size (the occupant) and leaves a free range of that size
+ *         (the hole) between a fence page below and a MAP_GROWSDOWN mapping
+ *         above, whose guard gap keeps Linux from placing a mapping there
+ *         without a fixed address, prints both addresses, and checks that a
+ *         mapping asking for the hole only as a hint is put elsewhere. The
+ *         record/replay test rewrites the recorded address of the memfd
+ *         mapping to one of them: replay must place the mapping in the free
+ *         hole, and refuse by name over the occupant.
  *
  * Usage: record_replay_shared_mappings <mode>
  * Prints one line per check and exits 0 only if every check saw what Linux
@@ -394,6 +405,45 @@ static void seccomp_filter(void) {
   printf("seccomp-filter: second sees %.8s\n", second);
 }
 
+/* The length of the placement modes' memfd mapping, which no other mapping
+ * of the workload has, so the record/replay test finds its event by it. */
+#define PLACEMENT_PAGES (1024 + 5)
+
+static void placement(const char* mode, int flags) {
+  size_t len = PLACEMENT_PAGES * page;
+  char* occupant = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  check(occupant != MAP_FAILED, "mmap occupant");
+  size_t grows = 16 * page;
+  char* region = mmap(NULL, page + len + grows, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  check(region != MAP_FAILED, "mmap region");
+  char* hole = region + page;
+  check(munmap(hole, len) == 0, "munmap hole");
+  char* above = mmap(hole + len, grows, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_GROWSDOWN, -1, 0);
+  check(above == hole + len, "mmap MAP_GROWSDOWN above the hole");
+  printf("%s: occupant %p\n", mode, (void*)occupant);
+  printf("%s: hole %p\n", mode, (void*)hole);
+  /* The guard gap (stack_guard_gap, 256 pages unless the kernel is booted
+   * with another) must refuse a hint at the hole. */
+  char* hinted = mmap(hole, len, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  check(hinted != MAP_FAILED, "mmap with a hint at the hole");
+  printf("%s: a hint at the hole is %s\n", mode, hinted == hole ? "taken" : "refused");
+  check(munmap(hinted, len) == 0, "munmap the hinted mapping");
+
+  int fd = memfd(PLACEMENT_PAGES);
+  for (int i = 0; i < PLACEMENT_PAGES; i++) {
+    unsigned char byte = (unsigned char)(i * 7 + 1);
+    check(pwrite(fd, &byte, 1, (off_t)i * page) == 1, "pwrite");
+  }
+  unsigned char* mapping = mmap(NULL, len, PROT_READ, flags, fd, 0);
+  check(mapping != MAP_FAILED, "mmap memfd");
+  unsigned long sum = 0;
+  for (int i = 0; i < PLACEMENT_PAGES; i++) {
+    sum = sum * 31 + mapping[(size_t)i * page];
+  }
+  printf("%s: mapping reads %lx\n", mode, sum);
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   page = sysconf(_SC_PAGESIZE);
@@ -434,6 +484,12 @@ int main(int argc, char** argv) {
     chroot_remap();
   } else if (strcmp(mode, "seccomp-filter") == 0) {
     seccomp_filter();
+  } else if (strcmp(mode, "placement-shared") == 0) {
+    placement(mode, MAP_SHARED);
+  } else if (strcmp(mode, "placement-validate") == 0) {
+    placement(mode, MAP_SHARED_VALIDATE);
+  } else if (strcmp(mode, "placement-private") == 0) {
+    placement(mode, MAP_PRIVATE);
   } else {
     fprintf(stderr, "unknown mode %s\n", mode);
     return 2;
