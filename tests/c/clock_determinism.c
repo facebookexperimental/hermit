@@ -31,11 +31,23 @@ static int check_clock(const struct clock_case* test) {
     return 1;
   }
 
-  const struct timespec request = {
+  // Waiting CPU-clock sleeps are deferred (#5102): Hermit refuses one that
+  // must wait, and natively a sole sleeping thread consumes no CPU, so a
+  // relative process-clock sleep here would never return. Exercise the
+  // process-clock nanosleep path with a deadline that has already passed,
+  // as in cpu_time_clocks.c, which returns at once.
+  const int passed_deadline = test->id == CLOCK_PROCESS_CPUTIME_ID;
+  const struct timespec relative = {
       .tv_sec = 0,
       .tv_nsec = 1000,
   };
-  const int sleep_error = clock_nanosleep(test->id, 0, &request, NULL);
+  const struct timespec passed = {
+      .tv_sec = 0,
+      .tv_nsec = 1,
+  };
+  const struct timespec* request = passed_deadline ? &passed : &relative;
+  const int sleep_error = clock_nanosleep(
+      test->id, passed_deadline ? TIMER_ABSTIME : 0, request, NULL);
   if (sleep_error != test->expected_sleep_error) {
     fprintf(
         stderr,
@@ -58,7 +70,8 @@ static int check_clock(const struct clock_case* test) {
   }
 
   const int64_t delta = timespec_ns(&after) - timespec_ns(&before);
-  const int64_t minimum_delta = sleep_error == 0 ? request.tv_nsec : 0;
+  const int64_t minimum_delta =
+      !passed_deadline && sleep_error == 0 ? request->tv_nsec : 0;
   if (delta < minimum_delta) {
     fprintf(
         stderr,
