@@ -1107,6 +1107,22 @@ pub(crate) mod tests {
         elf_image(words, Some(&[(1, 0, true)]))
     }
 
+    /// [`elf_image`] whose `.text` is marked `$x` at its start and holds an
+    /// AArch32 `$a` mapping symbol at word `at`: a section this reader does
+    /// not take as proved by its marks. Shared with the in-memory rewrite's
+    /// runtime tests, which are aarch64-only, as it is.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn elf_with_unsupported_mark(words: &[u32], at: usize) -> Vec<u8> {
+        let mut image = elf_image(words, Some(&[(1, 0, true), (1, at, false)]));
+        let names = b"\0$x\0$d\0";
+        let found = image
+            .windows(names.len())
+            .position(|window| window == names)
+            .expect("the mapping symbols' names");
+        image[found + 4..found + 6].copy_from_slice(b"$a");
+        image
+    }
+
     /// The plan names each rewritten sequence by file offset with its bytes
     /// before and after, those bytes are the rewriter's, and applying the
     /// plan is exactly what `rewrite_bytes` does to the file.

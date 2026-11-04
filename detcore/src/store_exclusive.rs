@@ -3200,6 +3200,7 @@ mod runtime {
         use super::*;
         use crate::aarch64_lse::elf::plan_bytes;
         use crate::aarch64_lse::elf::tests::elf_with_text;
+        use crate::aarch64_lse::elf::tests::elf_with_unsupported_mark;
 
         /// nop; ldaxr w8, [x0]; add w8, w8, #1; stlxr w9, w8, [x0];
         /// cbnz w9, <ldaxr>; ret: one canonical loop, at file offset 0x104
@@ -3429,6 +3430,40 @@ mod runtime {
             assert_eq!(shared.rewrite(&path, true), (rewrite(0, 1, 0), 0));
             assert_eq!(shared.bytes(LOOP_AT, LOOP_LEN), patch.original);
             assert_eq!(std::fs::read(&path).unwrap(), image);
+        }
+
+        /// A mapped file whose `.text` holds a mapping symbol other than `$x`
+        /// and `$d` (AArch32's `$a`) is not proved by its marks:
+        /// `rewrite_mapping` leaves its loop as the file has it and
+        /// marks the file as holding loops no accepted mapping symbol proves
+        /// (`Rewrite::unmarked`, from `FileReport::unproven`), so the run names
+        /// it in `exclusive_rewrite_unmarked` as it names a file with no mapping
+        /// symbols at all.
+        #[test]
+        #[ignore = "host-limited: runs code from /dev/shm; run with --run-ignored where it works (docs/TESTING_ENVIRONMENTS.md)"]
+        fn a_mapping_holding_an_unsupported_mapping_symbol_is_named_unproven() {
+            require_host(false);
+            let dir = tempfile::tempdir_in("/dev/shm").expect("a directory on /dev/shm (tmpfs)");
+            let path = dir.path().join("image");
+            let image = elf_with_unsupported_mark(&ONE_LOOP, 5);
+            std::fs::write(&path, &image).unwrap();
+            let mapping = Mapping::new(&path, libc::MAP_PRIVATE);
+            let (map, key) = mapping.listed();
+            assert_eq!(
+                rewrite_mapping(this_process(), &path, key, &map, 1, &|_, _| true),
+                (
+                    Rewrite {
+                        left: 1,
+                        unmarked: true,
+                        ..Rewrite::default()
+                    },
+                    0
+                )
+            );
+            assert_eq!(
+                mapping.bytes(LOOP_AT, LOOP_LEN),
+                image[LOOP_AT..LOOP_AT + LOOP_LEN]
+            );
         }
 
         /// A name that leads to another file than the mapped one plans
