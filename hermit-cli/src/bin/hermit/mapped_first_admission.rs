@@ -245,7 +245,9 @@ impl MappedFirstAdmission {
                 ));
             }
             let issues = server.retain_connection_issues();
-            server.set_connection_admission(self.clone());
+            server
+                .set_connection_admission(self.clone())
+                .map_err(error)?;
             server
                 .set_initial_image_admission(self.clone())
                 .map_err(error)?;
