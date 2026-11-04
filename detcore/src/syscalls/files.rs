@@ -14300,7 +14300,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// The binder part of `handle_ioctl`: under `--strict`, refuse a request
     /// the policy refuses before anything else (`Self::binder_entry`); take
     /// the call's one snapshot (`Self::binder_snapshot`), run it
-    /// (`Self::run_binder_call_with`), and for a read whose received
+    /// (`Self::run_binder_call_with`), refuse in a fail-closed run a read half
+    /// that faulted after it wrote what the header cannot account for
+    /// (`binder::faulted_read_reason`), and for a read whose received
     /// descriptors Detcore records, take them from the commands it wrote
     /// after the `read_consumed` that snapshot holds
     /// (`Self::take_binder_receipts`). Nothing reads the argument before the
@@ -14318,9 +14320,40 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(snapshot) => snapshot,
             Err(reason) => self.refuse_binder_under_strict(guest, reason).await,
         };
-        let (result, ran) = self
+        let outcome = self
             .run_binder_call_with(guest, call, fd, request, &snapshot)
-            .await?;
+            .await;
+        // A read half that faulted may have delivered descriptors the header
+        // does not account for (`binder::faulted_read_reason`).
+        let faulted = match &outcome {
+            Err(Error::Errno(errno)) => *errno == Errno::EFAULT,
+            Ok((result, _)) => *result == -i64::from(Errno::EFAULT.into_raw()),
+            Err(_) => false,
+        };
+        if faulted
+            && binder_read
+            && snapshot.write_read.is_some_and(|call| call.read_size > 0)
+            && self.cfg.panic_on_unsupported_syscalls
+            && self.records_received_descriptors(guest)
+        {
+            let reason = crate::syscalls::binder::faulted_read_reason(fd);
+            crate::syscalls::helpers::report_refusal_reason(
+                true,
+                &format!(
+                    "[dtid {}] ioctl refused: {reason}",
+                    guest.thread_state().dettid
+                ),
+            );
+            return self
+                .refuse_unserviceable_operation_because(
+                    guest,
+                    reverie::syscalls::Sysno::ioctl,
+                    Errno::EOPNOTSUPP,
+                    &reason,
+                )
+                .await;
+        }
+        let (result, ran) = outcome?;
         if binder_read && result >= 0 {
             self.take_binder_receipts(guest, fd, argument, snapshot.consumed_before(), ran)
                 .await?;
@@ -14878,8 +14911,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// while its caller was the run's one task
     /// (`binder::BinderRun::OffTurnAlone`): no other task existed to use,
     /// close or replace them, or rewrite what the read returned, before this
-    /// one resumed. A read there whose descriptors cannot be named is refused by
-    /// name in a fail-closed run (`binder::unrecorded_receipt_reason`): it may
+    /// one resumed. A read there, or in the turn, whose descriptors cannot be
+    /// named is refused by name in a fail-closed run
+    /// (`binder::unrecorded_receipt_reason`): it may
     /// have delivered some, and the guest's first use of one would otherwise
     /// fail with `EBADF`, an answer Linux never gives. A call that ran off the
     /// turn while the run had another task (`binder::BinderRun::OffTurnShared`), which
@@ -14898,9 +14932,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         use crate::syscalls::binder;
         use crate::syscalls::binder::BinderRun;
         let delivered = binder::delivered(&guest.memory(), argument, already_consumed);
-        let unrecorded = binder::unrecorded_receipt_reason(fd, &delivered);
+        let unrecorded = binder::unrecorded_receipt_reason(fd, ran, &delivered);
         match (ran, unrecorded) {
-            (BinderRun::OffTurnAlone, Some(reason))
+            // In the turn too: the generic receipt path refuses only an
+            // `SCM_RIGHTS` receipt it cannot read.
+            (BinderRun::OffTurnAlone | BinderRun::InTurn, Some(reason))
                 if delivered.refused.is_some()
                     && self.cfg.panic_on_unsupported_syscalls
                     && self.records_received_descriptors(guest) =>
@@ -21753,6 +21789,10 @@ mod inject_fstat_scratch {
         /// descriptor received outside the model do where it is gone; any
         /// other answer is not scripted.
         fcntl_ebadf: bool,
+        /// For a `BINDER_WRITE_READ`: the commands Linux writes into its read
+        /// buffer before the call fails with this errno, leaving the header
+        /// as it was, as when the copy back of a read-only header faults.
+        binder_read_fault: Option<(Vec<u8>, Errno)>,
         /// Whether `memory()` counts the reads it makes
         /// (`MEMORY_READS`), to show that a call read no guest memory.
         counts_memory_reads: bool,
@@ -21813,6 +21853,7 @@ mod inject_fstat_scratch {
                 ppoll_ready: None,
                 fcntl_ebadf: false,
                 counts_memory_reads: false,
+                binder_read_fault: None,
                 unreported_at_ioctl: None,
                 determinism_losses: Default::default(),
             };
@@ -22029,6 +22070,14 @@ mod inject_fstat_scratch {
                 }
                 Syscall::Ppoll(_) if let Some(ready) = self.ppoll_ready => ready,
                 Syscall::Fcntl(_) if self.fcntl_ebadf => return Err(Errno::EBADF),
+                Syscall::Ioctl(_) if self.binder_read_fault.is_some() => {
+                    let (commands, errno) = self.binder_read_fault.clone().unwrap();
+                    let address = AddrMut::<[u64; 6]>::from_raw(args.arg2).unwrap();
+                    let words: [u64; 6] = self.memory().read_value(address)?;
+                    let buffer = AddrMut::<u8>::from_raw((words[5] + words[4]) as usize).unwrap();
+                    self.memory().write_exact(buffer, &commands)?;
+                    return Err(errno);
+                }
                 Syscall::Ioctl(_) if self.binder_read_consumed.is_some() => {
                     assert_eq!(args.arg1 as u64, crate::syscalls::binder::BINDER_WRITE_READ);
                     self.unreported_at_ioctl =
@@ -22580,6 +22629,112 @@ mod inject_fstat_scratch {
         assert_eq!(
             crate::syscalls::binder::delivered(&LocalMemory::new(), argument, 0).fds,
             vec![123]
+        );
+    }
+
+    /// A binder read in the caller's turn whose descriptors cannot be named
+    /// is refused by name where the run fails closed, as one off the turn
+    /// is: it may have delivered some, which the generic receipt path would
+    /// leave unrecorded, refusing only an `SCM_RIGHTS` receipt it cannot read.
+    /// Where unsupported operations are allowed it goes on.
+    #[tokio::test]
+    async fn an_in_turn_binder_read_whose_descriptors_cannot_be_named_is_refused_where_the_run_fails_closed()
+     {
+        use crate::syscalls::binder::BinderRun;
+        let noop = 0x0000_720cu32.to_ne_bytes(); // BR_NOOP
+        // A read_consumed past read_size: what it delivered cannot be told.
+        let unreadable = [0, 0, 0, 4, 8, noop.as_ptr() as u64];
+        for fail_closed in [true, false] {
+            let (_, mut guest) = ScriptedGuest::new(true, false);
+            guest.config.sequentialize_threads = true;
+            guest.config.panic_on_unsupported_syscalls = fail_closed;
+            guest.config.exit_on_unsupported_syscall = true;
+            guest.fcntl_ebadf = true;
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+            assert!(tool.records_received_descriptors(&guest));
+            let taken = tool
+                .take_binder_receipts(
+                    &mut guest,
+                    99,
+                    unreadable.as_ptr() as usize,
+                    0,
+                    BinderRun::InTurn,
+                )
+                .await;
+            match (fail_closed, taken) {
+                (true, Err(Error::Tool(error))) => assert!(
+                    error
+                        .downcast_ref::<crate::UnsupportedSyscallError>()
+                        .is_some(),
+                    "{error:?}"
+                ),
+                (false, Ok(())) => {}
+                (_, other) => panic!("fail-closed {fail_closed}: {other:?}"),
+            }
+        }
+    }
+
+    /// A binder read whose header is read-only, so that Linux writes its
+    /// return commands and then fails the copy back with EFAULT, is refused
+    /// by name before the guest resumes where the run fails closed: the
+    /// descriptors it may have installed cannot be recorded, as the header
+    /// does not say how much it wrote. Where unsupported operations are
+    /// allowed the guest sees the EFAULT, and a read that fails otherwise
+    /// (EAGAIN from its wait) wrote nothing and returns its error. Driven
+    /// through `run_binder_ioctl`, the production path.
+    #[tokio::test]
+    async fn a_binder_read_that_faults_after_writing_its_commands_is_refused_where_the_run_fails_closed()
+     {
+        let mut reply = 0x8040_7203u32.to_ne_bytes().to_vec(); // BR_REPLY
+        reply.extend([0u8; 64]);
+        let mut buffer = [0u8; 256];
+        for (fail_closed, errno, refused) in [
+            (true, Errno::EFAULT, true),
+            (false, Errno::EFAULT, false),
+            (true, Errno::EAGAIN, false),
+        ] {
+            let mut words = [0, 0, 0, 256, 0, buffer.as_mut_ptr() as u64];
+            let (_, mut guest) = ScriptedGuest::new(true, false);
+            model_binder_descriptor(&guest);
+            guest.config.sequentialize_threads = true;
+            guest.config.panic_on_unsupported_syscalls = fail_closed;
+            guest.config.exit_on_unsupported_syscall = true;
+            guest.fcntl_ebadf = true;
+            guest.ppoll_ready = Some(1);
+            guest.binder_read_fault = Some((reply.clone(), errno));
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+            let call = binder_write_read_call(&mut words);
+            let argument = words.as_ptr() as usize;
+            let result = tool
+                .run_binder_ioctl(
+                    &mut guest,
+                    call,
+                    99,
+                    crate::syscalls::binder::BINDER_WRITE_READ,
+                    argument,
+                    true,
+                )
+                .await;
+            let case = format!("fail-closed {fail_closed}, {errno}");
+            match (refused, result) {
+                (true, Err(Error::Tool(error))) => assert!(
+                    error
+                        .downcast_ref::<crate::UnsupportedSyscallError>()
+                        .is_some(),
+                    "{case}: {error:?}"
+                ),
+                (false, Err(Error::Errno(got))) => assert_eq!(got, errno, "{case}"),
+                (_, other) => panic!("{case}: {other:?}"),
+            }
+            // The commands were written, and the header says nothing of them.
+            assert_eq!(&buffer[..4], &reply[..4], "{case}");
+            assert_eq!(words[4], 0, "{case}");
+            buffer = [0u8; 256];
+        }
+        let reason = crate::syscalls::binder::faulted_read_reason(99);
+        assert!(
+            reason.contains("failed with EFAULT, and its read half may have had effects"),
+            "{reason}"
         );
     }
 

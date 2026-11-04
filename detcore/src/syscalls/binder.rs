@@ -925,18 +925,49 @@ pub(crate) fn shared_task_reason(fd: RawFd, others: &str) -> String {
 
 /// Why the descriptors a binder read on descriptor `fd` delivered off the
 /// turn beside another task ([`BinderRun::OffTurnShared`]) go unrecorded, or
-/// why one that ran alone cannot have them recorded (Detcore cannot name them),
-/// or `None` when it delivered none.
-pub(crate) fn unrecorded_receipt_reason(fd: RawFd, delivered: &Delivered) -> Option<String> {
+/// why one that ran in the turn or alone off it cannot have them recorded
+/// (Detcore cannot name them), or `None` when it delivered none. `ran` says
+/// where the call ran.
+pub(crate) fn unrecorded_receipt_reason(
+    fd: RawFd,
+    ran: BinderRun,
+    delivered: &Delivered,
+) -> Option<String> {
     let what = match delivered.refused {
         Some(why) => format!("may have delivered descriptors Detcore cannot name ({why})"),
         None if delivered.fds.is_empty() => return None,
         None => format!("delivered descriptors {:?}", delivered.fds),
     };
+    let route = match ran {
+        BinderRun::InTurn => "ran in the guest's turn",
+        BinderRun::OffTurnAlone | BinderRun::OffTurnShared => "ran off the guest's turn",
+    };
     Some(format!(
-        "ioctl(BINDER_WRITE_READ) on descriptor {fd} ran off the guest's turn and {what}, \
-         which Detcore does not record"
+        "ioctl(BINDER_WRITE_READ) on descriptor {fd} {route} and {what}, which Detcore does not \
+         record"
     ))
+}
+
+/// Why a fail-closed run stops at a `BINDER_WRITE_READ` on `fd` with a read
+/// half (`read_size` > 0) that failed with `EFAULT`: Linux writes the read's
+/// return commands, and installs the descriptors they carry, before it copies
+/// the header back, and undoes neither when that copy, or a later write to
+/// the read buffer, faults (`binder_ioctl_write_read`,
+/// drivers/android/binder.c:5410-5423 and :5431-5433 at v6.16;
+/// `binder_thread_read` returns `-EFAULT` mid-buffer without updating
+/// `read_consumed`, :4750 to :5048). The header then does not say how much
+/// was written, so Detcore cannot record the descriptors, and the guest's
+/// first use of one would fail with `EBADF`, an answer Linux never gives.
+/// Any other error of the read half comes from its wait, after at most a
+/// `BR_NOOP` (:4667, :4702), and delivers nothing.
+pub(crate) fn faulted_read_reason(fd: RawFd) -> String {
+    format!(
+        "ioctl(BINDER_WRITE_READ) on descriptor {fd} failed with EFAULT, and its read half may \
+         have had effects: Linux does not undo the return commands it wrote, or the descriptors \
+         it installed, before a fault, and the call's binder_write_read does not say how much it \
+         wrote, so Detcore cannot record them. --allow-unsupported-syscalls lets the guest see \
+         the EFAULT"
+    )
 }
 
 /// `struct binder_freeze_info` at `argument`, read from guest memory.
@@ -1989,22 +2020,30 @@ mod tests {
             refused: None,
             may_have_installed: false,
         };
-        let reason = unrecorded_receipt_reason(4, &delivered).unwrap();
+        let reason = unrecorded_receipt_reason(4, BinderRun::OffTurnShared, &delivered).unwrap();
         assert!(
             reason.starts_with("ioctl(BINDER_WRITE_READ) on descriptor 4 ran off the guest's turn"),
             "{reason}"
+        );
+        let in_turn = unrecorded_receipt_reason(4, BinderRun::InTurn, &delivered).unwrap();
+        assert!(
+            in_turn.starts_with("ioctl(BINDER_WRITE_READ) on descriptor 4 ran in the guest's turn"),
+            "{in_turn}"
         );
         assert!(reason.contains("delivered descriptors [7, 9]"), "{reason}");
         let unknown = Delivered {
             refused: Some("its return commands cannot be read"),
             ..Delivered::default()
         };
-        let reason = unrecorded_receipt_reason(4, &unknown).unwrap();
+        let reason = unrecorded_receipt_reason(4, BinderRun::OffTurnAlone, &unknown).unwrap();
         assert!(
             reason.contains("may have delivered descriptors Detcore cannot name (its return commands cannot be read)"),
             "{reason}"
         );
-        assert_eq!(unrecorded_receipt_reason(4, &Delivered::default()), None);
+        assert_eq!(
+            unrecorded_receipt_reason(4, BinderRun::InTurn, &Delivered::default()),
+            None
+        );
     }
 
     /// The command codes are the uapi header's, from their `_IOR` parts.
