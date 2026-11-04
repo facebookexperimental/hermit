@@ -407,7 +407,7 @@ function run_nextest {
 
 function self_test {
     local scratch got expected status=0 wall_multiplier cpu_wrapper fixture_binary attempts
-    local binary_map inventory launch_failure=0 inventory_wrong_name=0 ordinary_attempts
+    local binary_map inventory launch_failure=0 inventory_wrong_name=0 ordinary_attempts ordinary_inventory
     scratch=$(mktemp -d)
     trap 'rm -rf "$scratch"' RETURN
 
@@ -633,6 +633,8 @@ PYEOF
     status=$?
     set -e
     [[ $status == 100 ]] || return 1
+    ordinary_inventory="$scratch/ordinary-inventory.json"
+    cp -- "$inventory" "$ordinary_inventory" || return 1
     [[ $got == *$'running 1 tests\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 filtered out' ]] || return 1
     [[ $got != *'test result: ok.'* ]] || return 1
     printf '%s\n' --color never --message-format json --profile ci -p suite \
@@ -790,7 +792,7 @@ PYEOF
     status=0
     DAGRUN_TEST_COUNTS_PATH="$scratch/failed-wrong-count.json" NEXTEST_EXPECTED_EXECUTED=2 \
         emit_libtest_count "$scratch/wrapper-events" 100 "$ordinary_attempts" "$binary_map" \
-        "$scratch/failed-wrong-cpu.json" "$inventory" >"$scratch/failed-wrong.stdout" 2>"$scratch/failed-wrong.stderr" || status=$?
+        "$scratch/failed-wrong-cpu.json" "$ordinary_inventory" >"$scratch/failed-wrong.stdout" 2>"$scratch/failed-wrong.stderr" || status=$?
     [[ $status == 2 ]] || return 1
     grep -q 'expected 2 tests to execute, saw 1' "$scratch/failed-wrong.stderr" || return 1
     grep -q 'of which 0 passed and 1 failed' "$scratch/failed-wrong.stderr" || return 1
