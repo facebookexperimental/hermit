@@ -336,8 +336,9 @@ struct MappedFileFacts {
 /// What a `MAP_SHARED` mapping maps, by its file's type and device number.
 #[derive(Debug, PartialEq, Eq)]
 enum MappedFile {
-    /// A file whose pages every shared mapping of it maps: a regular file, or
-    /// the shmem object of a recorded `/dev/zero` mapping.
+    /// A regular file, whose pages every shared mapping of it maps. The shmem
+    /// object of a shared anonymous or `/dev/zero` mapping is not one:
+    /// [`mapped_file`] refuses it.
     Regular,
     /// `/dev/zero`, of which every shared mapping is a new shmem object.
     Zero,
