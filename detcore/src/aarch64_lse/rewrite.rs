@@ -341,11 +341,18 @@ const REQUIRE_FULLY_DECODED_RANGES: bool = false;
 /// - `100x`: data processing (immediate), including ADR/ADRP, which
 ///   compute an address but never transfer control;
 /// - `11xx`: loads/stores and data processing (register) — literal
-///   loads read memory, nothing here jumps.
+///   loads read memory, nothing here jumps;
+/// - `0010`: the SVE encodings. The Arm Architecture Reference Manual
+///   for A-profile (DDI 0487), section C4.1, "A64 instruction set
+///   encoding", assigns this top-level class (op1, bits 28:25) to SVE
+///   alone, and none of its instructions writes the PC: SVE has no
+///   branch. Its predicate-generating and compare-and-terminate
+///   instructions set the condition flags, and control flow on them is
+///   a base A64 conditional branch, which `decode` recognises.
 ///
 /// Every other word the decoder does not recognise is a possible direct
-/// branch with an unknown target: the reserved (`0000`, SME), SVE
-/// (`0010`) and UNALLOCATED (`0001`, `0011`) top-level classes, any
+/// branch with an unknown target: the reserved (`0000`, SME) and
+/// UNALLOCATED (`0001`, `0011`) top-level classes, any
 /// future extension, and everything in the branch/exception/system
 /// group (`101x`) beyond its positively known non-direct members —
 /// exception generation (11010100: SVC/HVC/SMC/BRK and kin, which
@@ -375,7 +382,7 @@ pub fn unknown_direct_branch_possible(word: u32) -> bool {
     }
     match (word >> 25) & 0xf {
         // Positively known non-direct top-level classes (above).
-        0b0100..=0b0111 | 0b1000 | 0b1001 | 0b1100..=0b1111 => false,
+        0b0010 | 0b0100..=0b0111 | 0b1000 | 0b1001 | 0b1100..=0b1111 => false,
         0b1010 | 0b1011 => {
             let known_non_direct = (word >> 24) & 0xff == 0b11010100
                 || (word >> 24) & 0xff == 0b11010101
@@ -386,7 +393,8 @@ pub fn unknown_direct_branch_possible(word: u32) -> bool {
                     ));
             !known_non_direct
         }
-        // Reserved, SVE, unallocated, and anything not yet assigned.
+        // Reserved (SME), both unallocated classes, and anything not yet
+        // assigned.
         _ => true,
     }
 }
@@ -1080,6 +1088,21 @@ mod tests {
     }
 
     #[test]
+    fn an_sve_instruction_is_not_a_possible_branch() {
+        // ptrue p0.b; cntb x0; add z0.b, z0.b, z1.b; ld1b {z0.b}, p0/z, [x0]:
+        // SVE encodings, which hold no branch, sit beside a rewrite.
+        let (_, _, loop_words, _) = CASES[0];
+        for word in [0x2518_e3e0, 0x0420_e3e0, 0x0421_0000, 0xa400_a000] {
+            assert_eq!((word >> 25) & 0xf, 0b0010, "{word:#x} is in the SVE class");
+            assert_eq!(insn::decode(word), Insn::Other, "{word:#x}");
+            assert!(!unknown_direct_branch_possible(word), "{word:#x}");
+            let mut words = vec![word];
+            words.extend_from_slice(loop_words);
+            assert_eq!(plan(&words, BASE).patched.len(), 1, "{word:#x}");
+        }
+    }
+
+    #[test]
     fn every_top_level_class_is_classified_by_the_allow_list() {
         // All sixteen top-level classes (bits 28:25), one representative
         // unrecognised word each: only the positively known non-direct
@@ -1090,7 +1113,7 @@ mod tests {
         let cases: [(u32, bool); 16] = [
             (0x0001_0000, true),  // 0000 reserved (SME), not UDF
             (0x0200_0000, true),  // 0001 UNALLOCATED
-            (0x0400_0000, true),  // 0010 SVE (not allow-listed)
+            (0x0400_0000, false), // 0010 SVE (no branch)
             (0x0600_0000, true),  // 0011 UNALLOCATED
             (0x0800_0000, false), // 0100 data processing (register)
             (0x0a00_0400, false), // 0101 data processing / SIMD
