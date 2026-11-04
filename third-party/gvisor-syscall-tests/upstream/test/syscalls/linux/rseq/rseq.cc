@@ -1,0 +1,496 @@
+// Copyright 2019 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "test/syscalls/linux/rseq/critical.h"
+#include "test/syscalls/linux/rseq/syscalls.h"
+#include "test/syscalls/linux/rseq/test.h"
+#include "test/syscalls/linux/rseq/types.h"
+#include "test/syscalls/linux/rseq/uapi.h"
+
+namespace gvisor {
+namespace testing {
+
+extern "C" int main(int argc, char** argv, char** envp);
+
+// Standalone initialization before calling main().
+extern "C" void __init(uintptr_t* sp) {
+  int argc = sp[0];
+  char** argv = reinterpret_cast<char**>(&sp[1]);
+  char** envp = &argv[argc + 1];
+
+  // Call main() and exit.
+  sys_exit_group(main(argc, argv, envp));
+
+  // sys_exit_group does not return
+}
+
+int strcmp(const char* s1, const char* s2) {
+  const unsigned char* p1 = reinterpret_cast<const unsigned char*>(s1);
+  const unsigned char* p2 = reinterpret_cast<const unsigned char*>(s2);
+
+  while (*p1 == *p2) {
+    if (!*p1) {
+      return 0;
+    }
+    ++p1;
+    ++p2;
+  }
+  return static_cast<int>(*p1) - static_cast<int>(*p2);
+}
+
+int sys_rseq(struct rseq* rseq, uint32_t rseq_len, int flags, uint32_t sig) {
+  return raw_syscall(kRseqSyscall, rseq, rseq_len, flags, sig);
+}
+
+// RSeqRegistration represents a registered struct rseq, which is unregistered
+// when the RSeqRegistration is destroyed.
+class RSeqRegistration {
+ public:
+  ~RSeqRegistration() {
+    if (rseq_) {
+      sys_rseq(rseq_, rseq_len_, kRseqFlagUnregister, sig_);
+    }
+  }
+
+  RSeqRegistration(const RSeqRegistration&) = delete;
+  RSeqRegistration& operator=(const RSeqRegistration&) = delete;
+  RSeqRegistration(RSeqRegistration&&) = delete;
+  RSeqRegistration& operator=(RSeqRegistration&&) = delete;
+
+  int errno() const { return errno_; }
+
+ private:
+  RSeqRegistration(struct rseq* rseq, uint32_t rseq_len, uint32_t sig,
+                   int errno)
+      : rseq_(rseq), rseq_len_(rseq_len), sig_(sig), errno_(errno) {}
+
+  struct rseq* rseq_;
+  uint32_t rseq_len_;
+  uint32_t sig_;
+  int errno_;
+
+  friend RSeqRegistration RSeqRegister(struct rseq*, uint32_t, int, uint32_t);
+};
+
+RSeqRegistration RSeqRegister(struct rseq* rseq, uint32_t rseq_len, int flags,
+                              uint32_t sig) {
+  int ret = sys_rseq(rseq, rseq_len, flags, sig);
+  if (int errno = sys_errno(ret); errno != 0) {
+    return RSeqRegistration(nullptr, 0, 0, errno);
+  }
+  return RSeqRegistration(rseq, rseq_len, sig, 0);
+}
+
+// Test that rseq must be aligned.
+int TestUnaligned() {
+  constexpr uintptr_t kRequiredAlignment = alignof(rseq);
+
+  char buf[2 * kRequiredAlignment] = {};
+  uintptr_t ptr = reinterpret_cast<uintptr_t>(&buf[0]);
+  if ((ptr & (kRequiredAlignment - 1)) == 0) {
+    // buf is already aligned. Misalign it.
+    ptr++;
+  }
+
+  auto reg = RSeqRegister(reinterpret_cast<rseq*>(ptr), sizeof(rseq), 0, 0);
+  if (reg.errno() != EINVAL) {
+    return 1;
+  }
+  return 0;
+}
+
+// Sanity test that registration works.
+int TestRegister() {
+  struct rseq r = {};
+  auto reg = RSeqRegister(&r, sizeof(r), 0, 0);
+  if (reg.errno() != 0) {
+    return 1;
+  }
+  return 0;
+}
+
+// Registration can't be done twice.
+int TestDoubleRegister() {
+  struct rseq r = {};
+  auto reg1 = RSeqRegister(&r, sizeof(r), 0, 0);
+  if (reg1.errno() != 0) {
+    return 1;
+  }
+
+  auto reg2 = RSeqRegister(&r, sizeof(r), 0, 0);
+  if (reg2.errno() != EBUSY) {
+    return 1;
+  }
+
+  return 0;
+}
+
+// Registration can be done again after unregister.
+int TestRegisterUnregister() {
+  struct rseq r = {};
+
+  int ret = sys_rseq(&r, sizeof(r), 0, 0);
+  if (sys_errno(ret) != 0) {
+    return 1;
+  }
+
+  ret = sys_rseq(&r, sizeof(r), kRseqFlagUnregister, 0);
+  if (sys_errno(ret) != 0) {
+    return 1;
+  }
+
+  auto reg = RSeqRegister(&r, sizeof(r), 0, 0);
+  if (reg.errno() != 0) {
+    return 1;
+  }
+
+  return 0;
+}
+
+// The pointer to rseq must match on register/unregister.
+int TestUnregisterDifferentPtr() {
+  struct rseq r = {};
+
+  auto reg = RSeqRegister(&r, sizeof(r), 0, 0);
+  if (reg.errno() != 0) {
+    return 1;
+  }
+
+  struct rseq r2 = {};
+
+  int ret = sys_rseq(&r2, sizeof(r2), kRseqFlagUnregister, 0);
+  if (sys_errno(ret) != EINVAL) {
+    return 1;
+  }
+
+  return 0;
+}
+
+// The signature must match on register/unregister.
+int TestUnregisterDifferentSignature() {
+  constexpr int kSignature = 0;
+
+  struct rseq r = {};
+  auto reg = RSeqRegister(&r, sizeof(r), 0, kSignature);
+  if (reg.errno() != 0) {
+    return 1;
+  }
+
+  int ret = sys_rseq(&r, sizeof(r), kRseqFlagUnregister, kSignature + 1);
+  if (sys_errno(ret) != EPERM) {
+    return 1;
+  }
+
+  return 0;
+}
+
+// The CPU ID is initialized.
+int TestCPU() {
+  struct rseq r = {};
+  r.cpu_id = kRseqCPUIDUninitialized;
+
+  auto reg = RSeqRegister(&r, sizeof(r), 0, 0);
+  if (reg.errno() != 0) {
+    return 1;
+  }
+
+  if (__atomic_load_n(&r.cpu_id, __ATOMIC_RELAXED) < 0) {
+    return 1;
+  }
+  if (__atomic_load_n(&r.cpu_id_start, __ATOMIC_RELAXED) < 0) {
+    return 1;
+  }
+
+  return 0;
+}
+
+// Critical section is eventually aborted.
+int TestAbort() {
+  struct rseq r = {};
+  auto reg = RSeqRegister(&r, sizeof(r), 0, kRseqSignature);
+  if (reg.errno() != 0) {
+    return 1;
+  }
+
+  struct rseq_cs cs = {};
+  cs.version = 0;
+  cs.flags = 0;
+  cs.start_ip = reinterpret_cast<uint64_t>(&rseq_loop_start);
+  cs.post_commit_offset = reinterpret_cast<uint64_t>(&rseq_loop_post_commit) -
+                          reinterpret_cast<uint64_t>(&rseq_loop_start);
+  cs.abort_ip = reinterpret_cast<uint64_t>(&rseq_loop_abort);
+
+  // Loops until abort. If this returns then abort occurred.
+  rseq_loop(&r, &cs);
+
+  return 0;
+}
+
+// Abort may be before the critical section.
+int TestAbortBefore() {
+  struct rseq r = {};
+  auto reg = RSeqRegister(&r, sizeof(r), 0, kRseqSignature);
+  if (reg.errno() != 0) {
+    return 1;
+  }
+
+  struct rseq_cs cs = {};
+  cs.version = 0;
+  cs.flags = 0;
+  cs.start_ip = reinterpret_cast<uint64_t>(&rseq_loop_start);
+  cs.post_commit_offset = reinterpret_cast<uint64_t>(&rseq_loop_post_commit) -
+                          reinterpret_cast<uint64_t>(&rseq_loop_start);
+  cs.abort_ip = reinterpret_cast<uint64_t>(&rseq_loop_early_abort);
+
+  // Loops until abort. If this returns then abort occurred.
+  rseq_loop(&r, &cs);
+
+  return 0;
+}
+
+// Signature must match.
+int TestAbortSignature() {
+  struct rseq r = {};
+  auto reg = RSeqRegister(&r, sizeof(r), 0, kRseqSignature + 1);
+  if (reg.errno() != 0) {
+    return 1;
+  }
+
+  struct rseq_cs cs = {};
+  cs.version = 0;
+  cs.flags = 0;
+  cs.start_ip = reinterpret_cast<uint64_t>(&rseq_loop_start);
+  cs.post_commit_offset = reinterpret_cast<uint64_t>(&rseq_loop_post_commit) -
+                          reinterpret_cast<uint64_t>(&rseq_loop_start);
+  cs.abort_ip = reinterpret_cast<uint64_t>(&rseq_loop_abort);
+
+  // Loops until abort. This should SIGSEGV on abort.
+  rseq_loop(&r, &cs);
+
+  return 1;
+}
+
+// Abort must not be in the critical section.
+int TestAbortPreCommit() {
+  struct rseq r = {};
+  auto reg = RSeqRegister(&r, sizeof(r), 0, kRseqSignature + 1);
+  if (reg.errno() != 0) {
+    return 1;
+  }
+
+  struct rseq_cs cs = {};
+  cs.version = 0;
+  cs.flags = 0;
+  cs.start_ip = reinterpret_cast<uint64_t>(&rseq_loop_start);
+  cs.post_commit_offset = reinterpret_cast<uint64_t>(&rseq_loop_post_commit) -
+                          reinterpret_cast<uint64_t>(&rseq_loop_start);
+  cs.abort_ip = reinterpret_cast<uint64_t>(&rseq_loop_pre_commit);
+
+  // Loops until abort. This should SIGSEGV on abort.
+  rseq_loop(&r, &cs);
+
+  return 1;
+}
+
+// rseq.rseq_cs is cleared on abort.
+int TestAbortClearsCS() {
+  struct rseq r = {};
+  auto reg = RSeqRegister(&r, sizeof(r), 0, kRseqSignature);
+  if (reg.errno() != 0) {
+    return 1;
+  }
+
+  struct rseq_cs cs = {};
+  cs.version = 0;
+  cs.flags = 0;
+  cs.start_ip = reinterpret_cast<uint64_t>(&rseq_loop_start);
+  cs.post_commit_offset = reinterpret_cast<uint64_t>(&rseq_loop_post_commit) -
+                          reinterpret_cast<uint64_t>(&rseq_loop_start);
+  cs.abort_ip = reinterpret_cast<uint64_t>(&rseq_loop_abort);
+
+  // Loops until abort. If this returns then abort occurred.
+  rseq_loop(&r, &cs);
+
+  if (__atomic_load_n(&r.rseq_cs, __ATOMIC_RELAXED)) {
+    return 1;
+  }
+
+  return 0;
+}
+
+// rseq.rseq_cs is cleared on abort outside of critical section.
+int TestInvalidAbortClearsCS() {
+  struct rseq r = {};
+  auto reg = RSeqRegister(&r, sizeof(r), 0, kRseqSignature);
+  if (reg.errno() != 0) {
+    return 1;
+  }
+
+  struct rseq_cs cs = {};
+  cs.version = 0;
+  cs.flags = 0;
+  cs.start_ip = reinterpret_cast<uint64_t>(&rseq_loop_start);
+  cs.post_commit_offset = reinterpret_cast<uint64_t>(&rseq_loop_post_commit) -
+                          reinterpret_cast<uint64_t>(&rseq_loop_start);
+  cs.abort_ip = reinterpret_cast<uint64_t>(&rseq_loop_abort);
+
+  // Ensure that the kernel, running on this CPU, will observe the preceding
+  // stores to cs before the following store to r.rseq_cs. This is a compiler
+  // barrier, equivalent to std::atomic_signal_fence() but without stdlib.
+  asm volatile("" ::: "memory");
+
+  __atomic_store_n(&r.rseq_cs, &cs, __ATOMIC_RELAXED);
+
+  // When the next abort condition occurs, the kernel will clear cs once it
+  // determines we aren't in the critical section.
+  while (1) {
+    if (!__atomic_load_n(&r.rseq_cs, __ATOMIC_RELAXED)) {
+      break;
+    }
+  }
+
+  return 0;
+}
+
+// rseq.cpu_id_start is overwritten by RSEQ fence.
+int TestMembarrierResetsCpuIdStart() {
+  struct rseq r = {};
+  auto reg = RSeqRegister(&r, sizeof(r), 0, kRseqSignature);
+  if (reg.errno() != 0) {
+    return 1;
+  }
+  int ret = sys_membarrier(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ, 0);
+  if (sys_errno(ret) != 0) {
+    return 1;
+  }
+  constexpr size_t kStackSize = 2 << 20;  // 2 MB
+  uintptr_t child_stack_start =
+      sys_mmap(nullptr, kStackSize, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+  if (sys_errno(child_stack_start) != 0) {
+    return 1;
+  }
+  uintptr_t child_stack_end = child_stack_start + kStackSize;
+
+  // Set cpu_id_start to a negative value.
+  __atomic_store_n(&r.cpu_id_start, 0xffffffff, __ATOMIC_RELAXED);
+
+  // Start a thread to invoke the RSEQ fence.
+  uint32_t child_cleartid = 0;
+  bool fenced = false;
+  auto tid = clone(
+      +[](void* arg) {
+        int ret = sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ, 0);
+        if (sys_errno(ret) != 0) {
+          sys_exit_group(1);
+        }
+        __atomic_store_n(static_cast<bool*>(arg), true, __ATOMIC_RELAXED);
+        return 0;
+      },
+      child_stack_end,
+      CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
+          CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID,
+      &fenced, &child_cleartid);
+  if (sys_errno(tid) != 0) {
+    return 1;
+  }
+
+  // Expect that cpu_id_start will be overwritten with a real CPU number when
+  // the thread invokes the RSEQ fence.
+  while (true) {
+    if (__atomic_load_n(&fenced, __ATOMIC_ACQUIRE)) {
+      if (static_cast<int32_t>(
+              __atomic_load_n(&r.cpu_id_start, __ATOMIC_RELAXED)) < 0) {
+        return 1;
+      }
+      break;
+    }
+  }
+
+  // Wait for the thread to exit.
+  while (true) {
+    uint32_t cur_child_cleartid =
+        __atomic_load_n(&child_cleartid, __ATOMIC_RELAXED);
+    if (cur_child_cleartid == 0) {
+      break;
+    }
+    auto ret =
+        sys_futex(&child_cleartid, FUTEX_WAIT, cur_child_cleartid, nullptr);
+    if (ret != 0 && sys_errno(ret) != EAGAIN && sys_errno(ret) != EINTR) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+// Exit codes:
+//  0 - Pass
+//  1 - Fail
+//  2 - Missing argument
+//  3 - Unknown test case
+extern "C" int main(int argc, char** argv, char** envp) {
+  if (argc != 2) {
+    // Usage: rseq <test case>
+    return 2;
+  }
+
+  if (strcmp(argv[1], kRseqTestUnaligned) == 0) {
+    return TestUnaligned();
+  }
+  if (strcmp(argv[1], kRseqTestRegister) == 0) {
+    return TestRegister();
+  }
+  if (strcmp(argv[1], kRseqTestDoubleRegister) == 0) {
+    return TestDoubleRegister();
+  }
+  if (strcmp(argv[1], kRseqTestRegisterUnregister) == 0) {
+    return TestRegisterUnregister();
+  }
+  if (strcmp(argv[1], kRseqTestUnregisterDifferentPtr) == 0) {
+    return TestUnregisterDifferentPtr();
+  }
+  if (strcmp(argv[1], kRseqTestUnregisterDifferentSignature) == 0) {
+    return TestUnregisterDifferentSignature();
+  }
+  if (strcmp(argv[1], kRseqTestCPU) == 0) {
+    return TestCPU();
+  }
+  if (strcmp(argv[1], kRseqTestAbort) == 0) {
+    return TestAbort();
+  }
+  if (strcmp(argv[1], kRseqTestAbortBefore) == 0) {
+    return TestAbortBefore();
+  }
+  if (strcmp(argv[1], kRseqTestAbortSignature) == 0) {
+    return TestAbortSignature();
+  }
+  if (strcmp(argv[1], kRseqTestAbortPreCommit) == 0) {
+    return TestAbortPreCommit();
+  }
+  if (strcmp(argv[1], kRseqTestAbortClearsCS) == 0) {
+    return TestAbortClearsCS();
+  }
+  if (strcmp(argv[1], kRseqTestInvalidAbortClearsCS) == 0) {
+    return TestInvalidAbortClearsCS();
+  }
+  if (strcmp(argv[1], kRseqTestMembarrierResetsCpuIdStart) == 0) {
+    return TestMembarrierResetsCpuIdStart();
+  }
+
+  return 3;
+}
+
+}  // namespace testing
+}  // namespace gvisor

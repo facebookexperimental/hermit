@@ -1,0 +1,6 @@
+# Vendored gVisor test targets. "*" = every x86-64 target upstream
+# defines (257 at the current pin). All of them are vendored; which
+# cases run in which validation tier is a manifest concern
+# (tests/e2e/manifests/gvisor.yaml), not a vendoring concern.
+# A future trim would list target names here instead, one per line.
+*

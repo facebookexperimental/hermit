@@ -1,0 +1,361 @@
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <errno.h>
+#include <poll.h>
+#include <sys/timerfd.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <cstdint>
+#include <cstdio>
+
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
+#include "absl/strings/str_cat.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
+#include "test/util/file_descriptor.h"
+#include "test/util/posix_error.h"
+#include "test/util/save_util.h"
+#include "test/util/test_util.h"
+
+namespace gvisor {
+namespace testing {
+
+namespace {
+
+// Wrapper around timerfd_create(2) that returns a FileDescriptor.
+PosixErrorOr<FileDescriptor> TimerfdCreate(int clockid, int flags) {
+  int fd = timerfd_create(clockid, flags);
+  MaybeSave();
+  if (fd < 0) {
+    return PosixError(errno, "timerfd_create failed");
+  }
+  return FileDescriptor(fd);
+}
+
+// In tests that race a timerfd with a sleep, some slack is required because:
+//
+// - Timerfd expirations are asynchronous with respect to nanosleeps.
+//
+// - Because clock_gettime(CLOCK_MONOTONIC) is implemented through the VDSO,
+// it technically uses a closely-related, but distinct, time domain from the
+// CLOCK_MONOTONIC used to trigger timerfd expirations. The same applies to
+// CLOCK_BOOTTIME.
+absl::Duration TimerSlack() { return absl::Milliseconds(500); }
+
+class TimerfdTest : public ::testing::TestWithParam<int> {};
+
+TEST_P(TimerfdTest, IsInitiallyStopped) {
+  auto const tfd = ASSERT_NO_ERRNO_AND_VALUE(TimerfdCreate(GetParam(), 0));
+  struct itimerspec its = {};
+  ASSERT_THAT(timerfd_gettime(tfd.get(), &its), SyscallSucceeds());
+  EXPECT_EQ(0, its.it_value.tv_sec);
+  EXPECT_EQ(0, its.it_value.tv_nsec);
+}
+
+TEST_P(TimerfdTest, SingleShot) {
+  constexpr absl::Duration kDelay = absl::Seconds(1);
+
+  auto const tfd = ASSERT_NO_ERRNO_AND_VALUE(TimerfdCreate(GetParam(), 0));
+  struct itimerspec its = {};
+  its.it_value = absl::ToTimespec(kDelay);
+  ASSERT_THAT(timerfd_settime(tfd.get(), /* flags = */ 0, &its, nullptr),
+              SyscallSucceeds());
+
+  // The timer should fire exactly once since the interval is zero.
+  absl::SleepFor(kDelay + TimerSlack());
+  uint64_t val = 0;
+  ASSERT_THAT(ReadFd(tfd.get(), &val, sizeof(uint64_t)),
+              SyscallSucceedsWithValue(sizeof(uint64_t)));
+  EXPECT_EQ(1, val);
+}
+
+TEST_P(TimerfdTest, Periodic) {
+  constexpr absl::Duration kDelay = absl::Seconds(1);
+  constexpr int kPeriods = 3;
+
+  auto const tfd = ASSERT_NO_ERRNO_AND_VALUE(TimerfdCreate(GetParam(), 0));
+  struct itimerspec its = {};
+  its.it_value = absl::ToTimespec(kDelay);
+  its.it_interval = absl::ToTimespec(kDelay);
+  ASSERT_THAT(timerfd_settime(tfd.get(), /* flags = */ 0, &its, nullptr),
+              SyscallSucceeds());
+
+  // Expect to see at least kPeriods expirations. More may occur due to the
+  // timer slack, or due to delays from scheduling or save/restore.
+  absl::SleepFor(kPeriods * kDelay + TimerSlack());
+  uint64_t val = 0;
+  ASSERT_THAT(ReadFd(tfd.get(), &val, sizeof(uint64_t)),
+              SyscallSucceedsWithValue(sizeof(uint64_t)));
+  EXPECT_GE(val, kPeriods);
+}
+
+TEST_P(TimerfdTest, BlockingRead) {
+  constexpr absl::Duration kDelay = absl::Seconds(3);
+
+  auto const tfd = ASSERT_NO_ERRNO_AND_VALUE(TimerfdCreate(GetParam(), 0));
+  struct itimerspec its = {};
+  its.it_value.tv_sec = absl::ToInt64Seconds(kDelay);
+  auto const start_time = absl::Now();
+  ASSERT_THAT(timerfd_settime(tfd.get(), /* flags = */ 0, &its, nullptr),
+              SyscallSucceeds());
+
+  // read should block until the timer fires.
+  uint64_t val = 0;
+  ASSERT_THAT(ReadFd(tfd.get(), &val, sizeof(uint64_t)),
+              SyscallSucceedsWithValue(sizeof(uint64_t)));
+  auto const end_time = absl::Now();
+  EXPECT_EQ(1, val);
+  EXPECT_GE((end_time - start_time) + TimerSlack(), kDelay);
+}
+
+TEST_P(TimerfdTest, NonblockingRead) {
+  constexpr absl::Duration kDelay = absl::Seconds(5);
+
+  auto const tfd =
+      ASSERT_NO_ERRNO_AND_VALUE(TimerfdCreate(GetParam(), TFD_NONBLOCK));
+
+  // Since the timer is initially disabled and has never fired, read should
+  // return EAGAIN.
+  uint64_t val = 0;
+  ASSERT_THAT(ReadFd(tfd.get(), &val, sizeof(uint64_t)),
+              SyscallFailsWithErrno(EAGAIN));
+
+  DisableSave ds;  // Timing-sensitive.
+
+  // Arm the timer.
+  struct itimerspec its = {};
+  its.it_value.tv_sec = absl::ToInt64Seconds(kDelay);
+  ASSERT_THAT(timerfd_settime(tfd.get(), /* flags = */ 0, &its, nullptr),
+              SyscallSucceeds());
+
+  // Since the timer has not yet fired, read should return EAGAIN.
+  ASSERT_THAT(ReadFd(tfd.get(), &val, sizeof(uint64_t)),
+              SyscallFailsWithErrno(EAGAIN));
+
+  ds.reset();  // No longer timing-sensitive.
+
+  // After the timer fires, read should indicate 1 expiration.
+  absl::SleepFor(kDelay + TimerSlack());
+  ASSERT_THAT(ReadFd(tfd.get(), &val, sizeof(uint64_t)),
+              SyscallSucceedsWithValue(sizeof(uint64_t)));
+  EXPECT_EQ(1, val);
+
+  // The successful read should have reset the number of expirations.
+  ASSERT_THAT(ReadFd(tfd.get(), &val, sizeof(uint64_t)),
+              SyscallFailsWithErrno(EAGAIN));
+}
+
+TEST_P(TimerfdTest, BlockingPoll_SetTimeResetsExpirations) {
+  constexpr absl::Duration kDelay = absl::Seconds(3);
+
+  auto const tfd =
+      ASSERT_NO_ERRNO_AND_VALUE(TimerfdCreate(GetParam(), TFD_NONBLOCK));
+  struct itimerspec its = {};
+  its.it_value.tv_sec = absl::ToInt64Seconds(kDelay);
+  auto const start_time = absl::Now();
+  ASSERT_THAT(timerfd_settime(tfd.get(), /* flags = */ 0, &its, nullptr),
+              SyscallSucceeds());
+
+  // poll should block until the timer fires.
+  struct pollfd pfd = {};
+  pfd.fd = tfd.get();
+  pfd.events = POLLIN;
+  ASSERT_THAT(poll(&pfd, /* nfds = */ 1,
+                   /* timeout = */ 2 * absl::ToInt64Seconds(kDelay) * 1000),
+              SyscallSucceedsWithValue(1));
+  auto const end_time = absl::Now();
+  EXPECT_EQ(POLLIN, pfd.revents);
+  EXPECT_GE((end_time - start_time) + TimerSlack(), kDelay);
+
+  // Call timerfd_settime again with a value of 0. This should reset the number
+  // of expirations to 0, causing read to return EAGAIN since the timerfd is
+  // non-blocking.
+  its.it_value.tv_sec = 0;
+  ASSERT_THAT(timerfd_settime(tfd.get(), /* flags = */ 0, &its, nullptr),
+              SyscallSucceeds());
+  uint64_t val = 0;
+  ASSERT_THAT(ReadFd(tfd.get(), &val, sizeof(uint64_t)),
+              SyscallFailsWithErrno(EAGAIN));
+}
+
+TEST_P(TimerfdTest, SetAbsoluteTime) {
+  constexpr absl::Duration kDelay = absl::Seconds(3);
+
+  // Use a non-blocking timerfd so that if TFD_TIMER_ABSTIME is incorrectly
+  // non-functional, we get EAGAIN rather than a test timeout.
+  auto const tfd =
+      ASSERT_NO_ERRNO_AND_VALUE(TimerfdCreate(GetParam(), TFD_NONBLOCK));
+  struct itimerspec its = {};
+  ASSERT_THAT(clock_gettime(GetParam(), &its.it_value), SyscallSucceeds());
+  its.it_value.tv_sec += absl::ToInt64Seconds(kDelay);
+  ASSERT_THAT(timerfd_settime(tfd.get(), TFD_TIMER_ABSTIME, &its, nullptr),
+              SyscallSucceeds());
+
+  absl::SleepFor(kDelay + TimerSlack());
+  uint64_t val = 0;
+  ASSERT_THAT(ReadFd(tfd.get(), &val, sizeof(uint64_t)),
+              SyscallSucceedsWithValue(sizeof(uint64_t)));
+  EXPECT_EQ(1, val);
+}
+
+TEST_P(TimerfdTest, SetToPastExpiresEventually) {
+  auto const tfd = ASSERT_NO_ERRNO_AND_VALUE(TimerfdCreate(GetParam(), 0));
+  struct itimerspec its = {};
+  its.it_value.tv_nsec = 1;
+  ASSERT_THAT(timerfd_settime(tfd.get(), TFD_TIMER_ABSTIME, &its, nullptr),
+              SyscallSucceeds());
+
+  uint64_t val = 0;
+  ASSERT_THAT(ReadFd(tfd.get(), &val, sizeof(uint64_t)),
+              SyscallSucceedsWithValue(sizeof(uint64_t)));
+  ASSERT_EQ(val, 1);
+}
+
+TEST_P(TimerfdTest, IllegalSeek) {
+  // TODO: b/298787679 - this test fails on 6.0+ kernels.
+  SKIP_IF(!IsRunningOnGvisor());
+
+  auto const tfd = ASSERT_NO_ERRNO_AND_VALUE(TimerfdCreate(GetParam(), 0));
+  EXPECT_THAT(lseek(tfd.get(), 0, SEEK_SET), SyscallFailsWithErrno(ESPIPE));
+}
+
+TEST_P(TimerfdTest, IllegalPread) {
+  auto const tfd = ASSERT_NO_ERRNO_AND_VALUE(TimerfdCreate(GetParam(), 0));
+  int val;
+  EXPECT_THAT(pread(tfd.get(), &val, sizeof(val), 0),
+              SyscallFailsWithErrno(ESPIPE));
+}
+
+TEST_P(TimerfdTest, IllegalPwrite) {
+  auto const tfd = ASSERT_NO_ERRNO_AND_VALUE(TimerfdCreate(GetParam(), 0));
+  EXPECT_THAT(pwrite(tfd.get(), "x", 1, 0), SyscallFailsWithErrno(ESPIPE));
+}
+
+TEST_P(TimerfdTest, IllegalWrite) {
+  auto const tfd =
+      ASSERT_NO_ERRNO_AND_VALUE(TimerfdCreate(GetParam(), TFD_NONBLOCK));
+  uint64_t val = 0;
+  EXPECT_THAT(write(tfd.get(), &val, sizeof(val)),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+std::string PrintClockId(::testing::TestParamInfo<int> info) {
+  switch (info.param) {
+    case CLOCK_MONOTONIC:
+      return "CLOCK_MONOTONIC";
+    case CLOCK_BOOTTIME:
+      return "CLOCK_BOOTTIME";
+    default:
+      return absl::StrCat(info.param);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(AllTimerTypes, TimerfdTest,
+                         ::testing::Values(CLOCK_MONOTONIC, CLOCK_BOOTTIME),
+                         PrintClockId);
+
+TEST(TimerfdClockRealtimeTest, ClockRealtime) {
+  // Since CLOCK_REALTIME can, by definition, change, we can't make any
+  // non-flaky assertions about the amount of time it takes for a
+  // CLOCK_REALTIME-based timer to expire. Just check that it expires at all,
+  // and hope it happens before the test times out.
+  constexpr int kDelaySecs = 1;
+
+  auto const tfd = ASSERT_NO_ERRNO_AND_VALUE(TimerfdCreate(CLOCK_REALTIME, 0));
+  struct itimerspec its = {};
+  its.it_value.tv_sec = kDelaySecs;
+  ASSERT_THAT(timerfd_settime(tfd.get(), /* flags = */ 0, &its, nullptr),
+              SyscallSucceeds());
+
+  uint64_t val = 0;
+  ASSERT_THAT(ReadFd(tfd.get(), &val, sizeof(uint64_t)),
+              SyscallSucceedsWithValue(sizeof(uint64_t)));
+  EXPECT_EQ(1, val);
+}
+
+// A relative CLOCK_REALTIME timer measures its duration with CLOCK_MONOTONIC,
+// so that changes to the realtime clock, such as when the sandbox is
+// checkpointed and restored while the timer is armed, do not affect it.
+TEST(TimerfdClockRealtimeTest, RelativeClockRealtimeMeasuresMonotonicTime) {
+  constexpr absl::Duration kDelay = absl::Seconds(2);
+
+  auto const tfd = ASSERT_NO_ERRNO_AND_VALUE(TimerfdCreate(CLOCK_REALTIME, 0));
+  struct timespec before, after;
+  ASSERT_THAT(clock_gettime(CLOCK_MONOTONIC, &before), SyscallSucceeds());
+  struct itimerspec its = {};
+  its.it_value = absl::ToTimespec(kDelay);
+  ASSERT_THAT(timerfd_settime(tfd.get(), /* flags = */ 0, &its, nullptr),
+              SyscallSucceeds());
+  MaybeSave();
+
+  uint64_t val = 0;
+  ASSERT_THAT(ReadFd(tfd.get(), &val, sizeof(uint64_t)),
+              SyscallSucceedsWithValue(sizeof(uint64_t)));
+  ASSERT_THAT(clock_gettime(CLOCK_MONOTONIC, &after), SyscallSucceeds());
+  EXPECT_EQ(1, val);
+  EXPECT_GE(absl::TimeFromTimespec(after) - absl::TimeFromTimespec(before),
+            kDelay);
+}
+
+// Same as the above ClockRealtime test but expresses the input as an absolute
+// time value rather than an interval.
+TEST(TimerfdClockRealtimeTest, ClockAbsoluteRealtime) {
+  constexpr int kDelaySecs = 1;
+
+  struct itimerspec its = {};
+  ASSERT_EQ(0, clock_gettime(CLOCK_REALTIME, &its.it_value));
+  its.it_value.tv_sec += kDelaySecs;
+
+  auto const tfd = ASSERT_NO_ERRNO_AND_VALUE(TimerfdCreate(CLOCK_REALTIME, 0));
+  ASSERT_THAT(timerfd_settime(tfd.get(), TFD_TIMER_ABSTIME, &its, nullptr),
+              SyscallSucceeds());
+
+  uint64_t val = 0;
+  ASSERT_THAT(ReadFd(tfd.get(), &val, sizeof(uint64_t)),
+              SyscallSucceedsWithValue(sizeof(uint64_t)));
+  EXPECT_EQ(1, val);
+}
+
+// Same as the above ClockAbsoluteRealtime test but passes
+// TFD_TIMER_CANCEL_ON_SET to verify it behaves as it does without the flag.
+TEST(TimerfdClockRealtimeTest, ClockAbsoluteRealtimeCancelOnSet) {
+  // Skip on native Linux since we can't guarantee there
+  // will be no clock jumps causing ECANCELED
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
+
+  constexpr int kDelaySecs = 1;
+
+  struct itimerspec its = {};
+  ASSERT_EQ(0, clock_gettime(CLOCK_REALTIME, &its.it_value));
+  its.it_value.tv_sec += kDelaySecs;
+
+  auto const tfd = ASSERT_NO_ERRNO_AND_VALUE(TimerfdCreate(CLOCK_REALTIME, 0));
+  ASSERT_THAT(
+      timerfd_settime(tfd.get(), TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET,
+                      &its, nullptr),
+      SyscallSucceeds());
+
+  uint64_t val = 0;
+  ASSERT_THAT(ReadFd(tfd.get(), &val, sizeof(uint64_t)),
+              SyscallSucceedsWithValue(sizeof(uint64_t)));
+  EXPECT_EQ(1, val);
+}
+
+}  // namespace
+
+}  // namespace testing
+}  // namespace gvisor

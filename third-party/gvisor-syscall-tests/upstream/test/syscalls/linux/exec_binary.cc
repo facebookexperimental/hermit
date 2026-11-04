@@ -1,0 +1,2168 @@
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <elf.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <grp.h>
+#include <linux/capability.h>
+#include <linux/prctl.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <sys/prctl.h>
+#include <sys/ptrace.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <sys/user.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <iterator>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
+#include "test/util/cleanup.h"
+#include "test/util/file_descriptor.h"
+#include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
+#include "test/util/logging.h"
+#include "test/util/multiprocess_util.h"
+#include "test/util/posix_error.h"
+#include "test/util/proc_util.h"
+#include "test/util/save_util.h"
+#include "test/util/temp_path.h"
+#include "test/util/test_util.h"
+#include "test/util/thread_util.h"
+
+namespace gvisor {
+namespace testing {
+namespace {
+
+using ::testing::AnyOf;
+using ::testing::Eq;
+
+#if !defined(__x86_64__) && !defined(__aarch64__)
+// The assembly stub and ELF internal details must be ported to other arches.
+#error "Test only supported on x86-64/arm64"
+#endif  // __x86_64__ || __aarch64__
+
+#if defined(__x86_64__)
+#define EM_TYPE EM_X86_64
+#define IP_REG(p) ((p).rip)
+#define RAX_REG(p) ((p).rax)
+#define RDI_REG(p) ((p).rdi)
+#define RETURN_REG(p) ((p).rax)
+
+// amd64 stub that calls PTRACE_TRACEME and sends itself SIGSTOP.
+const char kPtraceCode[] = {
+    // movq $101, %rax  /* ptrace */
+    '\x48',
+    '\xc7',
+    '\xc0',
+    '\x65',
+    '\x00',
+    '\x00',
+    '\x00',
+    // movq $0, %rsi  /* PTRACE_TRACEME */
+    '\x48',
+    '\xc7',
+    '\xc6',
+    '\x00',
+    '\x00',
+    '\x00',
+    '\x00',
+    // movq $0, %rdi
+    '\x48',
+    '\xc7',
+    '\xc7',
+    '\x00',
+    '\x00',
+    '\x00',
+    '\x00',
+    // movq $0, %rdx
+    '\x48',
+    '\xc7',
+    '\xc2',
+    '\x00',
+    '\x00',
+    '\x00',
+    '\x00',
+    // movq $0, %r10
+    '\x49',
+    '\xc7',
+    '\xc2',
+    '\x00',
+    '\x00',
+    '\x00',
+    '\x00',
+    // syscall
+    '\x0f',
+    '\x05',
+
+    // movq $39, %rax  /* getpid */
+    '\x48',
+    '\xc7',
+    '\xc0',
+    '\x27',
+    '\x00',
+    '\x00',
+    '\x00',
+    // syscall
+    '\x0f',
+    '\x05',
+
+    // movq %rax, %rdi  /* pid */
+    '\x48',
+    '\x89',
+    '\xc7',
+    // movq $62, %rax  /* kill */
+    '\x48',
+    '\xc7',
+    '\xc0',
+    '\x3e',
+    '\x00',
+    '\x00',
+    '\x00',
+    // movq $19, %rsi  /* SIGSTOP */
+    '\x48',
+    '\xc7',
+    '\xc6',
+    '\x13',
+    '\x00',
+    '\x00',
+    '\x00',
+    // syscall
+    '\x0f',
+    '\x05',
+};
+
+// Size of a syscall instruction.
+constexpr int kSyscallSize = 2;
+
+#elif defined(__aarch64__)
+#define EM_TYPE EM_AARCH64
+#define IP_REG(p) ((p).pc)
+#define RAX_REG(p) ((p).regs[8])
+#define RDI_REG(p) ((p).regs[0])
+#define RETURN_REG(p) ((p).regs[0])
+
+const char kPtraceCode[] = {
+    // MOVD $117, R8 /* ptrace */
+    '\xa8',
+    '\x0e',
+    '\x80',
+    '\xd2',
+    // MOVD $0, R0 /* PTRACE_TRACEME */
+    '\x00',
+    '\x00',
+    '\x80',
+    '\xd2',
+    // MOVD $0, R1 /* pid */
+    '\x01',
+    '\x00',
+    '\x80',
+    '\xd2',
+    // MOVD $0, R2 /* addr */
+    '\x02',
+    '\x00',
+    '\x80',
+    '\xd2',
+    // MOVD $0, R3 /* data */
+    '\x03',
+    '\x00',
+    '\x80',
+    '\xd2',
+    // SVC
+    '\x01',
+    '\x00',
+    '\x00',
+    '\xd4',
+    // MOVD $172, R8 /* getpid */
+    '\x88',
+    '\x15',
+    '\x80',
+    '\xd2',
+    // SVC
+    '\x01',
+    '\x00',
+    '\x00',
+    '\xd4',
+    // MOVD $129, R8 /* kill, R0=pid */
+    '\x28',
+    '\x10',
+    '\x80',
+    '\xd2',
+    // MOVD $19, R1  /* SIGSTOP */
+    '\x61',
+    '\x02',
+    '\x80',
+    '\xd2',
+    // SVC
+    '\x01',
+    '\x00',
+    '\x00',
+    '\xd4',
+};
+// Size of a syscall instruction.
+constexpr int kSyscallSize = 4;
+#else
+#error "Unknown architecture"
+#endif
+
+// This test suite tests executable loading in the kernel (ELF and interpreter
+// scripts).
+
+// Parameterized ELF types for 64 and 32 bit.
+template <int Size>
+struct ElfTypes;
+
+template <>
+struct ElfTypes<64> {
+  typedef Elf64_Ehdr ElfEhdr;
+  typedef Elf64_Phdr ElfPhdr;
+};
+
+template <>
+struct ElfTypes<32> {
+  typedef Elf32_Ehdr ElfEhdr;
+  typedef Elf32_Phdr ElfPhdr;
+};
+
+template <int Size>
+struct ElfBinary {
+  using ElfEhdr = typename ElfTypes<Size>::ElfEhdr;
+  using ElfPhdr = typename ElfTypes<Size>::ElfPhdr;
+
+  ElfEhdr header = {};
+  std::vector<ElfPhdr> phdrs;
+  std::vector<char> data;
+
+  // UpdateOffsets updates p_offset, p_vaddr in all phdrs to account for the
+  // space taken by the header and phdrs.
+  //
+  // It also updates header.e_phnum and adds the offset to header.e_entry to
+  // account for the headers residing in the first PT_LOAD segment.
+  //
+  // Before calling UpdateOffsets each of those fields should be the appropriate
+  // offset into data.
+  void UpdateOffsets() {
+    size_t offset = sizeof(header) + phdrs.size() * sizeof(ElfPhdr);
+    header.e_entry += offset;
+    header.e_phnum = phdrs.size();
+    for (auto& p : phdrs) {
+      p.p_offset += offset;
+      p.p_vaddr += offset;
+    }
+  }
+
+  // AddInterpreter adds a PT_INTERP segment with the passed contents.
+  //
+  // A later call to UpdateOffsets is required to make the new phdr valid.
+  void AddInterpreter(std::vector<char> contents) {
+    const int start = data.size();
+    data.insert(data.end(), contents.begin(), contents.end());
+    const int size = data.size() - start;
+
+    ElfPhdr phdr = {};
+    phdr.p_type = PT_INTERP;
+    phdr.p_offset = start;
+    phdr.p_filesz = size;
+    phdr.p_memsz = size;
+    // "If [PT_INTERP] is present, it must precede any loadable segment entry."
+    phdrs.insert(phdrs.begin(), phdr);
+  }
+
+  // Writes the header, phdrs, and data to fd.
+  PosixError Write(int fd) const {
+    int ret = WriteFd(fd, &header, sizeof(header));
+    if (ret < 0) {
+      return PosixError(errno, "failed to write header");
+    } else if (ret != sizeof(header)) {
+      return PosixError(EIO, absl::StrCat("short write of header: ", ret));
+    }
+
+    for (auto const& p : phdrs) {
+      ret = WriteFd(fd, &p, sizeof(p));
+      if (ret < 0) {
+        return PosixError(errno, "failed to write phdr");
+      } else if (ret != sizeof(p)) {
+        return PosixError(EIO, absl::StrCat("short write of phdr: ", ret));
+      }
+    }
+
+    ret = WriteFd(fd, data.data(), data.size());
+    if (ret < 0) {
+      return PosixError(errno, "failed to write data");
+    } else if (ret != static_cast<int>(data.size())) {
+      return PosixError(EIO, absl::StrCat("short write of data: ", ret));
+    }
+
+    return NoError();
+  }
+};
+
+// Creates a new temporary executable ELF file in parent with elf as the
+// contents.
+template <int Size>
+PosixErrorOr<TempPath> CreateElfWith(absl::string_view parent,
+                                     ElfBinary<Size> const& elf) {
+  ASSIGN_OR_RETURN_ERRNO(
+      auto file, TempPath::CreateFileWith(parent, absl::string_view(), 0755));
+  ASSIGN_OR_RETURN_ERRNO(auto fd, Open(file.path(), O_RDWR));
+  RETURN_IF_ERRNO(elf.Write(fd.get()));
+  return std::move(file);
+}
+
+// Creates a new temporary executable ELF file with elf as the contents.
+template <int Size>
+PosixErrorOr<TempPath> CreateElfWith(ElfBinary<Size> const& elf) {
+  return CreateElfWith(GetAbsoluteTestTmpdir(), elf);
+}
+
+// Wait for pid to stop, and assert that it stopped via SIGSTOP.
+PosixError WaitStopped(pid_t pid) {
+  int status;
+  int ret = RetryEINTR(waitpid)(pid, &status, 0);
+  MaybeSave();
+  if (ret < 0) {
+    return PosixError(errno, "wait failed");
+  } else if (ret != pid) {
+    return PosixError(ESRCH, absl::StrCat("wait got ", ret, " want ", pid));
+  }
+
+  if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGSTOP) {
+    return PosixError(EINVAL,
+                      absl::StrCat("pid did not SIGSTOP; status = ", status));
+  }
+
+  return NoError();
+}
+
+// Returns a valid ELF that PTRACE_TRACEME and SIGSTOPs itself.
+//
+// UpdateOffsets must be called before writing this ELF.
+ElfBinary<64> StandardElf() {
+  ElfBinary<64> elf;
+  elf.header.e_ident[EI_MAG0] = ELFMAG0;
+  elf.header.e_ident[EI_MAG1] = ELFMAG1;
+  elf.header.e_ident[EI_MAG2] = ELFMAG2;
+  elf.header.e_ident[EI_MAG3] = ELFMAG3;
+  elf.header.e_ident[EI_CLASS] = ELFCLASS64;
+  elf.header.e_ident[EI_DATA] = ELFDATA2LSB;
+  elf.header.e_ident[EI_VERSION] = EV_CURRENT;
+  elf.header.e_type = ET_EXEC;
+  elf.header.e_machine = EM_TYPE;
+  elf.header.e_version = EV_CURRENT;
+  elf.header.e_phoff = sizeof(elf.header);
+  elf.header.e_phentsize = sizeof(decltype(elf)::ElfPhdr);
+
+  // TODO(gvisor.dev/issue/153): Always include a PT_GNU_STACK segment to
+  // disable executable stacks. With this omitted the stack (and all PROT_READ)
+  // mappings should be executable, but gVisor doesn't support that.
+  decltype(elf)::ElfPhdr phdr = {};
+  phdr.p_type = PT_GNU_STACK;
+  phdr.p_flags = PF_R | PF_W;
+  elf.phdrs.push_back(phdr);
+
+  phdr = {};
+  phdr.p_type = PT_LOAD;
+  phdr.p_flags = PF_R | PF_X;
+  phdr.p_offset = 0;
+  phdr.p_vaddr = 0x40000;
+  phdr.p_filesz = sizeof(kPtraceCode);
+  phdr.p_memsz = phdr.p_filesz;
+  elf.phdrs.push_back(phdr);
+
+  elf.header.e_entry = phdr.p_vaddr;
+
+  elf.data.assign(kPtraceCode, kPtraceCode + sizeof(kPtraceCode));
+
+  return elf;
+}
+
+// Test that a trivial binary executes.
+TEST(ElfTest, Execute) {
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  // Ensure it made it to SIGSTOP.
+  ASSERT_NO_ERRNO(WaitStopped(child));
+
+  struct user_regs_struct regs;
+  struct iovec iov;
+  iov.iov_base = &regs;
+  iov.iov_len = sizeof(regs);
+  EXPECT_THAT(ptrace(PTRACE_GETREGSET, child, NT_PRSTATUS, &iov),
+              SyscallSucceeds());
+  // Read exactly the full register set.
+  EXPECT_EQ(iov.iov_len, sizeof(regs));
+  // RIP/PC is just beyond the final syscall instruction.
+  EXPECT_EQ(IP_REG(regs), elf.header.e_entry + sizeof(kPtraceCode));
+
+  EXPECT_THAT(child, ContainsMappings(std::vector<ProcMapsEntry>({
+                         {0x40000, 0x40000 + kPageSize, true, false, true, true,
+                          0, 0, 0, 0, file.path().c_str()},
+                     })));
+}
+
+// StandardElf without data completes execve, but faults once running.
+TEST(ElfTest, MissingText) {
+  ElfBinary<64> elf = StandardElf();
+  elf.data.clear();
+  elf.UpdateOffsets();
+
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+              SyscallSucceedsWithValue(child));
+  // It runs off the end of the zeroes filling the end of the page.
+#if defined(__x86_64__)
+  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV) << status;
+#elif defined(__aarch64__)
+  // 0 is an invalid instruction opcode on arm64.
+  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGILL) << status;
+#endif
+}
+
+// Typical ELF with a data + bss segment
+TEST(ElfTest, DataSegment) {
+  ElfBinary<64> elf = StandardElf();
+
+  // Create a standard ELF, but extend to 1.5 pages. The second page will be the
+  // beginning of a multi-page data + bss segment.
+  elf.data.resize(kPageSize + kPageSize / 2);
+
+  decltype(elf)::ElfPhdr phdr = {};
+  phdr.p_type = PT_LOAD;
+  phdr.p_flags = PF_R | PF_W;
+  phdr.p_offset = kPageSize;
+  phdr.p_vaddr = 0x40000 + kPageSize;
+  phdr.p_filesz = kPageSize / 2;
+  // The header is going to push vaddr up by a few hundred bytes. Keep p_memsz a
+  // bit less than 2 pages so that this mapping fits into 2 pages.
+  phdr.p_memsz = 2 * kPageSize - kPageSize / 2;
+  elf.phdrs.push_back(phdr);
+
+  elf.UpdateOffsets();
+
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  ASSERT_NO_ERRNO(WaitStopped(child));
+
+  EXPECT_THAT(child,
+              ContainsMappings(std::vector<ProcMapsEntry>({
+                  // text page.
+                  {0x40000, 0x40000 + kPageSize, true, false, true, true, 0, 0,
+                   0, 0, file.path().c_str()},
+                  // data + bss page from file.
+                  {0x40000 + kPageSize, 0x40000 + 2 * kPageSize, true, true,
+                   false, true, kPageSize, 0, 0, 0, file.path().c_str()},
+                  // bss page from anon.
+                  {0x40000 + 2 * kPageSize, 0x40000 + 3 * kPageSize, true, true,
+                   false, true, 0, 0, 0, 0, ""},
+              })));
+}
+
+// Additional pages beyond filesz honor (only) execute protections.
+//
+// N.B. Linux changed this in 4.11 (16e72e9b30986 "powerpc: do not make the
+// entire heap executable"). Previously, extra pages were always RW.
+TEST(ElfTest, ExtraMemPages) {
+  // gVisor has the newer behavior.
+  if (!IsRunningOnGvisor()) {
+    auto version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
+    SKIP_IF(version.major < 4 || (version.major == 4 && version.minor < 11));
+  }
+
+  ElfBinary<64> elf = StandardElf();
+
+  // Create a standard ELF, but extend to 1.5 pages. The second page will be the
+  // beginning of a multi-page data + bss segment.
+  elf.data.resize(kPageSize + kPageSize / 2);
+
+  decltype(elf)::ElfPhdr phdr = {};
+  phdr.p_type = PT_LOAD;
+  // RWX segment. The extra anon page will also be RWX.
+  //
+  // N.B. Linux uses clear_user to clear the end of the file-mapped page, which
+  // respects the mapping protections. Thus if we map this RO with memsz >
+  // (unaligned) filesz, then execve will fail with EFAULT. See padzero(elf_bss)
+  // in fs/binfmt_elf.c:load_elf_binary.
+  //
+  // N.N.B.B. The above only applies to the last segment. For earlier segments,
+  // the clear_user error is ignored.
+  phdr.p_flags = PF_R | PF_W | PF_X;
+  phdr.p_offset = kPageSize;
+  phdr.p_vaddr = 0x40000 + kPageSize;
+  phdr.p_filesz = kPageSize / 2;
+  // The header is going to push vaddr up by a few hundred bytes. Keep p_memsz a
+  // bit less than 2 pages so that this mapping covers exactly 2 pages.
+  phdr.p_memsz = 2 * kPageSize - kPageSize / 2;
+  elf.phdrs.push_back(phdr);
+
+  elf.UpdateOffsets();
+
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  ASSERT_NO_ERRNO(WaitStopped(child));
+
+  EXPECT_THAT(child,
+              ContainsMappings(std::vector<ProcMapsEntry>({
+                  // text page.
+                  {0x40000, 0x40000 + kPageSize, true, false, true, true, 0, 0,
+                   0, 0, file.path().c_str()},
+                  // data + bss page from file.
+                  {0x40000 + kPageSize, 0x40000 + 2 * kPageSize, true, true,
+                   true, true, kPageSize, 0, 0, 0, file.path().c_str()},
+                  // extra page from anon.
+                  {0x40000 + 2 * kPageSize, 0x40000 + 3 * kPageSize, true, true,
+                   true, true, 0, 0, 0, 0, ""},
+              })));
+}
+
+// An aligned segment with filesz == 0, memsz > 0 is anon-only.
+TEST(ElfTest, AnonOnlySegment) {
+  ElfBinary<64> elf = StandardElf();
+
+  decltype(elf)::ElfPhdr phdr = {};
+  phdr.p_type = PT_LOAD;
+  // RO segment. The extra anon page will be RW anyways.
+  phdr.p_flags = PF_R;
+  phdr.p_offset = 0;
+  phdr.p_vaddr = 0x40000 + kPageSize;
+  phdr.p_filesz = 0;
+  phdr.p_memsz = kPageSize;
+  elf.phdrs.push_back(phdr);
+
+  elf.UpdateOffsets();
+
+  // UpdateOffsets adjusts p_vaddr and p_offset by the header size, but we need
+  // a page-aligned p_vaddr to get a truly anon-only page.
+  elf.phdrs[2].p_vaddr = 0x40000 + kPageSize;
+  // N.B. p_offset is now unaligned, but Linux doesn't care since this is
+  // anon-only.
+
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  ASSERT_NO_ERRNO(WaitStopped(child));
+
+  EXPECT_THAT(child, ContainsMappings(std::vector<ProcMapsEntry>({
+                         // text page.
+                         {0x40000, 0x40000 + kPageSize, true, false, true, true,
+                          0, 0, 0, 0, file.path().c_str()},
+                         // anon page.
+                         {0x40000 + kPageSize, 0x40000 + 2 * kPageSize, true,
+                          true, false, true, 0, 0, 0, 0, ""},
+                     })));
+}
+
+// p_offset must have the same alignment as p_vaddr.
+TEST(ElfTest, UnalignedOffset) {
+  ElfBinary<64> elf = StandardElf();
+
+  // Unaligned offset.
+  elf.phdrs[1].p_offset += 1;
+
+  elf.UpdateOffsets();
+
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+
+  // execve(2) return EINVAL, but behavior varies between Linux and gVisor.
+  //
+  // On Linux, the new mm is committed before attempting to map into it. By the
+  // time we hit EINVAL in the segment mmap, the old mm is gone. Linux returns
+  // to an empty mm, which immediately segfaults.
+  //
+  // OTOH, gVisor maps into the new mm before committing it. Thus when it hits
+  // failure, the caller is still intact to receive the error.
+  if (IsRunningOnGvisor()) {
+    ASSERT_EQ(execve_errno, EINVAL);
+  } else {
+    ASSERT_EQ(execve_errno, 0);
+
+    int status;
+    ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+                SyscallSucceedsWithValue(child));
+    EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV) << status;
+  }
+}
+
+// Linux will allow PT_LOAD segments to overlap.
+TEST(ElfTest, DirectlyOverlappingSegments) {
+  // NOTE(b/37289926): see PIEOutOfOrderSegments.
+  SKIP_IF(IsRunningOnGvisor());
+
+  ElfBinary<64> elf = StandardElf();
+
+  // Same as the StandardElf mapping.
+  decltype(elf)::ElfPhdr phdr = {};
+  phdr.p_type = PT_LOAD;
+  // Add PF_W so we can differentiate this mapping from the first.
+  phdr.p_flags = PF_R | PF_W | PF_X;
+  phdr.p_offset = 0;
+  phdr.p_vaddr = 0x40000;
+  phdr.p_filesz = sizeof(kPtraceCode);
+  phdr.p_memsz = phdr.p_filesz;
+  elf.phdrs.push_back(phdr);
+
+  elf.UpdateOffsets();
+
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  ASSERT_NO_ERRNO(WaitStopped(child));
+
+  EXPECT_THAT(child, ContainsMappings(std::vector<ProcMapsEntry>({
+                         {0x40000, 0x40000 + kPageSize, true, true, true, true,
+                          0, 0, 0, 0, file.path().c_str()},
+                     })));
+}
+
+// Linux allows out-of-order PT_LOAD segments.
+TEST(ElfTest, OutOfOrderSegments) {
+  // NOTE(b/37289926): see PIEOutOfOrderSegments.
+  SKIP_IF(IsRunningOnGvisor());
+
+  ElfBinary<64> elf = StandardElf();
+
+  decltype(elf)::ElfPhdr phdr = {};
+  phdr.p_type = PT_LOAD;
+  phdr.p_flags = PF_R | PF_X;
+  phdr.p_offset = 0;
+  phdr.p_vaddr = 0x20000;
+  phdr.p_filesz = sizeof(kPtraceCode);
+  phdr.p_memsz = phdr.p_filesz;
+  elf.phdrs.push_back(phdr);
+
+  elf.UpdateOffsets();
+
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  ASSERT_NO_ERRNO(WaitStopped(child));
+
+  EXPECT_THAT(child, ContainsMappings(std::vector<ProcMapsEntry>({
+                         {0x20000, 0x20000 + kPageSize, true, false, true, true,
+                          0, 0, 0, 0, file.path().c_str()},
+                         {0x40000, 0x40000 + kPageSize, true, false, true, true,
+                          0, 0, 0, 0, file.path().c_str()},
+                     })));
+}
+
+// header.e_phoff is bound the end of the file.
+TEST(ElfTest, OutOfBoundsPhdrs) {
+  ElfBinary<64> elf = StandardElf();
+  elf.header.e_phoff = 0x100000;
+  elf.UpdateOffsets();
+
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  // On Linux 3.11, this caused EIO. On newer Linux, it causes ENOEXEC.
+  EXPECT_THAT(execve_errno, AnyOf(Eq(ENOEXEC), Eq(EIO)));
+}
+
+// Claim there is a phdr beyond the end of the file, but don't include it.
+TEST(ElfTest, MissingPhdr) {
+  ElfBinary<64> elf = StandardElf();
+
+  // Clear data so the file ends immediately after the phdrs.
+  // N.B. Per ElfTest.MissingData, StandardElf without data completes execve
+  // without error.
+  elf.data.clear();
+  elf.UpdateOffsets();
+
+  // Claim that there is another phdr just beyond the end of the file. Of
+  // course, it isn't accessible.
+  elf.header.e_phnum++;
+
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  // On Linux 3.11, this caused EIO. On newer Linux, it causes ENOEXEC.
+  EXPECT_THAT(execve_errno, AnyOf(Eq(ENOEXEC), Eq(EIO)));
+}
+
+// No headers at all, just the ELF magic.
+TEST(ElfTest, MissingHeader) {
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileMode(0755));
+  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(file.path(), O_RDWR));
+
+  const char kElfMagic[] = {0x7f, 'E', 'L', 'F'};
+
+  ASSERT_THAT(WriteFd(fd.get(), &kElfMagic, sizeof(kElfMagic)),
+              SyscallSucceeds());
+  fd.reset();
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  EXPECT_EQ(execve_errno, ENOEXEC);
+}
+
+// Load a PIE ELF with a data + bss segment.
+TEST(ElfTest, PIE) {
+  ElfBinary<64> elf = StandardElf();
+
+  elf.header.e_type = ET_DYN;
+
+  // Create a standard ELF, but extend to 1.5 pages. The second page will be the
+  // beginning of a multi-page data + bss segment.
+  elf.data.resize(kPageSize + kPageSize / 2);
+
+  elf.header.e_entry = 0x0;
+
+  decltype(elf)::ElfPhdr phdr = {};
+  phdr.p_type = PT_LOAD;
+  phdr.p_flags = PF_R | PF_W;
+  phdr.p_offset = kPageSize;
+  // Put the data segment at a bit of an offset.
+  phdr.p_vaddr = 0x20000;
+  phdr.p_filesz = kPageSize / 2;
+  // The header is going to push vaddr up by a few hundred bytes. Keep p_memsz a
+  // bit less than 2 pages so that this mapping covers exactly 2 pages.
+  phdr.p_memsz = 2 * kPageSize - kPageSize / 2;
+  elf.phdrs.push_back(phdr);
+
+  elf.UpdateOffsets();
+
+  // The first segment really needs to start at 0 for a normal PIE binary, and
+  // thus includes the headers.
+  const uint64_t offset = elf.phdrs[1].p_offset;
+  elf.phdrs[1].p_offset = 0x0;
+  elf.phdrs[1].p_vaddr = 0x0;
+  elf.phdrs[1].p_filesz += offset;
+  elf.phdrs[1].p_memsz += offset;
+
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  ASSERT_NO_ERRNO(WaitStopped(child));
+
+  // RIP tells us which page the first segment was loaded into.
+  struct user_regs_struct regs;
+  struct iovec iov;
+  iov.iov_base = &regs;
+  iov.iov_len = sizeof(regs);
+
+  EXPECT_THAT(ptrace(PTRACE_GETREGSET, child, NT_PRSTATUS, &iov),
+              SyscallSucceeds());
+  // Read exactly the full register set.
+  EXPECT_EQ(iov.iov_len, sizeof(regs));
+
+  const uint64_t load_addr = IP_REG(regs) & ~(kPageSize - 1);
+
+  EXPECT_THAT(
+      child,
+      ContainsMappings(std::vector<ProcMapsEntry>({
+          // text page.
+          {load_addr, load_addr + kPageSize, true, false, true, true, 0, 0, 0,
+           0, file.path().c_str()},
+          // data + bss page from file.
+          {load_addr + 0x20000, load_addr + 0x20000 + kPageSize, true, true,
+           false, true, kPageSize, 0, 0, 0, file.path().c_str()},
+          // bss page from anon.
+          {load_addr + 0x20000 + kPageSize, load_addr + 0x20000 + 2 * kPageSize,
+           true, true, false, true, 0, 0, 0, 0, ""},
+      })));
+}
+
+// PIE binary with a non-zero start address.
+//
+// This is non-standard for a PIE binary, but valid. The binary is still loaded
+// at an arbitrary address, not the first PT_LOAD vaddr.
+//
+// N.B. Linux changed this behavior in d1fd836dcf00d2028c700c7e44d2c23404062c90.
+// Previously, with "randomization" enabled, PIE binaries with a non-zero start
+// address would be be loaded at the address they specified because mmap was
+// passed the load address, which wasn't 0 as expected.
+//
+// This change is present in kernel v4.1+.
+TEST(ElfTest, PIENonZeroStart) {
+  // gVisor has the newer behavior.
+  if (!IsRunningOnGvisor()) {
+    auto version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
+    SKIP_IF(version.major < 4 || (version.major == 4 && version.minor < 1));
+  }
+
+  ElfBinary<64> elf = StandardElf();
+
+  elf.header.e_type = ET_DYN;
+
+  // Create a standard ELF, but extend to 1.5 pages. The second page will be the
+  // beginning of a multi-page data + bss segment.
+  elf.data.resize(kPageSize + kPageSize / 2);
+
+  decltype(elf)::ElfPhdr phdr = {};
+  phdr.p_type = PT_LOAD;
+  phdr.p_flags = PF_R | PF_W;
+  phdr.p_offset = kPageSize;
+  // Put the data segment at a bit of an offset.
+  phdr.p_vaddr = 0x60000;
+  phdr.p_filesz = kPageSize / 2;
+  // The header is going to push vaddr up by a few hundred bytes. Keep p_memsz a
+  // bit less than 2 pages so that this mapping fits into 2 pages.
+  phdr.p_memsz = 2 * kPageSize - kPageSize / 2;
+  elf.phdrs.push_back(phdr);
+
+  elf.UpdateOffsets();
+
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  ASSERT_NO_ERRNO(WaitStopped(child));
+
+  // RIP tells us which page the first segment was loaded into.
+  struct user_regs_struct regs;
+  struct iovec iov;
+  iov.iov_base = &regs;
+  iov.iov_len = sizeof(regs);
+  EXPECT_THAT(ptrace(PTRACE_GETREGSET, child, NT_PRSTATUS, &iov),
+              SyscallSucceeds());
+  // Read exactly the full register set.
+  EXPECT_EQ(iov.iov_len, sizeof(regs));
+
+  const uint64_t load_addr = IP_REG(regs) & ~(kPageSize - 1);
+
+  // The ELF is loaded at an arbitrary address, not the first PT_LOAD vaddr.
+  //
+  // N.B. this is technically flaky, but Linux is *extremely* unlikely to pick
+  // this as the start address, as it searches from the top down.
+  EXPECT_NE(load_addr, 0x40000);
+
+  EXPECT_THAT(
+      child,
+      ContainsMappings(std::vector<ProcMapsEntry>({
+          // text page.
+          {load_addr, load_addr + kPageSize, true, false, true, true, 0, 0, 0,
+           0, file.path().c_str()},
+          // data + bss page from file.
+          {load_addr + 0x20000, load_addr + 0x20000 + kPageSize, true, true,
+           false, true, kPageSize, 0, 0, 0, file.path().c_str()},
+          // bss page from anon.
+          {load_addr + 0x20000 + kPageSize, load_addr + 0x20000 + 2 * kPageSize,
+           true, true, false, true, 0, 0, 0, 0, ""},
+      })));
+}
+
+TEST(ElfTest, PIEOutOfOrderSegments) {
+  // TODO(b/37289926): This triggers a bug in Linux where it computes the size
+  // of the binary as 0x20000 - 0x40000 = 0xfffffffffffe0000, which obviously
+  // fails to map.
+  //
+  // We test gVisor's behavior (of rejecting the binary) because I assert that
+  // Linux is wrong and needs to be fixed.
+  SKIP_IF(!IsRunningOnGvisor());
+
+  ElfBinary<64> elf = StandardElf();
+
+  elf.header.e_type = ET_DYN;
+
+  // Create a standard ELF, but extend to 1.5 pages. The second page will be the
+  // beginning of a multi-page data + bss segment.
+  elf.data.resize(kPageSize + kPageSize / 2);
+
+  decltype(elf)::ElfPhdr phdr = {};
+  phdr.p_type = PT_LOAD;
+  phdr.p_flags = PF_R | PF_W;
+  phdr.p_offset = kPageSize;
+  // Put the data segment *before* the first segment.
+  phdr.p_vaddr = 0x20000;
+  phdr.p_filesz = kPageSize / 2;
+  // The header is going to push vaddr up by a few hundred bytes. Keep p_memsz a
+  // bit less than 2 pages so that this mapping fits into 2 pages.
+  phdr.p_memsz = 2 * kPageSize - kPageSize / 2;
+  elf.phdrs.push_back(phdr);
+
+  elf.UpdateOffsets();
+
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  EXPECT_EQ(execve_errno, ENOEXEC);
+}
+
+TEST(ElfTest, PIEOverflow) {
+  ElfBinary<64> elf = StandardElf();
+
+  elf.header.e_type = ET_DYN;
+
+  // Choose vaddr of the first segment so that the end address overflows if the
+  // segment is mapped with a non-zero offset.
+  elf.phdrs[1].p_vaddr = 0xfffffffffffff000UL - elf.phdrs[1].p_memsz;
+
+  elf.UpdateOffsets();
+
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  if (IsRunningOnGvisor()) {
+    ASSERT_EQ(execve_errno, EINVAL);
+  } else {
+    ASSERT_EQ(execve_errno, 0);
+    int status;
+    ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+                SyscallSucceedsWithValue(child));
+    EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV) << status;
+  }
+}
+
+// Standard dynamically linked binary with an ELF interpreter.
+TEST(ElfTest, ELFInterpreter) {
+  ElfBinary<64> interpreter = StandardElf();
+  interpreter.header.e_type = ET_DYN;
+  interpreter.header.e_entry = 0x0;
+  interpreter.UpdateOffsets();
+
+  // The first segment really needs to start at 0 for a normal PIE binary, and
+  // thus includes the headers.
+  uint64_t const offset = interpreter.phdrs[1].p_offset;
+  // N.B. Since Linux 4.10 (0036d1f7eb95b "binfmt_elf: fix calculations for bss
+  // padding"), Linux unconditionally zeroes the remainder of the highest mapped
+  // page in an interpreter, failing if the protections don't allow write. Thus
+  // we must mark this writeable.
+  interpreter.phdrs[1].p_flags = PF_R | PF_W | PF_X;
+  interpreter.phdrs[1].p_offset = 0x0;
+  interpreter.phdrs[1].p_vaddr = 0x0;
+  interpreter.phdrs[1].p_filesz += offset;
+  interpreter.phdrs[1].p_memsz += offset;
+
+  TempPath interpreter_file =
+      ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(interpreter));
+
+  ElfBinary<64> binary = StandardElf();
+
+  // Append the interpreter path.
+  int const interp_data_start = binary.data.size();
+  for (char const c : interpreter_file.path()) {
+    binary.data.push_back(c);
+  }
+  // NUL-terminate.
+  binary.data.push_back(0);
+  int const interp_data_size = binary.data.size() - interp_data_start;
+
+  decltype(binary)::ElfPhdr phdr = {};
+  phdr.p_type = PT_INTERP;
+  phdr.p_offset = interp_data_start;
+  phdr.p_filesz = interp_data_size;
+  phdr.p_memsz = interp_data_size;
+  // "If [PT_INTERP] is present, it must precede any loadable segment entry."
+  //
+  // However, Linux allows it anywhere, so we just stick it at the end to make
+  // sure out-of-order PT_INTERP is OK.
+  binary.phdrs.push_back(phdr);
+
+  binary.UpdateOffsets();
+
+  TempPath binary_file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(binary));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec(
+      binary_file.path(), {binary_file.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  ASSERT_NO_ERRNO(WaitStopped(child));
+
+  // RIP tells us which page the first segment of the interpreter was loaded
+  // into.
+  struct user_regs_struct regs;
+  struct iovec iov;
+  iov.iov_base = &regs;
+  iov.iov_len = sizeof(regs);
+  EXPECT_THAT(ptrace(PTRACE_GETREGSET, child, NT_PRSTATUS, &iov),
+              SyscallSucceeds());
+  // Read exactly the full register set.
+  EXPECT_EQ(iov.iov_len, sizeof(regs));
+
+  const uint64_t interp_load_addr = IP_REG(regs) & ~(kPageSize - 1);
+
+  EXPECT_THAT(child,
+              ContainsMappings(std::vector<ProcMapsEntry>({
+                  // Main binary
+                  {0x40000, 0x40000 + kPageSize, true, false, true, true, 0, 0,
+                   0, 0, binary_file.path().c_str()},
+                  // Interpreter
+                  {interp_load_addr, interp_load_addr + kPageSize, true, true,
+                   true, true, 0, 0, 0, 0, interpreter_file.path().c_str()},
+              })));
+}
+
+// Returns the Yama ptrace scope (0 if Yama is not enabled).
+PosixErrorOr<int> YamaPtraceScope() {
+  constexpr char kYamaPtraceScopePath[] = "/proc/sys/kernel/yama/ptrace_scope";
+  ASSIGN_OR_RETURN_ERRNO(bool exists, Exists(kYamaPtraceScopePath));
+  if (!exists) {
+    return 0;
+  }
+  std::string contents;
+  RETURN_IF_ERRNO(GetContents(kYamaPtraceScopePath, &contents));
+  int scope;
+  if (!absl::SimpleAtoi(contents, &scope)) {
+    return PosixError(EINVAL, absl::StrCat(contents, ": not a valid number"));
+  }
+  return scope;
+}
+
+// Returns whether an exec that Linux would mark BINPRM_FLAGS_ENFORCE_NONDUMP
+// actually leaves the task non-dumpable. Under the native fs.suid_dumpable=1
+// ("debug") policy it does not; gVisor always enforces non-dumpability.
+PosixErrorOr<bool> ExecNonDumpEnforced() {
+  if (IsRunningOnGvisor()) {
+    return true;
+  }
+  std::string contents;
+  RETURN_IF_ERRNO(GetContents("/proc/sys/fs/suid_dumpable", &contents));
+  return atoi(contents.c_str()) != 1;
+}
+
+// An ELF interpreter requires only execute permission, and executing a binary
+// whose interpreter is not readable makes the task non-dumpable, as with a
+// non-readable binary. See gvisor.dev/issue/160.
+TEST(ElfTest, ExecuteOnlyELFInterpreter) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(ExecNonDumpEnforced()));
+
+  ElfBinary<64> interpreter = StandardElf();
+  interpreter.header.e_type = ET_DYN;
+  interpreter.header.e_entry = 0x0;
+  interpreter.UpdateOffsets();
+
+  // See ElfTest.ELFInterpreter above for the rationale.
+  uint64_t const offset = interpreter.phdrs[1].p_offset;
+  interpreter.phdrs[1].p_flags = PF_R | PF_W | PF_X;
+  interpreter.phdrs[1].p_offset = 0x0;
+  interpreter.phdrs[1].p_vaddr = 0x0;
+  interpreter.phdrs[1].p_filesz += offset;
+  interpreter.phdrs[1].p_memsz += offset;
+
+  // Use /tmp: an unprivileged host gofer cannot read an execute-only backing
+  // file, which is not what this test exercises.
+  TempPath interpreter_file =
+      ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", interpreter));
+  ASSERT_THAT(chmod(interpreter_file.path().c_str(), 0111), SyscallSucceeds());
+
+  ElfBinary<64> binary = StandardElf();
+
+  // Append the interpreter path.
+  int const interp_data_start = binary.data.size();
+  for (char const c : interpreter_file.path()) {
+    binary.data.push_back(c);
+  }
+  // NUL-terminate.
+  binary.data.push_back(0);
+  int const interp_data_size = binary.data.size() - interp_data_start;
+
+  decltype(binary)::ElfPhdr phdr = {};
+  phdr.p_type = PT_INTERP;
+  phdr.p_offset = interp_data_start;
+  phdr.p_filesz = interp_data_size;
+  phdr.p_memsz = interp_data_size;
+  binary.phdrs.push_back(phdr);
+
+  binary.UpdateOffsets();
+
+  // /tmp is also traversable by the unprivileged uid below, unlike the test
+  // tmpdir.
+  TempPath binary_file =
+      ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", binary));
+
+  // Use a separate thread so as to not pollute the other tests with the
+  // unprivileged uid we're about to set.
+  ScopedThread([&] {
+    constexpr int kUnprivilegedUid = 12345;
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+
+    // The interpreter must not be readable...
+    EXPECT_THAT(open(interpreter_file.path().c_str(), O_RDONLY),
+                SyscallFailsWithErrno(EACCES));
+
+    // ...but the binary must still be executable.
+    pid_t child;
+    int execve_errno;
+    auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec(
+        binary_file.path(), {binary_file.path()}, {}, &child, &execve_errno));
+    ASSERT_EQ(execve_errno, 0);
+
+    // WUNTRACED, unlike WaitStopped, also observes the group stop that occurs
+    // if the child's PTRACE_TRACEME was denied for the non-dumpable child.
+    int status;
+    ASSERT_THAT(RetryEINTR(waitpid)(child, &status, WUNTRACED),
+                SyscallSucceedsWithValue(child));
+    ASSERT_TRUE(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP) << status;
+
+    // The task must be non-dumpable: even the same-uid parent cannot access
+    // /proc/<pid>/mem.
+    EXPECT_THAT(open(absl::StrCat("/proc/", child, "/mem").c_str(), O_RDONLY),
+                SyscallFailsWithErrno(AnyOf(Eq(EACCES), Eq(EPERM))));
+  });
+}
+
+// An existing tracer must not be able to access the memory of a task that
+// exec'd a non-readable binary, matching Linux's
+// kernel/ptrace.c:ptrace_access_vm().
+TEST(ElfTest, PtraceExecuteOnlyBinary) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(ExecNonDumpEnforced()));
+
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+
+  // /tmp is also traversable by the unprivileged uid below, unlike the test
+  // tmpdir.
+  TempPath exec_only = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", elf));
+  ASSERT_THAT(chmod(exec_only.path().c_str(), 0111), SyscallSucceeds());
+  TempPath readable = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", elf));
+
+  // Use a separate thread so as to not pollute the other tests with the
+  // unprivileged uid we're about to set.
+  ScopedThread([&] {
+    constexpr int kUnprivilegedUid = 12345;
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+    // Restore dumpability, cleared by the uid change, so that the forked
+    // children below start out traceable.
+    ASSERT_THAT(prctl(PR_SET_DUMPABLE, 1), SyscallSucceeds());
+
+    // Trace a child across execve and try to read its memory. The first
+    // segment of StandardElf is loaded at 0x40000.
+    const auto peek_after_exec = [](const std::string& path, long* peeked,
+                                    long* poked) {
+      pid_t child = fork();
+      if (child == 0) {
+        if (ptrace(PTRACE_TRACEME, 0, 0, 0) != 0) {
+          _exit(40);
+        }
+        raise(SIGSTOP);
+        execl(path.c_str(), path.c_str(), nullptr);
+        _exit(41);
+      }
+      MaybeSave();
+      ASSERT_GT(child, 0);
+      int status;
+      ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+                  SyscallSucceedsWithValue(child));
+      ASSERT_TRUE(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP) << status;
+      ASSERT_THAT(ptrace(PTRACE_CONT, child, 0, 0), SyscallSucceeds());
+      // The traced child stops with SIGTRAP after execve.
+      ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+                  SyscallSucceedsWithValue(child));
+      ASSERT_TRUE(WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) << status;
+
+      errno = 0;
+      *peeked = ptrace(PTRACE_PEEKDATA, child, 0x40000, 0);
+      *peeked = (*peeked == -1) ? -errno : 0;
+      errno = 0;
+      *poked = ptrace(PTRACE_POKEDATA, child, 0x40000, 0x11223344);
+      *poked = (*poked == -1) ? -errno : 0;
+
+      kill(child, SIGKILL);
+      RetryEINTR(waitpid)(child, nullptr, 0);
+    };
+
+    int64_t peeked, poked;
+    // Control: a readable binary's memory is accessible to the tracer.
+    ASSERT_NO_FATAL_FAILURE(peek_after_exec(readable.path(), &peeked, &poked));
+    EXPECT_EQ(peeked, 0);
+    EXPECT_EQ(poked, 0);
+    // An execute-only binary's memory is not.
+    ASSERT_NO_FATAL_FAILURE(peek_after_exec(exec_only.path(), &peeked, &poked));
+    EXPECT_EQ(peeked, -EIO);
+    EXPECT_EQ(poked, -EIO);
+  });
+}
+
+// CAP_SYS_PTRACE in a user namespace that does not contain the executable's
+// owner must not permit tracing a task that exec'd that non-readable binary;
+// Linux checks the capability in mm->user_ns, which fs/exec.c:would_dump()
+// lowers to an ancestor namespace containing the executable's owner.
+TEST(ElfTest, UsernsAttachExecuteOnlyBinary) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(ExecNonDumpEnforced()));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+  TempPath exec_only = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", elf));
+  ASSERT_THAT(chmod(exec_only.path().c_str(), 0111), SyscallSucceeds());
+
+  // The helper must be single-threaded to unshare a user namespace, so fork
+  // before dropping privileges.
+  pid_t helper = fork();
+  if (helper == 0) {
+    if (setgroups(0, nullptr) != 0) _exit(20);
+    if (setresgid(12345, 12345, 12345) != 0) _exit(21);
+    if (setresuid(12345, 12345, 12345) != 0) _exit(22);
+    if (prctl(PR_SET_DUMPABLE, 1) != 0) _exit(23);
+    // The helper holds all capabilities in the new user namespace, but the
+    // executable's owner (root) is not mapped into it.
+    if (unshare(CLONE_NEWUSER) != 0) _exit(24);
+    pid_t child = fork();
+    if (child == 0) {
+      execl(exec_only.path().c_str(), exec_only.path().c_str(), nullptr);
+      _exit(25);
+    }
+    int status;
+    if (waitpid(child, &status, WUNTRACED) != child) _exit(26);
+    if (!WIFSTOPPED(status)) _exit(27);
+    // The stub PTRACE_TRACEMEs; detach (ignoring failure, in case the traceme
+    // was denied) so that PTRACE_ATTACH performs a fresh access check.
+    ptrace(PTRACE_DETACH, child, 0, SIGSTOP);
+    errno = 0;
+    int64_t ret = ptrace(PTRACE_ATTACH, child, 0, 0);
+    int attach_errno = errno;
+    kill(child, SIGKILL);
+    waitpid(child, nullptr, 0);
+    if (ret == 0) _exit(1);  // Attach must be denied.
+    _exit(attach_errno == EPERM ? 0 : 2);
+  }
+  ASSERT_GT(helper, 0);
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(helper, &status, 0),
+              SyscallSucceedsWithValue(helper));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "helper status: " << status;
+}
+
+// How CheckExecuteOnlyScriptStaysDumpable launches the script.
+enum class ScriptExecMode {
+  kPath,          // execve(path)
+  kEmptyPathFd,   // execveat(fd, "", AT_EMPTY_PATH), fd opened O_PATH
+  kRelativeDirfd  // execveat(dirfd, "name", 0)
+};
+
+// An interpreter script that is itself execute-only does not make the task
+// non-dumpable when its interpreter is readable: fs/exec.c:begin_new_exec()
+// applies would_dump() to the final binprm file (the interpreter binary), not
+// to the script, for both by-path and by-fd execution.
+void CheckExecuteOnlyScriptStaysDumpable(ScriptExecMode mode) {
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+  // /tmp is also traversable by the unprivileged uid below, unlike the test
+  // tmpdir.
+  TempPath interpreter_file =
+      ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", elf));
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      "/tmp", absl::StrCat("#!", interpreter_file.path()), 0111));
+
+  // Use a separate thread so as to not pollute the other tests with the
+  // unprivileged uid we're about to set.
+  ScopedThread([&] {
+    constexpr int kUnprivilegedUid = 12345;
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+    // Restore dumpability, cleared by the uid change.
+    ASSERT_THAT(prctl(PR_SET_DUMPABLE, 1), SyscallSucceeds());
+
+    pid_t child = fork();
+    if (child == 0) {
+      if (ptrace(PTRACE_TRACEME, 0, 0, 0) != 0) {
+        _exit(40);
+      }
+      raise(SIGSTOP);
+      char* const argv[] = {const_cast<char*>(script.path().c_str()), nullptr};
+      char* const envv[] = {nullptr};
+      switch (mode) {
+        case ScriptExecMode::kPath:
+          execve(script.path().c_str(), argv, envv);
+          break;
+        case ScriptExecMode::kEmptyPathFd: {
+          int fd = open(script.path().c_str(), O_PATH);
+          if (fd < 0) {
+            _exit(42);
+          }
+          syscall(SYS_execveat, fd, "", argv, envv, AT_EMPTY_PATH);
+          break;
+        }
+        case ScriptExecMode::kRelativeDirfd: {
+          int dirfd = open(std::string(Dirname(script.path())).c_str(),
+                           O_RDONLY | O_DIRECTORY);
+          if (dirfd < 0) {
+            _exit(43);
+          }
+          syscall(SYS_execveat, dirfd,
+                  std::string(Basename(script.path())).c_str(), argv, envv, 0);
+          break;
+        }
+      }
+      _exit(41);
+    }
+    MaybeSave();
+    ASSERT_GT(child, 0);
+    int status;
+    ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+                SyscallSucceedsWithValue(child));
+    ASSERT_TRUE(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP) << status;
+    ASSERT_THAT(ptrace(PTRACE_CONT, child, 0, 0), SyscallSucceeds());
+    ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+                SyscallSucceedsWithValue(child));
+    ASSERT_TRUE(WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) << status;
+
+    // The task must remain dumpable: its tracer can read its memory.
+    errno = 0;
+    ptrace(PTRACE_PEEKDATA, child, 0x40000, 0);
+    EXPECT_EQ(errno, 0);
+
+    kill(child, SIGKILL);
+    RetryEINTR(waitpid)(child, nullptr, 0);
+  });
+}
+
+TEST(ElfTest, ExecuteOnlyScriptReadableInterpreter) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  CheckExecuteOnlyScriptStaysDumpable(ScriptExecMode::kPath);
+}
+
+TEST(ElfTest, ExecuteOnlyScriptReadableInterpreterEmptyPathFd) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  CheckExecuteOnlyScriptStaysDumpable(ScriptExecMode::kEmptyPathFd);
+}
+
+TEST(ElfTest, ExecuteOnlyScriptReadableInterpreterRelativeDirfd) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  CheckExecuteOnlyScriptStaysDumpable(ScriptExecMode::kRelativeDirfd);
+}
+
+// A task that exec'd an execute-only binary is non-dumpable and therefore
+// unreadable via process_vm_readv. This verifies permission enforcement after
+// the exec has completed; it does not exercise the window during a concurrent
+// execve, which CanTraceAndGetMM closes by checking against the MemoryManager
+// it returns.
+TEST(ElfTest, ProcessVMReadExecuteOnlyBinary) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(ExecNonDumpEnforced()));
+  // The readable control drops capabilities, which Yama scope > 1 requires
+  // for process_vm_readv.
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope()) > 1);
+
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+  // /tmp is also traversable by the unprivileged uid below, unlike the test
+  // tmpdir.
+  TempPath exec_only = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", elf));
+  ASSERT_THAT(chmod(exec_only.path().c_str(), 0111), SyscallSucceeds());
+  TempPath readable = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", elf));
+
+  // Use a separate thread so as to not pollute the other tests with the
+  // unprivileged uid we're about to set.
+  ScopedThread([&] {
+    constexpr int kUnprivilegedUid = 12345;
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+    // Restore dumpability, cleared by the uid change.
+    ASSERT_THAT(prctl(PR_SET_DUMPABLE, 1), SyscallSucceeds());
+
+    const auto read_after_exec = [](const std::string& path) -> int64_t {
+      pid_t child = fork();
+      if (child == 0) {
+        char* const argv[] = {const_cast<char*>(path.c_str()), nullptr};
+        char* const envv[] = {nullptr};
+        execve(path.c_str(), argv, envv);
+        _exit(41);
+      }
+      TEST_CHECK(child > 0);
+      // The exec'd stub stops itself with SIGSTOP.
+      int status;
+      TEST_CHECK(RetryEINTR(waitpid)(child, &status, WUNTRACED) == child);
+      TEST_CHECK(WIFSTOPPED(status));
+
+      char buf[8] = {};
+      struct iovec local = {buf, sizeof(buf)};
+      // The first segment of StandardElf is loaded at 0x40000.
+      struct iovec remote = {reinterpret_cast<void*>(0x40000), sizeof(buf)};
+      errno = 0;
+      int64_t n =
+          syscall(SYS_process_vm_readv, child, &local, 1, &remote, 1, 0);
+      int64_t result = (n < 0) ? -errno : n;
+      kill(child, SIGKILL);
+      RetryEINTR(waitpid)(child, nullptr, 0);
+      return result;
+    };
+
+    // Control: a readable binary's memory is readable.
+    EXPECT_EQ(read_after_exec(readable.path()), 8);
+    // An execute-only binary's is not.
+    EXPECT_EQ(read_after_exec(exec_only.path()), -EPERM);
+  });
+}
+
+// A /proc/[pid]/mem file stays bound to the mm that its open-time access
+// check validated. After the target execs an execute-only binary, that old mm
+// has no users, so reads through the old fd return EOF rather than any data
+// from the new image, and a fresh open is denied.
+TEST(ElfTest, ProcMemFdAcrossExecuteOnlyExec) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(ExecNonDumpEnforced()));
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(YamaPtraceScope()) > 1);
+
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+  TempPath exec_only = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", elf));
+  ASSERT_THAT(chmod(exec_only.path().c_str(), 0111), SyscallSucceeds());
+
+  static volatile int64_t marker = 0x1111;
+
+  ScopedThread([&] {
+    constexpr int kUnprivilegedUid = 12345;
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+    ASSERT_THAT(prctl(PR_SET_DUMPABLE, 1), SyscallSucceeds());
+
+    int go[2];
+    ASSERT_THAT(pipe(go), SyscallSucceeds());
+    const FileDescriptor go_rfd(go[0]);
+    const FileDescriptor go_wfd(go[1]);
+    pid_t child = fork();
+    if (child == 0) {
+      char g;
+      if (ReadFd(go_rfd.get(), &g, 1) != 1) _exit(40);
+      char* const argv[] = {const_cast<char*>(exec_only.path().c_str()),
+                            nullptr};
+      execve(exec_only.path().c_str(), argv, nullptr);
+      _exit(41);
+    }
+    MaybeSave();
+    ASSERT_GT(child, 0);
+    const auto cleanup = Cleanup([child] {
+      kill(child, SIGKILL);
+      RetryEINTR(waitpid)(child, nullptr, 0);
+    });
+
+    const FileDescriptor mem = ASSERT_NO_ERRNO_AND_VALUE(
+        Open(absl::StrCat("/proc/", child, "/mem"), O_RDONLY));
+    int64_t v = 0;
+    ASSERT_THAT(pread(mem.get(), &v, sizeof(v), (off_t)&marker),
+                SyscallSucceedsWithValue(sizeof(v)));
+    EXPECT_EQ(v, marker);
+
+    ASSERT_THAT(WriteFd(go_wfd.get(), "g", 1), SyscallSucceedsWithValue(1));
+    int status;
+    ASSERT_THAT(RetryEINTR(waitpid)(child, &status, WUNTRACED),
+                SyscallSucceedsWithValue(child));
+    ASSERT_TRUE(WIFSTOPPED(status)) << status;
+
+    EXPECT_THAT(pread(mem.get(), &v, sizeof(v), (off_t)&marker),
+                SyscallSucceedsWithValue(0));
+    EXPECT_THAT(open(absl::StrCat("/proc/", child, "/mem").c_str(), O_RDONLY),
+                SyscallFailsWithErrno(EACCES));
+  });
+}
+
+// Test parameter to ElfInterpterStaticTest cases. The first item is a suffix to
+// add to the end of the interpreter path in the PT_INTERP segment and the
+// second is the expected execve(2) errno.
+using ElfInterpreterStaticParam = std::tuple<std::vector<char>, int>;
+
+class ElfInterpreterStaticTest
+    : public ::testing::TestWithParam<ElfInterpreterStaticParam> {};
+
+// Statically linked ELF with a statically linked ELF interpreter.
+TEST_P(ElfInterpreterStaticTest, Test) {
+  // TODO(gvisor.dev/issue/3721): Test has been observed to segfault on 5.X
+  // kernels.
+  if (GvisorPlatform() == Platform::kNative) {
+    auto version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
+    SKIP_IF(version.major > 4);
+  }
+
+  const std::vector<char> segment_suffix = std::get<0>(GetParam());
+  const int expected_errno = std::get<1>(GetParam());
+
+  ElfBinary<64> interpreter = StandardElf();
+  // See comment in ElfTest.ELFInterpreter.
+  interpreter.phdrs[1].p_flags = PF_R | PF_W | PF_X;
+  interpreter.UpdateOffsets();
+  TempPath interpreter_file =
+      ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(interpreter));
+
+  ElfBinary<64> binary = StandardElf();
+  // The PT_LOAD segment conflicts with the interpreter's PT_LOAD segment. The
+  // interpreter's will be mapped directly over the binary's.
+
+  // Interpreter path plus the parameterized suffix in the PT_INTERP segment.
+  const std::string path = interpreter_file.path();
+  std::vector<char> segment(path.begin(), path.end());
+  segment.insert(segment.end(), segment_suffix.begin(), segment_suffix.end());
+  binary.AddInterpreter(segment);
+
+  binary.UpdateOffsets();
+
+  TempPath binary_file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(binary));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec(
+      binary_file.path(), {binary_file.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, expected_errno);
+
+  if (expected_errno == 0) {
+    ASSERT_NO_ERRNO(WaitStopped(child));
+
+    EXPECT_THAT(child, ContainsMappings(std::vector<ProcMapsEntry>({
+                           // Interpreter.
+                           {0x40000, 0x40000 + kPageSize, true, true, true,
+                            true, 0, 0, 0, 0, interpreter_file.path().c_str()},
+                       })));
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Cases, ElfInterpreterStaticTest,
+    ::testing::ValuesIn({
+        // Simple NUL-terminator to run the interpreter as normal.
+        std::make_tuple(std::vector<char>({'\0'}), 0),
+        // Add some garbage to the segment followed by a NUL-terminator. This is
+        // ignored.
+        std::make_tuple(std::vector<char>({'\0', 'b', '\0'}), 0),
+        // Add some garbage to the segment without a NUL-terminator. Linux will
+        // reject
+        // this.
+        std::make_tuple(std::vector<char>({'\0', 'b'}), ENOEXEC),
+    }));
+
+// Test parameter to ElfInterpterBadPathTest cases. The first item is the
+// contents of the PT_INTERP segment and the second is the expected execve(2)
+// errno.
+using ElfInterpreterBadPathParam = std::tuple<std::vector<char>, int>;
+
+class ElfInterpreterBadPathTest
+    : public ::testing::TestWithParam<ElfInterpreterBadPathParam> {};
+
+TEST_P(ElfInterpreterBadPathTest, Test) {
+  const std::vector<char> segment = std::get<0>(GetParam());
+  const int expected_errno = std::get<1>(GetParam());
+
+  ElfBinary<64> binary = StandardElf();
+  binary.AddInterpreter(segment);
+  binary.UpdateOffsets();
+
+  TempPath binary_file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(binary));
+
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec(
+      binary_file.path(), {binary_file.path()}, {}, nullptr, &execve_errno));
+  EXPECT_EQ(execve_errno, expected_errno);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Cases, ElfInterpreterBadPathTest,
+    ::testing::ValuesIn({
+        // NUL-terminated fake path in the PT_INTERP segment.
+        std::make_tuple(std::vector<char>({'/', 'f', '/', 'b', '\0'}), ENOENT),
+        // ELF interpreter not NUL-terminated.
+        std::make_tuple(std::vector<char>({'/', 'f', '/', 'b'}), ENOEXEC),
+        // ELF interpreter path omitted entirely.
+        //
+        // fs/binfmt_elf.c:load_elf_binary returns ENOEXEC if p_filesz is < 2
+        // bytes.
+        std::make_tuple(std::vector<char>({'\0'}), ENOEXEC),
+        // ELF interpreter path = "\0".
+        //
+        // fs/binfmt_elf.c:load_elf_binary returns ENOEXEC if p_filesz is < 2
+        // bytes, so add an extra byte to pass that check.
+        //
+        // load_elf_binary -> open_exec -> do_open_execat fails to check that
+        // name != '\0' before calling do_filp_open, which thus opens the
+        // working directory. do_open_execat returns EACCES because the
+        // directory is not a regular file.
+        std::make_tuple(std::vector<char>({'\0', '\0'}), EACCES),
+    }));
+
+// Relative path to ELF interpreter.
+TEST(ElfTest, ELFInterpreterRelative) {
+  ElfBinary<64> interpreter = StandardElf();
+  interpreter.header.e_type = ET_DYN;
+  interpreter.header.e_entry = 0x0;
+  interpreter.UpdateOffsets();
+
+  // The first segment really needs to start at 0 for a normal PIE binary, and
+  // thus includes the headers.
+  uint64_t const offset = interpreter.phdrs[1].p_offset;
+  // See comment in ElfTest.ELFInterpreter.
+  interpreter.phdrs[1].p_flags = PF_R | PF_W | PF_X;
+  interpreter.phdrs[1].p_offset = 0x0;
+  interpreter.phdrs[1].p_vaddr = 0x0;
+  interpreter.phdrs[1].p_filesz += offset;
+  interpreter.phdrs[1].p_memsz += offset;
+
+  TempPath interpreter_file =
+      ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(interpreter));
+  auto cwd = ASSERT_NO_ERRNO_AND_VALUE(GetCWD());
+  auto interpreter_relative =
+      ASSERT_NO_ERRNO_AND_VALUE(GetRelativePath(cwd, interpreter_file.path()));
+
+  ElfBinary<64> binary = StandardElf();
+
+  // NUL-terminated path in the PT_INTERP segment.
+  std::vector<char> segment(interpreter_relative.begin(),
+                            interpreter_relative.end());
+  segment.push_back(0);
+  binary.AddInterpreter(segment);
+
+  binary.UpdateOffsets();
+
+  TempPath binary_file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(binary));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec(
+      binary_file.path(), {binary_file.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  ASSERT_NO_ERRNO(WaitStopped(child));
+
+  // RIP tells us which page the first segment of the interpreter was loaded
+  // into.
+  struct user_regs_struct regs;
+  struct iovec iov;
+  iov.iov_base = &regs;
+  iov.iov_len = sizeof(regs);
+  EXPECT_THAT(ptrace(PTRACE_GETREGSET, child, NT_PRSTATUS, &iov),
+              SyscallSucceeds());
+  // Read exactly the full register set.
+  EXPECT_EQ(iov.iov_len, sizeof(regs));
+
+  const uint64_t interp_load_addr = IP_REG(regs) & ~(kPageSize - 1);
+
+  EXPECT_THAT(child,
+              ContainsMappings(std::vector<ProcMapsEntry>({
+                  // Main binary
+                  {0x40000, 0x40000 + kPageSize, true, false, true, true, 0, 0,
+                   0, 0, binary_file.path().c_str()},
+                  // Interpreter
+                  {interp_load_addr, interp_load_addr + kPageSize, true, true,
+                   true, true, 0, 0, 0, 0, interpreter_file.path().c_str()},
+              })));
+}
+
+// ELF interpreter architecture doesn't match the binary.
+TEST(ElfTest, ELFInterpreterWrongArch) {
+  ElfBinary<64> interpreter = StandardElf();
+  interpreter.header.e_machine = EM_PPC64;
+  interpreter.header.e_type = ET_DYN;
+  interpreter.header.e_entry = 0x0;
+  interpreter.UpdateOffsets();
+
+  // The first segment really needs to start at 0 for a normal PIE binary, and
+  // thus includes the headers.
+  uint64_t const offset = interpreter.phdrs[1].p_offset;
+  // See comment in ElfTest.ELFInterpreter.
+  interpreter.phdrs[1].p_flags = PF_R | PF_W | PF_X;
+  interpreter.phdrs[1].p_offset = 0x0;
+  interpreter.phdrs[1].p_vaddr = 0x0;
+  interpreter.phdrs[1].p_filesz += offset;
+  interpreter.phdrs[1].p_memsz += offset;
+
+  TempPath interpreter_file =
+      ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(interpreter));
+
+  ElfBinary<64> binary = StandardElf();
+
+  // NUL-terminated path in the PT_INTERP segment.
+  const std::string path = interpreter_file.path();
+  std::vector<char> segment(path.begin(), path.end());
+  segment.push_back(0);
+  binary.AddInterpreter(segment);
+
+  binary.UpdateOffsets();
+
+  TempPath binary_file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(binary));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec(
+      binary_file.path(), {binary_file.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, ELIBBAD);
+}
+
+// No execute permissions on the binary.
+TEST(ElfTest, NoExecute) {
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  ASSERT_THAT(chmod(file.path().c_str(), 0644), SyscallSucceeds());
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  EXPECT_EQ(execve_errno, EACCES);
+}
+
+// Execute, but no read permissions on the binary works just fine. A task
+// whose credentials cannot read its executable is marked non-dumpable (see
+// ExecuteOnlyBinary and PtraceExecuteOnlyBinary), but this test runs with
+// CAP_DAC_OVERRIDE, so the executable remains readable to it and the task
+// stays dumpable.
+TEST(ElfTest, NoRead) {
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+
+  // Use /tmp: an unprivileged host gofer cannot read an execute-only backing
+  // file.
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", elf));
+
+  ASSERT_THAT(chmod(file.path().c_str(), 0111), SyscallSucceeds());
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  ASSERT_NO_ERRNO(WaitStopped(child));
+}
+
+// No execute permissions on the ELF interpreter.
+TEST(ElfTest, ElfInterpreterNoExecute) {
+  ElfBinary<64> interpreter = StandardElf();
+  interpreter.header.e_type = ET_DYN;
+  interpreter.header.e_entry = 0x0;
+  interpreter.UpdateOffsets();
+
+  // The first segment really needs to start at 0 for a normal PIE binary, and
+  // thus includes the headers.
+  uint64_t const offset = interpreter.phdrs[1].p_offset;
+  // See comment in ElfTest.ELFInterpreter.
+  interpreter.phdrs[1].p_flags = PF_R | PF_W | PF_X;
+  interpreter.phdrs[1].p_offset = 0x0;
+  interpreter.phdrs[1].p_vaddr = 0x0;
+  interpreter.phdrs[1].p_filesz += offset;
+  interpreter.phdrs[1].p_memsz += offset;
+
+  TempPath interpreter_file =
+      ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(interpreter));
+
+  ElfBinary<64> binary = StandardElf();
+
+  // NUL-terminated path in the PT_INTERP segment.
+  const std::string path = interpreter_file.path();
+  std::vector<char> segment(path.begin(), path.end());
+  segment.push_back(0);
+  binary.AddInterpreter(segment);
+
+  binary.UpdateOffsets();
+
+  TempPath binary_file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(binary));
+
+  ASSERT_THAT(chmod(interpreter_file.path().c_str(), 0644), SyscallSucceeds());
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(interpreter_file.path(), {interpreter_file.path()}, {},
+                  &child, &execve_errno));
+  EXPECT_EQ(execve_errno, EACCES);
+}
+
+// Execute a basic interpreter script.
+TEST(InterpreterScriptTest, Execute) {
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+  // Use /tmp explicitly to ensure the path is short enough.
+  TempPath binary = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", elf));
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(), absl::StrCat("#!", binary.path()), 0755));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(script.path(), {script.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  EXPECT_NO_ERRNO(WaitStopped(child));
+}
+
+// Whitespace after #!.
+TEST(InterpreterScriptTest, Whitespace) {
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+  // Use /tmp explicitly to ensure the path is short enough.
+  TempPath binary = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", elf));
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(), absl::StrCat("#! \t  \t", binary.path()), 0755));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(script.path(), {script.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  EXPECT_NO_ERRNO(WaitStopped(child));
+}
+
+// Interpreter script is missing execute permission.
+TEST(InterpreterScriptTest, InterpreterScriptNoExecute) {
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+  // Use /tmp explicitly to ensure the path is short enough.
+  TempPath binary = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", elf));
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(), absl::StrCat("#!", binary.path()), 0644));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(script.path(), {script.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, EACCES);
+}
+
+// Binary interpreter script refers to is missing execute permission.
+TEST(InterpreterScriptTest, BinaryNoExecute) {
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+  // Use /tmp explicitly to ensure the path is short enough.
+  TempPath binary = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", elf));
+
+  ASSERT_THAT(chmod(binary.path().c_str(), 0644), SyscallSucceeds());
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(), absl::StrCat("#!", binary.path()), 0755));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(script.path(), {script.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, EACCES);
+}
+
+// Linux will load interpreter scripts five levels deep, but no more.
+TEST(InterpreterScriptTest, MaxRecursion) {
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+  // Use /tmp explicitly to ensure the path is short enough.
+  TempPath binary = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", elf));
+
+  TempPath script1 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      "/tmp", absl::StrCat("#!", binary.path()), 0755));
+  TempPath script2 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      "/tmp", absl::StrCat("#!", script1.path()), 0755));
+  TempPath script3 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      "/tmp", absl::StrCat("#!", script2.path()), 0755));
+  TempPath script4 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      "/tmp", absl::StrCat("#!", script3.path()), 0755));
+  TempPath script5 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      "/tmp", absl::StrCat("#!", script4.path()), 0755));
+  TempPath script6 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      "/tmp", absl::StrCat("#!", script5.path()), 0755));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(script6.path(), {script6.path()}, {}, &child, &execve_errno));
+  // Too many levels of recursion.
+  EXPECT_EQ(execve_errno, ELOOP);
+
+  // The next level up is OK.
+  auto cleanup2 = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(script5.path(), {script5.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  EXPECT_NO_ERRNO(WaitStopped(child));
+}
+
+// Interpreter script with a relative path.
+TEST(InterpreterScriptTest, RelativePath) {
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+  TempPath binary = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", elf));
+
+  auto cwd = ASSERT_NO_ERRNO_AND_VALUE(GetCWD());
+  auto binary_relative =
+      ASSERT_NO_ERRNO_AND_VALUE(GetRelativePath(cwd, binary.path()));
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(), absl::StrCat("#!", binary_relative), 0755));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(script.path(), {script.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  EXPECT_NO_ERRNO(WaitStopped(child));
+}
+
+// Interpreter script with .. in a path component.
+TEST(InterpreterScriptTest, UncleanPath) {
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+  // Use /tmp explicitly to ensure the path is short enough.
+  TempPath binary = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", elf));
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(), absl::StrCat("#!/tmp/../", binary.path()),
+      0755));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(script.path(), {script.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  EXPECT_NO_ERRNO(WaitStopped(child));
+}
+
+// Passed interpreter script is a symlink.
+TEST(InterpreterScriptTest, Symlink) {
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+  // Use /tmp explicitly to ensure the path is short enough.
+  TempPath binary = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith("/tmp", elf));
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(), absl::StrCat("#!", binary.path()), 0755));
+
+  TempPath link = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateSymlinkTo(GetAbsoluteTestTmpdir(), script.path()));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(link.path(), {link.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  EXPECT_NO_ERRNO(WaitStopped(child));
+}
+
+// Interpreter script points to a symlink loop.
+TEST(InterpreterScriptTest, SymlinkLoop) {
+  std::string const link1 = NewTempAbsPathInDir("/tmp");
+  std::string const link2 = NewTempAbsPathInDir("/tmp");
+
+  ASSERT_THAT(symlink(link2.c_str(), link1.c_str()), SyscallSucceeds());
+  auto remove_link1 = Cleanup(
+      [&link1] { EXPECT_THAT(unlink(link1.c_str()), SyscallSucceeds()); });
+
+  ASSERT_THAT(symlink(link1.c_str(), link2.c_str()), SyscallSucceeds());
+  auto remove_link2 = Cleanup(
+      [&link2] { EXPECT_THAT(unlink(link2.c_str()), SyscallSucceeds()); });
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(), absl::StrCat("#!", link1), 0755));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(script.path(), {script.path()}, {}, &child, &execve_errno));
+  EXPECT_EQ(execve_errno, ELOOP);
+}
+
+// Binary is a symlink loop.
+TEST(ExecveTest, SymlinkLoop) {
+  std::string const link1 = NewTempAbsPathInDir("/tmp");
+  std::string const link2 = NewTempAbsPathInDir("/tmp");
+
+  ASSERT_THAT(symlink(link2.c_str(), link1.c_str()), SyscallSucceeds());
+  auto remove_link = Cleanup(
+      [&link1] { EXPECT_THAT(unlink(link1.c_str()), SyscallSucceeds()); });
+
+  ASSERT_THAT(symlink(link1.c_str(), link2.c_str()), SyscallSucceeds());
+  auto remove_link2 = Cleanup(
+      [&link2] { EXPECT_THAT(unlink(link2.c_str()), SyscallSucceeds()); });
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(link1, {link1}, {}, &child, &execve_errno));
+  EXPECT_EQ(execve_errno, ELOOP);
+}
+
+// Binary is a directory.
+TEST(ExecveTest, Directory) {
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec("/tmp", {"/tmp"}, {}, &child, &execve_errno));
+  EXPECT_EQ(execve_errno, EACCES);
+}
+
+// Pass a valid binary as a directory (extra / on the end).
+TEST(ExecveTest, BinaryAsDirectory) {
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  std::string const path = absl::StrCat(file.path(), "/");
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(path, {path}, {}, &child, &execve_errno));
+  EXPECT_EQ(execve_errno, ENOTDIR);
+}
+
+// The initial brk value is after the page at the end of the binary.
+TEST(ExecveTest, BrkAfterBinary) {
+  ElfBinary<64> elf = StandardElf();
+  elf.UpdateOffsets();
+
+  TempPath file = ASSERT_NO_ERRNO_AND_VALUE(CreateElfWith(elf));
+
+  pid_t child;
+  int execve_errno;
+  auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(file.path(), {file.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+
+  // Ensure it made it to SIGSTOP.
+  ASSERT_NO_ERRNO(WaitStopped(child));
+
+  struct user_regs_struct regs;
+  struct iovec iov;
+  iov.iov_base = &regs;
+  iov.iov_len = sizeof(regs);
+  EXPECT_THAT(ptrace(PTRACE_GETREGSET, child, NT_PRSTATUS, &iov),
+              SyscallSucceeds());
+  // Read exactly the full register set.
+  EXPECT_EQ(iov.iov_len, sizeof(regs));
+
+  // RIP is just beyond the final syscall instruction. Rewind to execute a brk
+  // syscall.
+  IP_REG(regs) -= kSyscallSize;
+  RAX_REG(regs) = __NR_brk;
+  RDI_REG(regs) = 0;
+  ASSERT_THAT(ptrace(PTRACE_SETREGSET, child, NT_PRSTATUS, &iov),
+              SyscallSucceeds());
+
+  // Resume the child, waiting for syscall entry.
+  ASSERT_THAT(ptrace(PTRACE_SYSCALL, child, 0, 0), SyscallSucceeds());
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+              SyscallSucceedsWithValue(child));
+  ASSERT_TRUE(WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP)
+      << "status = " << status;
+
+  // Execute the syscall.
+  ASSERT_THAT(ptrace(PTRACE_SYSCALL, child, 0, 0), SyscallSucceeds());
+  ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+              SyscallSucceedsWithValue(child));
+  ASSERT_TRUE(WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP)
+      << "status = " << status;
+
+  iov.iov_base = &regs;
+  iov.iov_len = sizeof(regs);
+  EXPECT_THAT(ptrace(PTRACE_GETREGSET, child, NT_PRSTATUS, &iov),
+              SyscallSucceeds());
+  // Read exactly the full register set.
+  EXPECT_EQ(iov.iov_len, sizeof(regs));
+
+  // brk is after the text page.
+  //
+  // The kernel does brk randomization, so we can't be sure what the exact
+  // address will be, but it is always beyond the final page in the binary.
+  // i.e., it does not start immediately after memsz in the middle of a page.
+  // Userspace may expect to use that space.
+  EXPECT_GE(RETURN_REG(regs), 0x40000 + kPageSize);
+}
+
+}  // namespace
+
+}  // namespace testing
+}  // namespace gvisor
