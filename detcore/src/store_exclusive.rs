@@ -238,6 +238,9 @@ mod model {
     use std::path::Path;
     use std::sync::Arc;
 
+    use detcore_model::summary::ExclusiveRewrite;
+    use detcore_model::summary::RunSummary;
+
     use crate::aarch64_lse::elf::FilePlan;
     use crate::aarch64_lse::elf::FileReport;
 
@@ -1180,24 +1183,60 @@ mod model {
         /// the ranges of one address space, the one that left or could not
         /// write the most (then the one with the most loops), so that the
         /// three counts describe one process and the worst exposure is the
-        /// one shown.
+        /// one shown. The unmarked flag instead covers every address space:
+        /// worse numeric exposure elsewhere cannot hide an unproven file.
         pub(crate) fn rewrites_per_path(&self) -> BTreeMap<String, Rewrite> {
             self.found
                 .iter()
                 .map(|(path, spaces)| {
-                    let rewrite = spaces
+                    let mut unmarked = false;
+                    let mut rewrite = spaces
                         .values()
                         .map(|ranges| {
                             ranges
                                 .values()
                                 .fold(Rewrite::default(), |sum, (_, rewrite)| sum.add(*rewrite))
                         })
+                        .inspect(|rewrite| unmarked |= rewrite.unmarked)
                         .max_by_key(|r| (r.left + r.failed, r.rewritten + r.left + r.failed))
                         .unwrap_or_default();
+                    rewrite.unmarked |= unmarked;
                     (path.clone(), rewrite)
                 })
                 .filter(|(_, rewrite)| !rewrite.is_empty())
                 .collect()
+        }
+
+        /// Project the rewrite counts and unmarked filenames into the run summary.
+        pub(crate) fn fill_rewrite_summary(&self, summary: &mut RunSummary) {
+            // The files whose loops were left for want of mapping symbols
+            // are named beside those the overlay left
+            // (`Config::rewrite_exclusives_unmarked`).
+            let mut unmarked_files = Vec::new();
+            summary.exclusive_rewrites = self
+                .rewrites_per_path()
+                .into_iter()
+                .map(|(path, rewrite)| {
+                    let Rewrite {
+                        rewritten,
+                        left,
+                        failed,
+                        unmarked,
+                    } = rewrite;
+                    if unmarked {
+                        unmarked_files.push(path.clone());
+                    }
+                    (
+                        path,
+                        ExclusiveRewrite {
+                            rewritten,
+                            left,
+                            failed,
+                        },
+                    )
+                })
+                .collect();
+            summary.exclusive_rewrite_unmarked.extend(unmarked_files);
         }
 
         /// The exclusive loops of each guest path that can still retry, in the
@@ -1271,7 +1310,6 @@ mod runtime {
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    use detcore_model::summary::ExclusiveRewrite;
     use detcore_model::summary::RunSummary;
     use detcore_model::summary::StoreExclusiveCounts;
     use procfs::process::MMPermissions;
@@ -1538,35 +1576,7 @@ mod runtime {
                 .collect();
             summary.exclusive_rewrite_cache_peak = PLANS.lock().unwrap().peak() as u64;
             summary.counter_reads = self.pairs.counter_reads_per_path();
-            // The files whose loops were left for want of mapping symbols
-            // are named beside those the overlay left
-            // (`Config::rewrite_exclusives_unmarked`).
-            let mut unmarked_files = Vec::new();
-            summary.exclusive_rewrites = self
-                .pairs
-                .rewrites_per_path()
-                .into_iter()
-                .map(|(path, rewrite)| {
-                    let Rewrite {
-                        rewritten,
-                        left,
-                        failed,
-                        unmarked,
-                    } = rewrite;
-                    if unmarked {
-                        unmarked_files.push(path.clone());
-                    }
-                    (
-                        path,
-                        ExclusiveRewrite {
-                            rewritten,
-                            left,
-                            failed,
-                        },
-                    )
-                })
-                .collect();
-            summary.exclusive_rewrite_unmarked.extend(unmarked_files);
+            self.pairs.fill_rewrite_summary(summary);
             match self.counts() {
                 Some(Ok(counts)) => summary.store_exclusives = Some(*counts),
                 Some(Err(reason)) => summary.store_exclusives_unavailable = Some(reason.clone()),
@@ -3909,6 +3919,97 @@ mod tests {
         let mut proved = PairTally::default();
         proved.note(&("0".to_owned(), 1), &[with(0, false)], None);
         assert!(!proved.rewrites_per_path()[stripped].unmarked);
+    }
+
+    #[test]
+    fn an_unproven_file_is_named_even_when_another_space_has_worse_counts() {
+        use detcore_model::summary::ExclusiveRewrite;
+        use detcore_model::summary::RunSummary;
+
+        let path = "/lib64/libstripped.so";
+        let with = |address, rewritten, left, failed, unmarked| ScannedMapping {
+            address,
+            rewrite: Rewrite {
+                rewritten,
+                left,
+                failed,
+                unmarked,
+            },
+            ..mapping(path, 0, 0x1000, rewritten + left + failed)
+        };
+        for reverse in [false, true] {
+            for unmarked in [false, true] {
+                let mut spaces = [
+                    (
+                        ("0".to_owned(), 1),
+                        vec![with(0x40_0000, 0, 1, 0, unmarked)],
+                    ),
+                    (
+                        ("01".to_owned(), 0),
+                        vec![
+                            with(0x40_0000, 0, 1, 0, false),
+                            with(0x50_0000, 0, 1, 0, false),
+                        ],
+                    ),
+                ];
+                if reverse {
+                    spaces.reverse();
+                }
+                let mut tally = PairTally::default();
+                for (space, mappings) in spaces {
+                    tally.note(&space, &mappings, None);
+                }
+                let mut summary = RunSummary {
+                    exclusive_rewrites: [("/stale".to_owned(), ExclusiveRewrite::default())]
+                        .into_iter()
+                        .collect(),
+                    exclusive_rewrite_unmarked: vec!["/overlay/unproved".to_owned()],
+                    ..RunSummary::default()
+                };
+                tally.fill_rewrite_summary(&mut summary);
+                // Numeric counts still describe the worse single space,
+                // including both aliases, rather than summing the spaces.
+                assert_eq!(summary.exclusive_rewrites.len(), 1);
+                assert_eq!(
+                    summary.exclusive_rewrites[path],
+                    ExclusiveRewrite {
+                        rewritten: 0,
+                        left: 2,
+                        failed: 0,
+                    }
+                );
+                let mut expected = vec!["/overlay/unproved".to_owned()];
+                if unmarked {
+                    expected.push(path.to_owned());
+                }
+                assert_eq!(summary.exclusive_rewrite_unmarked, expected);
+            }
+        }
+
+        // Equal numeric keys keep max_by_key's last-space winner. The
+        // earlier space's marker must survive without choosing its counts.
+        let mut tie = PairTally::default();
+        tie.note(
+            &("0".to_owned(), 1),
+            &[with(0x40_0000, 5, 2, 1, true)],
+            None,
+        );
+        tie.note(
+            &("01".to_owned(), 0),
+            &[with(0x40_0000, 5, 1, 2, false)],
+            None,
+        );
+        let mut summary = RunSummary::default();
+        tie.fill_rewrite_summary(&mut summary);
+        assert_eq!(
+            summary.exclusive_rewrites[path],
+            ExclusiveRewrite {
+                rewritten: 5,
+                left: 1,
+                failed: 2,
+            }
+        );
+        assert_eq!(summary.exclusive_rewrite_unmarked, vec![path.to_owned()]);
     }
 
     /// The in-memory rewrite is tallied like the pairs: summed over one
