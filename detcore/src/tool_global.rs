@@ -11918,9 +11918,9 @@ pub async fn trace_schedevent_with_access<G, T>(
                     // (`LogicalTime::from_rcbs`), which `into_rcbs` gives back
                     // exactly. Where the clock runs at another rate the armed
                     // end differs from this count, and the end keeps its stop.
-                    stopless_end = timeslice.stopless.then(|| {
-                        thread_state.committed_clock_value + timeslice.length.into_rcbs()
-                    });
+                    stopless_end = timeslice
+                        .stopless
+                        .then(|| thread_state.committed_clock_value + timeslice.length.into_rcbs());
                 }
             }
             guest.thread_state_mut().replayed_stopless_end = stopless_end;
