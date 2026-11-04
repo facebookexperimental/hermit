@@ -37,8 +37,10 @@ pub use detcore::aarch64_lse::rewrite;
 /// data; none of the changes since 2 had bumped it, though the canonical
 /// shapes the refusal census added, the conditional compare-and-swap
 /// refusal, the direct-entry decoding and the positive allow-list each
-/// changed what the rewrite writes.
-pub const REWRITE_FORMAT_VERSION: u32 = 3;
+/// changed what the rewrite writes. 4: a sequence a known entry (the
+/// loader's entry, a defined function symbol or an FDE start) points into
+/// is refused, as is a sub-word compare whose head is one.
+pub const REWRITE_FORMAT_VERSION: u32 = 4;
 
 /// Whether this host executes the FEAT_LSE atomics the rewrite emits.
 ///

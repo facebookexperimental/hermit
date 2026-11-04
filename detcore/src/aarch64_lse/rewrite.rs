@@ -81,9 +81,12 @@ pub enum Refusal {
     /// The window is decoded but is not one of the four idioms.
     NotCanonical,
     /// A direct branch elsewhere in the scanned range targets the inside of
-    /// the sequence, so the replacement could be entered part-way. Only
-    /// direct branches are checked: an indirect branch's target (a jump
-    /// table, a landing pad) is not known here.
+    /// the sequence, so the replacement could be entered part-way. A known
+    /// loader or function entry inside the sequence counts the same way:
+    /// control can start there without executing the sequence's first
+    /// instruction. Only direct branches are checked for unknown targets:
+    /// an indirect branch's target (a jump table, a landing pad) is not
+    /// known here.
     BranchIntoSequence,
     /// A conditional compare-and-swap loop (`CasZero` or `CasCompare`):
     /// the original stores only when its comparison matches, so on a
@@ -169,7 +172,7 @@ impl Report {
 
 /// A code range to scan: `words` are the instructions at `base`.
 pub fn plan(words: &[u32], base: u64) -> Report {
-    plan_with_external_targets(words, base, &HashSet::new())
+    plan_with_entries(words, base, &HashSet::new(), &HashSet::new())
 }
 
 /// The same, told the direct branch targets of the code OUTSIDE this range:
@@ -181,7 +184,23 @@ pub fn plan_with_external_targets(
     base: u64,
     external_targets: &HashSet<u64>,
 ) -> Report {
-    plan_with_external_store(words, base, external_targets, false)
+    plan_with_entries(words, base, external_targets, &HashSet::new())
+}
+
+/// The same, also told the addresses control is known to start at without
+/// executing what precedes them: the loader entry (`e_entry`), defined
+/// function symbols and unwind-table (FDE) entries. A known entry inside a
+/// sequence refuses it, and a known entry at a sequence's head means any
+/// setup instruction before the head can be bypassed, so an argument that
+/// setup ran (the sub-word compare's zero-extension) does not hold. Code-span
+/// membership alone proves neither.
+pub fn plan_with_entries(
+    words: &[u32],
+    base: u64,
+    external_targets: &HashSet<u64>,
+    known_entries: &HashSet<u64>,
+) -> Report {
+    plan_with_external_store(words, base, external_targets, known_entries, false)
 }
 
 /// The same, also told whether code outside this range holds a
@@ -196,9 +215,10 @@ pub fn plan_with_external_store(
     words: &[u32],
     base: u64,
     external_targets: &HashSet<u64>,
+    known_entries: &HashSet<u64>,
     _external_store_exclusive: bool,
 ) -> Report {
-    let mut report = plan_section(words, base, external_targets);
+    let mut report = plan_section(words, base, external_targets, known_entries);
     if words
         .iter()
         .any(|word| unknown_direct_branch_possible(*word))
@@ -211,7 +231,12 @@ pub fn plan_with_external_store(
 /// [`plan_with_external_store`] without its fail-closed entry rule, which
 /// the caller applies itself over the words it may execute: an image's
 /// executable sections also hold data, whose words decode as anything.
-pub fn plan_section(words: &[u32], base: u64, external_targets: &HashSet<u64>) -> Report {
+pub fn plan_section(
+    words: &[u32],
+    base: u64,
+    external_targets: &HashSet<u64>,
+    known_entries: &HashSet<u64>,
+) -> Report {
     let decoded: Vec<Insn> = words.iter().copied().map(decode).collect();
     let branches = direct_branches(&decoded, base);
     let mut targets: HashSet<u64> = branches.iter().map(|(_, target)| *target).collect();
@@ -234,11 +259,20 @@ pub fn plan_section(words: &[u32], base: u64, external_targets: &HashSet<u64>) -
             Insn::LoadExcl { .. } => report.exclusive_instructions += 1,
             Insn::StoreExcl { .. } => {
                 report.exclusive_instructions += 1;
-                match match_sequence(words, &decoded, index, base, &branches, external_targets) {
+                match match_sequence(
+                    words,
+                    &decoded,
+                    index,
+                    base,
+                    &branches,
+                    external_targets,
+                    known_entries,
+                ) {
                     Ok(site) => {
                         let start = ((site.addr - base) / 4) as usize;
-                        let interior_entered = (start + 1..start + site.words.len())
-                            .any(|i| targets.contains(&addr(i)));
+                        let interior_entered = (start + 1..start + site.words.len()).any(|i| {
+                            targets.contains(&addr(i)) || known_entries.contains(&addr(i))
+                        });
                         // A compare idiom stores only when its comparison
                         // matches, while a CAS asks for write permission
                         // before it compares, so no compare idiom is
@@ -385,6 +419,7 @@ fn match_sequence(
     base: u64,
     branches: &[(usize, u64)],
     external_targets: &HashSet<u64>,
+    known_entries: &HashSet<u64>,
 ) -> Result<Site, Refusal> {
     let (size, store_ord, rs, rv, rn) = match decoded[store] {
         Insn::StoreExcl {
@@ -459,6 +494,7 @@ fn match_sequence(
     // entry an argument about what ran BEFORE the loop may ignore.
     let head = base + 4 * start as u64;
     let entered_from_outside = external_targets.contains(&head)
+        || known_entries.contains(&head)
         || branches
             .iter()
             .any(|(index, target)| *target == head && (*index < start || *index > close));
@@ -708,7 +744,8 @@ fn cas_compare(
         // that very register to the access width, which is what the compiler's
         // own outline-atomics helpers do. That argument needs the extension to
         // have RUN, so the caller passes it only when nothing outside the
-        // sequence can branch straight to the loop head.
+        // sequence can branch straight to the loop head and no known loader
+        // or function entry is the loop head.
         Operand::Reg(rm)
             if !matches!(size, Size::W | Size::X)
                 && !matches!(
@@ -1164,6 +1201,109 @@ mod tests {
     }
 
     #[test]
+    fn a_known_entry_inside_a_sequence_refuses_it() {
+        // cas_compare_gcc_x_al with the loader entry at its CMP (the second
+        // instruction): starting there executes a different instruction in
+        // the replacement, whose first word materialises the expected value
+        // and whose second is the CAS itself.
+        let original = [0xc85ffc66, 0xeb0400df, 0x54000081, 0xc807fc62, 0x35ffff87];
+        let mut entries = HashSet::new();
+        entries.insert(BASE + 4);
+        let report = plan_with_entries(&original, BASE, &HashSet::new(), &entries);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::BranchIntoSequence)
+        );
+        // The same entry at the sequence's head is its ordinary start; a
+        // compare idiom is still left alone as conditional-cas.
+        let mut entries = HashSet::new();
+        entries.insert(BASE);
+        let report = plan_with_entries(&original, BASE, &HashSet::new(), &entries);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::ConditionalCas)
+        );
+    }
+
+    #[test]
+    fn a_known_entry_at_the_head_bypasses_the_zero_extension() {
+        // uxtb w16,w0; ldaxrb w0,[x2]; cmp w0,w16; b.ne out; stlxrb w17,w1,[x2];
+        // cbnz w17 -- with the function's entry (STT_FUNC or FDE) at the
+        // ldaxrb, a caller reaching it through ADR/BLR never runs the uxtb,
+        // so the sub-word register compare must stay refused exactly as a
+        // direct branch to the head keeps it refused.
+        let loop_words = [
+            0x085f_fc40,
+            0x6b10_001f,
+            0x5400_0081,
+            0x0811_fc41,
+            0x35ff_ff91,
+        ];
+        let mut words = vec![0x5300_1c10];
+        words.extend_from_slice(&loop_words);
+        let mut entries = HashSet::new();
+        entries.insert(BASE + 4);
+        let report = plan_with_entries(&words, BASE, &HashSet::new(), &entries);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::Registers("a sub-word compare against a register"))
+        );
+    }
+
+    #[test]
+    fn a_conditional_cas_that_exports_its_reservation_is_refused() {
+        // ldaxr x0,[x2]; cbnz x0,out; stlxr w3,x1,[x2]; cbnz w3,loop;
+        // out: stlxr w4,x1,[x2] -- the original's failing-compare exit
+        // reaches `out` holding the ldaxr's reservation, so the outside
+        // stlxr stores; the replacement's CAS makes no reservation and it
+        // would not. The sequence is refused, not silently rewritten.
+        let words = [
+            0xc85f_fc40,
+            0xb500_0060,
+            0xc803_fc41,
+            0x35ff_ffa3,
+            0xc804_fc41,
+        ];
+        let report = plan(&words, BASE);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert!(
+            report
+                .refused
+                .iter()
+                .any(|r| r.reason == Refusal::ConditionalCas),
+            "{report:?}"
+        );
+        // Without the outside store the same loop is also left alone:
+        // compare idioms are not rewritten at all.
+        let report = plan(&words[..4], BASE);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert!(
+            report
+                .refused
+                .iter()
+                .any(|r| r.reason == Refusal::ConditionalCas),
+            "{report:?}"
+        );
+
+        // The compare form exports its reservation the same way.
+        let original = [0xc85ffc66, 0xeb0400df, 0x54000081, 0xc807fc62, 0x35ffff87];
+        let mut words = original.to_vec();
+        words.push(0xc807_fc62);
+        let report = plan(&words, BASE);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert!(
+            report
+                .refused
+                .iter()
+                .any(|r| r.reason == Refusal::ConditionalCas),
+            "{report:?}"
+        );
+    }
+
+    #[test]
     fn a_compare_loop_is_left_alone_even_with_no_other_store() {
         let words = [0xc85f_fc40, 0xb500_0060, 0xc803_fc41, 0x35ff_ffa3];
         let report = plan(&words, BASE);
@@ -1184,7 +1324,7 @@ mod tests {
         // the monitor, so the outside store could still consume the
         // reservation the failing exit leaves.
         let words = [0xc85f_fc40, 0xb500_0060, 0xc803_fc41, 0x35ff_ffa3];
-        let report = plan_with_external_store(&words, BASE, &HashSet::new(), true);
+        let report = plan_with_external_store(&words, BASE, &HashSet::new(), &HashSet::new(), true);
         assert_eq!(report.patched, vec![], "{report:?}");
         assert!(
             report
@@ -1194,7 +1334,8 @@ mod tests {
             "{report:?}"
         );
         // Told there is none, the same loop is still left alone.
-        let report = plan_with_external_store(&words, BASE, &HashSet::new(), false);
+        let report =
+            plan_with_external_store(&words, BASE, &HashSet::new(), &HashSet::new(), false);
         assert_eq!(report.patched, vec![], "{report:?}");
         assert!(
             report

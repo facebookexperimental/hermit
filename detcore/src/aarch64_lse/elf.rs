@@ -227,11 +227,32 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
     // is where the parsed ELF lives.
     let relocated: Vec<(u64, u64)>;
     let mut relr_unreadable = false;
+    // Addresses control is known to start at without executing what precedes
+    // them: the loader entry, defined function symbols and FDE entries.
+    let mut known_entries: std::collections::HashSet<u64>;
     let (sections, functions) = {
         let elf = Elf::parse(bytes)?;
         if elf.header.e_machine != header::EM_AARCH64 {
             return Ok(None);
         }
+        // STT_FUNC = 2, SHN_UNDEF = 0: a defined function symbol names an
+        // entry a caller can reach (for example through ADR/BLR) without
+        // executing the instruction before it.
+        const STT_FUNC: u8 = 2;
+        known_entries = std::iter::once(elf.header.e_entry)
+            .filter(|entry| *entry != 0)
+            .chain(
+                elf.syms
+                    .iter()
+                    .chain(elf.dynsyms.iter())
+                    .filter(|symbol| {
+                        symbol.st_info & 0xf == STT_FUNC
+                            && symbol.st_shndx != 0
+                            && symbol.st_value != 0
+                    })
+                    .map(|symbol| symbol.st_value),
+            )
+            .collect();
         let writable_executable: Vec<(u64, u64)> = elf
             .program_headers
             .iter()
@@ -346,6 +367,8 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
         let unwind = evidence.unwind.unwrap_or_default();
         (sections, unwind)
     };
+    // Every FDE start is likewise an entry control can begin at.
+    known_entries.extend(functions.iter().map(|(entry, _)| *entry));
     // A direct branch in one executable section can target a sequence in
     // another, so collect each section's targets before planning any. A
     // section's OWN branches are not external to it: the planner already
@@ -444,7 +467,7 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
         // each sequence the planner finds is named as left alone for that
         // reason, whatever else it would have said of it.
         if let Some(reason) = unproven {
-            let plan = rewrite::plan_section(&words, vaddr, &external_targets);
+            let plan = rewrite::plan_section(&words, vaddr, &external_targets, &known_entries);
             report.exclusive_instructions += plan.exclusive_instructions;
             let mut sites: Vec<u64> = plan
                 .patched
@@ -476,7 +499,7 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
             ));
             continue;
         }
-        let mut plan = rewrite::plan_section(&words, vaddr, &external_targets);
+        let mut plan = rewrite::plan_section(&words, vaddr, &external_targets, &known_entries);
         restrict_to_code(&mut plan, &words, vaddr, &code);
         refuse_literals(&mut plan, &literals);
         refuse_overlapping(&mut plan, &extents, Refusal::AddressedData);
@@ -624,15 +647,16 @@ fn refuse_literals(plan: &mut rewrite::Report, targets: &[(u64, u64)]) {
 }
 
 /// Refuse, for `reason`, each rewrite whose sequence overlaps one of
-/// `ranges` (sorted, disjoint).
+/// `ranges` (sorted by start; overlapping or nested ranges are handled, so
+/// a short range cannot shadow a longer one).
 fn refuse_overlapping(plan: &mut rewrite::Report, ranges: &[(u64, u64)], reason: Refusal) {
     let patched = std::mem::take(&mut plan.patched);
     for site in patched {
         let end = site.addr + 4 * site.words.len() as u64;
         let after = ranges.partition_point(|(start, _)| *start < end);
-        if after
-            .checked_sub(1)
-            .is_some_and(|i| site.addr < ranges[i].1)
+        if ranges[..after]
+            .iter()
+            .any(|(start, stop)| *start < end && site.addr < *stop)
         {
             plan.refused.push(rewrite::RefusedSite {
                 addr: site.addr,
@@ -1794,6 +1818,146 @@ mod tests {
         image[16..18].copy_from_slice(&1u16.to_le_bytes()); // ET_REL
         let (bytes, report) = rewritten(&image);
         assert_eq!(bytes, image);
+        assert_eq!(report.patched_total(), 0, "{report:?}");
+        assert_eq!(
+            report.refused,
+            BTreeMap::from([("no-mapping-symbols", 1)]),
+            "{report:?}"
+        );
+    }
+
+    /// The loader entry inside a compare sequence refuses it: starting at
+    /// the CMP executes a different instruction once the sequence's first
+    /// word materialises the expected value and its second is the CAS.
+    #[test]
+    fn a_loader_entry_inside_a_sequence_refuses_it() {
+        // ldaxr x0,[x2]; cmp x0,#1; b.ne out; stlxr w17,x1,[x2]; cbnz w17; ret
+        let words = [
+            0x885f_fc40,
+            0x7100_041f,
+            0x5400_0061,
+            0x8811_fc41,
+            0x35ff_ff91,
+            0xd65f_03c0,
+        ];
+        let mut image = elf_image(&words, Some(&[(1, 0, true)]));
+        // e_entry at the CMP (word 1).
+        image[24..32].copy_from_slice(&0x104u64.to_le_bytes());
+        let (bytes, report) = rewritten(&image);
+        assert_eq!(bytes, image, "{report:?}");
+        assert_eq!(report.patched_total(), 0, "{report:?}");
+        assert_eq!(
+            report.refused,
+            BTreeMap::from([("branch-into-sequence", 1)]),
+            "{report:?}"
+        );
+        // The same image entered at its first instruction is still a
+        // compare idiom, left alone as conditional-cas.
+        let mut entered_at_head = elf_image(&words, Some(&[(1, 0, true)]));
+        entered_at_head[24..32].copy_from_slice(&0x100u64.to_le_bytes());
+        let (bytes, report) = rewritten(&entered_at_head);
+        assert_eq!(bytes, entered_at_head, "{report:?}");
+        assert_eq!(report.patched_total(), 0, "{report:?}");
+        assert_eq!(
+            report.refused,
+            BTreeMap::from([("conditional-cas", 1)]),
+            "{report:?}"
+        );
+    }
+
+    /// A function entry at a sub-word compare's head bypasses the
+    /// zero-extension before it, whether the entry is named by an FDE or by
+    /// a defined STT_FUNC symbol, so the compare stays refused.
+    #[test]
+    fn a_function_entry_at_a_sub_word_compare_bypasses_its_zero_extension() {
+        // uxtb w16,w0; ldaxrb w0,[x2]; cmp w0,w16; b.ne out;
+        // stlxrb w17,w1,[x2]; cbnz w17; ret
+        let words = [
+            0x5300_1c10,
+            0x085f_fc40,
+            0x6b10_001f,
+            0x5400_0061,
+            0x0811_fc41,
+            0x35ff_ff91,
+            0xd65f_03c0,
+        ];
+        // Named by its FDE alone.
+        let image = elf_image_with(&words, Some(&[(1, 0, true)]), Some(&[(1, 7)]));
+        let (bytes, report) = rewritten(&image);
+        assert_eq!(bytes, image, "{report:?}");
+        assert_eq!(report.patched_total(), 0, "{report:?}");
+        assert_eq!(
+            report.refused,
+            BTreeMap::from([("register-constraint", 1)]),
+            "{report:?}"
+        );
+        // Named by a defined STT_FUNC symbol alone: turn the $x mark at the
+        // ldaxrb into a function symbol at the same address.
+        let mut image = elf_image(&words, Some(&[(1, 0, true), (1, 1, true)]));
+        let mark = mapping::tests::symbol(1, 0, 1, 0x104);
+        let at = image
+            .windows(mark.len())
+            .position(|window| window == mark)
+            .expect("the mark is in the symbol table");
+        image[at..at + mark.len()].copy_from_slice(&mapping::tests::symbol(0, 0x12, 1, 0x104));
+        let (bytes, report) = rewritten(&image);
+        assert_eq!(bytes, image, "{report:?}");
+        assert_eq!(report.patched_total(), 0, "{report:?}");
+        assert_eq!(
+            report.refused,
+            BTreeMap::from([("register-constraint", 1)]),
+            "{report:?}"
+        );
+        // With no entry at the head the extension runs, but a compare
+        // idiom is still left alone as conditional-cas.
+        let image = elf_image(&words, Some(&[(1, 0, true)]));
+        let (bytes, report) = rewritten(&image);
+        assert_eq!(bytes, image, "{report:?}");
+        assert_eq!(report.patched_total(), 0, "{report:?}");
+        assert_eq!(
+            report.refused,
+            BTreeMap::from([("conditional-cas", 1)]),
+            "{report:?}"
+        );
+    }
+
+    /// A short addressed-data exclusion nested inside a whole-function
+    /// exclusion must not shadow it: the candidate after the short range
+    /// is still inside the function the unresolved ADRP took for data.
+    #[test]
+    fn a_short_exclusion_nested_in_a_whole_function_one_does_not_shadow_it() {
+        // Directly: the disjoint-range lookup handles nested ranges.
+        let mut plan = rewrite::Report::default();
+        plan.patched.push(rewrite::Site {
+            addr: 0x140,
+            idiom: Idiom::Rmw,
+            words: vec![0; 4],
+        });
+        refuse_overlapping(
+            &mut plan,
+            &[(0x100, 0x154), (0x130, 0x138)],
+            Refusal::AddressedData,
+        );
+        assert_eq!(plan.patched, vec![]);
+        assert_eq!(plan.refused.len(), 1);
+
+        // End to end, where an unresolved ADRP and an ADR name data inside
+        // one function: without mapping symbols the loop after the short
+        // table keeps its bytes.
+        let mut words = [0xd503_201fu32; 21];
+        words[0] = 0x9000_0001; // adrp x1, <this page>, never completed
+        words[1] = 0x1000_0162; // adr x2, <word 12>
+        words[2] = 0xb940_0443; // ldr w3, [x2, #4]
+        words[3] = 0x1400_0005; // b <word 8>
+        words[9] = 0x1400_0005; // b <word 14>
+        words[16] = 0x885f_fc08; // ldaxr w8, [x0]
+        words[17] = 0x1100_0508; // add w8, w8, #1
+        words[18] = 0x8809_fc08; // stlxr w9, w8, [x0]
+        words[19] = 0x35ff_ffa9; // cbnz w9, <ldaxr>
+        words[20] = 0xd65f_03c0; // ret
+        let image = elf_image_with(&words, None, Some(&[(0, 21)]));
+        let (bytes, report) = rewritten(&image);
+        assert_eq!(bytes, image, "{report:?}");
         assert_eq!(report.patched_total(), 0, "{report:?}");
         assert_eq!(
             report.refused,

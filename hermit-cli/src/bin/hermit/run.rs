@@ -1254,6 +1254,31 @@ fn exclusive_rewrite_applied_lines(overlays: &[ExecutableOverlayMount]) -> Vec<S
         .collect()
 }
 
+/// The bytes digest and mode of the artifact at `source`, or `None` when it
+/// cannot be read. Recorded when a trial preparation makes the artifact.
+fn overlay_fingerprint(source: &Path) -> Option<(String, u32)> {
+    let bytes = fs::read(source).ok()?;
+    let mode = fs::metadata(source).ok()?.permissions().mode() & 0o7777;
+    Some((detcore::Digest::new(&bytes).to_string(), mode))
+}
+
+/// Whether every remembered overlay artifact still holds the bytes and mode
+/// its preparation recorded. A missing, replaced or re-moded artifact is
+/// stale and must be prepared again rather than mounted.
+fn prepared_overlays_current(
+    overlays: &[ExecutableOverlayMount],
+    fingerprints: &[(PathBuf, String, u32)],
+) -> bool {
+    overlays.len() == fingerprints.len()
+        && overlays.iter().all(|overlay| {
+            fingerprints.iter().any(|(path, digest, mode)| {
+                *path == overlay.source
+                    && overlay_fingerprint(&overlay.source)
+                        .is_some_and(|(now, now_mode)| now == *digest && now_mode == *mode)
+            })
+        })
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum GuestPathMapping {
     Mapped(PathBuf),
@@ -2492,13 +2517,15 @@ pub(super) fn apply_base_environment(
 }
 
 /// One prepared analysis's key, its overlays, the guest paths of every
-/// file its overlay rewrite was given, and the files it left unchanged
-/// for want of mapping symbols.
+/// file its overlay rewrite was given, the files it left unchanged for
+/// want of mapping symbols, and a fingerprint (path, bytes digest, mode)
+/// of every overlay artifact it made.
 type PreparedTrialPreprocessing = (
     String,
     Vec<ExecutableOverlayMount>,
     Vec<PathBuf>,
     Vec<PathBuf>,
+    Vec<(PathBuf, String, u32)>,
 );
 /// The overlays prepared for analyze trials in this process, by
 /// [`RunOpts::trial_preprocessing_key`].
@@ -3715,7 +3742,12 @@ fn analyze_trials_are_refused_before_the_rewrite_cache_is_consulted() {
         PREPARED_TRIAL_PREPROCESSING
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push((trial.trial_preprocessing_key(), Vec::new(), Vec::new()));
+            .push((
+                trial.trial_preprocessing_key(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ));
         let error = trial
             .prepare_trial_preprocessing()
             .expect_err("a cached key must not admit a refused trial");
@@ -3922,6 +3954,42 @@ fn trial_preparations_are_keyed_by_every_input_they_read() {
         None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
     }
     assert_ne!(elsewhere, key(&[]), "another cache directory");
+}
+
+/// A memoized trial artifact is reused only while it still holds the bytes
+/// and mode its preparation recorded: deletion or replacement between
+/// preparations (with the original inputs unchanged) makes it stale, so
+/// the next preparation prepares again instead of mounting the path.
+#[test]
+fn a_stale_prepared_overlay_is_not_reused() {
+    let directory = tempfile::tempdir().unwrap();
+    let artifact = directory.path().join("guest");
+    std::fs::write(&artifact, b"the rewritten guest").unwrap();
+    let overlays = vec![ExecutableOverlayMount {
+        source: artifact.clone(),
+        target: PathBuf::from("/guest"),
+        rewritten: None,
+    }];
+    let fingerprints = vec![{
+        let (digest, mode) = overlay_fingerprint(&artifact).unwrap();
+        (artifact.clone(), digest, mode)
+    }];
+    assert!(prepared_overlays_current(&overlays, &fingerprints));
+
+    // Replaced bytes at the same path are not the preparation's artifact.
+    std::fs::write(&artifact, b"someone else's bytes").unwrap();
+    assert!(!prepared_overlays_current(&overlays, &fingerprints));
+
+    // Nor is a missing artifact.
+    std::fs::remove_file(&artifact).unwrap();
+    assert!(!prepared_overlays_current(&overlays, &fingerprints));
+
+    // The same bytes under another mode are not it either.
+    std::fs::write(&artifact, b"the rewritten guest").unwrap();
+    let mut mode = std::fs::metadata(&artifact).unwrap().permissions();
+    mode.set_mode(mode.mode() ^ 0o111);
+    std::fs::set_permissions(&artifact, mode).unwrap();
+    assert!(!prepared_overlays_current(&overlays, &fingerprints));
 }
 
 #[test]
@@ -14257,23 +14325,40 @@ impl RunOpts {
         let mut prepared = PREPARED_TRIAL_PREPROCESSING
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((_, overlays, covered, unmarked)) =
-            prepared.iter().find(|(seen, ..)| *seen == key)
-        {
-            self.exclusive_rewrite_overlays = overlays.clone();
-            self.exclusive_rewrite_covered = covered.clone();
-            self.exclusive_rewrite_unmarked = unmarked.clone();
-            return Ok(());
+        if let Some(position) = prepared.iter().position(|(seen, ..)| *seen == key) {
+            let (_, overlays, covered, unmarked, fingerprints) = &prepared[position];
+            // A remembered path is reused only while the artifact at that
+            // path still holds exactly the bytes and mode the preparation
+            // made. The cache directory stays writable by the invoking
+            // user between trials, so a deleted or replaced artifact must
+            // never be mounted: drop the stale entry and prepare again,
+            // which rewrites and repairs the cache entry.
+            if prepared_overlays_current(overlays, fingerprints) {
+                self.exclusive_rewrite_overlays = overlays.clone();
+                self.exclusive_rewrite_covered = covered.clone();
+                self.exclusive_rewrite_unmarked = unmarked.clone();
+                return Ok(());
+            }
+            prepared.remove(position);
         }
         self.exclusive_rewrite_overlays.clear();
         self.exclusive_rewrite_covered.clear();
         self.exclusive_rewrite_unmarked.clear();
         self.prepare_exclusive_rewrite(self.selected_backend())?;
+        let fingerprints = self
+            .exclusive_rewrite_overlays
+            .iter()
+            .filter_map(|overlay| {
+                overlay_fingerprint(&overlay.source)
+                    .map(|(digest, mode)| (overlay.source.clone(), digest, mode))
+            })
+            .collect();
         prepared.push((
             key,
             self.exclusive_rewrite_overlays.clone(),
             self.exclusive_rewrite_covered.clone(),
             self.exclusive_rewrite_unmarked.clone(),
+            fingerprints,
         ));
         Ok(())
     }
