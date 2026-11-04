@@ -2713,6 +2713,12 @@ pub struct Scheduler {
     /// thread was parked, for [`Self::order_continuation_fairly`].
     continuation_clocks: BTreeMap<DetTid, Option<fair_continuation::Clock>>,
 
+    /// For a schedule replay of a record whose slices ran without the
+    /// `--max-timeslice` bound (`PreemptionRecord::uncapped_slices`): a slice
+    /// length no recorded slice exceeds (`uncapped_replay_backstop_for`), which
+    /// replaces the bound while the record lasts (`uncapped_backstop`).
+    uncapped_replay_backstop: Option<LogicalTime>,
+
     /// Count record_event calls which determines the event number if we're recording a schedule
     /// event trace.
     pub recorded_event_count: u64,
@@ -5671,6 +5677,7 @@ impl Scheduler {
         // format's rules, and so says so in its own record.
         let mut replayed_format = None;
         let mut charge_replayed_switch_ins = false;
+        let mut uncapped_replay_backstop = None;
         let (replayer, m_vec) = match &cfg.replay_schedule_from {
             Some(path) => {
                 trace!("Scheduler loading trace from path {}", path.display());
@@ -5847,6 +5854,9 @@ impl Scheduler {
                 .with_post_crash_timeslice(
                     cfg.post_crash_timeslice_in_effect()
                         .map(std::num::NonZeroU64::get),
+                )
+                .with_uncapped_slices(
+                    cfg.replay_preemptions_from.is_some() || uncapped_replay_backstop.is_some(),
                 );
             // This run's own record lists every switch it takes, possibly
             // none, so its replay can refuse an unrecorded one.
@@ -5963,6 +5973,7 @@ impl Scheduler {
             fair_continuation: cfg.replay_continue_fairly.then(Default::default),
             continuation_clocks: BTreeMap::new(),
             queued_sleeps_registered_at_first_pass,
+            uncapped_replay_backstop,
             recorded_event_count: 0,
             stacktrace_events,
             stacktrace_events_counted: cfg.record_preemptions || cfg.replay_schedule_from.is_some(),
