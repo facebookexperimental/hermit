@@ -8018,9 +8018,10 @@ pub enum SignalScope {
 /// https://github.com/rrnewton/hermit/pull/4728's `SchedEvent::stopless`
 /// and `ReplayedSliceEnd` are revision 30, reserved for this change by the
 /// D2 seal; the combined layout on top of 31 appends revision 32.
-/// 33 appends the `CpuClockProcess` pair (drain of PR 4885) after 32, which
-/// is the current revision.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 33;
+/// 40 appends the `CpuClockProcess` pair (drain of PR 4885, allocated
+/// revision 40) after 32, skipping reserved 33 to 39, and is the current
+/// revision.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 40;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a

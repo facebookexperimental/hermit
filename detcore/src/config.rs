@@ -87,13 +87,16 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips. Nothing is reserved at this
-    /// head: 28 is https://github.com/rrnewton/hermit/pull/4789's, 29 is
-    /// https://github.com/rrnewton/hermit/pull/4884's, 30 is this change's
-    /// (https://github.com/rrnewton/hermit/pull/4728), 31 is
-    /// https://github.com/rrnewton/hermit/pull/4867's, and 32, this
-    /// change's layout on top of 31's, is the current revision.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[];
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: 33 to 39 are reserved for
+    /// pending changes in the coordinator's allocation table (39 for kvm
+    /// 2b-1). At this head 28 is https://github.com/rrnewton/hermit/pull/4789's,
+    /// 29 is https://github.com/rrnewton/hermit/pull/4884's, 30 is
+    /// https://github.com/rrnewton/hermit/pull/4728's, 31 is
+    /// https://github.com/rrnewton/hermit/pull/4867's, 32 is the stopless
+    /// layout on top of 31's, and 40, the `CpuClockProcess` pair allocated
+    /// to https://github.com/rrnewton/hermit/pull/4885, is the current
+    /// revision.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -263,9 +266,10 @@ mod tests {
         (32, "e178ac33707f23b5", "f013e36743d8d9e6"),
         // Adds `GlobalRequest::CpuClockProcess` and `GlobalResponse::CpuClockProcess`
         // (https://github.com/rrnewton/hermit/pull/4885; revision 20 at its base,
-        // renumbered to 33 at the drain rebase after main's landed 32 (the
-        // stopless layout on top of 31); digests measured at this head).
-        (33, "1096e1e45f53b6bf", "f013e36743d8d9e6"),
+        // allocated revision 40 at the drain rebase after main's landed 32
+        // (the stopless layout on top of 31), skipping reserved 33 to 39;
+        // digests measured at this head).
+        (40, "3919013da0508f27", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
