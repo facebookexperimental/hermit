@@ -10665,10 +10665,11 @@ impl RunOpts {
         }
         let (program, _, rootfs) = self.guest_program_on_host()?;
         let to_host = |path: &Path| match &rootfs {
-            Some(rootfs) => crate::app::image::resolve_in_rootfs(rootfs, path),
+            Some(rootfs) => Some(crate::app::image::resolve_in_rootfs(rootfs, path)),
             None => match self.mapped_host_program(path) {
-                GuestPathMapping::Mapped(host) => host,
-                GuestPathMapping::Unchanged | GuestPathMapping::Hidden => path.to_path_buf(),
+                GuestPathMapping::Mapped(host) => Some(host),
+                GuestPathMapping::Unchanged => Some(path.to_path_buf()),
+                GuestPathMapping::Hidden => None,
             },
         };
         // Where auto cannot resolve (an unreadable program, a level no

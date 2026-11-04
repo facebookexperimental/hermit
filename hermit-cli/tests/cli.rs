@@ -56285,6 +56285,65 @@ fn auto_records_v3_for_an_image_declaring_it_and_replay_uses_it() {
     assert_auto_recording_replays_as("auto-record-v3", Some(0b111));
 }
 
+/// A `--verify-replay-of` half replays the first half's recording under
+/// the profile that recording holds; this invocation's requested profile
+/// (flag or HERMIT_CPU_PROFILE) names no run it will execute, so it is
+/// neither classified nor qualified: a v2 recording replays even where
+/// the requested x86-64-v3 could not qualify on the host, and an unused
+/// host-no-rdrand request is not refused as a recording either
+/// (revcodex on PR 4709; the recorded-v3 qualification in replay is
+/// unchanged).
+#[test]
+fn replay_only_ignores_an_unused_requested_cpu_profile() {
+    let image = isa_fixture("replay-only-unmarked", None, 0, IsaLink::Static);
+    let image = image.to_str().unwrap();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let first = directory.path().join("first");
+    let (status, stdout, stderr) = isa_run(&[
+        "record",
+        "start",
+        "--verify-run",
+        first.to_str().unwrap(),
+        "--cpu-profile",
+        "auto",
+        "--",
+        image,
+    ]);
+    assert_eq!(status, Some(0), "{stderr}\n{stdout}");
+    for (label, requested) in [
+        ("flag-v3", None),
+        ("env-v3", Some("x86-64-v3")),
+        ("env-host", Some("host-no-rdrand")),
+    ] {
+        let second = directory.path().join(label);
+        let mut command = hermit_command(&[
+            "record",
+            "start",
+            "--verify-run",
+            second.to_str().unwrap(),
+            "--verify-replay-of",
+            first.to_str().unwrap(),
+            "--",
+            image,
+        ]);
+        match requested {
+            Some(profile) => command.env("HERMIT_CPU_PROFILE", profile),
+            None => command
+                .env_remove("HERMIT_CPU_PROFILE")
+                .args(["--cpu-profile", "x86-64-v3"]),
+        };
+        let output =
+            hermit_test::hermit_output("hermit record start --verify-replay-of", &mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{label}: {stderr}");
+        assert!(
+            !stderr.contains("--cpu-profile x86-64-v3 refused")
+                && !stderr.contains("--cpu-profile auto"),
+            "{label}: {stderr}"
+        );
+    }
+}
+
 /// Launches `image` through the library under `profile` (`None`: the
 /// ordinary default configuration's), by `run` or, with `output`,
 /// `run_with_output`, on a thread with room for a real run: the exit code,

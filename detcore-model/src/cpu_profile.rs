@@ -156,7 +156,8 @@ macro_rules! v3_residual {
          samples a fixed set of cases and forces only CPUID exits, so a CPU or hypervisor \
          that behaves differently only on other instruction paths, or on VM exits the guest \
          cannot see, is not excluded. Firmware (SMM) entries cannot be checked at all. \
-         Default runs use x86-64-v2, which this does not affect."
+         x86-64-v2 runs, including an auto run that resolves to x86-64-v2 where nothing \
+         declares more, are not affected."
     };
 }
 
@@ -191,7 +192,8 @@ pub const CPU_PROFILE_LONG_HELP: &str = concat!(
      x86-64-v2 where nothing is declared, and refuses a program it cannot read rather than \
      guess; the chosen profile is what runs, is qualified like an explicit one, is logged at \
      debug level, and is what a recording holds. A later exec of an image needing more is \
-     refused, never upgraded. auto reads no shared library: where only a library such as \
+     refused where each exec is checked (the ptrace backend), never upgraded; KVM checks \
+     only the first image, so a later KVM exec gets no such refusal. auto reads no shared library: where only a library such as \
      libc declares its need (as on distributions whose loader is unmarked), name the profile. \
      A named profile always means exactly itself. host-no-rdrand is available for `hermit run` on the ptrace backend with CPUID \
      faulting and virtual time; it refuses hosts without CPUID faulting instead of \

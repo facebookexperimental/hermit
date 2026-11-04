@@ -430,10 +430,13 @@ const MAX_SCRIPT_HOPS: usize = 4;
 /// at host path `program`, with why ([`detcore::exec_record::auto_profile`]):
 /// from the declarations of the image it execs first and of that image's
 /// program interpreter, where `to_host` gives the host path of a path as
-/// the guest names it. `program` is the program in the launch's completed
-/// view (its mounts, binds and image rootfs already applied by the
-/// caller), and every script hop is mapped through `to_host` the same
-/// way. A script's interpreter is followed as the kernel follows it
+/// the guest names it, or `None` where a mount with no source hides it in
+/// the launch view: a hidden interpreter refuses, rather than reading the
+/// host file its mount target shadows. `program` is the program in the
+/// launch's completed view (its mounts, binds and image rootfs already
+/// applied by the caller), and every script hop is mapped through
+/// `to_host` the same way. A script's interpreter is followed as the
+/// kernel follows it
 /// (Detcore's `script_interpreter`, the `load_script` rules: the line
 /// and the path end where the kernel ends them, at a newline and at a
 /// space, tab or NUL), through a bounded chain of scripts to the image
@@ -445,7 +448,7 @@ const MAX_SCRIPT_HOPS: usize = 4;
 /// objects need more, so a pathname read here can never admit one.
 pub fn resolve_auto(
     program: &Path,
-    to_host: impl Fn(&Path) -> PathBuf,
+    to_host: impl Fn(&Path) -> Option<PathBuf>,
 ) -> Result<(CpuProfile, String), String> {
     use detcore::exec_record::IsaNeeds;
     use detcore::exec_record::Script;
@@ -454,7 +457,8 @@ pub fn resolve_auto(
         match detcore::exec_record::script_interpreter(&image) {
             Script::Not => break,
             Script::Interpreter(interpreter) => {
-                image = to_host(&interpreter);
+                image = to_host(&interpreter)
+                    .ok_or_else(|| format!("{} is hidden by a mount", interpreter.display()))?;
             }
             Script::Declined => {
                 return Err(format!(
@@ -484,10 +488,18 @@ pub fn resolve_auto(
     }
     match detcore::exec_record::program_interpreter(&image) {
         Ok(None) => {}
-        Ok(Some(interpreter)) => objects.push((
-            format!("its program interpreter {}", interpreter.display()),
-            IsaNeeds::read_path_strict(&to_host(&interpreter)),
-        )),
+        Ok(Some(interpreter)) => {
+            let Some(host) = to_host(&interpreter) else {
+                return Err(format!(
+                    "its program interpreter {} is hidden by a mount",
+                    interpreter.display()
+                ));
+            };
+            objects.push((
+                format!("its program interpreter {}", interpreter.display()),
+                IsaNeeds::read_path_strict(&host),
+            ));
+        }
         Err(why) => return Err(format!("{} cannot be read: {why}", image.display())),
     }
     detcore::exec_record::auto_profile(&objects)
@@ -517,7 +529,14 @@ pub fn resolve_launch_auto(
         config.cpu_profile = CpuProfile::X86_64V2;
         return Ok(());
     };
-    let (profile, why) = resolve_auto(&program, Path::to_path_buf).map_err(refuse)?;
+    // The pinned Reverie `Command` exposes no mounts or chroot to read
+    // back, so this library boundary cannot yet map the completed launch
+    // view: paths resolve as host paths. Detcore's per-exec ISA check of
+    // the objects actually executed still refuses one that needs more
+    // than the profile chosen here; resolving the mounted/chrooted view
+    // here waits on Reverie accessors for a command's mounts and chroot
+    // (revcodex on PR 4709).
+    let (profile, why) = resolve_auto(&program, |path| Some(path.to_path_buf())).map_err(refuse)?;
     tracing::debug!("--cpu-profile auto resolved to {profile}: {why}");
     config.cpu_profile = profile;
     Ok(())
@@ -1763,8 +1782,8 @@ mod tests {
         // A -> B -> the test binary (an ELF image): both hops followed.
         let b = script("b", &exe);
         let a = script("a", &b);
-        let (profile, _) =
-            super::resolve_auto(&a, std::path::Path::to_path_buf).expect("a valid chain resolves");
+        let (profile, _) = super::resolve_auto(&a, |path| Some(path.to_path_buf()))
+            .expect("a valid chain resolves");
         assert_eq!(profile, super::CpuProfile::X86_64V2);
         // Every hop mapped through the caller's view: the same chain with
         // its interpreter names mapped onto the files above (the image
@@ -1774,9 +1793,9 @@ mod tests {
             // The view maps the chain's own names; system paths (the
             // image's program interpreter) stay as they are.
             if guest.starts_with("/tmp") || guest.parent() == exe.parent() {
-                directory.path().join(guest.file_name().unwrap())
+                Some(directory.path().join(guest.file_name().unwrap()))
             } else {
-                guest.to_path_buf()
+                Some(guest.to_path_buf())
             }
         })
         .expect("a mapped chain resolves");
@@ -1784,12 +1803,16 @@ mod tests {
         // A self-referring script is a chain past the bound, refused.
         let loop_path = directory.path().join("loop");
         std::fs::write(&loop_path, format!("#!{}\n", loop_path.display())).unwrap();
-        let why = super::resolve_auto(&loop_path, std::path::Path::to_path_buf).unwrap_err();
+        let why = super::resolve_auto(&loop_path, |path| Some(path.to_path_buf())).unwrap_err();
         assert!(why.contains("script chain longer"), "{why}");
         // A `#!` line naming no interpreter (NUL first) is declined.
         let declined = directory.path().join("declined");
         std::fs::write(&declined, b"#!\0/bin/sh\n").unwrap();
-        let why = super::resolve_auto(&declined, std::path::Path::to_path_buf).unwrap_err();
+        let why = super::resolve_auto(&declined, |path| Some(path.to_path_buf())).unwrap_err();
         assert!(why.contains("names no interpreter"), "{why}");
+        // An interpreter hidden by a mount with no source refuses, rather
+        // than classifying the host file its target shadows.
+        let why = super::resolve_auto(&a, |_| None).unwrap_err();
+        assert!(why.contains("is hidden by a mount"), "{why}");
     }
 }

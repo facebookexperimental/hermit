@@ -777,8 +777,9 @@ const PAGE_SIZE: u64 = 4096;
 
 /// The program interpreter (`PT_INTERP`) the x86-64 ELF64 image at `path`
 /// names: `Ok(None)` for an image naming none, an error for a file that is
-/// not one or whose `PT_INTERP` is unreadable. Read as the kernel reads it:
-/// at most a page, up to its terminating NUL.
+/// not one or whose `PT_INTERP` is unreadable. Read as the kernel reads it
+/// (`load_elf_binary`): at most a page, at least two bytes, the last of
+/// them NUL, and the name is the string up to its first NUL.
 pub fn program_interpreter(path: &Path) -> Result<Option<PathBuf>, &'static str> {
     use std::os::unix::ffi::OsStrExt;
     let file = crate::util::RawFd::open(path, libc::O_RDONLY).map_err(|_| "unreadable")?;
@@ -807,15 +808,18 @@ pub fn program_interpreter(path: &Path) -> Result<Option<PathBuf>, &'static str>
         }
         let field = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().unwrap());
         let size = field(32);
-        if size == 0 || size > PAGE_SIZE {
-            return Err("a PT_INTERP that is empty or larger than a page");
+        if size < 2 || size > PAGE_SIZE {
+            return Err("a PT_INTERP shorter than two bytes or larger than a page");
         }
         let mut name = vec![0_u8; size as usize];
         read_exact(field(8), &mut name).ok_or("a PT_INTERP past the end of the file")?;
+        if name.last() != Some(&0) {
+            return Err("a PT_INTERP without a terminating NUL");
+        }
         let end = name
             .iter()
             .position(|&byte| byte == 0)
-            .unwrap_or(name.len());
+            .expect("the last byte is NUL");
         return Ok(Some(PathBuf::from(std::ffi::OsStr::from_bytes(
             &name[..end],
         ))));
@@ -1413,6 +1417,22 @@ mod tests {
         );
         fs::write(&image, image_with(EM_X86_64, &[])).unwrap();
         assert_eq!(program_interpreter(&image), Ok(None));
+        // As the kernel refuses them: a one-byte name (a lone NUL names
+        // nothing) and a name the segment does not NUL-terminate.
+        fs::write(&image, image_with(EM_X86_64, &[(3, vec![0])])).unwrap();
+        assert_eq!(
+            program_interpreter(&image),
+            Err("a PT_INTERP shorter than two bytes or larger than a page")
+        );
+        fs::write(
+            &image,
+            image_with(EM_X86_64, &[(3, b"/lib64/ld-linux".to_vec())]),
+        )
+        .unwrap();
+        assert_eq!(
+            program_interpreter(&image),
+            Err("a PT_INTERP without a terminating NUL")
+        );
     }
 
     #[test]

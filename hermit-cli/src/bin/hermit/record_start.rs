@@ -409,7 +409,16 @@ impl StartOpts {
     fn mapped_launch_path(&self, guest: &Path) -> Option<PathBuf> {
         for mount in self.mount.iter().rev() {
             if let Ok(suffix) = guest.strip_prefix(mount.get_target()) {
-                return mount.get_source().map(|source| source.join(suffix));
+                return mount.get_source().map(|source| {
+                    // An exact file bind has an empty suffix; joining it
+                    // would append a separator and name `SOURCE/`, which
+                    // no regular file can be read at.
+                    if suffix.as_os_str().is_empty() {
+                        source.to_path_buf()
+                    } else {
+                        source.join(suffix)
+                    }
+                });
             }
         }
         Some(guest.to_path_buf())
@@ -674,9 +683,8 @@ impl StartOpts {
                 .ok_or_else(|| refuse(format!("{} is hidden by a mount", found.display())))?;
             let (profile, why) = hermit::cpu_profile_admission::resolve_auto(&program, |guest| {
                 self.mapped_launch_path(guest)
-                    .unwrap_or_else(|| guest.to_path_buf())
             })
-            .map_err(|why| refuse(why))?;
+            .map_err(refuse)?;
             let mut resolved = self.clone();
             resolved.cpu_profile = profile;
             resolved.auto_resolution =
@@ -690,7 +698,12 @@ impl StartOpts {
                 },
             )?;
         }
-        if self.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3 {
+        // A replay-only run likewise never qualifies this invocation's
+        // requested v3: the recording's own profile is selected and, if v3,
+        // qualified from its metadata in `Replay::spawn`. An unused ambient
+        // request must not refuse a replayable v2 recording on a host that
+        // cannot qualify for v3 (revcodex on PR 4709).
+        if !replay_only && self.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3 {
             super::verify::CPU_PROFILE_V3_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
             // Qualify here, before any container: a refusal ends the command at
             // once, and the recorder and replayer reuse the result.
@@ -2026,6 +2039,40 @@ mod tests {
             calls.get(),
             0,
             "the refused /proc target reached preprocessing"
+        );
+    }
+
+    /// The completed-view mapping a recorded launch's images are read
+    /// through: an exact regular-file bind maps to its source unchanged
+    /// (joining the empty suffix would name `SOURCE/`, unreadable as a
+    /// file - the exact02b witness in revcodex's PR 4709 review), a path
+    /// under a directory bind joins its suffix, a sourceless mount hides
+    /// its target, and anything else is itself. Interpreter paths go
+    /// through the same mapping, so file binds of either are covered.
+    #[test]
+    fn mapped_launch_path_preserves_an_exact_file_bind() {
+        let mut options = start_options(Vec::new());
+        options.mount = vec![
+            Mount::bind("/host/prog-source", "/guest/prog"),
+            Mount::bind("/host/libdir", "/guest/lib"),
+            Mount::new("/guest/hidden"),
+        ];
+        assert_eq!(
+            options.mapped_launch_path(Path::new("/guest/prog")),
+            Some(PathBuf::from("/host/prog-source"))
+        );
+        assert_eq!(
+            options.mapped_launch_path(Path::new("/guest/lib/ld.so")),
+            Some(PathBuf::from("/host/libdir/ld.so"))
+        );
+        assert_eq!(options.mapped_launch_path(Path::new("/guest/hidden")), None);
+        assert_eq!(
+            options.mapped_launch_path(Path::new("/guest/hidden/ld.so")),
+            None
+        );
+        assert_eq!(
+            options.mapped_launch_path(Path::new("/bin/true")),
+            Some(PathBuf::from("/bin/true"))
         );
     }
 }
