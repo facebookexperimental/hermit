@@ -2634,7 +2634,14 @@ mod tests {
                 factor: RcbTimeMultiplier::from_f64(1.5),
             },
         );
-        writer.insert_reprioritization(tid, LogicalTime::from_nanos(100), 10, DEFAULT_PRIORITY, 20);
+        writer.insert_reprioritization(
+            tid,
+            LogicalTime::from_nanos(100),
+            10,
+            DEFAULT_PRIORITY,
+            20,
+            None,
+        );
         writer.insert_schedevent(SchedEvent::branches(tid, 10));
         writer.insert_callback_checkpoint(
             tid,
@@ -2727,6 +2734,7 @@ mod tests {
                 rcbs,
                 DEFAULT_PRIORITY,
                 20,
+                None,
             );
             writer.record_store_exclusive_failures(store_exclusive_failures);
             writer.summary().unwrap()
@@ -2747,6 +2755,7 @@ mod tests {
                 10,
                 DEFAULT_PRIORITY,
                 20,
+                None,
             );
             writer.record_store_exclusive_failures(store_exclusive_failures);
             writer.summary().unwrap()

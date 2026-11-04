@@ -2848,6 +2848,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             KeptTimer::InsideOffset { target } => {
                 report_rcb_overshoot(
                     self.cfg.panic_on_rcb_overshoot,
+                    guest.tid(),
+                    target,
                     now,
                     now - thread_state_committed,
                     target - thread_state_committed,
