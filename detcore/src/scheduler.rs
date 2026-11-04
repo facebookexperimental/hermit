@@ -11890,13 +11890,26 @@ impl Scheduler {
             .thread_signal_mask_for(dtid, libc::SIGCHLD)
             .is_some_and(|mask| mask & bit != 0);
         let by_call = self.may_take_sigchld_by_call(dtid);
-        let ran_on = guest_progress
-            && self
-                .blocked
-                .sigchld_fenced
-                .get_mut(&process)
-                .is_some_and(|fence| !fence.ran.insert(dtid));
-        if by_call || (!blocks && ran_on) {
+        if by_call {
+            self.blocked.sigchld_fenced.remove(&process);
+            return;
+        }
+        // A turn under a mask blocking SIGCHLD is no delivery opportunity
+        // and must not prime the counter either: a wait4 grant runs with
+        // signals privately blocked and its callback's posthook grant
+        // follows with the mask restored, still within the same callback
+        // and before the pending copy's delivery - counting the blocked
+        // grant would expire the mark on the posthook, before any turn on
+        // which the copy could be delivered (revastra2 F8).
+        if blocks || !guest_progress {
+            return;
+        }
+        let ran_on = self
+            .blocked
+            .sigchld_fenced
+            .get_mut(&process)
+            .is_some_and(|fence| !fence.ran.insert(dtid));
+        if ran_on {
             self.blocked.sigchld_fenced.remove(&process);
         }
     }
@@ -41172,6 +41185,46 @@ mod test {
         }
         grant(&mut scheduler, Resources::new(taker));
         grant(&mut scheduler, Resources::new(taker));
+        assert!(!scheduler.blocked.sigchld_fenced.contains_key(&process));
+    }
+
+    /// A turn committed under a mask blocking `SIGCHLD` is no delivery
+    /// opportunity and does not prime the expiry counter: a wait4 grant
+    /// runs with signals privately blocked, and its callback's posthook
+    /// grant follows with the mask restored, still before the pending
+    /// copy's delivery. Counting the blocked grant would expire the mark
+    /// on the posthook and leave the delivery waiting for quiescence
+    /// (revastra2 F8 on PR 4627).
+    #[test]
+    fn a_fenced_sigchld_is_not_primed_by_a_turn_blocking_it() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let taker = DetTid::from_raw(100);
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.thread_tree.add_child(taker, taker, true);
+        register_known_thread(&mut scheduler, taker);
+        scheduler.blocked.continuation_masks.insert(taker, Some(0));
+        let process = scheduler.sigchld_process(taker);
+        scheduler.fence_child_exit_sigchld(
+            process,
+            Some(ChildExitNotification::Discard),
+            fence_marker(),
+        );
+        assert!(scheduler.blocked.sigchld_fenced.contains_key(&process));
+        // The wait4 grant: privately blocked.
+        scheduler
+            .blocked
+            .continuation_masks
+            .insert(taker, Some(chld));
+        commit_for_fence(&mut scheduler, taker);
+        // The posthook grant: mask restored. This is the first turn on
+        // which the copy could be delivered, so the mark stands.
+        scheduler.blocked.continuation_masks.insert(taker, Some(0));
+        commit_for_fence(&mut scheduler, taker);
+        assert!(
+            scheduler.blocked.sigchld_fenced.contains_key(&process),
+            "the blocked grant primed expiry on the posthook"
+        );
+        commit_for_fence(&mut scheduler, taker);
         assert!(!scheduler.blocked.sigchld_fenced.contains_key(&process));
     }
 
