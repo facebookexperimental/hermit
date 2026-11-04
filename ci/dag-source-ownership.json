@@ -1249,6 +1249,19 @@
         "setup.pinned_root_fetch"
       ]
     },
+    "privileged-test.binder_cli_cases": {
+      "owner": "core",
+      "labels": [
+        "privileged"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-only-build.privileged_tests_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
     "privileged-test.cli_kvm": {
       "owner": "core",
       "labels": [

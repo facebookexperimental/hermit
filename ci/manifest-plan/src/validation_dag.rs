@@ -624,6 +624,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "privileged-test.pmu_buck_chaos_cases",
     "privileged-test.pmu_ptrace_completion_cases",
     "privileged-test.pmu_cli_cases",
+    "privileged-test.binder_cli_cases",
     "privileged-test.pmu_detcore_time_cases",
     "privileged-cpuid.cpu_profile_v3",
     "test.pmu_integration_cases",
@@ -787,9 +788,11 @@ const PROFILES: [Profile; 11] = [
         selected_steps: 53,
     },
     Profile {
+        // 12/20 since privileged-test.binder_cli_cases joined the
+        // privileged lane (PR 4742): 11/19 before.
         label: "privileged",
-        direct_steps: 11,
-        selected_steps: 19,
+        direct_steps: 12,
+        selected_steps: 20,
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
@@ -3193,9 +3196,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // outside the per-commit smoke pair (2026-10-26).
     // 147 with privileged-test.deadline_slice_cap_kvm, the KVM gap-ledger
     // producer (2026-10-30).
-    if expected.len() != 147 {
+    // 148 with privileged-test.binder_cli_cases, the Binderfs-capable
+    // privileged node for PR 4742's two host-limited Binder CLI cases.
+    if expected.len() != 148 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 147",
+            "structured result producer registry has {} entries, expected 148",
             expected.len()
         ));
     }
@@ -3230,9 +3235,10 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // sabrecompat.sabre_examples, the archived SaBRe suite outside the smoke
     // pair, adds one.
     // privileged-test.deadline_slice_cap_kvm's required KVM tests add one.
-    if expected_counts.len() != 53 {
+    // privileged-test.binder_cli_cases' two Binder cases add one (PR 4742).
+    if expected_counts.len() != 54 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 53",
+            "Nextest expected-count registry has {} entries, expected 54",
             expected_counts.len()
         ));
     }

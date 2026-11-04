@@ -137,6 +137,7 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "privileged-only-test.cli_kvm_on_host",
     "privileged-only-test.pmu_buck_chaos_cases",
     "privileged-only-test.pmu_buck_chaos_cases_on_host",
+    "privileged-test.binder_cli_cases",
     "privileged-test.cli_kvm",
     "privileged-test.pmu_buck_chaos_cases",
     "privileged-test.pmu_cli_cases",
@@ -4773,6 +4774,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_new_thread_past_a_replayed_schedule_gets_its_first_turn_within_a_second,
     // which replays --chaos runs under --strict (PR #4926), joins them: 24 + 1 = 25.
     ("privileged-test.pmu_cli_cases", 25),
+    // The two Binder CLI cases that leave test.cli/test.cli_on_host as
+    // #[ignore]d host-limited cases (PR 4742): they run only here, with
+    // an exact-name filterset and `-- --ignored`, on a host that can
+    // mount a binder filesystem in a user namespace: 2, listed.
+    ("privileged-test.binder_cli_cases", 2),
     // The six x86-64-v3 CLI cases that run a guest, with
     // HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 so that a refusal fails
     // (https://github.com/rrnewton/hermit/issues/4243): 6, listed with this
@@ -10102,6 +10108,35 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         engine_only: false,
         timeout: 600,
         cpu_timeout: 190,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"privileged-test"########,
+        job: r########"binder_cli_cases"########,
+        desc: r########"Run the two host-limited Binder CLI cases on a Binderfs-capable host"########,
+        description: r########"a_descriptor_received_in_a_binder_transaction_is_usable and a_blocking_binder_read_does_not_hold_the_guests_turn (PR 4742) need a binder filesystem (CONFIG_ANDROID_BINDERFS) that an unprivileged user and mount namespace may mount, plus a C compiler for their guest. The full-profile hosts' kernels do not carry that filesystem (docs/TESTING_ENVIRONMENTS.md, the binder CLI tests row), so the two cases are #[ignore]d as host-limited and leave test.cli (797 to 795) and test.cli_on_host (716 to 714); this node is their only automatic validation destination. It carries only the privileged label, like the privileged-only KVM nodes: the privileged lane is the lane for kernel-capability cases. No scheduled host runs this node yet: every current validate host's kernel lacks the filesystem, so the node is wired and counted here and its execution waits for a Binderfs-capable privileged host (tracked as P1 dh-ggdbj); the first execution is one run of these two tests inside the devbig030 QEMU Binderfs guest at this head. The command first proves the capability (binder in /proc/filesystems and a trial mount inside an unshared user/mount namespace) and refuses loudly, naming the missing filesystem, when it is absent, rather than reporting a green that measured nothing; the cli_kvm node refuses the same way without /dev/kvm. It then runs exactly the two ignored identities with an exact-name filterset and `-- --ignored`, so the counted population is 2 executed and 0 skipped, enforced by the count pin above. The tests themselves also fail, naming the missing filesystem, when explicitly selected on an incapable host (binder_guest_output_on_a_capable_host), so no route counts a vacuous pass. It runs the shared cli binary privileged-only-build.privileged_tests verifies and, like privileged-test.pmu_cli_cases, holds no integration_test_binaries.cli token: nothing relinks that binary while it runs. No execution is claimed on a host without Binderfs, and no scheduled host runs this node yet."########,
+        labels: &[r########"privileged"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; bfs=$(mktemp -d); trap 'rm -rf "$bfs"' EXIT; if ! grep -qw binder /proc/filesystems || ! unshare --user --map-root-user --mount sh -c "mount -t binder binder \"$bfs\"" 2>/dev/null; then printf 'privileged-test.binder_cli_cases: this host cannot mount a binder filesystem (CONFIG_ANDROID_BINDERFS) in an unprivileged user namespace, so the two selected binder CLI cases would not run. Refusing rather than reporting a green that measured nothing; run this node on a Binderfs-capable host (docs/TESTING_ENVIRONMENTS.md).\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test cli -j 1 -E 'test(=a_descriptor_received_in_a_binder_transaction_is_usable) | test(=a_blocking_binder_read_does_not_hold_the_guests_turn)' -- --ignored"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: Some(&[r########"cli"########]),
+        deps: &[r########"privileged-only-build.privileged_tests"########],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 60.0,
+            rss_baseline_bytes: Some(4294967296),
+            hard_mem_max_bytes: Some(8589934592),
+            classification: StepClass::CpuBound,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 600,
+        cpu_timeout: 300,
         jobs_flag: None,
         jobs_env: None,
     },

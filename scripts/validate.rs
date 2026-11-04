@@ -33953,7 +33953,9 @@ printf finalized >target/finalized
         let privileged_selections =
             hermit_manifest_plan::nextest_binaries::profile_selections(repository, "privileged")
                 .unwrap();
-        assert_eq!(privileged_selections.len(), 3);
+        // 4 since privileged-test.binder_cli_cases (PR 4742) added the
+        // plain liteinst cli selection to the privileged lane: 3 before.
+        assert_eq!(privileged_selections.len(), 4);
         assert!(
             privileged_selections
                 .values()
