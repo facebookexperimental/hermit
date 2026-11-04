@@ -5955,6 +5955,35 @@ sys.exit(37)
             );
         }
         assert!(channels.contains("HERMIT_ISOLATION_JOBS"), "{channels:?}");
+        // The lone-slice allowance is node-scoped, not a global ptrace policy.
+        // Both authored and sharded commands retain the literal marker, while
+        // the KVM node and every other node retain their existing environment.
+        const SCOPE: &str = "HERMIT_NEXTEST_BUDGET_SCOPE";
+        for step in &steps {
+            assert_eq!(
+                step.env.get(SCOPE).map(String::as_str),
+                (step.tag() == PMU_INTEGRATION_TAG).then_some("pmu-integration"),
+                "{}",
+                step.tag()
+            );
+            if step.tag() == PMU_INTEGRATION_TAG {
+                assert!(pinned_root_command(step).contains(&format!(" --env {SCOPE} ")));
+            }
+        }
+        let mut sharded = crate::validation_dag_static::config();
+        materialize_node_shards(&mut sharded, PMU_INTEGRATION_TAG, PMU_INTEGRATION_SHARDS).unwrap();
+        let tags = pmu_integration_shard_tags();
+        for step in &sharded.steps {
+            assert_eq!(
+                step.env.get(SCOPE).map(String::as_str),
+                tags.contains(&step.tag()).then_some("pmu-integration"),
+                "{}",
+                step.tag()
+            );
+            if tags.contains(&step.tag()) {
+                assert!(pinned_root_command(step).contains(&format!(" --env {SCOPE} ")));
+            }
+        }
     }
 
     #[test]

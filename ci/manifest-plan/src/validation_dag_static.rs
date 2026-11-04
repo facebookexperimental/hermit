@@ -10265,7 +10265,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"privileged-build.privileged_tests"########,
             r########"privileged-pmu.preemption"########,
         ],
-        env: &[],
+        env: &[("HERMIT_NEXTEST_BUDGET_SCOPE", "pmu-integration")],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 80.0,
