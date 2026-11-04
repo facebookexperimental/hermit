@@ -1724,7 +1724,7 @@ where
         .with_sigsetsize(KERNEL_SIGSET_SIZE);
     guest.inject_with_retry(block_signals).await?;
     let guest_mask: KernelSigset = guest.memory().read_value(old_mask_addr)?;
-    if guest.config().backend.reports_child_exit_publication
+    if crate::scheduler::child_exit_publication(&guest.config().backend).is_ok()
         || crate::scheduler::discarded_at_send::records(guest.config())
     {
         // While the private mask is installed, the kernel reports Detcore's
@@ -1753,7 +1753,7 @@ where
             .with_sigsetsize(KERNEL_SIGSET_SIZE);
         guest.inject_with_retry(restore_signals).await?;
     }
-    if guest.config().backend.reports_child_exit_publication
+    if crate::scheduler::child_exit_publication(&guest.config().backend).is_ok()
         || crate::scheduler::discarded_at_send::records(guest.config())
     {
         crate::tool_global::set_saved_guest_sigmask(guest, None).await;

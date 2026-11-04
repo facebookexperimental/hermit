@@ -632,10 +632,11 @@ impl Scheduler {
         ) {
             return;
         }
-        let notification = if self.backend.reports_child_exit_publication {
-            self.classify_child_exit_notification(process, parent)
-        } else {
-            super::ChildExitNotification::Undecided
+        let notification = match self.child_exit_publication() {
+            Ok(super::ChildExitPublication::Reported) => {
+                self.classify_child_exit_notification(process, parent)
+            }
+            Err(_) => super::ChildExitNotification::Undecided,
         };
         match notification {
             super::ChildExitNotification::None | super::ChildExitNotification::Discard => {
@@ -654,13 +655,13 @@ impl Scheduler {
                 // returns (`CommitSigkill`), so the kernel's copy is pending at
                 // a point the schedule fixes and is delivered first; the
                 // scheduler's copy then sends nothing (`child_exit_sigchld`).
-                if self.backend.reports_child_exit_publication
+                if self.child_exit_publication().is_ok()
                     && !self.child_exit_publications_completed.remove(&process)
                 {
                     self.child_exit_publications_pending.insert(process);
                     self.sigkill.unpublished.insert(process);
                 }
-                if self.backend.reports_child_exit_publication {
+                if self.child_exit_publication().is_ok() {
                     self.fence_child_exit_sigchld(parent, Some(notification), sender);
                 }
                 self.child_exit_sigchld.exit_status.insert(

@@ -3180,7 +3180,7 @@ impl GlobalTool for GlobalState {
             .lock()
             .unwrap()
             .flock_torn_down(DetPid::from_raw(pid));
-        if self.cfg.backend.reports_child_exit_publication {
+        if crate::scheduler::child_exit_publication(&self.cfg.backend).is_ok() {
             // The kernel has published this process's exit to its parent. It
             // is not a physical-exit barrier report on this backend.
             let released = self
@@ -15916,7 +15916,7 @@ mod tests {
             ("E9PATCH", BackendCapabilities::E9PATCH),
             ("LITEINST_IN_GUEST", BackendCapabilities::LITEINST_IN_GUEST),
         ] {
-            let publishes = backend.reports_child_exit_publication;
+            let publishes = crate::scheduler::child_exit_publication(&backend).is_ok();
             assert_eq!(publishes, name != "LITEINST_IN_GUEST", "{name}");
             let config = Config {
                 sequentialize_threads: true,

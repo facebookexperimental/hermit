@@ -967,7 +967,7 @@ impl Scheduler {
                         // Without publication, nothing would clear it before a
                         // later, host-timed SIGCHLD delivery to the leader took
                         // it and skipped its deferral.
-                        if leader_marked && !self.backend.reports_child_exit_publication {
+                        if leader_marked && self.child_exit_publication().is_err() {
                             self.blocked.sigchld_ready.remove(&parent);
                         }
                         None
@@ -998,7 +998,7 @@ impl Scheduler {
                 // run queue's wake) takes the child-exit ledger's decision too:
                 // it records the scheduler's send, or sends nothing where the
                 // kernel's copy was delivered first.
-                let nothing_to_send = !self.backend.reports_child_exit_publication
+                let nothing_to_send = self.child_exit_publication().is_err()
                     && match id {
                         SignalTimerId::ChildExit { child, parent } => {
                             self.child_exit_sigchld.timer(parent, child)
@@ -1202,7 +1202,7 @@ impl Scheduler {
             // stands for that one (`ChildExitSigchldLedger::attributed`),
             // where publication is not reported (with it, as before).
             return (self.blocked.sigchld_deferred.contains(&process)
-                && (self.backend.reports_child_exit_publication
+                && (self.child_exit_publication().is_ok()
                     || !self.child_exit_sigchld.attributed.contains(&process)))
             .then_some(process);
         }

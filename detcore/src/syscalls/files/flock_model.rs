@@ -764,8 +764,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (`reports_physical_process_exits`): a later grant finds the holder
         // torn down, and its mirror is made as DBT's is.
         let backend = &self.cfg.backend;
-        let reported =
-            backend.reports_child_exit_publication || backend.process_exits_complete_asynchronously;
+        let reported = crate::scheduler::child_exit_publication(backend).is_ok()
+            || backend.process_exits_complete_asynchronously;
         let in_guest = backend.tool_shares_guest_descriptor_table
             || backend.runs_guest_code_between_injections;
         let started = Instant::now();

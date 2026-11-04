@@ -939,7 +939,7 @@ impl Scheduler {
     /// rather than `ShdPnd`.
     pub(super) fn own_sigchld_thread_directed(&self, parent: DetPid) -> Option<DetTid> {
         if !self.backend.reports_kernel_child_exit_signals
-            || self.backend.reports_child_exit_publication
+            || self.child_exit_publication().is_ok()
             || self.models_signal_targets
         {
             return None;
@@ -1173,7 +1173,7 @@ impl Scheduler {
         // host's CPU times, which the scheduler's copy does not, so which copy
         // comes first then changes nothing the guest reads. (A SIGKILL cohort's
         // copy is left to `claim_for_cohort`, which picks the member.)
-        if !self.backend.reports_child_exit_publication
+        if self.child_exit_publication().is_err()
             && !self.child_exit_sigchld.cohorts.contains_key(&child)
             && let Some(info) = self.child_exit_sigchld.outstanding_info(parent, child)
         {

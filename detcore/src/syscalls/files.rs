@@ -9712,7 +9712,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             // never been queued.
             match (result, call.buf()) {
                 (Ok(read), Some(buf))
-                    if read > 0 && self.cfg.backend.reports_child_exit_publication =>
+                    if read > 0
+                        && crate::scheduler::child_exit_publication(&self.cfg.backend).is_ok() =>
                 {
                     let Some(kept) = self
                         .reconcile_signalfd_records(guest, buf, read as usize, &before)
@@ -11111,7 +11112,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         extents: &[(usize, usize)],
         read: Option<usize>,
     ) -> bool {
-        if !self.cfg.backend.reports_child_exit_publication || !guest.config().sequentialize_threads
+        if crate::scheduler::child_exit_publication(&self.cfg.backend).is_err()
+            || !guest.config().sequentialize_threads
         {
             return false;
         }
@@ -11347,7 +11349,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
             self.execute_nonblockable_fd_syscall(guest, call).await
-        } else if fd_type == FdType::Signalfd && self.cfg.backend.reports_child_exit_publication {
+        } else if fd_type == FdType::Signalfd
+            && crate::scheduler::child_exit_publication(&self.cfg.backend).is_ok()
+        {
             // The SIGCHLD records a vectored read scatters go through the
             // child-exit ledger as `read`'s do (`reconcile_signalfd_extents`).
             self.vectored_signalfd_read(
@@ -11578,7 +11582,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
         } else if detfd.ty() == FdType::Signalfd
             && offset == -1
-            && self.cfg.backend.reports_child_exit_publication
+            && crate::scheduler::child_exit_publication(&self.cfg.backend).is_ok()
         {
             // At the current offset (-1) a signalfd reads as `readv` does,
             // and its records go through the child-exit ledger

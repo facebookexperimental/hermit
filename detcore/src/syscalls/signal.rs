@@ -1831,7 +1831,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // copy's siginfo is replaced by what the buffer held before.
         let records = crate::scheduler::discarded_at_send::records(guest.config());
         let before = match call.info() {
-            Some(info) if self.cfg.backend.reports_child_exit_publication || records => {
+            Some(info)
+                if crate::scheduler::child_exit_publication(&self.cfg.backend).is_ok()
+                    || records =>
+            {
                 Some(read_mapped_prefix(guest, info.as_raw(), 128))
             }
             _ => None,
@@ -2076,7 +2079,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         waited: Option<u64>,
         result: &Result<i64, Error>,
     ) -> bool {
-        if !self.cfg.backend.reports_child_exit_publication {
+        if crate::scheduler::child_exit_publication(&self.cfg.backend).is_err() {
             return true;
         }
         // Linux copies the set in before it dequeues, and the siginfo out

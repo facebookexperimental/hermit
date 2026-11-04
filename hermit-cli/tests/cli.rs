@@ -52016,6 +52016,43 @@ fn a_parents_sigchld_is_not_held_behind_a_sibling_that_never_blocks() {
             "{label}: {log}"
         );
     }
+    // The wait shape under the options that exposed F8: with slices of a
+    // single retired branch the wait grant and its posthook are separate
+    // turns, and the privately blocked first of them must not expire the
+    // fence before the delivery (the parity loop's wait mode alone does
+    // not pin this: without those options it passed even then).
+    let run = directory.path().join("wait-f8");
+    fs::create_dir_all(&run).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=info",
+            "run",
+            "--strict",
+            "--chaos",
+            "--seed=1",
+            "--max-timeslice=0",
+            "--target-timeslice=1",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "wait",
+        ]),
+        &run,
+        Duration::from_secs(150),
+        false,
+    );
+    let stdout =
+        fs::read_to_string(run.join("deadline-run.stdout")).expect("failed to read stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "wait-f8: {stdout}\n{log}"
+    );
+    assert_eq!(
+        stdout, "mode=wait exited=0 code=0 signaled=1 sig=9 handled=0\n",
+        "wait-f8: {log}"
+    );
 }
 
 /// A child-exit `SIGCHLD` ends a `pause` or `nanosleep` only as Linux delivery
