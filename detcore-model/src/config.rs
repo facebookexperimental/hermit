@@ -4149,7 +4149,7 @@ mod legacy_backend_json {
     /// `property_snapshot` came after it too, and only hermit-cli sets it, on
     /// Android, where DBT does not run; it is never written and reads as
     /// unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 56] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 55] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
