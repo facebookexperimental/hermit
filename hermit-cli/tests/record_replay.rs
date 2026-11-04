@@ -6013,33 +6013,77 @@ fn record_replay_shares_a_file_a_forked_child_maps_again() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// The standard output of recording `tests/c/record_replay_shared_mappings.c`
+/// in `mode` and of replaying it, each of which must exit 0, for a test that
+/// compares the two phases rather than checking one fixed output.
+fn shared_mappings_stdouts(mode: &str) -> [String; 2] {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let data_dir = format!("--data-dir={}", data_dir.path().display());
+    let program = &workload("c_record_replay_shared_mappings").path;
+    let record = ["record", "start", "--record-timeout=30"].as_slice();
+    let replay = ["replay", "--autopilot"].as_slice();
+    [("record", record), ("replay", replay)].map(|(phase, hermit_args)| {
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after=5s", "45s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg("--log=off")
+            .args(hermit_args)
+            .arg(&data_dir);
+        if phase == "record" {
+            command.arg("--").arg(program).arg(mode);
+        }
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "shared-mappings-{mode} {phase}: status {}\nstdout:\n{stdout}stderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    })
+}
+
+/// A guest that reopens its `/dev/zero` mapping's object through
+/// `/proc/self/map_files` gets the same answer in replay as in recording, and
+/// no descriptor for the object, so replay never has to share or split an
+/// object it did not record.
+///
+/// Known divergence from Linux, pinned by the last assertion: Hermit's
+/// `/proc` has no `map_files`, so readlink and open both fail with ENOENT.
+/// Linux shows the link, `/dev/zero (deleted)`, and refuses the open with
+/// EPERM unless the caller has CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN in the
+/// initial user namespace (`proc_map_files_get_link`, fs/proc/base.c), which
+/// a Hermit guest, always in a user namespace of its own, never has. A change
+/// that gives Hermit's `/proc` a `map_files` should change the pinned lines,
+/// and nothing else here.
+#[test]
+fn record_replay_answers_a_dev_zero_objects_map_files_alike() {
+    let _guard = hermit_record_lock();
+    let [record, replay] = shared_mappings_stdouts("dev-zero-map-files");
+    assert_eq!(
+        replay, record,
+        "replay answered map_files differently from the recording"
+    );
+    assert!(
+        record.contains("dev-zero-map-files: reopen fails with ")
+            && !record.contains("reopened mapping"),
+        "the guest opened its /dev/zero object through map_files:\n{record}"
+    );
+    // Current Hermit behaviour, not Linux's: see above.
+    assert_eq!(
+        record,
+        "dev-zero-map-files: readlink fails with ENOENT\n\
+         dev-zero-map-files: reopen fails with ENOENT\n"
+    );
+}
+
 /// Two `MAP_SHARED` mappings of one `/dev/zero` descriptor share nothing:
 /// Linux gives each a new shmem object of its own (`mmap_zero` calls
 /// `shmem_zero_setup`). Replay used to key every shared mapping by the
 /// descriptor's device and inode, so both mappings were views of one backing
 /// and a store through the first was read through the second.
-/// A guest that reopens its `/dev/zero` mapping's object through
-/// `/proc/self/map_files` finds no such file under Hermit, in record and in
-/// replay: Hermit's `/proc` has no `map_files`, so readlink and open both
-/// fail with ENOENT. (Linux shows the link, and refuses the open with EPERM
-/// unless the caller has CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN in the
-/// initial user namespace, which a Hermit guest, always in a user namespace
-/// of its own, never has.) So a recorded guest never holds a descriptor for a
-/// `/dev/zero` object, and replay neither shares nor splits one it did not
-/// record. The test fails if a guest ever reaches the object: the readlink
-/// line changes if Hermit shows `map_files`, and a line for the reopened
-/// mapping appears if the open succeeds.
-#[test]
-fn record_replay_finds_no_map_files_for_a_dev_zero_object() {
-    let _guard = hermit_record_lock();
-    let failures = shared_mappings_failures(
-        "dev-zero-map-files",
-        "dev-zero-map-files: readlink fails with ENOENT\n\
-         dev-zero-map-files: reopen fails with ENOENT\n",
-    );
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
 #[test]
 fn record_replay_keeps_two_dev_zero_mappings_apart() {
     let _guard = hermit_record_lock();

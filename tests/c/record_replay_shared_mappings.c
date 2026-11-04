@@ -82,9 +82,10 @@
  *         own file through /proc/self/map_files and tries to open it for
  *         reading and writing, which Linux allows only with CAP_SYS_ADMIN or
  *         CAP_CHECKPOINT_RESTORE in the initial user namespace, and prints
- *         each errno. Natively an unprivileged run sees the link and gets
- *         EPERM. Under Hermit, whose /proc has no map_files, both fail with
- *         ENOENT.
+ *         what each call gave. It checks nothing itself: natively an
+ *         unprivileged run sees the link and gets EPERM, while Hermit's
+ *         /proc, a known divergence, has no map_files and both calls fail
+ *         with ENOENT.
  *
  * Usage: record_replay_shared_mappings <mode>
  * Prints one line per check and exits 0 only if every check saw what Linux

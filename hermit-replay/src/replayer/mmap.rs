@@ -30,7 +30,8 @@
 //! the pages Linux shares, because the kernel keeps them as mappings of one
 //! file. A mapping of `/dev/zero` is recorded as a mapping of the new shmem
 //! object Linux made for it, so it gets a backing of its own, which its
-//! copies in forked children and a mapping of the object's own file share.
+//! copies in forked children share. Recording refuses a mapping of the
+//! object's own file (`/proc/<pid>/map_files`).
 
 use std::collections::HashMap;
 use std::collections::HashSet;

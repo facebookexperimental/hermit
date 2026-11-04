@@ -403,8 +403,8 @@ pub struct MmapEvent {
 /// mapped through. For a mapping of `/dev/zero` the file is the new shmem
 /// object Linux made for that mapping (`shmem_zero_setup`), as
 /// `/proc/<tid>/maps` names it, so no other mapping shares it but the
-/// mapping's copies in forked children and a mapping of that object's own
-/// file (`/proc/<pid>/map_files`).
+/// mapping's copies in forked children. Recording refuses a mapping of that
+/// object's own file (`/proc/<pid>/map_files`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedMapping {
     /// `st_dev` of the mapped file.

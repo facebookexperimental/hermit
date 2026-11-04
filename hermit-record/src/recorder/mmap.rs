@@ -6,7 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::collections::HashSet;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
@@ -14,8 +13,6 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::Mutex;
-use std::sync::MutexGuard;
 use std::sync::OnceLock;
 
 use reverie::Errno;
@@ -226,31 +223,6 @@ const OWN_MMAP_FILE_SYSTEMS: [(i64, &str); 4] = [
     (0x9fa0, "procfs"),
 ];
 
-/// The shmem objects of the `/dev/zero` mappings this recording recorded, by
-/// device and inode: a later mapping of one of them through its own file
-/// (`/proc/<pid>/map_files`) is recorded as a mapping of that file, which
-/// replay backs with the same memory.
-///
-/// No guest of the `hermit` command reaches that sharing case. Only
-/// `/proc/<pid>/map_files` gives a descriptor for such an object, and
-/// opening it needs CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN in the initial
-/// user namespace (`proc_map_files_get_link`). `hermit record` always runs
-/// its guest in a user namespace of its own, and Hermit's `/proc` has no
-/// `map_files` at all (the guest gets ENOENT;
-/// `record_replay_finds_no_map_files_for_a_dev_zero_object`). The case is
-/// kept for a direct user of this recorder whose guest runs in the initial
-/// namespace with that capability, where dropping it would refuse a mapping
-/// replay can reproduce. The refusal beside it in [`mapped_file`] still
-/// guards a descriptor for an object this recording did not make, such as
-/// one the guest inherited.
-fn recorded_zero_objects() -> MutexGuard<'static, HashSet<(u64, u64)>> {
-    static OBJECTS: OnceLock<Mutex<HashSet<(u64, u64)>>> = OnceLock::new();
-    OBJECTS
-        .get_or_init(Default::default)
-        .lock()
-        .expect("should not be poisoned: no code panics while holding it")
-}
-
 /// What a `MAP_SHARED` mapping shares, as recording sees it before the call.
 #[derive(Debug, PartialEq, Eq)]
 enum Sharing {
@@ -312,10 +284,7 @@ fn shared_mapping_with(
             file.target.display()
         ))
     };
-    let kind = mapped_file(&file, shmem_device(), |object| {
-        recorded_zero_objects().contains(&object)
-    });
-    Ok(Some(match kind {
+    Ok(Some(match mapped_file(&file, shmem_device()) {
         MappedFile::Regular => Sharing::File(SharedMapping {
             device: file.device,
             inode: file.inode,
@@ -378,14 +347,8 @@ enum MappedFile {
 
 /// What `file` is to a `MAP_SHARED` mapping. Linux opens a character device
 /// by its number, whatever its name, so `/dev/zero` is any node of
-/// [`DEV_ZERO`]. `shmem_device` is the kernel's internal shmem mount, and
-/// `recorded_zero_object` says whether this recording recorded a
-/// `/dev/zero` mapping of an object by device and inode.
-fn mapped_file(
-    file: &MappedFileFacts,
-    shmem_device: Option<Device>,
-    recorded_zero_object: impl FnOnce((u64, u64)) -> bool,
-) -> MappedFile {
+/// [`DEV_ZERO`]. `shmem_device` is the kernel's internal shmem mount.
+fn mapped_file(file: &MappedFileFacts, shmem_device: Option<Device>) -> MappedFile {
     // The files `anon_inode_getfile` makes share one inode, so its identity
     // names no file of its own. Linux reports an anonymous inode with no type
     // (`anon_inode_getattr`); its name says what it is whatever its reported
@@ -411,16 +374,20 @@ fn mapped_file(
             }
             let on_shmem_mount = shmem_device.is_some()
                 && shmem_device == Some((libc::major(file.device), libc::minor(file.device)));
-            if on_shmem_mount
-                && file.target == Path::new(ZERO_OBJECT_NAME)
-                && !recorded_zero_object((file.device, file.inode))
-            {
-                // Its first mapping was MAP_SHARED | MAP_ANONYMOUS, which runs
-                // live in record and replay with no event, so replay has no
-                // backing a mapping of this file could share.
+            if on_shmem_mount && file.target == Path::new(ZERO_OBJECT_NAME) {
+                // The object of a MAP_SHARED | MAP_ANONYMOUS mapping, which
+                // runs live in record and replay with no event, or of a
+                // /dev/zero mapping, which replay backs by the mapping and not
+                // by this file. Only /proc/<pid>/map_files gives a descriptor
+                // for it, and opening that needs CAP_CHECKPOINT_RESTORE or
+                // CAP_SYS_ADMIN in the initial user namespace
+                // (proc_map_files_get_link). No guest of the hermit command
+                // has either: it runs in a user namespace of its own, and
+                // Hermit's /proc has no map_files. The refusal also covers a
+                // descriptor the guest inherited.
                 return MappedFile::Other(
-                    "the shmem object of a MAP_SHARED | MAP_ANONYMOUS mapping, \
-                     whose memory replay cannot name"
+                    "the shmem object of a MAP_SHARED | MAP_ANONYMOUS or /dev/zero \
+                     mapping, whose memory replay does not back as a file"
                         .to_owned(),
                 );
             }
@@ -439,9 +406,8 @@ fn mapped_file(
 
 /// Names the new `/dev/zero` mapping at `address` of thread `tid`, mapped
 /// through a descriptor opened with `access`, by the object Linux made for it
-/// as `/proc/<tid>/maps` shows it, and remembers the object, so that a later
-/// mapping of the object's own file is recorded as sharing its memory. The
-/// mapping exists, so a listing without it cannot be recorded.
+/// as `/proc/<tid>/maps` shows it. The mapping exists, so a listing without
+/// it cannot be recorded.
 fn name_zero_mapping(tid: i32, address: usize, access: i32) -> SharedMapping {
     let maps_path = format!("/proc/{tid}/maps");
     let (device, inode) = std::fs::read_to_string(&maps_path)
@@ -453,7 +419,6 @@ fn name_zero_mapping(tid: i32, address: usize, access: i32) -> SharedMapping {
                  {maps_path} names no object at {address:#x}"
             )
         });
-    recorded_zero_objects().insert((device, inode));
     SharedMapping {
         device,
         inode,
@@ -832,7 +797,6 @@ mod tests {
             let named = name_zero_mapping(tid, address, libc::O_RDWR);
             assert_eq!((named.device, named.inode), own_object_at(address));
             assert_eq!((named.offset, named.access), (0, libc::O_RDWR));
-            assert!(recorded_zero_objects().contains(&(named.device, named.inode)));
             (named.device, named.inode)
         };
         let first = name(map(rw.as_raw_fd(), libc::MAP_SHARED, rw_prot));
@@ -861,34 +825,34 @@ mod tests {
 
     /// The kind of a mapped file is its type, file system and, for a
     /// character device, its number. A file an anonymous inode stands for is
-    /// never a regular file whatever type it reports, and a `/dev/zero`
-    /// object on the shmem mount is one only when its mapping was recorded.
+    /// never a regular file whatever type it reports, and neither is the
+    /// `/dev/zero (deleted)` object of a shared anonymous or `/dev/zero`
+    /// mapping on the shmem mount.
     #[test]
     fn a_mapped_files_kind_is_its_type_and_device_number() {
         const TMPFS: i64 = 0x0102_1994;
         let shmem = Some((0, 1));
         let shmem_dev = libc::makedev(0, 1);
-        let kind = |file: &MappedFileFacts, recorded: bool| mapped_file(file, shmem, |_| recorded);
-        let other = |file: MappedFileFacts| match kind(&file, false) {
+        let kind = |file: &MappedFileFacts| mapped_file(file, shmem);
+        let other = |file: MappedFileFacts| match kind(&file) {
             MappedFile::Other(what) => what,
             regular => panic!("{file:?} is {regular:?}"),
         };
         let regular = libc::S_IFREG | 0o600;
         let memfd = facts(regular, 0, shmem_dev, TMPFS, "/memfd:x (deleted)");
-        assert_eq!(kind(&memfd, false), MappedFile::Regular);
+        assert_eq!(kind(&memfd), MappedFile::Regular);
         let object = facts(regular, 0, shmem_dev, TMPFS, ZERO_OBJECT_NAME);
-        assert_eq!(kind(&object, true), MappedFile::Regular);
-        assert!(other(object).contains("MAP_SHARED | MAP_ANONYMOUS"));
+        assert!(other(object).contains("MAP_SHARED | MAP_ANONYMOUS or /dev/zero"));
         // A file of that name elsewhere is an ordinary file.
         let elsewhere = facts(regular, 0, libc::makedev(8, 1), TMPFS, ZERO_OBJECT_NAME);
-        assert_eq!(kind(&elsewhere, false), MappedFile::Regular);
+        assert_eq!(kind(&elsewhere), MappedFile::Regular);
         let node = |rdev, target| facts(libc::S_IFCHR | 0o666, rdev, 6, TMPFS, target);
         assert_eq!(
-            kind(&node(libc::makedev(1, 5), "/dev/zero"), false),
+            kind(&node(libc::makedev(1, 5), "/dev/zero")),
             MappedFile::Zero
         );
         assert_eq!(
-            kind(&node(libc::makedev(1, 5), "/x/zero-node"), false),
+            kind(&node(libc::makedev(1, 5), "/x/zero-node")),
             MappedFile::Zero
         );
         assert!(other(node(libc::makedev(1, 1), "/dev/mem")).contains("character device 1:1"));
@@ -913,21 +877,6 @@ mod tests {
             let file = facts(regular, 0, 20, magic, "/sys/bus/pci/devices/x/resource0");
             assert!(other(file).contains(&format!("a file on {name}")));
         }
-        // A reopened object is looked up by its own device and inode, not by
-        // name or by any other object's identity.
-        let looked_up = |file: &MappedFileFacts, recorded: (u64, u64)| {
-            mapped_file(file, shmem, |object| object == recorded)
-        };
-        let object = facts(regular, 0, shmem_dev, TMPFS, ZERO_OBJECT_NAME);
-        assert_eq!(looked_up(&object, (shmem_dev, 77)), MappedFile::Regular);
-        assert!(matches!(
-            looked_up(&object, (shmem_dev, 78)),
-            MappedFile::Other(_)
-        ));
-        assert!(matches!(
-            looked_up(&object, (libc::makedev(0, 2), 77)),
-            MappedFile::Other(_)
-        ));
     }
 
     /// The file `/proc/<pid>/map_files` would open for a real mapping, by the
@@ -936,8 +885,8 @@ mod tests {
     /// (deleted)`, with the device and inode `/proc/self/maps` shows. Opening
     /// it needs a capability in the initial user namespace, so its facts are
     /// built from the mapping's own `maps` line, which needs none. The object
-    /// of a `/dev/zero` mapping this recording named is recorded as that
-    /// file; the object of a `MAP_SHARED | MAP_ANONYMOUS` mapping refuses.
+    /// of a `/dev/zero` mapping this recording named and the object of a
+    /// `MAP_SHARED | MAP_ANONYMOUS` mapping both refuse.
     #[test]
     fn a_real_mappings_object_is_classified_as_its_reopened_file_would_be() {
         const TMPFS: i64 = 0x0102_1994;
@@ -959,17 +908,11 @@ mod tests {
             fs_type: TMPFS,
             target: ZERO_OBJECT_NAME.into(),
         };
-        let shmem = shmem_device();
-        let recorded = |object| recorded_zero_objects().contains(&object);
-        assert_eq!(
-            mapped_file(&reopened((named.device, named.inode)), shmem, recorded),
-            MappedFile::Regular
-        );
-        match mapped_file(&reopened(anonymous), shmem, recorded) {
-            MappedFile::Other(what) => {
-                assert!(what.contains("MAP_SHARED | MAP_ANONYMOUS"), "{what}")
+        for object in [(named.device, named.inode), anonymous] {
+            match mapped_file(&reopened(object), shmem_device()) {
+                MappedFile::Other(what) => assert!(what.contains("or /dev/zero mapping"), "{what}"),
+                other => panic!("the shmem object {object:?} was {other:?}"),
             }
-            other => panic!("a MAP_SHARED | MAP_ANONYMOUS object was {other:?}"),
         }
     }
 
