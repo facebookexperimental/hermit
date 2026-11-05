@@ -5669,7 +5669,7 @@ fn shared_mapping_replay_refuses_metadata_retagged_as_0x199() {
     let mut metadata: serde_json::Value =
         serde_json::from_slice(&fs::read(&metadata_path).expect("read metadata"))
             .expect("parse metadata");
-    assert_eq!(metadata["version"], 0x19b, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x19d, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x199);
     fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
     let mut replay = replay_command();
