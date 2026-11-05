@@ -9443,6 +9443,95 @@ fn run_parity_records(e2e_result_root: &Path) -> Vec<PathBuf> {
 /// Each `parity.jsonl` the run's post-passes left goes with them as a
 /// `--parity-file`, so each verify row carries its cell's divergence from
 /// ptrace (dev-hermit ai_docs/2026-10-21-cell-row-first-divergence-design.md).
+/// Start `series.py prepare-checker` so a cold shared-checker build overlaps
+/// the DAG instead of landing on the verdict path.
+///
+/// The after-graph series append prepares the content-addressed checker on
+/// first use; a cold build measured 60 s wall (2026-11-05) of the 66 s
+/// median append, after the last DAG node, before the verdict. Preparing at
+/// DAG start leaves the append its fast path (~10 s). The warmup is
+/// advisory exactly as the append's own prepare is: every failure is one log
+/// line, the append later prepares again authoritatively and falls back to
+/// the direct build, and no outcome here can change the verdict (a series
+/// write failure already cannot). The child inherits stdout/stderr, so its
+/// prepare outcome is in this run's log like any other after-graph phase.
+fn spawn_series_checker_warmup(
+    parent: Option<&Path>,
+    tool_root: Option<&Path>,
+) -> Option<std::process::Child> {
+    let parent = parent?;
+    let tool_root = tool_root?;
+    let script = tool_root.join("ci-hub/series/series.py");
+    if !script.is_file() {
+        eprintln!(
+            "validate: series checker warmup skipped: {} does not exist; \
+             the series append will report its own error as today",
+            script.display()
+        );
+        return None;
+    }
+    match Command::new("python3")
+        .arg(&script)
+        .arg("prepare-checker")
+        .arg("--parent")
+        .arg(parent)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            eprintln!(
+                "validate: series checker warmup started (pid {}); \
+                 its build overlaps the DAG and the series append re-prepares after it",
+                child.id()
+            );
+            Some(child)
+        }
+        Err(error) => {
+            eprintln!(
+                "validate: series checker warmup not started: cannot run {}: {error}; \
+                 the series append will prepare as today",
+                script.display()
+            );
+            None
+        }
+    }
+}
+
+/// Reap the warmup before the series append, waiting at most
+/// ``WARMUP_JOIN_SECONDS``. A warmup still running after a whole DAG is
+/// wedged on a lock or an enormous build; the append then proceeds exactly
+/// as today (its own prepare may duplicate some build work in the other
+/// cache slot, but it never waits unboundedly on the warmup).
+fn join_series_checker_warmup(mut warmup: Option<std::process::Child>) {
+    let Some(child) = warmup.as_mut() else {
+        return;
+    };
+    const WARMUP_JOIN_SECONDS: u64 = 30;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(WARMUP_JOIN_SECONDS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                eprintln!("validate: series checker warmup finished ({status})");
+                return;
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Ok(None) => {
+                eprintln!(
+                    "validate: series checker warmup still running after {WARMUP_JOIN_SECONDS}s; \
+                     not waiting for it -- the series append prepares as today"
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("validate: series checker warmup state unreadable ({error}); continuing");
+                return;
+            }
+        }
+    }
+}
+
 fn append_validate_series(
     parent: Option<&Path>,
     tool_root: Option<&Path>,
@@ -9528,9 +9617,16 @@ fn append_validate_series(
     // stderr; success used to drop it, so a post-graph stall inside the
     // append was invisible in the validate log (2026-11-04: every scan read
     // in full for ~8 min with nothing naming the phase). Forward those
-    // lines so the driver's own log says which path ran.
+    // lines so the driver's own log says which path ran. The tool-cache
+    // lines name the other stall this append can take: a cold shared-checker
+    // build, or the silent fallback to one, measured 60 s wall on
+    // 2026-11-05 inside a 66 s median append.
     for line in String::from_utf8_lossy(&output.stderr).lines() {
-        if line.contains("published scan:") {
+        if line.contains("published scan:")
+            || line.contains("published rows lookup")
+            || line.contains("rust tool cache:")
+            || line.contains("checker tool cache unavailable")
+        {
             eprintln!("validate: series writer: {line}");
         }
     }
@@ -30867,6 +30963,21 @@ fn run(
     };
     let mut run_timed_out = false;
 
+    // Overlap a cold shared-checker build with the DAG: the after-graph
+    // series append prepares the same checker, and a cold build there is
+    // ~60 s wall on the verdict path (see spawn_series_checker_warmup).
+    // Same gate as the append itself, so runs that write no series (nested,
+    // off-the-record, Buck payload) start no warmup.
+    let series_checker_warmup = if should_write_scorecard(
+        nesting.nested,
+        args.allow_local_off_the_record_run,
+        release_builder,
+    ) {
+        spawn_series_checker_warmup(parent.as_deref(), tool_root.as_deref())
+    } else {
+        None
+    };
+
     let r = lane(&execution_plan.cfg);
     outcomes.extend(r.outcomes.iter().cloned());
     skipped.extend(r.skipped.iter().cloned());
@@ -30929,6 +31040,9 @@ fn run(
     // real work would leave no record of having run at all — which reads exactly
     // like never having started. `SIG_IGN` for the window is what `trap ''
     // INT TERM HUP` bought the bash.
+    // Reap the checker warmup before the signal-ignored section: its bounded
+    // wait must not extend the window the critical section protects.
+    join_series_checker_warmup(series_checker_warmup);
     validate_runtime::enter_cleanup_critical_section();
     let interruption = interrupted_by().map(|s| s.to_string());
     // One original byte population feeds series, both retention contracts and
