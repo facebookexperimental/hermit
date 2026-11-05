@@ -693,6 +693,23 @@ def emit_buck(ir, mode):
     def ext_deps(exts):
         return sorted({buck_external(e) for e in exts})
 
+    def closure_externals(labels):
+        # External deps of these libraries and everything they transitively
+        # depend on. Consumers list them as plain deps after the vendored
+        # archives: system archives are extracted on demand in one link
+        # pass, so an external named before the whole-linked vendored
+        # object that needs it is silently skipped (pty_root_test).
+        seen, ext = set(), set()
+        stack = list(labels)
+        while stack:
+            lab = stack.pop()
+            if lab in seen or lab not in libs:
+                continue
+            seen.add(lab)
+            ext.update(libs[lab]["external"])
+            stack.extend(libs[lab]["deps"])
+        return ext_deps(sorted(ext))
+
     def fmt_list(items, indent="        "):
         return ("\n" + indent).join('"%s",' % i for i in items)
 
@@ -751,12 +768,14 @@ def emit_buck(ir, mode):
             # (temp_path <-> test_util <-> fs_util), so archive member
             # extraction order cannot resolve them; include every object.
             w("    link_whole = True,")
-        # Bazel cc_library deps are public: consumers compile against these
-        # headers (test_util.h includes gmock), so export them.
+        # Internal deps are exported (Bazel cc_library deps are public:
+        # consumers compile against these headers). Externals stay plain
+        # deps carrying the full closure's externals, so each consumer
+        # lists them itself, after the vendored archives, at link time.
         deps = [":gvisor_headers"]
         deps += [":" + lib_target(d) for d in l["deps"] if d != allocator_label]
-        deps += ext_deps(l["external"])
         w("    exported_deps = [\n        %s\n    ]," % fmt_list(deps))
+        w("    deps = [\n        %s\n    ]," % fmt_list(closure_externals([label])))
         w('    visibility = ["PUBLIC"],')
         w(")")
         w("")
@@ -773,6 +792,7 @@ def emit_buck(ir, mode):
         for b in users:
             deps.update(":" + lib_target(d) for d in b["lib_closure"] if d != allocator_label)
             deps.update(ext_deps(b["external"]))
+            deps.update(closure_externals(b["lib_closure"]))
             defines.update("-D" + d for d in b["defines"])
             copts.update(b["copts"])
         w("fb_native.cxx_library(")
@@ -814,7 +834,7 @@ def emit_buck(ir, mode):
             w('    name = "%s",' % ("gvh_" + h["name"]))
             w("    srcs = [\n        %s\n    ]," % fmt_list([buck_src(s) for s in h["srcs"]]))
             w("    compiler_flags = _COMMON_FLAGS,")
-            deps = [":gvisor_headers"] + [":" + lib_target(d) for d in h["deps"]] + ext_deps(h["external"])
+            deps = [":gvisor_headers"] + [":" + lib_target(d) for d in h["deps"]] + ext_deps(h["external"]) + closure_externals(h["deps"])
             w("    deps = [\n        %s\n    ]," % fmt_list(deps))
             w('    visibility = ["PUBLIC"],')
             w(")")
@@ -841,6 +861,7 @@ def emit_buck(ir, mode):
             # Full closure, dependents first: static-archive link order.
             deps += [":" + lib_target(d) for d in b["lib_closure"] if d != allocator_label]
             deps += ext_deps(b["external"])
+            deps += closure_externals(b["lib_closure"] + ([TEST_MAIN] if b["uses_test_main"] else []))
             w("    deps = [\n        %s\n    ]," % fmt_list(deps))
             w('    visibility = ["PUBLIC"],')
             w(")")
@@ -862,10 +883,13 @@ def emit_buck(ir, mode):
                 deps.add(":" + src_target(s) + "_c")
             else:
                 deps.add(":" + src_target(s))
+        mega_libs = set()
         for b in tests.values():
-            deps.update(":" + lib_target(d) for d in b["lib_closure"]
-                        if d not in (allocator_label, TEST_MAIN))
+            mega_libs.update(d for d in b["lib_closure"]
+                             if d not in (allocator_label, TEST_MAIN))
             deps.update(ext_deps(b["external"]))
+        deps.update(":" + lib_target(d) for d in mega_libs)
+        deps.update(closure_externals(sorted(mega_libs)))
         w("    deps = [\n        %s\n    ]," % fmt_list(sorted(deps)))
         w('    visibility = ["PUBLIC"],')
         w(")")
