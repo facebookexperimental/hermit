@@ -2018,6 +2018,19 @@ fn materialize_hosted_script_unit_tests(cfg: &mut DagConfig) -> Result<(), Strin
 /// adds to the `full` selection; see [`buck_e2e_selection`].
 pub const FULL_BUCK_E2E_LABEL: &str = "full-buck-e2e";
 /// The host node that runs every E2E cell under Buck/Tpx.
+///
+/// Fail-fast exemption (owner early-exit directive, 2026-11-04): this
+/// node deliberately runs EVERY cell even after one fails, in both
+/// the default and `--keep-going` modes. All cells execute as one or
+/// two parallel `buck2 test` invocations, the import twins judge the
+/// complete row set, and a full run populates the RE test-result
+/// cache that makes the next unchanged cell free. Stopping at the
+/// first failing cell would break judging and waste the cache. The
+/// node also emits no early-failure line: `ci/buck-e2e/run` captures
+/// buck2's output to its work log and fetches verdicts with testx
+/// only after the batch completes, so through this runner per-cell
+/// results cannot stream; the first failure signal is the batch's
+/// completion. The graph still aborts around it as usual.
 pub const BUCK_CELLS_TAG: &str = "e2e.buck_cells";
 /// The wall bound of e2e.buck_cells, in seconds, which ci/buck-e2e/validate-node
 /// cannot read from dagrun.

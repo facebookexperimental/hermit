@@ -1358,6 +1358,8 @@ fn usage() -> &'static str {
      \x20                The opt-in for a full failure list (nightly, audits).\n\
      \x20 --fail-fast    Early exit (the default): eager-exit the whole graph on\n\
      \x20                the first confirmed red. Adds no dependency edges.\n\
+     \x20                Exempt by design: e2e.buck_cells always runs every cell\n\
+     \x20                (complete rows for judging; RE cache); see BUCK_CELLS_TAG.\n\
      \x20 --allow-cgroup-failure  Downgrade to an UNBOXED run instead of failing closed.\n\
      \x20 --show-plan      Print the outer boxed DAG nodes, caps, and dependencies and exit.\n\
      \x20                  It does not enumerate Rust test IDs or E2E cells.\n\
