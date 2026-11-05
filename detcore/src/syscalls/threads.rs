@@ -1690,6 +1690,19 @@ where
     })
 }
 
+/// [`read_kernel_signal_state`] of the calling thread, read from the backend
+/// where its guest threads are not host tasks
+/// ([`reads_signal_state_from_backend`]), so that no host task's `/proc`
+/// state reaches a decision there.
+pub(crate) fn read_guest_signal_state<G, T>(guest: &G) -> Result<KernelSignalState, Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    backend_signal_state_of_caller(guest)
+        .unwrap_or_else(|| read_kernel_signal_state(guest.pid(), guest.tid()))
+}
+
 /// [`read_thread_signal_state`] of the calling thread, read from the backend
 /// where its guest threads are not host tasks
 /// ([`reads_signal_state_from_backend`]), so that no host task's `/proc`

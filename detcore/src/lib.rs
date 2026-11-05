@@ -621,9 +621,10 @@ pub fn two_phase_refusal(cfg: &Config) -> Option<&'static str> {
 
 /// A5 step 3c.1e A, IR-15: whether delivering `signal` takes its default
 /// action (neither a handler nor `SIG_IGN`), as Detcore's copy of the
-/// dispositions holds them or else as the kernel reports them. A thread whose
-/// state cannot be read counts as taking the default action, so the IR-15
-/// guard fails closed.
+/// dispositions holds them or else as the kernel reports them, or the backend
+/// where guest threads are not host tasks (`read_guest_signal_state`). A
+/// thread whose state cannot be read counts as taking the default action, so
+/// the IR-15 guard fails closed.
 fn delivery_takes_default_action<G, T>(guest: &G, signal: i32) -> bool
 where
     G: Guest<Detcore<T>>,
@@ -637,16 +638,20 @@ where
     let bit = crate::syscalls::kernel_sigset_bit(signal);
     match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal) {
         Some(copied) => (copied.caught | copied.ignored) & bit == 0,
-        None => crate::syscalls::read_kernel_signal_state(guest.pid(), guest.tid())
+        None => crate::syscalls::read_guest_signal_state(guest)
             .map_or(true, |state| (state.caught | state.ignored) & bit == 0),
     }
 }
 
 /// Whether delivering `signal` now runs a handler the guest installed, as
 /// Detcore's copy of the dispositions holds them or else as the kernel
-/// reports them (`ThreadState::delivered_since_request`). A thread whose state
-/// cannot be read counts as running one, which keeps the continuation;
-/// `MAX_SIGRETURN_CONTINUATIONS` still bounds it.
+/// reports them, or the backend where guest threads are not host tasks
+/// (`read_guest_signal_state`; `ThreadState::delivered_since_request`). A
+/// thread whose state cannot be read counts as running one, which keeps the
+/// continuation; `MAX_SIGRETURN_CONTINUATIONS` still bounds it. On KVM the
+/// host read was refused, so that fallback decided every delivery Detcore
+/// holds no copy for, such as a SIGCHLD to a process that never installed a
+/// handler, which then counted as running one.
 fn delivery_runs_handler<G, T>(guest: &G, signal: i32) -> bool
 where
     G: Guest<Detcore<T>>,
@@ -661,12 +666,14 @@ where
     let bit = crate::syscalls::kernel_sigset_bit(signal);
     match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal) {
         Some(copied) => copied.caught & bit != 0,
-        None => crate::syscalls::read_kernel_signal_state(guest.pid(), guest.tid())
+        None => crate::syscalls::read_guest_signal_state(guest)
             .map_or(true, |state| state.caught & bit != 0),
     }
 }
 
-/// The installed disposition observed before submitting the signal event.
+/// The installed disposition observed before submitting the signal event,
+/// from Detcore's copy, or else the kernel's or, where guest threads are not
+/// host tasks, the backend's (`read_guest_signal_state`).
 /// A replay handoff can let another thread change it before kernel delivery.
 /// This metadata never determines the signal's scheduling or continuation.
 fn traced_disposition<G, T>(
@@ -680,7 +687,7 @@ where
     let dispositions = match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal)
     {
         Some(copied) => Some((copied.ignored, copied.caught)),
-        None => crate::syscalls::read_kernel_signal_state(guest.pid(), guest.tid())
+        None => crate::syscalls::read_guest_signal_state(guest)
             .ok()
             .map(|state| (state.ignored, state.caught)),
     };
