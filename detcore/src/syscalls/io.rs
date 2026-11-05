@@ -3107,6 +3107,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .await;
                 staged.release(guest);
                 result
+            } else if self.backend_serves_masked_ppoll_waits()
+                && let Some(signal_mask) = signal_mask
+            {
+                // The backend runs the call and reports the guest's signal
+                // state (SIGSHARE S2b): the wait polls with the backend's own
+                // probe, which stages its copies each turn.
+                staged.release(guest);
+                self.backend_masked_ppoll_wait(guest, call, signal_mask, deadline)
+                    .await
             } else {
                 // Without the kernel's signal state, Hermit cannot tell whether
                 // the backend holds a signal that should end the wait, so a
@@ -3450,6 +3459,102 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         publish_wait_mask(guest, None, &mut published).await;
         refuse_held_signal_loss(guest, Sysno::ppoll, result).await
+    }
+
+    /// Whether a masked ppoll that would wait polls with the backend's own
+    /// probes (`backend_masked_ppoll_wait`): on a backend that runs the call
+    /// itself and reports the guest's signal state
+    /// (`reads_signal_state_from_backend`, KVM), under the scheduler, and
+    /// outside record and replay (which that backend refuses anyway).
+    fn backend_serves_masked_ppoll_waits(&self) -> bool {
+        crate::syscalls::reads_signal_state_from_backend(&self.cfg.backend)
+            && self.cfg.sequentialize_threads
+            && !self.cfg.recordreplay_modes
+    }
+
+    /// SIGSHARE S2b: the wait of a ppoll with a temporary mask, `call` with
+    /// the mask `signal_mask` as `read_ppoll_mask` read it, on a backend that
+    /// runs the call itself and reports the guest's signal state
+    /// (`backend_serves_masked_ppoll_waits`). Each turn runs a zero-timeout
+    /// probe that carries a private copy of the mask (`stage_ppoll_probe`),
+    /// so the backend applies the mask inside the call, as Linux installs it
+    /// for the whole call: a pending signal the mask lets in ends the probe
+    /// with `EINTR` and the mask installed for the delivery, and one the
+    /// guest's own mask lets in but the temporary mask blocks never ends it.
+    /// No signal can reach the thread between two probes: the backend
+    /// delivers only at a return to the guest. The wait ends with the first
+    /// probe whose result is not a wait (a ready count, `EINTR`, an error),
+    /// or with 0 once `deadline` passes.
+    ///
+    /// A probe the backend declines (`ENOSYS`) found a pending signal the mask
+    /// lets in that it cannot act on inside the call. When every such signal
+    /// is one the process ignores, they are removed, as Linux discards them as
+    /// the call returns before it restarts the call, and the wait goes on
+    /// (`discard_ignored_signals_let_in`); anything else is refused by name
+    /// (`refuse_masked_ppoll_signal`).
+    async fn backend_masked_ppoll_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Ppoll,
+        signal_mask: KernelSigset,
+        deadline: Option<LogicalTime>,
+    ) -> Result<i64, Error> {
+        let mask = sanitize_ppoll_signal_mask(signal_mask);
+        let mut rsrc = Resources::new(guest.thread_state().dettid);
+        rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+        rsrc.fyi("ppoll");
+        rsrc.poll_deadline = poll_deadline_for(guest, deadline);
+        rsrc.relies_on_guest_held_marks = poll_targets_guest_held(
+            guest,
+            call.fds().map(|fds| fds.as_raw()),
+            call.nfds() as usize,
+        );
+        rsrc.polls_guest_state_only = rsrc.relies_on_guest_held_marks;
+        rsrc.set_signal_interrupt_errno(Errno::EINTR);
+        rsrc.signal_state_task = guest_signal_state_task(guest);
+        let mut guest_held = GuestHeldPollProof::capture(guest, call.into(), &mut rsrc);
+        loop {
+            crate::syscalls::helpers::refresh_guest_poll_state(guest, call.into(), &mut rsrc);
+            // A guest-held proof this call already lost stays lost.
+            guest_held.revalidate(guest, &mut rsrc);
+            resource_request(guest, rsrc.clone()).await;
+            guest_held.revalidate(guest, &mut rsrc);
+            let Some((probe, staged)) = self
+                .stage_ppoll_probe(guest, call, Some(signal_mask))
+                .await?
+            else {
+                return match self.refuse_unstageable_ppoll_copy(guest).await {
+                    Some(refused) => refused,
+                    None => Err(Errno::ENOSYS.into()),
+                };
+            };
+            // Virtual timerfds first (`crate::syscalls::timerfd`), in the
+            // staged cells' scratch while they hold the stack.
+            let next_timerfd =
+                crate::syscalls::timerfd::publish_expired_in(guest, staged.timerfd_scratch).await;
+            rsrc.poll_deadline =
+                crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd);
+            let result = inject_ppoll_probe(guest, probe).await;
+            staged.release(guest);
+            match result {
+                Err(Errno::ENOSYS) => {
+                    if !self.discard_ignored_signals_let_in(guest, mask).await? {
+                        return self.refuse_masked_ppoll_signal(guest).await;
+                    }
+                }
+                result if !probe.syscall_would_have_blocked(result) => {
+                    return result.map_err(Into::into);
+                }
+                _ => {}
+            }
+            rsrc.poll_attempt += 1;
+            if let Some(deadline) = deadline
+                && thread_observe_time(guest).await >= deadline
+            {
+                return Ok(0);
+            }
+            record_retry_event(guest, probe).await;
+        }
     }
 
     #[cfg(test)]
