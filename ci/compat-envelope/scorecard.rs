@@ -33282,46 +33282,79 @@ mod post_verdict_transaction_tests {
         id: CellId,
     }
 
+    /// Clone this checkout into `directory/repo` for a fixture to measure.
+    /// `--shared` borrows its objects, so nothing is copied. The clone's
+    /// submodules stay uninitialized: no test here reads one. A recursive
+    /// `submodule update` of agent-utils used to clone that whole repository,
+    /// with its own submodule, from this checkout's object store, and failed
+    /// whenever the store lacked one of its objects (`unable to read sha1 file
+    /// of vibe-talk/...`), whatever the change under test.
+    fn clone_checkout(directory: &Path) -> PathBuf {
+        let source = Path::new(file!())
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let root = directory.join("repo");
+        git(
+            directory,
+            &[
+                "clone",
+                "--quiet",
+                "--shared",
+                source.to_str().unwrap(),
+                root.to_str().unwrap(),
+            ],
+        );
+        root
+    }
+
+    /// A fixture measures its clone of this checkout and nothing else: every
+    /// submodule of the clone stays an empty directory, so no fixture reads a
+    /// submodule's objects from this checkout's own store. (`submodule status`
+    /// cannot tell: an update given its URL by `-c` leaves the submodule
+    /// checked out but reported uninitialized.)
+    #[test]
+    fn a_fixture_clone_initializes_no_submodule_from_the_checkout() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = clone_checkout(directory.path());
+        let paths = git(
+            &root,
+            &[
+                "config",
+                "--file",
+                ".gitmodules",
+                "--get-regexp",
+                r"\.path$",
+            ],
+        );
+        let paths = paths
+            .lines()
+            .filter_map(|line| line.split_once(' ').map(|(_, path)| path))
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"agent-utils"), "{paths:?}");
+        let materialized = paths
+            .iter()
+            .filter(|path| {
+                fs::read_dir(root.join(path)).is_ok_and(|mut entries| entries.next().is_some())
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            materialized.is_empty(),
+            "the fixture clone checked out submodules from the checkout: {materialized:?}"
+        );
+        assert!(
+            !root.join(".git/modules").exists(),
+            "the fixture clone holds submodule repositories"
+        );
+    }
+
     impl Fixture {
         fn new() -> Self {
-            let source = Path::new(file!())
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap();
             let directory = tempfile::tempdir().unwrap();
-            let root = directory.path().join("repo");
-            git(
-                directory.path(),
-                &[
-                    "clone",
-                    "--quiet",
-                    "--shared",
-                    source.to_str().unwrap(),
-                    root.to_str().unwrap(),
-                ],
-            );
-            let local_au = format!(
-                "submodule.agent-utils.url={}",
-                source.join("agent-utils").display()
-            );
-            git(
-                &root,
-                &[
-                    "-c",
-                    "protocol.file.allow=always",
-                    "-c",
-                    &local_au,
-                    "submodule",
-                    "update",
-                    "--init",
-                    "--recursive",
-                    "--",
-                    "agent-utils",
-                ],
-            );
+            let root = clone_checkout(directory.path());
             let measured = git(&root, &["rev-parse", "HEAD"]);
             fs::write(
                 root.join("detcore/scorecard-fixture-source"),
