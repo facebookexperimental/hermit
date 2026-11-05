@@ -829,13 +829,20 @@ fn validate_test_inventory(
         ));
     }
 
-    if &inventory_manifest_tests != manifest_programs {
-        let missing: Vec<_> = manifest_programs
+    // Vendored rr programs are owned by the submodule pin, not the tests/
+    // inventory; their existence is checked per manifest row instead.
+    let tests_manifest_programs: BTreeSet<_> = manifest_programs
+        .iter()
+        .filter(|program| program.starts_with("tests/"))
+        .cloned()
+        .collect();
+    if inventory_manifest_tests != tests_manifest_programs {
+        let missing: Vec<_> = tests_manifest_programs
             .difference(&inventory_manifest_tests)
             .cloned()
             .collect();
         let stale: Vec<_> = inventory_manifest_tests
-            .difference(manifest_programs)
+            .difference(&tests_manifest_programs)
             .cloned()
             .collect();
         die(format!(
@@ -1193,9 +1200,12 @@ fn validate_and_expand(
             if !["sh", "c", "rs"].contains(&extension) {
                 die(format!("{id}: program `{program}` must end in .sh/.c/.rs"));
             }
-            if !program.starts_with("tests/") || program.split('/').any(|part| part == "..") {
+            // Vendored rr guests live in the pinned submodule, not tests/.
+            let below_tests = program.starts_with("tests/")
+                || program.starts_with("third-party/rr/src/test/");
+            if !below_tests || program.split('/').any(|part| part == "..") {
                 die(format!(
-                    "{id}: program must be a repo-relative path below tests/: {program}"
+                    "{id}: program must be a repo-relative path below tests/ or third-party/rr/src/test/: {program}"
                 ));
             }
             let path = repo_root.join(program);
@@ -1222,8 +1232,13 @@ fn validate_and_expand(
     }
     if let Some(preprocessors) = test.get("preprocessors") {
         let preprocessors = string_array(Some(preprocessors), &format!("{id}.preprocessors"));
-        if preprocessors.iter().any(|value| value != "e9patch") {
-            die(format!("{id}: the only supported preprocessor is e9patch"));
+        if preprocessors
+            .iter()
+            .any(|value| !matches!(value.as_str(), "e9patch" | "rr-generated-headers"))
+        {
+            die(format!(
+                "{id}: supported preprocessors are e9patch and rr-generated-headers"
+            ));
         }
     }
     if let Some(level) = test.get("proc") {
@@ -2232,6 +2247,17 @@ in-guest-trap = "unsupported"
     #[test]
     fn accepts_test_labels() {
         expand_util_c_with("labels: [strict-compat, full]");
+    }
+
+    #[test]
+    fn accepts_rr_generated_headers_preprocessor() {
+        expand_util_c_with("preprocessors: [rr-generated-headers]");
+    }
+
+    #[test]
+    #[should_panic(expected = "supported preprocessors are e9patch and rr-generated-headers")]
+    fn rejects_an_unknown_preprocessor() {
+        expand_util_c_with("preprocessors: [frobnicate]");
     }
 
     #[test]

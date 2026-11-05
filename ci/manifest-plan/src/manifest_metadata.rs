@@ -710,6 +710,12 @@ mod tests {
             fs::create_dir(&alias).unwrap();
             let alias = Self(alias);
             std::os::unix::fs::symlink(root.join("tests"), alias.path().join("tests")).unwrap();
+            // rr manifest programs live in the vendored submodule.
+            std::os::unix::fs::symlink(
+                root.join("third-party"),
+                alias.path().join("third-party"),
+            )
+            .unwrap();
             alias
         }
 

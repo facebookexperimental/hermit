@@ -4508,6 +4508,12 @@
     },
     {
       "disposition": "manifest-policy",
+      "path": "tests/e2e/manifests/rr.yaml",
+      "runner": "target/debug/test-harness via ci/manifest-plan",
+      "why": "tests/e2e/manifests/rr.yaml is owned by target/debug/test-harness via ci/manifest-plan: The `rr` YAML file is policy for the `rr` manifest bucket: it declares program identities, modes, backend partitions, and WHY reasons. It configures the common system and is not itself executable test input."
+    },
+    {
+      "disposition": "manifest-policy",
       "path": "tests/e2e/manifests/shared-futex-c.yaml",
       "runner": "target/debug/test-harness via ci/manifest-plan",
       "why": "tests/e2e/manifests/shared-futex-c.yaml is owned by target/debug/test-harness via ci/manifest-plan: The `shared-futex-c` YAML file is policy for the `shared-futex-c` manifest bucket: it declares program identities, modes, backend partitions, and WHY reasons. It configures the common system and is not itself executable test input."
@@ -4721,6 +4727,12 @@
       "path": "tests/e2e/performance/yield-storm.c",
       "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
       "why": "tests/e2e/performance/yield-storm.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the yield-storm workload from steady_state_common.c and is compiled as the performance/yield-storm cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/rr/prepare-rr-guest.sh",
+      "runner": "target/debug/test-harness via ci/manifest-plan",
+      "why": "tests/e2e/rr/prepare-rr-guest.sh is owned by target/debug/test-harness via ci/manifest-plan: Single preparation step for rr manifest guests; it generates rr syscall-enum headers then execs the guest compile, so the cell keeps one Preparation CPU observation."
     },
     {
       "disposition": "support-data",

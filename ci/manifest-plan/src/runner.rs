@@ -2703,7 +2703,9 @@ fn validate_document_with_cpu(
         validate_golden_kernel_floor(&test.id, &test.requires, &test.modes)?;
         match (&test.program, &test.direct) {
             (Some(program), None) => {
-                if !program.starts_with("tests/") || !root.join(program).exists() {
+                let below_tests = program.starts_with("tests/")
+                    || program.starts_with("third-party/rr/src/test/");
+                if !below_tests || !root.join(program).exists() {
                     return Err(format!("{}: missing program {program}", test.id));
                 }
             }
@@ -5641,10 +5643,24 @@ fn prepare_test_until(
             let output = dir.join("fixtures/program");
             if !context.prebuilt {
                 let _ = fs::remove_file(&output);
+                // rr guests include generated syscall-enum headers via
+                // util.h. Header generation and compilation run as ONE
+                // preparation process (prepare-rr-guest.sh) so the cell
+                // keeps a single Preparation CPU observation.
+                let rr_include = cell
+                    .test
+                    .preprocessors
+                    .iter()
+                    .any(|value| value == "rr-generated-headers")
+                    .then(|| dir.join("fixtures/rr-generated"));
                 let mut args = vec!["-std=c11", "-O2", "-g", "-Wall", "-Wextra", "-Werror"]
                     .into_iter()
                     .map(str::to_string)
                     .collect::<Vec<_>>();
+                if let Some(generated) = &rr_include {
+                    args.push("-I".into());
+                    args.push(generated.to_string_lossy().into_owned());
+                }
                 args.extend(
                     cell.test
                         .build
@@ -5655,12 +5671,26 @@ fn prepare_test_until(
                 args.push(context.root.join(program).to_string_lossy().into_owned());
                 args.push("-o".into());
                 args.push(output.to_string_lossy().into_owned());
+                let (prep_program, prep_args) = match &rr_include {
+                    Some(generated) => {
+                        let wrapper = context
+                            .root
+                            .join("tests/e2e/rr/prepare-rr-guest.sh")
+                            .to_string_lossy()
+                            .into_owned();
+                        let mut wrapped =
+                            vec![generated.to_string_lossy().into_owned(), "cc".into()];
+                        wrapped.extend(args);
+                        (wrapper, wrapped)
+                    }
+                    None => ("cc".to_string(), args),
+                };
                 cpu_usage_usec = cpu_usage_usec
                     .checked_add(run_preparation(
                         context,
                         dir,
-                        "cc",
-                        &args,
+                        &prep_program,
+                        &prep_args,
                         deadline,
                         wall_timeout_seconds,
                         observations,
