@@ -192,8 +192,9 @@ pub struct StartOpts {
 
     /// The CPU the recorded guest sees: x86-64-v2 (the default) or x86-64-v3,
     /// offered only on qualified ptrace hosts. The long help states what the
-    /// qualification leaves uncovered.
-    #[clap(long, value_enum, default_value_t, long_help = detcore_model::cpu_profile::CPU_PROFILE_LONG_HELP)]
+    /// qualification leaves uncovered. HERMIT_CPU_PROFILE supplies it when the
+    /// flag is absent, as for `hermit run`; the flag wins.
+    #[clap(long, value_enum, default_value_t, env = "HERMIT_CPU_PROFILE", long_help = detcore_model::cpu_profile::CPU_PROFILE_LONG_HELP)]
     cpu_profile: detcore_model::cpu_profile::CpuProfile,
 
     /// Refuse to record (exit 122) on a host whose retired-conditional-branch counter
@@ -1337,6 +1338,72 @@ mod tests {
             0,
             "a refused recording leaves nothing behind"
         );
+    }
+
+    /// Set in the child process of
+    /// [`record_start_takes_hermit_cpu_profile_when_the_flag_is_absent`]:
+    /// the arguments after `start`, one per line.
+    const RECORD_CPU_PROFILE_ARGS_IN_CHILD: &str = "HERMIT_TEST_RECORD_CPU_PROFILE_ARGS";
+
+    /// `record start --cpu-profile` reads HERMIT_CPU_PROFILE exactly as `hermit
+    /// run` does: unset is x86-64-v2, the flag wins, and a value that names no
+    /// profile is refused. Each parse runs in a child process given exactly
+    /// the variable under test.
+    #[test]
+    fn record_start_takes_hermit_cpu_profile_when_the_flag_is_absent() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[clap(flatten)]
+            start: StartOpts,
+        }
+        if let Some(args) = std::env::var_os(RECORD_CPU_PROFILE_ARGS_IN_CHILD) {
+            let args = args.into_string().unwrap();
+            let argv = ["start"]
+                .into_iter()
+                .chain(args.lines().filter(|arg| !arg.is_empty()))
+                .chain(["/bin/true"]);
+            match <Cli as clap::Parser>::try_parse_from(argv) {
+                Ok(cli) => println!("cpu-profile={}", cli.start.cpu_profile.name()),
+                Err(error) => println!("refused: {:?}", error.kind()),
+            }
+            return;
+        }
+
+        let test = format!(
+            "{}::record_start_takes_hermit_cpu_profile_when_the_flag_is_absent",
+            module_path!().split_once("::").unwrap().1
+        );
+        let parse = |variable: Option<&str>, args: &[&str]| -> String {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", &test, "--nocapture"])
+                .env(RECORD_CPU_PROFILE_ARGS_IN_CHILD, args.join("\n"))
+                .env_remove("HERMIT_CPU_PROFILE")
+                .env_remove("HERMIT_DATA_DIR");
+            if let Some(value) = variable {
+                child.env("HERMIT_CPU_PROFILE", value);
+            }
+            let output = child.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+                "the child for {variable:?} {args:?} did not run exactly once: {}\n{stdout}",
+                output.status,
+            );
+            stdout
+                .lines()
+                .find(|line| line.starts_with("cpu-profile=") || line.starts_with("refused: "))
+                .unwrap_or_else(|| panic!("the child printed no verdict:\n{stdout}"))
+                .to_owned()
+        };
+
+        assert_eq!(parse(None, &[]), "cpu-profile=x86-64-v2");
+        assert_eq!(parse(Some("x86-64-v3"), &[]), "cpu-profile=x86-64-v3");
+        assert_eq!(
+            parse(Some("x86-64-v3"), &["--cpu-profile=x86-64-v2"]),
+            "cpu-profile=x86-64-v2"
+        );
+        assert_eq!(parse(Some("x86-64-v4"), &[]), "refused: InvalidValue");
     }
 
     /// The refusal needs `--strict` and an inexact counter, and covers e9patch

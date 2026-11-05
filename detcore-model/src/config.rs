@@ -214,8 +214,11 @@ pub struct Config {
 
     /// The CPU the guest sees: virtual x86-64-v2/v3 or intercepted host
     /// features without hardware randomness. The long help states each
-    /// profile's host requirements and determinism limits.
-    #[clap(long, value_enum, default_value_t, long_help = crate::cpu_profile::CPU_PROFILE_LONG_HELP)]
+    /// profile's host requirements and determinism limits. Like
+    /// HERMIT_EPOCH, HERMIT_CPU_PROFILE supplies the value when the flag is
+    /// absent; an explicit flag wins, unset means x86-64-v2, and a value that
+    /// names no profile is refused. Admission is the same either way.
+    #[clap(long, value_enum, default_value_t, env = "HERMIT_CPU_PROFILE", long_help = crate::cpu_profile::CPU_PROFILE_LONG_HELP)]
     #[serde(default)]
     pub cpu_profile: crate::cpu_profile::CpuProfile,
 
@@ -2150,8 +2153,8 @@ const CONFIG_DEFINITION_SOURCES: &[&[u8]] = &[
 /// can make it decode the handshake or a subsequent request at the wrong offsets.
 fn config_wire_default() -> Config {
     // `Config::default()` is intentionally environment-aware through Clap.
-    // A coordinator may therefore inherit HERMIT_EPOCH/HERMIT_PRNG or
-    // HERMIT_SCHED_SEED even though the separately loaded plugin receives a
+    // A coordinator may therefore inherit HERMIT_EPOCH/HERMIT_PRNG,
+    // HERMIT_SCHED_SEED or HERMIT_CPU_PROFILE even though the separately loaded plugin receives a
     // minimal guest environment. Those invocation values are payload data,
     // not wire shape, and must not make two artifacts from the same source
     // reject one another. Explicit arguments take precedence over Clap's
@@ -2162,6 +2165,7 @@ fn config_wire_default() -> Config {
         &format!("--epoch={DEFAULT_EPOCH_STR}"),
         "--seed=0",
         "--sched-seed=0",
+        "--cpu-profile=x86-64-v2",
     ]);
     config.sched_seed = None;
     // `BackendCapabilities` is defined in Reverie, outside
@@ -2973,7 +2977,7 @@ mod legacy_backend_json {
     /// `Arg::env` reads a variable's value when the binding is made), but
     /// removing the bindings discards those values, so no ambient value
     /// reaches the parse. `Config::default()` would instead parse
-    /// HERMIT_EPOCH, HERMIT_PRNG and HERMIT_SCHED_SEED, and exit the process
+    /// HERMIT_EPOCH, HERMIT_PRNG, HERMIT_SCHED_SEED and HERMIT_CPU_PROFILE, and exit the process
     /// when one of them does not parse; the legacy decoder was not affected
     /// by any of them.
     fn config_field_order() -> serde_json::Result<Vec<String>> {
@@ -4968,7 +4972,7 @@ mod tests {
     /// that run from one that selected no test.
     const LEGACY_DECODED_IN_CHILD: &str = "legacy configuration decoded under the ambient settings";
 
-    /// Clap reads HERMIT_EPOCH, HERMIT_PRNG and HERMIT_SCHED_SEED when it
+    /// Clap reads HERMIT_EPOCH, HERMIT_PRNG, HERMIT_SCHED_SEED and HERMIT_CPU_PROFILE when it
     /// parses a `Config`, and exits the process when one of them does not
     /// parse. The legacy decoder read none of them, so a valid legacy object
     /// or array decodes to the configuration it lists whatever they hold. Each
@@ -4994,7 +4998,12 @@ mod tests {
             return;
         }
 
-        const VARIABLES: [&str; 3] = ["HERMIT_EPOCH", "HERMIT_PRNG", "HERMIT_SCHED_SEED"];
+        const VARIABLES: [&str; 4] = [
+            "HERMIT_EPOCH",
+            "HERMIT_PRNG",
+            "HERMIT_SCHED_SEED",
+            "HERMIT_CPU_PROFILE",
+        ];
         let text = OsStr::new("not-a-value");
         let bytes = OsStr::from_bytes(b"\xff");
         let mut settings: Vec<Vec<(&str, &OsStr)>> = vec![Vec::new()];
@@ -5048,6 +5057,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Set in the child process of
+    /// [`hermit_cpu_profile_supplies_the_profile_only_when_the_flag_is_absent`]:
+    /// the arguments it parses, one per line.
+    const CPU_PROFILE_ARGS_IN_CHILD: &str = "DETCORE_MODEL_TEST_CPU_PROFILE_ARGS";
+
+    /// HERMIT_CPU_PROFILE gives `--cpu-profile` its value when the flag is
+    /// absent: unset is x86-64-v2, an explicit flag wins over the variable,
+    /// and a value that names no profile is refused. The wire default stays
+    /// x86-64-v2 whatever the variable holds. Each parse runs in a child
+    /// process given exactly the variable under test, because Clap reads the
+    /// process environment.
+    #[test]
+    fn hermit_cpu_profile_supplies_the_profile_only_when_the_flag_is_absent() {
+        use clap::Parser;
+
+        if let Some(args) = std::env::var_os(CPU_PROFILE_ARGS_IN_CHILD) {
+            let args = args.into_string().unwrap();
+            let argv = std::iter::once("config").chain(args.lines());
+            match Config::try_parse_from(argv) {
+                Ok(config) => println!(
+                    "cpu-profile={} wire={}",
+                    config.cpu_profile.name(),
+                    config_wire_default().cpu_profile.name()
+                ),
+                Err(error) => println!("refused: {:?}", error.kind()),
+            }
+            return;
+        }
+
+        let test = format!(
+            "{}::hermit_cpu_profile_supplies_the_profile_only_when_the_flag_is_absent",
+            module_path!().split_once("::").unwrap().1
+        );
+        let parse = |variable: Option<&str>, args: &[&str]| -> String {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", &test, "--nocapture"])
+                .env(CPU_PROFILE_ARGS_IN_CHILD, args.join("\n"));
+            for name in [
+                "HERMIT_EPOCH",
+                "HERMIT_PRNG",
+                "HERMIT_SCHED_SEED",
+                "HERMIT_CPU_PROFILE",
+            ] {
+                child.env_remove(name);
+            }
+            if let Some(value) = variable {
+                child.env("HERMIT_CPU_PROFILE", value);
+            }
+            let output = child.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+                "the child for {variable:?} {args:?} did not run exactly once: {}\n{stdout}",
+                output.status,
+            );
+            stdout
+                .lines()
+                .find(|line| line.starts_with("cpu-profile=") || line.starts_with("refused: "))
+                .unwrap_or_else(|| panic!("the child printed no verdict:\n{stdout}"))
+                .to_owned()
+        };
+
+        assert_eq!(parse(None, &[]), "cpu-profile=x86-64-v2 wire=x86-64-v2");
+        assert_eq!(
+            parse(Some("x86-64-v3"), &[]),
+            "cpu-profile=x86-64-v3 wire=x86-64-v2"
+        );
+        assert_eq!(
+            parse(Some("host-no-rdrand"), &[]),
+            "cpu-profile=host-no-rdrand wire=x86-64-v2"
+        );
+        assert_eq!(
+            parse(None, &["--cpu-profile=x86-64-v3"]),
+            "cpu-profile=x86-64-v3 wire=x86-64-v2"
+        );
+        assert_eq!(
+            parse(Some("x86-64-v3"), &["--cpu-profile=x86-64-v2"]),
+            "cpu-profile=x86-64-v2 wire=x86-64-v2"
+        );
+        assert_eq!(parse(Some("x86-64-v4"), &[]), "refused: InvalidValue");
+        assert_eq!(
+            parse(Some("x86-64-v4"), &["--cpu-profile=x86-64-v2"]),
+            "cpu-profile=x86-64-v2 wire=x86-64-v2"
+        );
     }
 
     /// `backend` and `shared_dequeue_timers` were not keys of the legacy form,
@@ -5625,6 +5721,7 @@ mod tests {
             epoch: "2042-03-04T05:06:07.890123456Z".parse().unwrap(),
             seed: 41,
             sched_seed: Some(42),
+            cpu_profile: crate::cpu_profile::CpuProfile::X86_64V3,
             ..Config::default()
         };
 
@@ -5640,6 +5737,10 @@ mod tests {
         );
         assert_eq!(canonical.seed, 0);
         assert_eq!(canonical.sched_seed, None);
+        assert_eq!(
+            canonical.cpu_profile,
+            crate::cpu_profile::CpuProfile::X86_64V2
+        );
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
