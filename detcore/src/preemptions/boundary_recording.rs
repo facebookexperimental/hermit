@@ -570,6 +570,13 @@ impl Recording {
         self.metadata().format_version()
     }
 
+    /// What the recording states about its run's exclusive-loop
+    /// rewrite, for replay admission
+    /// (`super::reserved_input::validate_config_replay_inputs`).
+    pub(super) fn recorded_rewrite_exclusives(&self) -> super::RecordedRewriteExclusives {
+        self.metadata().recorded_rewrite_exclusives()
+    }
+
     fn metadata(&self) -> &PreemptionRecord {
         match self {
             Self::Legacy(record) => record,

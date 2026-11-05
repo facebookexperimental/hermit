@@ -27,11 +27,10 @@
 //! writes.
 
 pub mod elf;
+pub use detcore::aarch64_lse::REWRITE_FORMAT_VERSION;
 pub use detcore::aarch64_lse::insn;
 pub use detcore::aarch64_lse::mapping;
 pub use detcore::aarch64_lse::rewrite;
-
-pub use detcore::aarch64_lse::REWRITE_FORMAT_VERSION;
 
 /// Whether this host executes the FEAT_LSE atomics the rewrite emits.
 ///

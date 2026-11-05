@@ -362,6 +362,13 @@ pub struct PreemptionRecord {
     /// instructions no replay that rewrites can be shown to reproduce,
     /// and which is therefore refused for such a replay.
     rewrite_exclusives: Option<RewriteExclusives>,
+    /// Whether the record's run rewrote exclusive loops by the removed
+    /// stripped-file heuristic (`rewrite_exclusives_stripped_heuristic`).
+    /// No writer sets it -- the heuristic is gone -- but a record that
+    /// states it keeps it through every representation and editor this
+    /// Hermit passes it through, so replay admission can refuse it
+    /// rather than lose the marker on decode and admit it as plain.
+    rewrite_exclusives_stripped_heuristic: bool,
 }
 
 /// A count a record's run observed on its host rather than decided: it is
@@ -655,6 +662,7 @@ impl PreemptionRecord {
             rows_alone: false,
             background_starts_unnoted: false,
             rewrite_exclusives: None,
+            rewrite_exclusives_stripped_heuristic: false,
         }
     }
 
@@ -731,6 +739,7 @@ impl PreemptionRecord {
             rows_alone,
             background_starts_unnoted,
             rewrite_exclusives,
+            rewrite_exclusives_stripped_heuristic,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -820,6 +829,7 @@ impl PreemptionRecord {
             rows_alone: *rows_alone,
             background_starts_unnoted: *background_starts_unnoted,
             rewrite_exclusives: *rewrite_exclusives,
+            rewrite_exclusives_stripped_heuristic: *rewrite_exclusives_stripped_heuristic,
         };
         // The background starts are points of the recorded run too, and go
         // the same way, as an edited record's do (`forget_run_points`): a
@@ -1242,6 +1252,23 @@ impl PreemptionRecord {
         self.rewrite_exclusives
     }
 
+    /// Whether the record states its run rewrote exclusive loops by the
+    /// removed stripped-file heuristic, whose rewritten instructions no
+    /// supported rewrite reproduces.
+    pub fn rewrite_exclusives_stripped_heuristic(&self) -> bool {
+        self.rewrite_exclusives_stripped_heuristic
+    }
+
+    /// What this record states about its run's exclusive-loop rewrite,
+    /// for replay admission (`rewrite_exclusives_mismatch`).
+    pub fn recorded_rewrite_exclusives(&self) -> RecordedRewriteExclusives {
+        RecordedRewriteExclusives {
+            rewrite: self.rewrite_exclusives,
+            in_memory: self.rewrite_exclusives_in_memory,
+            stripped_heuristic: self.rewrite_exclusives_stripped_heuristic,
+        }
+    }
+
     /// The same record, stating the exclusive-loop rewrite the trials it
     /// came from applied, if any; analyze stamps it on every record it
     /// writes. The older in-memory field is set to agree.
@@ -1459,6 +1486,7 @@ impl PreemptionRecord {
             // Rows alone note no starts by that mark (`notes_background_starts`).
             background_starts_unnoted: false,
             rewrite_exclusives: self.rewrite_exclusives,
+            rewrite_exclusives_stripped_heuristic: self.rewrite_exclusives_stripped_heuristic,
         }
     }
 
@@ -1541,6 +1569,7 @@ impl PreemptionRecord {
             rows_alone: false,
             background_starts_unnoted: false,
             rewrite_exclusives: None,
+            rewrite_exclusives_stripped_heuristic: false,
         }
     }
 
@@ -3713,11 +3742,7 @@ mod tests {
             );
             let back: PreemptionRecord = serde_json::from_str(json).unwrap();
             assert_eq!(back.rewrite_exclusives(), None, "{json}");
-            if !expected.stripped_heuristic {
-                // A legacy key no record field owns is read for admission
-                // only, and is not written back.
-                assert_eq!(serde_json::to_string(&back).unwrap(), json, "{json}");
-            }
+            assert_eq!(serde_json::to_string(&back).unwrap(), json, "{json}");
         }
         let provenance = |mode, format_version| {
             Some(RewriteExclusives {
@@ -3803,6 +3828,51 @@ mod tests {
                 "{recorded:?} replayed with {replay:?}"
             );
         }
+    }
+
+    /// The legacy heuristic marker survives every representation a
+    /// supported reader or editor passes a record through -- the slice-
+    /// boundary envelope (whose settings are reconstructed from the
+    /// decoded record) and the strip-times editor -- so admission still
+    /// refuses the record on the far side of each.
+    #[test]
+    fn a_heuristic_record_keeps_its_marker_through_envelopes_and_editors() {
+        let directory = tempfile::tempdir().unwrap();
+        let envelope = directory.path().join("boundary.json");
+        std::fs::write(
+            &envelope,
+            r#"{"slice_boundary_recording":{"preemptions":{"per_thread":{},"global":[],"rewrite_exclusives_stripped_heuristic":true},"schedule":{"protocol":"hermit-slice-boundaries","version":1,"record_count":0,"boundary_count":0,"records":[]}}}"#,
+        )
+        .unwrap();
+        let recorded = read_recorded_rewrite_exclusives(&envelope).unwrap();
+        assert!(recorded.stripped_heuristic, "{recorded:?}");
+        assert!(rewrite_exclusives_mismatch("--replay-schedule-from=x", recorded, None).is_some());
+        let recording = boundary_recording::Recording::read(&envelope).unwrap();
+        let error = recording
+            .validate_replay_inputs(
+                "--replay-schedule-from=x",
+                detcore_model::pid::GuestIds::Namespace,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error}").contains("cannot reproduce the run"),
+            "{error}"
+        );
+
+        let flat = directory.path().join("heuristic.json");
+        std::fs::write(
+            &flat,
+            r#"{"per_thread":{},"global":[],"rewrite_exclusives_stripped_heuristic":true}"#,
+        )
+        .unwrap();
+        let stripped = strip_times_from_events_file(
+            &flat,
+            Some(directory.path().join("heuristic.notimes.json")),
+        )
+        .unwrap();
+        let recorded = read_recorded_rewrite_exclusives(&stripped).unwrap();
+        assert!(recorded.stripped_heuristic, "{recorded:?}");
+        assert!(rewrite_exclusives_mismatch("--replay-schedule-from=x", recorded, None).is_some());
     }
 
     #[test]
@@ -6945,6 +7015,20 @@ pub struct RecordedRewriteExclusives {
     /// (`rewrite_exclusives_stripped_heuristic`), whose rewritten
     /// instructions no supported rewrite reproduces.
     pub stripped_heuristic: bool,
+}
+
+/// The exclusive-loop rewrite a run under `config` applies, as its
+/// preemption record states it and as a replay of that record must be
+/// admitted under: the config's rewrite form at this Hermit's rewrite
+/// format version, or `None` when the run rewrites nothing.
+pub fn config_rewrite_exclusives(config: &crate::Config) -> Option<RewriteExclusives> {
+    if config.rewrite_exclusives_in_memory {
+        Some(RewriteExclusives::current(RewriteExclusivesMode::Memory))
+    } else if !config.rewrite_exclusives_overlay.is_empty() {
+        Some(RewriteExclusives::current(RewriteExclusivesMode::Overlay))
+    } else {
+        None
+    }
 }
 
 /// Read only what a preemption record file states about its run's

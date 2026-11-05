@@ -94,6 +94,8 @@ struct RawRecord {
     background_starts_unnoted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rewrite_exclusives: Option<super::RewriteExclusives>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    rewrite_exclusives_stripped_heuristic: bool,
 }
 
 // The INFO comparison projection: RawRecord's exact serialization except the

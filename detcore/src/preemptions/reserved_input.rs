@@ -206,11 +206,25 @@ impl PreemptionRecord {
 
     /// Reconcile numbering and private-input provenance on the complete
     /// decoded record that an authoritative replay loader will install.
+    /// A record of the removed stripped-file heuristic rewrite is
+    /// refused here, on the decoded bytes every loader installs: no
+    /// supported rewrite reproduces its instructions, whatever the
+    /// replay's own rewrite, which `validate_config_replay_inputs`
+    /// compares in full at launch.
     pub fn validate_replay_inputs(
         &self,
         source: &str,
         guest_ids: GuestIds,
     ) -> Result<(), RecordAdmissionRefusal> {
+        if self.rewrite_exclusives_stripped_heuristic {
+            let refusal = super::rewrite_exclusives_mismatch(
+                source,
+                self.recorded_rewrite_exclusives(),
+                None,
+            )
+            .expect("a heuristic record is always refused");
+            return Err(RecordAdmissionRefusal(refusal));
+        }
         if let Some(reason) =
             super::guest_ids_mismatch(source, self.guest_ids.unwrap_or_default(), guest_ids)
         {
@@ -255,17 +269,26 @@ pub fn read_recorded_reserved_input(
 /// Early launch preflight. Each authoritative loader repeats the check on
 /// the same immutable decoded bytes it installs; this pathname check is not
 /// that final authority. Both Config inputs are checked independently.
+/// The run's exclusive-loop rewrite must be the one each record states
+/// (`super::rewrite_exclusives_mismatch` against the final config), so
+/// every launch path -- the CLI and the public library entries alike --
+/// refuses another rewrite before any backend starts the guest.
 pub fn validate_config_replay_inputs(config: &crate::Config) -> anyhow::Result<()> {
     for (option, path) in [
         ("--replay-schedule-from", &config.replay_schedule_from),
         ("--replay-preemptions-from", &config.replay_preemptions_from),
     ] {
         if let Some(path) = path {
+            let source = format!("{option} {}", path.display());
             let recording = super::boundary_recording::Recording::read(path)?;
-            recording.validate_replay_inputs(
-                &format!("{option} {}", path.display()),
-                config.guest_ids,
-            )?;
+            recording.validate_replay_inputs(&source, config.guest_ids)?;
+            if let Some(refusal) = super::rewrite_exclusives_mismatch(
+                &source,
+                recording.recorded_rewrite_exclusives(),
+                super::config_rewrite_exclusives(config),
+            ) {
+                return Err(RecordAdmissionRefusal(refusal).into());
+            }
         }
     }
     Ok(())
@@ -523,6 +546,83 @@ mod tests {
                 .chain()
                 .any(|cause| cause.is::<RecordAdmissionRefusal>())
         );
+    }
+
+    /// The shared launch preflight refuses a replay whose exclusive
+    /// rewrite is not the one its record states -- either recorded mode
+    /// with rewriting off, a same-mode record of another rewrite format,
+    /// a record stating no provenance when the run rewrites, and a
+    /// legacy heuristic record inside the boundary envelope -- with the
+    /// typed admission refusal, before any backend starts.
+    #[test]
+    fn config_admission_refuses_another_exclusive_rewrite() {
+        use crate::preemptions::RewriteExclusives;
+        use crate::preemptions::RewriteExclusivesMode;
+        let directory = tempfile::tempdir().unwrap();
+        let write = |name: &str, rewrite: Option<RewriteExclusives>| {
+            let path = directory.path().join(name);
+            PreemptionRecord::from_sched_events(Vec::new())
+                .with_rewrite_exclusives(rewrite)
+                .write_to_disk(&path)
+                .unwrap();
+            path
+        };
+        let plain = write("plain.json", None);
+        let memory6 = write(
+            "memory6.json",
+            Some(RewriteExclusives::current(RewriteExclusivesMode::Memory)),
+        );
+        let overlay6 = write(
+            "overlay6.json",
+            Some(RewriteExclusives::current(RewriteExclusivesMode::Overlay)),
+        );
+        let overlay5 = directory.path().join("overlay5.json");
+        std::fs::write(
+            &overlay5,
+            r#"{"per_thread":{},"global":[],"rewrite_exclusives":{"mode":"overlay","format_version":5}}"#,
+        )
+        .unwrap();
+        let heuristic = directory.path().join("boundary-heuristic.json");
+        std::fs::write(
+            &heuristic,
+            r#"{"slice_boundary_recording":{"preemptions":{"per_thread":{},"global":[],"rewrite_exclusives_stripped_heuristic":true},"schedule":{"protocol":"hermit-slice-boundaries","version":1,"record_count":0,"boundary_count":0,"records":[]}}}"#,
+        )
+        .unwrap();
+        // (in_memory, overlay) of the final config.
+        for (path, current, refused) in [
+            (&plain, (false, false), false),
+            (&plain, (false, true), true),
+            (&plain, (true, false), true),
+            (&memory6, (false, false), true),
+            (&memory6, (false, true), true),
+            (&memory6, (true, false), false),
+            (&overlay6, (false, false), true),
+            (&overlay6, (true, false), true),
+            (&overlay6, (false, true), false),
+            (&overlay5, (false, true), true),
+            (&heuristic, (false, false), true),
+            (&heuristic, (false, true), true),
+        ] {
+            for from_schedule in [true, false] {
+                let config = crate::Config {
+                    rewrite_exclusives_in_memory: current.0,
+                    rewrite_exclusives_overlay: current.1,
+                    replay_schedule_from: from_schedule.then(|| path.clone()),
+                    replay_preemptions_from: (!from_schedule).then(|| path.clone()),
+                    ..crate::Config::default()
+                };
+                let result = validate_config_replay_inputs(&config);
+                assert_eq!(result.is_err(), refused, "{path:?} under {current:?}");
+                if let Err(error) = result {
+                    assert!(
+                        error
+                            .chain()
+                            .any(|cause| cause.is::<RecordAdmissionRefusal>()),
+                        "{error:#}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

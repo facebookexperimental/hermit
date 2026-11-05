@@ -5794,17 +5794,7 @@ impl Scheduler {
                 .with_chaos_timeslice(cfg.chaos_timeslice)
                 .with_guest_ids(cfg.guest_ids)
                 .with_queued_sleeps_registered_at_first_pass(queued_sleeps_registered_at_first_pass)
-                .with_rewrite_exclusives(if cfg.rewrite_exclusives_in_memory {
-                    Some(crate::preemptions::RewriteExclusives::current(
-                        crate::preemptions::RewriteExclusivesMode::Memory,
-                    ))
-                } else if cfg.rewrite_exclusives_overlay {
-                    Some(crate::preemptions::RewriteExclusives::current(
-                        crate::preemptions::RewriteExclusivesMode::Overlay,
-                    ))
-                } else {
-                    None
-                })
+                .with_rewrite_exclusives(crate::preemptions::config_rewrite_exclusives(cfg))
                 .with_post_crash_timeslice(
                     cfg.post_crash_timeslice_in_effect()
                         .map(std::num::NonZeroU64::get),

@@ -8733,6 +8733,50 @@ mod tests {
         }
     }
 
+    /// The public entry refuses a replay under another exclusive
+    /// rewrite than its record's, before the guest starts: the shared
+    /// launch preflight, not only the CLI flag check, carries the
+    /// refusal (`detcore::preemptions::RecordAdmissionRefusal`).
+    #[test]
+    fn run_with_output_refuses_another_exclusive_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, json) in [
+            (
+                "memory6.json",
+                r#"{"per_thread":{},"global":[],"rewrite_exclusives_in_memory":true,"rewrite_exclusives":{"mode":"memory","format_version":6}}"#,
+            ),
+            (
+                "overlay6.json",
+                r#"{"per_thread":{},"global":[],"rewrite_exclusives":{"mode":"overlay","format_version":6}}"#,
+            ),
+            (
+                "heuristic.json",
+                r#"{"slice_boundary_recording":{"preemptions":{"per_thread":{},"global":[],"rewrite_exclusives_stripped_heuristic":true},"schedule":{"protocol":"hermit-slice-boundaries","version":1,"record_count":0,"boundary_count":0,"records":[]}}}"#,
+            ),
+        ] {
+            let record = dir.path().join(name);
+            std::fs::write(&record, json).unwrap();
+            let config = super::DetConfig {
+                replay_schedule_from: Some(record.clone()),
+                ..super::DetConfig::default()
+            };
+            let mut command = super::Command::new("/bin/echo");
+            command.arg("PROVENANCE_GUEST_STARTED");
+            let error = super::run_with_output(command, config, false, &None)
+                .expect_err("the other rewrite must be refused");
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.is::<detcore::preemptions::RecordAdmissionRefusal>()),
+                "{name}: {error:#}"
+            );
+            assert!(
+                format!("{error:#}").contains("cannot reproduce the run"),
+                "{name}: {error:#}"
+            );
+        }
+    }
+
     #[test]
     fn liteinst_public_dispatch_runs_in_guest_detcore() {
         if Backend::Liteinst.ensure_available().is_err() {
