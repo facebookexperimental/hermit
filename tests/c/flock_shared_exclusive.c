@@ -670,6 +670,30 @@ static void proc_locks_rows(char* out, size_t size) {
   }
 }
 
+/* proc_locks_rows once two consecutive scans agree, or after 5 seconds.
+   /proc/locks is a seq_file over locks belonging to every process; while it
+   is being read, unrelated lock churn can shift the traversal and cause one
+   scan to skip or repeat this file's row even though this scenario's locks
+   are stable at a channel-synchronized point. Full-object matching (above)
+   cannot repair an incoherent scan, so settle on agreement rather than let
+   one snapshot decide. The last scan is returned if they never agree.
+   (Measured at the full-object head without this: 3 failures in 1000 native
+   runs, two missing rows and one duplicated WRITE; with it, 0 in 1000.) */
+static void proc_locks_rows_settled(char* out, size_t size) {
+  char previous[128];
+  proc_locks_rows(previous, sizeof(previous));
+  for (int attempt = 0; attempt < 500; attempt++) {
+    sleep_ms(10);
+    proc_locks_rows(out, size);
+    if (strcmp(out, previous) == 0) {
+      return;
+    }
+    size_t length = strnlen(out, sizeof(previous) - 1);
+    memcpy(previous, out, length);
+    previous[length] = '\0';
+  }
+}
+
 /* proc_locks_rows once they are `want`, or after 5 seconds: natively a
    waiter blocks when the kernel's scheduler runs it; under Hermit in its turn,
    which the reads' sleeps let come. */
@@ -711,17 +735,17 @@ static void scenario_proc_locks(void) {
   char line[64];
   hear(report, line, sizeof(line));
   expect(s, "child LOCK_SH", line, "ok");
-  proc_locks_rows(rows, sizeof(rows));
+  proc_locks_rows_settled(rows, sizeof(rows));
   expect(s, "rows with two shared holders", rows, "READ READ");
   say(go, "exit");
   reap(child);
-  proc_locks_rows(rows, sizeof(rows));
+  proc_locks_rows_settled(rows, sizeof(rows));
   expect(s, "rows after the child's exit", rows, "READ");
   expect(s, "parent converts to LOCK_EX", attempt(held, LOCK_EX), "ok");
-  proc_locks_rows(rows, sizeof(rows));
+  proc_locks_rows_settled(rows, sizeof(rows));
   expect(s, "rows after the conversion", rows, "WRITE");
   close(held);
-  proc_locks_rows(rows, sizeof(rows));
+  proc_locks_rows_settled(rows, sizeof(rows));
   expect(s, "rows after the last close", rows, "none");
   close_channel(report);
   close_channel(go);
