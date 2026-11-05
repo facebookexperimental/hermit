@@ -1019,8 +1019,9 @@ mod tests {
     #[test]
     fn cpuinfo_describes_the_virtual_cpu() {
         // Each line is derived from the table above as Linux derives it; see
-        // `InterceptedCpuid::cpuinfo`. The flags include `avx` without
-        // `xsave` and `hle`/`rtm` because the table advertises them
+        // `InterceptedCpuid::cpuinfo`. The flags include the x86-64-v3 set
+        // (`fma`, `movbe`, `xsave`, `f16c`, `abm`) and `hle`/`rtm` because the
+        // table advertises them
         // (https://github.com/rrnewton/hermit/issues/4251,
         // https://github.com/rrnewton/hermit/issues/4252); Linux shows them too.
         let expected = "processor\t: 0\n\
@@ -1042,8 +1043,8 @@ mod tests {
             cpuid level\t: 13\n\
             wp\t\t: yes\n\
             flags\t\t: fpu de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pse36 \
-            clflush mmx fxsr sse sse2 syscall nx lm pni ssse3 cx16 sse4_1 sse4_2 x2apic popcnt \
-            avx hypervisor lahf_lm fsgsbase bmi1 hle avx2 smep bmi2 erms invpcid rtm adx smap\n\
+            clflush mmx fxsr sse sse2 syscall nx lm pni ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt \
+            xsave avx f16c hypervisor lahf_lm abm fsgsbase bmi1 hle avx2 smep bmi2 erms invpcid rtm adx smap\n\
             bugs\t\t: cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs taa \
             itlb_multihit bhi spectre_v2_user its\n\
             bogomips\t: 2000.00\n\
