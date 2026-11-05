@@ -3245,12 +3245,17 @@ fn config_wire_default() -> Config {
     config.sched_seed = None;
     // `BackendCapabilities` is defined in Reverie, outside
     // `CONFIG_DEFINITION_SOURCES`, so the source domain cannot see a change to
-    // it; only its encoding can. Every field encodes in one byte (a bool, or
-    // the `u8` width of `hardware_watchpoints`), so any constant
-    // carries every field's width (see
+    // it; only its encoding can. Every field but the optional one encodes at
+    // a fixed width (a bool or the `u8` width of `hardware_watchpoints` in
+    // one byte, the `u64` signal set in eight), so any constant carries those
+    // widths (see
     // `config_fingerprint_sees_the_width_of_every_backend_capability`). KVM's
     // is kept, as it was when one field was optional and only KVM's set it.
+    // The optional `rcb_clock_contract` is set to ptrace's, the one contract
+    // any backend states, because a `None` would encode as the same bare tag
+    // whatever the contract's type became.
     config.backend = BackendCapabilities::KVM;
+    config.backend.rcb_clock_contract = BackendCapabilities::PTRACE.rcb_clock_contract;
     config
 }
 
@@ -3503,7 +3508,9 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// `places_orphans` reads back as false and `publishable_parent_death_signals`
 /// as the empty set, DBT's values; KVM, the one backend that reports
 /// otherwise, travels through this form only inside the versioned envelope
-/// too.
+/// too. `rcb_clock_contract` reads back as `None`, DBT's value; ptrace, the
+/// one backend that states a contract, travels through this form only
+/// inside the versioned envelope as well.
 ///
 /// `cpuid_virtualized_by_backend` supplies no capability either: it said the
 /// backend installed a CPUID policy of its own, which no backend does any
@@ -3652,6 +3659,23 @@ pub fn decode_backend_config_json(json: &str) -> serde_json::Result<Config> {
             ),
         ));
     }
+    // `BackendCapabilities` reads a capability Reverie added later (with
+    // `#[serde(default)]`, such as `rcb_clock_contract`) as its default when
+    // it is absent. The envelope is written whole by this build's
+    // `encode_backend_config_json`, so every capability must be named: an
+    // absent one is refused rather than defaulted.
+    let named: EnvelopeBackendKeys = serde_json::from_str(json)?;
+    let expected = serde_json::to_value(envelope.backend)?;
+    if let Some(missing) = expected
+        .as_object()
+        .into_iter()
+        .flat_map(|capabilities| capabilities.keys())
+        .find(|capability| !named.backend.contains_key(capability.as_str()))
+    {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            format_args!("missing field `{missing}` in the envelope's backend"),
+        ));
+    }
     let mut config = from_legacy_backend_json(envelope.config.get())?;
     config.backend = envelope.backend;
     Ok(config)
@@ -3664,6 +3688,14 @@ struct VersionedBackendConfig<'a> {
     #[serde(borrow)]
     config: &'a serde_json::value::RawValue,
     backend: BackendCapabilities,
+}
+
+/// The capability names a versioned envelope gives, read apart from the
+/// typed [`VersionedBackendConfig`], which has already refused duplicate and
+/// unknown keys.
+#[derive(Deserialize)]
+struct EnvelopeBackendKeys {
+    backend: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The names of the fifteen legacy backend keys, in the order
@@ -3821,6 +3853,12 @@ impl LegacyBackendKeys {
         // only by the versioned envelope of `encode_backend_config_json`,
         // never by these keys.
         backend.hardware_watchpoints = 0;
+        // Added after the legacy form froze (Reverie 7535309b): `None`, no
+        // qualified RCB clock, DBT's value, the form's only reader. Ptrace,
+        // the one backend that states a contract, is preserved exactly only
+        // by the versioned envelope of `encode_backend_config_json`, never by
+        // these keys.
+        backend.rcb_clock_contract = None;
         backend
     }
 }
@@ -4954,6 +4992,9 @@ mod tests {
         // The legacy form carries no width for `hardware_watchpoints`: it
         // reads back as 0, the minimal width (see `LegacyBackendKeys::capabilities`).
         backend.hardware_watchpoints = 0;
+        // Added after the legacy form froze: it reads back as `None` (see
+        // `LegacyBackendKeys::capabilities`).
+        backend.rcb_clock_contract = None;
         backend
     }
 
@@ -5048,14 +5089,20 @@ mod tests {
         for (name, value) in baseline.as_object().unwrap() {
             let mut edited = baseline.clone();
             // Every capability is a bool except `hardware_watchpoints`, a
-            // `u8` width, and `publishable_parent_death_signals`, a `u64`
-            // set of signal bits: flip a bool, and move a number to another
-            // value (DBT's is 0 for both: width 1, and KVM's set).
+            // `u8` width, `publishable_parent_death_signals`, a `u64` set of
+            // signal bits, and `rcb_clock_contract`, an optional contract:
+            // flip a bool, and move a number to another value (DBT's is 0
+            // for both: width 1, and KVM's set), and DBT's absent contract
+            // to ptrace's.
             edited[name] = match name.as_str() {
                 "hardware_watchpoints" => serde_json::Value::from(1u8),
                 "publishable_parent_death_signals" => serde_json::Value::from(
                     BackendCapabilities::KVM.publishable_parent_death_signals,
                 ),
+                "rcb_clock_contract" => {
+                    assert!(value.is_null(), "DBT states no RCB clock contract");
+                    serde_json::to_value(BackendCapabilities::PTRACE.rcb_clock_contract).unwrap()
+                }
                 _ => serde_json::Value::Bool(!value.as_bool().unwrap()),
             };
             let backend = serde_json::from_value(edited).unwrap();
@@ -5620,8 +5667,9 @@ mod tests {
     /// (`supports_blocked_wait_signal_interruption` and the four split out of
     /// it, `delivers_preemption_timer_events`,
     /// `runs_guest_code_between_injections`, `reports_sigreturns`,
-    /// `kernel_never_walks_robust_lists`, `places_orphans`, and
-    /// `publishable_parent_death_signals`, which reads back as the empty set)
+    /// `kernel_never_walks_robust_lists`, `places_orphans`,
+    /// `publishable_parent_death_signals`, which reads back as the empty set,
+    /// and `rcb_clock_contract`, which reads back as `None`)
     /// never enter it, whatever their
     /// value: the legacy string keeps its bytes, and they read
     /// back as false from both the object and the array form.
@@ -5640,6 +5688,8 @@ mod tests {
         on.backend.places_orphans = true;
         on.backend.publishable_parent_death_signals =
             BackendCapabilities::KVM.publishable_parent_death_signals;
+        on.backend.rcb_clock_contract = BackendCapabilities::PTRACE.rcb_clock_contract;
+        assert!(on.backend.rcb_clock_contract.is_some());
         let json = to_legacy_backend_json(&on).unwrap();
         assert_eq!(json, to_legacy_backend_json(&off).unwrap());
         for key in [
@@ -5654,6 +5704,7 @@ mod tests {
             "kernel_never_walks_robust_lists",
             "places_orphans",
             "publishable_parent_death_signals",
+            "rcb_clock_contract",
         ] {
             assert!(!json.contains(key), "{json}");
         }
@@ -5675,6 +5726,7 @@ mod tests {
             assert!(!backend.kernel_never_walks_robust_lists);
             assert!(!backend.places_orphans);
             assert_eq!(backend.publishable_parent_death_signals, 0);
+            assert_eq!(backend.rcb_clock_contract, None);
             assert_eq!(backend, legacy_expressible(BackendCapabilities::DBT));
         }
     }
@@ -8194,13 +8246,16 @@ mod tests {
         // encoded default carries every field, and adding, removing or
         // widening one changes the bytes. A field that is optional would have
         // to be present in the default, or a change to its width would encode
-        // as the same bare `None`; this fails first.
+        // as the same bare `None`; this fails first. The one optional field,
+        // `rcb_clock_contract`, is present: `config_wire_default` sets
+        // ptrace's contract.
         let config = config_wire_default();
         let fields = serde_json::to_value(config.backend).unwrap();
         let fields = fields.as_object().unwrap();
         // The true widths from the capability table: every field is a bool
-        // except `hardware_watchpoints`, a `u8` count, and
-        // `publishable_parent_death_signals`, a `u64` set of signal bits.
+        // except `hardware_watchpoints`, a `u8` count,
+        // `publishable_parent_death_signals`, a `u64` set of signal bits, and
+        // `rcb_clock_contract`, an optional unit-variant enum, present here.
         for (name, value) in fields {
             match name.as_str() {
                 "hardware_watchpoints" => {
@@ -8212,18 +8267,25 @@ mod tests {
                         .as_u64()
                         .expect("a u64 signal set encodes as a number");
                 }
+                "rcb_clock_contract" => {
+                    value
+                        .as_str()
+                        .expect("the default's contract is present, a unit variant's name");
+                }
                 _ => assert!(value.is_boolean(), "{name}={value} is not a bool"),
             }
         }
         let encode = |config: &Config| {
             bincode::serde::encode_to_vec(config, bincode::config::legacy()).unwrap()
         };
-        // One byte per field, and seven more for the `u64` signal set.
+        // One byte per field (the option's tag for `rcb_clock_contract`),
+        // seven more for the `u64` signal set, and four for the contract's
+        // `u32` variant index.
         assert_eq!(
             bincode::serde::encode_to_vec(config.backend, bincode::config::legacy())
                 .unwrap()
                 .len(),
-            fields.len() + 7
+            fields.len() + 7 + 4
         );
         // The backend's values are part of the encoded default.
         let flipped = config.clone().with_backend(|backend| {
@@ -8245,6 +8307,11 @@ mod tests {
             .with_backend(|backend| backend.publishable_parent_death_signals ^= 1 << 63);
         assert_eq!(encode(&resigned).len(), encode(&config).len());
         assert_ne!(encode(&resigned), encode(&config));
+        // The contract: its absence drops the variant index.
+        let uncontracted = config
+            .clone()
+            .with_backend(|backend| backend.rcb_clock_contract = None);
+        assert_eq!(encode(&uncontracted).len() + 4, encode(&config).len());
     }
 
     #[test]

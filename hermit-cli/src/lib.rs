@@ -8165,6 +8165,9 @@ mod tests {
     /// `kernel_never_walks_robust_lists` (Reverie 93d3a168), `places_orphans`
     /// and `publishable_parent_death_signals` (Reverie f614c7c8) arrived with
     /// the Reverie pin of the first-party split; each is KVM's alone.
+    /// `rcb_clock_contract` (Reverie 7535309b) names how ptrace counts the
+    /// RCB clock a recording's coordinates use, and so e9patch's, whose guest
+    /// Hermit runs on ptrace; every other backend states none.
     fn golden_backend_capabilities(backend: CapabilityCase) -> serde_json::Value {
         let sabre = backend == CapabilityCase::Sabre;
         let kvm = backend == CapabilityCase::Kvm;
@@ -8250,6 +8253,13 @@ mod tests {
             // Signals 1 to 31 but SIGCHLD (17) and SIGSTOP, SIGTSTP, SIGTTIN
             // and SIGTTOU (19 to 22), as a kernel signal set.
             "publishable_parent_death_signals": if kvm { 0x7fc2_ffff_u64 } else { 0 },
+            // Reverie 7535309b: a perf counter on the guest thread's own host
+            // task, user mode only, read raw; only ptrace counts that way.
+            "rcb_clock_contract": if matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch) {
+                serde_json::json!("PerfCounterOnTargetThreadUserOnly")
+            } else {
+                serde_json::Value::Null
+            },
         })
     }
 
