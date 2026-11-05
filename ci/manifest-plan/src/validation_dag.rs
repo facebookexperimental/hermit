@@ -552,6 +552,7 @@ const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 14] = [
     ("e2e.manifest_debugger_c", "manifest_guest", 1, 20),
     ("e2e.manifest_determinism_stress", "manifest_guest", 1, 20),
     ("e2e.manifest_determinism_stress_c", "manifest_guest", 1, 20),
+    ("e2e.manifest_gvisor", "manifest_guest", 1, 20),
     ("e2e.manifest_language_runtimes", "manifest_guest", 1, 20),
     ("e2e.manifest_rr", "manifest_guest", 1, 20),
     ("e2e.manifest_shared_futex_c", "manifest_guest", 1, 20),
@@ -2172,10 +2173,11 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
         })
         .cloned()
         .collect::<Vec<_>>();
-    // 17 since the rr bucket (first post-split extension bucket) joined.
-    if buckets.len() != 17 {
+    // 17 since the rr bucket (first post-split extension bucket) joined;
+    // 18 with the gvisor bucket.
+    if buckets.len() != 18 {
         return Err(format!(
-            "the full profile has {} E2E buckets, expected 17",
+            "the full profile has {} E2E buckets, expected 18",
             buckets.len()
         ));
     }
@@ -3391,10 +3393,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // 148 with privileged-test.binder_cli_cases, the Binderfs-capable
     // privileged node for PR 4742's two host-limited Binder CLI cases.
     // 151 with the rr bucket's three producers (pinned, on-host, Buck
-    // twin), the first post-split extension bucket (148 + 3).
-    if expected.len() != 151 {
+    // twin), the first post-split extension bucket (148 + 3); 154 with
+    // the gvisor bucket's three producers.
+    if expected.len() != 154 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 151",
+            "structured result producer registry has {} entries, expected 154",
             expected.len()
         ));
     }
@@ -3799,6 +3802,7 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
         "debugger_c",
         "determinism_stress",
         "determinism_stress_c",
+        "gvisor",
         "language_runtimes",
         "rr",
         "shared_futex_c",
@@ -7404,6 +7408,7 @@ sys.exit(37)
             "e2e.manifest_determinism_stress_c_on_host",
             "e2e.manifest_determinism_stress_on_host",
             "e2e.manifest_language_runtimes_on_host",
+            "e2e.manifest_gvisor_on_host",
             "e2e.manifest_rr_on_host",
             "e2e.manifest_shared_futex_c_on_host",
             "e2e.manifest_system_utils_on_host",
@@ -7476,8 +7481,9 @@ sys.exit(37)
         // e2e.manifest_backend_parity_c_on_host was folded into
         // e2e.manifest_c_programs_on_host (slice S6 of
         // https://github.com/rrnewton/hermit/issues/3301).
-        // 17 with e2e.manifest_rr_on_host, the first post-split extension twin.
-        assert_eq!(expected.len(), 17);
+        // 17 with e2e.manifest_rr_on_host, the first post-split extension
+        // twin; 18 with e2e.manifest_gvisor_on_host.
+        assert_eq!(expected.len(), 18);
         assert!(expected.is_disjoint(&new_variants));
         expected.extend(new_variants);
         expected.retain(|tag| crate::dag_source_ownership::is_admitted_core(tag));
@@ -7948,7 +7954,8 @@ sys.exit(37)
             .into_iter()
             .filter(|tag| crate::dag_source_ownership::is_core(tag))
             .collect::<BTreeSet<_>>();
-        // Post-split Buck twins (e2e.manifest_rr_buck) join the selection
+        // Post-split Buck twins (e2e.manifest_rr_buck,
+        // e2e.manifest_gvisor_buck) join the selection
         // through the extension registry, not the frozen source lineage.
         expected.extend(
             crate::dag_source_ownership::extension_tags()
