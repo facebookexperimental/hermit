@@ -6516,6 +6516,21 @@ fn replay_refuses_another_exclusive_rewrite_provenance() {
         "overlay6.json",
         r#"{"per_thread":{},"global":[],"rewrite_exclusives":{"mode":"overlay","format_version":6}}"#,
     );
+    // Records of this Hermit's rewriter; format 6 is the one before reads
+    // through an ADRP's page or an ADR's address protected bytes (7).
+    let current = hermit::aarch64_lse::REWRITE_FORMAT_VERSION;
+    let memory_now = write(
+        "memory-now.json",
+        &format!(
+            r#"{{"per_thread":{{}},"global":[],"rewrite_exclusives_in_memory":true,"rewrite_exclusives":{{"mode":"memory","format_version":{current}}}}}"#
+        ),
+    );
+    let overlay_now = write(
+        "overlay-now.json",
+        &format!(
+            r#"{{"per_thread":{{}},"global":[],"rewrite_exclusives":{{"mode":"overlay","format_version":{current}}}}}"#
+        ),
+    );
     let none: &[&str] = &[];
     let overlay: &[&str] = &["--rewrite-exclusives", "--rewrite-exclusives-mode=overlay"];
     let memory: &[&str] = &["--rewrite-exclusives", "--rewrite-exclusives-mode=memory"];
@@ -6530,11 +6545,13 @@ fn replay_refuses_another_exclusive_rewrite_provenance() {
             (&legacy_memory, memory, true),
             (&memory6, none, true),
             (&memory6, overlay, true),
-            (&memory6, memory, false),
+            (&memory_now, memory, false),
+            (&memory6, memory, true),
             (&memory5, memory, true),
             (&overlay6, none, true),
             (&overlay6, memory, true),
-            (&overlay6, overlay, false),
+            (&overlay_now, overlay, false),
+            (&overlay6, overlay, true),
         ] {
             let replay = format!("{flag}={}", path.display());
             let mut argv = vec!["fakehermit".to_owned(), replay];
@@ -6574,25 +6591,31 @@ fn matching_exclusive_rewrite_replays_are_admitted_by_the_cli() {
         std::fs::write(&path, json).unwrap();
         path
     };
-    let memory6 = write(
-        "memory6.json",
-        r#"{"per_thread":{},"global":[],"rewrite_exclusives_in_memory":true,"rewrite_exclusives":{"mode":"memory","format_version":6}}"#,
+    // Records of this Hermit's rewriter, whatever its format version.
+    let current = hermit::aarch64_lse::REWRITE_FORMAT_VERSION;
+    let memory_now = write(
+        "memory-now.json",
+        &format!(
+            r#"{{"per_thread":{{}},"global":[],"rewrite_exclusives_in_memory":true,"rewrite_exclusives":{{"mode":"memory","format_version":{current}}}}}"#
+        ),
     );
-    let overlay6 = write(
-        "overlay6.json",
-        r#"{"per_thread":{},"global":[],"rewrite_exclusives":{"mode":"overlay","format_version":6}}"#,
+    let overlay_now = write(
+        "overlay-now.json",
+        &format!(
+            r#"{{"per_thread":{{}},"global":[],"rewrite_exclusives":{{"mode":"overlay","format_version":{current}}}}}"#
+        ),
     );
     for flag in ["--replay-schedule-from", "--replay-preemptions-from"] {
         for (path, rewrite) in [
             (
-                &memory6,
+                &memory_now,
                 &["--rewrite-exclusives", "--rewrite-exclusives-mode=memory"][..],
             ),
             (
-                &overlay6,
+                &overlay_now,
                 &["--rewrite-exclusives", "--rewrite-exclusives-mode=overlay"][..],
             ),
-            (&overlay6, &["--rewrite-exclusives"][..]),
+            (&overlay_now, &["--rewrite-exclusives"][..]),
         ] {
             let replay = format!("{flag}={}", path.display());
             let mut argv = vec!["fakehermit".to_owned(), replay];

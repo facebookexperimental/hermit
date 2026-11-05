@@ -1421,6 +1421,18 @@ functions, including any table a function branches over or keeps after a call
 that does not return, so a stripped file is left unchanged whatever its unwind
 table covers.
 
+A loop the file's code may read as data is left unchanged as well, listed as
+`literal-inside-the-sequence`. Hermit follows every PC-relative address the
+code forms (`LDR` literal, `ADR` and `ADRP`, through the `ADD`s and loads that
+complete it) to each use of it. An access whose address and width the
+instruction gives protects those bytes; any other use, such as an index
+register, an SVE access, the address copied, stored or passed to a call, or
+still held where the code branches, may read any executable byte, so every
+loop in the file is left alone. That holds for a function pointer as well: a
+pointer passed on or kept can be read as well as called. Only forming an
+address that names a function's start (an unwind table entry), with nothing
+read through it, leaves the instruction there unprotected.
+
 ### Virtual Inputs
 
 | Option | Effect |

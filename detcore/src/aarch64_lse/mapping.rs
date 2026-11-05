@@ -737,6 +737,640 @@ pub(super) fn literal_references(words: &[u32], base: u64) -> Vec<LiteralReferen
         .collect()
 }
 
+/// What an `ADRP` or `ADR` lets the code after it read or write through its
+/// register, for the image-wide reader scan ([`literal_references`] covers
+/// the `LDR` (literal) and the `ADR` itself).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BaseReference {
+    /// A load or store through the register whose address and width the
+    /// instruction gives: these bytes.
+    Access(u64, u64),
+    /// An address an `ADD` or `SUB` (immediate) forms from the register,
+    /// taken as `ADR`'s target is: one word, and nothing at an FDE start,
+    /// since forming an address is not a read, and one that names a
+    /// function's entry takes a pointer to the function. What the code then
+    /// does with the address is followed like the `ADR`'s or `ADRP`'s own.
+    Address(u64),
+    /// A use of the address whose extent is not known: a load or store
+    /// through it that the instruction does not bound (an index register, a
+    /// scalable vector access, a form not decoded), the address passed on to
+    /// a register or memory the scan does not follow, or the address still
+    /// held where following stops (a transfer of control, a conditional
+    /// branch, whose taken path is not followed, or the end of the window).
+    /// Any executable byte may be read through it, even where `at` is a
+    /// function's entry: a function pointer passed on can be read as well
+    /// as called. `at` is the address, or with `page` the `ADRP`'s page.
+    Unknown { at: u64, page: bool },
+}
+
+/// What one instruction does with the address a register holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Effect {
+    /// It does not read the register.
+    Untouched,
+    /// It reads it without accessing memory or passing it on: a compare.
+    Tested,
+    /// It accesses `low..high` from the address, and then, with `writeback`,
+    /// leaves the address plus that in the register.
+    Accesses {
+        low: i64,
+        high: i64,
+        writeback: Option<i64>,
+    },
+    /// It forms the address plus `offset` in register `into` (`ADD` or
+    /// `SUB` immediate).
+    Forms { offset: i64, into: u32 },
+    /// It accesses memory through the address to an extent it does not
+    /// bound.
+    ReadsUnbounded,
+    /// It passes the address on: a copy, register arithmetic, a value stored,
+    /// an index, or a form not decoded.
+    PassesOn,
+}
+
+/// The bytes `words` (at `base`) may read or write through each `ADRP`'s
+/// page or `ADR`'s address. Each is followed through the instructions after
+/// it, up to [`BASE_WINDOW`], with what each does with every register
+/// holding an address from it ([`effect`]): an access the instruction bounds
+/// is a [`BaseReference::Access`], an `ADD` or `SUB` (immediate) a
+/// [`BaseReference::Address`] whose register is followed too, and a write
+/// ([`writes_register`]) ends the register's part. Anything else fails
+/// closed: an unbounded access, the address passed on, any use by an
+/// encoding [`decoded`] does not cover (wherever [`names`] says it may name
+/// the register), and every register still holding an address where
+/// following stops (a transfer of control, a conditional branch, the
+/// window's or the range's end) is a [`BaseReference::Unknown`].
+pub(super) fn base_references(words: &[u32], base: u64) -> Vec<BaseReference> {
+    let mut references = Vec::new();
+    for (index, word) in words.iter().enumerate() {
+        let pc = base.wrapping_add(4 * index as u64);
+        let register = word & 0x1F;
+        let imm = ((word >> 5) & 0x7_FFFF) << 2 | ((word >> 29) & 0b11);
+        let (origin, page) = if word & 0x9F00_0000 == 0x9000_0000 {
+            // ADRP: the 4 KiB page of `pc`, plus immhi:immlo pages.
+            let pages = ((imm << 11) as i32 >> 11) as i64;
+            ((pc & !0xFFF).wrapping_add((pages << 12) as u64), true)
+        } else if word & 0x9F00_0000 == 0x1000_0000 {
+            // ADR: `pc` plus immhi:immlo bytes.
+            let offset = ((imm << 11) as i32 >> 11) as i64;
+            (pc.wrapping_add(offset as u64), false)
+        } else {
+            continue;
+        };
+        if register == 31 {
+            continue; // into the zero register: nothing is addressed
+        }
+        let mut found = Vec::new();
+        let mut note = |reference: BaseReference| {
+            if !found.contains(&reference) {
+                found.push(reference);
+            }
+        };
+        let unknown = |at: u64, page: bool| BaseReference::Unknown { at, page };
+        // Each register holding an address from this one: the register, the
+        // address, and whether it is the bare page.
+        let mut bases = vec![(register, origin, page)];
+        for next in words[index + 1..].iter().take(BASE_WINDOW) {
+            if transfers_control(*next) || branches_conditionally(*next) {
+                break;
+            }
+            let mut after = Vec::new();
+            for &(held, at, bare) in &bases {
+                let mut kept = Some((held, at, bare));
+                match effect(*next, held) {
+                    Effect::Untouched | Effect::Tested => {}
+                    Effect::Accesses {
+                        low,
+                        high,
+                        writeback,
+                    } => {
+                        match (at.checked_add_signed(low), at.checked_add_signed(high)) {
+                            (Some(start), Some(end)) => note(BaseReference::Access(start, end)),
+                            _ => note(unknown(at, bare)),
+                        }
+                        if let Some(by) = writeback {
+                            kept = Some((held, at.wrapping_add_signed(by), false));
+                        }
+                    }
+                    Effect::Forms { offset, into } => {
+                        let target = at.wrapping_add_signed(offset);
+                        note(BaseReference::Address(target));
+                        after.push((into, target, false));
+                    }
+                    Effect::ReadsUnbounded => {
+                        note(unknown(at, bare));
+                        kept = None;
+                    }
+                    Effect::PassesOn => note(unknown(at, bare)),
+                }
+                if let Some((held, at, bare)) = kept
+                    && !writes_register(*next, held)
+                {
+                    after.push((held, at, bare));
+                }
+            }
+            // A register formed into replaces what it held.
+            bases.clear();
+            for (held, at, bare) in after.into_iter().rev() {
+                if !bases.iter().any(|(other, _, _)| *other == held) {
+                    bases.push((held, at, bare));
+                }
+            }
+            if bases.is_empty() {
+                break;
+            }
+        }
+        // Following stopped with these still holding an address.
+        for (_, at, bare) in bases {
+            note(unknown(at, bare));
+        }
+        references.extend(found);
+    }
+    references
+}
+
+/// How many instructions after an `ADRP` or `ADR` [`base_references`]
+/// follows its register. A compiler schedules a completion well after its
+/// `ADRP` (glibc's NSS tables complete one eleven instructions on), so this
+/// looks further than [`addressed_starts`]' eight.
+const BASE_WINDOW: usize = 64;
+
+/// Whether control may not continue to the next instruction: an
+/// unconditional branch (immediate or register, calls and returns among
+/// them) or an exception-generating instruction.
+fn transfers_control(word: u32) -> bool {
+    word & 0x7C00_0000 == 0x1400_0000 // B, BL
+        || word & 0xFE00_0000 == 0xD600_0000 // BR, BLR, RET, ERET, ...
+        || word & 0xFF00_0000 == 0xD400_0000 // SVC, HVC, SMC, BRK, HLT, ...
+}
+
+/// Whether control may go on elsewhere as well as to the next instruction:
+/// every word of the branch, exception and system class (op0 `101x`) that
+/// is neither [`transfers_control`] nor in [`system_space`], so `B.cond`,
+/// `BC.cond`, `CBZ`, `TBZ`, `CB<cc>` and any branch form not named here.
+/// The scan does not follow the taken path.
+fn branches_conditionally(word: u32) -> bool {
+    word & 0x1C00_0000 == 0x1400_0000 && !system_space(word) && !transfers_control(word)
+}
+
+/// Whether `word` is in the system instruction space (hints, barriers,
+/// `MSR`, `MRS`, `SYS` and their pair forms), whose instructions all
+/// continue to the next.
+fn system_space(word: u32) -> bool {
+    word & 0xFF80_0000 == 0xD500_0000
+}
+
+/// Every general register `word` may name, as a mask: each field a
+/// register can occupy in any encoding (bits 4:0, 9:5, 14:10 and 20:16)
+/// and the registers some families name implicitly ([`implicit`]). An
+/// encoding [`decoded`] does not cover touches a register only through
+/// this mask, and any it names counts as passed on.
+fn names(word: u32) -> u32 {
+    let field = |shift: u32| 1u32 << ((word >> shift) & 0x1F);
+    (field(0) | field(5) | field(10) | field(16) | implicit(word)) & !(1 << 31)
+}
+
+/// The registers some families name without a field of their own: a
+/// register list's successors (for any load or store, the register after
+/// each in bits 4:0 and 20:16, as `CASP`, `CASPT`, `RCWCASP` and the
+/// 128-bit atomics' pairs run; the eight of `LD64B` and `ST64B*`; and the
+/// system pair forms' Xt+1), the slice and predicate index registers of SME
+/// and SVE (w8 to w15), and the pointer authentication forms' fixed
+/// registers (x16 and x17 for `*1716`, x30 for `*Z`, `*SP` and `XPACLRI`,
+/// x15 to x17 for `*171615`, x16 for `CHKFEAT`).
+fn implicit(word: u32) -> u32 {
+    let (rt, rs) = (word & 0x1F, (word >> 16) & 0x1F);
+    let run =
+        |first: u32, count: u32| (0..count).fold(0, |mask, i| mask | 1 << ((first + i) & 0x1F));
+    let mut mask = 0;
+    if word & 0x0A00_0000 == 0x0800_0000 {
+        mask |= run(rt, 2) | run(rs, 2);
+    }
+    if ls64(word) {
+        mask |= run(rt, 8);
+    }
+    if word & 0xFFC0_0000 == 0xD540_0000 {
+        mask |= run(rt, 2); // SYSP, MSRR, MRRS
+    }
+    if word & 0x9E00_0000 == 0x8000_0000 || word & 0x1E00_0000 == 0x0400_0000 {
+        mask |= 0xFF00; // SME, SVE
+    }
+    if word & 0xFFFF_FF1F == 0xD503_211F {
+        mask |= 1 << 16 | 1 << 17;
+    }
+    if word & 0xFFFF_FF1F == 0xD503_231F || word == 0xD503_20FF {
+        mask |= 1 << 30;
+    }
+    if word == 0xD503_251F {
+        mask |= 1 << 16;
+    }
+    if word & 0xFFFF_83FF == 0xDAC1_83FE {
+        mask |= 0b111 << 15;
+    }
+    mask
+}
+
+/// Whether `word` is `LD64B`, `ST64B`, `ST64BV` or `ST64BV0`, which access
+/// 64 bytes at the base through the eight registers from Xt.
+fn ls64(word: u32) -> bool {
+    word & 0xFFE0_8C00 == 0xF820_8000 && matches!((word >> 12) & 0b111, 1 | 2 | 3 | 5)
+}
+
+/// Whether `word` is one of the forms [`effect`] decodes in full: the data
+/// processing (immediate) and (register) classes but pointer
+/// authentication, the hints, barriers, `MSR` (immediate and register),
+/// `MRS`, `DC CVAC` and `IC IVAU`, and the load and store families
+/// [`load_store_effect`] names. Every other encoding, SIMD and floating
+/// point, SVE and SME among them, uses a register only as [`names`] says,
+/// and any use passes the address on.
+fn decoded(word: u32) -> bool {
+    decoded_effect(word, 0).is_some()
+}
+
+/// What `word` does with the address `register` holds ([`Effect`]): as
+/// [`decoded_effect`] says for a form it decodes, and otherwise passed on
+/// where the word may name the register at all ([`names`]).
+fn effect(word: u32, register: u32) -> Effect {
+    match decoded_effect(word, register) {
+        Some(effect) => effect,
+        None if names(word) & (1 << register) != 0 => Effect::PassesOn,
+        None => Effect::Untouched,
+    }
+}
+
+/// [`effect`] for the forms it decodes in full, or `None`, whatever the
+/// register, for any other.
+fn decoded_effect(word: u32, register: u32) -> Option<Effect> {
+    let rn = (word >> 5) & 0x1F == register;
+    let rm = (word >> 16) & 0x1F == register;
+    let ra = (word >> 10) & 0x1F == register;
+    let rt = word & 0x1F == register;
+    if word & 0x0A00_0000 == 0x0800_0000 {
+        return load_store_effect(word, register);
+    }
+    if word & 0x1C00_0000 == 0x1000_0000 {
+        // Data processing (immediate).
+        return Some(match word & 0x1F80_0000 {
+            0x1000_0000 | 0x1080_0000 => Effect::Untouched, // ADR, ADRP
+            // MOVK keeps the rest of its register; MOVZ and MOVN read none.
+            0x1280_0000 if rt && (word >> 29) & 0b11 == 0b11 => Effect::PassesOn,
+            0x1280_0000 => Effect::Untouched,
+            0x1100_0000 | 0x1180_0000 if rn => {
+                // ADD/SUB (immediate): a compare into the zero register, or
+                // a 64-bit address formed in another register.
+                let rd = word & 0x1F;
+                let flags = (word >> 29) & 1 == 1;
+                if flags && rd == 31 {
+                    Effect::Tested
+                } else if word >> 31 == 1 && !flags && rd != 31 && (word >> 23) & 1 == 0 {
+                    let imm = i64::from((word >> 10) & 0xFFF) << (12 * ((word >> 22) & 1));
+                    let offset = if (word >> 30) & 1 == 1 { -imm } else { imm };
+                    Effect::Forms { offset, into: rd }
+                } else {
+                    Effect::PassesOn
+                }
+            }
+            // BFM (`BFI`, `BFXIL`) keeps the bits of its destination it does
+            // not insert, so it reads that register as well.
+            0x1300_0000 if rt && (word >> 29) & 0b11 == 0b01 => Effect::PassesOn,
+            // Logical, bitfield and extract (which reads two) pass it on.
+            0x1380_0000 if rn || rm => Effect::PassesOn,
+            _ if rn => Effect::PassesOn,
+            _ => Effect::Untouched,
+        });
+    }
+    if word & 0x0E00_0000 == 0x0A00_0000 {
+        // Data processing (register), but PAC*, AUT* and XPAC* (one source,
+        // opcode2 00001), which read their destination and can name
+        // registers implicitly. Bits 14:10 name a register only in the
+        // three-source class (`MADD`, `MSUB` and their widening forms);
+        // elsewhere they are a shift, an extension, a condition or an
+        // opcode. A compare into the zero register (ADDS, SUBS, ANDS) or a
+        // conditional compare only tests it.
+        if word & 0x5FFF_0000 == 0x5AC1_0000 {
+            return None;
+        }
+        let three_source = word & 0x1F00_0000 == 0x1B00_0000;
+        if !(rn || rm || (three_source && ra)) {
+            return Some(Effect::Untouched);
+        }
+        let into_zero = word & 0x1F == 31;
+        let adds = word & 0x1F00_0000 == 0x0B00_0000 && (word >> 29) & 1 == 1;
+        let ands = word & 0x1F00_0000 == 0x0A00_0000 && (word >> 29) & 0b11 == 0b11;
+        let ccmp = word & 0x1FE0_0000 == 0x1A40_0000;
+        return Some(if (into_zero && (adds || ands)) || ccmp {
+            Effect::Tested
+        } else {
+            Effect::PassesOn
+        });
+    }
+    if word & 0xFFFF_F01F == 0xD503_201F {
+        // A hint names no register but the implicit ones.
+        return Some(if implicit(word) & (1 << register) != 0 {
+            Effect::PassesOn
+        } else {
+            Effect::Untouched
+        });
+    }
+    if word & 0xFFFF_F01F == 0xD503_301F || word & 0xFFF8_F01F == 0xD500_401F {
+        return Some(Effect::Untouched); // barriers, MSR (immediate)
+    }
+    if word & 0xFFF0_0000 == 0xD530_0000 {
+        return Some(Effect::Untouched); // MRS: writes Xt
+    }
+    if word & 0xFFF0_0000 == 0xD510_0000 {
+        return Some(if rt {
+            Effect::PassesOn
+        } else {
+            Effect::Untouched
+        }); // MSR
+    }
+    if matches!(word & 0xFFFF_FFE0, 0xD50B_7A20 | 0xD50B_7520) {
+        // Cleaning a data cache line or invalidating an instruction cache
+        // line by its address (`DC CVAC`, `IC IVAU`) changes no data.
+        return Some(if rt {
+            Effect::Tested
+        } else {
+            Effect::Untouched
+        });
+    }
+    None
+}
+
+/// [`decoded_effect`] for the loads and stores (op0 `x1x0`) it decodes:
+/// literal loads; single registers with an unsigned, a 9-bit signed or a
+/// register offset; pairs (`STGP` scaled by 16); exclusive, ordered and
+/// compare-and-swap (`CASP` as its own family); the LSE atomics but the
+/// RCW forms, whose size field is not their width; and `LD64B`/`ST64B*`.
+fn load_store_effect(word: u32, register: u32) -> Option<Effect> {
+    let rn = (word >> 5) & 0x1F == register;
+    let rm = (word >> 16) & 0x1F == register;
+    let ra = (word >> 10) & 0x1F == register;
+    let rt = word & 0x1F == register;
+    let listed = |first: u32, count: u32| (0..count).any(|i| (first + i) & 0x1F == register);
+    let size = word >> 30;
+    let vector = (word >> 26) & 1 == 1;
+    let opc = (word >> 22) & 0b11;
+    // A single-register general-purpose store (opc 00) reads its transfer
+    // register; a vector one names a SIMD register there.
+    let stores_it = rt && !vector && opc == 0;
+    let width = if vector && size == 0 && opc & 0b10 != 0 {
+        16
+    } else {
+        1i64 << size
+    };
+    // The single-register forms allocated: a 128-bit vector access only at
+    // size 00, and no general-purpose opc 11 at size 10 or 11.
+    let single = if vector {
+        size == 0 || opc & 0b10 == 0
+    } else {
+        !(opc == 0b11 && size >= 0b10)
+    };
+    if word & 0x3B00_0000 == 0x1800_0000 {
+        // A literal load has no base; vector opc 11 is unallocated.
+        return (!vector || size != 0b11).then_some(Effect::Untouched);
+    }
+    if word & 0x3B00_0000 == 0x3900_0000 && single {
+        // Unsigned offset, scaled by the access size.
+        if stores_it {
+            return Some(Effect::PassesOn);
+        }
+        if !rn {
+            return Some(Effect::Untouched);
+        }
+        let offset = i64::from((word >> 10) & 0xFFF) * width;
+        return Some(Effect::Accesses {
+            low: offset,
+            high: offset + width,
+            writeback: None,
+        });
+    }
+    if word & 0x3B20_0000 == 0x3800_0000 && single {
+        // A 9-bit signed offset: unscaled, unprivileged, pre- or post-index.
+        if stores_it {
+            return Some(Effect::PassesOn);
+        }
+        if !rn {
+            return Some(Effect::Untouched);
+        }
+        let offset = i64::from(((((word >> 12) & 0x1FF) << 23) as i32) >> 23);
+        return Some(match (word >> 10) & 0b11 {
+            0b01 => Effect::Accesses {
+                low: 0,
+                high: width,
+                writeback: Some(offset),
+            },
+            0b11 => Effect::Accesses {
+                low: offset,
+                high: offset + width,
+                writeback: Some(offset),
+            },
+            _ => Effect::Accesses {
+                low: offset,
+                high: offset + width,
+                writeback: None,
+            },
+        });
+    }
+    if word & 0x3B20_0C00 == 0x3820_0800 && single {
+        // A register offset: not bounded, and its index is passed on.
+        return Some(if stores_it || rm {
+            Effect::PassesOn
+        } else if rn {
+            Effect::ReadsUnbounded
+        } else {
+            Effect::Untouched
+        });
+    }
+    if word & 0x3B20_0C00 == 0x3820_0000 && !vector {
+        let o3 = (word >> 15) & 1 == 1;
+        let operation = (word >> 12) & 0b111;
+        if ls64(word) {
+            // ST64B, ST64BV and ST64BV0 store Xt to Xt+7; LD64B loads them.
+            if operation != 0b101 && listed(word & 0x1F, 8) {
+                return Some(Effect::PassesOn);
+            }
+            return Some(if rn {
+                Effect::Accesses {
+                    low: 0,
+                    high: 64,
+                    writeback: None,
+                }
+            } else {
+                Effect::Untouched
+            });
+        }
+        // LDADD and the other operations, SWP, and LDAPR (A set, R clear,
+        // Rs 11111): Xs is stored, Xt receives the old value.
+        let ldapr = operation == 0b100 && opc == 0b10 && (word >> 16) & 0x1F == 31;
+        if o3 && operation != 0 && !ldapr {
+            return None;
+        }
+        return Some(if rm {
+            Effect::PassesOn
+        } else if rn {
+            Effect::Accesses {
+                low: 0,
+                high: width,
+                writeback: None,
+            }
+        } else {
+            Effect::Untouched
+        });
+    }
+    if word & 0x3A00_0000 == 0x2800_0000 {
+        // A pair: a 7-bit signed offset scaled by the element size, or by
+        // 16 for `STGP`, which stores two 64-bit registers.
+        let load = (word >> 22) & 1 == 1;
+        let stgp = !vector && size == 0b01 && !load;
+        let element: i64 = match (vector, size) {
+            (true, 0b11) | (false, 0b11) => return None,
+            (true, size) => 4 << size,
+            (false, 0b00) => 4,
+            (false, 0b10) => 8,
+            (false, _) if stgp => 8,
+            (false, _) => 4, // LDPSW
+        };
+        if !vector && size == 0b01 && (word >> 23) & 0b11 == 0 {
+            return None; // no non-temporal STGP or LDPSW
+        }
+        if !load && !vector && (rt || ra) {
+            return Some(Effect::PassesOn); // a value stored
+        }
+        if !rn {
+            return Some(Effect::Untouched);
+        }
+        let scale = if stgp { 16 } else { element };
+        let offset = i64::from(((((word >> 15) & 0x7F) << 25) as i32) >> 25) * scale;
+        let (low, high) = (offset, offset + 2 * element);
+        return Some(match (word >> 23) & 0b11 {
+            0b01 => Effect::Accesses {
+                low: 0,
+                high: 2 * element,
+                writeback: Some(offset),
+            },
+            0b11 => Effect::Accesses {
+                low,
+                high,
+                writeback: Some(offset),
+            },
+            _ => Effect::Accesses {
+                low,
+                high,
+                writeback: None,
+            },
+        });
+    }
+    if word & 0x3F00_0000 == 0x0800_0000 {
+        let load = (word >> 22) & 1 == 1;
+        let pair = (word >> 21) & 1 == 1;
+        let compare = (word >> 23) & 1 == 1 && pair;
+        if size < 0b10 && pair && !compare {
+            // CASP: compares Xs:Xs+1 and stores Xt:Xt+1 at the base, then
+            // writes the old value to Xs:Xs+1.
+            if word & 0x7C00 != 0x7C00 {
+                return None;
+            }
+            if listed(word & 0x1F, 2) {
+                return Some(Effect::PassesOn);
+            }
+            return Some(if rn {
+                Effect::Accesses {
+                    low: 0,
+                    high: 2 * (4 << size),
+                    writeback: None,
+                }
+            } else if listed((word >> 16) & 0x1F, 2) {
+                Effect::Tested
+            } else {
+                Effect::Untouched
+            });
+        }
+        // Exclusive, ordered and compare-and-swap: at the base itself. A
+        // compare-and-swap reads Rs and Rt, a store-exclusive Rt (and Rt2).
+        if (compare && (rt || rm)) || (!compare && !load && (rt || (pair && ra))) {
+            return Some(Effect::PassesOn);
+        }
+        if !rn {
+            return Some(Effect::Untouched);
+        }
+        return Some(Effect::Accesses {
+            low: 0,
+            high: if pair || compare { 16 } else { width },
+            writeback: None,
+        });
+    }
+    None
+}
+
+/// Whether `word` writes `register`, ending the address it held: a form
+/// [`decoded`] covers whose destination it is (a data-processing result
+/// other than a flags-only form's, a load's transfer registers, a
+/// store-exclusive's or compare-and-swap's status or old value, `MRS`'s
+/// Xt). Any other encoding counts as not writing it, so the address stays
+/// followed.
+fn writes_register(word: u32, register: u32) -> bool {
+    if !decoded(word) {
+        return false;
+    }
+    let rd = word & 0x1F == register;
+    let rm = (word >> 16) & 0x1F == register;
+    let ra = (word >> 10) & 0x1F == register;
+    let listed = |first: u32, count: u32| (0..count).any(|i| (first + i) & 0x1F == register);
+    // Data processing forms that write only the flags, whose bits 4:0 are
+    // not a destination: a conditional compare's are its NZCV immediate,
+    // `RMIF`'s its mask, `SETF8` and `SETF16`'s fixed.
+    let flags_only = word & 0x1FE0_0000 == 0x1A40_0000
+        || word & 0xFFE0_7C10 == 0xBA00_0400
+        || word & 0xFFFF_BC1F == 0x3A00_080D;
+    if flags_only {
+        return false;
+    }
+    if word & 0x1C00_0000 == 0x1000_0000 || word & 0x0E00_0000 == 0x0A00_0000 {
+        return rd;
+    }
+    if system_space(word) {
+        return word & 0xFFF0_0000 == 0xD530_0000 && rd; // MRS
+    }
+    let vector = (word >> 26) & 1 == 1;
+    let opc = (word >> 22) & 0b11;
+    if word & 0x3B20_0C00 == 0x3820_0000 && !vector {
+        if ls64(word) {
+            return match (word >> 12) & 0b111 {
+                0b101 => listed(word & 0x1F, 8),
+                0b010 | 0b011 => rm, // the status
+                _ => false,
+            };
+        }
+        return rd; // the old value
+    }
+    let load = if word & 0x3B00_0000 == 0x1800_0000 {
+        word >> 30 != 0b11 // a literal load, not PRFM
+    } else if word & 0x3A00_0000 == 0x2800_0000 {
+        (word >> 22) & 1 == 1 // a pair
+    } else if word & 0x3F00_0000 == 0x0800_0000 {
+        let pair = (word >> 21) & 1 == 1;
+        if (word >> 23) & 1 == 1 && pair {
+            return rm; // compare-and-swap: the old value
+        }
+        if word >> 31 == 0 && pair {
+            return listed((word >> 16) & 0x1F, 2); // CASP: the old value
+        }
+        if (word >> 22) & 1 == 0 {
+            return rm; // the status
+        }
+        true
+    } else {
+        // A single register: opc 00 stores; PRFM (size 11, opc 10) loads
+        // nothing.
+        opc != 0 && !(word >> 30 == 0b11 && opc == 0b10)
+    };
+    // LDP and LDXP's second register.
+    let pair = word & 0x3A00_0000 == 0x2800_0000
+        || (word & 0x3F00_0000 == 0x0800_0000 && (word >> 21) & 1 == 1);
+    !vector && load && (rd || (pair && ra))
+}
+
 /// Where `words` (at `base`) address bytes as data, or may: the target of
 /// each `LDR` (literal) and `ADR`, and of each `ADRP` with every `ADD`
 /// (immediate) or unsigned-offset load or store that completes it among the
@@ -1301,6 +1935,399 @@ pub(crate) mod tests {
                 (0x1021, 0x1025),
             ]
         );
+    }
+
+    /// The general registers an independent disassembler lists for a
+    /// sample of encodings across every class (`testdata/gpr-operands.txt`,
+    /// written by `testdata/generate-gpr-operands.rs` with LLVM), with the
+    /// implicit ones LLVM does not print added from [`implicit_operands`],
+    /// this test's own table. An encoding the scan does not decode in full
+    /// passes on each of them and writes none; one it decodes uses each, or
+    /// writes it. A branch ends the scan, so it is not asked.
+    #[test]
+    fn every_register_a_disassembler_lists_is_used_unless_decoded() {
+        let (mut checked, mut outside) = (0, 0);
+        for line in include_str!("testdata/gpr-operands.txt").lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            let (word, listed) = line.split_once(' ').expect("an encoding and its registers");
+            let word = u32::from_str_radix(word, 16).expect("a hexadecimal encoding");
+            if transfers_control(word) || branches_conditionally(word) {
+                continue;
+            }
+            let mut registers: Vec<u32> = listed
+                .split(',')
+                .filter(|register| !register.is_empty())
+                .map(|register| register.parse().expect("a register number"))
+                .collect();
+            registers.extend(implicit_operands(word));
+            for register in registers {
+                let (effect, written) = (effect(word, register), writes_register(word, register));
+                if decoded(word) {
+                    assert!(
+                        effect != Effect::Untouched || written,
+                        "{word:08x}: x{register} neither used nor written"
+                    );
+                } else {
+                    outside += 1;
+                    assert!(
+                        effect == Effect::PassesOn && !written,
+                        "{word:08x}: x{register} {effect:?}, written {written}"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 15_000 && outside > 4_000,
+            "{checked} checked, {outside} outside"
+        );
+    }
+
+    /// The general registers an encoding uses that LLVM does not print:
+    /// `LD64B` and `ST64B*`'s Xt+1 to Xt+7 (it prints Xt alone), the
+    /// pointer authentication hints' x16 and x17 (`*1716`) or x30 (`*Z`,
+    /// `*SP`, `XPACLRI`), and `*171615`'s x15 to x17.
+    fn implicit_operands(word: u32) -> Vec<u32> {
+        let rt = word & 0x1F;
+        let mut found = Vec::new();
+        if word & 0xFFE0_8C00 == 0xF820_8000 && matches!((word >> 12) & 0b111, 1 | 2 | 3 | 5) {
+            found.extend((1..8).map(|i| (rt + i) & 0x1F));
+        }
+        if word & 0xFFFF_FF1F == 0xD503_211F {
+            found.extend([16, 17]);
+        }
+        if word & 0xFFFF_FF1F == 0xD503_231F || word == 0xD503_20FF {
+            found.push(30);
+        }
+        if word & 0xFFFF_83FF == 0xDAC1_83FE {
+            found.extend([15, 16, 17]);
+        }
+        found.retain(|register| *register < 31);
+        found
+    }
+
+    /// Each `ADRP` and `ADR` is followed to what the code does through its
+    /// register: an access of known address and width (unsigned, signed
+    /// 9-bit and pair offsets, writeback, exclusives) is exact, an `ADD` an
+    /// address, a compare nothing, and a write ends the base. Every other
+    /// use fails closed as unknown: an unbounded access (an index register,
+    /// SVE), the address passed on (a copy, register arithmetic, a value
+    /// stored, a pair store among them), a write that may name a SIMD
+    /// register, and the address still held at a call, a conditional branch
+    /// or the window's end, whether or not a completion came first.
+    #[test]
+    fn base_references_follow_each_adrp_and_adr_to_its_reads() {
+        use BaseReference::*;
+        const ADRP: u32 = 0x9000_0001; // adrp x1, 0x1000 (from 0x1000)
+        const ADRP19: u32 = 0x9000_0013; // adrp x19, 0x1000
+        const MOV: u32 = 0xd280_0001; // mov x1, #0
+        const MOV0: u32 = 0xd280_0000; // mov x0, #0
+        const MOV19: u32 = 0xd280_0013; // mov x19, #0
+        const RET: u32 = 0xd65f_03c0;
+        let page = Unknown {
+            at: 0x1000,
+            page: true,
+        };
+        let at = |at| Unknown { at, page: false };
+        let mut window = vec![ADRP];
+        window.extend([0x9100_0442; 64]); // add x2, x2, #1
+        let mut within = vec![ADRP];
+        within.extend([0x9100_0442; 63]);
+        within.push(MOV);
+        let cases: &[(&str, &[u32], Vec<BaseReference>)] = &[
+            // ldr w2, [x1, #0x100]
+            (
+                "a load",
+                &[ADRP, 0xb941_0022, MOV],
+                vec![Access(0x1100, 0x1104)],
+            ),
+            // ldr q0, [x1, #16]
+            (
+                "a 128-bit load",
+                &[ADRP, 0x3dc0_0420, MOV],
+                vec![Access(0x1010, 0x1020)],
+            ),
+            // add x0, x1, #0x80; ldr w2, [x0, #8]
+            (
+                "an ADD and a load through it",
+                &[ADRP, 0x9102_0020, 0xb940_0802, MOV, MOV0],
+                vec![Address(0x1080), Access(0x1088, 0x108c)],
+            ),
+            // ldr x1, [x1, #8]: the page is gone.
+            (
+                "a GOT load",
+                &[ADRP, 0xf940_0421, 0xb940_0022],
+                vec![Access(0x1008, 0x1010)],
+            ),
+            ("overwritten unused", &[ADRP, MOV], vec![]),
+            ("live at a return", &[ADRP, RET], vec![page]),
+            // ldr w2, [x1, x3]
+            (
+                "an index from the page",
+                &[ADRP, 0xb863_6822, MOV],
+                vec![page],
+            ),
+            // add x1, x1, #0x40; ldr w2, [x1, x3]
+            (
+                "an index from an ADD",
+                &[ADRP, 0x9101_0021, 0xb863_6822, MOV],
+                vec![Address(0x1040), at(0x1040)],
+            ),
+            // adr x1, 0x1010; ldr w2, [x1, #4]
+            (
+                "a load through ADR",
+                &[0x1000_0081, 0xb940_0422, MOV],
+                vec![Access(0x1014, 0x1018)],
+            ),
+            ("ADR alone", &[0x1000_0081, MOV], vec![]),
+            (
+                "ADR live at a return",
+                &[0x1000_0081, RET],
+                vec![at(0x1010)],
+            ),
+            // ldr w0, [x19, #0x200]; bl; ldr w1, [x19, #0x100]
+            (
+                "a completed page reused after a call",
+                &[ADRP19, 0xb942_0260, 0x9400_0002, 0xb941_0261],
+                vec![Access(0x1200, 0x1204), page],
+            ),
+            // mov x20, x19
+            ("a copy", &[ADRP19, 0xaa13_03f4, MOV19], vec![page]),
+            // add x21, x19, x22
+            (
+                "register arithmetic",
+                &[ADRP19, 0x8b16_0275, MOV19],
+                vec![page],
+            ),
+            // stp x19, x20, [sp, #-16]!: a spill, not a write of x19
+            ("a pair spill", &[ADRP19, 0xa9bf_53f3, MOV19], vec![page]),
+            // str x1, [sp, #8]
+            ("a store of it", &[ADRP, 0xf900_07e1, MOV], vec![page]),
+            // cbz x0, +8
+            (
+                "live at a conditional branch",
+                &[ADRP, 0xb400_0040, MOV],
+                vec![page],
+            ),
+            ("live at the window's end", &window, vec![page]),
+            ("dead within the window", &within, vec![]),
+            // cmp x1, x2
+            ("a compare", &[ADRP, 0xeb02_003f, MOV], vec![]),
+            // mov x0, x19: an ORR whose shift amount (bits 14:10) is 0,
+            // which names no register, so it only writes x0.
+            (
+                "another register copied into it",
+                &[0x9000_0000, 0x9101_0002, 0xaa13_03e0, 0xd280_0002],
+                vec![Address(0x1040)],
+            ),
+            // fmov d1, d2: may name x1's number for a SIMD register
+            (
+                "a write that may not be one",
+                &[ADRP, 0x1e60_4041],
+                vec![page],
+            ),
+            // add x1, x1, #0x104; ldur w2, [x1, #-4]
+            (
+                "a negative unscaled offset",
+                &[ADRP, 0x9104_1021, 0xb85f_c022, MOV],
+                vec![Address(0x1104), Access(0x1100, 0x1104)],
+            ),
+            // add x1, x1, #0x110; ldp x2, x3, [x1, #-16]
+            (
+                "a negative pair offset",
+                &[ADRP, 0x9104_4021, 0xa97f_0c22, MOV],
+                vec![Address(0x1110), Access(0x1100, 0x1110)],
+            ),
+            // ldr w2, [x1, #8]!; ldr w3, [x1, #4]
+            (
+                "a pre-index writeback",
+                &[ADRP, 0xb840_8c22, 0xb940_0423, MOV],
+                vec![Access(0x1008, 0x100c), Access(0x100c, 0x1010)],
+            ),
+            // ld1b {z0.b}, p0/z, [x1]
+            ("an SVE load", &[ADRP, 0xa400_a020, MOV], vec![page]),
+            // bfxil x1, x2, #8, #8: keeps the bits it does not insert
+            ("a BFXIL into it", &[ADRP, 0xb348_3c41, MOV], vec![page]),
+            // bfxil x3, x2, #8, #8
+            ("a BFXIL into another", &[ADRP, 0xb348_3c43, MOV], vec![]),
+            // pacia x3, x2; autia x3, x2; xpaci x3: adrp x3
+            (
+                "PACIA on it",
+                &[0x9000_0003, 0xdac1_0043, 0xd280_0003],
+                vec![page],
+            ),
+            (
+                "AUTIA on it",
+                &[0x9000_0003, 0xdac1_1043, 0xd280_0003],
+                vec![page],
+            ),
+            (
+                "XPACI on it",
+                &[0x9000_0003, 0xdac1_43e3, 0xd280_0003],
+                vec![page],
+            ),
+            // adrp x17; pacia1716; mov x17, #0
+            (
+                "PACIA1716",
+                &[0x9000_0011, 0xd503_211f, 0xd280_0011],
+                vec![page],
+            ),
+            // ccmp x1, x2, #1, eq and ccmp x1, #2, #1, eq: only flags
+            ("a CCMP", &[ADRP, 0xfa42_0021, MOV], vec![]),
+            ("a CCMP immediate", &[ADRP, 0xfa42_0821, MOV], vec![]),
+            ("a CCMP, then held", &[ADRP, 0xfa42_0021, RET], vec![page]),
+            // bc.eq +8: a conditional branch
+            ("live at a BC.cond", &[ADRP, 0x5400_0050, MOV], vec![page]),
+            // dc zva, x1 zeroes a block through it
+            ("a DC ZVA", &[ADRP, 0xd50b_7421, MOV], vec![page]),
+            ("a DC GVA", &[ADRP, 0xd50b_7461, MOV], vec![page]),
+            // dc cvac, x1 and ic ivau, x1 change no data
+            ("a DC CVAC", &[ADRP, 0xd50b_7a21, MOV], vec![]),
+            ("an IC IVAU", &[ADRP, 0xd50b_7521, MOV], vec![]),
+            // paciasp: signs x30 in place
+            (
+                "PACIASP",
+                &[0x9000_001e, 0xd503_233f, 0xd280_001e],
+                vec![page],
+            ),
+            // chkfeat x16; pacia171615 (x17 with x16 and x15)
+            (
+                "CHKFEAT",
+                &[0x9000_0010, 0xd503_251f, 0xd280_0010],
+                vec![page],
+            ),
+            (
+                "PACIA171615",
+                &[0x9000_000f, 0xdac1_8bfe, 0xd280_000f],
+                vec![page],
+            ),
+            // SVE and SIMD forms taking a general register: dup z1.d, x0;
+            // index z1.d, x0, #1; cpy z1.d, p0/m, x0; insr z1.d, x0;
+            // addvl x2, x1, #1; incd x1; dup v0.2d, x1; fmov d0, x1
+            (
+                "SVE DUP",
+                &[0x9000_0000, 0x05e0_3801, 0xd280_0000],
+                vec![page],
+            ),
+            (
+                "SVE INDEX",
+                &[0x9000_0000, 0x04e1_4401, 0xd280_0000],
+                vec![page],
+            ),
+            (
+                "SVE CPY",
+                &[0x9000_0000, 0x05e8_a001, 0xd280_0000],
+                vec![page],
+            ),
+            (
+                "SVE INSR",
+                &[0x9000_0000, 0x05e4_3801, 0xd280_0000],
+                vec![page],
+            ),
+            ("SVE ADDVL", &[ADRP, 0x0421_5022, MOV], vec![page]),
+            ("SVE INCD", &[ADRP, 0x04f0_e3e1, MOV], vec![page]),
+            ("SIMD DUP", &[ADRP, 0x4e08_0c20, MOV], vec![page]),
+            ("SIMD FMOV", &[ADRP, 0x9e67_0020, MOV], vec![page]),
+            // ldr za[w12, 0], [x1]: a slice index and a base
+            (
+                "SME slice index",
+                &[0x9000_000c, 0xe100_0020, 0xd280_000c],
+                vec![page],
+            ),
+            ("SME base", &[ADRP, 0xe100_0020, MOV], vec![page]),
+            // caspa x0, x1, x2, x3, [x4] and the other orderings: x2:x3 are
+            // stored, x0:x1 compared and then overwritten, x4 the base.
+            (
+                "CASPA Xt",
+                &[0x9000_0002, 0x4860_7c82, 0xd280_0002],
+                vec![page],
+            ),
+            (
+                "CASP Xt+1",
+                &[0x9000_0003, 0x4820_7c82, 0xd280_0003],
+                vec![page],
+            ),
+            (
+                "CASPL Xt+1",
+                &[0x9000_0003, 0x4820_fc82, 0xd280_0003],
+                vec![page],
+            ),
+            (
+                "CASPAL Xt+1",
+                &[0x9000_0003, 0x4860_fc82, 0xd280_0003],
+                vec![page],
+            ),
+            ("CASPA Xs+1", &[0x9000_0001, 0x4860_7c82, RET], vec![]),
+            (
+                "CASPA base",
+                &[0x9000_0004, 0x4860_7c82, 0xd280_0004],
+                vec![Access(0x1000, 0x1010)],
+            ),
+            // swpp x4, x6, [x8]; ldclrp; ldsetp: not decoded, so x5 and x7,
+            // taken as the pairs' successors, are passed on.
+            ("SWPP", &[0x9000_0005, 0x1926_8104, 0xd280_0005], vec![page]),
+            (
+                "LDCLRP",
+                &[0x9000_0007, 0x1926_1104, 0xd280_0007],
+                vec![page],
+            ),
+            (
+                "LDSETP",
+                &[0x9000_0004, 0x1926_3104, 0xd280_0004],
+                vec![page],
+            ),
+            // ld64b x0, [x8]: 64 bytes read, x0 to x7 overwritten;
+            // st64b x0, [x8]: x0 to x7 stored; st64bv x10, x0, [x8]: x10 is
+            // the status.
+            (
+                "LD64B base",
+                &[0x9000_0008, 0xf83f_d100, 0xd280_0008],
+                vec![Access(0x1000, 0x1040)],
+            ),
+            ("LD64B Xt+5", &[0x9000_0005, 0xf83f_d100, RET], vec![]),
+            (
+                "ST64B Xt+5",
+                &[0x9000_0005, 0xf83f_9100, 0xd280_0005],
+                vec![page],
+            ),
+            ("ST64BV status", &[0x9000_000a, 0xf82a_b100, RET], vec![]),
+            (
+                "ST64BV Xt+3",
+                &[0x9000_0003, 0xf82a_b100, 0xd280_0003],
+                vec![page],
+            ),
+            // rcwswp x2, x3, [x1]: its size field is not its width
+            ("RCWSWP", &[ADRP, 0x3822_a023, MOV], vec![page]),
+            // stgp x2, x3, [x1, #16]: two 64-bit registers, offset by 16
+            (
+                "STGP",
+                &[ADRP, 0x6900_8c22, MOV],
+                vec![Access(0x1010, 0x1020)],
+            ),
+            // cbgt x1, x2, #8: a branch the scan does not name
+            ("CB<cc>", &[ADRP, 0xf402_0041, MOV], vec![page]),
+            // The same branch with the address in x3, which it does not name:
+            // the scan stops there with x3 still holding it.
+            (
+                "CB<cc> beside it",
+                &[0x9000_0003, 0xf402_0041, 0xd280_0003],
+                vec![page],
+            ),
+            // sysp #0, c8, c0, #0, x0, x1; msrr ttbr0_el1, x0, x1
+            ("SYSP Xt+1", &[ADRP, 0xd548_8000, MOV], vec![page]),
+            ("MSRR Xt+1", &[ADRP, 0xd558_2000, MOV], vec![page]),
+            // add x1, x1, #0x40; ldaxr w0, [x1]
+            (
+                "an exclusive at the base",
+                &[ADRP, 0x9101_0021, 0x885f_fc20, MOV],
+                vec![Address(0x1040), Access(0x1040, 0x1044)],
+            ),
+        ];
+        for (case, words, expected) in cases {
+            assert_eq!(&base_references(words, 0x1000), expected, "{case}");
+        }
     }
 
     #[test]

@@ -362,6 +362,7 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
                 Section {
                     offset: sh.sh_offset,
                     vaddr: sh.sh_addr,
+                    size: sh.sh_size,
                     writable,
                     words,
                     evidence: held.evidence,
@@ -387,10 +388,11 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
             None => std::collections::HashSet::new(),
         })
         .collect();
-    // Collect `LDR` (literal) and `ADR` references from code and unknown
-    // executable ranges. An unproven section stays unchanged, but its readers
-    // can still observe rewritten bytes in a different, marked section.
-    // Proven data contributes no references. Sort the targets below.
+    // Collect `LDR` (literal) and `ADR` references, and what each `ADRP`
+    // lets the code after it read, from code and unknown executable ranges.
+    // An unproven section stays unchanged, but its readers can still observe
+    // rewritten bytes in a different, marked section. Proven data
+    // contributes no references. Sort the targets below.
     // An `ADR` that names a function's own entry takes a pointer to the
     // function. A literal load reads its instruction bytes even there,
     // so only the address-taking can allow that function's first sequence.
@@ -399,7 +401,11 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
             .binary_search_by_key(&target, |(entry, _)| *entry)
             .is_ok()
     };
-    let mut literals: Vec<(u64, u64)> = sections
+    // Each possibly executable range of each readable section, as words
+    // and the PC of the first. Include every word intersecting a range, even
+    // at a partial-word boundary; decode at that word's actual PC, not the
+    // possibly unaligned span start.
+    let spans: Vec<(&[u32], u64)> = sections
         .iter()
         .filter_map(|section| Some((section, section.words.as_ref()?)))
         .flat_map(|(section, words)| {
@@ -407,22 +413,50 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
                 .code
                 .iter()
                 .chain(&section.unknown)
-                .flat_map(move |(start, end)| {
-                    // Include every word intersecting a possibly executable
-                    // range, even at a partial-word boundary. Decode at that
-                    // word's actual PC, not the possibly unaligned span start.
+                .map(move |(start, end)| {
                     let first = (((start - section.vaddr) / 4) as usize).min(words.len());
                     let last = (((end - section.vaddr).div_ceil(4)) as usize).min(words.len());
-                    let pc = section.vaddr + 4 * first as u64;
-                    mapping::literal_references(&words[first..last], pc)
+                    (&words[first..last], section.vaddr + 4 * first as u64)
                 })
         })
+        .collect();
+    let mut literals: Vec<(u64, u64)> = spans
+        .iter()
+        .flat_map(|(words, pc)| mapping::literal_references(words, *pc))
         .filter(|reference| {
             reference.kind != mapping::LiteralKind::Address || !entry_of(reference.range.0)
         })
         .map(|reference| reference.range)
         .collect();
+    // What the code reads through an `ADRP`'s page or an `ADR`'s address
+    // ([`mapping::base_references`]): an access of known address and width
+    // reads those bytes, and an `ADD` from it takes an address, as `ADR`
+    // does, which is not a read of the word there where it is an FDE start:
+    // it takes a function pointer. Any use whose extent is not known may
+    // read any executable byte of the image, a function's entry included:
+    // a function pointer passed on, or still held, can be read as well as
+    // called.
+    let executable: Vec<(u64, u64)> = sections
+        .iter()
+        .map(|section| (section.vaddr, section.vaddr.saturating_add(section.size)))
+        .collect();
+    let mut unbounded: Vec<(u64, u64)> = Vec::new();
+    for reference in spans
+        .iter()
+        .flat_map(|(words, pc)| mapping::base_references(words, *pc))
+    {
+        match reference {
+            mapping::BaseReference::Access(start, end) => unbounded.push((start, end)),
+            mapping::BaseReference::Address(at) if !entry_of(at) => {
+                literals.push((at, at.wrapping_add(4)))
+            }
+            mapping::BaseReference::Address(_) => {}
+            mapping::BaseReference::Unknown { .. } => unbounded.extend(&executable),
+        }
+    }
     literals.sort_unstable();
+    unbounded.sort_unstable();
+    unbounded.dedup();
     // No addressed-data extents are computed: without mapping symbols a
     // section is unproven and left alone, so no data exclusion is needed.
     let extents: Vec<(u64, u64)> = Vec::new();
@@ -458,6 +492,7 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
         let Section {
             offset,
             vaddr,
+            size: _,
             writable,
             words,
             evidence,
@@ -522,6 +557,7 @@ pub fn plan_bytes(bytes: &[u8]) -> Result<Option<FilePlan>, goblin::error::Error
         let mut plan = rewrite::plan_section(&words, vaddr, &external_targets, &known_entries);
         restrict_to_code(&mut plan, &words, vaddr, &code);
         refuse_literals(&mut plan, &literals);
+        refuse_overlapping(&mut plan, &unbounded, Refusal::LiteralInsideSequence);
         refuse_overlapping(&mut plan, &extents, Refusal::AddressedData);
         if unknown_direct_branch {
             rewrite::refuse_patched(&mut plan, Refusal::UnknownDirectBranch);
@@ -587,6 +623,8 @@ struct Section {
     /// Its file offset and address.
     offset: u64,
     vaddr: u64,
+    /// Its size in bytes, as its header gives it.
+    size: u64,
     /// Whether a writable mapping holds it.
     writable: bool,
     /// Its instruction words; `None` when it is truncated or unaligned.
@@ -1538,6 +1576,40 @@ pub(crate) mod tests {
         );
     }
 
+    /// [`elf_image_two_sections`] with the second section's mapping symbols
+    /// replaced by `marks`, (name, offset into the section): names are
+    /// `$x`=1, `$d`=4 and `$a`=7. The first section stays marked as code.
+    fn two_sections_with_marks(first: &[u32], second: &[u32], marks: &[(u32, u64)]) -> Vec<u8> {
+        // Reuse the two-section fixture, replacing only its non-allocated
+        // symbol/string tables.
+        let mut image = elf_image_two_sections(first, second);
+        let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
+        let symtab_header = shoff + 64 * 4;
+        let strtab_header = shoff + 64 * 5;
+        let symtab_at = image.len().next_multiple_of(8);
+        image.resize(symtab_at, 0);
+        image.extend_from_slice(&[0u8; 24]);
+        image.extend_from_slice(&mapping::tests::symbol(1, 0, 1, 0x400100));
+        for &(name, offset) in marks {
+            image.extend_from_slice(&mapping::tests::symbol(name, 0, 2, 0x400200 + offset));
+        }
+        let symtab_len = image.len() - symtab_at;
+        let strtab_at = image.len();
+        let strings = b"\0$x\0$d\0$a\0";
+        image.extend_from_slice(strings);
+        image[symtab_header + 24..symtab_header + 32]
+            .copy_from_slice(&(symtab_at as u64).to_le_bytes());
+        image[symtab_header + 32..symtab_header + 40]
+            .copy_from_slice(&(symtab_len as u64).to_le_bytes());
+        image[symtab_header + 44..symtab_header + 48]
+            .copy_from_slice(&((2 + marks.len()) as u32).to_le_bytes());
+        image[strtab_header + 24..strtab_header + 32]
+            .copy_from_slice(&(strtab_at as u64).to_le_bytes());
+        image[strtab_header + 32..strtab_header + 40]
+            .copy_from_slice(&(strings.len() as u64).to_le_bytes());
+        image
+    }
+
     #[test]
     fn literal_readers_in_unknown_executable_ranges_protect_other_sections() {
         let loop_words = [
@@ -1550,36 +1622,8 @@ pub(crate) mod tests {
         const LDR: u32 = 0x18ff_f801; // 0x400200: ldr w1, 0x400100
         const NOP: u32 = 0xd503_201f;
 
-        // Reuse the two-section fixture, replacing only its non-allocated
-        // symbol/string tables. Names are $x=1, $d=4, $a=7. Every reader
-        // layout keeps the first section marked as code.
         let image_with_reader_marks = |reader: u32, marks: &[(u32, u64)]| {
-            let mut image = elf_image_two_sections(&loop_words, &[reader, 0xd65f_03c0]);
-            let shoff = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
-            let symtab_header = shoff + 64 * 4;
-            let strtab_header = shoff + 64 * 5;
-            let symtab_at = image.len().next_multiple_of(8);
-            image.resize(symtab_at, 0);
-            image.extend_from_slice(&[0u8; 24]);
-            image.extend_from_slice(&mapping::tests::symbol(1, 0, 1, 0x400100));
-            for &(name, offset) in marks {
-                image.extend_from_slice(&mapping::tests::symbol(name, 0, 2, 0x400200 + offset));
-            }
-            let symtab_len = image.len() - symtab_at;
-            let strtab_at = image.len();
-            let strings = b"\0$x\0$d\0$a\0";
-            image.extend_from_slice(strings);
-            image[symtab_header + 24..symtab_header + 32]
-                .copy_from_slice(&(symtab_at as u64).to_le_bytes());
-            image[symtab_header + 32..symtab_header + 40]
-                .copy_from_slice(&(symtab_len as u64).to_le_bytes());
-            image[symtab_header + 44..symtab_header + 48]
-                .copy_from_slice(&((2 + marks.len()) as u32).to_le_bytes());
-            image[strtab_header + 24..strtab_header + 32]
-                .copy_from_slice(&(strtab_at as u64).to_le_bytes());
-            image[strtab_header + 32..strtab_header + 40]
-                .copy_from_slice(&(strings.len() as u64).to_le_bytes());
-            image
+            two_sections_with_marks(&loop_words, &[reader, 0xd65f_03c0], marks)
         };
 
         let layouts: &[(&str, &[(u32, u64)])] = &[
@@ -1645,6 +1689,123 @@ pub(crate) mod tests {
         assert_ne!(changed, nearby);
     }
 
+    /// What an `ADRP` lets the code read is protected like a literal load's
+    /// target, from the sequence's own section, another marked section and
+    /// an unknown range alike: a load through the page its width, and a use
+    /// of unknown extent (the page held at a return or across a call, an
+    /// index load, a copy) any executable byte. With no reader, a reader of
+    /// other bytes, or the page gone before the call, the loop is still
+    /// rewritten.
+    #[test]
+    fn adrp_readers_protect_the_bytes_they_read() {
+        let loop_words = [
+            0x885f_fc08, // 0x400100: ldaxr w8, [x0]
+            0x1100_0508, // add w8, w8, #1
+            0x8809_fc08, // stlxr w9, w8, [x0]
+            0x35ff_ffa9, // cbnz w9, 0x400100
+            0xd65f_03c0, // ret
+        ];
+        const ADRP: u32 = 0x9000_0001; // adrp x1, 0x400000 (from 0x400200)
+        const ADRP19: u32 = 0x9000_0013; // adrp x19, 0x400000
+        const MOV: u32 = 0xd280_0001; // mov x1, #0: the page is gone
+        const MOV19: u32 = 0xd280_0013; // mov x19, #0
+        const NOP: u32 = 0xd503_201f;
+        const RET: u32 = 0xd65f_03c0;
+        let reads: &[(&str, &[u32])] = &[
+            // ldr w2, [x1, #0x100]: the loop's first word.
+            ("a load of the loop", &[ADRP, 0xb941_0022, MOV, RET]),
+            // Nothing completes the page before the return.
+            ("an ADRP nothing completes", &[ADRP, NOP, RET]),
+            // add x1, x1, #0x100; ldr w2, [x1, x3]: an index from the loop.
+            (
+                "an index load from an ADD",
+                &[ADRP, 0x9104_0021, 0xb863_6822, MOV, RET],
+            ),
+            // ldr w0, [x19, #0x200]; bl; ldr w1, [x19, #0x100]: completed,
+            // then held across the call and read there.
+            (
+                "a page reused after a call",
+                &[ADRP19, 0xb942_0260, 0x9400_0002, 0xb941_0261, RET],
+            ),
+            // mov x20, x19; mov x19, #0; ldr w1, [x20, #0x100]
+            (
+                "a copy read after the page is gone",
+                &[ADRP19, 0xaa13_03f4, MOV19, 0xb941_0281, RET],
+            ),
+        ];
+        let misses: &[(&str, &[u32])] = &[
+            ("no reader", &[NOP, NOP, NOP, RET]),
+            // ldr w2, [x1, #0x200]: the reader's own section.
+            ("a load of other bytes", &[ADRP, 0xb942_0022, MOV, RET]),
+            // ldr w0, [x19, #0x200]; mov x19, #0; bl: nothing held at the call.
+            (
+                "the page gone before a call",
+                &[ADRP19, 0xb942_0260, MOV19, 0x9400_0002, RET],
+            ),
+        ];
+        let layouts: &[(&str, &[(u32, u64)])] = &[
+            ("marked code", &[(1, 0)]),
+            ("unmarked section", &[]),
+            ("unsupported section", &[(7, 0)]),
+        ];
+        for &(layout, marks) in layouts {
+            for &(read, reader) in reads {
+                let image = two_sections_with_marks(&loop_words, reader, marks);
+                let (unchanged, report) = rewritten(&image);
+                assert_eq!(unchanged, image, "{layout}, {read}: {report:?}");
+                assert_eq!(
+                    report.refused_sites,
+                    vec![(0x400100, "literal-inside-the-sequence".into())],
+                    "{layout}, {read}: {report:?}"
+                );
+            }
+            for &(miss, reader) in misses {
+                let image = two_sections_with_marks(&loop_words, reader, marks);
+                let (changed, report) = rewritten(&image);
+                assert_eq!(report.patched_total(), 1, "{layout}, {miss}: {report:?}");
+                assert_ne!(changed, image, "{layout}, {miss}");
+            }
+        }
+
+        // An index load from an address an `ADD` formed before the loop reads
+        // on into it: add x1, x1, #0x100 names a `nop` before the loop, so
+        // ldr w2, [x1, x3] may read the loop, and ldr w2, [x1] only the `nop`.
+        let mut shifted = vec![NOP];
+        shifted.extend(loop_words);
+        for &(layout, marks) in layouts {
+            let index = [ADRP, 0x9104_0021, 0xb863_6822, MOV, RET];
+            let image = two_sections_with_marks(&shifted, &index, marks);
+            let (unchanged, report) = rewritten(&image);
+            assert_eq!(unchanged, image, "{layout}: {report:?}");
+            assert_eq!(
+                report.refused_sites,
+                vec![(0x400104, "literal-inside-the-sequence".into())],
+                "{layout}: {report:?}"
+            );
+            let first = [ADRP, 0x9104_0021, 0xb940_0022, MOV, RET];
+            let image = two_sections_with_marks(&shifted, &first, marks);
+            assert_eq!(rewritten(&image).1.patched_total(), 1, "{layout}");
+        }
+
+        // In the loop's own section: ldr w2, [x1, #0x104] reads the loop's
+        // first instruction (the `ldaxr` after `LOOP`'s `nop`), and
+        // ldr w2, [x1, #0x100] only the `nop` before it.
+        let own = |load: u32| {
+            let mut words = LOOP.to_vec();
+            words.extend([ADRP, load, MOV, RET]);
+            elf_with_text(&words)
+        };
+        let image = own(0xb941_0422);
+        let (unchanged, report) = rewritten(&image);
+        assert_eq!(unchanged, image, "{report:?}");
+        assert_eq!(
+            report.refused,
+            BTreeMap::from([("literal-inside-the-sequence", 1)]),
+            "{report:?}"
+        );
+        assert_eq!(rewritten(&own(0xb941_0022)).1.patched_total(), 1);
+    }
+
     #[test]
     fn a_literal_load_of_an_fde_entry_keeps_the_read_bytes() {
         let words = [
@@ -1682,26 +1843,137 @@ pub(crate) mod tests {
             );
         }
 
-        // ADR takes an address rather than reading bytes. Only a known
-        // function entry qualifies; an address inside the sequence does not.
-        let mut address = words;
-        address[5] = 0x10ff_ff61; // adr x1, 0x100
-        let image = elf_image_with(&address, Some(&marks), Some(&functions));
+        // ADR takes an address rather than reading bytes, so an FDE start
+        // qualifies where nothing reads through the address (`mov x1, #0`
+        // drops it); an address inside the sequence does not. Kept to the
+        // return, the pointer reaches the caller, which may read it as well
+        // as call it.
+        let taken = |adr: u32, then: u32| {
+            let mut address = words.to_vec();
+            address[5] = adr;
+            address.insert(6, then);
+            elf_image_with(&address, Some(&marks), Some(&[(0, 5), (5, 8)]))
+        };
+        let image = taken(0x10ff_ff61, 0xd280_0001); // adr x1, 0x100; mov x1, #0
         let (changed, report) = rewritten(&image);
         assert_eq!(report.patched_total(), 1, "{report:?}");
         assert_ne!(changed, image);
+        for (adr, then) in [
+            (0x10ff_ff81, 0xd280_0001), // adr x1, 0x104; mov x1, #0
+            (0x10ff_ff61, 0xd503_201f), // adr x1, 0x100; nop: held at the return
+        ] {
+            let image = taken(adr, then);
+            assert!(plan_bytes(&image).unwrap().unwrap().patches.is_empty());
+            let (unchanged, report) = rewritten(&image);
+            assert_eq!(unchanged, image, "{report:?}");
+            assert_eq!(report.patched_total(), 0, "{report:?}");
+            assert_eq!(
+                report.refused.get("literal-inside-the-sequence"),
+                Some(&1),
+                "{report:?}"
+            );
+        }
+    }
 
-        address[5] = 0x10ff_ff81; // adr x1, 0x104
-        let image = elf_image_with(&address, Some(&marks), Some(&functions));
-        assert!(plan_bytes(&image).unwrap().unwrap().patches.is_empty());
-        let (unchanged, report) = rewritten(&image);
-        assert_eq!(unchanged, image, "{report:?}");
-        assert_eq!(report.patched_total(), 0, "{report:?}");
+    /// A function pointer can be read as well as called: one taken with
+    /// `ADR` at an FDE start, kept in a register the callee preserves across
+    /// a call and read after it (`adr x19, 0x100; bl; ldr w0, [x19]`), leaves
+    /// the loop alone. Dropped before the call, nothing reads it.
+    #[test]
+    fn a_function_pointer_kept_across_a_call_protects_the_function() {
+        let words = vec![
+            0x885f_fc08, // 0x100: ldaxr w8, [x0]
+            0x1100_0508, // add w8, w8, #1
+            0x8809_fc08, // stlxr w9, w8, [x0]
+            0x35ff_ffa9, // cbnz w9, 0x100
+            0xd65f_03c0, // ret
+        ];
+        let functions = [(0, 5), (5, 9), (9, 10)];
+        let image = |reader: [u32; 4]| {
+            let mut words = words.clone();
+            words.extend(reader);
+            words.push(0xd65f_03c0); // 0x124: the callee, ret
+            elf_image_with(&words, Some(&[(1, 0, true)]), Some(&functions))
+        };
+        const ADR: u32 = 0x10ff_ff73; // 0x114: adr x19, 0x100
+        const RET: u32 = 0xd65f_03c0;
+        // bl 0x124; ldr w0, [x19]
+        let read = image([ADR, 0x9400_0003, 0xb940_0260, RET]);
+        let (unchanged, report) = rewritten(&read);
+        assert_eq!(unchanged, read, "{report:?}");
         assert_eq!(
-            report.refused.get("literal-inside-the-sequence"),
-            Some(&1),
+            report.refused,
+            BTreeMap::from([("literal-inside-the-sequence", 1)]),
             "{report:?}"
         );
+        // mov x19, #0; bl 0x124
+        let dropped = image([ADR, 0xd280_0013, 0x9400_0002, RET]);
+        let (changed, report) = rewritten(&dropped);
+        assert_eq!(report.patched_total(), 1, "{report:?}");
+        assert_ne!(changed, dropped);
+    }
+
+    /// The canonical loop at 0x400100 in the first of
+    /// [`two_sections_with_marks`]'s sections, its `ret` at 0x400110.
+    const NARROWED_LOOP: [u32; 5] = [
+        0x885f_fc08, // 0x400100: ldaxr w8, [x0]
+        0x1100_0508, // add w8, w8, #1
+        0x8809_fc08, // stlxr w9, w8, [x0]
+        0x35ff_ffa9, // cbnz w9, 0x400100
+        0xd65f_03c0, // 0x400110: ret
+    ];
+
+    /// The forms a base survives, from another marked section: `BFXIL` and
+    /// `CCMP` keep it (the first reads the bits it does not insert, the
+    /// second writes only flags), `BC.cond` branches with it held, and
+    /// `DC ZVA` zeroes a block through it. Each leaves the loop alone; a
+    /// `BFXIL` into another register, a `DC CVAC` and the base dropped before
+    /// a `BC.cond` do not.
+    #[test]
+    fn a_base_kept_by_a_partial_write_a_flag_write_or_a_branch_still_protects() {
+        const ADRP: u32 = 0x9000_0001; // adrp x1, 0x400000 (from 0x400200)
+        const MOV: u32 = 0xd280_0001; // mov x1, #0
+        const RET: u32 = 0xd65f_03c0;
+        const ADD: u32 = 0x9103_0021; // add x1, x1, #0xc0: before the loop
+        let readers: &[(&str, &[u32])] = &[
+            // bfxil x1, x2, #8, #8; ldr w0, [x1, #0x100]
+            ("BFXIL", &[ADRP, 0xb348_3c41, 0xb941_0020, MOV, RET]),
+            // ccmp x1, x2, #1, eq; ldr w0, [x1, #0x100]
+            ("CCMP", &[ADRP, 0xfa42_0021, 0xb941_0020, MOV, RET]),
+            // bc.eq +8; mov x1, #0; ret
+            ("BC.cond", &[ADRP, 0x5400_0050, MOV, RET]),
+            // dc zva, x1
+            ("DC ZVA", &[ADRP, ADD, 0xd50b_7421, MOV, RET]),
+        ];
+        let controls: &[(&str, &[u32])] = &[
+            // bfxil x3, x2, #8, #8; ldr w0, [x1, #0x200]
+            ("BFXIL into x3", &[ADRP, 0xb348_3c43, 0xb942_0020, MOV, RET]),
+            // ccmp x1, x2, #1, eq; ldr w0, [x1, #0x200]
+            (
+                "CCMP, other bytes",
+                &[ADRP, 0xfa42_0021, 0xb942_0020, MOV, RET],
+            ),
+            // mov x1, #0; bc.eq +8
+            ("BC.cond after the drop", &[ADRP, MOV, 0x5400_0050, RET]),
+            // dc cvac, x1
+            ("DC CVAC", &[ADRP, ADD, 0xd50b_7a21, MOV, RET]),
+        ];
+        for &(form, reader) in readers {
+            let image = two_sections_with_marks(&NARROWED_LOOP, reader, &[(1, 0)]);
+            let (unchanged, report) = rewritten(&image);
+            assert_eq!(unchanged, image, "{form}: {report:?}");
+            assert_eq!(
+                report.refused_sites,
+                vec![(0x400100, "literal-inside-the-sequence".into())],
+                "{form}: {report:?}"
+            );
+        }
+        for &(form, reader) in controls {
+            let image = two_sections_with_marks(&NARROWED_LOOP, reader, &[(1, 0)]);
+            let (changed, report) = rewritten(&image);
+            assert_eq!(report.patched_total(), 1, "{form}: {report:?}");
+            assert_ne!(changed, image, "{form}");
+        }
     }
 
     /// Under the unwind table alone, code is what control reaches from the
@@ -1738,17 +2010,31 @@ pub(crate) mod tests {
             assert_eq!(bytes, image, "{branch:#010x}: the table is untouched");
         }
         // Marked as code, the same words would be rewritten: the
-        // reachability is what refuses them.
-        let marked = elf_image(&words, Some(&[(1, 0, true)]));
+        // reachability is what refuses them. The load reads the table's
+        // first word into the register, which then holds no address; the one
+        // at #4 reads the loop's first instruction, which a rewrite would
+        // change under it, and keeps the address across the branch, so that
+        // loop is left alone.
+        let mut marked_words = words;
+        marked_words[1] = 0xb940_0021; // ldr w1, [x1]
+        let marked = elf_image(&marked_words, Some(&[(1, 0, true)]));
         assert_eq!(rewritten(&marked).1.patched_total(), 1);
+        let reading = rewritten(&elf_image(&words, Some(&[(1, 0, true)]))).1;
+        assert_eq!(reading.patched_total(), 0, "{reading:?}");
+        assert_eq!(
+            reading.refused,
+            BTreeMap::from([("literal-inside-the-sequence", 1)]),
+            "{reading:?}"
+        );
     }
 
     /// Under the unwind table alone, a call is taken to return, so a table
     /// placed after a call that does not return is reached as code. What the
     /// code addresses as data is taken for data from there to the next
     /// instruction a branch reaches, so a table whose words form a loop is
-    /// refused, addressed either by `ADRP`+`ADD` or by `ADR`, and the same
-    /// words marked `$x` are still rewritten.
+    /// refused, addressed either by `ADRP`+`ADD` or by `ADR`. Marked `$x`, the
+    /// same words are refused too while the table's address is held across
+    /// the call, and rewritten when only the header word is loaded.
     #[test]
     fn a_table_after_a_call_that_does_not_return_is_not_rewritten() {
         // <address the table at word 3>; bl <word 9>, which traps; a header
@@ -1789,11 +2075,25 @@ pub(crate) mod tests {
                 BTreeMap::from([("no-mapping-symbols", 1)]),
                 "{how}: {report:?}"
             );
-            // Marked as code, the same words are rewritten: only the unwind
-            // table's weaker evidence needs this.
+            // Marked as code, the loop is still left alone: the address of
+            // the table is held across the call, where it may be read (and
+            // `ADR`'s load at #4 reads the loop's first instruction).
             let marked = elf_image(&words, Some(&[(1, 0, true)]));
-            assert_eq!(rewritten(&marked).1.patched_total(), 1, "{how}");
+            let report = rewritten(&marked).1;
+            assert_eq!(report.patched_total(), 0, "{how}: {report:?}");
+            assert_eq!(
+                report.refused,
+                BTreeMap::from([("literal-inside-the-sequence", 1)]),
+                "{how}: {report:?}"
+            );
         }
+        // Marked as code with only the header word loaded, into the register
+        // itself (adrp x1, 0x0; ldr w1, [x1, #0x10c]), nothing is held across
+        // the call, and only the unwind table's weaker evidence refused it.
+        let mut header = words;
+        header[..2].copy_from_slice(&[0x9000_0001, 0xb941_0c21]);
+        let marked = elf_image(&header, Some(&[(1, 0, true)]));
+        assert_eq!(rewritten(&marked).1.patched_total(), 1);
         // Nor is a table the code does not address, now that the call to
         // a function that cannot return does not fall through.
         let mut unaddressed = words;

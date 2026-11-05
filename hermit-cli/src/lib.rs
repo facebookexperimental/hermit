@@ -8740,18 +8740,25 @@ mod tests {
     #[test]
     fn run_with_output_refuses_another_exclusive_rewrite() {
         let dir = tempfile::tempdir().unwrap();
+        // Records of this Hermit's rewriter, so that only the mode differs
+        // from the run's, which rewrites nothing.
+        let current = crate::aarch64_lse::REWRITE_FORMAT_VERSION;
         for (name, json) in [
             (
-                "memory6.json",
-                r#"{"per_thread":{},"global":[],"rewrite_exclusives_in_memory":true,"rewrite_exclusives":{"mode":"memory","format_version":6}}"#,
+                "memory-now.json",
+                format!(
+                    r#"{{"per_thread":{{}},"global":[],"rewrite_exclusives_in_memory":true,"rewrite_exclusives":{{"mode":"memory","format_version":{current}}}}}"#
+                ),
             ),
             (
-                "overlay6.json",
-                r#"{"per_thread":{},"global":[],"rewrite_exclusives":{"mode":"overlay","format_version":6}}"#,
+                "overlay-now.json",
+                format!(
+                    r#"{{"per_thread":{{}},"global":[],"rewrite_exclusives":{{"mode":"overlay","format_version":{current}}}}}"#
+                ),
             ),
             (
                 "heuristic.json",
-                r#"{"slice_boundary_recording":{"preemptions":{"per_thread":{},"global":[],"rewrite_exclusives_stripped_heuristic":true},"schedule":{"protocol":"hermit-slice-boundaries","version":1,"record_count":0,"boundary_count":0,"records":[]}}}"#,
+                r#"{"slice_boundary_recording":{"preemptions":{"per_thread":{},"global":[],"rewrite_exclusives_stripped_heuristic":true},"schedule":{"protocol":"hermit-slice-boundaries","version":1,"record_count":0,"boundary_count":0,"records":[]}}}"#.to_owned(),
             ),
         ] {
             let record = dir.path().join(name);
@@ -8785,16 +8792,22 @@ mod tests {
     #[test]
     fn run_with_output_admits_the_matching_exclusive_rewrite() {
         let dir = tempfile::tempdir().unwrap();
+        // Records of this Hermit's rewriter, whatever its format version.
+        let current = crate::aarch64_lse::REWRITE_FORMAT_VERSION;
         for (name, json, in_memory, overlay) in [
             (
-                "memory6.json",
-                r#"{"per_thread":{},"global":[],"rewrite_exclusives_in_memory":true,"rewrite_exclusives":{"mode":"memory","format_version":6}}"#,
+                "memory-now.json",
+                format!(
+                    r#"{{"per_thread":{{}},"global":[],"rewrite_exclusives_in_memory":true,"rewrite_exclusives":{{"mode":"memory","format_version":{current}}}}}"#
+                ),
                 true,
                 false,
             ),
             (
-                "overlay6.json",
-                r#"{"per_thread":{},"global":[],"rewrite_exclusives":{"mode":"overlay","format_version":6}}"#,
+                "overlay-now.json",
+                format!(
+                    r#"{{"per_thread":{{}},"global":[],"rewrite_exclusives":{{"mode":"overlay","format_version":{current}}}}}"#
+                ),
                 false,
                 true,
             ),

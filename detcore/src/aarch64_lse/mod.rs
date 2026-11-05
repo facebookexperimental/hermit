@@ -46,7 +46,10 @@ pub mod rewrite;
 /// address-taking can use the function-entry exemption. 6: literal readers
 /// in unknown executable ranges protect the bytes they reference, including
 /// bytes in other sections; only proven data is excluded from that scan.
-pub const REWRITE_FORMAT_VERSION: u32 = 6;
+/// 7: so do the reads through an `ADRP`'s page or an `ADR`'s address: an
+/// access the instruction bounds protects those bytes, and any other use,
+/// or the address held where the scan stops, every executable byte.
+pub const REWRITE_FORMAT_VERSION: u32 = 7;
 
 /// Whether this host executes the FEAT_LSE atomics the rewrite emits.
 ///
