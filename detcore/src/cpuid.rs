@@ -858,7 +858,7 @@ const CPUIDS: &[CpuIdResult] = &[
     cpuid_result(0x00000120, 0x01C0003F, 0x0000003F, 0x00000001),
     cpuid_result(0x00000000, 0x00000000, 0x00000003, 0x00000000),
     cpuid_result(0x00000000, 0x00000000, 0x00000000, 0x00000000),
-    cpuid_result(0x00000000, 0x00180FB9, 0x00000000, 0x00000000),
+    cpuid_result(0x00000000, 0x001807A9, 0x00000000, 0x00000000),
     cpuid_result(0x00000000, 0x00000000, 0x00000000, 0x00000000),
     cpuid_result(0x00000000, 0x00000000, 0x00000000, 0x00000000),
     cpuid_result(0x00000000, 0x00000000, 0x00000000, 0x00000000),
@@ -1020,8 +1020,9 @@ mod tests {
     fn cpuinfo_describes_the_virtual_cpu() {
         // Each line is derived from the table above as Linux derives it; see
         // `InterceptedCpuid::cpuinfo`. The flags include the x86-64-v3 set
-        // (`fma`, `movbe`, `xsave`, `f16c`, `abm`) and `hle`/`rtm` because the
-        // table advertises them
+        // (`fma`, `movbe`, `xsave`, `f16c`, `abm`) because the
+        // table advertises them; HLE/RTM are cleared so glibc does not select
+        // TSX paths on hosts without them
         // (https://github.com/rrnewton/hermit/issues/4251,
         // https://github.com/rrnewton/hermit/issues/4252); Linux shows them too.
         let expected = "processor\t: 0\n\
@@ -1044,7 +1045,7 @@ mod tests {
             wp\t\t: yes\n\
             flags\t\t: fpu de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pse36 \
             clflush mmx fxsr sse sse2 syscall nx lm pni ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt \
-            xsave avx f16c hypervisor lahf_lm abm fsgsbase bmi1 hle avx2 smep bmi2 erms invpcid rtm adx smap\n\
+            xsave avx f16c hypervisor lahf_lm abm fsgsbase bmi1 avx2 smep bmi2 erms invpcid adx smap\n\
             bugs\t\t: cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs taa \
             itlb_multihit bhi spectre_v2_user its\n\
             bogomips\t: 2000.00\n\
@@ -1249,7 +1250,7 @@ mod tests {
         }
         assert_eq!(
             registers(cpuid.cpuid(0x07, 0).unwrap()),
-            [0, 0x0018_0fb9, 0, 0]
+            [0, 0x0018_07a9, 0, 0]
         );
         assert_eq!(registers(cpuid.cpuid(0x0b, 0).unwrap()), [0, 1, 0x100, 1]);
     }
