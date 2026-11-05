@@ -19867,12 +19867,14 @@ mod nextest_timeout_tests {
                 "profile {name} must carry the bounded validate retry count"
             );
         }
-        // fail-fast stays exactly as before: stated once, in default, and
-        // never restated (hence never changed) in ci.
+        // fail-fast is stated once, in default, and never restated (hence
+        // never separately changed) in ci. Its value is true: early exit is
+        // the default (the fail-fast-default change), and a keep-going run
+        // renders it back to false per run instead of editing this file.
         let default = profiles["default"].as_table().unwrap();
         assert_eq!(
             default.get("fail-fast").and_then(toml::Value::as_bool),
-            Some(false)
+            Some(true)
         );
         let ci = profiles["ci"].as_table().unwrap();
         assert!(!ci.contains_key("fail-fast"));
