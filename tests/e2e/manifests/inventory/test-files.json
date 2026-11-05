@@ -4903,6 +4903,192 @@
       "why": "Included verbatim by the refusal-detail regression controls to verify that a real scorecard rejection retains its cell identity and cause. The diagnostic text is compared in memory; its recorded paths are never executed."
     },
     {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/README.md",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/README.md is owned by Meta Buck test targets: This README documents the five copied gVisor syscall cases, their pinned upstream revision, and their Buck build/run contract. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/base_poll_test.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/base_poll_test.cc is owned by Meta Buck test targets: Shared poll fixture implementation for the copied gVisor PollTest case. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/base_poll_test.h",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/base_poll_test.h is owned by Meta Buck test targets: Shared poll fixture header for the copied gVisor PollTest case. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/clock_getres.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/clock_getres.cc is owned by Meta Buck test targets: Copied gVisor ClockGetres.Timespec syscall case, one of the five per-binary cases selected by main.cc. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/eventfd.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/eventfd.cc is owned by Meta Buck test targets: Copied gVisor EventfdTest.Nonblock syscall case, one of the five per-binary cases selected by main.cc. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/getrandom.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/getrandom.cc is owned by Meta Buck test targets: Copied gVisor GetrandomTest.IsRandom syscall case, one of the five per-binary cases selected by main.cc. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/main.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/main.cc is owned by Meta Buck test targets: Per-binary entry point that selects exactly one compile-defined gVisor case and rejects zero, multiple, or skipped executed cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/poll.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/poll.cc is owned by Meta Buck test targets: Copied gVisor PollTest.InvalidFds syscall case, one of the five per-binary cases selected by main.cc. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/sched_yield.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/sched_yield.cc is owned by Meta Buck test targets: Copied gVisor SchedYieldTest.Success syscall case, one of the five per-binary cases selected by main.cc. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/cleanup.h",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/cleanup.h is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/epoll_util.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/epoll_util.cc is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/epoll_util.h",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/epoll_util.h is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/errno_safe_allocator.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/errno_safe_allocator.cc is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/eventfd_util.h",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/eventfd_util.h is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/file_descriptor.h",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/file_descriptor.h is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/fs_util.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/fs_util.cc is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/fs_util.h",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/fs_util.h is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/logging.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/logging.cc is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/logging.h",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/logging.h is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/posix_error.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/posix_error.cc is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/posix_error.h",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/posix_error.h is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/save_util.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/save_util.cc is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/save_util.h",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/save_util.h is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/save_util_linux.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/save_util_linux.cc is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/signal_util.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/signal_util.cc is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/signal_util.h",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/signal_util.h is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/test_util.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/test_util.cc is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/test_util.h",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/test_util.h is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/test_util_impl.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/test_util_impl.cc is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util/thread_util.h",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util/thread_util.h is owned by Meta Buck test targets: Part of the shared gVisor test utilities compiled once as the Buck :test_util library for the five cases. It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/gvisor/util_test.cc",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/util_test.cc is owned by Meta Buck test targets: GoogleTest unit tests for the copied gVisor test utilities (RetryEINTR argument ownership). It is built and run only by the internal Buck hermit_bin_test targets (GoogleTest/Abseil/Benchmark are Buck-supplied); the public Cargo/E2E manifest harness cannot link it, so it has no manifest-test entry."
+    },
+    {
       "disposition": "support-data",
       "path": "tests/helpers.bzl",
       "runner": "Meta Buck test targets",
