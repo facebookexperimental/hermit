@@ -7,6 +7,12 @@
 nextest-version = "0.9.100"
 
 [profile.default]
+# Bounded inner retries for validate-used profiles: a test that fails and
+# then passes is recorded FLAKY with its attempt count (never silently
+# green); a test that fails every attempt stays failed. ci inherits this
+# unless it restates it; both profiles state it so the budget gate in
+# ci/nextest-timeout-config.rs can require the exact value.
+retries = 2
 fail-fast = false
 test-threads = "num-cpus"
 status-level = "pass"
@@ -27,6 +33,7 @@ slow-timeout = { period = "180s", terminate-after = 1, grace-period = "2s" }
 global-timeout = "60m"
 
 [profile.ci]
+retries = 2
 status-level = "slow"
 final-status-level = "slow"
 

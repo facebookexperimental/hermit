@@ -19805,6 +19805,41 @@ mod nextest_timeout_tests {
     }
 
     #[test]
+    fn validate_profiles_retry_twice_with_fail_fast_unchanged() {
+        let root = Path::new(file!())
+            .parent()
+            .and_then(Path::parent)
+            .expect("validate.rs has a repository parent")
+            .to_path_buf();
+        let config = std::fs::read_to_string(root.join(".config/nextest.toml")).unwrap();
+        let document: toml::Value = config.parse().unwrap();
+        let profiles = document
+            .get("profile")
+            .and_then(toml::Value::as_table)
+            .expect("nextest config has profiles");
+        for name in ["default", "ci"] {
+            let profile = profiles
+                .get(name)
+                .and_then(toml::Value::as_table)
+                .unwrap_or_else(|| panic!("nextest config has profile {name}"));
+            assert_eq!(
+                profile.get("retries").and_then(toml::Value::as_integer),
+                Some(2),
+                "profile {name} must carry the bounded validate retry count"
+            );
+        }
+        // fail-fast stays exactly as before: stated once, in default, and
+        // never restated (hence never changed) in ci.
+        let default = profiles["default"].as_table().unwrap();
+        assert_eq!(
+            default.get("fail-fast").and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        let ci = profiles["ci"].as_table().unwrap();
+        assert!(!ci.contains_key("fail-fast"));
+    }
+
+    #[test]
     fn enclosing_timeout_checks_scale_and_refuse_unsafe_multipliers() {
         assert_eq!(
             require_outer_timeout_headroom("fixture", 600, 74, 10, 2, 1.0).unwrap(),

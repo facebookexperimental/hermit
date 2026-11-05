@@ -1066,6 +1066,12 @@ fn prepared_selected_cpu_allowances(
     Ok(allowances)
 }
 
+/// The one retry count a regular validate configuration may carry. It must
+/// match `.config/nextest.toml` exactly: any other value (including none)
+/// leaves budget resolution uncertified rather than budgeting for attempts
+/// the runner will not make, or the reverse.
+const REGULAR_NEXTEST_RETRIES: i64 = 2;
+
 /// The only overrides a regular configuration may carry, as (filter,
 /// test-group) pairs. Each group only lowers how many of its tests run at once.
 const REGULAR_GROUP_OVERRIDES: [(&str, &str); 2] = [
@@ -1108,7 +1114,11 @@ fn regular_config_compatible(document: &DocumentMut) -> bool {
         else {
             continue;
         };
-        if table.contains_key("retries")
+        if table
+            .get("retries")
+            .and_then(Item::as_value)
+            .and_then(Value::as_integer)
+            != Some(REGULAR_NEXTEST_RETRIES)
             || table.contains_key("threads-required")
             || profile == "ci" && table.contains_key("slow-timeout")
         {
@@ -1137,18 +1147,51 @@ fn regular_config_compatible(document: &DocumentMut) -> bool {
     true
 }
 
+/// The retry count the canonical configuration gives the selected profile,
+/// for budget resolution when the invocation does not state one itself.
+/// `ci` inherits `default` in nextest, as here. None when either table or
+/// the key is absent or not an integer.
+fn configured_retries(document: &DocumentMut, args: &[String]) -> Option<u64> {
+    let mut selected = env::var("NEXTEST_PROFILE").unwrap_or_else(|_| "default".into());
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--profile" {
+            selected = args.get(index + 1)?.clone();
+            index += 2;
+            continue;
+        }
+        if let Some(value) = args[index].strip_prefix("--profile=") {
+            selected = value.into();
+        }
+        index += 1;
+    }
+    let retries_of = |name: &str| {
+        document
+            .get("profile")
+            .and_then(Item::as_table)
+            .and_then(|profiles| profiles.get(name))
+            .and_then(Item::as_table)
+            .and_then(|profile| profile.get("retries"))
+            .and_then(Item::as_value)
+            .and_then(Value::as_integer)
+    };
+    let value = retries_of(&selected).or_else(|| retries_of("default"))?;
+    u64::try_from(value).ok()
+}
+
 /// Only certify an emitted finite width and the supported regular profiles.
 /// Unknown invocation semantics retain the original configuration unchanged.
-fn runtime_settings(args: &[String]) -> Option<(u64, u64)> {
+/// The retry count is explicit-only here (flag or environment); a caller
+/// budgeting a counted run falls back to `configured_retries`, because the
+/// counted runner states no `--retries` of its own.
+fn runtime_settings(args: &[String]) -> Option<(u64, Option<u64>)> {
     if env::var("NEXTEST_PROFILE")
         .is_ok_and(|profile| !matches!(profile.as_str(), "default" | "ci"))
     {
         return None;
     }
     let mut threads = env::var("NEXTEST_TEST_THREADS").ok();
-    let mut retries = env::var("NEXTEST_RETRIES")
-        .ok()
-        .unwrap_or_else(|| "0".into());
+    let mut retries: Option<String> = env::var("NEXTEST_RETRIES").ok();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -1159,7 +1202,7 @@ fn runtime_settings(args: &[String]) -> Option<(u64, u64)> {
             }
             "--retries" => {
                 index += 1;
-                retries = args.get(index)?.clone();
+                retries = Some(args.get(index)?.clone());
             }
             "--profile" => {
                 index += 1;
@@ -1180,7 +1223,7 @@ fn runtime_settings(args: &[String]) -> Option<(u64, u64)> {
                 {
                     threads = Some(value.into());
                 } else if let Some(value) = arg.strip_prefix("--retries=") {
-                    retries = value.into();
+                    retries = Some(value.into());
                 } else if !matches!(arg.as_str(), "--profile=default" | "--profile=ci") {
                     return None;
                 }
@@ -1189,7 +1232,11 @@ fn runtime_settings(args: &[String]) -> Option<(u64, u64)> {
         index += 1;
     }
     let threads = threads?.parse::<u64>().ok().filter(|value| *value > 0)?;
-    Some((threads, retries.parse().ok()?))
+    let retries = match retries {
+        Some(value) => Some(value.parse::<u64>().ok()?),
+        None => None,
+    };
+    Some((threads, retries))
 }
 
 fn resolve_budgets(
@@ -1377,7 +1424,19 @@ fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
         }
         return fs::write(&args[2], rendered).map_err(|e| e.to_string());
     }
-    let (threads, retries) = settings.unwrap();
+    let (threads, explicit_retries) = settings.unwrap();
+    // The counted runner states no `--retries` of its own: the attempts it
+    // will make come from the canonical configuration, and the population
+    // budget must count them. An explicit invocation value (the fixture's
+    // `--retries 0` included) always wins.
+    let retries = match explicit_retries {
+        Some(retries) => retries,
+        None => configured_retries(
+            &source.parse::<DocumentMut>().map_err(|e| e.to_string())?,
+            &runtime,
+        )
+        .ok_or("configured nextest retries are missing or invalid")?,
+    };
     let calibration = match fs::read(&args[6]) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1915,10 +1974,30 @@ mod tests {
         ));
         assert_eq!(
             runtime_settings(&["-j8".into(), "--retries=2".into()]),
-            Some((8, 2))
+            Some((8, Some(2)))
         );
+        assert_eq!(runtime_settings(&["-j8".into()]), Some((8, None)));
         assert!(runtime_settings(&["-j0".into()]).is_none());
         assert!(runtime_settings(&["-j8".into(), "--profile=other".into()]).is_none());
+        // The canonical configuration carries exactly the certified retry
+        // count for both validate profiles; any other value (or none) is
+        // not certified, and budget resolution reads the configured count.
+        assert_eq!(configured_retries(&canonical, &["-j8".into()]), Some(2));
+        assert_eq!(
+            configured_retries(&canonical, &["--profile=ci".into(), "-j8".into()]),
+            Some(2)
+        );
+        let wrong_retries =
+            include_str!("../.config/nextest.toml").replace("retries = 2", "retries = 1");
+        assert_ne!(wrong_retries, include_str!("../.config/nextest.toml"));
+        assert!(!regular_config_compatible(
+            &wrong_retries.parse::<DocumentMut>().unwrap()
+        ));
+        let no_retries = include_str!("../.config/nextest.toml").replace("retries = 2\n", "");
+        assert_ne!(no_retries, include_str!("../.config/nextest.toml"));
+        assert!(!regular_config_compatible(
+            &no_retries.parse::<DocumentMut>().unwrap()
+        ));
     }
 
     #[test]
