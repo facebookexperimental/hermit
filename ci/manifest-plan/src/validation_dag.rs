@@ -2811,6 +2811,77 @@ fn materialize_quick_super_budgets(cfg: &mut DagConfig) {
     }
 }
 
+/// DAG label marking a super-labelled node as pressure-tier: measured
+/// nightly by the pressure sweep, excluded from the alerting super
+/// selection until it has hermetic-image pass evidence (owner model
+/// 2026-11-04: super is expected-pass; pressure owns the negative
+/// space). Selected directly with `dagrun run --labels pressure`.
+pub const PRESSURE_LABEL: &str = "pressure";
+
+/// Super-labelled nodes with no hermetic-image pass evidence. Each is
+/// a diagnostic/stress node by construction (nonblocking unmeasured
+/// probes, the host-sensitive mem_race family, weekly ignored/chaos
+/// cases, determinism diagnostics) or a producer only those nodes
+/// consume. A node leaves this list only with retained pass evidence
+/// in the pinned root, recorded in its promotion change.
+const PRESSURE_NODES: &[&str] = &[
+    "super-compatprep.fixtures",
+    "super.chaos_hello_race_verification_diagnostic",
+    "super.full_leveldb_strict_determinism",
+    "super.ipc_determinism_diagnostic",
+    "super.managed_jvm_strict_verify_diagnostics",
+    "super.network_syscall_determinism_diagnostic",
+    "super.pmu_analyze_hello_race_stress_calibrated_skid",
+    "super.pmu_buck_chaos_cases",
+    "super.post_fork_scheduling_diagnostics",
+    "super.pselect_signal_interruption_diagnostic",
+    "super.random_source_determinism_diagnostic",
+    "super.record_replay_matrix_diagnostic",
+    "super.relaxed_hermit_flag_matrix",
+    "super.sqlite_veryquick_strict_determinism",
+    "super.threaded_integration_matrix_diagnostic",
+    "super.weekly_ignored_portable_chaos_cases",
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore",
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore",
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore",
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore",
+    "super.weekly_portable_chaos_cases",
+    "super.weekly_relaxed_default_mode_cases",
+    "supercompat.manifest_compat",
+    "superstress.kvm_available",
+    "superstress.kvm_verify",
+    "superstress.ptrace_pipeline",
+    "superstress.ptrace_record_replay",
+    "superstress.ptrace_strict_verify",
+];
+
+fn materialize_pressure_labels(cfg: &mut DagConfig) -> Result<(), String> {
+    let mut marked = 0usize;
+    for step in &mut cfg.steps {
+        if PRESSURE_NODES.contains(&step.tag().as_str()) {
+            if !step.labels.iter().any(|label| label == "super") {
+                return Err(format!(
+                    "pressure node {} does not carry the super label it re-tiers from",
+                    step.tag()
+                ));
+            }
+            if !step.labels.iter().any(|label| label == PRESSURE_LABEL) {
+                step.labels.push(PRESSURE_LABEL.to_string());
+                step.labels.sort();
+            }
+            marked += 1;
+        }
+    }
+    if marked != PRESSURE_NODES.len() {
+        return Err(format!(
+            "pressure re-tier marked {marked} of {} named nodes; a renamed or \
+             retired node must update PRESSURE_NODES with its evidence",
+            PRESSURE_NODES.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Keep direct preflight dependencies on host commands and tests so focused
 /// selection cannot drop their source/gate ordering. Pinned preparation retains
 /// its original pin/fetch prerequisites and can overlap the manifest audit.
@@ -4970,15 +5041,17 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         ));
     }
     // A bucket node that selects a run type by label carries exactly that
-    // run type's DAG label and passes exactly that `--label`; every other
-    // bucket node selects the default run type and passes none.
+    // run type's DAG label (plus the pressure re-tier marker when the
+    // node is pressure-tier) and passes exactly that `--label`; every
+    // other bucket node selects the default run type and passes none.
     for step in cfg.steps.iter().filter(|step| step.manifest.is_some()) {
         let tag = step.tag();
         match crate::validation_dag_static::manifest_run_type(&tag) {
             Some(label) => {
                 let manifest = step.manifest.as_ref().expect("filtered on manifest");
                 let flag = format!(" --category {} --label {label} ", manifest.category);
-                if step.labels != [label] || !step.cmd.contains(&flag) {
+                let tiered = [PRESSURE_LABEL.to_string(), label.to_string()];
+                if (step.labels != [label] && step.labels != tiered) || !step.cmd.contains(&flag) {
                     return Err(format!(
                         "{tag} selects run type {label}: it must carry only that DAG label and pass `{}`",
                         flag.trim()
@@ -5347,6 +5420,7 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     materialize_pinned_root(&mut refreshed)?;
     materialize_focused_preflight(&mut refreshed)?;
     materialize_quick_super_budgets(&mut refreshed);
+    materialize_pressure_labels(&mut refreshed)?;
     materialize_runtime_policy(&mut refreshed);
     materialize_regular_calibration_launch(&mut refreshed)?;
     crate::dag_source_ownership::select_core(&mut refreshed)?;
@@ -6120,6 +6194,48 @@ sys.exit(37)
         ));
         retire_host_fixtures_when_twin_present(&mut cfg);
         assert!(cfg.steps[0].labels.is_empty(), "{:?}", cfg.steps[0].labels);
+    }
+
+    #[test]
+    fn pressure_labels_mark_exactly_the_named_super_nodes() {
+        // Synthetic: every named node present and super-labelled is
+        // marked once; a missing or unlabelled node refuses.
+        let steps: Vec<String> = PRESSURE_NODES
+            .iter()
+            .map(|tag| {
+                let (group, job) = tag.split_once('.').unwrap();
+                format!(
+                    r#"{{"group":"{group}","job":"{job}","cmd":"true","labels":["super"],"timeout":1,"cpu_timeout":1,"hint":{{"rss_baseline_bytes":1,"hard_mem_max_bytes":1}}}}"#
+                )
+            })
+            .collect();
+        let text = format!(r#"{{"description":"","steps":[{}]}}"#, steps.join(","));
+        let mut cfg = dag_from_json(&text).unwrap();
+        materialize_pressure_labels(&mut cfg).unwrap();
+        assert!(
+            cfg.steps
+                .iter()
+                .all(|step| step.labels == [PRESSURE_LABEL.to_string(), "super".to_string()])
+        );
+        // Idempotent: marking twice changes nothing.
+        materialize_pressure_labels(&mut cfg).unwrap();
+        assert!(cfg.steps.iter().all(|step| step.labels.len() == 2));
+        cfg.steps.remove(0);
+        assert!(materialize_pressure_labels(&mut cfg).is_err());
+
+        // Committed: the generated DAG carries exactly the named set.
+        let committed = generated_dag();
+        let marked: Vec<String> = committed
+            .steps
+            .iter()
+            .filter(|step| step.labels.iter().any(|l| l == PRESSURE_LABEL))
+            .map(|step| step.tag())
+            .collect();
+        let mut want: Vec<String> = PRESSURE_NODES.iter().map(|tag| tag.to_string()).collect();
+        want.sort();
+        let mut got = marked.clone();
+        got.sort();
+        assert_eq!(got, want);
     }
 
     fn owner(result_manifests: Vec<DagManifest>) -> Step {

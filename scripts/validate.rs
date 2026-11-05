@@ -7719,12 +7719,8 @@ fn super_plan_bracket() -> Result<(), String> {
     for want in [
         "super.build_workspace",
         "super.build_release_hermit",
-        "super.sqlite_veryquick_strict_determinism",
-        "super.pmu_analyze_hello_race_stress_calibrated_skid",
-        "superstress.ptrace_strict_verify",
-        "superstress.kvm_available",
-        "super-compatprep.fixtures",
-        "supercompat.manifest_compat",
+        "quick-super-gate.manifest",
+        "quick-super-selftest.validate_rs",
         // The super level is the full+super union (nightly tier): full
         // representatives must be present beside the super-only nodes.
         "build.workspace_in_pinned_root",
@@ -7735,43 +7731,44 @@ fn super_plan_bracket() -> Result<(), String> {
             return Err(format!("super plan: node {want} is missing"));
         }
     }
-    for reject in ["e2e.manifest_c_programs_on_host", "quick.build"] {
+    // Pressure-tier nodes (negative space, re-tiered 2026-11-04) and
+    // other lanes' nodes must stay out of the alerting selection.
+    for reject in [
+        "e2e.manifest_c_programs_on_host",
+        "quick.build",
+        "supercompat.manifest_compat",
+        "superstress.kvm_verify",
+        "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore",
+    ] {
         if tags.contains(reject) {
             return Err(format!("super plan: node {reject} must not be selected"));
         }
     }
-    // Each stress probe is one node whose repetitions are rows of its
-    // structured test results; the pass-rate table reads nothing else.
-    let stress: Vec<_> = plan
+    if plan.cfg.steps.iter().any(|step| {
+        step.labels
+            .iter()
+            .any(|l| l == hermit_manifest_plan::validation_dag::PRESSURE_LABEL)
+    }) {
+        return Err("super plan: a pressure-labelled step survived selection".into());
+    }
+    // The stress probes are pressure-tier now; the super plan carries
+    // none, and the stress table prints its header over zero probes.
+    let stress = plan
         .cfg
         .steps
         .iter()
         .filter(|step| step.group == "superstress" && !step.job.ends_with("_available"))
-        .collect();
-    let reporting = stress
-        .iter()
-        .filter(|step| {
-            step.result_manifests.iter().flatten().any(|manifest| {
-                matches!(
-                    manifest,
-                    ResultManifest::StructuredTestResults(structured)
-                        if structured.owner == step.tag()
-                )
-            })
-        })
         .count();
-    if stress.len() != validate_super::CORE_STRESS_PROBES.len() || reporting != stress.len() {
+    if stress != 0 {
         return Err(format!(
-            "super plan: want one result-reporting node per stress probe ({}), found {} node(s), {reporting} reporting",
-            validate_super::CORE_STRESS_PROBES.len(),
-            stress.len()
+            "super plan: want no stress probes (pressure-tier), found {stress}"
         ));
     }
     if !plan.super_mode {
         return Err("super plan: super_mode must be set so the stress table is printed".into());
     }
     println!(
-        "  super plan: {} boxed node(s); every expansion and stress probe present",
+        "  super plan: {} boxed node(s); union present, pressure tier excluded",
         plan.cfg.steps.len()
     );
     Ok(())
@@ -8938,8 +8935,15 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
                 ));
             }
             String::new()
-        } else if step.labels.iter().map(String::as_str).eq(["super"]) {
-            // The super run type's one bucket, supercompat.manifest_compat,
+        } else if step.labels.iter().map(String::as_str).eq(["super"])
+            || step.labels.iter().map(String::as_str).eq([
+                hermit_manifest_plan::validation_dag::PRESSURE_LABEL,
+                "super",
+            ])
+        {
+            // The super run type's one bucket, supercompat.manifest_compat
+            // (pressure-tier since the 2026-11-04 re-tier, hence the
+            // two-label form),
             // runs the release Hermit its own super.build_release_hermit
             // builds, named by exactly SUPER_HERMIT_BIN, so the super suite
             // does not pull in the full validation's e2e artifact and its
@@ -14597,6 +14601,36 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
                 args.ignore_selected_deps,
             )?;
             selection_mode = "selected";
+        }
+        // Expected-pass tier (owner model 2026-11-04): pressure-labelled
+        // nodes are the negative space the pressure sweep measures; the
+        // alerting super selection must not contain them. An explicit
+        // --selected naming one is the caller's deliberate choice and is
+        // not filtered. Ancestry must not smuggle one back in.
+        if label == "super" && args.selected.is_none() {
+            let kept: Vec<String> = cfg
+                .steps
+                .iter()
+                .filter(|step| {
+                    !step
+                        .labels
+                        .iter()
+                        .any(|l| l == hermit_manifest_plan::validation_dag::PRESSURE_LABEL)
+                })
+                .map(Step::tag)
+                .collect();
+            cfg = dagrun::select_steps_by_tags(&cfg, &kept, false)?;
+            if let Some(step) = cfg.steps.iter().find(|step| {
+                step.labels
+                    .iter()
+                    .any(|l| l == hermit_manifest_plan::validation_dag::PRESSURE_LABEL)
+            }) {
+                return Err(format!(
+                    "super plan retained pressure-tier node {} via ancestry; \
+                     a kept node must not depend on the negative space",
+                    step.tag()
+                ));
+            }
         }
         let (compat, compat_prefix) = match label {
             "e9patch-compat-only" => (Some(CompatMode::E9patch), Some("e9patchcompat.")),
@@ -36435,14 +36469,29 @@ mod scorecard_cutover_tests {
             "build.workspace_in_pinned_root",
             "e2e.manifest_c_programs",
             "lint.clippy",
-            "supercompat.manifest_compat",
-            "superstress.ptrace_strict_verify",
+            "quick-super-gate.manifest",
+            "quick-super-selftest.validate_rs",
         ] {
             assert!(tags.contains(want), "super plan is missing {want}");
         }
-        for reject in ["e2e.manifest_c_programs_on_host", "quick.build"] {
+        // Pressure-tier nodes (negative space) and other lanes' nodes
+        // must stay out of the alerting super selection.
+        for reject in [
+            "e2e.manifest_c_programs_on_host",
+            "quick.build",
+            "supercompat.manifest_compat",
+            "superstress.kvm_verify",
+            "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore",
+        ] {
             assert!(!tags.contains(reject), "super plan wrongly holds {reject}");
         }
+        assert!(
+            plan.cfg.steps.iter().all(|step| !step
+                .labels
+                .iter()
+                .any(|l| l == hermit_manifest_plan::validation_dag::PRESSURE_LABEL)),
+            "super plan holds a pressure-labelled step"
+        );
         assert!(plan.super_mode);
         assert!(!plan.suite_complete);
     }
