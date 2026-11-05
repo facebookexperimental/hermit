@@ -5170,7 +5170,7 @@ mod tests {
                 .with_schedule_recording();
             let replayed = run.sched_path_in().to_path_buf();
             options
-                .write_trial_schedule(events.clone(), &replayed)
+                .write_trial_schedule_from(events.clone(), &[], &replayed)
                 .unwrap();
             run
         };
@@ -5198,7 +5198,7 @@ mod tests {
         let mut again = make();
         again.launch().unwrap();
         assert!(!again.is_a_match());
-        assert_eq!(again.sched_out().unwrap(), &events);
+        assert_eq!(again.preempts_out().schedevents(), events.as_slice());
     }
 
     /// The budget shortens a run's `--timeout` to the time it has left,
@@ -5252,11 +5252,17 @@ mod tests {
             .unwrap()
             .with_schedule_replay();
         let path = run.sched_path_in().to_path_buf();
-        options.write_trial_schedule(events(5), &path).unwrap();
+        options
+            .write_trial_schedule_from(events(5), &[], &path)
+            .unwrap();
         let first = run.journal_key();
-        options.write_trial_schedule(events(6), &path).unwrap();
+        options
+            .write_trial_schedule_from(events(6), &[], &path)
+            .unwrap();
         assert_ne!(run.journal_key(), first);
-        options.write_trial_schedule(events(5), &path).unwrap();
+        options
+            .write_trial_schedule_from(events(5), &[], &path)
+            .unwrap();
         assert_eq!(run.journal_key(), first);
     }
 

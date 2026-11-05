@@ -1754,6 +1754,8 @@ fn analyze_starts_from_a_recorded_target_run() {
         "{label}: a missed replay: {}\n{combined}",
         output.status
     );
+}
+
 /// `--trial-budget` ends a prefix search with a partial report and exit 120,
 /// naming a bracket that holds the deciding event, and keeps the workspace
 /// even without --keep-tmp. `--resume` with that workspace answers the runs
