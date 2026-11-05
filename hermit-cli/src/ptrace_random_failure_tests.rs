@@ -449,6 +449,15 @@ mod real_random {
                     max_timeslice: NonZeroU64::new(1_000_000),
                     record_preemptions_to: Some(future_recording),
                     detlog_io_buffers: true,
+                    // This case spawns the tracer directly, bypassing the
+                    // library launch that resolves an unnamed `auto` CPU
+                    // profile from the guest image, so name the profile that
+                    // resolution selects for this guest: it declares
+                    // x86-64-v2 and its loader declares nothing, which is
+                    // also the profile every launch of it ran under before
+                    // the unnamed default became `auto`. Detcore's refusal
+                    // of a genuinely unresolved `auto` is unchanged.
+                    cpu_profile: detcore::CpuProfile::X86_64V2,
                     ..Default::default()
                 };
                 config.validate();
