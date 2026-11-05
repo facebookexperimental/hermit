@@ -436,22 +436,18 @@ fn transfer_diagnostic_dependencies_with(
     for step in &mut cfg.steps {
         let tag = step.tag();
         if extension_tags.contains(&tag) {
-            // Extension nodes get no diagnostic transfer: every dependency
-            // must already be core or extension (see module docs).
+            // Extension nodes get no diagnostic transfer. Refuse deps the
+            // frozen contract owns to patching/dynamorio here; deps unknown
+            // at this phase (pre-materialization names such as
+            // build.e2e_artifact) are judged by select_core after renaming.
             for dependency in &step.deps {
-                let frozen_core = source
-                    .nodes
-                    .get(dependency)
-                    .is_some_and(|node| node.owner == "core");
-                if !frozen_core && !extension_tags.contains(dependency) {
-                    let owner = source
-                        .nodes
-                        .get(dependency)
-                        .map(|node| node.owner.as_str())
-                        .unwrap_or("unknown");
-                    return Err(format!(
-                        "post-split extension node {tag} may depend only on core/extension nodes; crossed dependency {dependency} (owner {owner})"
-                    ));
+                if let Some(node) = source.nodes.get(dependency) {
+                    if node.owner != "core" {
+                        return Err(format!(
+                            "post-split extension node {tag} may depend only on core/extension nodes; crossed dependency {dependency} (owner {})",
+                            node.owner
+                        ));
+                    }
                 }
             }
             continue;
@@ -658,6 +654,10 @@ mod tests {
     fn extension_transfer_admits_core_deps_and_refuses_crossed_by_name() {
         let mut ok = one_step_cfg(&["gate.manifest"]);
         transfer_diagnostic_dependencies_with(&mut ok, EXAMPLE).unwrap();
+        // Pre-materialization names unknown to the frozen contract pass
+        // transfer; select_core judges their final names after renaming.
+        let mut pre_materialized = one_step_cfg(&["build.e2e_artifact"]);
+        transfer_diagnostic_dependencies_with(&mut pre_materialized, EXAMPLE).unwrap();
         let mut crossed = one_step_cfg(&["check.dbt_runtime_abi"]);
         let crossed_registry = [ExtensionNode {
             tag: "e2e.manifest_example",
