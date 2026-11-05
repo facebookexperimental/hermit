@@ -5402,6 +5402,44 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     Ok(())
 }
 
+/// Dispatch priority for cheap static checks: among READY steps they
+/// start first, so a static red surfaces in seconds (owner 5756:
+/// priorities are planner hints, never dependency edges).
+pub const CHECK_PRIORITY: i64 = 100;
+/// Dispatch priority for build/setup producers that test steps wait on
+/// through real dependencies: ahead of ordinary work, behind checks.
+pub const PRODUCER_PRIORITY: i64 = 50;
+const _: () = assert!(CHECK_PRIORITY > PRODUCER_PRIORITY && PRODUCER_PRIORITY > 0);
+
+/// The dispatch priority a generated step carries, by group. Everything
+/// not named keeps dagrun's default 0 (today's order).
+pub fn step_priority(step: &Step) -> i64 {
+    match step.group.as_str() {
+        "check" | "lint" => CHECK_PRIORITY,
+        "build"
+        | "privileged-build"
+        | "privileged-only-build"
+        | "quick-super-build"
+        | "setup"
+        | "quick-super-setup"
+        | "pre"
+        | "compatprep"
+        | "portablecompatprep"
+        | "rrcompatprep"
+        | "super-compatprep" => PRODUCER_PRIORITY,
+        _ => 0,
+    }
+}
+
+/// Stamp every generated step with its [`step_priority`]. Priorities
+/// only order dispatch among ready steps; this adds, removes, and
+/// reorders no dependency.
+pub fn apply_step_priorities(cfg: &mut DagConfig) {
+    for step in &mut cfg.steps {
+        step.priority = step_priority(step);
+    }
+}
+
 pub fn generate(root: &Path) -> Result<DagConfig, String> {
     let static_source = crate::validation_dag_static::config();
     let scratch = Scratch::create()?;
@@ -5424,6 +5462,7 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     materialize_runtime_policy(&mut refreshed);
     materialize_regular_calibration_launch(&mut refreshed)?;
     crate::dag_source_ownership::select_core(&mut refreshed)?;
+    apply_step_priorities(&mut refreshed);
     attach_result_ownership(&mut refreshed, &cells);
     assert_invariants(&refreshed, &cells)?;
     for step in &refreshed.steps {
@@ -6304,6 +6343,39 @@ sys.exit(37)
     /// for a cold export at load ~265 on 2026-10-06, against nextest's 57 s limit.
     fn generated_dag() -> DagConfig {
         dag_from_json(include_str!("../../dag/validate.json")).unwrap()
+    }
+
+    #[test]
+    fn generated_priorities_dispatch_checks_and_producers_first() {
+        // Owner 5756: no artificial sequential dependencies; priorities
+        // are dispatch hints among READY steps only. Cheap static checks
+        // outrank build/setup producers, which outrank everything else;
+        // the committed artifact carries exactly what step_priority
+        // assigns, and no dependency is created or removed by it.
+        let cfg = generated_dag();
+        let mut saw_check = false;
+        let mut saw_producer = false;
+        for step in &cfg.steps {
+            assert_eq!(
+                step.priority,
+                step_priority(step),
+                "{} priority drifted from the generator rule",
+                step.tag()
+            );
+            match step.group.as_str() {
+                "check" | "lint" => {
+                    saw_check = true;
+                    assert_eq!(step.priority, CHECK_PRIORITY, "{}", step.tag());
+                }
+                "build" | "setup" => {
+                    saw_producer = true;
+                    assert_eq!(step.priority, PRODUCER_PRIORITY, "{}", step.tag());
+                }
+                "test" | "e2e" => assert_eq!(step.priority, 0, "{}", step.tag()),
+                _ => {}
+            }
+        }
+        assert!(saw_check && saw_producer);
     }
 
     #[test]

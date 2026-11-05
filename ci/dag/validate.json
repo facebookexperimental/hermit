@@ -32,6 +32,7 @@
       "engine_only": false,
       "timeout": 900,
       "cpu_timeout": 300,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -68,6 +69,7 @@
       "engine_only": false,
       "timeout": 900,
       "cpu_timeout": 300,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -102,6 +104,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 2100,
+      "priority": 50,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -173,6 +176,7 @@
       "engine_only": false,
       "timeout": 1200,
       "cpu_timeout": 7200,
+      "priority": 50,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -209,6 +213,7 @@
       "engine_only": false,
       "timeout": 240,
       "cpu_timeout": 30,
+      "priority": 100,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -245,6 +250,7 @@
       "engine_only": false,
       "timeout": 240,
       "cpu_timeout": 30,
+      "priority": 100,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -281,6 +287,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 190,
+      "priority": 100,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -317,6 +324,7 @@
       "engine_only": false,
       "timeout": 240,
       "cpu_timeout": 30,
+      "priority": 100,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -353,6 +361,7 @@
       "engine_only": false,
       "timeout": 440,
       "cpu_timeout": 55,
+      "priority": 100,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -389,6 +398,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 100,
+      "priority": 100,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -425,6 +435,7 @@
       "engine_only": false,
       "timeout": 480,
       "cpu_timeout": 60,
+      "priority": 100,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -461,6 +472,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 210,
+      "priority": 100,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -497,6 +509,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 90,
+      "priority": 100,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -533,6 +546,7 @@
       "engine_only": false,
       "timeout": 2400,
       "cpu_timeout": 7200,
+      "priority": 100,
       "jobs_flag": "",
       "jobs_env": "HERMIT_LINT_CHECK_JOBS",
       "hint": {
@@ -568,6 +582,7 @@
       "engine_only": false,
       "timeout": 1500,
       "cpu_timeout": 7200,
+      "priority": 100,
       "jobs_flag": "",
       "jobs_env": "HERMIT_SCRIPT_TEST_JOBS",
       "hint": {
@@ -602,6 +617,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 120,
+      "priority": 100,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -638,6 +654,7 @@
       "engine_only": false,
       "timeout": 480,
       "cpu_timeout": 60,
+      "priority": 100,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -674,6 +691,7 @@
       "engine_only": false,
       "timeout": 560,
       "cpu_timeout": 70,
+      "priority": 100,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -710,6 +728,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 80,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -745,6 +764,7 @@
       "engine_only": false,
       "timeout": 1800,
       "cpu_timeout": 7200,
+      "priority": 50,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -780,6 +800,7 @@
       "engine_only": false,
       "timeout": 60,
       "cpu_timeout": 60,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -816,6 +837,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 7200,
+      "priority": 50,
       "jobs_flag": "--jobs",
       "jobs_env": null,
       "hint": {
@@ -24578,6 +24600,7 @@
       "engine_only": false,
       "timeout": 1200,
       "cpu_timeout": 7200,
+      "priority": 100,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -26370,6 +26393,7 @@
       "engine_only": false,
       "timeout": 240,
       "cpu_timeout": 30,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -27172,6 +27196,7 @@
       "engine_only": false,
       "timeout": 240,
       "cpu_timeout": 30,
+      "priority": 50,
       "jobs_flag": "--jobs",
       "jobs_env": null,
       "hint": {
@@ -41842,6 +41867,7 @@
       "engine_only": false,
       "timeout": 120,
       "cpu_timeout": 300,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -41874,6 +41900,7 @@
       "engine_only": false,
       "timeout": 1200,
       "cpu_timeout": 7200,
+      "priority": 50,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -41906,6 +41933,7 @@
       "engine_only": false,
       "timeout": 180,
       "cpu_timeout": 7200,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -41971,6 +41999,7 @@
       "engine_only": false,
       "timeout": 120,
       "cpu_timeout": 7200,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -42125,6 +42154,7 @@
       "engine_only": false,
       "timeout": 120,
       "cpu_timeout": 7200,
+      "priority": 50,
       "jobs_flag": "--jobs",
       "jobs_env": null,
       "hint": {
@@ -42710,6 +42740,7 @@
       "engine_only": false,
       "timeout": 420,
       "cpu_timeout": 420,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -42742,6 +42773,7 @@
       "engine_only": false,
       "timeout": 420,
       "cpu_timeout": 420,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -42774,6 +42806,7 @@
       "engine_only": false,
       "timeout": 420,
       "cpu_timeout": 420,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -42809,6 +42842,7 @@
       "engine_only": false,
       "timeout": 420,
       "cpu_timeout": 420,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -43047,6 +43081,7 @@
       "engine_only": false,
       "timeout": 2100,
       "cpu_timeout": 11100,
+      "priority": 50,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -43082,6 +43117,7 @@
       "engine_only": false,
       "timeout": 520,
       "cpu_timeout": 65,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -43159,6 +43195,7 @@
       "engine_only": false,
       "timeout": 1200,
       "cpu_timeout": 7200,
+      "priority": 100,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -44023,6 +44060,7 @@
       "engine_only": false,
       "timeout": 420,
       "cpu_timeout": 420,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -44057,6 +44095,7 @@
       "engine_only": false,
       "timeout": 1500,
       "cpu_timeout": 7200,
+      "priority": 100,
       "jobs_flag": "",
       "jobs_env": "HERMIT_SCRIPT_TEST_JOBS",
       "hint": {
@@ -61874,6 +61913,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 600,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -61911,6 +61951,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 2100,
+      "priority": 50,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -61947,6 +61988,7 @@
       "engine_only": false,
       "timeout": 1200,
       "cpu_timeout": 7200,
+      "priority": 50,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -61983,6 +62025,7 @@
       "engine_only": false,
       "timeout": 1200,
       "cpu_timeout": 11100,
+      "priority": 50,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -62022,6 +62065,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 5700,
+      "priority": 50,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -62058,6 +62102,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 2100,
+      "priority": 50,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -62097,6 +62142,7 @@
       "engine_only": false,
       "timeout": 520,
       "cpu_timeout": 65,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -62135,6 +62181,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 7200,
+      "priority": 50,
       "jobs_flag": "--jobs",
       "jobs_env": null,
       "hint": {
@@ -62172,6 +62219,7 @@
       "engine_only": false,
       "timeout": 900,
       "cpu_timeout": 3600,
+      "priority": 50,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -62210,6 +62258,7 @@
       "engine_only": false,
       "timeout": 240,
       "cpu_timeout": 30,
+      "priority": 50,
       "jobs_flag": "--jobs",
       "jobs_env": null,
       "hint": {
@@ -62246,6 +62295,7 @@
       "engine_only": false,
       "timeout": 120,
       "cpu_timeout": 7200,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -62282,6 +62332,7 @@
       "engine_only": false,
       "timeout": 420,
       "cpu_timeout": 2400,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -62320,6 +62371,7 @@
       "engine_only": false,
       "timeout": 420,
       "cpu_timeout": 420,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -62353,6 +62405,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 2100,
+      "priority": 50,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -62422,6 +62475,7 @@
       "engine_only": false,
       "timeout": 1200,
       "cpu_timeout": 2400,
+      "priority": 50,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -62457,6 +62511,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 80,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -62698,6 +62753,7 @@
       "engine_only": false,
       "timeout": 600,
       "cpu_timeout": 2100,
+      "priority": 50,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -62734,6 +62790,7 @@
       "engine_only": false,
       "timeout": 1200,
       "cpu_timeout": 2400,
+      "priority": 50,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
