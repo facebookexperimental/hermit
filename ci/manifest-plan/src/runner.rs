@@ -765,9 +765,8 @@ impl CellTier {
 }
 
 /// This cell's derived tier, or `None` for rows outside the tiered corpora.
-/// Manifest validation rejects a cell carrying both markers, and mode labels
-/// may not carry either marker, so a validated manifest cannot make this
-/// return an error.
+/// Manifest validation rejects a resolved cell carrying both markers, so a
+/// validated manifest cannot make this return an error.
 pub fn cell_tier(
     test: &TestRecipe,
     recipe: &ModeRecipe,
@@ -2717,6 +2716,15 @@ fn validate_document_with_cpu(
         }
         validate_labels(&test.id, &test.labels)?;
         validate_tier_marker(&test.id, stem, &test.labels)?;
+        // The tier is resolved per cell: a mode may add `super` for one
+        // backend (the compat corpus's heavy rows do), but no resolved
+        // cell may carry both tier markers.
+        for (mode, recipe) in &test.modes {
+            for backend in &recipe.backends_enabled {
+                cell_tier(test, recipe, Some(backend))
+                    .map_err(|error| format!("{}: {mode} on {backend}: {error}", test.id))?;
+            }
+        }
         for (mode, recipe) in &test.modes {
             validate_mode_with_cpu(
                 &test.id,
@@ -10741,14 +10749,6 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
             return Err(format!("{id}: {mode} labels for `{backend}` are empty"));
         }
         validate_labels(&format!("{id}: {mode} on {backend}"), labels)?;
-        if let Some(label) = labels
-            .iter()
-            .find(|label| matches!(label.as_str(), SUPER_RUN_TYPE | PRESSURE_RUN_TYPE))
-        {
-            return Err(format!(
-                "{id}: {mode} labels for `{backend}` cannot carry tier label `{label}`; author it once on the test row"
-            ));
-        }
     }
     for (backend, reason) in &recipe.diagnostic {
         if !stripped {
@@ -12665,10 +12665,12 @@ corpus:
             "\"pressure\""
         );
 
+        // A mode label may put one backend's cell in a tier (the compat
+        // corpus's heavy rows carry mode-level `super`); the resolved
+        // cell still may not carry both markers.
         let mut mode = test.modes["verify"].clone();
-        mode.labels = BTreeMap::from([("ptrace".into(), vec!["pressure".into()])]);
-        let error = validate_mode_extensions(&test.id, "verify", &mode).unwrap_err();
-        assert!(error.contains("cannot carry tier label"), "{error}");
+        mode.labels = BTreeMap::from([("ptrace".into(), vec!["super".into()])]);
+        assert!(cell_tier(&test, &mode, Some("ptrace")).is_err());
     }
 
     /// A mode's per-backend labels put that backend's cell in their run type

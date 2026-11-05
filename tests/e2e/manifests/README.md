@@ -557,7 +557,8 @@ so a typo cannot select nothing and pass.
 Two label values are reserved as the single tier marker for the `gvisor`
 and `rr` buckets: `super` (expected-pass nightly) and `pressure`
 (negative-space nightly). Every row in those buckets carries exactly one
-at test-row level; mode/backend labels may carry neither. A row in the
+at test-row level, and no resolved cell may carry both (a mode may add
+`super` for one backend, as the compat corpus's heavy rows do). A row in the
 full validation sample carries `[full, super]`. Projections derive the
 JSON key `tier` (`"super"` or `"pressure"`) from that one label; there is
 no separately authored `tier` field. Promotion replaces `pressure` with
