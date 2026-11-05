@@ -235,6 +235,11 @@ impl PruneOpts {
             if live.contains(&name) {
                 continue;
             }
+            // An in-progress local materialization staging directory is
+            // not an unreferenced cache; its owner cleans it up.
+            if name.contains(".staging-") {
+                continue;
+            }
             if self.dry_run {
                 println!("would remove {}", entry.path().display());
             } else {
@@ -336,6 +341,24 @@ impl OciRunOpts {
                  run `hermit run --image <ID> {option} ...` instead.",
                 self.image_ref
             )));
+        }
+        // Local image inputs are `hermit run --image` material, not store
+        // references; refuse them before any store (podman) access.
+        match crate::app::image_source::parse_image_source(&self.image_ref) {
+            crate::app::image_source::ImageSourceRef::Local { .. } => {
+                return Err(Error::msg(format!(
+                    "`hermit oci run` resolves references from the local podman \
+                     store; {:?} is a local image input. Run it with \
+                     `hermit run --image={} -- <program>` instead.",
+                    self.image_ref, self.image_ref
+                )));
+            }
+            crate::app::image_source::ImageSourceRef::BareRelative { kind, remainder } => {
+                return Err(crate::app::image_source::bare_relative_error(
+                    kind, &remainder,
+                ));
+            }
+            crate::app::image_source::ImageSourceRef::StoreReference => {}
         }
         let store = require_store()?;
         // Resolution never contacts a registry unless --pull was asked for, so

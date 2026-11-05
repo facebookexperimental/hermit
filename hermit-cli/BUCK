@@ -170,6 +170,8 @@ rust_library(
         "//hermetic_infra/hermit/hermit-resources:hermit-resources",
         "//hermetic_infra/reverie:reverie",
         "//hermetic_infra/reverie:reverie-inguest",
+        "fbsource//third-party/rust:flate2",
+        "fbsource//third-party/rust:tar",
         "//hermetic_infra/reverie:reverie-kvm",
         "//hermetic_infra/reverie:reverie-liteinst",
         "//hermetic_infra/reverie:reverie-ptrace",
@@ -275,6 +277,8 @@ rust_library(
     env = release_build_env,
     preferred_linkage = "static",
     deps = [
+        "fbsource//third-party/rust:flate2",
+        "fbsource//third-party/rust:tar",
         "fbsource//third-party/rust:addr2line",
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:bincode",

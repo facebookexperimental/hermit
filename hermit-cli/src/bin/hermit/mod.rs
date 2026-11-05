@@ -38,6 +38,7 @@ mod guest_ids;
 mod host_capabilities;
 mod host_seccomp;
 mod image;
+mod image_source;
 #[cfg(any(
     feature = "native-exec",
     all(feature = "exec-stop-launcher", feature = "liteinst")

@@ -1971,19 +1971,40 @@ pub struct RunOpts {
     #[clap(long, value_name = "dirpath")]
     tmp: Option<PathBuf>,
 
-    /// PROTOTYPE: run the guest against the root filesystem of a pinned OCI image
-    /// instead of the host filesystem. The reference is materialized (pulled and
-    /// unpacked, rootless) via `buildah` and the guest is `chroot`ed into a
-    /// read-only cached root with an isolated writable `/tmp`, so its FILE INPUTS
-    /// come deterministically from the image. Pin by digest for
-    /// reproducibility, e.g.
-    /// `--image docker.io/library/busybox@sha256:...`. The guest program path
-    /// must resolve inside the image: give an absolute path (e.g. `/bin/sh`) or
-    /// a relative path containing a `/` (e.g. `./bin/sh`), which is resolved
-    /// against the image working directory; a bare command name is searched
-    /// on the image's PATH. Requires namespaces (incompatible
-    /// with `--no-namespace`). The prototype supports the ptrace and kvm
-    /// backends and does not yet compose with custom `--mount`/`--bind` options.
+    /// PROTOTYPE: run the guest against the root filesystem of an OCI image
+    /// instead of the host filesystem. The image is materialized into a
+    /// read-only cached root and the guest is `chroot`ed into it with an
+    /// isolated writable `/tmp`, so its FILE INPUTS come deterministically
+    /// from the image. Three forms are accepted. (1) A reference into the
+    /// local podman store, e.g. `--image docker.io/library/busybox@sha256:...`
+    /// (pin by digest for reproducibility); the image must already be in the
+    /// store — fetch it first with `hermit oci pull` or `podman pull`, as
+    /// `hermit run` never pulls. (2) `--image=oci-dir:/absolute/path` (or
+    /// `./relative/path`): an OCI layout directory (`oci-layout` +
+    /// `index.json` + `blobs/sha256/`), for example from
+    /// `podman save --format oci-dir`. (3)
+    /// `--image=docker-archive:/absolute/file.tar` (or `./file.tar`): a
+    /// `podman save`/`docker save` archive holding exactly one image. The
+    /// local forms are read directly by Hermit — podman is not invoked.
+    /// Verification is per format: an oci-dir's manifest blob digest,
+    /// config digest, layer blob digests, and layer diff_ids are all
+    /// verified, while a docker-archive (which has no manifest blob
+    /// digest) is verified by its config hash and layer diff_ids. Only
+    /// linux/amd64 images with uncompressed or gzip layers are supported:
+    /// where the image declares an os/architecture it must be
+    /// linux/amd64, and an unspecified os/architecture is accepted.
+    /// Layer uid/gid are flattened to the invoking user
+    /// (materialization is unprivileged; the flattened-entry count is
+    /// logged), while modes and mtimes are preserved (subsecond mtimes
+    /// included where the layer records them; directories created only
+    /// as implicit parents get mode 0755 and mtime 0). The guest program
+    /// path must resolve inside the image: give an absolute path (e.g.
+    /// `/bin/sh`) or a relative path containing a `/` (e.g. `./bin/sh`),
+    /// which is resolved against the image working directory; a bare
+    /// command name is searched on the image's PATH. Requires namespaces
+    /// (incompatible with `--no-namespace`). The prototype supports the
+    /// ptrace and kvm backends and does not yet compose with custom
+    /// `--mount`/`--bind` options.
     #[clap(long, value_name = "OCI-REFERENCE")]
     image: Option<String>,
 
@@ -10098,26 +10119,43 @@ impl RunOpts {
             }
             return Ok(());
         };
-        // Prefer the config persisted at materialization (digest-pinned);
-        // fall back to a single store probe for not-yet-materialized images.
-        let persisted = crate::app::image::read_image_config(&image).unwrap_or_default();
-        let config = if !persisted.cmd.is_empty() || !persisted.entrypoint.is_empty() {
-            Some(crate::app::podman_store::ImageRunConfig {
-                env: persisted.env.clone(),
-                workdir: persisted.workdir.clone(),
-                cmd: persisted.cmd.clone(),
-                entrypoint: persisted.entrypoint.clone(),
-            })
-        } else {
-            crate::app::podman_store::PodmanStore::probe()
-                .ok()
-                .flatten()
-                .and_then(|store| {
-                    store
-                        .resolve(&image)
+        // Local image inputs answer Entrypoint/Cmd from their own config and
+        // must never reach the podman-store fallback below; a bare-relative
+        // prefixed value is refused by name here so even a run with no
+        // explicit program names the problem instead of consulting a store.
+        let config = match crate::app::image_source::parse_image_source(&image) {
+            crate::app::image_source::ImageSourceRef::BareRelative { kind, remainder } => {
+                return Err(crate::app::image_source::bare_relative_error(
+                    kind, &remainder,
+                ));
+            }
+            crate::app::image_source::ImageSourceRef::Local { kind, path } => {
+                Some(crate::app::image_source::peek_local_config(kind, &path)?)
+            }
+            crate::app::image_source::ImageSourceRef::StoreReference => {
+                // Prefer the config persisted at materialization
+                // (digest-pinned); fall back to a single store probe for
+                // not-yet-materialized images.
+                let persisted = crate::app::image::read_image_config(&image).unwrap_or_default();
+                if !persisted.cmd.is_empty() || !persisted.entrypoint.is_empty() {
+                    Some(crate::app::podman_store::ImageRunConfig {
+                        env: persisted.env.clone(),
+                        workdir: persisted.workdir.clone(),
+                        cmd: persisted.cmd.clone(),
+                        entrypoint: persisted.entrypoint.clone(),
+                    })
+                } else {
+                    crate::app::podman_store::PodmanStore::probe()
                         .ok()
-                        .and_then(|resolved| store.config(&resolved).ok())
-                })
+                        .flatten()
+                        .and_then(|store| {
+                            store
+                                .resolve(&image)
+                                .ok()
+                                .and_then(|resolved| store.config(&resolved).ok())
+                        })
+                }
+            }
         };
         let (entrypoint, cmd) = match config {
             Some(c) => (c.entrypoint, c.cmd),
