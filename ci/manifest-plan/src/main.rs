@@ -1201,8 +1201,8 @@ fn validate_and_expand(
                 die(format!("{id}: program `{program}` must end in .sh/.c/.rs"));
             }
             // Vendored rr guests live in the pinned submodule, not tests/.
-            let below_tests = program.starts_with("tests/")
-                || program.starts_with("third-party/rr/src/test/");
+            let below_tests =
+                program.starts_with("tests/") || program.starts_with("third-party/rr/src/test/");
             if !below_tests || program.split('/').any(|part| part == "..") {
                 die(format!(
                     "{id}: program must be a repo-relative path below tests/ or third-party/rr/src/test/: {program}"

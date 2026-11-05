@@ -58,8 +58,45 @@ pub struct ExtensionNode {
 }
 
 /// The ONE registry for validation-DAG nodes created after the split.
-/// Empty until the first post-split bucket lands; see module docs.
-pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[];
+/// See module docs for the admission rules.
+pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[
+    ExtensionNode {
+        tag: "e2e.manifest_rr",
+        labels: &["full", "portable"],
+        deps: &[
+            "build.e2e_artifact_in_pinned_root",
+            "build.manifest_guests_in_pinned_root",
+            "build.rust_scripts_in_pinned_root",
+            "gate.manifest",
+            "pre.reverie_pin",
+            "setup.manifest_plan",
+            "setup.manifest_plan_in_pinned_root",
+            "setup.pinned_root_fetch",
+        ],
+    },
+    ExtensionNode {
+        tag: "e2e.manifest_rr_on_host",
+        labels: &["hosted-portable"],
+        deps: &[
+            "build.e2e_artifact_on_host",
+            "build.manifest_guests",
+            "gate.manifest",
+            "pre.reverie_pin",
+            "setup.manifest_plan",
+        ],
+    },
+    ExtensionNode {
+        tag: "e2e.manifest_rr_buck",
+        labels: &["full-buck-e2e"],
+        deps: &[
+            "build.rust_scripts",
+            "e2e.buck_cells",
+            "gate.manifest",
+            "pre.reverie_pin",
+            "setup.manifest_plan",
+        ],
+    },
+];
 
 /// Tags admitted by `extension`, after validating it against `source`.
 fn validate_extension_registry(
@@ -134,9 +171,10 @@ pub fn admitted_core_tags() -> BTreeSet<String> {
 }
 
 /// Whether `tag` is frozen core or admitted by `extension` (validated
-/// registry). Generation-time filters and graph-purity checks that
-/// must accept registered post-split buckets use this; frozen
-/// population comparisons keep using [`is_core`]/[`core_tags`].
+/// registry). Generation-time filters (producer registry, hosted
+/// resources) and graph-purity checks that must accept registered
+/// post-split buckets use this; frozen population comparisons keep
+/// using [`is_core`]/[`core_tags`].
 fn is_admitted_core_with(tag: &str, extension: &[ExtensionNode]) -> bool {
     is_core(tag)
         || validate_extension_registry(&contract(), extension)
@@ -419,11 +457,23 @@ pub fn source_profile(
     closure: bool,
 ) -> Result<BTreeSet<String>, String> {
     let source = contract();
+    // Post-split extension nodes join core profiles only; the original
+    // (non-core-only) lineage stays exactly the frozen source.
+    let extension: BTreeMap<&str, &ExtensionNode> = if core_only {
+        validate_extension_registry(&source, POST_SPLIT_CORE_NODES)?;
+        POST_SPLIT_CORE_NODES
+            .iter()
+            .map(|node| (node.tag, node))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
     let admitted = |tag: &str| {
-        source
-            .nodes
-            .get(tag)
-            .is_some_and(|node| !core_only || node.owner == "core")
+        extension.contains_key(tag)
+            || source
+                .nodes
+                .get(tag)
+                .is_some_and(|node| !core_only || node.owner == "core")
     };
     let mut selected = source
         .nodes
@@ -432,15 +482,26 @@ pub fn source_profile(
             (admitted(tag) && node.labels.iter().any(|value| value == label)).then_some(tag.clone())
         })
         .collect::<BTreeSet<_>>();
+    selected.extend(
+        extension
+            .values()
+            .filter(|node| node.labels.contains(&label))
+            .map(|node| node.tag.to_string()),
+    );
     if closure {
         let mut pending = selected.iter().cloned().collect::<Vec<_>>();
         while let Some(tag) = pending.pop() {
-            let node = source
-                .nodes
-                .get(&tag)
-                .ok_or_else(|| format!("unknown source owner {tag}"))?;
-            for dependency in &node.deps {
-                if !source.nodes.contains_key(dependency) {
+            let deps: Vec<String> = if let Some(node) = source.nodes.get(&tag) {
+                node.deps.clone()
+            } else if let Some(node) = extension.get(tag.as_str()) {
+                node.deps.iter().map(|dep| dep.to_string()).collect()
+            } else {
+                return Err(format!("unknown source owner {tag}"));
+            };
+            for dependency in &deps {
+                if !source.nodes.contains_key(dependency)
+                    && !extension.contains_key(dependency.as_str())
+                {
                     return Err(format!("unprovided original dependency {dependency}"));
                 }
                 if admitted(dependency) && selected.insert(dependency.clone()) {

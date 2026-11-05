@@ -542,7 +542,7 @@ fn exclusion_flags(excluded: &[&str]) -> String {
 }
 // The capacity column is the DAG's one resource_caps entry: a hosted run selects its
 // steps from the same validate.json, so it carries the same 20 slots as a local run.
-const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 13] = [
+const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 14] = [
     ("e2e.manifest_applications", "manifest_guest", 1, 20),
     ("e2e.manifest_bin_c", "manifest_guest", 1, 20),
     ("e2e.manifest_c_programs", "manifest_guest", 8, 20),
@@ -553,6 +553,7 @@ const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 13] = [
     ("e2e.manifest_determinism_stress", "manifest_guest", 1, 20),
     ("e2e.manifest_determinism_stress_c", "manifest_guest", 1, 20),
     ("e2e.manifest_language_runtimes", "manifest_guest", 1, 20),
+    ("e2e.manifest_rr", "manifest_guest", 1, 20),
     ("e2e.manifest_shared_futex_c", "manifest_guest", 1, 20),
     ("e2e.manifest_system_utils", "manifest_guest", 1, 20),
     ("e2e.manifest_util_c", "manifest_guest", 1, 20),
@@ -2171,9 +2172,10 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
         })
         .cloned()
         .collect::<Vec<_>>();
-    if buckets.len() != 16 {
+    // 17 since the rr bucket (first post-split extension bucket) joined.
+    if buckets.len() != 17 {
         return Err(format!(
-            "the full profile has {} E2E buckets, expected 16",
+            "the full profile has {} E2E buckets, expected 17",
             buckets.len()
         ));
     }
@@ -3388,9 +3390,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // producer (2026-10-30).
     // 148 with privileged-test.binder_cli_cases, the Binderfs-capable
     // privileged node for PR 4742's two host-limited Binder CLI cases.
-    if expected.len() != 148 {
+    // 151 with the rr bucket's three producers (pinned, on-host, Buck
+    // twin), the first post-split extension bucket (148 + 3).
+    if expected.len() != 151 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 148",
+            "structured result producer registry has {} entries, expected 151",
             expected.len()
         ));
     }
@@ -3400,11 +3404,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .map(|kind| {
             kind.tags()
                 .iter()
-                .filter(|tag| crate::dag_source_ownership::is_core(tag))
+                .filter(|tag| crate::dag_source_ownership::is_admitted_core(tag))
                 .count()
         })
         .collect::<Vec<_>>();
-    expected.retain(|tag, _| crate::dag_source_ownership::is_core(tag));
+    expected.retain(|tag, _| crate::dag_source_ownership::is_admitted_core(tag));
     let mut expected_counts = NEXTEST_EXPECTED_COUNTS
         .iter()
         .copied()
@@ -3433,7 +3437,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         ));
     }
 
-    expected_counts.retain(|tag, _| crate::dag_source_ownership::is_core(tag));
+    expected_counts.retain(|tag, _| crate::dag_source_ownership::is_admitted_core(tag));
     let mut seen_by_kind = BTreeMap::<StructuredResultProducerKind, usize>::new();
     for step in &cfg.steps {
         let tag = step.tag();
@@ -3796,6 +3800,7 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
         "determinism_stress",
         "determinism_stress_c",
         "language_runtimes",
+        "rr",
         "shared_futex_c",
         "system_utils",
         "util_c",
@@ -4891,8 +4896,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // (441 + 1).
     // 443 with sabrecompat.sabre_examples, the archived SaBRe suite's tests
     // outside the per-commit smoke pair, in the SaBRe run type (442 + 1).
+    // 446 with the rr bucket (e2e.manifest_rr and its on-host/Buck twins),
+    // the first post-split extension nodes (443 + 3).
     let actual_tags = cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
-    let expected_tags = crate::dag_source_ownership::core_tags();
+    let expected_tags = crate::dag_source_ownership::admitted_core_tags();
     if actual_tags != expected_tags || actual_tags.len() != cfg.steps.len() {
         return Err(format!(
             "core source owner tags differ: missing={:?}, extra={:?}",
@@ -5546,7 +5553,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
             }
             let expected_resources = HOSTED_RESOURCE_TUPLES
                 .iter()
-                .filter(|(tag, _, _, _)| crate::dag_source_ownership::is_core(tag))
+                .filter(|(tag, _, _, _)| crate::dag_source_ownership::is_admitted_core(tag))
                 .map(|(tag, resource, demand, capacity)| {
                     ((*tag).into(), (*resource).into(), *demand, *capacity)
                 })
@@ -7397,6 +7404,7 @@ sys.exit(37)
             "e2e.manifest_determinism_stress_c_on_host",
             "e2e.manifest_determinism_stress_on_host",
             "e2e.manifest_language_runtimes_on_host",
+            "e2e.manifest_rr_on_host",
             "e2e.manifest_shared_futex_c_on_host",
             "e2e.manifest_system_utils_on_host",
             "e2e.manifest_util_c_on_host",
@@ -7468,10 +7476,11 @@ sys.exit(37)
         // e2e.manifest_backend_parity_c_on_host was folded into
         // e2e.manifest_c_programs_on_host (slice S6 of
         // https://github.com/rrnewton/hermit/issues/3301).
-        assert_eq!(expected.len(), 16);
+        // 17 with e2e.manifest_rr_on_host, the first post-split extension twin.
+        assert_eq!(expected.len(), 17);
         assert!(expected.is_disjoint(&new_variants));
         expected.extend(new_variants);
-        expected.retain(|tag| crate::dag_source_ownership::is_core(tag));
+        expected.retain(|tag| crate::dag_source_ownership::is_admitted_core(tag));
         assert_eq!(
             selected
                 .steps
@@ -7935,10 +7944,17 @@ sys.exit(37)
             .chain(original_buck)
             .collect::<BTreeSet<_>>();
         assert_eq!(original.len(), 102);
-        let expected = original
+        let mut expected = original
             .into_iter()
             .filter(|tag| crate::dag_source_ownership::is_core(tag))
             .collect::<BTreeSet<_>>();
+        // Post-split Buck twins (e2e.manifest_rr_buck) join the selection
+        // through the extension registry, not the frozen source lineage.
+        expected.extend(
+            crate::dag_source_ownership::extension_tags()
+                .into_iter()
+                .filter(|tag| tag.ends_with("_buck")),
+        );
         let actual = buck_e2e_selection(&committed)
             .unwrap()
             .steps

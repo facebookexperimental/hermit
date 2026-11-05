@@ -1160,6 +1160,61 @@
     },
     {
       "group": "e2e",
+      "job": "manifest_rr",
+      "desc": "Portable manifest bucket: rr",
+      "description": "Upstream rr test guests (third-party/rr/src/test) as pressure-tier replay and verify cells on ptrace. Every cell starts ci=false under the pressure label and this node therefore selects none until promotion, which --allow-empty states explicitly. Promotion to super needs a hermetic pass plus 2 clean pressure nights.",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env CI --env HERMIT_EPOCH --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_NEXTEST_FILTER_EXPR --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env HERMIT_VALIDATE_BUCK_DOTSLASH --env NEXTEST_TEST_THREADS --env RUST_MIN_STACK --env VALIDATE_RUN_STATE -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category rr --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_rr/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_rr/junit.xml\"'",
+      "manifest": {
+        "lane": "portable",
+        "category": "rr"
+      },
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_rr"
+        }
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.manifest_guests_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ],
+      "env": {
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 600,
+      "cpu_timeout": 80,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {
+          "manifest_guest": 1
+        },
+        "est_duration_s": 5.0,
+        "rss_baseline_bytes": 1073741824,
+        "hard_mem_max_bytes": 3221225472,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "e2e.manifest_rr"
+    },
+    {
+      "group": "e2e",
       "job": "manifest_c_programs",
       "desc": "Portable manifest bucket: c-programs",
       "description": "FOLD 2026-09-28 (https://github.com/rrnewton/hermit/issues/3301): the backend-parity-c bucket was folded into c-programs, so this node now also runs the 276 portable cells that e2e.manifest_backend_parity_c ran (713 portable cells in all), and that node is gone. Validation run validate-coord-s15-fdd8f55a8e7c (Hermit fdd8f55a8e7c, 2026-09-28) measured the two nodes at 128.62 s and 75.76 s of wall time (about 204 s together), 844 s and 510 s of CPU time (1354 s together, under the unchanged 7200 s CPU bound), and peaks of 3862880256 and 3859349504 bytes at width 8. The wall bound rises from 600 s to 900 s and the estimate from 300 s to 480 s, the sum of the two former estimates; memory bounds are unchanged because peak memory follows the worker width, which stays 8, not the number of cells. The selector no longer passes --allow-empty: a c-programs node that selects no cells now fails instead of passing having run nothing. WORKER WIDTH measured 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 127 selected strict rows in 264.3s with 127 canonical matches and no no_result, leaving a measured 335.7s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots and passes the same width to the harness; ordinary Hermit gates may overlap now that their unsupported exclusive resource is removed. Tradeoff: blocking validation still does not exercise the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 40-107: five uncapped cgroup peaks were 2855145472-2894295040 bytes; three stricter 4-GiB-cap repetitions completed all 128 cells with peaks up to 3025047552 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves nearly 3 GiB of runaway headroom without reserving the former unmeasured 32 GiB. SHARED CAPACITY 12 2026-10-17: the manifest_guest resource this node reserves 8 of now has 12 slots, up from 8, so the eleven one-slot buckets no longer wait for this node or e2e.manifest_compat (also 8) to finish; this node and compat still run one at a time, and both keep --jobs 8. In the Cargo-route full validation of 0328f30b, the buckets ran one after another on 8 slots (system-utils +325 to +442 s, this node +475 to +582, compat +582 to +637); replayed on that run's own durations with the slot count honoured, capacity 12 ends the graph at +486 s, 16 at +483 and 24 at +483. 12 is the smaller step that reaches it, taken while the host saw memory pressure that afternoon. The first Cargo-route validation afterwards is the measurement. SHARED CAPACITY 20 2026-11-05: the resource now has 20 slots, up from 12, so this node and e2e.manifest_compat (8 each, --jobs 8 unchanged) overlap with four one-slot buckets beside them. Replayed on the journals of 19 full Cargo-route validations of 2026-11-04/05 on the named measurement host (100 nodes, about 12,620 tests; the replay reproduces each run's makespan at 12), capacity 20 ends the graph a median 80 s of wall earlier (873 s to 792 s; p90 956 s to 848 s); 16 gains only 10 s because the one-slot buckets then wait, and 24 no more than 20. The Oct 17 replay's 3-second 16-slot gain no longer holds because this node now runs 202 s of wall (713 cells after the fold above) ahead of compat's 106 s on the critical path. Peaks in those runs: compat 3.82 GiB median (4.08 max) under its 6 GiB hard cap, this node 0.92 GiB, every other manifest bucket at most 1.22 GiB, so 20 concurrent guests fit the measured memory many times over; the cap is per scheduler process in production (paired validations already reach 24 combined), so two validations can now reach 40. The former 20-way no_result flake (WORKER WIDTH above) was one bucket at width 20, not disjoint buckets totalling 20; the first validations afterwards are the measurement, and a rising no_result rate reverts this.",
@@ -27763,6 +27818,7 @@
         "e2e.manifest_determinism_stress",
         "e2e.manifest_determinism_stress_c",
         "e2e.manifest_language_runtimes",
+        "e2e.manifest_rr",
         "e2e.manifest_shared_futex_c",
         "e2e.manifest_system_utils",
         "e2e.manifest_util_c",
@@ -27795,7 +27851,7 @@
       "group": "scorecard",
       "job": "compatibility",
       "desc": "Verify fresh per-cell results and print the compatibility table",
-      "description": "After the thirteen portable e2e.manifest_* buckets finish, `ci/compat-envelope/scorecard.rs verify-results --lanes portable` requires one fresh row at git HEAD, from a clean tree, for every portable-lane regression cell ci/expected-e2e-plan.json selects. Each must be a PASS, except a cell the manifest declares diagnostic, whose FAIL is listed without failing the check; declared stripped-comparator passes are counted apart as below L2. All rows must come from one Hermit binary, and each cell's rows from one run. A cell no bucket wrote, a row from another commit, or rows from two Hermit builds fail it with \"fresh result set refused: N missing, M non-passing\" even when every bucket node passed; on success it prints the compatibility table. It is the portable-profile copy of full-scorecard.compatibility, which checks both lanes.",
+      "description": "After the fourteen portable e2e.manifest_* buckets finish, `ci/compat-envelope/scorecard.rs verify-results --lanes portable` requires one fresh row at git HEAD, from a clean tree, for every portable-lane regression cell ci/expected-e2e-plan.json selects. Each must be a PASS, except a cell the manifest declares diagnostic, whose FAIL is listed without failing the check; declared stripped-comparator passes are counted apart as below L2. All rows must come from one Hermit binary, and each cell's rows from one run. A cell no bucket wrote, a row from another commit, or rows from two Hermit builds fail it with \"fresh result set refused: N missing, M non-passing\" even when every bucket node passed; on success it prints the compatibility table. It is the portable-profile copy of full-scorecard.compatibility, which checks both lanes.",
       "labels": [
         "portable"
       ],
@@ -27812,6 +27868,7 @@
         "e2e.manifest_determinism_stress",
         "e2e.manifest_determinism_stress_c",
         "e2e.manifest_language_runtimes",
+        "e2e.manifest_rr",
         "e2e.manifest_shared_futex_c",
         "e2e.manifest_system_utils",
         "e2e.manifest_util_c",
@@ -33228,6 +33285,55 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "e2e.manifest_bin_c_on_host"
+    },
+    {
+      "group": "e2e",
+      "job": "manifest_rr_on_host",
+      "desc": "Portable manifest bucket: rr",
+      "description": "Upstream rr test guests (third-party/rr/src/test) as pressure-tier replay and verify cells on ptrace. Every cell starts ci=false under the pressure label and this node therefore selects none until promotion, which --allow-empty states explicitly. Promotion to super needs a hermetic pass plus 2 clean pressure nights.",
+      "labels": [
+        "hosted-portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category rr --ci-only --allow-empty --prebuilt --exclude-backend kvm --exclude-backend liteinst --exclude-backend in-guest-trap --results \"$E2E_RESULT_ROOT/portable/manifest_rr/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_rr/junit.xml\"",
+      "manifest": {
+        "lane": "portable",
+        "category": "rr"
+      },
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_rr_on_host"
+        }
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "build.manifest_guests",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 600,
+      "cpu_timeout": 7200,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {
+          "manifest_guest": 1
+        },
+        "est_duration_s": 5.0,
+        "rss_baseline_bytes": 1073741824,
+        "hard_mem_max_bytes": 3221225472,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "e2e.manifest_rr_on_host"
     },
     {
       "group": "e2e",
@@ -41984,7 +42090,7 @@
       "group": "scorecard",
       "job": "compatibility_on_host",
       "desc": "Verify fresh per-cell results and print the compatibility table",
-      "description": "The GitHub-hosted copy of scorecard.compatibility: the same `scorecard.rs verify-results --lanes portable` check, run on the host after the thirteen e2e.manifest_*_on_host buckets, with `--exclude-backend kvm --exclude-backend liteinst --exclude-backend in-guest-trap` added. Hosted runners expose /dev/kvm through nested virtualization but have no PMU, so KVM guests fail when their clock opens the retired-branch counter, and they have no CPUID faulting, so the in-guest LiteInst runtime of the liteinst and in-guest-trap backends refuses to start; the profile drops those cells, and the scorecard prints them on an \"Omitted by --exclude-backend\" line instead of counting them. Every other selected portable cell still needs one fresh PASS at HEAD from one Hermit binary and one run per cell. A bucket that wrote no row for a cell fails it as missing; if the plan ever selects no KVM cell, `--exclude-backend kvm --exclude-backend liteinst --exclude-backend in-guest-trap matches no selected cell in the named lanes` turns it red rather than silently excluding nothing.",
+      "description": "The GitHub-hosted copy of scorecard.compatibility: the same `scorecard.rs verify-results --lanes portable` check, run on the host after the fourteen e2e.manifest_*_on_host buckets, with `--exclude-backend kvm --exclude-backend liteinst --exclude-backend in-guest-trap` added. Hosted runners expose /dev/kvm through nested virtualization but have no PMU, so KVM guests fail when their clock opens the retired-branch counter, and they have no CPUID faulting, so the in-guest LiteInst runtime of the liteinst and in-guest-trap backends refuses to start; the profile drops those cells, and the scorecard prints them on an \"Omitted by --exclude-backend\" line instead of counting them. Every other selected portable cell still needs one fresh PASS at HEAD from one Hermit binary and one run per cell. A bucket that wrote no row for a cell fails it as missing; if the plan ever selects no KVM cell, `--exclude-backend kvm --exclude-backend liteinst --exclude-backend in-guest-trap matches no selected cell in the named lanes` turns it red rather than silently excluding nothing.",
       "labels": [
         "hosted-portable"
       ],
@@ -42001,6 +42107,7 @@
         "e2e.manifest_determinism_stress_c_on_host",
         "e2e.manifest_determinism_stress_on_host",
         "e2e.manifest_language_runtimes_on_host",
+        "e2e.manifest_rr_on_host",
         "e2e.manifest_shared_futex_c_on_host",
         "e2e.manifest_system_utils_on_host",
         "e2e.manifest_util_c_on_host",
@@ -44541,6 +44648,53 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "e2e.manifest_bin_c_buck"
+    },
+    {
+      "group": "e2e",
+      "job": "manifest_rr_buck",
+      "desc": "Portable manifest bucket: rr (Buck rows)",
+      "description": "Upstream rr test guests (third-party/rr/src/test) as pressure-tier replay and verify cells on ptrace. Every cell starts ci=false under the pressure label and this node therefore selects none until promotion, which --allow-empty states explicitly. Promotion to super needs a hermetic pass plus 2 clean pressure nights. Buck import twin: publishes the cells of e2e.manifest_rr from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_rr's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_rr.",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; E2E_IMPORT_RESULTS=\"$VALIDATE_RUN_STATE/buck-e2e/results\" target/debug/test-harness run --lane portable --category rr --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_rr/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_rr/junit.xml\"",
+      "manifest": {
+        "lane": "portable",
+        "category": "rr"
+      },
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_rr_buck"
+        }
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 600,
+      "cpu_timeout": 600,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 1.0,
+        "rss_baseline_bytes": 1073741824,
+        "hard_mem_max_bytes": 3221225472,
+        "classification": "light",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "e2e.manifest_rr_buck"
     },
     {
       "group": "e2e",
@@ -62028,6 +62182,7 @@
         "e2e.manifest_determinism_stress_buck",
         "e2e.manifest_determinism_stress_c_buck",
         "e2e.manifest_language_runtimes_buck",
+        "e2e.manifest_rr_buck",
         "e2e.manifest_shared_futex_c_buck",
         "e2e.manifest_system_utils_buck",
         "e2e.manifest_util_c_buck",
