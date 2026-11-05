@@ -829,7 +829,7 @@ fn local_materialization_recovers_from_partial_tree() {
 fn assert_refused_by_name(output: &Output, case: &str, needles: &[&str]) {
     assert_eq!(
         output.status.code(),
-        Some(125),
+        Some(hermit::HERMIT_INTERNAL_FAILURE_EXIT),
         "{case}: expected exit 125, got {:?}\nstdout:\n{}\nstderr:\n{}",
         output.status.code(),
         stdout_of(output),
