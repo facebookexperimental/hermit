@@ -8,59 +8,59 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 3130,
-      "applicable": 2272,
-      "selectable": 1779,
-      "population": 3055,
-      "population_candidate_selected": 1779,
+      "cells": 3140,
+      "applicable": 2273,
+      "selectable": 1780,
+      "population": 3065,
+      "population_candidate_selected": 1780,
       "population_candidate_not_selected": 475,
-      "population_candidate_disabled": 801
+      "population_candidate_disabled": 810
     },
     "by_backend": {
       "dbt": {
-        "cells": 626,
+        "cells": 628,
         "applicable": 560,
         "selectable": 555,
-        "population": 611,
+        "population": 613,
         "population_candidate_selected": 555,
         "population_candidate_not_selected": 2,
-        "population_candidate_disabled": 54
+        "population_candidate_disabled": 56
       },
       "in-guest-trap": {
-        "cells": 626,
+        "cells": 628,
         "applicable": 314,
         "selectable": 314,
-        "population": 611,
+        "population": 613,
         "population_candidate_selected": 314,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 297
+        "population_candidate_disabled": 299
       },
       "kvm": {
-        "cells": 626,
-        "applicable": 604,
-        "selectable": 595,
-        "population": 611,
-        "population_candidate_selected": 595,
+        "cells": 628,
+        "applicable": 605,
+        "selectable": 596,
+        "population": 613,
+        "population_candidate_selected": 596,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 13
+        "population_candidate_disabled": 14
       },
       "liteinst": {
-        "cells": 626,
+        "cells": 628,
         "applicable": 315,
         "selectable": 315,
-        "population": 611,
+        "population": 613,
         "population_candidate_selected": 315,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 296
+        "population_candidate_disabled": 298
       },
       "sabre": {
-        "cells": 626,
+        "cells": 628,
         "applicable": 479,
         "selectable": 0,
-        "population": 611,
+        "population": 613,
         "population_candidate_selected": 0,
         "population_candidate_not_selected": 470,
-        "population_candidate_disabled": 141
+        "population_candidate_disabled": 143
       }
     }
   },
@@ -605,6 +605,16 @@
     {"test_id":"c-programs/madvise-determinism","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/madvise-determinism","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/madvise-determinism","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"c-programs/madvise-guard-fault","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Not yet measured on DBT: the run that added this cell (https://github.com/rrnewton/hermit/issues/5154) had no DBT-capable build; enable after a DBT verify run of this cell"},
+    {"test_id":"c-programs/madvise-guard-fault","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"c-programs/madvise-guard-fault","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM enforces no page protection in its vCPU page tables, so a direct access to a guard page does not fault (https://github.com/rrnewton/hermit/issues/5177); re-enable when hardware enforcement lands under Track B"},
+    {"test_id":"c-programs/madvise-guard-fault","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"c-programs/madvise-guard-fault","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Not yet qualified on SaBRe: guard regions were measured on ptrace and KVM only (https://github.com/rrnewton/hermit/issues/5154)"},
+    {"test_id":"c-programs/madvise-guard-regions","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Not yet measured on DBT: the run that added this cell (https://github.com/rrnewton/hermit/issues/5154) had no DBT-capable build; enable after a DBT verify run of this cell"},
+    {"test_id":"c-programs/madvise-guard-regions","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"c-programs/madvise-guard-regions","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/madvise-guard-regions","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"c-programs/madvise-guard-regions","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Not yet qualified on SaBRe: guard regions were measured on ptrace and KVM only (https://github.com/rrnewton/hermit/issues/5154)"},
     {"test_id":"c-programs/map-shadow-stack-enosys","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/map-shadow-stack-enosys","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/map-shadow-stack-enosys","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

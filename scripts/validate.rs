@@ -20106,7 +20106,10 @@ mod nextest_timeout_tests {
                 // with the java/javac compile+run split of 2026-11-05, which
                 // replaces each combined row with two rows (+2 net replay
                 // cells in this default population).
-                assert_eq!(all.len(), 2978, "the original all-owner population is retained");
+                // 2983 with #5154's guard cells: c-programs/madvise-guard-fault
+                // and c-programs/madvise-guard-regions, verify and replay on
+                // ptrace, and madvise-guard-regions verify on KVM.
+                assert_eq!(all.len(), 2983, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");

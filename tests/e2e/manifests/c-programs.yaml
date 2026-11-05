@@ -3486,6 +3486,150 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/madvise-guard-fault
+    description: A direct access to a madvise(MADV_GUARD_INSTALL) guard page raises SIGSEGV SEGV_MAPERR at the faulting address (tests/c/madvise_guard_fault.c)
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/madvise_guard_fault.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+        - -pthread
+    modes:
+      verify:
+        ci:
+          ptrace: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: "Not yet measured on DBT: the run that added this cell (https://github.com/rrnewton/hermit/issues/5154) had no DBT-capable build; enable after a DBT verify run of this cell"
+          kvm: "KVM enforces no page protection in its vCPU page tables, so a direct access to a guard page does not fault (https://github.com/rrnewton/hermit/issues/5177); re-enable when hardware enforcement lands under Track B"
+          sabre: "Not yet qualified on SaBRe: guard regions were measured on ptrace and KVM only (https://github.com/rrnewton/hermit/issues/5154)"
+          liteinst: "Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)"
+          in-guest-trap: "Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"
+        expected_stdout:
+          ptrace: "read guard: SIGSEGV SEGV_MAPERR, si_addr exact\nwrite guard: SIGSEGV SEGV_MAPERR, si_addr exact\nread neighbour: no fault, read 97\nread guard after mprotect: SIGSEGV SEGV_MAPERR, si_addr exact\nchild read guard: SIGSEGV SEGV_MAPERR, si_addr exact\nchild killed by Segmentation fault\nread removed guard: no fault, read 0\nwrite removed guard: no fault, read 0\n"
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: The guest asserts Linux 6.13+ guard-region semantics through expected_stdout; native nondeterminism is not part of this contract'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest asserts Linux 6.13+ guard-region semantics through expected_stdout; native nondeterminism is not part of this contract
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: "NOT-EXERCISED: Guard-region semantics are a fixed contract; chaos scheduling adds no signal there"
+        backends_enabled: []
+        backends_disabled:
+          ptrace: "Guard-region semantics are a fixed contract; chaos scheduling adds no signal there"
+          dbt: "Guard-region semantics are a fixed contract; chaos scheduling adds no signal there"
+          kvm: "Guard-region semantics are a fixed contract; chaos scheduling adds no signal there"
+          sabre: "Guard-region semantics are a fixed contract; chaos scheduling adds no signal there"
+          liteinst: "Guard-region semantics are a fixed contract; chaos scheduling adds no signal there"
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: No custom edge-case arguments have been calibrated for this C guest'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/madvise-guard-regions
+    description: Guard regions (madvise MADV_GUARD_INSTALL and MADV_GUARD_REMOVE) give Linux 6.13+ answers to every syscall that copies to or from them (tests/c/madvise_guard_regions.c)
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/madvise_guard_regions.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+        - -pthread
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          kvm: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: "Not yet measured on DBT: the run that added this cell (https://github.com/rrnewton/hermit/issues/5154) had no DBT-capable build; enable after a DBT verify run of this cell"
+          sabre: "Not yet qualified on SaBRe: guard regions were measured on ptrace and KVM only (https://github.com/rrnewton/hermit/issues/5154)"
+          liteinst: "Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)"
+          in-guest-trap: "Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"
+        expected_stdout:
+          ptrace: "install: 0\nguard page: Bad address\nneighbours: ok\n            ok\nread into guard: Bad address\nneighbour kept: a\nagain: 0\nguard page: Bad address\nunaligned: Invalid argument\ndontneed: 0\nguard page: Bad address\nmprotect: 0\nguard page: Bad address\nchild guard page: Bad address\nchild remove: 0\nchild page: ok\nchild exit: 0\nparent guard page: Bad address\nremove: 0\npage: ok\ncontents: 0\ninstall over hole: Cannot allocate memory\nmapped part: Bad address\nremove over hole: Cannot allocate memory\nmapped part: ok\nremapped: same\npage: ok\nmapped over guard: ok\nmoved first: ok\nmoved guard: Bad address\ngrown: ok\nmaps lines over guarded mapping unchanged: yes\nstack guard: 0\nstack guard page: Bad address\nmaps lines over guarded stack: 1\nstack guard removed: 0\nthread ran: 1\n"
+          kvm: "install: 0\nguard page: Bad address\nneighbours: ok\n            ok\nread into guard: Bad address\nneighbour kept: a\nagain: 0\nguard page: Bad address\nunaligned: Invalid argument\ndontneed: 0\nguard page: Bad address\nmprotect: 0\nguard page: Bad address\nchild guard page: Bad address\nchild remove: 0\nchild page: ok\nchild exit: 0\nparent guard page: Bad address\nremove: 0\npage: ok\ncontents: 0\ninstall over hole: Cannot allocate memory\nmapped part: Bad address\nremove over hole: Cannot allocate memory\nmapped part: ok\nremapped: same\npage: ok\nmapped over guard: ok\nmoved first: ok\nmoved guard: Bad address\ngrown: ok\nmaps lines over guarded mapping unchanged: yes\nstack guard: 0\nstack guard page: Bad address\nmaps lines over guarded stack: 1\nstack guard removed: 0\nthread ran: 1\n"
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: The guest asserts Linux 6.13+ guard-region semantics through expected_stdout; native nondeterminism is not part of this contract'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest asserts Linux 6.13+ guard-region semantics through expected_stdout; native nondeterminism is not part of this contract
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: "NOT-EXERCISED: Guard-region semantics are a fixed contract; chaos scheduling adds no signal there"
+        backends_enabled: []
+        backends_disabled:
+          ptrace: "Guard-region semantics are a fixed contract; chaos scheduling adds no signal there"
+          dbt: "Guard-region semantics are a fixed contract; chaos scheduling adds no signal there"
+          kvm: "Guard-region semantics are a fixed contract; chaos scheduling adds no signal there"
+          sabre: "Guard-region semantics are a fixed contract; chaos scheduling adds no signal there"
+          liteinst: "Guard-region semantics are a fixed contract; chaos scheduling adds no signal there"
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: No custom edge-case arguments have been calibrated for this C guest'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/map-shadow-stack-enosys
     description: Strict verification for tests/c/map_shadow_stack_enosys.c
     lane: portable

@@ -1327,6 +1327,18 @@
       "why": "tests/c/madvise_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/c/madvise_guard_fault.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/c/madvise_guard_fault.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): pins that a direct access to a madvise(MADV_GUARD_INSTALL) guard page raises SIGSEGV with SEGV_MAPERR at the faulting address, through mprotect and in a fork's child, with a ptrace verify cell; the KVM cell is disabled because KVM's page tables enforce no page protection (https://github.com/rrnewton/hermit/issues/5177)"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/madvise_guard_regions.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/c/madvise_guard_regions.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): pins Linux 6.13+ guard-region answers observed through syscalls (EFAULT copies, survival through MADV_DONTNEED, mprotect and fork, ENOMEM over a hole, munmap and MAP_FIXED ending a guard, mremap moving it, no /proc/self/maps split) at canonical bitwise parity on ptrace and KVM (https://github.com/rrnewton/hermit/issues/5154)"
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/c/main_stack_maps.c",
       "runner": "hermit-cli/tests/cli.rs",
