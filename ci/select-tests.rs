@@ -3077,6 +3077,42 @@ fn self_test() {
             && super_hits(&core_fp, &core_dag, &["ci/run-nextest-counted.sh".into()])
                 == core_dag.super_nodes,
     );
+    // Test-body precision (musereviewd residual on the affected-super
+    // change): an edit to only a super node's test body - no selector,
+    // budget, or harness file - still names exactly that node.
+    check(
+        "4741: analyze.rs-only edit selects the pmu analyze node",
+        select(
+            &core_fp,
+            &core_dag,
+            &["hermit-cli/tests/analyze.rs".into()],
+        )
+        .super_nodes
+            == BTreeSet::from([pmu.to_string()]),
+    );
+    check(
+        "4741: pmu_skid.c-only edit selects the pmu analyze node",
+        select(&core_fp, &core_dag, &["tests/util/pmu_skid.c".into()])
+            .super_nodes
+            .contains(pmu),
+    );
+    check(
+        "4741: scorecard.rs-only edit selects its selftest nodes",
+        select(
+            &core_fp,
+            &core_dag,
+            &["ci/compat-envelope/scorecard.rs".into()],
+        )
+        .super_nodes
+        .is_superset(
+            &[
+                "quick-super-selftest.scorecard".to_string(),
+                "quick-super-selftest.scorecard_commands".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    );
     let policy: Value = serde_json::from_slice(
         &std::fs::read(root.join("ci/test-footprints-policy.json")).unwrap(),
     )

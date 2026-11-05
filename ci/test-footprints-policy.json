@@ -341,6 +341,52 @@
         "tests/compat/complex_shell_workload.sh"
       ],
       "nodes": ["super-compatprep.fixtures", "supercompat.manifest_compat"]
+    },
+    {
+      "_why": "Test-body precision for the PMU analyze super node: its ignored nextest cases, the hermit analyze product code they drive, and the skid calibration guest the node compiles. A slower test body here breaks only this node (the 4741 residual).",
+      "paths": [
+        "hermit-cli/tests/analyze.rs",
+        "hermit-cli/tests/common/hermit_binary.rs",
+        "hermit-cli/tests/common/skid_overshoot.rs",
+        "hermit-cli/src/bin/hermit/analyze.rs",
+        "detcore/src/skid_overshoots.rs",
+        "tests/util/pmu_skid.c"
+      ],
+      "nodes": ["super.pmu_analyze_hello_race_stress_calibrated_skid"]
+    },
+    {
+      "_why": "Quick-super selftest own inputs: each tool self-test node's program and harness sources map to exactly its node.",
+      "paths": [
+        "ci/compat-envelope/scorecard.rs",
+        "ci/prepare-scorecard-self-test-corpus.sh"
+      ],
+      "nodes": [
+        "quick-super-selftest.scorecard",
+        "quick-super-selftest.scorecard_commands"
+      ]
+    },
+    {
+      "_why": "Quick-super selftest own inputs: each tool self-test node's program and harness sources map to exactly its node.",
+      "paths": [
+        "ci/compat-envelope/pressure-test.rs",
+        "ci/compat-envelope/pressure_log_tail.rs"
+      ],
+      "nodes": ["quick-super-selftest.pressure_test"]
+    },
+    {
+      "_why": "Quick-super selftest own inputs: each tool self-test node's program and harness sources map to exactly its node.",
+      "paths": ["scripts/validate.rs", "scripts/lib/validate_*.rs"],
+      "nodes": ["quick-super-selftest.validate_rs"]
+    },
+    {
+      "_why": "Quick-super selftest own inputs: each tool self-test node's program and harness sources map to exactly its node.",
+      "paths": ["tests/manifest-cli.rs"],
+      "nodes": ["quick-super-selftest.manifest_cli"]
+    },
+    {
+      "_why": "Quick-super selftest own inputs: each tool self-test node's program and harness sources map to exactly its node.",
+      "paths": ["ci/run-with-core-build-test.sh", "ci/run-with-core-build.sh"],
+      "nodes": ["quick-super-selftest.core_build"]
     }
   ],
   "backend_rules": [
