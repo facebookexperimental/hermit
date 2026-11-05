@@ -928,8 +928,8 @@ struct Args {
     verbosity: i64,
     jobs: Option<i64>,
     keep_going: bool,
-    /// Queue-candidate mode: checks run as a gated first wave and the first
-    /// confirmed red eager-cancels everything else. See [`apply_fail_fast`].
+    /// Queue-candidate mode: the first confirmed red eager-cancels
+    /// everything else. Adds no dependency edges. See [`apply_fail_fast`].
     fail_fast: bool,
     allow_cgroup_failure: bool,
     /// Wall budget for the whole validate invocation, across lanes and retries.
@@ -1354,8 +1354,8 @@ fn usage() -> &'static str {
      \x20                  reports instead of being killed externally. Also sets a later\n\
      \x20                  systemd-scope backstop. Env: HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS.\n\
      \x20 -k, --keep-going Do not eager-exit on the first failure.\n\
-     \x20 --fail-fast    Queue-candidate mode: run the static checks first and\n\
-     \x20                eager-exit the whole graph on the first confirmed red.\n\
+     \x20 --fail-fast    Queue-candidate mode: eager-exit the whole graph on the\n\
+     \x20                first confirmed red. Adds no dependency edges.\n\
      \x20 --allow-cgroup-failure  Downgrade to an UNBOXED run instead of failing closed.\n\
      \x20 --show-plan      Print the outer boxed DAG nodes, caps, and dependencies and exit.\n\
      \x20                  It does not enumerate Rust test IDs or E2E cells.\n\
@@ -13451,49 +13451,19 @@ fn frozen_run_withheld_lines(withheld: &[String]) -> Vec<String> {
 /// The committed DAG isolates every step in its own `fail_fast_family`, so
 /// one red node cancels nothing but itself and a queue candidate still pays
 /// for the whole matrix (4742: a 7 s static-check red known at t+309 s,
-/// then 542 s of unrelated nodes). In fail-fast mode:
-///   * every family collapses to the scheduler's global eager-exit scope
-///     (`None`): the first confirmed failure stops launches and cancels
-///     in-flight peers, and
-///   * the static checks (`check.*`) become a gated first wave: every step
-///     outside the checks' dependency closure gains a dependency on every
-///     check, so no build or test node starts until the cheap reds that can
-///     kill the run in seconds have had their say.
-/// The node population, commands and wave-internal edges are untouched;
-/// only scheduling scope and order change, so a green fail-fast run
-/// measures exactly what the ordinary run measures.
+/// then 542 s of unrelated nodes). In fail-fast mode every family collapses
+/// to the scheduler's global eager-exit scope (`None`): the first confirmed
+/// failure stops launches and cancels in-flight peers.
+///
+/// Nothing else changes. No dependency edge is added, removed, or
+/// reordered: the owner forbids artificial sequential dependencies, so
+/// preferring cheap checks early is a scheduler priority hint among ready
+/// steps, never a barrier other nodes wait behind. A green fail-fast run
+/// therefore measures exactly what the ordinary run measures.
 fn apply_fail_fast(plan: &mut Plan) {
     for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
-        let checks: BTreeSet<String> = cfg
-            .steps
-            .iter()
-            .filter(|step| step.group == "check")
-            .map(Step::tag)
-            .collect();
-        let by_tag: BTreeMap<String, Vec<String>> = cfg
-            .steps
-            .iter()
-            .map(|step| (step.tag(), step.deps.clone()))
-            .collect();
-        let mut wave: BTreeSet<String> = checks.clone();
-        let mut stack: Vec<String> = checks.iter().cloned().collect();
-        while let Some(tag) = stack.pop() {
-            for dep in by_tag.get(&tag).cloned().unwrap_or_default() {
-                if wave.insert(dep.clone()) {
-                    stack.push(dep);
-                }
-            }
-        }
         for step in &mut cfg.steps {
             step.fail_fast_family = None;
-            if wave.contains(&step.tag()) {
-                continue;
-            }
-            for check in &checks {
-                if !step.deps.contains(check) {
-                    step.deps.push(check.clone());
-                }
-            }
         }
     }
 }
@@ -37903,80 +37873,48 @@ mod fail_fast_tests {
         assert!(!off.fail_fast);
     }
 
-    /// Queue mode: one shared eager-exit scope, and no build/test node may
-    /// start until every static check has finished (4742: its 7 s check red
-    /// was known at t+309 s while 542 s of other nodes still ran).
+    /// Queue mode: one shared eager-exit scope, and NOTHING else changes.
+    /// The owner forbids artificial sequential dependencies: fail-fast must
+    /// not add, remove, or reorder a single dependency edge (an earlier
+    /// version gated every non-check node behind the whole check wave;
+    /// ordering among ready nodes is the scheduler's priority hint, never
+    /// an edge). Deps must be byte-identical with and without the flag.
     #[test]
-    fn fail_fast_collapses_families_and_gates_the_rest_behind_checks() {
+    fn fail_fast_collapses_families_and_adds_no_dependency_edges() {
         let mut plan = full_plan();
-        let checks: BTreeSet<String> = plan
-            .cfg
-            .steps
-            .iter()
-            .filter(|step| step.group == "check")
-            .map(Step::tag)
-            .collect();
-        assert!(!checks.is_empty(), "the full plan lost its check wave");
+        assert!(
+            plan.cfg.steps.iter().any(|step| step.group == "check"),
+            "the full plan lost its check steps"
+        );
+        let deps_of = |cfg: &DagConfig| -> BTreeMap<String, Vec<String>> {
+            cfg.steps
+                .iter()
+                .map(|step| (step.tag(), step.deps.clone()))
+                .collect()
+        };
+        let before = deps_of(&plan.cfg);
+        let before_second = plan.second.as_ref().map(|cfg| deps_of(cfg));
         apply_fail_fast(&mut plan);
         assert!(
             plan.cfg.steps.iter().all(|step| step.fail_fast_family.is_none()),
             "every step must share the global eager-exit scope"
         );
-        let by_tag: BTreeMap<String, &Step> =
-            plan.cfg.steps.iter().map(|step| (step.tag(), step)).collect();
-        // Wave closure: checks plus everything they already depended on.
-        let mut wave: BTreeSet<String> = checks.clone();
-        let mut stack: Vec<String> = checks.iter().cloned().collect();
-        while let Some(tag) = stack.pop() {
-            for dep in &by_tag[tag.as_str()].deps {
-                if wave.insert(dep.clone()) {
-                    stack.push(dep.clone());
-                }
-            }
+        if let Some(second) = &plan.second {
+            assert!(
+                second.steps.iter().all(|step| step.fail_fast_family.is_none()),
+                "every second-graph step must share the global eager-exit scope"
+            );
         }
-        for step in &plan.cfg.steps {
-            if wave.contains(&step.tag()) {
-                continue;
-            }
-            for check in &checks {
-                assert!(
-                    step.deps.contains(check),
-                    "{} must wait for {} in fail-fast mode",
-                    step.tag(),
-                    check
-                );
-            }
-        }
-        // No cycle: a topological order exists (Kahn).
-        let mut indegree: BTreeMap<String, usize> = plan
-            .cfg
-            .steps
-            .iter()
-            .map(|step| (step.tag(), step.deps.len()))
-            .collect();
-        let mut dependents: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for step in &plan.cfg.steps {
-            for dep in &step.deps {
-                dependents.entry(dep.clone()).or_default().push(step.tag());
-            }
-        }
-        let mut ready: Vec<String> = indegree
-            .iter()
-            .filter(|(_, &degree)| degree == 0)
-            .map(|(tag, _)| tag.clone())
-            .collect();
-        let mut ordered = 0usize;
-        while let Some(tag) = ready.pop() {
-            ordered += 1;
-            for next in dependents.get(&tag).cloned().unwrap_or_default() {
-                let degree = indegree.get_mut(&next).unwrap();
-                *degree -= 1;
-                if *degree == 0 {
-                    ready.push(next);
-                }
-            }
-        }
-        assert_eq!(ordered, plan.cfg.steps.len(), "fail-fast wave introduced a cycle");
+        assert_eq!(
+            deps_of(&plan.cfg),
+            before,
+            "fail-fast must not add, remove, or reorder dependency edges"
+        );
+        assert_eq!(
+            plan.second.as_ref().map(|cfg| deps_of(cfg)),
+            before_second,
+            "fail-fast must not add, remove, or reorder second-graph edges"
+        );
     }
 
     #[test]
