@@ -955,7 +955,7 @@ impl RecordVersion {
 // It is refused here.
 // https://github.com/rrnewton/hermit/pull/4885
 // 0x19a -> 0x19c (reserved for this change in minibeads dh-gxmvo;
-// devbig014 keeps 0x19c for it at its rebase onto main f76f9b8c, after
+// this change keeps 0x19c at its rebase onto main f76f9b8c, after
 // 0x19a shipped above; 0x19b stays reserved for the replayed-MAP_SHARED
 // fix-forward, and land-time numbering still applies): a parent's
 // SIGCHLD that the scheduler defers until no other ordinary work is
