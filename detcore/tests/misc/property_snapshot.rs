@@ -160,7 +160,15 @@ fn a_property_snapshot_serves_every_read_of_the_files_it_copied() {
 /// `read` fails with `EBADF`. Creation is likewise refused before it
 /// runs where only the kernel-resolved parent is the area: through a
 /// dangling final symlink into the area, and through a retained dirfd
-/// on the area whose spelling has since been replaced.
+/// on the area whose spelling has since been replaced. The parent is
+/// an intermediate component of the pending open, so the kernel
+/// follows it even where it is a symlink: creation through a
+/// symlinked final parent (a dangling link whose target names the
+/// area through an alias, and `alias/name` under a dirfd), through a
+/// chain of dangling final links, and through a dangling link whose
+/// spelling is too long to resolve in the guest (refused fail-closed)
+/// are likewise refused before anything is created, while chained
+/// and plain creations outside the area still succeed.
 #[test]
 fn a_late_property_file_is_refused_through_alias_spellings() {
     let area = area();
@@ -184,6 +192,51 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
     std::os::unix::fs::symlink(area.live.path(), &alias_dir).unwrap();
     let dangling_link = outside.path().join("dangling-final");
     std::os::unix::fs::symlink(&dangling_target, &dangling_link).unwrap();
+    // A dangling final symlink whose target names the area only
+    // through the alias: only the link target's parent, followed as
+    // the pending open follows an intermediate component, is the area.
+    let alias_absent_name = "u:object_r:alias_absent_prop:s0";
+    let alias_absent_target = area.live.path().join(alias_absent_name);
+    let alias_dangling_link = outside.path().join("alias-dangling-final");
+    std::os::unix::fs::symlink(alias_dir.join(alias_absent_name), &alias_dangling_link).unwrap();
+    // A name only `alias-area/<name>` under a dirfd on the outside
+    // directory can create, where the alias is the final parent.
+    let dirfd_absent_name = "u:object_r:dirfd_absent_prop:s0";
+    let dirfd_absent_target = area.live.path().join(dirfd_absent_name);
+    // A chain of dangling final links into the area: the first names
+    // the second relatively, and only the second names the area.
+    let chain_absent_name = "u:object_r:chain_absent_prop:s0";
+    let chain_absent_target = area.live.path().join(chain_absent_name);
+    let chain_link2 = outside.path().join("chain-final-2");
+    std::os::unix::fs::symlink(&chain_absent_target, &chain_link2).unwrap();
+    let chain_link1 = outside.path().join("chain-final-1");
+    std::os::unix::fs::symlink("chain-final-2", &chain_link1).unwrap();
+    // The same chain shape naming an absent file outside the area:
+    // creation through it still succeeds (the positive control).
+    let outside_chain_target = outside.path().join("outside-chain-absent");
+    let outside_chain_link2 = outside.path().join("outside-chain-2");
+    std::os::unix::fs::symlink(&outside_chain_target, &outside_chain_link2).unwrap();
+    let outside_chain_link1 = outside.path().join("outside-chain-1");
+    std::os::unix::fs::symlink("outside-chain-2", &outside_chain_link1).unwrap();
+    // A plain absent file outside the area, created by its own name.
+    let outside_plain_target = outside.path().join("outside-plain-absent");
+    // A dangling final link into the area whose own spelling is too
+    // long to stage for resolution in the guest: its creation is
+    // refused fail-closed rather than made live first.
+    let overlong_absent_name = "u:object_r:overlong_absent_prop:s0";
+    let overlong_absent_target = area.live.path().join(overlong_absent_name);
+    let overlong_dir = outside
+        .path()
+        .join("a".repeat(90))
+        .join("b".repeat(90))
+        .join("c".repeat(90));
+    std::fs::create_dir_all(&overlong_dir).unwrap();
+    let overlong_link = overlong_dir.join("overlong-final");
+    std::os::unix::fs::symlink(&overlong_absent_target, &overlong_link).unwrap();
+    assert!(
+        overlong_link.as_os_str().as_encoded_bytes().len() > 256,
+        "the overlong spelling must exceed the staged resolution bound"
+    );
     let dotdot = area
         .live
         .path()
@@ -208,6 +261,12 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
     let absent_host = absent.clone();
     let dangling_host = dangling_target.clone();
     let retained_host = retained_target.clone();
+    let alias_absent_host = alias_absent_target.clone();
+    let dirfd_absent_host = dirfd_absent_target.clone();
+    let chain_absent_host = chain_absent_target.clone();
+    let overlong_absent_host = overlong_absent_target.clone();
+    let outside_chain_host = outside_chain_target.clone();
+    let outside_plain_host = outside_plain_target.clone();
     let guest = move || {
         let expect_refused = |path: &Path, what: &str| {
             let error = std::fs::read(path).unwrap_err();
@@ -336,6 +395,98 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
             std::fs::remove_file(&alias_dir).unwrap();
             std::os::unix::fs::symlink(&live_dir, &alias_dir).unwrap();
         }
+        // A symlinked final parent is followed by the pending open, as
+        // every intermediate component is: creation through it is
+        // refused before it runs, by each spelling below. Outcomes
+        // are collected so one run names every spelling that was not
+        // refused; the host files must stay absent either way.
+        {
+            let mut failures: Vec<String> = Vec::new();
+            let mut check_refused = |path: &Path, flags: libc::c_int, what: &str| {
+                let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                // SAFETY: a valid NUL-terminated path and a creation mode.
+                let fd = unsafe { libc::open(c.as_ptr(), flags, 0o644) };
+                if fd >= 0 {
+                    // SAFETY: the descriptor opened above.
+                    unsafe { libc::close(fd) };
+                    failures.push(format!("{what}: open succeeded"));
+                } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EOPNOTSUPP) {
+                    failures.push(format!(
+                        "{what}: refused with {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            };
+            // Only the link target's parent, an alias for the area, is
+            // the area; the spelled parent is outside it.
+            check_refused(
+                &alias_dangling_link,
+                libc::O_WRONLY | libc::O_CREAT,
+                "alias target-parent dangling write-only O_CREAT",
+            );
+            check_refused(
+                &alias_dangling_link,
+                libc::O_RDONLY | libc::O_CREAT,
+                "alias target-parent dangling O_CREAT",
+            );
+            // Only the second link of the chain names the area.
+            check_refused(
+                &chain_link1,
+                libc::O_WRONLY | libc::O_CREAT,
+                "chained dangling write-only O_CREAT",
+            );
+            // The link spelling itself is too long to resolve staged.
+            check_refused(
+                &overlong_link,
+                libc::O_WRONLY | libc::O_CREAT,
+                "overlong dangling write-only O_CREAT",
+            );
+            // `alias-area/<name>` under a dirfd on the outside
+            // directory: the alias is the final parent component.
+            {
+                let outside_fd = std::fs::File::open(&outside_dir).unwrap();
+                let rel =
+                    std::ffi::CString::new(format!("alias-area/{dirfd_absent_name}")).unwrap();
+                // SAFETY: valid dirfd and NUL-terminated relative path.
+                let fd = unsafe {
+                    libc::openat(
+                        outside_fd.as_raw_fd(),
+                        rel.as_ptr(),
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                        0o600,
+                    )
+                };
+                if fd >= 0 {
+                    // SAFETY: the descriptor opened above.
+                    unsafe { libc::close(fd) };
+                    failures.push("dirfd alias-parent write-only O_CREAT: open succeeded".into());
+                } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EOPNOTSUPP) {
+                    failures.push(format!(
+                        "dirfd alias-parent write-only O_CREAT: refused with {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+            // Positive controls: creations outside the area, through
+            // the same chain shape and by a plain name, still succeed.
+            let mut check_created = |path: &Path, what: &str| {
+                let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                // SAFETY: a valid NUL-terminated path and a creation mode.
+                let fd = unsafe { libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_CREAT, 0o644) };
+                if fd >= 0 {
+                    // SAFETY: the descriptor opened above.
+                    unsafe { libc::close(fd) };
+                } else {
+                    failures.push(format!(
+                        "{what}: outside creation refused with {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            };
+            check_created(&outside_chain_link1, "chained dangling outside O_CREAT");
+            check_created(&outside_plain_target, "plain outside O_CREAT");
+            assert!(failures.is_empty(), "symlinked-parent cases: {failures:?}");
+        }
         let _ = file;
     };
     detcore_testutils::det_test_fn_with_config(
@@ -355,6 +506,30 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
     assert!(
         !retained_host.exists(),
         "a refused retained-dirfd O_CREAT made a file"
+    );
+    assert!(
+        !alias_absent_host.exists(),
+        "a refused alias target-parent O_CREAT made a file"
+    );
+    assert!(
+        !dirfd_absent_host.exists(),
+        "a refused dirfd alias-parent O_CREAT made a file"
+    );
+    assert!(
+        !chain_absent_host.exists(),
+        "a refused chained dangling O_CREAT made a file"
+    );
+    assert!(
+        !overlong_absent_host.exists(),
+        "a refused overlong dangling O_CREAT made a file"
+    );
+    assert!(
+        outside_chain_host.exists(),
+        "a chained creation outside the area made no file"
+    );
+    assert!(
+        outside_plain_host.exists(),
+        "a plain creation outside the area made no file"
     );
 }
 

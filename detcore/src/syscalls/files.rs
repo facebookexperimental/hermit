@@ -1271,6 +1271,21 @@ enum LiveCheck {
     NotLive,
 }
 
+/// Whether a creation's parent directory, resolved as the pending
+/// open resolves it, is the live property area (`resolved_parent_area`).
+enum ParentArea {
+    /// The resolved parent is the live area itself.
+    Area,
+    /// The resolved parent is some other directory, or cannot be
+    /// resolved at all, in which case the pending open fails natively
+    /// the same way and creates nothing.
+    Outside,
+    /// The resolved parent could not be determined (its spelling does
+    /// not fit the staged probe, or the probe itself failed), so the
+    /// creation cannot be shown to be outside the area.
+    Unknown,
+}
+
 /// What an open under a property snapshot does (`property_decision`).
 enum PropertyOpen {
     /// Read the copy at this path instead.
@@ -5882,17 +5897,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             && call.flags().contains(OFlag::O_CREAT)
             && opens_to_change(call.flags())
         {
-            let name = match area_parent_name(snapshot, path) {
-                Some(name) => Some(name),
+            let reason = match area_parent_name(snapshot, path) {
+                Some(name) => Some(format!(
+                    "{name} is in the property area but not in its snapshot"
+                )),
                 None => {
                     self.creation_in_live_area(guest, call, path, snapshot)
                         .await
                 }
             };
-            if let Some(name) = name {
-                return Some(PropertyOpen::Live(format!(
-                    "{name} is in the property area but not in its snapshot"
-                )));
+            if let Some(reason) = reason {
+                return Some(PropertyOpen::Live(reason));
             }
         }
         if !pure_read && !opens_readable(call.flags()) {
@@ -5956,31 +5971,37 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Whether the directory the guest kernel resolves for
     /// `parent` (a pathname resolved from `dirfd`, exactly as the
     /// pending open will resolve it) is the live property area: an
-    /// injected `O_PATH|O_NOFOLLOW` open of the parent, compared by
-    /// `(st_dev, st_ino)` with the area itself. This binds the decision
-    /// to the directory object the open will use, not to any spelling
-    /// of it, so a retained dirfd whose spelling was replaced and a
-    /// parent reached through symlinks are both decided correctly.
-    async fn resolved_parent_is_area<G: Guest<Self>>(
+    /// injected `O_PATH` open of the parent, compared by
+    /// `(st_dev, st_ino)` with the area itself. The probe takes no
+    /// `O_NOFOLLOW`: for the pending open the parent is an
+    /// *intermediate* component, which the kernel always follows
+    /// (`O_NOFOLLOW` on the guest's call affects only its final
+    /// component), so a final parent component that is a symlink to
+    /// the area must be followed here too, or the probe stats the
+    /// link itself and misses the directory the open will create in.
+    /// This binds the decision to the directory object the open will
+    /// use, not to any spelling of it, so a retained dirfd whose
+    /// spelling was replaced and a parent reached through symlinks
+    /// are both decided correctly. A probe the kernel refuses while
+    /// resolving the parent (a missing or non-directory component, a
+    /// symlink loop) is `Outside`: the pending open resolves its
+    /// parent the same way and fails natively without creating.
+    async fn resolved_parent_area<G: Guest<Self>>(
         &self,
         guest: &mut G,
         dirfd: RawFd,
         parent: &[u8],
         snapshot: &detcore_model::config::PropertySnapshot,
-    ) -> bool {
-        // The scratch lives on the guest stack, whose free capacity is
-        // small; a parent spelling that does not fit is left to the
-        // spelled-parent check the caller already made.
+    ) -> ParentArea {
+        // A parent spelling that does not fit the staged probe cannot
+        // be shown to be outside the area in the guest.
         const PATH_MAX: usize = 512;
         if parent.is_empty() || parent.len() >= PATH_MAX {
-            return false;
-        }
-        if guest.stack().await.capacity() < PATH_MAX + 64 {
-            return false;
+            return ParentArea::Unknown;
         }
         let mut spelled = [0_u8; PATH_MAX];
         spelled[..parent.len()].copy_from_slice(parent);
-        let flags = OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+        let flags = OFlag::O_PATH | OFlag::O_CLOEXEC;
         let opened = crate::syscalls::scratch::inject_with_scratch(guest, spelled, |base| {
             syscalls::Openat::new()
                 .with_dirfd(dirfd)
@@ -5990,30 +6011,47 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .into()
         })
         .await;
-        let Ok((opened, _)) = opened else {
-            return false;
+        let (opened, _) = match opened {
+            Ok(opened) => opened,
+            Err(
+                Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP | Errno::EACCES | Errno::ENAMETOOLONG,
+            ) => return ParentArea::Outside,
+            Err(_) => return ParentArea::Unknown,
         };
         let Ok(fd) = RawFd::try_from(opened) else {
-            return false;
+            return ParentArea::Unknown;
         };
+        if fd < 0 {
+            return ParentArea::Outside;
+        }
         let dir = self.inject_fstat(guest, fd).await;
         let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
         match (dir, crate::util::raw_stat(&snapshot.guest_dir)) {
-            (Ok(dir), Ok(area)) => (dir.st_dev, dir.st_ino) == (area.st_dev, area.st_ino),
-            _ => false,
+            (Ok(dir), Ok(area)) if (dir.st_dev, dir.st_ino) == (area.st_dev, area.st_ino) => {
+                ParentArea::Area
+            }
+            (Ok(_), Ok(_)) => ParentArea::Outside,
+            _ => ParentArea::Unknown,
         }
     }
 
-    /// The area name an `O_CREAT` open with no existing object would
-    /// create, where the spelled parent (`area_parent_name` on the
-    /// observed spelling) is not the live area. The creating directory
-    /// is resolved in the guest (`resolved_parent_is_area`), from the
-    /// same dirfd the open uses. An open that follows its final
-    /// component (`O_NOFOLLOW` unset, and not `O_CREAT|O_EXCL`, which
-    /// fails `EEXIST` on any link) creates in its final link's target
-    /// directory instead; that directory is resolved the same way from
-    /// the link target read in the guest. `None` where neither
-    /// resolution names the area.
+    /// Why an `O_CREAT` open with no existing object is refused
+    /// before it creates, where the spelled parent
+    /// (`area_parent_name` on the observed spelling) is not the live
+    /// area, or `None` where the creation runs as it is. The
+    /// creating directory is the one the kernel resolves for the
+    /// open, decided in the guest (`resolved_parent_area`, from the
+    /// same dirfd the open uses, following a symlinked final
+    /// parent). An open that follows its final component
+    /// (`O_NOFOLLOW` unset, and not `O_CREAT|O_EXCL`, which fails
+    /// `EEXIST` on any link) creates in its final link's target
+    /// directory instead; the link chain is walked in the guest, one
+    /// `readlinkat` per link up to the kernel's own nested-link
+    /// limit, and the last target's parent is decided the same way.
+    /// A creating directory that cannot be shown to be outside the
+    /// area (a spelling or a link target that does not fit the
+    /// staged resolution) refuses the creation by name, rather than
+    /// letting the real open create live first.
     async fn creation_in_live_area<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -6022,19 +6060,52 @@ impl<T: RecordOrReplay> Detcore<T> {
         snapshot: &detcore_model::config::PropertySnapshot,
     ) -> Option<String> {
         use std::os::unix::ffi::OsStrExt as _;
+        fn split(path: &[u8]) -> (&[u8], &[u8]) {
+            match path.iter().rposition(|byte| *byte == b'/') {
+                Some(0) => (b"/".as_slice(), &path[1..]),
+                Some(index) => (&path[..index], &path[index + 1..]),
+                None => (b".".as_slice(), path),
+            }
+        }
+        fn area_reason(name: &[u8]) -> String {
+            format!(
+                "{} is in the property area but not in its snapshot",
+                String::from_utf8_lossy(name)
+            )
+        }
+        fn unknown_reason(name: &[u8]) -> String {
+            format!(
+                "creating {} could not be shown to be outside the property area",
+                String::from_utf8_lossy(name)
+            )
+        }
         let spelled_ptr = call.path()?;
         let spelled: PathBuf = spelled_ptr.read(&guest.memory()).ok()?;
         let bytes = spelled.as_os_str().as_bytes();
-        let (parent, name): (&[u8], &[u8]) = match bytes.iter().rposition(|byte| *byte == b'/') {
-            Some(0) => (b"/".as_slice(), &bytes[1..]),
-            Some(index) => (&bytes[..index], &bytes[index + 1..]),
-            None => (b".".as_slice(), bytes),
-        };
-        if self
-            .resolved_parent_is_area(guest, call.dirfd(), parent, snapshot)
-            .await
-        {
-            return Some(String::from_utf8_lossy(name).into_owned());
+        let (parent, name) = split(bytes);
+        let mut parent_area = self
+            .resolved_parent_area(guest, call.dirfd(), parent, snapshot)
+            .await;
+        // An absolute spelling the staged probe cannot fit can still
+        // be shown outside the area on the host, as the caller's
+        // spelled-parent check itself resolves it; a relative one
+        // depends on the guest's dirfd and cannot.
+        if matches!(parent_area, ParentArea::Unknown) && bytes.first() == Some(&b'/') {
+            let parent_path =
+                Path::new(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(parent));
+            parent_area = match (
+                crate::util::canonicalize(parent_path),
+                crate::util::canonicalize(&snapshot.guest_dir),
+            ) {
+                (Ok(resolved), Ok(area)) if resolved == area => ParentArea::Area,
+                (Ok(_), Ok(_)) | (Err(_), _) => ParentArea::Outside,
+                _ => ParentArea::Unknown,
+            };
+        }
+        match parent_area {
+            ParentArea::Area => return Some(area_reason(name)),
+            ParentArea::Unknown => return Some(unknown_reason(name)),
+            ParentArea::Outside => {}
         }
         let flags = call.flags();
         if flags.contains(OFlag::O_NOFOLLOW)
@@ -6052,51 +6123,82 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         const PATH_PART: usize = 256;
         const TARGET_PART: usize = 512;
-        if bytes.len() >= PATH_PART || guest.stack().await.capacity() < PATH_PART + TARGET_PART + 64
-        {
-            return None;
-        }
-        let mut buffer = [0_u8; PATH_PART + TARGET_PART];
-        buffer[..bytes.len()].copy_from_slice(bytes);
+        // Linux's nested-link limit (`MAXSYMLINKS`, fs/namei.c): a
+        // chain longer than this fails `ELOOP` in the real open.
+        const MAX_LINKS: usize = 40;
         let dirfd = call.dirfd();
-        let linked = crate::syscalls::scratch::inject_with_scratch(guest, buffer, |base| {
-            // SAFETY: the buffer holds a path half and a target half.
-            let target = unsafe { base.add(PATH_PART) };
-            syscalls::Readlinkat::new()
-                .with_dirfd(dirfd)
-                .with_path(PathPtr::from_ptr(base.as_raw() as *const libc::c_char))
-                .with_buf(Some(target.cast::<libc::c_char>()))
-                .with_buf_len(TARGET_PART)
-                .into()
-        })
-        .await
-        .ok()?;
-        let (length, buffer) = linked;
-        let length = usize::try_from(length).ok()?;
-        if length >= TARGET_PART {
-            return None;
-        }
-        let target = &buffer[PATH_PART..PATH_PART + length];
-        let (target_parent, target_name): (&[u8], &[u8]) =
-            match target.iter().rposition(|byte| *byte == b'/') {
-                Some(0) => (b"/".as_slice(), &target[1..]),
-                Some(index) => (&target[..index], &target[index + 1..]),
-                None => (b".".as_slice(), target),
+        let mut current = bytes.to_vec();
+        for depth in 0..MAX_LINKS {
+            // The final component of `current` is a link (the spelled
+            // one by the `lstat` above, a later one by the readlink
+            // that produced it), or the walk ends below.
+            if current.len() >= PATH_PART {
+                return Some(unknown_reason(split(&current).1));
+            }
+            let mut buffer = [0_u8; PATH_PART + TARGET_PART];
+            buffer[..current.len()].copy_from_slice(&current);
+            let linked = crate::syscalls::scratch::inject_with_scratch(guest, buffer, |base| {
+                // SAFETY: the buffer holds a path half and a target half.
+                let target = unsafe { base.add(PATH_PART) };
+                syscalls::Readlinkat::new()
+                    .with_dirfd(dirfd)
+                    .with_path(PathPtr::from_ptr(base.as_raw() as *const libc::c_char))
+                    .with_buf(Some(target.cast::<libc::c_char>()))
+                    .with_buf_len(TARGET_PART)
+                    .into()
+            })
+            .await;
+            let target: Vec<u8> = match linked {
+                Ok((length, buffer)) => {
+                    let Ok(length) = usize::try_from(length) else {
+                        return Some(unknown_reason(split(&current).1));
+                    };
+                    // A target that fills its buffer may be cut off.
+                    if length == 0 || length >= TARGET_PART {
+                        return Some(unknown_reason(split(&current).1));
+                    }
+                    buffer[PATH_PART..PATH_PART + length].to_vec()
+                }
+                // The spelled final component is a link (above), so a
+                // refused readlink leaves its target directory unknown.
+                Err(_) if depth == 0 => return Some(unknown_reason(name)),
+                // A later target that is no link (absent, or an object
+                // the earlier stat did not see): its own parent is
+                // the creating directory.
+                Err(_) => {
+                    let (target_parent, target_name) = split(&current);
+                    let target_parent = target_parent.to_vec();
+                    let target_name = target_name.to_vec();
+                    return match self
+                        .resolved_parent_area(guest, dirfd, &target_parent, snapshot)
+                        .await
+                    {
+                        ParentArea::Area => Some(area_reason(&target_name)),
+                        ParentArea::Unknown => Some(unknown_reason(&target_name)),
+                        ParentArea::Outside => None,
+                    };
+                }
             };
-        // A relative target is named from the link's own directory.
-        let resolved: Vec<u8> = if target.first() == Some(&b'/') {
-            target_parent.to_vec()
-        } else if target_parent == b"." {
-            parent.to_vec()
-        } else {
-            let mut joined = parent.to_vec();
-            joined.push(b'/');
-            joined.extend_from_slice(target_parent);
-            joined
-        };
-        self.resolved_parent_is_area(guest, call.dirfd(), &resolved, snapshot)
-            .await
-            .then(|| String::from_utf8_lossy(target_name).into_owned())
+            // A relative target is named from the link's own directory.
+            current = if target.first() == Some(&b'/') {
+                target
+            } else {
+                let (link_parent, _) = split(&current);
+                if link_parent == b"." {
+                    target
+                } else {
+                    let mut joined = link_parent.to_vec();
+                    if !joined.ends_with(b"/") {
+                        joined.push(b'/');
+                    }
+                    joined.extend_from_slice(&target);
+                    joined
+                }
+            };
+        }
+        // A chain past the kernel's limit: the real open fails
+        // `ELOOP` natively and creates nothing.
+        None
     }
 
     /// Say once that the guest opens a file of the property area to write,
