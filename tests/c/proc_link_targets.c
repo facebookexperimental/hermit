@@ -116,6 +116,7 @@
 #include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static int failures;
@@ -206,7 +207,17 @@ static void print_target(const char *label, const char *text) {
  * 200 native runs of --directory-links: 10 to 17 ELOOPs on each 40-link
  * line, none on a 39- or 41-link line. The retries keep the native
  * transcript stable; each budget line's attempts are printed to standard
- * error ("attempts: <label> <n>"), which the tests log and do not compare. */
+ * error ("attempts: <label> <n>"), which the tests log and do not compare.
+ * Strikes arrive in bursts with the churn that causes them, so back-to-back
+ * retries can all land in the same burst and exhaust a small budget: on
+ * 2026-11-05 a donor decide run's native oracle took ELOOP for an answer on
+ * an exactly-40 line (ENOTDIR expected) and the test failed in 0.19 s before
+ * any Hermit run (dh-vtwze). A retry therefore sleeps 1 ms first, so the
+ * attempts are spread over tens of milliseconds instead of one burst; the
+ * budget is 64 attempts, still bounded, and a lookup the kernel ELOOPs for a
+ * lasting reason still answers ELOOP and fails the comparison. Measured
+ * while fixing: 200 native runs on a loaded host (load ~100), one strike
+ * absorbed at attempt 2, no exhausted line. */
 static int link_attempts = 1;
 /* Whether this is the native oracle's run (--native-oracle). */
 static int native_oracle = 0;
@@ -216,6 +227,13 @@ static int last_link_attempts = 0;
 static ssize_t read_link(const char *path, char *out) {
   ssize_t n;
   for (int attempt = 1;; attempt++) {
+    if (attempt > 1) {
+      /* Only the native oracle's budget probes retry (link_attempts > 1);
+       * spread the attempts out of the churn burst that struck the last
+       * one (see the link_attempts comment above). */
+      struct timespec pause = {0, 1000000};
+      nanosleep(&pause, NULL);
+    }
     n = readlink(path, out, PATH_MAX - 1);
     last_link_attempts = attempt;
     if (n >= 0 || errno != ELOOP || attempt >= link_attempts) {
@@ -708,7 +726,7 @@ static void show_budget_spelled(
   }
   snprintf(path + used, sizeof(path) - (size_t)used, "%s%s", target, tail);
   snprintf(shown, sizeof(shown), "budget: %d %s segments %s%s", count, label, name, tail);
-  link_attempts = native_oracle ? 8 : 1;
+  link_attempts = native_oracle ? 64 : 1;
   show(shown, path);
   link_attempts = 1;
   if (native_oracle) {
