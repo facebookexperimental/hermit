@@ -700,7 +700,12 @@ from its selector, or the aggregate selected cells differ from the ratchet.
 4. Add or update its exact entry in `inventory/test-files.json`.
 5. Run `target/debug/test-harness validate` and the affected cells.
 6. Add a structured DAG node when adding a bucket; validation fails until each
-   lane has exactly one node per bucket.
+   lane has exactly one node per bucket. Post-split nodes are admitted ONLY
+   through `POST_SPLIT_CORE_NODES` in
+   `ci/manifest-plan/src/dag_source_ownership.rs` (see its module docs for
+   the exact API): one entry per generated tag, dependencies on core or
+   extension nodes only. Never edit the frozen
+   `ci/dag-source-ownership.json` to admit a node.
 
 Do not replace a semantic workload with `--help`, `--version`, or a no-op
 launcher probe.
