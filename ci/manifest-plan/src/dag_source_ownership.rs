@@ -4,7 +4,7 @@
 //! # Adding a post-split DAG node (the ONE admission path)
 //!
 //! `ci/dag-source-ownership.json` is the frozen pre-split source snapshot.
-//! Never edit it (or [`ORIGIN_SHA256`]) to admit a new node, and never fold a
+//! Never edit it (or `ORIGIN_SHA256`) to admit a new node, and never fold a
 //! new bucket into an existing node's step. Every validation-DAG node created
 //! after the first-party core split — rr, gVisor, and future e2e buckets —
 //! is admitted by adding one entry to [`POST_SPLIT_CORE_NODES`] below:
