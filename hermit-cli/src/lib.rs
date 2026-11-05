@@ -8394,6 +8394,9 @@ mod tests {
             // The legacy form carries no width for `hardware_watchpoints`;
             // it reads back as 0.
             config.backend.hardware_watchpoints = 0;
+            // The legacy form predates `rcb_clock_contract`; it reads back
+            // as `None`, DBT's value.
+            config.backend.rcb_clock_contract = None;
             assert_eq!(
                 detcore::to_legacy_backend_json(&config).unwrap(),
                 before,
