@@ -6379,6 +6379,43 @@ sys.exit(37)
     }
 
     #[test]
+    fn generated_manifest_plan_steps_carry_the_measured_memory_cap() {
+        // 2026-11-05: across 195 retained runs the median measured peak sat
+        // AT the old 4 GiB hard cap (176 of 195 at >= 3.99 GiB, cgroup
+        // memory.events `max` to 15032), so the true peak was censored; an
+        // Fresh uncapped cold builds at this head (j8, fresh target,
+        // cache-inclusive memory.peak): 5.00, 4.54 and 4.28 GiB, anonymous
+        // at most 1.46 GiB polled. Baseline 5 GiB (worst observed), hard
+        // cap 6 GiB, on the host step and its
+        // pinned-root twin alike. setup.manifest_plan_on_host is excluded:
+        // its spec records that the local twin's measurements do not apply
+        // on the hosted-privileged runner.
+        let cfg = generated_dag();
+        let mut saw = false;
+        for step in &cfg.steps {
+            if matches!(
+                step.job.as_str(),
+                "manifest_plan" | "manifest_plan_in_pinned_root"
+            ) {
+                saw = true;
+                assert_eq!(
+                    step.hint.rss_baseline_bytes,
+                    Some(5 * 1024 * 1024 * 1024),
+                    "{}",
+                    step.tag()
+                );
+                assert_eq!(
+                    step.hint.hard_mem_max_bytes,
+                    Some(6 * 1024 * 1024 * 1024),
+                    "{}",
+                    step.tag()
+                );
+            }
+        }
+        assert!(saw, "no setup.manifest_plan step in the generated DAG");
+    }
+
+    #[test]
     fn full_generator_refuses_static_artifact_mutations() {
         let root = crate::git_environment::checkout_root();
         let generated = canonical_text(&generate(&root).unwrap());
