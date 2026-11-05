@@ -434,24 +434,160 @@ impl Default for ProbeOptions {
     }
 }
 
+/// How long a process that finds another user's probe already running
+/// waits for its shared verdict before falling back to queueing for the
+/// lock itself. A probe's trials and counter reopens are bounded
+/// ([`MAX_ATTEMPTS`], [`MAX_COUNTER_REOPENS`]), and the slowest passing
+/// probe measured under donor load took about 12 s, so this is an order
+/// of magnitude past a healthy holder.
+const SHARED_VERDICT_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The longest one probe may run, wall clock, before it refuses itself.
+/// The holder of the per-user probe lock is a process other qualifications
+/// wait behind, so a holder wedged by host load must not hold them up
+/// without bound: [`Probe::matrix`], its trials and calibration check this
+/// between cells, trials and spins and refuse past it. It is an order of
+/// magnitude past the slowest passing probe measured under donor load
+/// (about 12 s), so a healthy probe never reaches it, and it leaves the
+/// per-trial attempt and counter-reopen bounds to judge progress within it.
+const PROBE_WALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Refuses once `started` is more than `bound` ago.
+fn check_probe_deadline(
+    started: std::time::Instant,
+    bound: std::time::Duration,
+) -> Result<(), ProbeRefusal> {
+    if started.elapsed() > bound {
+        return Err(format!(
+            "the XINUSE probe did not finish within {} seconds, so its result \
+             would be inconclusive",
+            bound.as_secs()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a report read from the shared verdict file is one this call's
+/// probe would produce on this host: the XCR0 and case count for the XCR0
+/// this process reads, and the same repetitions, forced-exit choice and
+/// certified-pair count the cached-verdict check in
+/// `cpu_profile_admission` requires. A report that disagrees is ignored,
+/// never a refusal: the caller measures for itself.
+fn shared_report_matches(
+    report: &ProbeReport,
+    xcr0: u64,
+    options: ProbeOptions,
+    hypervisor: bool,
+) -> bool {
+    report.xcr0 == xcr0
+        && report.cases == expected_case_count(xcr0)
+        && report.repetitions == options.repetitions
+        && report.forced_exit == options.forced_exit.unwrap_or(hypervisor)
+        && report.certified_pairs == report.cells as u64 * u64::from(report.repetitions)
+}
+
 /// Runs the qualification on a new thread pinned to an idle, low-numbered CPU.
 /// Returns the report, or the reason v3 cannot be offered on this host.
 pub fn qualify(options: ProbeOptions) -> Result<ProbeReport, ProbeRefusal> {
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let lock_path = std::env::temp_dir().join(format!("hermit-xinuse-probe-{uid}.lock"));
+    let verdict_path = std::env::temp_dir().join(format!("hermit-xinuse-probe-{uid}.json"));
+    qualify_coordinated(
+        options,
+        &lock_path,
+        &verdict_path,
+        SHARED_VERDICT_WAIT,
+        |options| {
+            std::thread::Builder::new()
+                .name("xinuse-probe".into())
+                .spawn(move || Probe::run(options))
+                .map_err(|e| format!("cannot start the probe thread: {e}"))?
+                .join()
+                .map_err(|_| "the probe thread panicked".to_owned())?
+        },
+    )
+}
+
+/// [`qualify`] with its coordination paths, wait bound and probe runner
+/// named, for tests. Probes pin themselves to the same CPU, so two at once
+/// would switch each other out until both refused; they serialize per user
+/// on `lock_path`. A waiter does not just queue on that lock: the holder
+/// publishes its passing report at `verdict_path` (under the host
+/// qualification key, like the per-host cache), and a waiter polls for it
+/// and reuses it, so concurrent Hermit processes on one host — donor
+/// validations with separate cache directories included — measure the host
+/// once instead of one timing out behind the other. Under a hypervisor
+/// nothing is shared, for the live-migration reason the per-host cache
+/// gives; waiters there queue as before.
+fn qualify_coordinated(
+    options: ProbeOptions,
+    lock_path: &std::path::Path,
+    verdict_path: &std::path::Path,
+    wait: std::time::Duration,
+    run: impl FnOnce(ProbeOptions) -> Result<ProbeReport, ProbeRefusal>,
+) -> Result<ProbeReport, ProbeRefusal> {
     if !(MIN_REPETITIONS..=MAX_REPETITIONS).contains(&options.repetitions) {
         return Err(format!(
             "the probe needs {MIN_REPETITIONS} to {MAX_REPETITIONS} repetitions, not {}",
             options.repetitions
         ));
     }
-    // Probes pin themselves to the same CPU, so two at once would switch each
-    // other out until both refused. One at a time per user: the others wait.
-    let _serialized = ProbeLock::acquire()?;
-    std::thread::Builder::new()
-        .name("xinuse-probe".into())
-        .spawn(move || Probe::run(options))
-        .map_err(|e| format!("cannot start the probe thread: {e}"))?
-        .join()
-        .map_err(|_| "the probe thread panicked".to_owned())?
+    let hypervisor = std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
+    if hypervisor {
+        let _serialized = ProbeLock::acquire(lock_path)?;
+        return run(options);
+    }
+    let host = crate::host_qualification::HostKey::current();
+    let inputs = format!("options={options:?}");
+    let shared = |path: &std::path::Path| -> Option<ProbeReport> {
+        // SAFETY: XGETBV with ECX 0, as in `Layout::host`.
+        let xcr0 = unsafe { std::arch::x86_64::_xgetbv(0) };
+        crate::host_qualification::load::<ProbeReport>(path, &host, &inputs)
+            .filter(|report| shared_report_matches(report, xcr0, options, hypervisor))
+    };
+    let publish = |report: &ProbeReport| {
+        crate::host_qualification::store(verdict_path, &host, &inputs, report);
+    };
+    if let Some(report) = shared(verdict_path) {
+        return Ok(report);
+    }
+    if let Some(_serialized) = ProbeLock::try_acquire(lock_path)? {
+        if let Some(report) = shared(verdict_path) {
+            return Ok(report);
+        }
+        let report = run(options)?;
+        publish(&report);
+        return Ok(report);
+    }
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if let Some(report) = shared(verdict_path) {
+            return Ok(report);
+        }
+        if let Some(_serialized) = ProbeLock::try_acquire(lock_path)? {
+            if let Some(report) = shared(verdict_path) {
+                return Ok(report);
+            }
+            let report = run(options)?;
+            publish(&report);
+            return Ok(report);
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // No verdict within the bound and the holder is still running (a dead
+    // holder's lock is free, and the loop above takes it): queue for the
+    // lock as before rather than refuse a host that may well qualify.
+    let _serialized = ProbeLock::acquire(lock_path)?;
+    if let Some(report) = shared(verdict_path) {
+        return Ok(report);
+    }
+    let report = run(options)?;
+    publish(&report);
+    Ok(report)
 }
 
 /// An exclusive `flock` on a per-user file in the temporary directory, held
@@ -461,17 +597,36 @@ struct ProbeLock {
 }
 
 impl ProbeLock {
-    fn acquire() -> Result<Self, ProbeRefusal> {
-        use std::os::fd::AsRawFd;
-        // SAFETY: getuid has no preconditions.
-        let uid = unsafe { libc::getuid() };
-        let path = std::env::temp_dir().join(format!("hermit-xinuse-probe-{uid}.lock"));
+    fn open(path: &std::path::Path) -> Result<std::fs::File, ProbeRefusal> {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The path is predictable and in a shared temporary directory, as
+        // for `host_qualification::locked`: neither follow a link planted
+        // there nor block opening a FIFO planted there, and lock only a
+        // regular file. The file is never unlinked, so every process
+        // locks the same inode.
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(&path)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
             .map_err(|e| format!("cannot open the probe lock {}: {e}", path.display()))?;
+        let is_file = file
+            .metadata()
+            .map_err(|e| format!("cannot stat the probe lock {}: {e}", path.display()))?
+            .is_file();
+        if !is_file {
+            return Err(format!(
+                "the probe lock {} is not a regular file",
+                path.display()
+            ));
+        }
+        Ok(file)
+    }
+
+    fn acquire(path: &std::path::Path) -> Result<Self, ProbeRefusal> {
+        use std::os::fd::AsRawFd;
+        let file = Self::open(path)?;
         // SAFETY: the descriptor is open for the duration of the call.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(format!(
@@ -481,6 +636,23 @@ impl ProbeLock {
             ));
         }
         Ok(ProbeLock { _file: file })
+    }
+
+    /// The lock if no probe holds it, `None` if one does. An open or lock
+    /// failure other than contention is the refusal
+    /// [`ProbeLock::acquire`] reports.
+    fn try_acquire(path: &std::path::Path) -> Result<Option<Self>, ProbeRefusal> {
+        use std::os::fd::AsRawFd;
+        let file = Self::open(path)?;
+        // SAFETY: the descriptor is open for the duration of the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(ProbeLock { _file: file }));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(None);
+        }
+        Err(format!("cannot lock {}: {error}", path.display()))
     }
 }
 
@@ -641,10 +813,14 @@ struct Probe {
     forced_exit: bool,
     reload_bound: u64,
     report: ProbeReport,
+    /// When this probe started, for [`PROBE_WALL_DEADLINE`].
+    started: std::time::Instant,
+    deadline: std::time::Duration,
 }
 
 impl Probe {
     fn run(options: ProbeOptions) -> Result<ProbeReport, ProbeRefusal> {
+        let probe_started = std::time::Instant::now();
         let cpu = probe_cpu()?;
         pin_to(cpu)?;
         let layout = Layout::host()?;
@@ -658,7 +834,8 @@ impl Probe {
                 expected_case_count(layout.xcr0)
             ));
         }
-        let (counter, calibration) = open_calibrated_counter(cpu, 0)?;
+        let (counter, calibration) =
+            open_calibrated_counter(cpu, 0, probe_started, PROBE_WALL_DEADLINE)?;
         let hypervisor = std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
         let forced_exit = options.forced_exit.unwrap_or(hypervisor);
 
@@ -757,16 +934,18 @@ impl Probe {
             seq: 0,
             forced_exit,
             reload_bound,
+            started: probe_started,
+            deadline: PROBE_WALL_DEADLINE,
         };
         tracing::info!(
             "xinuse probe: calibrated on CPU {cpu} ({}); reload bound {reload_bound} cycles",
             probe.report.calibration
         );
-        let started = std::time::Instant::now();
+        let matrix_started = std::time::Instant::now();
         let result = probe.with_peer(|probe| probe.matrix(&cases, options.repetitions));
         tracing::info!(
             "xinuse probe: matrix took {:?}: {} cells, retried {} reference, {} reload and {} exit trials",
-            started.elapsed(),
+            matrix_started.elapsed(),
             probe.report.cells,
             probe.report.retried_references,
             probe.report.retried_reloads,
@@ -861,6 +1040,7 @@ impl Probe {
                     continue;
                 }
                 for mxcsr in MXCSR_VALUES {
+                    check_probe_deadline(self.started, self.deadline)?;
                     self.cell(case, peer, mxcsr, repetitions)?;
                     self.report.cells += 1;
                 }
@@ -921,6 +1101,7 @@ impl Probe {
         slot: usize,
     ) -> Result<(), ProbeRefusal> {
         for _attempt in 0..MAX_ATTEMPTS {
+            check_probe_deadline(self.started, self.deadline)?;
             self.prepare_image(case, mxcsr);
             self.prepare_peer(peer);
             clear(&mut self.save[slot]);
@@ -1035,8 +1216,12 @@ impl Probe {
                 "{why}, and it stayed unreliable after {MAX_COUNTER_REOPENS} reopenings"
             ));
         }
-        let (counter, calibration) =
-            open_calibrated_counter(self.cpu, self.report.counter_reopens)?;
+        let (counter, calibration) = open_calibrated_counter(
+            self.cpu,
+            self.report.counter_reopens,
+            self.started,
+            self.deadline,
+        )?;
         self.counter = counter;
         self.report.calibration = calibration;
         Ok(())
@@ -1147,11 +1332,17 @@ const MAX_COUNTER_REOPENS: u32 = 5;
 
 /// Opens the interrupt counter and calibrates it. A counter that fails a read
 /// during calibration is replaced, up to [`MAX_COUNTER_REOPENS`] times in all.
-fn open_calibrated_counter(cpu: usize, reopens: u32) -> Result<(IrqCounter, String), ProbeRefusal> {
+fn open_calibrated_counter(
+    cpu: usize,
+    reopens: u32,
+    started: std::time::Instant,
+    bound: std::time::Duration,
+) -> Result<(IrqCounter, String), ProbeRefusal> {
     let mut reopens = reopens;
     loop {
+        check_probe_deadline(started, bound)?;
         let counter = IrqCounter::open(CpuModel::host()).map_err(|e| e.to_string())?;
-        match calibrate(&counter, cpu) {
+        match calibrate(&counter, cpu, started, bound) {
             Ok(calibration) => return Ok((counter, calibration)),
             Err(CalibrationFailure::CounterLost(why)) if reopens < MAX_COUNTER_REOPENS => {
                 reopens += 1;
@@ -1188,7 +1379,12 @@ enum CalibrationFailure {
 /// lower timer frequency) makes the next spins twice as long, up to
 /// [`CALIBRATION_SPIN_MAX`]; a tickless CPU never reaches the floor and is
 /// refused.
-fn calibrate(counter: &IrqCounter, cpu: usize) -> Result<String, CalibrationFailure> {
+fn calibrate(
+    counter: &IrqCounter,
+    cpu: usize,
+    started: std::time::Instant,
+    bound: std::time::Duration,
+) -> Result<String, CalibrationFailure> {
     let refused = |e: irq_counter::CounterRefusal| CalibrationFailure::Refused(e.to_string());
     let lost = CalibrationFailure::CounterLost;
     let mut spin = CALIBRATION_SPIN;
@@ -1196,6 +1392,7 @@ fn calibrate(counter: &IrqCounter, cpu: usize) -> Result<String, CalibrationFail
     let (mut switched, mut slow_reads, mut clean) = (0, 0, 0);
     let mut sum = CalibrationSum::default();
     for _attempt in 0..CALIBRATION_ATTEMPTS {
+        check_probe_deadline(started, bound).map_err(CalibrationFailure::Refused)?;
         std::thread::sleep(CALIBRATION_PAUSE);
         // SAFETY: RDTSC is available on every x86_64 processor.
         let tsc = || unsafe { std::arch::x86_64::_rdtsc() };
@@ -1355,6 +1552,209 @@ impl Switches {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn coordinated_paths(
+        name: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "hermit-probe-lock-test-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        (
+            directory.join("probe.lock"),
+            directory.join("probe.json"),
+            directory,
+        )
+    }
+
+    fn fake_report(cpu: usize) -> ProbeReport {
+        // SAFETY: XGETBV with ECX 0, as in `Layout::host`.
+        let xcr0 = unsafe { std::arch::x86_64::_xgetbv(0) };
+        ProbeReport {
+            cpu,
+            xcr0,
+            cases: expected_case_count(xcr0),
+            cells: 0,
+            repetitions: MIN_REPETITIONS,
+            certified_pairs: 0,
+            forced_exit: false,
+            reload_bound: 0,
+            cpuid_min_cycles: 0,
+            calibration: "test".into(),
+            retried_references: 0,
+            retried_reloads: 0,
+            retried_exits: 0,
+            counter_reopens: 0,
+        }
+    }
+
+    /// A qualification that finds another process's probe already running
+    /// succeeds with that probe's published verdict instead of queueing
+    /// behind it until its caller gives up (dh-jqhfx): the synthetic
+    /// holder below still holds the lock when the waiter returns, and the
+    /// waiter's own probe never runs. Under a hypervisor nothing is
+    /// shared, so the waiter there queues and measures for itself; the
+    /// assertions cover whichever host this is.
+    #[test]
+    fn a_concurrent_qualification_reuses_the_first_probers_verdict() {
+        use std::sync::atomic::AtomicBool;
+        let (lock_path, verdict_path, directory) = coordinated_paths("reuse");
+        let hypervisor = std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
+        let holder_verdict = verdict_path.clone();
+        let holder_lock = lock_path.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _lock = ProbeLock::acquire(&holder_lock).unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let host = crate::host_qualification::HostKey::current();
+            crate::host_qualification::store(
+                &holder_verdict,
+                &host,
+                &format!("options={:?}", ProbeOptions::default()),
+                &fake_report(98765),
+            );
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        held_rx.recv().unwrap();
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let waiter_ran = ran.clone();
+        let started = std::time::Instant::now();
+        let report = qualify_coordinated(
+            ProbeOptions::default(),
+            &lock_path,
+            &verdict_path,
+            std::time::Duration::from_secs(30),
+            move |_| {
+                waiter_ran.store(true, Ordering::SeqCst);
+                Ok(fake_report(12345))
+            },
+        )
+        .unwrap();
+        if hypervisor {
+            assert_eq!(report.cpu, 12345, "under a hypervisor nothing is shared");
+            assert!(ran.load(Ordering::SeqCst));
+        } else {
+            assert_eq!(report.cpu, 98765, "the waiter reuses the holder's verdict");
+            assert!(!ran.load(Ordering::SeqCst), "the waiter's probe never ran");
+            assert!(
+                ProbeLock::try_acquire(&lock_path).unwrap().is_none(),
+                "the waiter returned while the holder still holds the lock"
+            );
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        }
+        holder.join().unwrap();
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// The other concurrent outcome: the holder finishes without a
+    /// publishable verdict, so the waiter takes the lock, measures for
+    /// itself, and publishes for the next waiter.
+    #[test]
+    fn a_concurrent_qualification_measures_after_a_verdictless_holder() {
+        use std::sync::atomic::AtomicBool;
+        let (lock_path, verdict_path, directory) = coordinated_paths("measure");
+        let holder_lock = lock_path.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _lock = ProbeLock::acquire(&holder_lock).unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        });
+        held_rx.recv().unwrap();
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let waiter_ran = ran.clone();
+        let report = qualify_coordinated(
+            ProbeOptions::default(),
+            &lock_path,
+            &verdict_path,
+            std::time::Duration::from_secs(30),
+            move |_| {
+                waiter_ran.store(true, Ordering::SeqCst);
+                Ok(fake_report(12345))
+            },
+        )
+        .unwrap();
+        assert_eq!(report.cpu, 12345);
+        assert!(ran.load(Ordering::SeqCst), "the waiter measured for itself");
+        holder.join().unwrap();
+        let hypervisor = std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
+        if !hypervisor {
+            let published: Option<ProbeReport> = crate::host_qualification::load(
+                &verdict_path,
+                &crate::host_qualification::HostKey::current(),
+                &format!("options={:?}", ProbeOptions::default()),
+            );
+            assert_eq!(published.map(|report| report.cpu), Some(12345));
+        }
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A shared verdict that is not one this host's probe would produce
+    /// (here its XCR0 disagrees with the XCR0 this process reads) is
+    /// ignored: the waiter measures for itself instead of reusing it.
+    #[test]
+    fn a_mismatched_shared_verdict_is_ignored() {
+        use std::sync::atomic::AtomicBool;
+        let (lock_path, verdict_path, directory) = coordinated_paths("mismatch");
+        let mut mismatched = fake_report(98765);
+        mismatched.xcr0 ^= 1 << PKRU_COMPONENT;
+        crate::host_qualification::store(
+            &verdict_path,
+            &crate::host_qualification::HostKey::current(),
+            &format!("options={:?}", ProbeOptions::default()),
+            &mismatched,
+        );
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let waiter_ran = ran.clone();
+        let report = qualify_coordinated(
+            ProbeOptions::default(),
+            &lock_path,
+            &verdict_path,
+            std::time::Duration::from_secs(30),
+            move |_| {
+                waiter_ran.store(true, Ordering::SeqCst);
+                Ok(fake_report(12345))
+            },
+        )
+        .unwrap();
+        assert_eq!(report.cpu, 12345, "the mismatched verdict was not reused");
+        assert!(ran.load(Ordering::SeqCst), "the waiter measured for itself");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// The cooperative wall deadline the matrix, trials and calibration
+    /// check refuses once its bound has passed, and not before.
+    #[test]
+    fn the_probe_deadline_refuses_after_its_bound() {
+        let started = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(check_probe_deadline(started, std::time::Duration::from_secs(60)).is_ok());
+        let refusal =
+            check_probe_deadline(started, std::time::Duration::from_millis(1)).unwrap_err();
+        assert!(refusal.contains("did not finish"), "{refusal}");
+    }
+
+    /// At its predictable shared-directory path the probe lock follows
+    /// neither a planted link nor a planted FIFO: both refuse promptly
+    /// instead of locking whatever they name or blocking on the FIFO.
+    #[test]
+    fn the_probe_lock_refuses_a_link_or_fifo_instead_of_a_regular_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let (lock_path, _verdict_path, directory) = coordinated_paths("hardened");
+        let target = directory.join("elsewhere.lock");
+        std::fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, &lock_path).unwrap();
+        assert!(ProbeLock::try_acquire(&lock_path).is_err(), "link refused");
+        assert!(ProbeLock::acquire(&lock_path).is_err(), "link refused");
+        std::fs::remove_file(&lock_path).unwrap();
+        let c_path = std::ffi::CString::new(lock_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a NUL-terminated path that does not exist.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert!(ProbeLock::try_acquire(&lock_path).is_err(), "FIFO refused");
+        std::fs::remove_dir_all(&directory).ok();
+    }
 
     /// PKRU instructions run only with both the XCR0 component and OSPKE; the
     /// subsets without PKRU (C6) run with neither, and a host with the
