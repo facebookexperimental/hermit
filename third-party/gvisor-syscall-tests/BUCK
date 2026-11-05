@@ -16002,7 +16002,7 @@ fb_native.cxx_binary(
 fb_native.cxx_binary(
     name = "gvisor_tests",
     srcs = ["build/support/combined_main.cc", "upstream/test/util/errno_safe_allocator.cc"],
-    compiler_flags = _COMMON_FLAGS,
+    compiler_flags = _COMMON_FLAGS + ["-DGVT_MAIN_CPP_LINKAGE"],
     linker_flags = ["-Wl,--wrap=_ZN6gvisor7testing11RunAllTestsEv"],
     deps = [
         ":gvisor_combined_headers",

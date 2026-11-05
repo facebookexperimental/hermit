@@ -851,7 +851,7 @@ def emit_buck(ir, mode):
         w("fb_native.cxx_binary(")
         w('    name = "gvisor_tests",')
         w('    srcs = ["build/support/combined_main.cc", "%s"],' % allocator_src)
-        w("    compiler_flags = _COMMON_FLAGS,")
+        w('    compiler_flags = _COMMON_FLAGS + ["-DGVT_MAIN_CPP_LINKAGE"],')
         w('    linker_flags = ["-Wl,--wrap=_ZN6gvisor7testing11RunAllTestsEv"],')
         deps = {":gvisor_combined_headers"}
         for s in sorted(all_srcs):

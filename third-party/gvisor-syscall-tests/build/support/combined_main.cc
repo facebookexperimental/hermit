@@ -50,7 +50,14 @@ struct Target {
 
 #define GVT_LIST(...) {__VA_ARGS__}
 #define GVT_TARGET(...)
+// The CMake build renames with objcopy, keeping the extern "C" `main`
+// symbol; the Buck build renames with -Dmain=, which yields a C++
+// mangled symbol, so it defines GVT_MAIN_CPP_LINKAGE instead.
+#ifdef GVT_MAIN_CPP_LINKAGE
+#define GVT_MAIN_DECL(sym) int sym(int, char**);
+#else
 #define GVT_MAIN_DECL(sym) extern "C" int sym(int, char**);
+#endif
 #include "combined_manifest.inc"
 #undef GVT_TARGET
 #undef GVT_MAIN_DECL
