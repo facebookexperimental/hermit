@@ -325,6 +325,7 @@ pub(super) fn exec_refusal() {
         let status = bounded_command_polling(
             &mut super::hermit_command(&args),
             &directory,
+            None,
             remaining(start, budget),
             || {
                 if released

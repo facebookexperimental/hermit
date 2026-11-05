@@ -146,6 +146,135 @@ mod real_random {
             .unwrap();
     }
 
+    /// CPU budget for one fixture compile. Both fixtures measured
+    /// 0.05-0.06 s CPU and ~26 MiB peak RSS locally (2026-11-05); the budget
+    /// covers slower hosts while staying far below the former 10 s wall
+    /// `timeout`, which donor job eb64ff5f showed firing on a descheduled
+    /// `cc` at load ~980 (the wrapper SIGKILLed its own compile).
+    const COMPILE_CPU_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+    /// Hang backstop only: 8x the former 10 s wall limit.
+    const COMPILE_WALL_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(80);
+    /// Memory box for the compile (address-space rlimit in the child).
+    const COMPILE_MEM_BYTES: u64 = 1024 * 1024 * 1024;
+    /// Bounded, logged infrastructure retries for a compile that was
+    /// signal-killed or timed out; a real compile error is never retried.
+    const COMPILE_MAX_RETRIES: usize = 2;
+
+    fn compile_cpu(pid: u32, clk_tck: u64) -> std::time::Duration {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return std::time::Duration::ZERO;
+        };
+        let Some(close) = stat.rfind(')') else {
+            return std::time::Duration::ZERO;
+        };
+        let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+        // After comm: utime, stime, cutime, cstime are fields 14-17, i.e.
+        // indexes 11-14 here. The cc driver reaps each sub-tool, so the
+        // waited-for-children terms carry cc1/as/ld CPU.
+        let ticks: u64 = [11, 12, 13, 14]
+            .iter()
+            .filter_map(|&i| fields.get(i).and_then(|f| f.parse::<u64>().ok()))
+            .sum();
+        std::time::Duration::from_secs_f64(ticks as f64 / clk_tck as f64)
+    }
+
+    enum CompileOutcome {
+        Built,
+        /// Signal-killed or over budget: infrastructure, retryable.
+        Infrastructure(String),
+        /// The compiler ran and rejected the fixture: a real failure.
+        Rejected(std::process::ExitStatus),
+    }
+
+    fn compile_once(source: &Path, binary: &Path) -> CompileOutcome {
+        use std::os::unix::process::CommandExt;
+        use std::os::unix::process::ExitStatusExt;
+        let mut command = Command::new("cc");
+        command
+            .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+            .arg(source)
+            .arg("-o")
+            .arg(binary)
+            .process_group(0);
+        // SAFETY: the closure only lowers this child's own address-space
+        // rlimit between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                let limit = libc::rlimit {
+                    rlim_cur: COMPILE_MEM_BYTES,
+                    rlim_max: COMPILE_MEM_BYTES,
+                };
+                if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => return CompileOutcome::Infrastructure(format!("spawn cc: {error}")),
+        };
+        let pid = child.id();
+        let clk_tck = {
+            let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+            if tck > 0 { tck as u64 } else { 100 }
+        };
+        let started = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return CompileOutcome::Built,
+                Ok(Some(status)) if status.signal() == Some(libc::SIGKILL) => {
+                    return CompileOutcome::Infrastructure(format!(
+                        "compile signal-killed ({status}) after {:.1}s wall",
+                        started.elapsed().as_secs_f64()
+                    ));
+                }
+                Ok(Some(status)) => return CompileOutcome::Rejected(status),
+                Ok(None) => {}
+                Err(error) => {
+                    return CompileOutcome::Infrastructure(format!("wait cc: {error}"));
+                }
+            }
+            let cpu = compile_cpu(pid, clk_tck);
+            if cpu >= COMPILE_CPU_BUDGET || started.elapsed() >= COMPILE_WALL_BACKSTOP {
+                // SAFETY: pid is this child's own process-group id, unreaped.
+                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+                let _ = child.wait();
+                return CompileOutcome::Infrastructure(format!(
+                    "compile over budget ({:.2}s CPU of {:.1}s, {:.1}s wall of {:.0}s)",
+                    cpu.as_secs_f64(),
+                    COMPILE_CPU_BUDGET.as_secs_f64(),
+                    started.elapsed().as_secs_f64(),
+                    COMPILE_WALL_BACKSTOP.as_secs_f64(),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn compile_fixture(name: &str, source: &Path, binary: &Path) {
+        for attempt in 0..=COMPILE_MAX_RETRIES {
+            match compile_once(source, binary) {
+                CompileOutcome::Built => return,
+                CompileOutcome::Rejected(status) => {
+                    panic!("{name} fixture compile failed: {status}");
+                }
+                CompileOutcome::Infrastructure(reason) => {
+                    eprintln!(
+                        "{name} fixture compile infrastructure failure (attempt {} of {}): {reason}",
+                        attempt + 1,
+                        COMPILE_MAX_RETRIES + 1,
+                    );
+                    assert!(
+                        attempt < COMPILE_MAX_RETRIES,
+                        "{name} fixture compile infrastructure exhausted after {} attempts: {reason}",
+                        COMPILE_MAX_RETRIES + 1,
+                    );
+                }
+            }
+        }
+    }
+
     fn case_body(name: &str, fatal: bool, trace_diagnostics: bool, operation: Operation) {
         if std::env::var("HERMIT_OWNER_TEST_ROLE").as_deref() == Ok(name) {
             isolated(name, || exercise(fatal, trace_diagnostics, operation));
@@ -161,23 +290,7 @@ mod real_random {
             let source = fixture.path().join(format!("{name}.c"));
             let binary = fixture.path().join(name);
             std::fs::write(&source, bytes).unwrap();
-            let status = Command::new("timeout")
-                .args([
-                    "--kill-after=1s",
-                    "10s",
-                    "cc",
-                    "-O2",
-                    "-std=c11",
-                    "-Wall",
-                    "-Wextra",
-                    "-Werror",
-                ])
-                .arg(&source)
-                .arg("-o")
-                .arg(&binary)
-                .status()
-                .unwrap();
-            assert!(status.success(), "{name} fixture compile failed: {status}");
+            compile_fixture(name, &source, &binary);
             binary
         };
         let binary = match std::env::var_os("HERMIT_RANDOM_FAILURE_GUEST") {

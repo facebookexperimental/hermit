@@ -19,10 +19,21 @@ use std::time::Duration;
 use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
 use hermit::canonical_verdict::VerificationReport;
 
-use super::kvm_cancellation::bounded_command_with_timeout;
+use super::kvm_cancellation::bounded_command_with_budgets;
 use super::kvm_cancellation::bounded_read;
 
 const MIB: u64 = 1024 * 1024;
+
+/// CPU-primary budgets (owner rule, 2026-11-01). Measured locally on
+/// 2026-11-05: the fixture compile takes 0.18-0.20 s CPU over five runs, and
+/// the heaviest whole test (sigchld-storm, compile plus both verified runs)
+/// takes 3.67 s CPU. The wall figures are hang backstops at 8x the former
+/// wall limits (20 s compile, 57 s run); donor job eb64ff5f failed the old
+/// 20 s wall compile limit at load ~980 while doing 0.2 s of CPU work.
+const COMPILE_CPU: Duration = Duration::from_millis(500);
+const COMPILE_WALL_BACKSTOP: Duration = Duration::from_secs(160);
+const RUN_CPU: Duration = Duration::from_secs(6);
+const RUN_WALL_BACKSTOP: Duration = Duration::from_secs(456);
 
 /// The fixture, compiled once per test process.
 fn guest() -> &'static Path {
@@ -37,7 +48,7 @@ fn guest() -> &'static Path {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/timerfd_virtual_time.c");
         let guest = root.join("program");
         let compile = root.join("compile");
-        let status = bounded_command_with_timeout(
+        let status = bounded_command_with_budgets(
             Command::new("cc")
                 .args([
                     "-std=gnu11",
@@ -55,7 +66,8 @@ fn guest() -> &'static Path {
                 .arg("-o")
                 .arg(&guest),
             &compile,
-            Duration::from_secs(20),
+            COMPILE_CPU,
+            COMPILE_WALL_BACKSTOP,
         );
         assert!(status.success(), "timerfd fixture compilation failed");
         guest
@@ -132,7 +144,7 @@ pub(super) fn verify(backend: &str, mode: &str, expected: &str) {
     args.extend(["--", guest().to_str().unwrap(), mode]);
     let mut command = super::hermit_command(&args);
     command.env("HERMIT_LOG_MAX_BYTES", (64 * MIB).to_string());
-    let status = bounded_command_with_timeout(&mut command, &directory, Duration::from_secs(57));
+    let status = bounded_command_with_budgets(&mut command, &directory, RUN_CPU, RUN_WALL_BACKSTOP);
     let stdout =
         String::from_utf8_lossy(&bounded_read(&directory.join("stdout"), 16 * MIB)).into_owned();
     let stderr =
@@ -175,7 +187,7 @@ pub(super) fn refused(backend: &str, mode: &str, env: Option<(&str, &str)>, reas
     if let Some((name, value)) = env {
         command.env(name, value);
     }
-    let status = bounded_command_with_timeout(&mut command, &directory, Duration::from_secs(57));
+    let status = bounded_command_with_budgets(&mut command, &directory, RUN_CPU, RUN_WALL_BACKSTOP);
     let stderr =
         String::from_utf8_lossy(&bounded_read(&directory.join("stderr"), 16 * MIB)).into_owned();
     assert_eq!(
@@ -217,7 +229,7 @@ pub(super) fn signal_during_publish(backend: &str) {
     ];
     let mut command = super::hermit_command(&args);
     command.env("HERMIT_TEST_TIMERFD_FAULT", "signal-before-arm");
-    let status = bounded_command_with_timeout(&mut command, &directory, Duration::from_secs(57));
+    let status = bounded_command_with_budgets(&mut command, &directory, RUN_CPU, RUN_WALL_BACKSTOP);
     let stdout =
         String::from_utf8_lossy(&bounded_read(&directory.join("stdout"), 16 * MIB)).into_owned();
     let stderr =

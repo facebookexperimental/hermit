@@ -16,6 +16,17 @@ use crate::artifact::Result;
 use crate::artifact::Runner;
 use crate::artifact::VerifiedCompiledSources;
 
+/// Wall hang backstop for each Runner: 8x the former wall-primary budgets
+/// (90 s child, 120 s parent), capped at the owner rule's 600 s. CPU is the
+/// primary limit for the child run below; donor job eb64ff5f (2026-11-05,
+/// load ~980) failed this test at 105.8 s wall for ~5 s of CPU work
+/// (whole test measured 5.08 s CPU locally, 2026-11-05).
+const WALL_BACKSTOP: Duration = Duration::from_secs(600);
+/// CPU budget for the whole child test process tree (cgroup-accounted by
+/// `Runner::run_cpu_bounded`): ~3x the measured whole-test CPU above, the
+/// child being only part of it.
+const CHILD_CPU_BUDGET: Duration = Duration::from_secs(15);
+
 const CHILD_ROOT: &str = "HERMIT_SOURCE_COPY_TEST_CHILD";
 const TEST_NAME: &str = "source_copy::gitless_standalone_compiler_sources";
 const TRANSACTION_TEST_NAME: &str =
@@ -228,7 +239,7 @@ fn gitless_standalone_compiler_sources() -> Result<()> {
         .ok_or("Hermit source root missing")?;
     if let Some(case) = std::env::var_os(CHILD_ROOT) {
         let case = PathBuf::from(case);
-        let mut runner = Runner::new(case.join("child-logs"), Duration::from_secs(90), 8 << 20)?;
+        let mut runner = Runner::new(case.join("child-logs"), WALL_BACKSTOP, 8 << 20)?;
         return copied_source_checks(&case, original, &mut runner);
     }
     run_private_copy_test(original, TEST_NAME)
@@ -246,7 +257,7 @@ fn run_private_copy_test(original: &Path, test_name: &str) -> Result<()> {
         io(fs::create_dir_all(target.parent().unwrap()))?;
         io(fs::copy(original.join(relative), target))?;
     }
-    let mut runner = Runner::new(case.join("parent-logs"), Duration::from_secs(120), 8 << 20)?;
+    let mut runner = Runner::new(case.join("parent-logs"), WALL_BACKSTOP, 8 << 20)?;
     let original_context = resolve(original, &mut runner)?;
     let cargo_home = match std::env::var_os("CARGO_HOME") {
         Some(path) => PathBuf::from(path),
@@ -294,7 +305,24 @@ fn run_private_copy_test(original: &Path, test_name: &str) -> Result<()> {
         "--nocapture".into(),
         "--test-threads=1".into(),
     ]);
-    if let Err(error) = runner.run("env", &child, &copied) {
+    // The child run is CPU-bounded (primary) under the Runner's wall
+    // backstop. Where cgroup CPU accounting is unavailable the command is
+    // not started; fall back to the wall backstop alone and say so, rather
+    // than failing a test the host cannot account.
+    let child_run = runner
+        .run_cpu_bounded("env", &child, &copied, CHILD_CPU_BUDGET)
+        .or_else(|error| {
+            if error.contains("producer CPU accounting unavailable") {
+                eprintln!(
+                    "source-copy child: CPU accounting unavailable ({error}); \
+                     running under the wall backstop only"
+                );
+                runner.run("env", &child, &copied)
+            } else {
+                Err(error)
+            }
+        });
+    if let Err(error) = child_run {
         let retained = directory.keep();
         return Err(format!("{error}; retained fixture {}", retained.display()));
     }
@@ -519,7 +547,7 @@ fn compiled_source_transaction_closes_both_result_paths() -> Result<()> {
         .ok_or("Hermit source root missing")?;
     if let Some(case) = std::env::var_os(CHILD_ROOT) {
         let case = PathBuf::from(case);
-        let mut runner = Runner::new(case.join("child-logs"), Duration::from_secs(90), 8 << 20)?;
+        let mut runner = Runner::new(case.join("child-logs"), WALL_BACKSTOP, 8 << 20)?;
         return transaction_checks(&case, &mut runner);
     }
     run_private_copy_test(original, TRANSACTION_TEST_NAME)
