@@ -163,6 +163,12 @@
       "why": "tests/c/chaos_spinner_and_new_thread.c is owned by hermit-cli/tests/cli.rs: chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting (ptrace) and run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting (KVM) run it under --chaos --sched-seed=7 with 1 ms slices, where a new low-priority thread waits behind a main thread busy-waiting on getpid; the chaos starvation bound must let it run within two slices (https://github.com/rrnewton/hermit/issues/4374). Each run requires run --strict --verify --verify-strict at bitwise parity and parses the guest's own virtual wait, so it remains a guest fixture rather than a manifest cell."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/child_exit_sigchld_wake.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/child_exit_sigchld_wake.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test run_kvm_a_child_exit_sigchld_reaches_a_one_thread_parent_as_on_linux compiles this guest, whose single-threaded parent waits in read, wait4, ppoll or sigsuspend while its only child exits, with SIGCHLD caught (also with SA_NOCLDSTOP or SA_NOCLDWAIT), ignored or at its default, and requires the exact native output on ptrace and KVM with --verify-strict bitwise parity and equal counts of the scheduler's child-exit SIGCHLD records (SIGSHARE S4); it remains a guest fixture because a generic manifest cannot assert this exact output or compare two backends' records."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/child_subreaper_refusal.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

@@ -249,6 +249,7 @@ static PROCESS_SIGNAL_RECEIVER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REALTIME_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIPE_READ_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static BACKEND_SIGNAL_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CHILD_EXIT_SIGCHLD_WAKE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static INOTIFY_BLOCKING_READ_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OWN_PROCESS_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VDSO_SYMBOL_VERSIONS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1647,6 +1648,32 @@ fn pipe_read_signal_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "pipe-read-signal guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn child_exit_sigchld_wake_guest() -> &'static Path {
+    CHILD_EXIT_SIGCHLD_WAKE_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("child-exit-sigchld-wake");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create child-exit-sigchld-wake guest directory");
+        let guest = build_root.join("child_exit_sigchld_wake");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/child_exit_sigchld_wake.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile child-exit-sigchld-wake guest");
+        assert!(
+            output.status.success(),
+            "child-exit-sigchld-wake guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -47504,8 +47531,9 @@ fn run_kvm_the_drain_decides_a_polled_call_from_the_backends_signal_state() {
 /// signal, a timer's, a process-directed POSIX timer's with two waiters (one
 /// handler run), a default-fatal signal, a signal the temporary mask blocks
 /// (it does not end the wait), a pending ignored signal the mask lets in
-/// (discarded, and the wait goes on), and a child's exit SIGCHLD, which keeps
-/// the path it had before S2b (SIGSHARE S4). Each mode runs on ptrace and on
+/// (discarded, and the wait goes on), and a child's exit SIGCHLD, which since
+/// SIGSHARE S4 ends a parked suspend at the drain like any other signal (the
+/// backend publishes it inside the exit's control barrier). Each mode runs on ptrace and on
 /// KVM: the output is the native line, and each run verifies at bitwise
 /// parity with nonzero compared INFO counts, except `ignored-let-in` on
 /// ptrace, which is one `--strict` run: ptrace's kernel call returns at once
@@ -47695,6 +47723,124 @@ fn run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux() {
                 "kvm {mode} chaos seed {seed}: {verdict}"
             );
         }
+    }
+}
+
+/// SIGSHARE S4: a single-threaded parent that waits while its only child
+/// exits gets the child's exit SIGCHLD as on Linux, under each disposition,
+/// on ptrace and on KVM. On KVM the scheduler now decides that SIGCHLD as it
+/// does on ptrace (a classification at the child's exit grant, a `ChildExit`
+/// timer, and at its pop the backend's publication standing for the send),
+/// so it wakes the parent's parked call. Each mode prints the native line
+/// and verifies at bitwise parity with nonzero equal compared INFO counts,
+/// and a logged run on each backend shows the same number of the
+/// scheduler's child-exit SIGCHLD records ("Alarm fired, delivering signal
+/// SIGCHLD to guest.", "removing blocking entries and requeuing thread").
+/// Before S4, KVM's `read-caught`, `read-nocldstop` and `read-nocldwait`
+/// polled the empty pipe until the run was killed (design G5), and
+/// `sigsuspend-caught` returned to the guest 41 times instead of once.
+/// `wait4-default` pins the classification under a child wait's private
+/// mask: the guest's own mask decides (none of SIGCHLD's records on either
+/// backend), not the all-blocked mask Detcore installs for the wait.
+#[test]
+fn run_kvm_a_child_exit_sigchld_reaches_a_one_thread_parent_as_on_linux() {
+    if kvm_unavailable("run_kvm_a_child_exit_sigchld_reaches_a_one_thread_parent_as_on_linux") {
+        return;
+    }
+    let guest = child_exit_sigchld_wake_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for (mode, expected) in [
+        (
+            "read-caught",
+            "read-caught eintr=1 n=1 handler=1 status=7\n",
+        ),
+        (
+            "read-nocldstop",
+            "read-nocldstop eintr=1 n=1 handler=1 status=7\n",
+        ),
+        (
+            "read-nocldwait",
+            "read-nocldwait eintr=1 n=1 handler=1 wait=-1 echild=1\n",
+        ),
+        (
+            "read-ignored",
+            "read-ignored eintr=0 n=0 wait=-1 echild=1\n",
+        ),
+        ("read-default", "read-default eintr=0 n=0 status=7\n"),
+        (
+            "wait4-caught",
+            "wait4-caught pid_ok=1 eintr=0 status=7 handler=1\n",
+        ),
+        ("wait4-default", "wait4-default pid_ok=1 status=7\n"),
+        (
+            "ppoll-caught",
+            "ppoll-caught rc=-1 eintr=1 handler=1 status=7\n",
+        ),
+        (
+            "sigsuspend-caught",
+            "sigsuspend-caught suspends=1 handler=1 status=7\n",
+        ),
+    ] {
+        let mut records = Vec::new();
+        for backend in ["ptrace", "kvm"] {
+            let backend_arg = format!("--backend={backend}");
+            let report = directory.path().join(format!("{mode}-{backend}.json"));
+            let report_arg = report.to_str().unwrap().to_owned();
+            let args = [
+                backend_arg.as_str(),
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                report_arg.as_str(),
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--",
+                guest.as_str(),
+                mode,
+            ];
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{backend} {mode}");
+            let verdict: serde_json::Value =
+                serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+            assert_eq!(
+                verdict["bitwise_parity"], true,
+                "{backend} {mode}: {verdict}"
+            );
+            let compared = &verdict["compared_log_messages"];
+            assert!(
+                compared["left"].as_u64().is_some_and(|count| count > 0)
+                    && compared["left"] == compared["right"],
+                "{backend} {mode} compared no INFO messages: {verdict}"
+            );
+            let logged = [
+                backend_arg.as_str(),
+                "--log=info",
+                "run",
+                "--strict",
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--",
+                guest.as_str(),
+                mode,
+            ];
+            let output = hermit(&logged);
+            assert_success(&output, &logged);
+            let text = stderr(&output);
+            records.push((
+                text.matches("Alarm fired, delivering signal SIGCHLD to guest.")
+                    .count(),
+                text.matches("SIGCHLD coalesced").count(),
+                text.matches("Linux discards as sent").count(),
+                text.contains("sigchld-decision-mismatch"),
+            ));
+        }
+        assert_eq!(
+            records[0], records[1],
+            "{mode}: KVM's child-exit SIGCHLD records (alarm, coalesced, discarded, mismatch) differ from ptrace's"
+        );
     }
 }
 
