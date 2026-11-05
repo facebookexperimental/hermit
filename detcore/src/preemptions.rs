@@ -2587,7 +2587,7 @@ mod tests {
     #[test]
     fn bounded_summary_distinguishes_equal_count_histories_by_content() {
         let tid = DetTid::from_raw(3);
-        let summary = |time, rcbs| {
+        let summary = |time, rcbs, store_exclusive_failures| {
             let mut writer = PreemptionWriter::new(None);
             writer.register_thread(tid, DEFAULT_PRIORITY);
             writer.insert_reprioritization(
@@ -2597,10 +2597,30 @@ mod tests {
                 DEFAULT_PRIORITY,
                 20,
             );
+            writer.record_store_exclusive_failures(store_exclusive_failures);
             writer.summary().unwrap()
         };
 
-        assert_ne!(summary(100, 10), summary(200, 20));
+        assert_ne!(summary(100, 10, 0), summary(200, 20, 0));
+        // A host-observed diagnostic count is not schedule content: it
+        // compares (and hashes) as equal in the record itself, so the
+        // compared summary evidence must not reintroduce it.
+        assert_eq!(summary(100, 10, 0), summary(100, 10, 20));
+
+        let boundary_summary = |store_exclusive_failures| {
+            let mut writer = PreemptionWriter::new(None).with_slice_boundaries().unwrap();
+            writer.register_thread(tid, DEFAULT_PRIORITY);
+            writer.insert_reprioritization(
+                tid,
+                LogicalTime::from_nanos(100),
+                10,
+                DEFAULT_PRIORITY,
+                20,
+            );
+            writer.record_store_exclusive_failures(store_exclusive_failures);
+            writer.summary().unwrap()
+        };
+        assert_eq!(boundary_summary(0), boundary_summary(20));
     }
 
     /// Every streaming write/summary path runs the writer's stopless
@@ -4700,8 +4720,10 @@ impl PreemptionWriter {
     }
 
     /// A bounded description for logs that do not request a complete JSON
-    /// artifact. It streams the finalized record to a digest and counts rows
-    /// without allocating its complete serialization or cloning the tape.
+    /// artifact. It streams the finalized record's INFO projection (the
+    /// exact serialization minus the host-observed store-exclusive count,
+    /// which compared evidence must not depend on) to a digest and counts
+    /// rows without allocating its complete serialization or cloning the tape.
     pub(crate) fn summary(mut self) -> Result<String, String> {
         // Like into_string, this consumes the output owner without a later
         // Drop write. Run the same stopless lowering/refusal and boundary
@@ -4712,11 +4734,11 @@ impl PreemptionWriter {
         self.flushed = true;
         self.finalize()?;
         let digest = if let Some(records) = &self.boundary_records {
-            let output = boundary_recording::BorrowedEnvelope::new(&self.inner, records)
+            let output = boundary_recording::BorrowedInfoEnvelope::new(&self.inner, records)
                 .map_err(|error| error.to_string())?;
             streaming::digest_json(&output)
         } else {
-            streaming::digest_json(&self.inner)
+            streaming::digest_json(&record_serde::InfoProjection(&self.inner))
         }
         .map_err(|error| error.to_string())?;
         let digest = digest

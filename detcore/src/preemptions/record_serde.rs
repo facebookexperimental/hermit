@@ -90,6 +90,102 @@ struct RawRecord {
     rewrite_exclusives_in_memory: bool,
 }
 
+// The INFO comparison projection: RawRecord's exact serialization except the
+// host-observed store-exclusive count, which compares and hashes as equal in
+// the record itself and is deliberately excluded from the INFO view (it
+// remains in the artifact and full report). Every other field, order, and
+// omission matches RawRecord.
+#[derive(Serialize)]
+#[serde(remote = "PreemptionRecord")]
+struct InfoRecord {
+    per_thread: BTreeMap<DetTid, ThreadHistory>,
+    global: Vec<SchedEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    epoch: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pipe_wake_latency: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signal_state_copy: Option<bool>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    cap_preemption_charge: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chaos_timeslice: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    guest_ids: Option<detcore_model::pid::GuestIds>,
+    #[serde(default, skip_serializing_if = "ReservedInputMetadata::is_missing")]
+    reserved_input: ReservedInputMetadata,
+    #[serde(skip)]
+    replay_departed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    post_crash_timeslice: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    post_crash: Option<Vec<crate::post_crash::PostCrashSwitch>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rng_seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    expired_wait_runs_charged_once: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_inputs: Option<HostInputSet>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    queued_sleeps_registered_at_first_pass: bool,
+    #[serde(skip)]
+    store_exclusive_failures: HostObservedCount,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    format_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "super::lists_no_time_skips")]
+    time_skips: Option<Vec<TimeSkip>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rejoins: Option<Vec<crate::scheduler::rejoin_log::Rejoin>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    background_starts: Vec<BackgroundStart>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    rewrite_exclusives_in_memory: bool,
+}
+
+struct InfoLegacyFields<'a>(&'a PreemptionRecord);
+
+impl Serialize for InfoLegacyFields<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        InfoRecord::serialize(self.0, serializer)
+    }
+}
+
+/// A `PreemptionRecord` as the INFO comparison sees it: its exact
+/// serialization, marked envelope included, minus the host-observed
+/// store-exclusive count.
+pub(super) struct InfoProjection<'a>(pub(super) &'a PreemptionRecord);
+
+impl Serialize for InfoProjection<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Some(replay_departed_at) = self.0.replay_departed_at else {
+            return InfoRecord::serialize(self.0, serializer);
+        };
+        if !serializer.is_human_readable() {
+            return Err(serde::ser::Error::custom(
+                "marked preemption records require the incomplete_preemption_record JSON envelope",
+            ));
+        }
+        #[derive(Serialize)]
+        struct InfoMarkedRef<'a> {
+            version: u32,
+            replay_departed_at: u64,
+            record: InfoLegacyFields<'a>,
+        }
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(
+            ENVELOPE,
+            &InfoMarkedRef {
+                version: VERSION,
+                replay_departed_at,
+                record: InfoLegacyFields(self.0),
+            },
+        )?;
+        map.end()
+    }
+}
+
 struct LegacyFields<'a>(&'a PreemptionRecord);
 
 impl Serialize for LegacyFields<'_> {

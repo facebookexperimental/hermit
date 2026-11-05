@@ -82,6 +82,37 @@ impl<'a> BorrowedEnvelope<'a> {
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename = "BoundaryWire")]
+struct BorrowedInfoBoundary<'a> {
+    preemptions: super::record_serde::InfoProjection<'a>,
+    schedule: BorrowedSchedule<'a>,
+}
+
+/// A borrowed envelope as the INFO comparison sees it: the exact boundary
+/// serialization with the preemption history projected through
+/// `record_serde::InfoProjection` (no host-observed store-exclusive count).
+#[derive(Serialize)]
+#[serde(rename = "Envelope")]
+pub(super) struct BorrowedInfoEnvelope<'a> {
+    slice_boundary_recording: BorrowedInfoBoundary<'a>,
+}
+
+impl<'a> BorrowedInfoEnvelope<'a> {
+    pub(super) fn new(
+        preemptions: &'a PreemptionRecord,
+        records: &'a [detcore_model::schedule::boundary::Record],
+    ) -> anyhow::Result<Self> {
+        let envelope = BorrowedEnvelope::new(preemptions, records)?;
+        Ok(Self {
+            slice_boundary_recording: BorrowedInfoBoundary {
+                preemptions: super::record_serde::InfoProjection(preemptions),
+                schedule: envelope.slice_boundary_recording.schedule,
+            },
+        })
+    }
+}
+
 impl Serialize for BoundaryRecording {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
