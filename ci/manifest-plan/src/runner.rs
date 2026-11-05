@@ -723,7 +723,7 @@ const TIERED_BUCKETS: [&str; 2] = ["gvisor", "rr"];
 
 /// The one tier marker shared by the gVisor and rr corpora and their
 /// selectors. It is authored as a test-row [`TestRecipe::labels`] value;
-/// projections serialize this derived value under the JSON key `tier`.
+/// selectors consume it through `--label super|pressure`.
 #[derive(
     Clone,
     Copy,
@@ -764,9 +764,14 @@ impl CellTier {
     }
 }
 
-/// This cell's derived tier, or `None` for rows outside the tiered corpora.
-/// Manifest validation rejects a resolved cell carrying both markers, so a
-/// validated manifest cannot make this return an error.
+/// This cell's derived tier: `Some(Super)` or `Some(Pressure)` when the
+/// resolved labels carry that one marker, and `None` when they carry
+/// neither (every row outside the tiered buckets, and any untiered cell).
+/// A mode label can put a cell in a tier on its own: the compat corpus's
+/// heavy rows carry mode-level `super`, so their cells return
+/// `Some(CellTier::Super)` with no test-row marker. Manifest validation
+/// rejects a resolved cell carrying both markers, so a validated
+/// manifest cannot make this return an error.
 pub fn cell_tier(
     test: &TestRecipe,
     recipe: &ModeRecipe,
@@ -12671,6 +12676,63 @@ corpus:
         let mut mode = test.modes["verify"].clone();
         mode.labels = BTreeMap::from([("ptrace".into(), vec!["super".into()])]);
         assert!(cell_tier(&test, &mode, Some("ptrace")).is_err());
+    }
+
+    #[test]
+    fn tier_marker_is_enforced_at_document_level() {
+        let five_modes = |id: &str, labels: Vec<String>| {
+            let mut test = recipe(true);
+            test.id = id.into();
+            test.labels = labels;
+            for mode in ["naked", "replay", "chaos", "custom"] {
+                let backends: &[&str] = if mode == "naked" {
+                    &["native"]
+                } else {
+                    &["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"]
+                };
+                test.modes.insert(
+                    mode.into(),
+                    ModeRecipe {
+                        ci: CiSelectionSpec::Uniform(false),
+                        ci_disabled_reason: Some(CiDisabledReasonSpec::Uniform(
+                            "fixture cell: only the verify mode is measured here".into(),
+                        )),
+                        backends_disabled: backends
+                            .iter()
+                            .map(|backend| ((*backend).into(), "fixture mode is not run".into()))
+                            .collect(),
+                        ..ModeRecipe::default()
+                    },
+                );
+            }
+            test
+        };
+        let validate = |bucket: &str, test: TestRecipe| {
+            validate_document_with_cpu(
+                &ManifestDocument {
+                    image: None,
+                    schema: MANIFEST_SCHEMA,
+                    bucket: bucket.into(),
+                    timeout_seconds: None,
+                    slow_reason: None,
+                    test: vec![test],
+                },
+                bucket,
+                Path::new("/"),
+                15,
+                DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+            )
+        };
+        let untiered = five_modes("gvisor/x", vec![]);
+        let error = validate("gvisor", untiered).unwrap_err();
+        assert!(error.contains("requires exactly one tier label"), "{error}");
+        validate("gvisor", five_modes("gvisor/x", vec!["pressure".into()])).unwrap();
+        let mut both = five_modes("gvisor/x", vec!["pressure".into()]);
+        both.modes.get_mut("verify").unwrap().labels =
+            BTreeMap::from([("ptrace".into(), vec!["super".into()])]);
+        let error = validate("gvisor", both).unwrap_err();
+        assert!(error.contains("both"), "{error}");
+        validate("fixture", five_modes("fixture/x", vec![])).unwrap();
     }
 
     /// A mode's per-backend labels put that backend's cell in their run type
