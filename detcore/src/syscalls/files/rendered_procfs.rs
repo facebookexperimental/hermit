@@ -1184,7 +1184,10 @@ pub(super) enum IoAccessByCredentials {
 /// - the reader's filesystem IDs must be its real IDs (Detcore makes the
 ///   guest's credential calls no-ops, so they keep the IDs the guest started
 ///   with), else, or where an ID reads as [`OVERFLOW_ID`], so that whether
-///   they are cannot be told, the answer is unanswerable;
+///   they are cannot be told, the credentials cannot answer, and the kernel
+///   is asked the FSCREDS check itself
+///   ([`Detcore::inject_pidfd_namespace_answer`]), else the read is refused
+///   by name;
 /// - REALCREDS refuses: FSCREDS refuses too (the effective set is within
 ///   the permitted set, so commoncap's FSCREDS condition implies its
 ///   REALCREDS one);
@@ -1303,6 +1306,21 @@ pub(super) enum PidfdAccess {
     /// The check was not reached: `pidfd_open` failed (`opened` false), or
     /// the ioctl failed before the check (`opened` true), with `errno`.
     NotAsked { opened: bool, errno: Errno },
+}
+
+/// Why the kernel's own check could not be asked through a pidfd
+/// ([`PidfdAccess::NotAsked`]), for a named refusal.
+fn pidfd_not_asked_reason(opened: bool, errno: Errno) -> String {
+    match (opened, errno) {
+        (true, Errno::ESRCH) => {
+            "the task has exited, so the kernel has no namespaces of it to ask about".to_owned()
+        }
+        (false, Errno::EMFILE | Errno::ENFILE) => {
+            format!("the pidfd needs a free descriptor ({errno})")
+        }
+        (false, errno) => format!("pidfd_open failed with {errno}"),
+        (true, errno) => format!("the ioctl failed with {errno}"),
+    }
 }
 
 /// [`PidfdAccess`] from the ioctl's result, once `pidfd_open` has
@@ -2998,13 +3016,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// for the call's length; where it cannot be asked (the task has exited,
     /// so its namespaces are gone, or no descriptor is free), Detcore's
     /// record of user namespaces answers ([`io_access_by_user_namespaces`]),
-    /// which the clones that made each namespace fixed in their turns.
+    /// which the clones that made each namespace fixed in their turns. Where
+    /// the reader's credentials cannot tell the FSCREDS answer from the
+    /// REALCREDS one (its filesystem IDs are not its real IDs, or read as the
+    /// overflow ID, as every ID does in a user namespace with no mapping),
+    /// the kernel is asked the FSCREDS check through the pidfd too.
     ///
     /// Where that cannot decide Linux's answer (a nested PID namespace, whose
     /// numbers are not the table's; `kcmp` or `capget` unavailable; the cases
     /// [`io_access_by_real_credentials`] and [`io_access_by_user_namespaces`]
-    /// name), the run stops with a named refusal (the failure policy), never
-    /// an EACCES Linux might not give.
+    /// name, where the pidfd cannot be asked either), the run stops with a
+    /// named refusal (the failure policy), never an EACCES Linux might not
+    /// give.
     async fn io_read_allowed_by_number<G: Guest<Self>>(
         guest: &mut G,
         named: i32,
@@ -3102,17 +3125,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 unreachable!("the record of user namespaces answers by itself")
                             }
                             IoAccessByCredentials::Unanswerable(detail) => {
-                                let why = match (opened, errno) {
-                                    (true, Errno::ESRCH) => "the task has exited, so the kernel \
-                                                             has no namespaces of it to ask \
-                                                             about"
-                                        .to_owned(),
-                                    (false, Errno::EMFILE | Errno::ENFILE) => {
-                                        format!("the pidfd needs a free descriptor ({errno})")
-                                    }
-                                    (false, errno) => format!("pidfd_open failed with {errno}"),
-                                    (true, errno) => format!("the ioctl failed with {errno}"),
-                                };
+                                let why = pidfd_not_asked_reason(opened, errno);
                                 let reason = refuse(format!(
                                     "the task's permitted capabilities are within the reader's \
                                      permitted set but not its effective set, which lacks \
@@ -3130,8 +3143,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
             IoAccessByCredentials::Unanswerable(detail) => {
-                let reason = refuse(detail.to_owned());
-                Err(Self::scratch_failure(guest, Sysno::read, reason).await)
+                // The credentials cannot tell Linux's answer: the kernel is
+                // asked the FSCREDS check itself, which reads the reader's
+                // filesystem IDs whatever they read as from its namespace.
+                match Self::inject_pidfd_namespace_answer(guest, kernel).await {
+                    Ok(PidfdAccess::Allowed) => Ok(Ok(())),
+                    Ok(PidfdAccess::Refused) => Ok(Err(Errno::EACCES)),
+                    Ok(PidfdAccess::NotAsked { opened, errno }) => {
+                        let why = pidfd_not_asked_reason(opened, errno);
+                        let reason = refuse(format!(
+                            "{detail}; and the kernel's own check, asked through a pidfd's \
+                             user-namespace ioctl, cannot answer ({why})"
+                        ));
+                        Err(Self::scratch_failure(guest, Sysno::read, reason).await)
+                    }
+                    Err(reason) => Err(Self::scratch_failure(guest, Sysno::read, reason).await),
+                }
             }
         }
     }

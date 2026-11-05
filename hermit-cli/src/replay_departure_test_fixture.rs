@@ -168,6 +168,7 @@ pub(crate) async fn receiver_cleanup(
             "chaos_epochs": [],
             "killed_by_group_signal": false,
             "passed_descriptors_out": false,
+            "wait_status": 0,
         }}),
     );
     assert_eq!(
