@@ -71,7 +71,6 @@ hermit-resources = { version = "0.5.4", path = "../hermit-resources" }
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
-num_cpus = "1.16"
 object = { version = "0.40.0", features = ["read"] }
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
 rand = "0.10.2"

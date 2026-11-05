@@ -8,13 +8,15 @@ rust_library(
     name = "hermit-record-format",
     srcs = glob(["src/**/*.rs"]),
     autocargo = {"cargo_toml_dir": "."},
+    test_deps = [
+        "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:tempfile",
+    ],
     deps = [
         "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:goblin",
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:serde",
-        "fbsource//third-party/rust:serde_json",
-        "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:tracing",
         "//hermetic_infra/hermit/detcore:detcore",
         "//hermetic_infra/reverie:reverie",

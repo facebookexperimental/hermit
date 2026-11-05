@@ -8,6 +8,7 @@
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_sh_test")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
+load(":release_alias.bzl", "hermit_release_aliases")
 
 oncall("hermit")
 
@@ -50,12 +51,12 @@ release_build_env = hermit_build_env if release_unstamped else {
 release_lzma_target = read_root_config(
     "hermit_release",
     "lzma_target",
-    "gh_facebook_buck2_shims_meta//third-party/xz:lzma",
+    "fbsource//third-party/xz:lzma",
 )
 release_unwind_target = read_root_config(
     "hermit_release",
     "unwind_target",
-    "gh_facebook_buck2_shims_meta//third-party/libunwind:unwind-ptrace",
+    "fbsource//third-party/libunwind:unwind-ptrace",
 )
 
 rust_library(
@@ -133,6 +134,10 @@ rust_library(
     ]),
     crate = "hermit",
     env = hermit_build_env,
+    # Like _libhermit-release below: the LiteInst backing descriptor and the
+    # in-guest entry symbols are per-image link contracts that only a final
+    # binary link can resolve, so this library must not become a shared object.
+    preferred_linkage = "static",
     # The shared application deliberately uses LiteInst in this internal debug
     # build, unlike Cargo's empty default feature set. Backend cfgs and their app
     # tests now belong to this library, not the thin executable.
@@ -153,7 +158,6 @@ rust_library(
         "fbsource//third-party/rust:rand_pcg",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
-        "fbsource//third-party/rust:sha2",
         "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:tracing",
@@ -169,7 +173,6 @@ rust_library(
         "//hermetic_infra/hermit/hermit-run-ptrace:hermit-run-ptrace",
         "//hermetic_infra/hermit/hermit-resources:hermit-resources",
         "//hermetic_infra/reverie:reverie",
-        "//hermetic_infra/reverie:reverie-inguest",
         "fbsource//third-party/rust:flate2",
         "fbsource//third-party/rust:tar",
         "//hermetic_infra/reverie:reverie-kvm",
@@ -179,7 +182,6 @@ rust_library(
         "//hermetic_infra/reverie:safeptrace",
         "fbsource//third-party/rust:colored",
         "fbsource//third-party/rust:diff",
-        "fbsource//third-party/rust:num_cpus",
         "fbsource//third-party/rust:pretty_assertions",
         "fbsource//third-party/rust:rand",
         "fbsource//third-party/rust:regex",
@@ -314,7 +316,6 @@ rust_library(
         "//hermetic_infra/reverie:safeptrace",
         "fbsource//third-party/rust:colored",
         "fbsource//third-party/rust:diff",
-        "fbsource//third-party/rust:num_cpus",
         "fbsource//third-party/rust:pretty_assertions",
         "fbsource//third-party/rust:rand",
         "fbsource//third-party/rust:regex",
@@ -347,19 +348,9 @@ rust_binary(
     **release_features
 )
 
-configured_alias(
-    name = "libhermit-release",
-    actual = ":_libhermit-release",
-    platform = "shim//:hermit_rust_release_platform",
-    visibility = ["PUBLIC"],
-)
-
-configured_alias(
-    name = "hermit-release",
-    actual = ":_hermit-release",
-    platform = "shim//:hermit_rust_release_platform",
-    visibility = ["PUBLIC"],
-)
+# The hermit-release aliases exist only in the GitHub build; see
+# release_alias.bzl for why (fbcode forbids the raw configured_alias rule).
+hermit_release_aliases()
 
 buck_sh_test(
     name = "test_record_uptime",

@@ -372,6 +372,15 @@ pub mod pid;
 pub mod procfs;
 pub mod replay_departure;
 pub mod schedule;
+
+/// Source text of `schedule.rs`, for Detcore's global-RPC revision digest test.
+///
+/// The test in detcore hashes the wire definitions in this file's text;
+/// exposing the text from this crate keeps that check working in build
+/// systems that cannot read a sibling crate's source file by relative path.
+#[doc(hidden)]
+pub const SCHEDULE_RS_SOURCE: &str = include_str!("schedule.rs");
+
 pub mod summary;
 pub mod syscall_histogram;
 pub mod time;

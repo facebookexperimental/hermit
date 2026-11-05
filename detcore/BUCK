@@ -18,7 +18,11 @@ sanitized_feature = selects.apply(
 
 rust_library(
     name = "detcore",
-    srcs = glob(["src/**/*.rs"]),
+    srcs = glob([
+        "src/**/*.rs",
+        "src/**/*.txt",
+        "src/**/*.json",
+    ]),
     autocargo = {
         "cargo_toml_config": {
             "package": {

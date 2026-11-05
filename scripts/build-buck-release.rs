@@ -8303,9 +8303,9 @@ esac
     #[test]
     fn release_buck_target_uses_declared_library_dependencies_and_exact_rpath() {
         let buck = fs::read_to_string(source_root().join("hermit-cli/BUCK")).unwrap();
-        assert!(buck.contains("\"gh_facebook_buck2_shims_meta//third-party/xz:lzma\""));
+        assert!(buck.contains("\"fbsource//third-party/xz:lzma\""));
         assert!(
-            buck.contains("\"gh_facebook_buck2_shims_meta//third-party/libunwind:unwind-ptrace\"")
+            buck.contains("\"fbsource//third-party/libunwind:unwind-ptrace\"")
         );
         assert!(buck.contains("deps = [release_lzma_target, release_unwind_target] + ["));
         assert!(buck.contains("link-arg=-Wl,--disable-new-dtags"));
