@@ -6668,10 +6668,11 @@ sys.exit(37)
         refuse(OUTPUT, "the file", text);
     }
 
-    /// The PMU analyze node retains exactly the seven other ignored
-    /// integrations (the six refusal/workspace/timeout cases and the
-    /// racewrite selfcheck regression) while hello-race pinpointing is
-    /// excluded for its tracked failure.
+    /// The PMU analyze node retains exactly the eight other ignored
+    /// integrations (the six refusal/workspace/timeout cases, the
+    /// racewrite selfcheck regression and the race finder's fd_reuse
+    /// case) while hello-race pinpointing and the race-candidates case
+    /// are excluded for their tracked reasons.
     #[test]
     fn the_pmu_analyze_node_runs_the_ignored_analyze_integrations() {
         let source = include_str!("../../../hermit-cli/tests/analyze.rs");
@@ -6683,6 +6684,8 @@ sys.exit(37)
             "analyze_cleans_up_when_a_signal_stops_it",
             "analyze_stops_a_run_whose_init_has_not_armed",
             "analyze_racewrite_nostdlib",
+            // The race finder's.
+            "analyze_names_the_close_racing_the_reused_descriptor",
         ];
         for case in cases {
             assert!(
@@ -6691,6 +6694,13 @@ sys.exit(37)
             );
         }
         assert!(source.contains("fn analyze_hello_race()"));
+        // The excluded race-candidates case stays in the source as a
+        // hand-runnable ignored test (dh-zr6yo tracks its re-inclusion).
+        assert!(
+            source
+                .contains("fn analyze_checks_the_race_candidates_and_says_what_each_edit_moved()"),
+            "excluded rpc case must remain in hermit-cli/tests/analyze.rs"
+        );
         let expected_filter = cases
             .iter()
             .map(|case| format!("test(={case})"))
@@ -6726,6 +6736,16 @@ sys.exit(37)
             assert!(
                 !step.cmd.contains("test(=analyze_hello_race)"),
                 "{origin}: excluded hello-race must not run"
+            );
+            assert!(
+                !step.cmd.contains(
+                    "test(=analyze_checks_the_race_candidates_and_says_what_each_edit_moved)"
+                ),
+                "{origin}: excluded race-candidates case must not run"
+            );
+            assert!(
+                step.description.contains("dh-zr6yo"),
+                "{origin}: missing race-candidates exclusion tracking"
             );
             assert!(
                 step.description

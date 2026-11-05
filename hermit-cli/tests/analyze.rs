@@ -498,6 +498,20 @@ fn analyze_racewrite_nostdlib_prefix_search() {
 /// server then cannot run as edited (it needs the request that now comes
 /// after it), so the check is not realized rather than a verdict. No
 /// poller nap decides.
+///
+/// This test is NOT in the PMU analyze node. Measured 2026-11-04 on an
+/// AMD EPYC 9D85 (the validation host class), whole-cgroup CPU of one
+/// systemd scope per run at the node's 20000-branch margin, it takes
+/// 24.31, 24.47 and 24.78 CPU-seconds against the node's ordinary
+/// 22-second per-test cap, and shrinking the poller's nap far enough to
+/// fit (600 microseconds and up) makes the analysis degenerate: the
+/// deciding event falls in startup (#53), the server-change replay
+/// departs at event #0, and no candidate check is realized -- the
+/// assertions below now refuse that shape. An exact-identity CPU
+/// allowance cannot admit it either today, because allowance selection
+/// drops ignored testcases (nextest_cpu::selected_inventory). It stays
+/// runnable by hand as an ignored test; re-inclusion is tracked in
+/// minibeads dh-zr6yo.
 #[test]
 #[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_checks_the_race_candidates_and_says_what_each_edit_moved() {
@@ -525,6 +539,54 @@ fn analyze_checks_the_race_candidates_and_says_what_each_edit_moved() {
         .unwrap_or_else(|| panic!("no candidate names the server's change: {report}"));
     let check = &change["check"];
     assert_eq!(check["verdict"], "not_realized", "{report}");
+    // Guard against a degenerate analysis (F5): with too little poller
+    // traffic the deciding event falls in startup, before the server
+    // thread exists, the edit replay departs at event #0 instead of at
+    // the server's read, and no candidate check is realized -- while the
+    // assertions above still pass on the ranked text alone.
+    let decision = racing["decision"].as_u64().expect("decision event");
+    let server_thread = change["accesses"][1]["thread"]
+        .as_u64()
+        .expect("server thread");
+    let detail = check["detail"].as_str().unwrap_or("");
+    let departure: u64 = detail
+        .split("at event #")
+        .nth(1)
+        .and_then(|rest| {
+            rest.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no departure event in check detail: {report}"));
+    let departure_thread: u64 = detail
+        .split("(tid")
+        .nth(1)
+        .and_then(|rest| {
+            rest.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no departure thread in check detail: {report}"));
+    assert_eq!(
+        departure_thread, server_thread,
+        "the server-change replay must depart on the server thread: {report}"
+    );
+    assert!(
+        departure >= decision,
+        "the server-change replay departs at #{departure}, before the deciding \
+         event #{decision}: {report}"
+    );
+    assert!(
+        candidates.iter().any(|candidate| matches!(
+            candidate["check"]["verdict"].as_str(),
+            Some("decides" | "does_not_decide")
+        )),
+        "at least one candidate check must be realized: {report}"
+    );
     assert!(
         check["edit"].as_str().unwrap_or("").starts_with("moving ")
             && check["moved"]["events"].as_u64().unwrap_or(0) > 0
@@ -552,16 +614,21 @@ fn analyze_checks_the_race_candidates_and_says_what_each_edit_moved() {
 /// that fails with EBADF, on two threads, and no edge Hermit observes orders
 /// them.
 ///
-/// It takes no calibrated skid margin. At `--max-timeslice=400000` the guest's
-/// writer, which computes between its syscalls, has 59 of a run's 64
-/// timeslices end at the timer, and under the PMU analyze node's margin every
-/// such event is placed by stepping through up to 20000 branches. Measured on
-/// an Intel Xeon Gold 6138 with this test's command: without the margin the
-/// analysis finishes in 33 s, its 18 trials taking 1.5 to 2.0 s each; with a
-/// margin of 20000 each trial takes 42 to 61 s, and the analysis had run 7 of
-/// them when a 420 s bound stopped it. What the test checks is the race
-/// finder's report on the pair the search finds, not where a timer event
-/// lands.
+/// It takes no calibrated skid margin. Power/weight, 2026-11-04, on an AMD
+/// EPYC 9D85 (the validation host class), whole-cgroup CPU of one systemd
+/// scope per run of this test alone: the writer's spin went from 3000000 to
+/// 100000 iterations. The recorded schedule keeps every event class
+/// (Syscall 138, OtherInstructions 100, Cpuid 21, Rdtsc 10; Branch 228 ->
+/// 101, of which the writer's timer slices 141 -> 14), and the test's CPU
+/// fell from 191 and 230 CPU-seconds (n=2) to 12.18 and 12.25 (n=2) without
+/// the margin, inside the node's 22-second cap. With
+/// `HERMIT_ANALYZE_SKID_MARGIN=20000` the shrunk test still takes 76 to 81
+/// CPU-seconds (n=3), because the margin steps every Branch event, the ~77
+/// startup slices included, so the exemption stays. Plain `--chaos` seeds
+/// 1-5 no longer fail on this host at the shrunk spin (the 3000000-iteration
+/// guest failed seeds 1-3); analyze's own search found the failing schedule
+/// in 5 of 5 measured runs. What the test checks is the race finder's
+/// report on the pair the search finds, not where a timer event lands.
 #[test]
 #[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_names_the_close_racing_the_reused_descriptor() {
@@ -575,9 +642,9 @@ fn analyze_names_the_close_racing_the_reused_descriptor() {
         ],
         "unordered by the edges Hermit observes",
         SkidMargin::Without(
-            "its CPU-bound writer is stepped through the margin at each timer event, which made \
-             each prefix trial take 42 to 61 s instead of 1.5 to 2.0 s (see the test's \
-             documentation)",
+            "stepping every Branch event through a 20000-branch margin, startup slices \
+             included, took 76 to 81 CPU-seconds on the validation host class against \
+             12.2 without it (see the test's documentation)",
         ),
     );
     let racing = &report["racing_accesses"];

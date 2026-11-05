@@ -19,8 +19,11 @@
 // first close before the open and the open before the second close in
 // every schedule; nothing orders the second close against the seek. Without
 // chaos the writer keeps running through its work to the seek and the guest
-// passes; with --max-timeslice=400000, chaos preempts the work and every one
-// of seeds 1-20 failed.
+// passes. The work loop is sized so the timer ends about fourteen of the
+// writer's slices inside it at --max-timeslice=400000: enough preemption
+// points for analyze's prefix search to place the second close on either
+// side of the seek, at a cost the PMU analyze node's per-test CPU cap
+// admits (measured in the analyze test's documentation).
 
 #include <errno.h>
 #include <fcntl.h>
@@ -70,7 +73,7 @@ static void* writer(void* arg) {
     perror("write");
     exit(2);
   }
-  for (long i = 0; i < 3000000; i++) {
+  for (long i = 0; i < 100000; i++) {
     sink += i;
   }
   if (lseek(fd, 0, SEEK_SET) < 0 && errno == EBADF) {
