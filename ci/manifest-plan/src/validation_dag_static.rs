@@ -1744,7 +1744,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4234): 1050, run.
     // And host_base_env_keeps_hermits_own_variables_from_the_guest
     // (hermit run --dap-listen): 1051.
-    // And the eleven xstate_probe tests of the x86-64-v3 qualification
+    // And the sixteen xstate_probe tests of the x86-64-v3 qualification
     // (https://github.com/rrnewton/hermit/issues/4243): 1062, listed.
     // And the four cpu_profile_admission tests: 1066, listed.
     // And a_replay_host_is_compared_fact_by_fact and
@@ -1998,7 +1998,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4920 (3): the prefix-trial unit: 1258 + 1 = 1259.
     // And PR #4743's eight hermit-unit additions on this base (trial-log,
     // bisection-checkpoint, workspace-source and guest-log units): +8.
-    ("test.hermit_unit", 1268),
+    // And the five concurrent-probe xstate_probe tests (dh-jqhfx, PR 5182;
+    // xstate_probe tests in mod.rs 11 -> 16): 1268 + 5 = 1273, composed as
+    // main + (head - base).
+    ("test.hermit_unit", 1273),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6234,7 +6237,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from f4e27a59: 1049.
     // And the armed-waiting-signal record-epoch test: 1050.
     // And the host-environment test for hermit run --dap-listen: 1051.
-    // And the eleven xstate_probe tests: 1062.
+    // And the sixteen xstate_probe tests: 1062.
     // And the four cpu_profile_admission tests: 1066.
     // And the replay-host and 0x155 version tests: 1068.
     // And the floating-point write admission test: 1069.
@@ -6380,7 +6383,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4920 (3): the same unit: 1252 + 1 = 1253.
     // And PR #4743's eight hermit-unit additions on this base (trial-log,
     // bisection-checkpoint, workspace-source and guest-log units): +8.
-    ("test.hermit_unit_on_host", 1262),
+    // And the same five concurrent-probe xstate_probe tests as
+    // test.hermit_unit (dh-jqhfx, PR 5182): 1262 + 5 = 1267.
+    ("test.hermit_unit_on_host", 1267),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
