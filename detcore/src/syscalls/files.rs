@@ -6079,6 +6079,24 @@ impl<T: RecordOrReplay> Detcore<T> {
                 String::from_utf8_lossy(name)
             )
         }
+        /// Whether a spelling resolves in the resolving process's
+        /// own context (its descriptor table or task identity), so
+        /// the tracer's filesystem cannot decide it for the guest:
+        /// `/proc/self/...`, `/proc/thread-self/...`, any
+        /// `/proc/<tid>/...` form (including `task/<tid>/fd/...`),
+        /// and `/dev/fd/...`.
+        fn guest_context_spelling(bytes: &[u8]) -> bool {
+            let mut components = bytes.split(|byte| *byte == b'/').filter(|c| !c.is_empty());
+            match (components.next(), components.next()) {
+                (Some(b"proc"), Some(second)) => {
+                    second == b"self"
+                        || second == b"thread-self"
+                        || second.iter().all(|byte| byte.is_ascii_digit())
+                }
+                (Some(b"dev"), Some(b"fd")) => true,
+                _ => false,
+            }
+        }
         let spelled_ptr = call.path()?;
         let spelled: PathBuf = spelled_ptr.read(&guest.memory()).ok()?;
         let bytes = spelled.as_os_str().as_bytes();
@@ -6089,8 +6107,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         // An absolute spelling the staged probe cannot fit can still
         // be shown outside the area on the host, as the caller's
         // spelled-parent check itself resolves it; a relative one
-        // depends on the guest's dirfd and cannot.
-        if matches!(parent_area, ParentArea::Unknown) && bytes.first() == Some(&b'/') {
+        // depends on the guest's dirfd and cannot. A spelling that
+        // resolves in the guest's own context (a descriptor-table
+        // or task spelling) likewise cannot: host resolution there
+        // names the tracer's descriptors, so neither its success
+        // nor its failure is evidence about the guest's parent.
+        // Such a parent stays `Unknown` and is refused by name
+        // below; that is the accepted bound for a guest-context
+        // spelling too long for the staged guest probe.
+        if matches!(parent_area, ParentArea::Unknown)
+            && bytes.first() == Some(&b'/')
+            && !guest_context_spelling(bytes)
+        {
             let parent_path =
                 Path::new(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(parent));
             parent_area = match (
@@ -6125,10 +6153,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         const TARGET_PART: usize = 512;
         // Linux's nested-link limit (`MAXSYMLINKS`, fs/namei.c): a
         // chain longer than this fails `ELOOP` in the real open.
+        // The walk therefore needs one readlink attempt past the
+        // limit: the parent of a dangling target is decided in the
+        // Err arm of the attempt *after* the readlink that reached
+        // it, so a chain of exactly `MAX_LINKS` links (which Linux
+        // still creates through) is decided by attempt 41, and a
+        // target that is still a link after 41 readlinks means the
+        // real open needs a further traversal and fails `ELOOP`.
         const MAX_LINKS: usize = 40;
         let dirfd = call.dirfd();
         let mut current = bytes.to_vec();
-        for depth in 0..MAX_LINKS {
+        for depth in 0..=MAX_LINKS {
             // The final component of `current` is a link (the spelled
             // one by the `lstat` above, a later one by the readlink
             // that produced it), or the walk ends below.

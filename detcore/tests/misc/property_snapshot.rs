@@ -168,7 +168,11 @@ fn a_property_snapshot_serves_every_read_of_the_files_it_copied() {
 /// chain of dangling final links, and through a dangling link whose
 /// spelling is too long to resolve in the guest (refused fail-closed)
 /// are likewise refused before anything is created, while chained
-/// and plain creations outside the area still succeed.
+/// and plain creations outside the area still succeed. A dangling
+/// chain of exactly the kernel's 40 nested links is likewise
+/// refused (Linux creates through 40 traversals), while a 41-link
+/// chain reaches the real open and fails there with `ELOOP`, as
+/// natively, creating nothing.
 #[test]
 fn a_late_property_file_is_refused_through_alias_spellings() {
     let area = area();
@@ -237,6 +241,36 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
         overlong_link.as_os_str().as_encoded_bytes().len() > 256,
         "the overlong spelling must exceed the staged resolution bound"
     );
+    // Dangling chains at the kernel's nested-link limit, in a fresh
+    // outside directory with no symlinked intermediate components:
+    // `l0 -> l1 -> ... -> l39 -> <area>/absent` is exactly 40 links
+    // (Linux creates through 40 traversals, so the creation must be
+    // refused first), and one more link in front is 41 (Linux
+    // refuses the real open with `ELOOP`).
+    let bound_outside = tempfile::tempdir().unwrap();
+    let bound40_absent_name = "u:object_r:bound40_prop:s0";
+    let bound40_absent_target = area.live.path().join(bound40_absent_name);
+    let bound41_absent_name = "u:object_r:bound41_prop:s0";
+    let bound41_absent_target = area.live.path().join(bound41_absent_name);
+    for index in 0..40 {
+        let next = if index == 39 {
+            bound40_absent_target.clone()
+        } else {
+            PathBuf::from(format!("l{}", index + 1))
+        };
+        std::os::unix::fs::symlink(next, bound_outside.path().join(format!("l{index}"))).unwrap();
+    }
+    let bound40_link1 = bound_outside.path().join("l0");
+    let bound39_link1 = bound_outside.path().join("l1");
+    for index in 0..41 {
+        let next = if index == 40 {
+            bound41_absent_target.clone()
+        } else {
+            PathBuf::from(format!("m{}", index + 1))
+        };
+        std::os::unix::fs::symlink(next, bound_outside.path().join(format!("m{index}"))).unwrap();
+    }
+    let bound41_link1 = bound_outside.path().join("m0");
     let dotdot = area
         .live
         .path()
@@ -265,6 +299,17 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
     let dirfd_absent_host = dirfd_absent_target.clone();
     let chain_absent_host = chain_absent_target.clone();
     let overlong_absent_host = overlong_absent_target.clone();
+    let bound40_absent_host = bound40_absent_target.clone();
+    let bound41_absent_host = bound41_absent_target.clone();
+    // A guest-only descriptor spelling of the area whose parent is
+    // too long to resolve staged: the tracer has no fd 900, so only
+    // resolution in the guest's own context can decide it.
+    let procfd_absent_host = area.live.path().join("long-proc-fd-created");
+    let procfd_outside_host = outside.path().join("proc-fd-outside-created");
+    assert!(
+        !Path::new("/proc/self/fd/900").exists(),
+        "control: fd 900 must be absent in the tracer"
+    );
     let outside_chain_host = outside_chain_target.clone();
     let outside_plain_host = outside_plain_target.clone();
     let guest = move || {
@@ -441,6 +486,38 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
                 libc::O_WRONLY | libc::O_CREAT,
                 "overlong dangling write-only O_CREAT",
             );
+            // Below and at the kernel's 40 nested links: Linux
+            // creates through this many traversals, so both must
+            // be refused.
+            check_refused(
+                &bound39_link1,
+                libc::O_WRONLY | libc::O_CREAT,
+                "39-link dangling chain write-only O_CREAT",
+            );
+            check_refused(
+                &bound40_link1,
+                libc::O_WRONLY | libc::O_CREAT,
+                "exactly-40 dangling chain write-only O_CREAT",
+            );
+            // One link past the limit: the real open fails `ELOOP`
+            // natively (not the property refusal) and creates nothing.
+            {
+                let c =
+                    std::ffi::CString::new(bound41_link1.as_os_str().as_encoded_bytes()).unwrap();
+                // SAFETY: a valid NUL-terminated path and a creation mode.
+                let fd = unsafe { libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_CREAT, 0o644) };
+                if fd >= 0 {
+                    // SAFETY: the descriptor opened above.
+                    unsafe { libc::close(fd) };
+                    failures
+                        .push("41-link dangling chain write-only O_CREAT: open succeeded".into());
+                } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ELOOP) {
+                    failures.push(format!(
+                        "41-link dangling chain write-only O_CREAT: refused with {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
             // `alias-area/<name>` under a dirfd on the outside
             // directory: the alias is the final parent component.
             {
@@ -487,6 +564,54 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
             check_created(&outside_plain_target, "plain outside O_CREAT");
             assert!(failures.is_empty(), "symlinked-parent cases: {failures:?}");
         }
+        // A parent named through a guest-only descriptor, too long
+        // to resolve staged, cannot be decided from the tracer's
+        // descriptor table: creation through it is refused before
+        // it runs, while a short descriptor spelling of an outside
+        // directory is decided in the guest and still creates.
+        {
+            let directory = std::fs::File::open(&live_dir).unwrap();
+            // SAFETY: duplicating an open directory descriptor.
+            assert_eq!(unsafe { libc::dup2(directory.as_raw_fd(), 900) }, 900);
+            let spelling = format!("/proc/self/fd/900/{}long-proc-fd-created", "./".repeat(300));
+            assert!(spelling.len() > 512);
+            let c = std::ffi::CString::new(spelling).unwrap();
+            // SAFETY: a valid NUL-terminated path and a creation mode.
+            let fd = unsafe {
+                libc::open(
+                    c.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                    0o600,
+                )
+            };
+            assert_eq!(fd, -1, "long guest-only fd parent creation must be refused");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EOPNOTSUPP),
+                "long guest-only fd parent"
+            );
+            // SAFETY: the descriptor duplicated above.
+            unsafe { libc::close(900) };
+            drop(directory);
+            let outside_directory = std::fs::File::open(&outside_dir).unwrap();
+            // SAFETY: duplicating an open directory descriptor.
+            assert_eq!(
+                unsafe { libc::dup2(outside_directory.as_raw_fd(), 901) },
+                901
+            );
+            let c = std::ffi::CString::new("/proc/self/fd/901/proc-fd-outside-created").unwrap();
+            // SAFETY: a valid NUL-terminated path and a creation mode.
+            // No `O_EXCL`: the guest runs more than once.
+            let fd = unsafe { libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_CREAT, 0o600) };
+            assert!(
+                fd >= 0,
+                "short proc-fd outside creation: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: the descriptors opened above.
+            unsafe { libc::close(fd) };
+            unsafe { libc::close(901) };
+        }
         let _ = file;
     };
     detcore_testutils::det_test_fn_with_config(
@@ -522,6 +647,22 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
     assert!(
         !overlong_absent_host.exists(),
         "a refused overlong dangling O_CREAT made a file"
+    );
+    assert!(
+        !bound40_absent_host.exists(),
+        "a refused exactly-40 dangling chain O_CREAT made a file"
+    );
+    assert!(
+        !bound41_absent_host.exists(),
+        "an ELOOP 41-link dangling chain O_CREAT made a file"
+    );
+    assert!(
+        !procfd_absent_host.exists(),
+        "a refused long guest-only fd parent O_CREAT made a file"
+    );
+    assert!(
+        procfd_outside_host.exists(),
+        "a short proc-fd creation outside the area made no file"
     );
     assert!(
         outside_chain_host.exists(),
