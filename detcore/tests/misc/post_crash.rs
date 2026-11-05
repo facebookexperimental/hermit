@@ -63,6 +63,44 @@ fn run_scenario_if_inner() {
     std::process::exit(0);
 }
 
+/// Keep the scenario processes from dumping core, so a trial that crashes (a
+/// default-action SIGABRT or SIGSEGV) leaves no core
+/// (https://github.com/rrnewton/hermit/issues/5196 for this test). The crash
+/// and its status are unchanged except the core flag, which no scenario
+/// reads. Dumping a whole test binary took 13 to 15 s WALL a trial where
+/// `core_pattern` pipes to a helper, past the node's CPU bound (two trials,
+/// about 26 s).
+///
+/// Set in this test process, before Detcore starts, so every guest process
+/// inherits the kernel's limit: a guest's own `setrlimit` is Detcore's
+/// virtual limit and does not reach the kernel. Where the hard limit is 0,
+/// the soft limit cannot be raised to 1, and the trials dump as before.
+fn no_core_dumps() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // The soft limit is 1, NOT 0, on purpose. A piped `core_pattern` (one
+    // that starts with `|`) ignores RLIMIT_CORE except for the value 1, the
+    // kernel's recursion guard for core-dump helpers: Linux v6.12
+    // fs/coredump.c:594-611 skips a piped dump when `cprm.limit == 1`
+    // ("RLIMIT_CORE is set to 1, aborting core"; umh_pipe_setup() gives the
+    // helper itself 1), and :613 lifts any other limit to RLIM_INFINITY, so
+    // 0 does not stop a piped dump. For a file pattern, :650 skips a dump
+    // below `min_coredump` (a page), which 1 byte is. See core(5), "Piping
+    // core dumps to a program".
+    // PR_SET_DUMPABLE would also skip the dump, but detcore_testutils traces
+    // without a user namespace, so a non-dumpable guest refuses the tracer's
+    // perf timer (a backend failure in every scenario).
+    // SAFETY: reads and lowers this process's own core limit.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_CORE, &mut limit) == 0 && limit.rlim_max >= 1 {
+            limit.rlim_cur = 1;
+            libc::setrlimit(libc::RLIMIT_CORE, &limit);
+        }
+    }
+}
+
 /// Release pipe shared by the two terminal-edge scenarios: a descendant
 /// created inside an armed handler reads one byte before it execs, and the
 /// byte is written only after the armed thread has ended.
@@ -336,6 +374,7 @@ fn recorded_at(
         post_crash_timeslice: post_crash.and_then(NonZeroU64::new),
         ..Default::default()
     };
+    no_core_dumps();
     // On a thread of its own with a large stack: Detcore's futures outgrow
     // the test harness thread's.
     std::thread::Builder::new()
