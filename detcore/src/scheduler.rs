@@ -762,33 +762,17 @@ pub struct BlockedPool {
     /// absorbs and a bound counted from it would not, so such a thread has no
     /// entry and waits for quiescence alone, as before.
     ///
-    /// Backend parity: bounded delivery is the one Detcore semantics on
-    /// every backend, and child-exit publication is the backend contract
-    /// it rests on. Only a backend whose capabilities report it fences a
-    /// copy, which at this revision is ptrace alone (Reverie's
-    /// `BackendCapabilities::PTRACE`; the e9patch preprocessing path runs
-    /// on ptrace and inherits the bound, untested). On a backend without
-    /// the contract (today LiteInst in-guest, SaBRe, DBT and KVM) nothing
-    /// is fenced, so no entry is recorded here; the deferral instead
-    /// records the same snapshot in `sigchld_unbounded_behind`, and the
-    /// run refuses by name if that bound expires with the delivery still
-    /// deferred, rather than silently waiting for quiescence alone past
-    /// the point where the backends would diverge
+    /// Backend parity: bounded delivery rests on child-exit publication,
+    /// the backend contract only a reporting backend fences a copy under
+    /// (at this revision ptrace alone; the e9patch preprocessing path
+    /// runs on ptrace and inherits the bound, untested). On a backend
+    /// without the contract (today LiteInst in-guest, SaBRe, DBT and KVM)
+    /// nothing is fenced and no entry is recorded here: 4627 adds no new
+    /// deferral there, and the pre-4627 quiescence-only wait remains -
+    /// including its known starvation beside a sibling that never blocks
+    /// - until that backend implements the contract (the P1 follow-ups).
     /// (<https://github.com/rrnewton/hermit/issues/4132>).
     pub sigchld_deferred_behind: BTreeMap<DetTid, BTreeSet<DetTid>>,
-
-    /// The same deferral snapshot as `sigchld_deferred_behind`, for a
-    /// deferral on a backend without child-exit publication: the work
-    /// runnable at the deferral, counted the same way (guest-executing
-    /// turns, `sigchld_deferrals_pass`). It never re-admits anything -
-    /// up to its drain the shared quiescence wait behaves identically on
-    /// every backend, and most deferrals are re-admitted there first.
-    /// Once it drains with the delivery still deferred, the bound would
-    /// expire: that is the exact point bounded delivery would proceed on
-    /// a reporting backend, so step2e refuses the run by name there
-    /// (`refuse_unbounded_sigchld_deferral`) instead of starving beside
-    /// work that never blocks.
-    pub sigchld_unbounded_behind: BTreeMap<DetTid, BTreeSet<DetTid>>,
 
     /// Parent processes whose pending `SIGCHLD` from the kernel was raised at
     /// a point the schedule fixes: a child's exit whose notification Linux
@@ -4701,27 +4685,6 @@ pub(crate) fn child_exit_publication(
             backend: backend_name(capabilities).unwrap_or("a backend"),
         })
     }
-}
-
-/// End the run where a deferred `SIGCHLD` delivery's bound has expired
-/// on a backend without the contract: bounded delivery is the one
-/// Detcore semantics, and it rests on [`child_exit_publication`]. Up to
-/// that expiry the shared quiescence wait behaves identically on every
-/// backend; past it a reporting backend would deliver bounded, so the
-/// run refuses by name there rather than waiting on for quiescence and
-/// starving beside a sibling that never blocks
-/// (docs/ARCHITECTURE.md rules 4 and 6, revastra2 F3 on PR 4627,
-/// coordinator refinement 2026-11-04); a unit test sees it as a panic
-/// with the same text.
-fn refuse_unbounded_sigchld_deferral(unsupported: UnsupportedBackend) -> ! {
-    let refusal = format_args!(
-        "hermit: a SIGCHLD delivery waits behind other runnable work on the {} backend, which does not report child-exit publication (reports_child_exit_publication), the contract bounded SIGCHLD delivery requires; refusing the run rather than deferring it until quiescence (https://github.com/rrnewton/hermit/pull/4627)",
-        unsupported.backend
-    );
-    #[cfg(test)]
-    panic!("{refusal}");
-    #[cfg(not(test))]
-    exit_on_scheduler_refusal(&refusal)
 }
 
 pub(crate) fn refuse_real_time_expiration(signo: i32) -> ! {
@@ -11833,7 +11796,6 @@ impl Scheduler {
     /// behind. Whether it was deferred.
     pub(super) fn undefer_sigchld(&mut self, dtid: DetTid) -> bool {
         self.blocked.sigchld_deferred_behind.remove(&dtid);
-        self.blocked.sigchld_unbounded_behind.remove(&dtid);
         self.blocked.sigchld_deferred.remove(&dtid)
     }
 
@@ -11858,9 +11820,6 @@ impl Scheduler {
             return;
         }
         for behind in self.blocked.sigchld_deferred_behind.values_mut() {
-            behind.remove(&dtid);
-        }
-        for behind in self.blocked.sigchld_unbounded_behind.values_mut() {
             behind.remove(&dtid);
         }
     }
@@ -12021,9 +11980,6 @@ impl Scheduler {
         self.blocked
             .sigchld_deferred_behind
             .retain(|dtid, _| deferred.contains(dtid));
-        self.blocked
-            .sigchld_unbounded_behind
-            .retain(|dtid, _| deferred.contains(dtid));
         if self.blocked.sigchld_deferred.is_empty() {
             return;
         }
@@ -12033,7 +11989,6 @@ impl Scheduler {
             // order when several parents are owed a signal at the same quiescence.
             let ready = std::mem::take(&mut self.blocked.sigchld_deferred);
             self.blocked.sigchld_deferred_behind.clear();
-            self.blocked.sigchld_unbounded_behind.clear();
             for dtid in ready {
                 info!("[step2] Re-admit deferred SIGCHLD for dtid {:?}", dtid);
                 self.blocked.sigchld_ready.insert(dtid);
@@ -12053,25 +12008,6 @@ impl Scheduler {
             self.undefer_sigchld(next);
             self.blocked.sigchld_ready.insert(next);
             self.readmit_ready_thread(next);
-        }
-        // On a backend without child-exit publication, an unbounded
-        // snapshot that has drained with its delivery still deferred is
-        // the exact point the backends would diverge: bounded delivery
-        // would proceed there, so the run refuses by name instead of
-        // waiting on for quiescence. Checked after the quiescence and
-        // replay readmissions above, which most deferrals reach first.
-        if let Err(unsupported) = self.child_exit_publication() {
-            let expired = self
-                .blocked
-                .sigchld_unbounded_behind
-                .iter_mut()
-                .any(|(dtid, behind)| {
-                    behind.retain(|ahead| self.run_queue.holds_work(*ahead));
-                    behind.is_empty() && self.blocked.sigchld_deferred.contains(dtid)
-                });
-            if expired {
-                refuse_unbounded_sigchld_deferral(unsupported);
-            }
         }
         // In DetTid order, each thread whose delivery has waited behind all
         // the work that was runnable when it was deferred. Under a schedule
@@ -19195,19 +19131,11 @@ impl Scheduler {
                     // The work it waits behind: what is runnable now. Each of
                     // these leaves the set at its next guest-executing commit
                     // (`unblock_guest`) or once it is no longer runnable work
-                    // (step2e). Recorded where the schedule fixes the turn of
-                    // this deferral (`sigchld_deferred_behind`); on a backend
-                    // without child-exit publication nothing is fenced, so
-                    // the same snapshot bounds the quiescence wait instead
-                    // (`sigchld_unbounded_behind`): up to its drain both
-                    // backends behave identically, and step2e refuses by
-                    // name there rather than starving past it.
+                    // (step2e). Only where the schedule fixes the turn of
+                    // this deferral (`sigchld_deferred_behind`).
                     if fenced {
                         let behind = self.run_queue.runnable_besides(dettid);
                         self.blocked.sigchld_deferred_behind.insert(dettid, behind);
-                    } else if self.child_exit_publication().is_err() {
-                        let behind = self.run_queue.runnable_besides(dettid);
-                        self.blocked.sigchld_unbounded_behind.insert(dettid, behind);
                     }
                     Err(SkipTurn)
                 } else {
@@ -41334,14 +41262,14 @@ mod test {
         assert!(!scheduler.blocked.sigchld_fenced.contains_key(&process));
     }
 
-    /// On a backend without child-exit publication, a `SIGCHLD` delivery
-    /// that waits behind other work refuses the run by name at its
-    /// deferral instead of waiting for quiescence alone: bounded delivery
-    /// is the one semantics, and no copy can be fenced there
-    /// (revastra2 F3 on PR 4627, coordinator ruling 2026-11-04).
+    /// On a backend without child-exit publication this change adds no
+    /// new deferral and no bound: a `SIGCHLD` delivery that waits behind
+    /// other work keeps the pre-4627 quiescence wait, however many turns
+    /// the work ahead of it commits (coordinator shape (B) for revastra2
+    /// F3 on PR 4627), and the typed operation names the unsupported
+    /// backend its deferral would have needed.
     #[test]
-    #[should_panic(expected = "does not report child-exit publication")]
-    fn a_sigchld_deferral_without_child_exit_publication_refuses_by_name() {
+    fn a_sigchld_deferral_without_child_exit_publication_waits_for_quiescence() {
         let config = Config {
             backend: BackendCapabilities::DBT,
             ..Config::default()
@@ -41361,8 +41289,6 @@ mod test {
             Some(signaled)
         );
         let inbound = ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD));
-        // The deferral itself is shared semantics: it parks and records
-        // the unbounded snapshot, with no refusal yet.
         assert!(
             scheduler
                 .block_for_one_resource(
@@ -41376,18 +41302,24 @@ mod test {
                 .is_err()
         );
         assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
-        assert_eq!(
-            scheduler.blocked.sigchld_unbounded_behind.get(&signaled),
-            Some(&BTreeSet::from([busy]))
+        assert!(
+            !scheduler
+                .blocked
+                .sigchld_deferred_behind
+                .contains_key(&signaled),
+            "no bound is recorded without the contract"
         );
-        // The work it waited behind has not run: no refusal yet, and no
-        // readmission (the busy thread is still runnable work).
-        scheduler.step2e_process_signal_deferred();
-        assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
-        // It had its guest-executing turn: the bound expires with the
-        // delivery still deferred, which refuses by name.
+        // The busy thread's turn does not readmit it (no bound here), and
+        // does not refuse the run either: the shared wait continues.
         scheduler.sigchld_deferrals_pass(busy, true);
         scheduler.step2e_process_signal_deferred();
+        assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
+        // Once the busy work leaves the queue the run is quiescent for
+        // this purpose and the delivery is re-admitted, as before 4627.
+        assert!(scheduler.run_queue.remove_tid(busy));
+        scheduler.step2e_process_signal_deferred();
+        assert!(!scheduler.blocked.sigchld_deferred.contains(&signaled));
+        assert!(scheduler.blocked.sigchld_ready.contains(&signaled));
     }
 
     /// Two more routes by which a fenced copy goes without a delivery taking
