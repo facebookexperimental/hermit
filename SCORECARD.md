@@ -59,7 +59,7 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `determinism-stress-c` | 11 / 11 | 11 / 11 | 1 / 11 | 23 | 33 |
 | `gvisor` | 0 / 148 | 0 / 148 | 0 / 148 | 0 | 444 |
 | `language-runtimes` | 21 / 22 | 19 / 22 | 0 / 22 | 40 | 66 |
-| `rr` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
+| `rr` | 0 / 32 | 0 / 32 | 0 / 32 | 0 | 96 |
 | `shared-futex-c` | 1 / 4 | 0 / 4 | 0 / 4 | 1 | 12 |
 | `system-utils` | 41 / 41 | 40 / 41 | 0 / 41 | 81 | 123 |
 | `util-c` | 1 / 1 | 0 / 1 | 0 / 1 | 1 | 3 |
