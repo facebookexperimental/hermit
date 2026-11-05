@@ -42,6 +42,9 @@ mod sigalrm;
 pub mod sigkill_retirement;
 pub(crate) mod signal_control;
 pub(crate) mod signal_lists;
+mod signal_state_reader;
+#[cfg(test)]
+mod signal_state_reader_tests;
 mod sleep_signal;
 pub mod timed_waiters;
 pub(crate) mod user_namespaces;

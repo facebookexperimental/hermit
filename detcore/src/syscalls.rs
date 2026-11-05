@@ -96,10 +96,12 @@ pub(crate) use threads::keep_status_files_open;
 pub(crate) use threads::kernel_sigset_bit;
 pub(crate) use threads::read_kernel_signal_state;
 pub(crate) use threads::read_thread_signal_state;
+pub(crate) use threads::reads_signal_state_from_backend;
 pub(crate) use threads::real_uid;
 pub(crate) use threads::refuse_host_signal_state_reads;
 pub(crate) use threads::refuses_host_signal_state_reads;
 pub(crate) use threads::retires_others_at_fatal_delivery;
+pub(crate) use threads::signal_sets_errno;
 #[cfg(test)]
 pub(crate) use threads::signal_state_read_seam;
 pub(crate) use threads::thread_is_gone;
