@@ -9516,6 +9516,16 @@ fn append_validate_series(
         result_root.display(),
         String::from_utf8_lossy(&output.stdout).trim()
     );
+    // The writer prints one "published scan: ... fast|full" line per scan to
+    // stderr; success used to drop it, so a post-graph stall inside the
+    // append was invisible in the validate log (2026-11-04: every scan read
+    // in full for ~8 min with nothing naming the phase). Forward those
+    // lines so the driver's own log says which path ran.
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        if line.contains("published scan:") {
+            eprintln!("validate: series writer: {line}");
+        }
+    }
     Ok(true)
 }
 
