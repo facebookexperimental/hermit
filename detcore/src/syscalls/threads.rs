@@ -1673,6 +1673,36 @@ pub(crate) fn signal_sets_errno(error: reverie::FactError) -> Errno {
     }
 }
 
+/// The calling thread's signal state, from the backend where Detcore reads
+/// it there ([`reads_signal_state_from_backend`]: `Guest::signal_sets`, in
+/// this thread's own callback, while it is stopped), and `None` elsewhere,
+/// where the caller keeps its `/proc` read.
+fn backend_signal_state_of_caller<G, T>(guest: &G) -> Option<Result<KernelSignalState, Errno>>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    reads_signal_state_from_backend(&guest.config().backend).then(|| {
+        guest
+            .signal_sets(guest.tid())
+            .map(|sets| KernelSignalState::from_backend_sets(&sets))
+            .map_err(signal_sets_errno)
+    })
+}
+
+/// [`read_thread_signal_state`] of the calling thread, read from the backend
+/// where its guest threads are not host tasks
+/// ([`reads_signal_state_from_backend`]), so that no host task's `/proc`
+/// state reaches a decision there.
+pub(crate) fn read_guest_thread_signal_state<G, T>(guest: &G) -> Result<KernelSignalState, Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    backend_signal_state_of_caller(guest)
+        .unwrap_or_else(|| read_thread_signal_state(guest.pid(), guest.tid()))
+}
+
 /// A test seam in front of the `/proc` read in [`read_kernel_signal_state`].
 #[cfg(test)]
 pub(crate) mod signal_state_read_seam {

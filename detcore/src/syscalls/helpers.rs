@@ -1079,12 +1079,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         resources.polls_channel = self
             .pipe_channel_end(guest, call.fd())
             .map(|end| Box::new((end.channel, crate::pipe_wake::Wants::Space)));
-        // Without a host task whose kernel state the scheduler can filter by
-        // (KVM), the scheduler keeps every signal and the write checks after
-        // the wake, as `execute_blocking_pipe_writev` does, whether one would
-        // be delivered: a blocked or ignored signal must not end a write that
+        // Without a thread whose signal state the scheduler can filter by
+        // (`guest_signal_state_task`: KVM without sequentialized threads),
+        // the scheduler keeps every signal and the write checks after the
+        // wake, as `execute_blocking_pipe_writev` does, whether one would be
+        // delivered: a blocked or ignored signal must not end a write that
         // has made progress, which would return a short count where Linux
-        // keeps waiting.
+        // keeps waiting. Wherever a reader answers, the drain has already
+        // filtered by that state, so a `Signaled` wake is one Linux would
+        // deliver.
         let disposition_scratch = if resources.signal_state_task.is_none() {
             resources.decides_signal_interruption_itself = true;
             let mut stack = guest.stack().await;
@@ -3214,17 +3217,25 @@ where
     retry_nonblocking_syscall_helper(guest, call, rsrc, maybe_tup, None).await
 }
 
-/// The task whose kernel signal state the scheduler may read to decide which
-/// signal ends an internal IO poll: the guest thread itself where guest thread
-/// IDs name host tasks, and `None` elsewhere (KVM), where
-/// `/proc/<pid>/task/<tid>` would describe an unrelated host task.
+/// The task whose signal state the scheduler may read to decide which signal
+/// ends an internal IO poll: the guest thread itself wherever a reader
+/// answers for it. Where guest thread IDs name host tasks that is the
+/// kernel's `/proc` state; where they do not (KVM), the state its backend
+/// reports (`Scheduler::backend_signal_state`, SIGSHARE S2), which the
+/// scheduler reads through the run-scoped signal control installed only for
+/// sequentialized threads. `None` for KVM without sequentialized threads,
+/// where no reader answers and `/proc/<pid>/task/<tid>` would describe an
+/// unrelated host task.
 pub(crate) fn guest_signal_state_task<T, G>(guest: &G) -> Option<(i32, i32)>
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    crate::procfs_inode::guest_tids_name_host_tasks(&guest.config().backend, None)
-        .then(|| (guest.pid().as_raw(), guest.tid().as_raw()))
+    let config = guest.config();
+    let reader_answers = crate::procfs_inode::guest_tids_name_host_tasks(&config.backend, None)
+        || (crate::syscalls::reads_signal_state_from_backend(&config.backend)
+            && config.sequentialize_threads);
+    reader_answers.then(|| (guest.pid().as_raw(), guest.tid().as_raw()))
 }
 
 /// Whether a signal that woke a poll would be delivered to this thread now,

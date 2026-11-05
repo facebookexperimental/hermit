@@ -856,18 +856,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Whether a default job-control stop is pending for the caller, whose
     /// wait a signal just ended without a lock: `SIGSTOP`, or `SIGTSTP`,
     /// `SIGTTIN` or `SIGTTOU` while their disposition is `SIG_DFL`, read from
-    /// the kernel's signal state of the thread where guest threads are host
-    /// tasks. The scheduler ended the wait for that signal in this turn, and a
-    /// guest's own call alone changes a pending bit Detcore recorded the send
-    /// of, so the read decides as the scheduler did.
+    /// the thread's signal state wherever a reader answers for it
+    /// (`guest_signal_state_task`): the kernel's where guest threads are host
+    /// tasks, and the backend's where they are not (KVM), never a host task's
+    /// `/proc` state there (`read_guest_thread_signal_state`). The scheduler
+    /// ended the wait for that signal in this turn, and a guest's own call
+    /// alone changes a pending bit Detcore recorded the send of, so the read
+    /// decides as the scheduler did.
     fn flock_wait_stopped<G: Guest<Self>>(&self, guest: &G) -> bool {
-        let Some((pid, tid)) = crate::syscalls::helpers::guest_signal_state_task(guest) else {
+        if crate::syscalls::helpers::guest_signal_state_task(guest).is_none() {
             return false;
-        };
-        let Ok(state) = crate::syscalls::read_thread_signal_state(
-            reverie::Pid::from_raw(pid),
-            reverie::Pid::from_raw(tid),
-        ) else {
+        }
+        let Ok(state) = crate::syscalls::read_guest_thread_signal_state(guest) else {
             return false;
         };
         let stops =

@@ -324,3 +324,255 @@ fn an_unknown_state_is_an_error_never_an_empty_state() {
     );
     assert!(control.asked().is_empty());
 }
+
+// The step-2 drain decision for a restartable internal IO poll on KVM
+// (design section 12's matrix, rows 1-9; it replaces
+// `the_drain_never_reads_kernel_signal_state_under_process_signal_control`,
+// which pinned the keep-every-signal guard this reader retires). Each row
+// scripts the target's backend state, sends one signal as a guest's
+// cross-task send (`notify_signal_pending`), and runs the drain. Mutations
+// each row catches:
+// - "guard left in place" (every signal wakes): the must-not-wake rows;
+// - "filter by pending instead of mask and disposition": the state has
+//   nothing pending, so a pending-based filter wakes nothing;
+// - "hold dropped": the SIGCHLD and host-timed rows;
+// - "SigBlk used under a published mask": the published-mask row.
+
+/// The poller: thread 100, its own process's leader.
+const POLLER: DetTid = DetTid::from_raw(100);
+
+/// A KVM scheduler, with the scripted control installed, whose thread 100
+/// polls internally (a `read` of an empty pipe), with the backend state
+/// `state` scripted for it. `decides_itself` marks a parked pipe `writev`,
+/// and `names_task` stamps the request with the thread's own task, as
+/// `guest_signal_state_task` stamps it wherever a reader answers.
+fn kvm_poller(
+    state: SignalSets,
+    decides_itself: bool,
+    names_task: bool,
+) -> (Scheduler, Arc<ScriptedControl>) {
+    let control = Arc::new(ScriptedControl::default());
+    let mut scheduler = kvm_scheduler(&control, true);
+    add_bound_thread(&mut scheduler, POLLER, POLLER);
+    control.script(POLLER, vec![Ok(state)]);
+    let mut polling = Resources::new(POLLER);
+    polling.insert(ResourceID::InternalIOPolling, Permission::W);
+    polling.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+    polling.signal_state_task = names_task.then_some((POLLER.as_raw(), POLLER.as_raw()));
+    polling.decides_signal_interruption_itself = decides_itself;
+    polling.fyi(if decides_itself { "writev" } else { "read" });
+    scheduler.next_turns.get_mut(&POLLER).unwrap().req = Ivar::full(Ok(polling));
+    scheduler.runqueue_push_back(POLLER);
+    (scheduler, control)
+}
+
+/// Send `signal` to the poller and drain; the signals its wake carries
+/// (empty when it keeps polling).
+fn send_and_drain(scheduler: &mut Scheduler, signal: i32) -> Vec<SigWrapper> {
+    scheduler.notify_signal_pending(POLLER, SigWrapper(signal));
+    scheduler.drain_pending_cross_task_signals();
+    scheduler.inbound_signals(POLLER)
+}
+
+/// The poller still holds its polling request, unchanged, in the run queue.
+fn keeps_polling(scheduler: &Scheduler) -> bool {
+    let request = scheduler
+        .next_turns
+        .get(&POLLER)
+        .and_then(|turn| turn.req.try_read())
+        .and_then(Result::ok)
+        .expect("the poller holds a request");
+    scheduler.run_queue.contains_tid(POLLER)
+        && request.resources.len() == 1
+        && request
+            .resources
+            .contains_key(&ResourceID::InternalIOPolling)
+}
+
+fn woke_with(scheduler: &Scheduler, signals: &[i32]) -> bool {
+    let request = scheduler
+        .next_turns
+        .get(&POLLER)
+        .and_then(|turn| turn.req.try_read())
+        .and_then(Result::ok)
+        .expect("the poller holds a request");
+    scheduler.run_queue.contains_tid(POLLER)
+        && request.signal_interrupt_errno() == Some(Errno::ERESTARTSYS.into_raw())
+        && scheduler.inbound_signals(POLLER)
+            == signals
+                .iter()
+                .map(|signal| SigWrapper(*signal))
+                .collect::<Vec<_>>()
+}
+
+#[test]
+fn a_blocked_signal_does_not_wake_a_kvm_poll() {
+    // Caught, but blocked by the thread's mask.
+    let (mut scheduler, control) =
+        kvm_poller(sets(bit(libc::SIGUSR1), 0, bit(libc::SIGUSR1)), false, true);
+    assert!(send_and_drain(&mut scheduler, libc::SIGUSR1).is_empty());
+    assert!(keeps_polling(&scheduler));
+    assert_eq!(control.asked(), vec![identity(POLLER, POLLER)]);
+}
+
+#[test]
+fn an_ignored_signal_does_not_wake_a_kvm_poll() {
+    let (mut scheduler, _) = kvm_poller(sets(0, bit(libc::SIGUSR1), 0), false, true);
+    assert!(send_and_drain(&mut scheduler, libc::SIGUSR1).is_empty());
+    assert!(keeps_polling(&scheduler));
+}
+
+#[test]
+fn a_default_ignored_signal_does_not_wake_a_kvm_poll() {
+    for signal in [libc::SIGCHLD, libc::SIGWINCH, libc::SIGURG, libc::SIGCONT] {
+        let (mut scheduler, _) = kvm_poller(sets(0, 0, 0), false, true);
+        assert!(
+            send_and_drain(&mut scheduler, signal).is_empty(),
+            "signal {signal}"
+        );
+        assert!(keeps_polling(&scheduler), "signal {signal}");
+    }
+}
+
+#[test]
+fn a_caught_signal_wakes_a_kvm_poll() {
+    let (mut scheduler, _) = kvm_poller(sets(0, 0, bit(libc::SIGUSR1)), false, true);
+    send_and_drain(&mut scheduler, libc::SIGUSR1);
+    assert!(woke_with(&scheduler, &[libc::SIGUSR1]));
+    // The wake keeps the request's task, so a later batch is filtered by the
+    // same thread's state.
+    let request = scheduler.next_turns[&POLLER]
+        .req
+        .try_read()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        request.signal_state_task,
+        Some((POLLER.as_raw(), POLLER.as_raw()))
+    );
+    assert!(!request.decides_signal_interruption_itself);
+}
+
+#[test]
+fn a_default_fatal_signal_wakes_a_kvm_poll() {
+    let (mut scheduler, _) = kvm_poller(sets(0, 0, 0), false, true);
+    send_and_drain(&mut scheduler, libc::SIGTERM);
+    assert!(woke_with(&scheduler, &[libc::SIGTERM]));
+}
+
+#[test]
+fn held_signals_do_not_wake_a_kvm_poll() {
+    // A caught SIGCHLD is held, as for a futex waiter (`futex_wait_held_signals`).
+    let (mut scheduler, _) = kvm_poller(sets(0, 0, bit(libc::SIGCHLD)), false, true);
+    assert!(send_and_drain(&mut scheduler, libc::SIGCHLD).is_empty());
+    assert!(keeps_polling(&scheduler));
+    // So is a caught signal a host-timed source armed by the process can post.
+    let (mut scheduler, _) = kvm_poller(sets(0, 0, bit(libc::SIGUSR2)), false, true);
+    scheduler.record_host_timed_signals(POLLER, HostTimedSignalScope::Caller, bit(libc::SIGUSR2));
+    assert!(send_and_drain(&mut scheduler, libc::SIGUSR2).is_empty());
+    assert!(keeps_polling(&scheduler));
+}
+
+#[test]
+fn a_kvm_poll_is_filtered_by_the_mask_it_published() {
+    // The poll blocks every blockable signal in place and published the
+    // guest's own mask, which leaves SIGUSR1 unblocked.
+    let (mut scheduler, _) = kvm_poller(sets(!0, 0, bit(libc::SIGUSR1)), false, true);
+    assert!(scheduler.set_saved_guest_sigmask(POLLER, Some(0)));
+    send_and_drain(&mut scheduler, libc::SIGUSR1);
+    assert!(woke_with(&scheduler, &[libc::SIGUSR1]));
+    // And the published mask blocks one the backend's mask lets through.
+    let (mut scheduler, _) = kvm_poller(sets(0, 0, bit(libc::SIGUSR1)), false, true);
+    assert!(scheduler.set_saved_guest_sigmask(POLLER, Some(bit(libc::SIGUSR1))));
+    assert!(send_and_drain(&mut scheduler, libc::SIGUSR1).is_empty());
+    assert!(keeps_polling(&scheduler));
+}
+
+#[test]
+fn an_already_woken_kvm_poll_merges_only_signals_that_interrupt_it() {
+    let (mut scheduler, _) = kvm_poller(
+        sets(
+            bit(libc::SIGUSR2),
+            0,
+            bit(libc::SIGUSR1) | bit(libc::SIGUSR2),
+        ),
+        false,
+        true,
+    );
+    send_and_drain(&mut scheduler, libc::SIGUSR1);
+    assert!(woke_with(&scheduler, &[libc::SIGUSR1]));
+    // A blocked one sent to the woken poll is not added to its wake.
+    send_and_drain(&mut scheduler, libc::SIGUSR2);
+    assert!(woke_with(&scheduler, &[libc::SIGUSR1]));
+    // A caught one is.
+    send_and_drain(&mut scheduler, libc::SIGTERM);
+    assert!(woke_with(&scheduler, &[libc::SIGUSR1, libc::SIGTERM]));
+}
+
+#[test]
+fn a_kvm_writev_that_decides_for_itself_is_not_filtered() {
+    // A parked pipe writev polls under a private mask and checks the
+    // disposition itself after the wake, on every backend: the drain keeps
+    // every signal for it and never asks the backend.
+    let (mut scheduler, control) =
+        kvm_poller(sets(bit(libc::SIGUSR1), 0, bit(libc::SIGUSR1)), true, true);
+    send_and_drain(&mut scheduler, libc::SIGUSR1);
+    assert!(woke_with(&scheduler, &[libc::SIGUSR1]));
+    assert!(control.asked().is_empty());
+}
+
+#[test]
+fn a_kvm_poll_whose_state_is_unknown_keeps_every_signal_it_does_not_hold() {
+    // The backend no longer has the task (it exited): the wake is what it was
+    // before this reader, and the woken call decides.
+    let (mut scheduler, control) =
+        kvm_poller(sets(bit(libc::SIGUSR1), 0, bit(libc::SIGUSR1)), false, true);
+    control.script(POLLER, vec![Err(FactError::Errno(reverie::Errno::ESRCH))]);
+    send_and_drain(&mut scheduler, libc::SIGUSR1);
+    assert!(woke_with(&scheduler, &[libc::SIGUSR1]));
+    // A held signal stays held.
+    assert!(send_and_drain(&mut scheduler, libc::SIGCHLD) == vec![SigWrapper(libc::SIGUSR1)]);
+
+    // A request that names no task: the backend is not asked.
+    let (mut scheduler, control) = kvm_poller(
+        sets(bit(libc::SIGUSR1), 0, bit(libc::SIGUSR1)),
+        false,
+        false,
+    );
+    send_and_drain(&mut scheduler, libc::SIGUSR1);
+    assert!(woke_with(&scheduler, &[libc::SIGUSR1]));
+    assert!(control.asked().is_empty());
+}
+
+#[test]
+fn the_kvm_drain_never_reads_host_proc() {
+    use std::sync::atomic::Ordering;
+    // With the control installed the backend answers; without it (a run
+    // without sequentialized threads) nothing does, and every signal the
+    // wait does not hold wakes the poll, as before this reader. In neither
+    // case is a host task's `/proc` state read.
+    for installed in [true, false] {
+        let control = Arc::new(ScriptedControl::default());
+        let mut scheduler = kvm_scheduler(&control, installed);
+        add_bound_thread(&mut scheduler, POLLER, POLLER);
+        control.script(
+            POLLER,
+            vec![Ok(sets(bit(libc::SIGUSR1), 0, bit(libc::SIGUSR1)))],
+        );
+        let mut polling = Resources::new(POLLER);
+        polling.insert(ResourceID::InternalIOPolling, Permission::W);
+        polling.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+        polling.signal_state_task = Some((POLLER.as_raw(), POLLER.as_raw()));
+        scheduler.next_turns.get_mut(&POLLER).unwrap().req = Ivar::full(Ok(polling));
+        scheduler.runqueue_push_back(POLLER);
+        let woke = send_and_drain(&mut scheduler, libc::SIGUSR1);
+        assert_eq!(
+            scheduler
+                .test_internal_io_signal_state_reads
+                .load(Ordering::Relaxed),
+            0,
+            "installed {installed}"
+        );
+        assert_eq!(woke.is_empty(), installed, "installed {installed}");
+    }
+}

@@ -15551,7 +15551,9 @@ impl Scheduler {
     /// The signals that would interrupt the restartable internal IO poll of
     /// `dettid` (`restartable_internal_io_signals`), read from the thread the
     /// request names for `/proc` (`Resources::signal_state_task`; with none,
-    /// no signal is filtered out). A poll that decides for itself
+    /// no signal is filtered out), or, where guest threads are not host tasks
+    /// (KVM), from the state its backend reports for the thread
+    /// (`backend_signal_state`, SIGSHARE S2). A poll that decides for itself
     /// (`Resources::decides_signal_interruption_itself`, a parked pipe
     /// `writev`, which polls with every ordinary signal blocked) is not
     /// passed here. The signals kept are those unblocked under its mask,
@@ -15580,13 +15582,36 @@ impl Scheduler {
         // A guest thread ID names a host task only on a backend whose guest
         // runs as host tasks. Elsewhere (KVM) `/proc/<pid>/task/<tid>` is an
         // unrelated host task, if any, chosen by host thread-ID allocation, so
-        // its state must never decide which signal ends the poll: keep every
-        // signal the wait does not hold, and the woken call decides from the
-        // backend's own state (a scalar pipe write checks the guest's mask and
-        // disposition; a call with no progress returns ERESTARTSYS, which the
-        // backend restarts unless a signal it would deliver is pending).
-        if !crate::procfs_inode::guest_tids_name_host_tasks(&self.backend, None) {
-            return !held;
+        // its state must never decide which signal ends the poll. The backend
+        // reports the thread's state instead (`backend_signal_state`), read
+        // here at the step-2 drain, where no guest thread holds the turn, as
+        // `/proc` is read on ptrace: the same filter then decides
+        // (`poll_wake_signals`, with `models_signal_targets` false there, so
+        // by mask and disposition). A request that names no task, or a state
+        // the backend cannot report, keeps every signal the wait does not
+        // hold, as before this reader: the woken call then returns
+        // ERESTARTSYS, which the backend restarts unless a signal it would
+        // deliver is pending.
+        if crate::syscalls::reads_signal_state_from_backend(&self.backend) {
+            let Some(Some(read)) = task.map(|_| self.backend_signal_state(dettid)) else {
+                return !held;
+            };
+            return match read {
+                Ok(state) => {
+                    poll_wake_signals(
+                        &self.under_published_mask(dettid, state),
+                        self.models_signal_targets,
+                    ) & !held
+                }
+                Err(errno) => {
+                    debug!(
+                        "[dtid {}] its backend cannot report the signal state of its internal \
+                         IO poll ({}); treating every signal it does not hold as interrupting.",
+                        dettid, errno
+                    );
+                    !held
+                }
+            };
         }
         // Unit tests script a thread's state; one with none scripted keeps
         // the unfiltered behaviour and never reads a host task's.
@@ -46365,10 +46390,13 @@ mod test {
     /// On a backend that owns process signal control (KVM) a guest thread ID
     /// is not a host task, so the drain never reads kernel signal state for
     /// it: `/proc/<pid>/task/<tid>` would describe an unrelated host task,
-    /// chosen by host thread-ID allocation. Every signal the wait does not
-    /// hold wakes the poll, which decides for itself: here the SIGUSR1 that
-    /// the (never consulted) scripted state blocks still wakes it. On ptrace
-    /// the same poll is filtered by that state.
+    /// chosen by host thread-ID allocation. The backend reports the state
+    /// instead, through the run-scoped control (SIGSHARE S2; its matrix is
+    /// `scheduler::signal_state_reader_tests`). With no control installed,
+    /// as here, nothing answers, and every signal the wait does not hold
+    /// wakes the poll: here the SIGUSR1 that the (never consulted) scripted
+    /// `/proc` state blocks still wakes it. On ptrace the same poll is
+    /// filtered by that state.
     #[test]
     fn the_drain_never_reads_kernel_signal_state_under_process_signal_control() {
         use std::sync::atomic::Ordering;

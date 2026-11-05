@@ -47,13 +47,6 @@ impl Scheduler {
     ///
     /// Callers treat every error as an unknown state, which is what the
     /// refused `/proc` read gave them before.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "its first caller is the step-2 drain decision, in the next commit"
-        )
-    )]
     pub(crate) fn backend_signal_state(
         &self,
         dettid: DetTid,
