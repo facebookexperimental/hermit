@@ -56316,21 +56316,24 @@ fn replay_only_ignores_an_unused_requested_cpu_profile() {
         ("env-host", Some("host-no-rdrand")),
     ] {
         let second = directory.path().join(label);
-        let mut command = hermit_command(&[
+        // The flag-v3 row's flag belongs before `--` (after it, it would
+        // be a guest argument and the row would test nothing).
+        let mut args = vec![
             "record",
             "start",
             "--verify-run",
             second.to_str().unwrap(),
             "--verify-replay-of",
             first.to_str().unwrap(),
-            "--",
-            image,
-        ]);
+        ];
+        if requested.is_none() {
+            args.extend(["--cpu-profile", "x86-64-v3"]);
+        }
+        args.extend(["--", image]);
+        let mut command = hermit_command(&args);
         match requested {
             Some(profile) => command.env("HERMIT_CPU_PROFILE", profile),
-            None => command
-                .env_remove("HERMIT_CPU_PROFILE")
-                .args(["--cpu-profile", "x86-64-v3"]),
+            None => command.env_remove("HERMIT_CPU_PROFILE"),
         };
         let output =
             hermit_test::hermit_output("hermit record start --verify-replay-of", &mut command);

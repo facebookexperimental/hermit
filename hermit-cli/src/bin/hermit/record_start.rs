@@ -2057,9 +2057,14 @@ mod tests {
             Mount::bind("/host/libdir", "/guest/lib"),
             Mount::new("/guest/hidden"),
         ];
+        // Raw OsStr: PathBuf equality treats a trailing slash (the old
+        // exact-bind bug, SOURCE/) as the same path as SOURCE.
         assert_eq!(
-            options.mapped_launch_path(Path::new("/guest/prog")),
-            Some(PathBuf::from("/host/prog-source"))
+            options
+                .mapped_launch_path(Path::new("/guest/prog"))
+                .as_deref()
+                .map(Path::as_os_str),
+            Some(std::ffi::OsStr::new("/host/prog-source"))
         );
         assert_eq!(
             options.mapped_launch_path(Path::new("/guest/lib/ld.so")),
