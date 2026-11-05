@@ -1075,9 +1075,11 @@ struct RunPaths {
 /// The counted run of the whole population: the required tests and the gap rows together, so
 /// the gap rows run under the same executables, budgets and backend. NEXTEST_RETRIES=0 overrides
 /// any inherited value, the profile and every per-test override (measured with cargo-nextest
-/// 0.9.100), so every test runs exactly once. RUST_BACKTRACE=0 keeps a panic's output in the form
-/// the signatures match (std's "note: run with `RUST_BACKTRACE=1`" line rather than a backtrace),
-/// whatever the caller's environment.
+/// 0.9.100), so every test runs exactly once. HERMIT_NEXTEST_FAIL_FAST=0 likewise overrides the
+/// executor's fail-fast default: a known-gap row's expected failure is diagnostic, and the
+/// ledger can judge only a run that attempted the whole population. RUST_BACKTRACE=0 keeps a
+/// panic's output in the form the signatures match (std's "note: run with `RUST_BACKTRACE=1`"
+/// line rather than a backtrace), whatever the caller's environment.
 fn counted_run(
     root: &Path,
     declaration: &Declaration,
@@ -1091,6 +1093,7 @@ fn counted_run(
         .env("HERMIT_TEST_BACKEND", declaration.backend)
         .env(known_gaps::BACKEND_PROOF_ENV, &paths.proof)
         .env("NEXTEST_RETRIES", "0")
+        .env("HERMIT_NEXTEST_FAIL_FAST", "0")
         .env("RUST_BACKTRACE", "0")
         .env("NEXTEST_EXPECTED_EXECUTED", population.to_string())
         .env("DAGRUN_TEST_COUNTS_PATH", &paths.all)
@@ -1963,8 +1966,8 @@ mod tests {
         );
     }
 
-    /// The counted run gets zero retries and the declared backend, and the node refuses an
-    /// argument that would ask for retries, or a filter expression beside its own.
+    /// The counted run gets zero retries, no executor fail-fast and the declared backend, and
+    /// the node refuses an argument that would ask for retries, or a filter beside its own.
     #[test]
     fn the_counted_run_allows_no_retry() {
         for arguments in [["--retries", "2"].as_slice(), ["--retries=2"].as_slice()] {
@@ -2011,6 +2014,7 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         for (name, value) in [
             ("NEXTEST_RETRIES", "0"),
+            ("HERMIT_NEXTEST_FAIL_FAST", "0"),
             ("RUST_BACKTRACE", "0"),
             ("HERMIT_TEST_BACKEND", "kvm"),
             ("NEXTEST_EXPECTED_EXECUTED", "5"),
