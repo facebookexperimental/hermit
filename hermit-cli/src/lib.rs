@@ -8778,9 +8778,10 @@ mod tests {
     }
 
     /// The public entry admits a replay whose final config states the
-    /// same rewrite as its record: provenance is not the refusal. (On
-    /// this host the memory form may still be refused later for want of
-    /// FEAT_LSE; what must not appear is the admission refusal.)
+    /// same rewrite as its record and runs the guest: the overlay form
+    /// succeeds on every host, and the memory form succeeds where the
+    /// host executes FEAT_LSE and is otherwise refused by exactly that
+    /// host refusal -- never by rewrite-provenance admission.
     #[test]
     fn run_with_output_admits_the_matching_exclusive_rewrite() {
         let dir = tempfile::tempdir().unwrap();
@@ -8803,28 +8804,43 @@ mod tests {
             let config = super::DetConfig {
                 replay_schedule_from: Some(record),
                 rewrite_exclusives_in_memory: in_memory,
-<<<<<<< HEAD
-                rewrite_exclusives_overlay: overlay,
-=======
                 rewrite_exclusives_overlay: overlay
                     .then(|| std::path::PathBuf::from("/bin/echo"))
                     .into_iter()
                     .collect(),
                 sequentialize_threads: true,
                 max_timeslice: None,
->>>>>>> cb77f07909 (fixup! Validate CLI replay inputs against the effective rewrite settings)
                 ..super::DetConfig::default()
             };
             let mut command = super::Command::new("/bin/echo");
             command.arg("PROVENANCE_GUEST_STARTED");
-            if let Err(error) = super::run_with_output(command, config, false, &None) {
+            let result = super::run_with_output(command, config, false, &None);
+            let lse_refusal =
+                detcore_model::config::RewriteExclusivesRefusal::HostLacksLseAtomics.to_string();
+            if in_memory && !detcore::aarch64_lse::host_has_lse_atomics() {
+                let error = result.expect_err("a host without FEAT_LSE refuses the memory form");
+                assert!(
+                    error.chain().any(|cause| cause.to_string() == lse_refusal),
+                    "{name}: {error:#}"
+                );
                 assert!(
                     !error
                         .chain()
                         .any(|cause| cause.is::<detcore::preemptions::RecordAdmissionRefusal>()),
                     "{name}: {error:#}"
                 );
+                continue;
             }
+            let output = result.unwrap_or_else(|error| {
+                panic!("{name}: matching replay must run the guest: {error:#}")
+            });
+            assert_eq!(
+                output.status,
+                super::ExitStatus::Exited(0),
+                "{name}: guest did not exit 0.\n--- guest stderr ---\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"PROVENANCE_GUEST_STARTED\n", "{name}");
         }
     }
 
