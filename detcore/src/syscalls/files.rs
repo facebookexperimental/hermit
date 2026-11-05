@@ -5876,15 +5876,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 None => {
                     let first = self.record_or_replay(guest, Syscall::Openat(call)).await;
                     match first {
-                        Err(Errno::EROFS) => {
-                            match timer_slack_witness_open(&observed_path, call) {
-                                Some(witness) => self
-                                    .record_or_replay(guest, Syscall::Openat(witness))
-                                    .await
-                                    .map_err(Error::from),
-                                None => Err(Error::from(Errno::EROFS)),
-                            }
-                        }
+                        Err(Errno::EROFS) => match timer_slack_witness_open(&observed_path, call) {
+                            Some(witness) => self
+                                .record_or_replay(guest, Syscall::Openat(witness))
+                                .await
+                                .map_err(Error::from),
+                            None => Err(Error::from(Errno::EROFS)),
+                        },
                         other => other.map_err(Error::from),
                     }
                 }

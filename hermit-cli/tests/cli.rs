@@ -8240,7 +8240,6 @@ fn detcore_refuses_removing_the_procfs_names_outside_the_level_on_kvm() {
     );
 }
 
-
 /// The `/proc` links whose targets Detcore decides itself read the same by
 /// every spelling and on every backend
 /// (https://github.com/rrnewton/hermit/issues/4266, slice B3a-2): `self`
