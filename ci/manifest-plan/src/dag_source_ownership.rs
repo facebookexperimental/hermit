@@ -68,6 +68,12 @@ pub struct ExtensionNode {
 /// See module docs for the admission rules.
 pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[
     ExtensionNode {
+        tag: "check.gvisor_vendoring",
+        labels: &["full", "hosted-portable", "portable"],
+        deps: &[],
+        populations: &[],
+    },
+    ExtensionNode {
         tag: "e2e.manifest_rr",
         labels: &["full", "portable"],
         deps: &[

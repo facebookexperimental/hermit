@@ -7954,13 +7954,18 @@ sys.exit(37)
             .into_iter()
             .filter(|tag| crate::dag_source_ownership::is_core(tag))
             .collect::<BTreeSet<_>>();
-        // Post-split Buck twins (e2e.manifest_rr_buck,
-        // e2e.manifest_gvisor_buck) join the selection
-        // through the extension registry, not the frozen source lineage.
+        // Post-split extension nodes join the selection through the
+        // extension registry, not the frozen source lineage: their Buck
+        // twins (e2e.manifest_rr_buck, e2e.manifest_gvisor_buck) and
+        // full-profile members that are not replaced
+        // (check.gvisor_vendoring).
+        let core_full = crate::dag_source_ownership::source_profile("full", true, true).unwrap();
         expected.extend(
             crate::dag_source_ownership::extension_tags()
                 .into_iter()
-                .filter(|tag| tag.ends_with("_buck")),
+                .filter(|tag| {
+                    tag.ends_with("_buck") || (core_full.contains(tag) && !replaced.contains(tag))
+                }),
         );
         let actual = buck_e2e_selection(&committed)
             .unwrap()

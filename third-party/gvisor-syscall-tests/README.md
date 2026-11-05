@@ -20,9 +20,12 @@ repository.
 
 ## Layout
 
-- `upstream/` — byte-identical upstream files. Never edit anything here.
-  `scripts/refresh-gvisor-tests.py --check` fails if this tree or the
-  generated build files drift from the pinned commit.
+- `upstream/` — upstream files as extracted from the pinned commit's
+  `git archive` at refresh time. Never edit anything here.
+  `build/upstream.sha256` records every file's hash from that refresh;
+  `scripts/refresh-gvisor-tests.py --check` (run by the
+  `check.gvisor_vendoring` DAG node) fails if any file is missing,
+  extra, or edited since, or if the generated build files drift.
 - `build/` — everything of ours: the generator (`gen_build.py`,
   `starlark_eval.py`), the generated neutral target list (`targets.json`)
   and combined-binary tables, the generated `BUCK`, and `support/`

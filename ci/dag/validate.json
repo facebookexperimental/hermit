@@ -193,6 +193,42 @@
     },
     {
       "group": "check",
+      "job": "gvisor_vendoring",
+      "desc": "Verify the vendored gVisor tree against its recorded hash manifest",
+      "description": "Refresh-time byte identity, checked offline on every validation: scripts/refresh-gvisor-tests.py --check verifies every file under third-party/gvisor-syscall-tests/upstream against build/upstream.sha256 (recorded from the upstream git archive at refresh time) and the generated build files, so a hand-edit to a vendored file fails here instead of passing silently. --self-test proves the refusal on a scratch tree (clean, one-byte edit, extra file). Pure Python over the checkout; no build inputs, so it keeps the small check-node caps (240 s wall hang backstop, 30 CPU seconds).",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "cmd": "python3 scripts/refresh-gvisor-tests.py --check && python3 scripts/refresh-gvisor-tests.py --self-test",
+      "result_manifests": [],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 240,
+      "cpu_timeout": 30,
+      "priority": 100,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 3.0,
+        "rss_baseline_bytes": 67108864,
+        "hard_mem_max_bytes": 536870912,
+        "classification": "light",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "check.gvisor_vendoring"
+    },
+    {
+      "group": "check",
       "job": "skill_discovery",
       "desc": "Verify Claude and stock Codex discover the same safe product skills",
       "description": "Makes Claude and stock Codex discover the same product skills from one copy. It compiles and runs scripts/check-skill-discovery.rs, which requires each skill to exist exactly once under .claude/skills and to resolve to that same file through .llms/skills and through one .agents/skills symlink per skill, allows an optional CLAUDE.md that is a regular file starting with @AGENTS.md (a symlink is refused), and requires each SKILL.md to open with frontmatter whose name equals its directory and a quoted description. The packaged set must equal the checker's list, and no parent-workspace coordinator role may appear among the product skills. A skill added without its .agents/skills link, a copied instead of linked SKILL.md, or a frontmatter name that differs from its directory breaks it.",

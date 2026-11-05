@@ -17,11 +17,15 @@ Applying replaces upstream/ wholesale from `git archive` at COMMIT,
 rewrites UPSTREAM_COMMIT, LICENSE, and the generated files. Nothing
 under upstream/ is ever edited in place.
 
---check needs no network: it re-extracts the pinned commit only when a
-local gVisor clone is available via --gvisor-clone; unconditionally it
-regenerates the build files in memory (build/gen_build.py --check
-semantics) and fails if the committed copies differ. Use it in PR
-evidence and as a validation lint.
+--check needs no network. Byte identity to upstream is established at
+refresh time: apply copies from `git archive` at the pinned commit and
+records every vendored file's sha256 in build/upstream.sha256. --check
+verifies the on-disk tree against that manifest (missing, extra, or
+one-byte-edited file fails) and regenerates the build files in memory,
+failing if the committed copies differ. It proves the tree is
+unchanged since the recorded refresh; it does not re-fetch upstream.
+--self-test exercises the manifest check on a scratch tree, including
+the one-byte-edit refusal.
 
 Exit status: 0 no change / applied, 3 files would change (dry-run),
 4 dependency-version drift in MODULE.bazel (apply refuses until the
@@ -32,6 +36,7 @@ In an fbsource checkout this tree is import output: run only
 --check/--dry-run there; apply refreshes on the GitHub side.
 """
 import argparse
+import hashlib
 import difflib
 import json
 import os
@@ -47,6 +52,7 @@ UPSTREAM = os.path.join(PKG, "upstream")
 BUILD = os.path.join(PKG, "build")
 PATHS = ["test/syscalls/linux", "test/util", "MODULE.bazel"]
 GVISOR_URL = "https://github.com/google/gvisor"
+MANIFEST = os.path.join(BUILD, "upstream.sha256")
 
 sys.path.insert(0, BUILD)
 import gen_build  # noqa: E402
@@ -96,6 +102,69 @@ def vendored_files(extract, ir):
         keep.update(h.get("srcs", []))
     return sorted(keep)
 
+def hash_manifest(tree):
+    """sha256sum-format manifest of every file under `tree`."""
+    lines = []
+    for base, _dirs, names in os.walk(tree):
+        for n in names:
+            full = os.path.join(base, n)
+            rel = os.path.relpath(full, tree)
+            with open(full, "rb") as fh:
+                lines.append("%s  %s" % (hashlib.sha256(fh.read()).hexdigest(), rel))
+    return "\n".join(sorted(lines)) + "\n"
+
+
+def verify_manifest(tree, manifest_path=MANIFEST):
+    """Problems between `tree` and the recorded hash manifest."""
+    if not os.path.exists(manifest_path):
+        return ["hash manifest missing: %s" % manifest_path]
+    recorded = {}
+    for line in open(manifest_path):
+        line = line.rstrip("\n")
+        if line:
+            digest, rel = line.split("  ", 1)
+            recorded[rel] = digest
+    problems = []
+    on_disk = set()
+    for base, _dirs, names in os.walk(tree):
+        for n in names:
+            on_disk.add(os.path.relpath(os.path.join(base, n), tree))
+    for rel in sorted(on_disk - set(recorded)):
+        problems.append("vendored file not in hash manifest: %s" % rel)
+    for rel in sorted(set(recorded) - on_disk):
+        problems.append("vendored file missing from tree: %s" % rel)
+    for rel in sorted(set(recorded) & on_disk):
+        with open(os.path.join(tree, rel), "rb") as fh:
+            if hashlib.sha256(fh.read()).hexdigest() != recorded[rel]:
+                problems.append("vendored file hash mismatch: %s" % rel)
+    return problems
+
+
+def self_test():
+    tmp = tempfile.mkdtemp(prefix="gvisor-refresh-selftest-")
+    try:
+        tree = os.path.join(tmp, "upstream")
+        os.makedirs(os.path.join(tree, "test"))
+        victim = os.path.join(tree, "test", "x.cc")
+        with open(victim, "wb") as fh:
+            fh.write(b"int main() { return 0; }\n")
+        manifest = os.path.join(tmp, "upstream.sha256")
+        with open(manifest, "w") as fh:
+            fh.write(hash_manifest(tree))
+        assert verify_manifest(tree, manifest) == [], "clean tree must verify"
+        with open(victim, "r+b") as fh:
+            fh.write(b"X")
+        problems = verify_manifest(tree, manifest)
+        assert any("hash mismatch" in p for p in problems), problems
+        with open(os.path.join(tree, "test", "extra.cc"), "wb") as fh:
+            fh.write(b"// extra\n")
+        problems = verify_manifest(tree, manifest)
+        assert any("not in hash manifest" in p for p in problems), problems
+        print("refresh-gvisor-tests self-test: ok (clean, one-byte edit, extra file)")
+        return 0
+    finally:
+        shutil.rmtree(tmp)
+
 
 def dep_versions(module_text):
     out = {}
@@ -106,6 +175,14 @@ def dep_versions(module_text):
 
 
 def check():
+    problems = verify_manifest(UPSTREAM)
+    if problems:
+        for problem in problems:
+            print(problem)
+        print("vendored tree differs from build/upstream.sha256; a hand-edit"
+              " (or a refresh without regenerating the manifest) is the"
+              " usual cause. Re-run the refresh at %s." % pinned())
+        return 1
     ir, files = generate(UPSTREAM)
     bad = []
     for name, text in files.items():
@@ -118,7 +195,7 @@ def check():
         print("generated files are stale: %s" % ", ".join(bad))
         print("regenerate with: scripts/refresh-gvisor-tests.py %s" % pinned())
         return 1
-    print("gvisor vendored tree is up to date at %s (%d tests)"
+    print("gvisor vendored tree matches its hash manifest and is up to date at %s (%d tests)"
           % (pinned(), len(ir["tests"])))
     return 0
 
@@ -128,9 +205,19 @@ def main():
     ap.add_argument("commit", nargs="?")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--write-manifest", action="store_true",
+                    help="rewrite build/upstream.sha256 from the on-disk tree")
     ap.add_argument("--gvisor-clone", help="existing gVisor clone to fetch from "
                     "(default: fresh blobless clone in a temp dir)")
     a = ap.parse_args()
+    if a.self_test:
+        return self_test()
+    if a.write_manifest:
+        with open(MANIFEST, "w") as fh:
+            fh.write(hash_manifest(UPSTREAM))
+        print("wrote %s" % MANIFEST)
+        return 0
     if a.check:
         return check()
 
@@ -207,6 +294,8 @@ def main():
 
         shutil.rmtree(UPSTREAM)
         shutil.copytree(stage, UPSTREAM)
+        with open(MANIFEST, "w") as fh:
+            fh.write(hash_manifest(UPSTREAM))
         with open(os.path.join(PKG, "UPSTREAM_COMMIT"), "w") as fh:
             fh.write(commit + "\n")
         with open(os.path.join(PKG, "LICENSE"), "w") as fh:
