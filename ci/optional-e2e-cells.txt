@@ -5,18 +5,9 @@ c-programs/signal-waitstatus-identity verify dbt
 c-programs/writev-determinism custom ptrace
 compat/cscope replay ptrace
 compat/gcov verify dbt
-compat/logger replay ptrace
 compat/logger verify dbt
-compat/logger verify ptrace
 compat/lsof replay ptrace
-compat/mountpoint replay ptrace
-compat/pkg-config replay ptrace
 compat/pkg-config verify dbt
-compat/pkg-config verify kvm
-compat/pkg-config verify ptrace
-compat/shred verify kvm
-compat/sysctl-random-uuid verify kvm
-compat/top verify kvm
 compat/zip-unzip replay ptrace
 data-handling/jq-json-transform naked -
 data-handling/sqlite-query-determinism naked -
@@ -79,8 +70,6 @@ gvisor/tkill-tkilltest-validtidandrealsignal verify ptrace
 language-runtimes/bash-random naked -
 language-runtimes/cpp-stl-determinism naked -
 language-runtimes/gawk-random naked -
-language-runtimes/go-os-exec-output verify kvm
-language-runtimes/go-os-exec-output verify ptrace
 language-runtimes/lua-random naked -
 language-runtimes/m4-macro-mkstemp naked -
 language-runtimes/node-v8-jit naked -

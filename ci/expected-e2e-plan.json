@@ -45810,12 +45810,12 @@
       "timeout_seconds": 180
     },
     {
-      "backend": "kvm",
-      "category": "c-programs",
+      "backend": "ptrace",
+      "category": "applications",
       "classification": "required",
       "cpu_timeout_seconds": 22,
       "lane": "portable",
-      "mode": "verify",
+      "mode": "replay",
       "requires": [
         "linux",
         "x86_64",
@@ -45824,9 +45824,249 @@
         "cc"
       ],
       "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "applications/cc-compile-and-run",
+      "timeout_seconds": 180
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "replay",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "c-programs/nanosleep-threads-simple",
+      "timeout_seconds": 180
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "replay",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "c-programs/vfork-shares-memory",
+      "timeout_seconds": 180
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "replay",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "compat/logger",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/logger",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "replay",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "compat/mountpoint",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "replay",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "compat/pkg-config",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "kvm",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
         "kvm"
       ],
-      "test": "c-programs/sigsuspend-sibling-signal-wake",
+      "test": "compat/pkg-config",
+      "timeout_seconds": 180
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/pkg-config",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "kvm",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "compat/shred",
+      "timeout_seconds": 180
+    },
+    {
+      "backend": "kvm",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "compat/sysctl-random-uuid",
+      "timeout_seconds": 180
+    },
+    {
+      "backend": "kvm",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "compat/top",
+      "timeout_seconds": 180
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "language-runtimes/go-os-exec-output",
+      "timeout_seconds": 180
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "language-runtimes/go-os-exec-output",
       "timeout_seconds": 180
     }
   ],

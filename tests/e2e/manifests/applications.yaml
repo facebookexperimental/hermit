@@ -397,11 +397,9 @@ test:
           ptrace: "14999995\n"
           kvm: "14999995\n"
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification cell and has not been run for it.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification cell
           dbt: Record/replay is unsupported by DBI
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe

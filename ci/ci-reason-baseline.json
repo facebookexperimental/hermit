@@ -200,7 +200,6 @@
     "c-programs/nanosleep-threads-simple::chaos",
     "c-programs/nanosleep-threads-simple::custom",
     "c-programs/nanosleep-threads-simple::naked",
-    "c-programs/nanosleep-threads-simple::replay",
     "c-programs/netlink-autobind-generic::chaos",
     "c-programs/netlink-autobind-generic::custom",
     "c-programs/netlink-autobind-generic::naked",

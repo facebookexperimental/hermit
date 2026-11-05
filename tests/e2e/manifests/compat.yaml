@@ -1673,24 +1673,6 @@ corpus:
   # this bucket): each stays enabled with ci: false and its failure class's
   # issue, so the SaBRe run type does not require it.
   unselected:
-    # Measured red on 2026-10-30 in the pinned hermetic image (the corpus
-    # moved in-image the same day): the pinned nixpkgs implementations
-    # differ from the host programs these rows were written against. The
-    # owner deselected them to land the move and fix forward; the rework
-    # (a /dev/log stub or new argv for logger, pkgconf's flag order for
-    # pkg-config) is tracked in the evidence bead.
-    - backend: ptrace
-      result: crash-error
-      evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
-      reason: >-
-        In the pinned image, logger (nix util-linux) opens /dev/log even
-        with --stderr --no-act and exits 1 with no journal socket present,
-        and pkg-config is pkgconf, which emits -D before -I where the
-        workload asserts freedesktop pkg-config's file-order output
-      rows:
-        [
-          logger, pkg-config
-        ]
     # Measured red on 2026-10-30 in the pinned hermetic image (full validate
     # validate-museland-9ab8418de603, 7 cells): the same image difference on
     # the remaining backends, plus gcov's DBT determinism failure.
@@ -1718,18 +1700,6 @@ corpus:
     # issue 4997 were re-enabled the same day once the fixture race was
     # fixed (271ec81bd4): one writer for the shared fixtures, published
     # atomically, so cells no longer see inputs swapped mid-run.
-    - backend: kvm
-      result: crash-error
-      evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
-      reason: >-
-        Measured crash-error under KVM in the pinned image (full validate
-        validate-museland-9ab8418de603): pkg-config is pkgconf (flag order,
-        as above); shred, sysctl-random-uuid and top hit KVM backend
-        refusals on the pinned programs' device/proc accesses
-      rows:
-        [
-          pkg-config, shred, sysctl-random-uuid, top
-        ]
     - backend: sabre
       result: crash-error
       evidence: https://github.com/rrnewton/hermit/issues/3486
@@ -1859,27 +1829,6 @@ corpus:
     # sixth, joined once https://github.com/rrnewton/hermit/issues/3964 and
     # https://github.com/rrnewton/hermit/issues/3963 were fixed.)
     unselected:
-      # Measured red on 2026-10-30 in the pinned hermetic image: the same
-      # implementation differences as the verify cells above (logger needs
-      # /dev/log, pkg-config is pkgconf), tracked in the evidence bead.
-      - result: replay-failure
-        evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
-        reason: >-
-          In the pinned image, logger (nix util-linux) opens /dev/log even
-          with --stderr --no-act and exits 1 with no journal socket present,
-          and pkg-config is pkgconf, which emits -D before -I where the
-          workload asserts freedesktop pkg-config's file-order output
-        rows: [logger, pkg-config]
-      # Measured red on 2026-10-30 in the pinned hermetic image: a Hermit
-      # record/replay divergence on statmount, not an implementation
-      # difference; the pinned (nixpkgs) mountpoint probes with statmount
-      # where the host's does not, so the host run never exercised it.
-      - result: replay-failure
-        evidence: https://github.com/rrnewton/hermit/issues/4979
-        reason: >-
-          Strict replay diverges at record 520 (syscall 74, statmount): the
-          recorded and replayed calls carry different flags (5 vs 0)
-        rows: [mountpoint]
       - result: replay-failure
         evidence: https://github.com/rrnewton/hermit/issues/3966
         reason: >-

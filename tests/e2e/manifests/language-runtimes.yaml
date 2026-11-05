@@ -1424,8 +1424,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: the pinned validation root (ci/hermetic) has no Go toolchain, so --prepare cannot build the program there; it passes 21 of 21 at L2 on KVM and ptrace on a host with go 1.26.1, and joins validation once the root carries go.'
+        ci: true
         backends_enabled:
           - ptrace
           - kvm

@@ -962,6 +962,13 @@
           "lane": "portable",
           "category": "applications",
           "test": "applications/cc-compile-and-run",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
+          "test": "applications/cc-compile-and-run",
           "mode": "verify",
           "backend": "kvm"
         },
@@ -5209,6 +5216,13 @@
           "category": "c-programs",
           "test": "c-programs/nanosleep-threads-nocrash",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/nanosleep-threads-simple",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -10395,6 +10409,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/vfork-shares-memory",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vfork-shares-memory",
           "mode": "verify",
           "backend": "kvm"
         },
@@ -12962,8 +12983,22 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/logger",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/logger",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/logger",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -13319,6 +13354,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/mountpoint",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/mountpoint",
           "mode": "verify",
           "backend": "kvm"
         },
@@ -14011,6 +14053,27 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/pkg-config",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pkg-config",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pkg-config",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/pkill",
           "mode": "replay",
           "backend": "ptrace"
@@ -14748,6 +14811,13 @@
           "category": "compat",
           "test": "compat/shred",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/shred",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -15078,6 +15148,13 @@
           "test": "compat/sysctl-random-uuid",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sysctl-random-uuid",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -15295,6 +15372,13 @@
           "test": "compat/top",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/top",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18000,8 +18084,22 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/logger",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/logger",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/logger",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -18287,6 +18385,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/mountpoint",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/mountpoint",
           "mode": "verify",
           "backend": "kvm"
         },
@@ -18867,6 +18972,27 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/pkg-config",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pkg-config",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pkg-config",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/pkill",
           "mode": "replay",
           "backend": "ptrace"
@@ -19444,6 +19570,13 @@
           "test": "compat/shred",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/shred",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -19731,6 +19864,13 @@
           "test": "compat/sysctl-random-uuid",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sysctl-random-uuid",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -19927,6 +20067,13 @@
           "test": "compat/top",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/top",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -21213,6 +21360,13 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/logger",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/logname",
           "mode": "replay",
           "backend": "ptrace"
@@ -21298,6 +21452,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/mktemp",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/mountpoint",
           "mode": "replay",
           "backend": "ptrace"
         },
@@ -21487,6 +21648,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/pinky",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pkg-config",
           "mode": "replay",
           "backend": "ptrace"
         },
@@ -23123,6 +23291,20 @@
           "lane": "portable",
           "category": "language-runtimes",
           "test": "language-runtimes/gawk-random",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/go-os-exec-output",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/go-os-exec-output",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -30488,6 +30670,13 @@
         {
           "lane": "portable",
           "category": "language-runtimes",
+          "test": "language-runtimes/go-os-exec-output",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
           "test": "language-runtimes/lua-random",
           "mode": "verify",
           "backend": "ptrace"
@@ -33273,6 +33462,13 @@
           "lane": "portable",
           "category": "applications",
           "test": "applications/cc-compile-and-run",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
+          "test": "applications/cc-compile-and-run",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -35164,6 +35360,13 @@
           "category": "c-programs",
           "test": "c-programs/nanosleep-threads-nocrash",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/nanosleep-threads-simple",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -37424,6 +37627,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/vfork-shares-memory",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vfork-shares-memory",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -38914,6 +39124,20 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/logger",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/logger",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/logname",
           "mode": "replay",
           "backend": "ptrace"
@@ -39098,6 +39322,13 @@
           "category": "compat",
           "test": "compat/mktemp",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/mountpoint",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -39482,6 +39713,20 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/pinky",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pkg-config",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pkg-config",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -41254,6 +41499,13 @@
           "lane": "portable",
           "category": "language-runtimes",
           "test": "language-runtimes/gawk-random",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/go-os-exec-output",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -44614,6 +44866,13 @@
           "category": "applications",
           "test": "applications/c-toolchain-workflow",
           "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
+          "test": "applications/cc-compile-and-run",
+          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -48814,6 +49073,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/nanosleep-threads-simple",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/nanosleep-threads-simple",
           "mode": "verify",
           "backend": "kvm"
         },
@@ -53994,6 +54260,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/vfork-shares-memory",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vfork-shares-memory",
           "mode": "verify",
           "backend": "kvm"
         },
@@ -56545,8 +56818,22 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/logger",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/logger",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/logger",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -56902,6 +57189,13 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/mountpoint",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/mountpoint",
           "mode": "verify",
           "backend": "kvm"
         },
@@ -57594,6 +57888,27 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/pkg-config",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pkg-config",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pkg-config",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/pkill",
           "mode": "replay",
           "backend": "ptrace"
@@ -58331,6 +58646,13 @@
           "category": "compat",
           "test": "compat/shred",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/shred",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -58661,6 +58983,13 @@
           "test": "compat/sysctl-random-uuid",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sysctl-random-uuid",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -58878,6 +59207,13 @@
           "test": "compat/top",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/top",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -60518,6 +60854,20 @@
           "lane": "portable",
           "category": "language-runtimes",
           "test": "language-runtimes/gawk-random",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/go-os-exec-output",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/go-os-exec-output",
           "mode": "verify",
           "backend": "ptrace"
         },
