@@ -8870,12 +8870,33 @@ fn controlled_child_exit_to_pop(
     effect: ChildExitPublicationEffect,
     waitable: bool,
 ) -> (Scheduler, Arc<Backend>, DetTid) {
+    controlled_child_exit_to_pop_from(sets, effect, waitable, file_restartable_read)
+}
+
+/// `tid`'s `nanosleep` until one second, filed and parked at its deadline, as
+/// a parked sleep is: a wait the grant does not classify (Undecided).
+fn park_nanosleep(s: &mut Scheduler, tid: DetTid) {
+    let deadline = LogicalTime::from_nanos(1_000_000_000);
+    let mut request = Resources::new(tid);
+    request.insert(ResourceID::SleepUntil(deadline), Permission::RW);
+    request.fyi(crate::resources::NANOSLEEP_FYI);
+    s.next_turns.get_mut(&tid).unwrap().req = Ivar::full(Ok(request));
+    s.blocked.timed_waiters.insert(deadline, tid);
+}
+
+/// [`controlled_child_exit_to_pop`] with the parent's wait filed by `file`.
+fn controlled_child_exit_to_pop_from(
+    sets: reverie::SignalSets,
+    effect: ChildExitPublicationEffect,
+    waitable: bool,
+    file: fn(&mut Scheduler, DetTid),
+) -> (Scheduler, Arc<Backend>, DetTid) {
     let (mut s, backend) = kvm_fixture();
     let (parent, _, _) = add(&mut s, 100, 100);
     let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
     backend.signal_sets.lock().unwrap().insert(100, sets);
     *backend.child_effect.lock().unwrap() = Some(effect);
-    file_restartable_read(&mut s, parent);
+    file(&mut s, parent);
     grant_group_exit(&mut s, child, child_mm);
     let permit = s.parked.exit_fences[&child].permit;
     s.consume_signal_boundary(SignalBoundaryReceipt {
@@ -8939,6 +8960,65 @@ fn a_controlled_child_exit_timer_acts_on_the_publication_effect() {
     assert!(child_exit_timers(&s).is_empty());
     assert!(!woken_for_sigchld(&s, parent));
     assert_eq!(s.controlled_child_exits.refusal_for_test(), None);
+}
+
+/// A queued SIGCHLD ends a parked `nanosleep` only where Linux's would (the
+/// revastra2 review of https://github.com/rrnewton/hermit/pull/5192, F1): a
+/// blocked copy stays pending and wakes nothing; a default-ignored one is
+/// discarded at generation, and an explicit SIG_IGN is suppressed at
+/// publication, both woken as a discarded send, which commits no
+/// `InboundSignal`; a caught one interrupts the sleep. Mutation "Queued wakes
+/// whatever the receiver's sets say": the blocked and default rows wake.
+#[test]
+fn a_queued_child_exit_sigchld_ends_a_parked_sleep_only_where_it_interrupts() {
+    for (name, sets, effect, waitable, woken) in [
+        (
+            "blocked",
+            sigchld_sets(true, false, false),
+            ChildExitPublicationEffect::Queued,
+            true,
+            false,
+        ),
+        (
+            "default",
+            sigchld_sets(false, false, false),
+            ChildExitPublicationEffect::Queued,
+            true,
+            false,
+        ),
+        (
+            "blocked and caught",
+            sigchld_sets(true, false, true),
+            ChildExitPublicationEffect::Queued,
+            true,
+            false,
+        ),
+        (
+            "ignored",
+            sigchld_sets(false, true, false),
+            ChildExitPublicationEffect::SuppressedExplicitIgnore,
+            false,
+            false,
+        ),
+        (
+            "caught",
+            sigchld_sets(false, false, true),
+            ChildExitPublicationEffect::Queued,
+            true,
+            true,
+        ),
+    ] {
+        let (s, _, parent) =
+            controlled_child_exit_to_pop_from(sets, effect, waitable, park_nanosleep);
+        assert_eq!(
+            s.controlled_child_exits_decision(DetPid::from_raw(200)),
+            None,
+            "{name}: the decision is consumed at publication"
+        );
+        assert!(child_exit_timers(&s).is_empty(), "{name}");
+        assert_eq!(woken_for_sigchld(&s, parent), woken, "{name}");
+        assert_eq!(s.controlled_child_exits.refusal_for_test(), None, "{name}");
+    }
 }
 
 /// Mutation "a mismatch passes silently": a parent that explicitly ignores

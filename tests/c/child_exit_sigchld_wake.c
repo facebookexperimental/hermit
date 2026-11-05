@@ -37,6 +37,13 @@
  *                    temporary mask: EINTR, the handler runs once.
  *   sigsuspend-caught: SIGCHLD caught and blocked; sigsuspend(empty) until the
  *                    handler saw the exit.
+ *   sleep-blocked, sleep-default, sleep-ignored, sleep-caught: the parent
+ *                    sleeps 200 ms in nanosleep() while its child exits, with
+ *                    SIGCHLD blocked (default disposition), at its default,
+ *                    explicitly ignored, or caught. Only a caught SIGCHLD ends
+ *                    the sleep (EINTR, the handler once); a blocked or ignored
+ *                    one leaves it to complete (the revastra2 review of
+ *                    https://github.com/rrnewton/hermit/pull/5192, F1).
  *
  * Each mode prints one line, the same natively and under Hermit.
  */
@@ -254,6 +261,43 @@ static int sigsuspend_caught(void) {
   return 0;
 }
 
+static int sleep_through(const char* mode) {
+  int caught = strcmp(mode, "sleep-caught") == 0;
+  int ignored = strcmp(mode, "sleep-ignored") == 0;
+  install(0, caught ? on_chld : ignored ? SIG_IGN : SIG_DFL);
+  if (strcmp(mode, "sleep-blocked") == 0) {
+    block_sigchld();
+  }
+  pid_t child = spawn(0);
+  struct timespec ts = {0, 200000000L};
+  errno = 0;
+  int rc = nanosleep(&ts, &ts);
+  int eintr = rc < 0 && errno == EINTR;
+  int status = 0;
+  pid_t waited;
+  while ((waited = waitpid(child, &status, 0)) < 0 && errno == EINTR) {
+  }
+  if (ignored) {
+    printf(
+        "%s rc=%d eintr=%d handler=%d wait=%d echild=%d\n",
+        mode,
+        rc,
+        eintr,
+        (int)handler_runs,
+        (int)waited,
+        waited < 0 && errno == ECHILD);
+  } else {
+    printf(
+        "%s rc=%d eintr=%d handler=%d status=%d\n",
+        mode,
+        rc,
+        eintr,
+        (int)handler_runs,
+        waited == child && WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(stderr, "usage: %s MODE\n", argv[0]);
@@ -283,6 +327,10 @@ int main(int argc, char** argv) {
     return ppoll_caught();
   } else if (strcmp(mode, "sigsuspend-caught") == 0) {
     return sigsuspend_caught();
+  } else if (
+      strcmp(mode, "sleep-blocked") == 0 || strcmp(mode, "sleep-default") == 0 ||
+      strcmp(mode, "sleep-ignored") == 0 || strcmp(mode, "sleep-caught") == 0) {
+    return sleep_through(mode);
   }
   fprintf(stderr, "unknown mode %s\n", mode);
   return 2;

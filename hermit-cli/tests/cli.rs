@@ -47741,7 +47741,11 @@ fn run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux() {
 /// `sigsuspend-caught` returned to the guest 41 times instead of once.
 /// `wait4-default` pins the classification under a child wait's private
 /// mask: the guest's own mask decides (none of SIGCHLD's records on either
-/// backend), not the all-blocked mask Detcore installs for the wait.
+/// backend), not the all-blocked mask Detcore installs for the wait. The
+/// `sleep-` modes pin a parked `nanosleep`, a wait the grant leaves
+/// Undecided: only a caught SIGCHLD ends it. Before the fix of the revastra2
+/// review of https://github.com/rrnewton/hermit/pull/5192 (F1), KVM's
+/// `sleep-blocked` and `sleep-default` answered EINTR.
 #[test]
 fn run_kvm_a_child_exit_sigchld_reaches_a_one_thread_parent_as_on_linux() {
     if kvm_unavailable("run_kvm_a_child_exit_sigchld_reaches_a_one_thread_parent_as_on_linux") {
@@ -47779,6 +47783,22 @@ fn run_kvm_a_child_exit_sigchld_reaches_a_one_thread_parent_as_on_linux() {
         (
             "sigsuspend-caught",
             "sigsuspend-caught suspends=1 handler=1 status=7\n",
+        ),
+        (
+            "sleep-blocked",
+            "sleep-blocked rc=0 eintr=0 handler=0 status=7\n",
+        ),
+        (
+            "sleep-default",
+            "sleep-default rc=0 eintr=0 handler=0 status=7\n",
+        ),
+        (
+            "sleep-ignored",
+            "sleep-ignored rc=0 eintr=0 handler=0 wait=-1 echild=1\n",
+        ),
+        (
+            "sleep-caught",
+            "sleep-caught rc=-1 eintr=1 handler=1 status=7\n",
         ),
     ] {
         let mut records = Vec::new();

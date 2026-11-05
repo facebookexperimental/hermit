@@ -29,7 +29,10 @@
 //! with the barrier down (`do_a_turn_blocking`). So `send_guest_signal` sends
 //! nothing on such a backend; it takes the publication's effect instead
 //! ([`Scheduler::child_exit_sink`]):
-//! - `Queued`: the copy is pending, and the parent is woken as on ptrace;
+//! - `Queued`: the copy is pending. The parent is woken as on ptrace when
+//!   the copy interrupts its wait (unblocked, and caught or default-fatal);
+//!   an unblocked ignored copy is logged as ptrace's discard, and a blocked
+//!   one wakes nothing ([`Scheduler::queued_sigchld_fate`]);
 //! - `Coalesced`: Linux does not queue a standard signal already pending
 //!   (`legacy_queue`), so no thread is woken, as `note_group_send` decides on
 //!   ptrace;
@@ -81,6 +84,19 @@ pub(crate) struct ControlledChildExits {
     sending: Option<DetPid>,
     /// A decision and an effect that disagree: the run is refused.
     refusal: Option<String>,
+}
+
+/// What a queued child-exit `SIGCHLD` does to its receiver's parked wait
+/// (`Scheduler::queued_sigchld_fate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueuedSigchld {
+    /// Unblocked and caught (or its state unreadable): it ends the wait.
+    Interrupts,
+    /// Unblocked and ignored, explicitly or by default: Linux discards it at
+    /// generation.
+    DiscardedAtGeneration,
+    /// Blocked: it stays pending, and the wait goes on.
+    StaysPending,
 }
 
 /// Whether a child-exit publication's effect (and its waitability) agrees
@@ -219,6 +235,70 @@ impl Scheduler {
         result
     }
 
+    /// What the `SIGCHLD` a child-exit publication queued for `dettid` does to
+    /// the wait `dettid` is parked in. `Queued` says only that the backend
+    /// queued a copy, not that it interrupts anything. Linux wakes a waiting
+    /// task for a signal only when the signal is unblocked and acted on
+    /// (caught, or default-fatal; `signal_wake_up` from `complete_signal`,
+    /// past `sig_ignored` and `wants_signal`). A blocked copy stays pending
+    /// and wakes nothing. An unblocked one that is ignored, explicitly or by
+    /// default, is discarded at generation (`sig_ignored`), which the backend
+    /// does not model (design G8, S0 correction 2): ptrace's send records that
+    /// discard, so this does too.
+    ///
+    /// The receiver's sets are the backend's (`backend_signal_state`, S2a),
+    /// under the mask the guest published while Detcore holds a private one
+    /// (`under_published_mask`), filtered as the drain filters a restartable
+    /// poll (`poll_wake_signals`). They are read at the timer's pop, a
+    /// committed point where no guest thread holds the turn, so the answer is
+    /// a function of the schedule. An unreadable state wakes the thread, as
+    /// before this filter.
+    ///
+    /// Without this, a parked `nanosleep` (a wait the grant leaves Undecided)
+    /// was woken for a blocked or default-ignored `SIGCHLD` and answered EINTR
+    /// on KVM, where the sleep cannot judge the wake itself (`signal_sleep`;
+    /// the revastra2 review of https://github.com/rrnewton/hermit/pull/5192,
+    /// F1).
+    pub(super) fn queued_sigchld_fate(&self, dettid: DetTid) -> QueuedSigchld {
+        let bit = super::kernel_signal_bit(libc::SIGCHLD);
+        match self.backend_signal_state(dettid) {
+            Some(Ok(state)) => {
+                let state = self.under_published_mask(dettid, state);
+                if super::poll_wake_signals(&state, self.models_signal_targets) & bit != 0 {
+                    QueuedSigchld::Interrupts
+                } else if state.discarded_at_generation() & bit != 0 {
+                    QueuedSigchld::DiscardedAtGeneration
+                } else {
+                    QueuedSigchld::StaysPending
+                }
+            }
+            Some(Err(_)) | None => QueuedSigchld::Interrupts,
+        }
+    }
+
+    /// Commit a child-exit `SIGCHLD` Linux discarded: ptrace's
+    /// discarded-at-send record, no delivery, and a wake that commits no
+    /// `InboundSignal` (`wake_signaled_guest_as`).
+    fn discard_child_exit_sigchld(
+        &mut self,
+        dettid: DetTid,
+        signal: nix::sys::signal::Signal,
+        named: DetTid,
+    ) {
+        info!(
+            target: "detcore::scheduler",
+            "[dtid {}] signal {} is one Linux discards as sent to {}; committing no wake.",
+            dettid, signal, named
+        );
+        // No delivery follows to consume the process's mark
+        // (`dispatch_timed_signal_at`).
+        let process = self.sigchld_process(dettid);
+        self.blocked.sigchld_ready.remove(&process);
+        if self.send_wakes(dettid) {
+            self.wake_signaled_guest_as(dettid, signal, true);
+        }
+    }
+
     /// `send_guest_signal`'s physical step where a signal control is
     /// installed: the backend's child-exit publication already made it, so
     /// the scheduler acts on its effect. A send of anything else, or of a
@@ -253,11 +333,23 @@ impl Scheduler {
         self.note_scheduler_signal_sent(dettid, signal as libc::c_int);
         self.guest_send_landed = Some(true);
         match effect {
-            ChildExitPublicationEffect::Queued => {
-                if self.send_wakes(dettid) {
-                    self.wake_signaled_guest_as(dettid, signal, false);
+            ChildExitPublicationEffect::Queued => match self.queued_sigchld_fate(dettid) {
+                QueuedSigchld::Interrupts => {
+                    if self.send_wakes(dettid) {
+                        self.wake_signaled_guest_as(dettid, signal, false);
+                    }
                 }
-            }
+                QueuedSigchld::DiscardedAtGeneration => {
+                    self.discard_child_exit_sigchld(dettid, signal, named);
+                }
+                QueuedSigchld::StaysPending => {
+                    info!(
+                        target: "detcore::scheduler",
+                        "[dtid {}] SIGCHLD blocked by its receiver stays pending; waking no thread.",
+                        dettid
+                    );
+                }
+            },
             ChildExitPublicationEffect::Coalesced => {
                 info!(
                     target: "detcore::scheduler",
@@ -267,18 +359,7 @@ impl Scheduler {
             }
             ChildExitPublicationEffect::SuppressedExplicitIgnore
             | ChildExitPublicationEffect::DiscardedByDispositionChange => {
-                info!(
-                    target: "detcore::scheduler",
-                    "[dtid {}] signal {} is one Linux discards as sent to {}; committing no wake.",
-                    dettid, signal, named
-                );
-                // No delivery follows to consume the process's mark
-                // (`dispatch_timed_signal_at`).
-                let process = self.sigchld_process(dettid);
-                self.blocked.sigchld_ready.remove(&process);
-                if self.send_wakes(dettid) {
-                    self.wake_signaled_guest_as(dettid, signal, true);
-                }
+                self.discard_child_exit_sigchld(dettid, signal, named);
             }
         }
     }
