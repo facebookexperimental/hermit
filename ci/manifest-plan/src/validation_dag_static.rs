@@ -6874,6 +6874,7 @@ impl StaticStepSpec {
             delegated_children: false,
             timeout: self.timeout,
             cpu_timeout: self.cpu_timeout,
+            priority: 0,
             jobs_flag: self.jobs_flag.map(Into::into),
             jobs_env: self.jobs_env.map(Into::into),
             skip_reason: None,

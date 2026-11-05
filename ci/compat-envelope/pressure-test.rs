@@ -5,7 +5,7 @@
 //! [dependencies]
 //! chrono = "0.4"
 //! csv = "1"
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "f79789533dc03fe529a6a1211921bade81ae0680" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "96d05180a7e75be69e69379bee57a193a1b6cdb4" }
 //! hermit-manifest-plan = { path = "../manifest-plan" }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
@@ -8655,6 +8655,7 @@ fn write_plan_after_scorecard_check(
             delegated_children: false,
             timeout: wall,
             cpu_timeout: wall * 2,
+            priority: 0,
             jobs_flag: None,
             jobs_env: None,
             skip_reason: None,
@@ -8886,6 +8887,7 @@ fn write_plan_after_scorecard_check(
                 delegated_children: false,
                 timeout: wall,
                 cpu_timeout: wall * 2,
+                priority: 0,
                 jobs_flag: None,
                 jobs_env: None,
                 skip_reason: None,
@@ -8943,6 +8945,7 @@ fn write_plan_after_scorecard_check(
         delegated_children: false,
         timeout: PRESSURE_SUMMARY_TIMEOUT_SECONDS,
         cpu_timeout: PRESSURE_SUMMARY_TIMEOUT_SECONDS,
+        priority: 0,
         jobs_flag: None,
         jobs_env: None,
         skip_reason: None,
@@ -9387,6 +9390,7 @@ fn full_memory_dag(
                 delegated_children: false,
                 timeout: 0,
                 cpu_timeout: 0,
+                priority: 0,
                 jobs_flag: None,
                 jobs_env: None,
                 skip_reason: None,

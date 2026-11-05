@@ -313,6 +313,7 @@ pub(crate) fn step_with_caps(
         delegated_children: false,
         timeout,
         cpu_timeout,
+        priority: 0,
         jobs_flag: None,
         jobs_env: None,
         skip_reason: None,
