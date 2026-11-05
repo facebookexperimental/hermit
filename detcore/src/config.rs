@@ -295,7 +295,7 @@ mod tests {
         // `GlobalResponse::WithWatchOrder` (#4796). Live-computed as 45 at
         // its rebase onto main's 41, skipping reserved 42 to 44; digest
         // measured at the sealed head.
-        (45, "e909c0d8e85f5336", "f013e36743d8d9e6"),
+        (45, "b434f4f465fdbb8d", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
