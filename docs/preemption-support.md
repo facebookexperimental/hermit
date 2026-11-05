@@ -213,7 +213,7 @@ refuses by name rather than replaying those slices to their branch targets;
 every copy and edit of such rows keeps it, and this Hermit refuses offset rows
 in an older format. A record that drops the background starts its run noted
 (a shorter schedule prefix, an edit, the re-record of a schedule replay) goes
-below format 4 when it holds no offsets; with offset rows it keeps format 5
+below format 4 when it holds no offsets; with offset rows it keeps format 6
 and says `"background_starts_unnoted": true`, so that no reader takes the
 number for a claim to note every start, and a Hermit that reads only formats
 1 to 5 still refuses it by number. Either way it drops its `"stopless"`
