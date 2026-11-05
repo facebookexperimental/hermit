@@ -4496,6 +4496,12 @@
     },
     {
       "disposition": "manifest-policy",
+      "path": "tests/e2e/manifests/gvisor.yaml",
+      "runner": "target/debug/test-harness via ci/manifest-plan",
+      "why": "tests/e2e/manifests/gvisor.yaml is owned by target/debug/test-harness via ci/manifest-plan: The `gvisor` YAML file is policy for the `gvisor` manifest bucket: it declares vendored gVisor syscall-test case identities, modes, backend partitions, tier labels, and WHY reasons. It configures the common system and is not itself executable test input."
+    },
+    {
+      "disposition": "manifest-policy",
       "path": "tests/e2e/manifests/inventory/retired-ids.json",
       "runner": "target/debug/test-harness via ci/manifest-plan",
       "why": "tests/e2e/manifests/inventory/retired-ids.json is owned by target/debug/test-harness via ci/manifest-plan: It maps every E2E test id that no manifest declares any more to the live id that now carries the same program, so history readers (ci/compat-envelope/scorecard.rs and the dev-hermit series and website readers) join an old-id row and a new-id row into one cell history. ci/manifest-plan checks that it is a bijection onto live ids; it is policy data, not executable test input."
