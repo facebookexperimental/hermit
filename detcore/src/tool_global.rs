@@ -2061,7 +2061,7 @@ impl GlobalState {
             use std::io::Write;
             let _ = writeln!(
                 crate::util::RetryingStderr,
-                "hermit: --watch: some threads never armed their watches, so their accesses are \
+                "hermit: --watch: some watch intervals were never armed, so their accesses are \
                  missing from the trace: {}",
                 watch
                     .unarmed

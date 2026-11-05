@@ -843,18 +843,22 @@ pub const WATCH_HITS_WITH_STACKS: u64 = 64;
 /// without stacks when the run ends.
 pub const WATCH_HITS_KEPT_LAST: u64 = 64;
 
-/// One thread's watch outcome (`--watch`): whether and when it armed, and its
-/// hits. Written for every thread that recorded an event once the watches
-/// were due (`--watch-from`), in tid order, before the end line.
+/// One image interval's watch outcome for a thread (`--watch`): whether
+/// and when it armed, and its hits. Written for every interval of every
+/// thread that recorded an event once the watches were due
+/// (`--watch-from`), in tid order, before the end line. A thread that
+/// armed, exec'd, and could not re-arm gets two: the armed interval,
+/// hits intact, then the uncovered one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchSummaryRecord {
     /// The thread.
     pub tid: DetTid,
-    /// The first event the thread recorded with its watches armed: it armed
-    /// at a stop before it. `None` when it never armed.
+    /// The first event the thread recorded with its watches armed in this
+    /// interval: it armed at a stop before it. `None` when this interval
+    /// never armed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub armed_before: Option<EventIndex>,
-    /// Why it never armed, when it did not.
+    /// Why this interval never armed, when it did not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unarmed: Option<WatchUnarmed>,
     /// Every hit the thread had, written or not.
@@ -863,7 +867,7 @@ pub struct WatchSummaryRecord {
     pub recorded: u64,
 }
 
-/// Why a thread never armed its watches.
+/// Why a thread interval never armed its watches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WatchUnarmed {
