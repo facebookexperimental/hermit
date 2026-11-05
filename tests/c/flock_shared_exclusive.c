@@ -510,18 +510,54 @@ static void scenario_mixed_waiters(void) {
    apart and need not. */
 static int all_flock_rows_are_ours;
 
-/* The lock file's MAJ:MIN:INO as /proc/locks prints it, learned from this
-   process's own row while it holds a lock. The device cannot come from
-   stat(): on btrfs, st_dev is the subvolume's anonymous device while
+/* The lock file's MAJ:MIN:INO as /proc/locks prints it, learned once per
+   lock file from a row this test created, whoever holds it: a row whose
+   inode is the file's st_ino and whose pid is this process or one of its
+   descendants (in exec-waiter only children and threads ever hold or wait
+   on the lock, so own-pid rows may never exist). The device cannot come
+   from stat(): on btrfs, st_dev is the subvolume's anonymous device while
    /proc/locks prints the superblock's, and an inode number alone also
    matches unrelated files on other filesystems that reuse it (a native
    false red: a foreign shared flock on a same-inode file counted as a
-   third holder here). */
+   third holder here). If no descendant row is visible yet and exactly one
+   triple carries the file's inode, that triple is unambiguous and is
+   learned instead. */
 static char lock_object[64];
 
+/* Whether `pid` is this process or a descendant of it, by /proc parentage. */
+static int pid_is_ours(long pid) {
+  long own = (long)getpid();
+  for (int hops = 0; hops < 32 && pid > 1; hops++) {
+    if (pid == own) {
+      return 1;
+    }
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%ld/stat", pid);
+    FILE* stat_file = fopen(path, "re");
+    if (stat_file == NULL) {
+      return 0;
+    }
+    char text[512];
+    size_t length = fread(text, 1, sizeof(text) - 1, stat_file);
+    fclose(stat_file);
+    text[length] = '\0';
+    char* close_paren = strrchr(text, ')');
+    long ppid = 0;
+    if (close_paren == NULL || sscanf(close_paren + 1, "%*s %ld", &ppid) != 1) {
+      return 0;
+    }
+    pid = ppid;
+  }
+  return pid == own;
+}
+
 /* The access of each /proc/locks row on the lock file, in row order, a
-   waiter's (`->`) after `->`. */
-static void proc_locks_rows(char* out, size_t size) {
+   waiter's (`->`) after `->`: one read of /proc/locks. */
+static void proc_locks_snapshot(char* out, size_t size) {
+  struct stat file;
+  if (stat(lock_path, &file) != 0) {
+    harness("stat the lock file");
+  }
   FILE* locks = fopen("/proc/locks", "re");
   if (locks == NULL) {
     harness("open /proc/locks");
@@ -557,11 +593,35 @@ static void proc_locks_rows(char* out, size_t size) {
   }
   fclose(locks);
   if (lock_object[0] == '\0') {
-    for (int index = 0; index < count; index++) {
-      if (!parsed[index].waits && parsed[index].pid == (long)getpid()) {
-        snprintf(lock_object, sizeof(lock_object), "%s", parsed[index].object);
-        break;
+    /* Learn the file's triple: first from a holder row this test created
+       (descendant pid, matching inode), then from such a waiter row, and
+       finally from the only triple carrying the inode, if there is one. */
+    const char* unique = NULL;
+    int ambiguous = 0;
+    for (int pass = 0; pass < 3 && lock_object[0] == '\0'; pass++) {
+      for (int index = 0; index < count; index++) {
+        const char* colon = strrchr(parsed[index].object, ':');
+        if (colon == NULL ||
+            strtoull(colon + 1, NULL, 10) != (unsigned long long)file.st_ino) {
+          continue;
+        }
+        if (pass == 2) {
+          if (unique == NULL) {
+            unique = parsed[index].object;
+          } else if (strcmp(unique, parsed[index].object) != 0) {
+            ambiguous = 1;
+          }
+          continue;
+        }
+        if ((pass == 0) != (parsed[index].waits != 0) &&
+            pid_is_ours(parsed[index].pid)) {
+          snprintf(lock_object, sizeof(lock_object), "%s", parsed[index].object);
+          break;
+        }
       }
+    }
+    if (lock_object[0] == '\0' && unique != NULL && !ambiguous) {
+      snprintf(lock_object, sizeof(lock_object), "%s", unique);
     }
   }
   out[0] = '\0';
@@ -580,6 +640,33 @@ static void proc_locks_rows(char* out, size_t size) {
   }
   if (out[0] == '\0') {
     snprintf(out, size, "none");
+  }
+}
+
+/* proc_locks_rows as read everywhere above: a one-shot read of a long
+   /proc/locks (~1,300 rows on a busy host) can race lock changes and tear,
+   so re-read until two consecutive snapshots agree on the matched rows.
+   Bounded and counted; on exhaustion the last snapshot stands, which is
+   what a one-shot read would have returned. */
+static void proc_locks_rows(char* out, size_t size) {
+  static char first[1024];
+  static char second[1024];
+  if (size > sizeof(first)) {
+    proc_locks_snapshot(out, size);
+    return;
+  }
+  int attempts = 0;
+  for (;;) {
+    attempts++;
+    proc_locks_snapshot(first, size);
+    proc_locks_snapshot(second, size);
+    if (strcmp(first, second) == 0 || attempts >= 250) {
+      size_t length = strnlen(second, size - 1);
+      memcpy(out, second, length);
+      out[length] = '\0';
+      return;
+    }
+    sleep_ms(10);
   }
 }
 
