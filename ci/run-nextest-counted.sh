@@ -285,6 +285,18 @@ function run_nextest {
         cleanup_nextest_config
         return 2
     fi
+    # Retain the census identities beside the counts report: the landing
+    # census gate diffs these against the base run's, so a test that stops
+    # being listed is named instead of hidden inside a drifting count.
+    # Derived from this same inventory; a failure here is the same class
+    # as failing to derive the count.
+    if [[ -n ${DAGRUN_TEST_COUNTS_PATH:-} && ${DAGRUN_TEST_COUNTS_PATH} != - ]]; then
+        if ! run_rust_script "$RESULT_WRITER" --listed-ids "$inventory" "${DAGRUN_TEST_COUNTS_PATH}.listed-ids"; then
+            printf 'run-nextest-counted: cannot derive listed test identities from nextest inventory\n' >&2
+            cleanup_nextest_config
+            return 2
+        fi
+    fi
 
     # Prepared consumers can bind calibration to the exact checked build and
     # selected inventory. Standalone/unsupported populations keep the existing
@@ -600,6 +612,8 @@ PYEOF
         }
     }' >"$scratch/listed-inventory.json"
     [[ $(run_rust_script "$RESULT_WRITER" --listed-count "$scratch/listed-inventory.json") == 3 ]] || return 1
+    run_rust_script "$RESULT_WRITER" --listed-ids "$scratch/listed-inventory.json" "$scratch/listed-ids.txt" || return 1
+    [[ $(cat "$scratch/listed-ids.txt") == $'suite/suite/also_runs\nsuite/suite/ignored_one\nsuite/suite/runs' ]] || return 1
 
     # Exercise the generated config, the real per-execution wrapper, and the
     # typed reconciliation path. A valid failed run must still return nextest's
