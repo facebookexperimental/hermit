@@ -33124,8 +33124,13 @@ mod committed_selection_preservation_tests {
             "test.rr_suite_contract",
             "test.sabre_examples",
         ];
-        let hosted =
+        let mut hosted =
             dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()]).unwrap();
+        // build_plan applies the default early-exit shape before sealing
+        // (apply_fail_fast). Shape the committed expectation the same way
+        // so the per-step byte comparison still proves the exact nodes
+        // changed nothing else; the collapse itself is pinned below.
+        collapse_fail_fast_families(&mut hosted);
         let mut expected = public
             .iter()
             .map(|tag| format!("{tag}_on_host"))
@@ -33190,6 +33195,10 @@ mod committed_selection_preservation_tests {
                     .map(Step::tag)
                     .collect::<BTreeSet<_>>(),
                 expected
+            );
+            assert!(
+                plan.cfg.steps.iter().all(|step| step.fail_fast_family.is_none()),
+                "{argv:?}"
             );
             for actual in &plan.cfg.steps {
                 let source = hosted
@@ -36160,13 +36169,22 @@ mod scorecard_cutover_tests {
     fn complete_full_plans_preserve_full_selection_in_ledger() {
         let source = test_source_root();
         let (committed, _, _) = load_committed_validation_dag(&source).unwrap();
-        let complete = dagrun::select_steps_by_labels(&committed, &["full".into()]).unwrap();
+        let mut complete = dagrun::select_steps_by_labels(&committed, &["full".into()]).unwrap();
+        // build_plan applies the default early-exit shape before sealing
+        // (apply_fail_fast). Shape the committed expectation the same way
+        // so the byte comparison still proves full scope changed nothing
+        // else; the collapse itself is pinned on the plan below.
+        collapse_fail_fast_families(&mut complete);
         for argv in [vec!["full"], vec!["full", "--all"]] {
             let temp = tempfile::tempdir().unwrap();
             let args =
                 parse_argv(&argv.iter().map(|arg| (*arg).into()).collect::<Vec<_>>()).unwrap();
             let plan = build_plan(&source, &args, temp.path()).unwrap();
             assert!(plan.suite_complete);
+            assert!(
+                plan.cfg.steps.iter().all(|step| step.fail_fast_family.is_none()),
+                "{argv:?}"
+            );
             assert_eq!(dag_to_json(&plan.cfg), dag_to_json(&complete));
 
             // Exercise the real writer without running the graph or inventing
@@ -36555,7 +36573,22 @@ mod scorecard_cutover_tests {
             assert_eq!(plan.selection_mode, selection, "{argv:?}");
             assert!(!plan.suite_complete, "{argv:?}");
             if argv.get(2) == Some(&all_tags.as_str()) {
-                assert_eq!(dag_to_json(&plan.cfg), dag_to_json(&complete));
+                // build_plan applies the default early-exit shape before
+                // sealing (apply_fail_fast, itself under direct test in
+                // fail_fast_tests). Shape the committed expectation the
+                // same way so the byte comparison still proves the
+                // explicit selection changed nothing else, and keep the
+                // collapse itself pinned directly here.
+                assert!(
+                    plan.cfg
+                        .steps
+                        .iter()
+                        .all(|step| step.fail_fast_family.is_none()),
+                    "{argv:?}"
+                );
+                let mut expected = complete.clone();
+                collapse_fail_fast_families(&mut expected);
+                assert_eq!(dag_to_json(&plan.cfg), dag_to_json(&expected));
             }
         }
         // The super level is the union of the full and super labels (the
