@@ -27,6 +27,7 @@ use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -63,6 +64,7 @@ use reverie::syscalls::Openat;
 use reverie::syscalls::PathPtr;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 use reverie::syscalls::Unlinkat;
 use reverie::syscalls::Whence;
@@ -155,6 +157,16 @@ impl Drop for ReplayMaterializationScope {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.identity);
+        // Pending flock entries for this root die with its scope, like
+        // its materialized files, so a later run reusing a descriptor
+        // number and thread-group id cannot spend a stale entry. The
+        // registry itself is declared with the pending-open type below.
+        if let Some(registry) = PENDING_PLACEHOLDER_OPENS.get() {
+            registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|pending| pending.root != self.identity);
+        }
     }
 }
 
@@ -212,6 +224,17 @@ pub(super) const ACCEPT_SLOT_REFUSAL: &str = "replay refused: an accepted connec
     descriptor slot differs from the recording, because record does not log where a \
     backgrounded accept took its slot (https://github.com/rrnewton/hermit/issues/3880)";
 
+/// How replay refuses a recorded `flock` whose descriptor it cannot
+/// materialize beneath the replay root (dh-gg5uv): the descriptor was
+/// served a placeholder at its recorded open and nothing since put a
+/// real file beneath the root for it, so taking the lock for real is
+/// impossible and returning the recorded result would falsely claim a
+/// lock was acquired. Named like [`ACCEPT_SLOT_REFUSAL`] so downstream
+/// tooling can tell this typed refusal from a generic panic.
+pub(super) const FLOCK_OUTSIDE_REPLAY_ROOT_REFUSAL: &str = "replay refused: cannot replay flock side effects for a descriptor outside the \
+     replay root that replay could not materialize; returning the recorded result \
+     would falsely claim a lock was acquired";
+
 /// The initial count of the eventfd that stands in for an accepted
 /// connection. Every other replay placeholder starts at 0, and replay serves
 /// every operation on a stand-in from the log, so this count never changes and
@@ -233,6 +256,20 @@ const ACCEPT_STAND_IN_COUNT: u32 = 0x3880_acc7;
 /// the count back; it is distinctive only so that a stand-in can be told
 /// apart from a guest eventfd in a replay's `/proc/<pid>/fdinfo`.
 pub(super) const RECEIVED_STAND_IN_COUNT: u32 = 0x5c3d_f0d5;
+
+/// The `eventfd-id` line of an fdinfo file: the kernel-wide identity
+/// of one eventfd open file description, shared by its duplicates.
+fn parse_eventfd_id(fdinfo: &str) -> Option<String> {
+    fdinfo
+        .lines()
+        .find_map(|line| Some(line.strip_prefix("eventfd-id:")?.trim().to_owned()))
+}
+
+/// The `eventfd-id` of descriptor `fd` in thread `tid`'s table.
+fn placeholder_eventfd_id(tid: Pid, fd: libc::c_int) -> Option<String> {
+    let fdinfo = std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", tid.as_raw())).ok()?;
+    parse_eventfd_id(&fdinfo)
+}
 
 /// The `eventfd-count` line of an fdinfo file, present for eventfds. Linux
 /// prints the count in hexadecimal.
@@ -340,12 +377,23 @@ fn unix_table_lists_inode(table: &[u8], inode: u64) -> bool {
 /// Whether the regular file behind a guest descriptor lives beneath the
 /// guest's replay root, judged by directory ancestry rather than path text
 /// (the guest may live in a mount namespace the replayer cannot name).
+///
+/// Only a pathname descriptor qualifies: its procfs link is absolute. A
+/// placeholder's link (`anon_inode:[eventfd]`, `pipe:[…]`, `socket:[…]`) is
+/// slashless, its parent is the empty path, and the host path built below
+/// would name the replay root itself, which is trivially beneath the root.
+/// Without this guard, `handle_flock` admitted such a placeholder and
+/// locked the shared `anon_inode` instead of the recorded object, so
+/// distinct recorded objects falsely contended (dh-gg5uv review).
 fn file_is_beneath_replay_root(pid: Pid, fd: libc::c_int) -> bool {
     let Ok(link) = std::fs::read_link(format!("/proc/{}/fd/{fd}", pid.as_raw())) else {
         return false;
     };
     let link = link.to_string_lossy().into_owned();
     let link = link.strip_suffix(" (deleted)").unwrap_or(&link);
+    if !std::path::Path::new(link).is_absolute() {
+        return false;
+    }
     let Some(parent) = std::path::Path::new(link).parent() else {
         return false;
     };
@@ -363,7 +411,13 @@ fn remember_materialized_file(pid: Pid, fd: libc::c_int) {
     let Ok(metadata) = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())) else {
         return;
     };
-    if metadata.file_type().is_file() {
+    // FIFOs register beside regular files: the registry is keyed by object
+    // identity (root, device, inode), which is exactly the identity a
+    // later `flock`, `fchmod`, or `lseek` on any descriptor for the same
+    // object must be judged by. A per-thread set of bare descriptor
+    // numbers could not do that — it stayed stale across close/reuse and
+    // disagreed across `CLONE_FILES` threads (dh-gg5uv review).
+    if metadata.file_type().is_file() || metadata.file_type().is_fifo() {
         let Ok(root) = replay_root_identity(pid) else {
             return;
         };
@@ -431,6 +485,663 @@ pub struct ReplayerThreadState {
     /// every thread inherits from the thread that created it.
     #[serde(skip)]
     outputs: std::sync::Arc<ReplayOutputs>,
+}
+
+/// A placeholder descriptor reserved for a recorded open, with the
+/// request that may still materialize it at a following `flock`.
+///
+/// Entries live in a process-wide registry, not in thread state:
+/// descriptor tables are shared across `CLONE_FILES` threads and copied
+/// at `fork`, so any thread naming the descriptor must invalidate the
+/// entry, and the entry may be spent only once even where two tables
+/// inherited the placeholder (dh-gg5uv review). `tgid` is the opening
+/// thread group; a descendant that inherited the descriptor may spend
+/// the entry (a shell handing its descriptor to a `flock` helper), but
+/// an unrelated process reusing the same descriptor number may not.
+/// `parent`/`object` pin what `(dirfd, path)` resolved to at recorded-
+/// open time, by device and inode, so re-resolution at `flock` time
+/// cannot quietly materialize a different object after a `chdir`,
+/// rename, unlink, symlink swap, or `dirfd` reuse; a pin that could
+/// not be taken refuses by name at materialize time where the check
+/// needs it, rather than skipping the check. `open_id` is one
+/// recorded open's identity across its dup aliases: spending any
+/// alias's entry retires them all, because one recorded open has one
+/// open file description and materializing two aliases separately
+/// would invent two lock domains for it.
+#[derive(Clone, Debug)]
+struct PendingPlaceholderOpen {
+    open_id: u64,
+    root: ReplayFileIdentity,
+    tgid: libc::pid_t,
+    opener_tid: libc::pid_t,
+    fd: libc::c_int,
+    dirfd: libc::c_int,
+    path: PathBuf,
+    flags: OFlag,
+    mode: Option<reverie::syscalls::Mode>,
+    parent: Option<ReplayFileIdentity>,
+    object: Option<ReplayFileIdentity>,
+    /// The placeholder eventfd's own identity (`eventfd-id` from its
+    /// fdinfo), pinned at reservation. All eventfds share one anon
+    /// inode, so device/inode cannot tell two placeholders apart; the
+    /// id can, and it is what keeps a split-table sibling (same
+    /// thread group, private descriptor table) from spending this
+    /// entry on its own placeholder at the same number. A freed id is
+    /// reused at once, but the close/dup2 that frees a placeholder
+    /// also retires its entry by descriptor number first.
+    placeholder_id: Option<String>,
+}
+
+static PENDING_PLACEHOLDER_OPENS: OnceLock<Mutex<Vec<PendingPlaceholderOpen>>> = OnceLock::new();
+
+/// Sequence for `PendingPlaceholderOpen::open_id`: unique per recorded
+/// open within this replay process, shared by its dup-alias clones.
+static PENDING_OPEN_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn pending_placeholder_opens() -> &'static Mutex<Vec<PendingPlaceholderOpen>> {
+    PENDING_PLACEHOLDER_OPENS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Remembers one placeholder-answered recorded open for a following
+/// `flock`, replacing only an entry for the very same placeholder. Entries for other descriptors stay: a second
+/// recorded open must not displace the first one's pending request.
+fn remember_pending_placeholder_open(pending: PendingPlaceholderOpen) {
+    let mut registry = pending_placeholder_opens()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Re-remembering the same placeholder replaces its entry; a
+    // different placeholder at the same number in a split descriptor
+    // table (same thread group, another thread's own table) must not
+    // evict it, or that thread's flock could spend this entry on the
+    // wrong file.
+    registry.retain(|existing| {
+        !(existing.root == pending.root
+            && existing.opener_tid == pending.opener_tid
+            && existing.fd == pending.fd
+            && existing.placeholder_id == pending.placeholder_id)
+    });
+    registry.push(pending);
+}
+
+/// The thread group and parent process of a guest thread, from its
+/// status file. `guest.pid()` is the group leader, whose descriptor
+/// table is not the calling thread's when it was made without
+/// `CLONE_FILES`, so pending entries are judged against the calling
+/// thread (`guest.tid()`), not the leader.
+fn guest_tgid_ppid(tid: Pid) -> Option<(libc::pid_t, libc::pid_t)> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", tid.as_raw())).ok()?;
+    let (mut tgid, mut ppid) = (None, None);
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Tgid:") {
+            tgid = rest.trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("PPid:") {
+            ppid = rest.trim().parse().ok();
+        }
+    }
+    Some((tgid?, ppid?))
+}
+
+/// Whether thread group `ancestor` is the thread group of `tid` or one
+/// of its process ancestors: the groups whose descriptor this thread
+/// could have inherited the pending placeholder from.
+fn tgid_is_self_or_ancestor(ancestor: libc::pid_t, tid: Pid) -> bool {
+    let Some((tgid, mut ppid)) = guest_tgid_ppid(tid) else {
+        return false;
+    };
+    if tgid == ancestor {
+        return true;
+    }
+    // A ppid names the parent's thread-group leader. The walk is
+    // bounded so a cyclic or vanished ancestry just fails closed.
+    for _ in 0..16 {
+        if ppid == ancestor {
+            return true;
+        }
+        if ppid <= 1 {
+            return false;
+        }
+        let Some((_, next)) = guest_tgid_ppid(Pid::from_raw(ppid)) else {
+            return false;
+        };
+        ppid = next;
+    }
+    false
+}
+
+/// Takes the pending entry for `fd` that thread `tid` may spend: the
+/// opening thread's own first, then its thread group's, else an
+/// ancestor's it inherited. The opening-thread preference matters
+/// where a thread group has split descriptor tables (a thread made
+/// without `CLONE_FILES` holds its own file at the same number):
+/// exact `tgid` alone would let such a thread spend a sibling's entry
+/// and materialize over its own real descriptor. Taking removes the
+/// whole family — every dup-alias entry of the same recorded open —
+/// so a fork sibling or alias descriptor cannot materialize a
+/// second, divergent object for the one recorded open; its recorded
+/// `flock` then refuses by name instead of locking a different open
+/// file description than the recording's.
+fn take_pending_placeholder_open(tid: Pid, fd: libc::c_int) -> Option<PendingPlaceholderOpen> {
+    let root = replay_root_identity(tid).ok()?;
+    let (tgid, _) = guest_tgid_ppid(tid)?;
+    // Cross-table tiers (thread group, ancestor) must prove this
+    // descriptor is the very placeholder the entry was remembered
+    // for, by its eventfd id: a split-table sibling's own placeholder
+    // at the same number has a different id, and spending its entry
+    // here would lock the sibling's file. The opening thread's own
+    // entry may spend when no id could be pinned (its table is the
+    // one the reservation landed in).
+    let current_id = placeholder_eventfd_id(tid, fd);
+    let id_matches = |pending: &PendingPlaceholderOpen| {
+        pending.placeholder_id.is_some() && pending.placeholder_id == current_id
+    };
+    let mut registry = pending_placeholder_opens()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let index = registry
+        .iter()
+        .position(|pending| {
+            pending.root == root
+                && pending.opener_tid == tid.as_raw()
+                && pending.fd == fd
+                && (pending.placeholder_id.is_none() || pending.placeholder_id == current_id)
+        })
+        .or_else(|| {
+            registry.iter().position(|pending| {
+                pending.root == root
+                    && pending.tgid == tgid
+                    && pending.fd == fd
+                    && id_matches(pending)
+            })
+        })
+        .or_else(|| {
+            registry.iter().position(|pending| {
+                pending.root == root
+                    && pending.fd == fd
+                    && id_matches(pending)
+                    && tgid_is_self_or_ancestor(pending.tgid, tid)
+            })
+        })?;
+    let taken = registry.remove(index);
+    registry.retain(|pending| pending.open_id != taken.open_id);
+    Some(taken)
+}
+
+/// Whether descriptor `fd` of thread `tid` is a plain replay
+/// placeholder: an eventfd still at the initial count `reserve_replay_fd`
+/// installs (0), as opposed to an accepted connection's or received
+/// descriptor's stand-in, which carry their own counts. Only a plain
+/// placeholder may be swapped for a pending entry's real object;
+/// anything else at that number is a real descriptor (or another
+/// stand-in) that a pending spend must not clobber.
+fn fd_is_plain_placeholder(tid: Pid, fd: libc::c_int) -> bool {
+    if !fd_is_eventfd(tid, fd) {
+        return false;
+    }
+    match std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", tid.as_raw())) {
+        Ok(fdinfo) => parse_eventfd_count(&fdinfo) == Some(0),
+        // Unreadable fdinfo proves nothing about this descriptor, and
+        // this guard exists to keep a spend from clobbering a real
+        // descriptor: fail closed.
+        Err(_) => false,
+    }
+}
+
+/// Clones the pending entry for `oldfd` onto `newfd` after a recorded
+/// dup produced `newfd`: a shell opens its lock file onto the lowest
+/// free descriptor, then dups it onto the high descriptor it hands to
+/// `flock` and closes the original, so the pending open must travel
+/// with the placeholder or that shape could never materialize. The
+/// original entry stays while its descriptor stays open (aliases of
+/// one placeholder), and `take_pending_placeholder_open` still spends
+/// an entry exactly once. Only entries the dup'ing thread could itself
+/// spend are cloned, under the new descriptor's close-on-exec bit.
+fn follow_pending_through_dup(tid: Pid, oldfd: libc::c_int, newfd: libc::c_int, cloexec: bool) {
+    if oldfd == newfd {
+        return;
+    }
+    let Ok(root) = replay_root_identity(tid) else {
+        return;
+    };
+    let clones: Vec<PendingPlaceholderOpen> = {
+        let registry = pending_placeholder_opens()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry
+            .iter()
+            .filter(|pending| {
+                pending.root == root
+                    && pending.fd == oldfd
+                    && tgid_is_self_or_ancestor(pending.tgid, tid)
+            })
+            .map(|pending| {
+                let mut clone = pending.clone();
+                clone.fd = newfd;
+                clone.flags.set(OFlag::O_CLOEXEC, cloexec);
+                clone
+            })
+            .collect()
+    };
+    for clone in clones {
+        remember_pending_placeholder_open(clone);
+    }
+}
+
+/// What `(dirfd, path)` resolves to for thread `tid` right now, as
+/// identities: the containing directory and, when it exists, the object
+/// itself. Resolution is descriptor-based without procfs symlinks
+/// (`resolve_existing_path_without_procfs_symlinks`), starting from the
+/// calling thread's own root/cwd/dirfd descriptors, so a path crossing a
+/// procfs magic link cannot pin an in-root name to an out-of-root
+/// object, and a thread with its own descriptor table pins what *it*
+/// sees, not its leader's view.
+struct PendingOpenPins {
+    parent: Option<ReplayFileIdentity>,
+    object: Option<ReplayFileIdentity>,
+    object_is_fifo: bool,
+}
+
+fn pin_pending_open_object(tid: Pid, dirfd: libc::c_int, path: &Path) -> PendingOpenPins {
+    let missing = PendingOpenPins {
+        parent: None,
+        object: None,
+        object_is_fifo: false,
+    };
+    let Ok(root) = crate::record_replay_path::open_process_root(tid) else {
+        return missing;
+    };
+    let start = if path.is_absolute() {
+        crate::record_replay_path::open_process_root(tid)
+    } else if dirfd == libc::AT_FDCWD {
+        crate::record_replay_path::open_process_cwd(tid)
+    } else {
+        crate::record_replay_path::open_process_directory_fd(tid, dirfd)
+    };
+    let Ok(start) = start else {
+        return missing;
+    };
+    let parent = match path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        Some(parent) => crate::record_replay_path::resolve_existing_path_without_procfs_symlinks(
+            &root, &start, parent,
+        )
+        .ok()
+        .and_then(|resolved| identity_for_fd(resolved.object.as_raw_fd()).ok()),
+        None => identity_for_fd(start.as_raw_fd()).ok(),
+    };
+    let (object, object_is_fifo) =
+        match crate::record_replay_path::resolve_existing_path_without_procfs_symlinks(
+            &root, &start, path,
+        ) {
+            Ok(resolved) => {
+                let is_fifo =
+                    std::fs::metadata(format!("/proc/self/fd/{}", resolved.object.as_raw_fd()))
+                        .is_ok_and(|metadata| metadata.file_type().is_fifo());
+                (identity_for_fd(resolved.object.as_raw_fd()).ok(), is_fifo)
+            }
+            Err(_) => (None, false),
+        };
+    PendingOpenPins {
+        parent,
+        object,
+        object_is_fifo,
+    }
+}
+
+/// Builds the registry entry for one placeholder-answered recorded
+/// open, pinning `(dirfd, path)` as it resolves for the opening thread.
+/// Returns `None` when the opening thread's root or thread group
+/// cannot be identified; the recorded `flock` then refuses by name
+/// rather than materializing on a guess.
+fn pending_placeholder_open(
+    tid: Pid,
+    fd: libc::c_int,
+    dirfd: libc::c_int,
+    path: PathBuf,
+    flags: OFlag,
+    mode: Option<reverie::syscalls::Mode>,
+) -> Option<PendingPlaceholderOpen> {
+    let pins = pin_pending_open_object(tid, dirfd, &path);
+    Some(PendingPlaceholderOpen {
+        open_id: PENDING_OPEN_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        root: replay_root_identity(tid).ok()?,
+        tgid: guest_tgid_ppid(tid)?.0,
+        opener_tid: tid.as_raw(),
+        fd,
+        dirfd,
+        path,
+        flags,
+        mode,
+        parent: pins.parent,
+        object: pins.object,
+        placeholder_id: placeholder_eventfd_id(tid, fd),
+    })
+}
+
+/// Whether `syscall` may have operated on descriptor `fd`, retiring a
+/// pending placeholder for it: after such a call the placeholder may
+/// have served as the descriptor, so its recorded open may no longer
+/// be materialized late at a `flock`.
+///
+/// This is deliberately inverted from a "names the descriptor" list
+/// (dh-gg5uv review): a syscall keeps the pending entry only when it
+/// is proven not to touch `fd`. Syscalls whose descriptor arguments
+/// are decoded below (including the second descriptor of the
+/// splice family, `epoll_ctl`'s target, `pidfd_getfd`'s target, and
+/// the `dirfd` arguments of the `*at` family) clear only on a match;
+/// syscalls that take descriptors from guest memory (`poll`/`select`
+/// arrays, io_uring submission entries, AIO control blocks,
+/// `SCM_RIGHTS` in the message calls, `bpf` unions) clear always, as
+/// do numbers this function does not classify. Erring wide only loses
+/// a materialization, which the named refusal then states; erring
+/// narrow would lock a placeholder or an object whose recorded I/O
+/// was served virtually. Path-only calls keep the entry: what they
+/// change is caught by the identity pins when the `flock` arrives.
+/// `flock` itself never clears here, so `handle_flock` can spend the
+/// entry its own descriptor named.
+fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
+    // Pure queries leave no state on the open file description for a
+    // late materialization to miss: replay answers them from the
+    // recording, and the object the descriptor names is unchanged.
+    // (A shell, for one, fstats its freshly opened lock file before
+    // dup'ing it onto the descriptor it hands to `flock`.)
+    match syscall {
+        Syscall::Fstat(_)
+        | Syscall::Fstatfs(_)
+        | Syscall::Fgetxattr(_)
+        | Syscall::Flistxattr(_) => {
+            return false;
+        }
+        Syscall::Fcntl(call) => match call.cmd() {
+            FcntlCmd::F_GETFD | FcntlCmd::F_GETFL => return false,
+            // A dup's source keeps its entry; the dup handlers clone
+            // it onto the descriptor the recording actually produced.
+            FcntlCmd::F_DUPFD(_) | FcntlCmd::F_DUPFD_CLOEXEC(_) => return false,
+            _ => return call.fd() == fd,
+        },
+        _ => {}
+    }
+    if let Syscall::Mmap(call) = syscall {
+        return call.fd() == fd;
+    }
+    // A dup2/dup3 retires only an entry for the descriptor it
+    // replaces; the source entry is cloned onto the new descriptor by
+    // the dup handlers once the recorded dup is known to have
+    // succeeded, so a shell's open-then-dup-to-9 shape reaches its
+    // flock with the pending open still attached to descriptor 9.
+    if let Syscall::Dup2(call) = syscall {
+        return call.newfd() == fd && call.oldfd() != call.newfd();
+    }
+    if let Syscall::Dup3(call) = syscall {
+        return call.newfd() == fd && call.oldfd() != call.newfd();
+    }
+    let (number, args) = syscall.into_parts();
+    let arg = |value: usize| value as libc::c_int == fd;
+    if number == Sysno::close_range {
+        // close_range takes unsigned bounds: ~0U is the usual "to the
+        // end" last bound, whose cast to c_int used to make the range
+        // empty and leave closed descriptors pending (dh-gg5uv review).
+        let in_range = fd >= 0 && (args.arg0 as u32..=args.arg1 as u32).contains(&(fd as u32));
+        // CLOSE_RANGE_CLOEXEC only flags the descriptors, but retiring
+        // the entry is the conservative reading: an exec between here
+        // and the flock would close it, and this function does not
+        // track the flag onto the entry.
+        return in_range;
+    }
+    // The flock this pending entry exists for; handle_flock spends it.
+    if number == Sysno::flock {
+        return false;
+    }
+    // Descriptors decoded from the arguments (first listed position is
+    // the one the kernel reads the descriptor from).
+    match number {
+        // One descriptor argument, in arg0: plain I/O and per-file
+        // operations, socket calls on one socket, and the *at family
+        // whose arg0 is the base directory (using the placeholder as a
+        // directory base is operating on it).
+        Sysno::read
+        | Sysno::write
+        | Sysno::close
+        | Sysno::lseek
+        | Sysno::pread64
+        | Sysno::pwrite64
+        | Sysno::readv
+        | Sysno::writev
+        | Sysno::preadv
+        | Sysno::pwritev
+        | Sysno::preadv2
+        | Sysno::pwritev2
+        | Sysno::fcntl
+        | Sysno::ftruncate
+        | Sysno::fsync
+        | Sysno::fdatasync
+        | Sysno::readahead
+        | Sysno::sync_file_range
+        | Sysno::fallocate
+        | Sysno::fadvise64
+        | Sysno::fstat
+        | Sysno::fstatfs
+        | Sysno::ioctl
+        | Sysno::getdents
+        | Sysno::getdents64
+        | Sysno::fchmod
+        | Sysno::fchown
+        | Sysno::fchdir
+        | Sysno::fsetxattr
+        | Sysno::fremovexattr
+        | Sysno::syncfs
+        | Sysno::epoll_wait
+        | Sysno::epoll_pwait
+        | Sysno::epoll_pwait2
+        | Sysno::accept
+        | Sysno::accept4
+        | Sysno::connect
+        | Sysno::bind
+        | Sysno::listen
+        | Sysno::getsockname
+        | Sysno::getpeername
+        | Sysno::setsockopt
+        | Sysno::getsockopt
+        | Sysno::shutdown
+        | Sysno::sendto
+        | Sysno::recvfrom
+        | Sysno::vmsplice
+        | Sysno::inotify_add_watch
+        | Sysno::inotify_rm_watch
+        | Sysno::signalfd
+        | Sysno::signalfd4
+        | Sysno::timerfd_settime
+        | Sysno::timerfd_gettime
+        | Sysno::pidfd_send_signal
+        | Sysno::openat
+        | Sysno::openat2
+        | Sysno::unlinkat
+        | Sysno::mkdirat
+        | Sysno::mknodat
+        | Sysno::fchownat
+        | Sysno::fchmodat
+        | Sysno::fchmodat2
+        | Sysno::newfstatat
+        | Sysno::readlinkat
+        | Sysno::faccessat
+        | Sysno::faccessat2
+        | Sysno::futimesat
+        | Sysno::utimensat
+        | Sysno::execveat
+        | Sysno::statx
+        | Sysno::name_to_handle_at
+        | Sysno::open_by_handle_at => arg(args.arg0),
+        // Two descriptor arguments.
+        Sysno::sendfile => arg(args.arg0) || arg(args.arg1),
+        Sysno::splice | Sysno::copy_file_range => arg(args.arg0) || arg(args.arg2),
+        Sysno::tee => arg(args.arg0) || arg(args.arg1),
+        Sysno::epoll_ctl => arg(args.arg0) || arg(args.arg2),
+        Sysno::renameat | Sysno::renameat2 | Sysno::linkat => arg(args.arg0) || arg(args.arg2),
+        Sysno::symlinkat => arg(args.arg1),
+        Sysno::pidfd_getfd => arg(args.arg0) || arg(args.arg1),
+        Sysno::fanotify_mark => arg(args.arg0) || arg(args.arg3),
+        Sysno::perf_event_open => arg(args.arg3),
+        Sysno::kcmp => arg(args.arg3) || arg(args.arg4),
+        // Descriptor lists or ancillary data in guest memory, or a ring
+        // whose entries name descriptors: undecodable here, always clear.
+        Sysno::poll
+        | Sysno::ppoll
+        | Sysno::select
+        | Sysno::pselect6
+        | Sysno::io_uring_enter
+        | Sysno::io_uring_register
+        | Sysno::io_submit
+        | Sysno::sendmsg
+        | Sysno::recvmsg
+        | Sysno::sendmmsg
+        | Sysno::recvmmsg
+        | Sysno::bpf => true,
+        // Proven to take no descriptor argument: identity/time/signal/
+        // memory bookkeeping, process lifecycle (a fork and exec between
+        // the open and the flock is the shell-to-helper shape; the
+        // close-on-exec retirement runs separately in the dispatch
+        // prologue), pathname-only calls, and descriptor *creators*,
+        // which cannot take the pending slot while its placeholder
+        // occupies it.
+        Sysno::getpid
+        | Sysno::gettid
+        | Sysno::getppid
+        | Sysno::getuid
+        | Sysno::geteuid
+        | Sysno::getgid
+        | Sysno::getegid
+        | Sysno::getpgrp
+        | Sysno::getsid
+        | Sysno::getpgid
+        | Sysno::setpgid
+        | Sysno::setsid
+        | Sysno::getgroups
+        | Sysno::setgroups
+        | Sysno::setuid
+        | Sysno::setgid
+        | Sysno::setreuid
+        | Sysno::setregid
+        | Sysno::setresuid
+        | Sysno::setresgid
+        | Sysno::getresuid
+        | Sysno::getresgid
+        | Sysno::times
+        | Sysno::clock_gettime
+        | Sysno::clock_getres
+        | Sysno::clock_settime
+        | Sysno::gettimeofday
+        | Sysno::settimeofday
+        | Sysno::time
+        | Sysno::sysinfo
+        | Sysno::uname
+        | Sysno::getrandom
+        | Sysno::brk
+        | Sysno::munmap
+        | Sysno::mprotect
+        | Sysno::mremap
+        | Sysno::msync
+        | Sysno::mincore
+        | Sysno::madvise
+        | Sysno::mlock
+        | Sysno::mlock2
+        | Sysno::mlockall
+        | Sysno::munlock
+        | Sysno::munlockall
+        | Sysno::arch_prctl
+        | Sysno::set_tid_address
+        | Sysno::set_robust_list
+        | Sysno::get_robust_list
+        | Sysno::rseq
+        | Sysno::futex
+        | Sysno::nanosleep
+        | Sysno::clock_nanosleep
+        | Sysno::rt_sigaction
+        | Sysno::rt_sigprocmask
+        | Sysno::rt_sigpending
+        | Sysno::rt_sigreturn
+        | Sysno::rt_sigsuspend
+        | Sysno::rt_sigtimedwait
+        | Sysno::sigaltstack
+        | Sysno::pause
+        | Sysno::sched_yield
+        | Sysno::sched_getaffinity
+        | Sysno::sched_setaffinity
+        | Sysno::sched_getparam
+        | Sysno::sched_setparam
+        | Sysno::sched_getscheduler
+        | Sysno::sched_setscheduler
+        | Sysno::sched_rr_get_interval
+        | Sysno::sched_getattr
+        | Sysno::sched_setattr
+        | Sysno::getcpu
+        | Sysno::getrlimit
+        | Sysno::setrlimit
+        | Sysno::prlimit64
+        | Sysno::getrusage
+        | Sysno::membarrier
+        | Sysno::fork
+        | Sysno::vfork
+        | Sysno::clone
+        | Sysno::clone3
+        | Sysno::execve
+        | Sysno::wait4
+        | Sysno::waitid
+        | Sysno::exit
+        | Sysno::exit_group
+        | Sysno::kill
+        | Sysno::tkill
+        | Sysno::tgkill
+        | Sysno::getcwd
+        | Sysno::chdir
+        | Sysno::umask
+        | Sysno::open
+        | Sysno::creat
+        | Sysno::stat
+        | Sysno::lstat
+        | Sysno::statfs
+        | Sysno::access
+        | Sysno::readlink
+        | Sysno::mkdir
+        | Sysno::rmdir
+        | Sysno::unlink
+        | Sysno::rename
+        | Sysno::link
+        | Sysno::symlink
+        | Sysno::truncate
+        | Sysno::chmod
+        | Sysno::chown
+        | Sysno::lchown
+        | Sysno::mknod
+        | Sysno::utime
+        | Sysno::utimes
+        | Sysno::setxattr
+        | Sysno::lsetxattr
+        | Sysno::getxattr
+        | Sysno::lgetxattr
+        | Sysno::listxattr
+        | Sysno::llistxattr
+        | Sysno::removexattr
+        | Sysno::lremovexattr
+        | Sysno::dup
+        | Sysno::socket
+        | Sysno::socketpair
+        | Sysno::pipe
+        | Sysno::pipe2
+        | Sysno::eventfd
+        | Sysno::eventfd2
+        | Sysno::epoll_create
+        | Sysno::epoll_create1
+        | Sysno::timerfd_create
+        | Sysno::inotify_init
+        | Sysno::inotify_init1
+        | Sysno::io_uring_setup
+        | Sysno::memfd_create
+        | Sysno::userfaultfd
+        | Sysno::pidfd_open => false,
+        // Anything unclassified: not proven descriptor-free.
+        _ => true,
+    }
 }
 
 /// Duplicates of the stdout and stderr the root guest inherited, the only
@@ -571,6 +1282,36 @@ impl Tool for Replayer {
     ) -> Result<i64, Error> {
         self.expect_syscall(guest, syscall);
 
+        // A placeholder open is materializable only by a following
+        // flock, and only until some other syscall may have operated
+        // on its descriptor (which replay may have served virtually
+        // on the placeholder). The registry is process-wide, so a
+        // sibling thread sharing the descriptor table (CLONE_FILES)
+        // or a fork sibling retires the entry exactly as the opening
+        // thread would; clearing is keyed by descriptor number across
+        // entries, which at worst loses another process's
+        // materialization to the named refusal, never locks wrongly.
+        // Proven descriptor-free syscalls — including a fork and exec
+        // between the open and the flock, as in a shell handing its
+        // descriptor to a lock helper — leave entries pending. An
+        // exec's close-on-exec retirement runs in `handle_exec`, only
+        // once the recorded exec is known to have succeeded: a failed
+        // exec keeps its descriptors, so retiring them here, before
+        // the result is known, would refuse a flock the recording
+        // took on the surviving descriptor.
+        {
+            let mut registry = pending_placeholder_opens()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry.retain(|pending| {
+                let clears = syscall_clears_pending(syscall, pending.fd);
+                if clears {
+                    tracing::debug!(?syscall, pending.fd, "pending flock open retired");
+                }
+                !clears
+            });
+        }
+
         // As the recorder does: the kernel's restart of a poll a signal ended
         // there is served from the poll's recorded outputs.
         if let Some(poll) = guest.thread_state_mut().interrupted_poll.take()
@@ -708,16 +1449,10 @@ impl Tool for Replayer {
             // TODO-HUMAN-REVIEW(#2373)
             Syscall::Flock(call) => self.handle_flock(guest, call).await,
             Syscall::Ftruncate(syscall) => Ok(self.handle_ftruncate(guest, syscall).await?),
-            Syscall::Dup(_) => {
-                self.handle_replayed_side_effect(guest, syscall, "dup")
-                    .await
-            }
+            Syscall::Dup(_) => self.handle_dup_family(guest, syscall, "dup").await,
             #[cfg(target_arch = "x86_64")]
             Syscall::Dup2(_) => self.handle_dup2(guest, syscall).await,
-            Syscall::Dup3(_) => {
-                self.handle_replayed_side_effect(guest, syscall, "dup3")
-                    .await
-            }
+            Syscall::Dup3(_) => self.handle_dup_family(guest, syscall, "dup3").await,
             Syscall::Ioctl(syscall) => self.handle_ioctl(guest, syscall).await,
             Syscall::Socket(_) => {
                 self.handle_replayed_side_effect(guest, syscall, "socket")
@@ -747,8 +1482,7 @@ impl Tool for Replayer {
                     FcntlCmd::F_DUPFD(_) | FcntlCmd::F_DUPFD_CLOEXEC(_)
                 ) =>
             {
-                self.handle_replayed_side_effect(guest, syscall, "fcntl_dupfd")
-                    .await
+                self.handle_dup_family(guest, syscall, "fcntl_dupfd").await
             }
             Syscall::Fcntl(call) if matches!(call.cmd(), FcntlCmd::F_SETFD(_)) => {
                 self.handle_replayed_side_effect(guest, syscall, "fcntl_setfd")
@@ -863,6 +1597,22 @@ impl Replayer {
             Ok(event) => event,
             Err(error) => return Err(error),
         };
+        // The recorded exec succeeded (this handler runs only for a
+        // recorded Exec event): pending entries of the exec'ing
+        // thread group whose recorded descriptors were close-on-exec
+        // die with it, because its placeholders are physically closed.
+        // An ancestor's entry stays: its own table still holds the
+        // descriptor, and a descendant can no longer spend it anyway
+        // once its inherited placeholder is closed (the eventfd-id
+        // check in `take_pending_placeholder_open`).
+        if let Some((exec_tgid, _)) = guest_tgid_ppid(guest.tid()) {
+            pending_placeholder_opens()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|pending| {
+                    !(pending.flags.contains(OFlag::O_CLOEXEC) && pending.tgid == exec_tgid)
+                });
+        }
         let actual_request = self
             .read_exec_request(guest, syscall)
             .unwrap_or_else(|error| {
@@ -1607,7 +2357,7 @@ impl Replayer {
         let Ok(metadata) = std::fs::metadata(&path) else {
             return false;
         };
-        if metadata.file_type().is_file() {
+        if metadata.file_type().is_file() || metadata.file_type().is_fifo() {
             return materialized_file_is_registered(pid, &metadata);
         }
         if !metadata.file_type().is_dir() {
@@ -1627,28 +2377,37 @@ impl Replayer {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#662): Audit replay path confinement.
-    fn open_request<G: Guest<Self>>(
+    fn open_request_with_mode<G: Guest<Self>>(
         &self,
         guest: &G,
         syscall: Syscall,
-    ) -> io::Result<(libc::c_int, PathBuf, OFlag)> {
+    ) -> io::Result<(
+        (libc::c_int, PathBuf, OFlag),
+        Option<reverie::syscalls::Mode>,
+    )> {
         let request = match syscall {
             #[cfg(target_arch = "x86_64")]
             Syscall::Open(call) => (
-                libc::AT_FDCWD,
-                call.path()
-                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EFAULT))?
-                    .read(&guest.memory())
-                    .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?,
-                call.flags(),
+                (
+                    libc::AT_FDCWD,
+                    call.path()
+                        .ok_or_else(|| io::Error::from_raw_os_error(libc::EFAULT))?
+                        .read(&guest.memory())
+                        .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?,
+                    call.flags(),
+                ),
+                call.mode(),
             ),
             Syscall::Openat(call) => (
-                call.dirfd(),
-                call.path()
-                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EFAULT))?
-                    .read(&guest.memory())
-                    .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?,
-                call.flags(),
+                (
+                    call.dirfd(),
+                    call.path()
+                        .ok_or_else(|| io::Error::from_raw_os_error(libc::EFAULT))?
+                        .read(&guest.memory())
+                        .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?,
+                    call.flags(),
+                ),
+                call.mode(),
             ),
             _ => unreachable!("open replay path requested for {syscall:?}"),
         };
@@ -1806,9 +2565,12 @@ impl Replayer {
         let event = next_event!(guest, Open)?;
         let recorded = event.result;
         if let Ok(fd) = recorded {
-            let (dirfd, path, flags) = self.open_request(guest, syscall).unwrap_or_else(|error| {
-                panic!("could not decode successful recorded open: {error}")
-            });
+            let ((dirfd, path, flags), mode) = self
+                .open_request_with_mode(guest, syscall)
+                .unwrap_or_else(|error| {
+                    panic!("could not decode successful recorded open: {error}")
+                });
+
             let materialize = match event.materialize {
                 OpenMaterialization::Directory => self
                     .materialize_recorded_directory(guest, syscall, dirfd, &path, flags)
@@ -1837,14 +2599,123 @@ impl Replayer {
                         );
                         self.reserve_replay_fd(guest, fd as i32, flags.contains(OFlag::O_CLOEXEC))
                             .await;
+                        if let Some(pending) = pending_placeholder_open(
+                            guest.tid(),
+                            fd as libc::c_int,
+                            dirfd,
+                            path.clone(),
+                            flags,
+                            mode,
+                        ) {
+                            remember_pending_placeholder_open(pending);
+                        }
                     }
                 }
+            } else if self
+                .try_materialize_fifo_open(guest, syscall, dirfd, &path, flags, fd)
+                .await
+            {
+                // The recorded open now names the real fifo in this
+                // descriptor table, registered by identity inside.
             } else {
                 self.reserve_replay_fd(guest, fd as i32, flags.contains(OFlag::O_CLOEXEC))
                     .await;
+                if let Some(pending) = pending_placeholder_open(
+                    guest.tid(),
+                    fd as libc::c_int,
+                    dirfd,
+                    path.clone(),
+                    flags,
+                    mode,
+                ) {
+                    remember_pending_placeholder_open(pending);
+                }
             }
         }
         recorded
+    }
+
+    /// Materializes a recorded fifo open for real, in the opening
+    /// thread's own table, when the fifo resolves beneath the replay
+    /// root. Doing it here rather than lazily at a descendant's
+    /// `flock` is what keeps the lock's lifetime right: a lock taken
+    /// through an inherited descriptor is held by the shared open
+    /// file description, so it must survive the locking child's exit
+    /// for exactly as long as the opener keeps the descriptor — a
+    /// descriptor materialized only in the child's table takes its
+    /// lock with it when the child exits, and a later contender the
+    /// recording turned away would win in replay (the dh-gg5uv
+    /// review's fork/shared-description split, in lock-lifetime
+    /// form). The recorder still marks fifo opens unmaterialized, so
+    /// this is tried only where the regular-file decision said no.
+    ///
+    /// A single-access-mode fifo open is re-issued with `O_NONBLOCK`
+    /// (and its recorded status flags restored after) so replay
+    /// cannot stall on a rendezvous whose peer has not been replayed
+    /// yet; a writer open that then fails `ENXIO` falls back to the
+    /// placeholder plus pending entry, exactly as before.
+    async fn try_materialize_fifo_open<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        dirfd: libc::c_int,
+        path: &Path,
+        flags: OFlag,
+        fd: i64,
+    ) -> bool {
+        if !self.fifo_resolves_in_replay_root(guest, dirfd, path) {
+            return false;
+        }
+        let access = flags & OFlag::O_ACCMODE;
+        let nonblocking_reissue = access != OFlag::O_RDWR
+            && !flags.contains(OFlag::O_NONBLOCK)
+            && !flags.contains(OFlag::O_PATH);
+        let inject = if nonblocking_reissue {
+            match syscall {
+                #[cfg(target_arch = "x86_64")]
+                Syscall::Open(call) => Syscall::Open(call.with_flags(flags | OFlag::O_NONBLOCK)),
+                Syscall::Openat(call) => {
+                    Syscall::Openat(call.with_flags(flags | OFlag::O_NONBLOCK))
+                }
+                _ => return false,
+            }
+        } else {
+            syscall
+        };
+        let actual = match guest.inject_with_retry(inject).await {
+            Ok(actual) => actual,
+            Err(error) => {
+                tracing::debug!(
+                    ?syscall,
+                    %error,
+                    "replay fifo path unavailable; reserving a virtual descriptor"
+                );
+                return false;
+            }
+        };
+        assert_eq!(
+            actual, fd,
+            "replay materialized fifo open returned a different descriptor"
+        );
+        if nonblocking_reissue {
+            const SETTABLE: libc::c_int = libc::O_APPEND
+                | libc::O_ASYNC
+                | libc::O_DIRECT
+                | libc::O_NOATIME
+                | libc::O_NONBLOCK;
+            guest
+                .inject_with_retry(
+                    Fcntl::new()
+                        .with_fd(fd as libc::c_int)
+                        .with_cmd(FcntlCmd::F_SETFL(flags.bits() & SETTABLE)),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("could not restore materialized fifo open status flags: {error}")
+                });
+        }
+        remember_materialized_file(guest.tid(), fd as libc::c_int);
+        true
     }
 
     fn mkdir_request<G: Guest<Self>>(
@@ -2033,6 +2904,47 @@ impl Replayer {
     ) -> Result<i64, Errno> {
         let recorded = next_event!(guest, Return);
         if let Ok(fd) = recorded {
+            // Remember a placeholder reserve below for a following
+            // flock, unless the resolve flags change what an openat
+            // re-issue would mean, or the recorded flags/mode are wider
+            // than the plain openat the materialization re-issues:
+            // truncating them would re-issue a different open than the
+            // recorded one (dh-gg5uv review), so they must fit exactly.
+            let how = syscall.how().and_then(|how| how.read(&guest.memory()).ok());
+            let remember = |guest: &mut G| {
+                let (Some(how), Some(path)) = (how, syscall.path()) else {
+                    return;
+                };
+                if how.resolve != 0 {
+                    return;
+                }
+                let (Ok(flags), Ok(path)) = (
+                    i32::try_from(how.flags)
+                        .ok()
+                        .and_then(OFlag::from_bits)
+                        .ok_or(()),
+                    path.read(&guest.memory()),
+                ) else {
+                    return;
+                };
+                if u32::try_from(how.mode).is_err() {
+                    return;
+                }
+                let mode = reverie::syscalls::Mode::from_bits(how.mode as u32);
+                if mode.is_none() && how.mode != 0 {
+                    return;
+                }
+                if let Some(pending) = pending_placeholder_open(
+                    guest.tid(),
+                    fd as libc::c_int,
+                    syscall.dirfd(),
+                    path,
+                    flags,
+                    mode,
+                ) {
+                    remember_pending_placeholder_open(pending);
+                }
+            };
             if self.dirfd_is_confined(guest.pid(), syscall.dirfd()) {
                 match guest.inject_with_retry(syscall).await {
                     Ok(actual) => {
@@ -2040,14 +2952,78 @@ impl Replayer {
                     }
                     Err(error) => {
                         tracing::debug!(%error, "replay openat2 path unavailable");
-                        self.reserve_replay_fd(guest, fd as i32, false).await;
+                        self.reserve_replay_fd(
+                            guest,
+                            fd as i32,
+                            how.is_some_and(|how| {
+                                how.flags & u64::from(libc::O_CLOEXEC as u32) != 0
+                            }),
+                        )
+                        .await;
+                        remember(guest);
                     }
                 }
+            } else if let Some(inject) = self.openat2_fifo_inject(&syscall, how)
+                && self
+                    .try_materialize_fifo_open(
+                        guest,
+                        inject,
+                        syscall.dirfd(),
+                        &syscall
+                            .path()
+                            .and_then(|path| path.read(&guest.memory()).ok())
+                            .unwrap_or_default(),
+                        i32::try_from(how.map(|how| how.flags).unwrap_or(0))
+                            .ok()
+                            .and_then(OFlag::from_bits)
+                            .unwrap_or_else(OFlag::empty),
+                        fd,
+                    )
+                    .await
+            {
+                // Real fifo descriptor in the recorded slot, as with
+                // the open/openat eager path.
             } else {
-                self.reserve_replay_fd(guest, fd as i32, false).await;
+                self.reserve_replay_fd(
+                    guest,
+                    fd as i32,
+                    how.is_some_and(|how| how.flags & u64::from(libc::O_CLOEXEC as u32) != 0),
+                )
+                .await;
+                remember(guest);
             }
         }
         recorded
+    }
+
+    /// The plain-`openat` form of a recorded `openat2`, for eager fifo
+    /// materialization on its unconfined path (where the open would
+    /// otherwise become a placeholder): `Some` only when the resolve
+    /// flags are zero and the recorded flags/mode fit `openat`
+    /// exactly, the same conditions under which the pending registry
+    /// may re-issue the open at a later flock. Confined openat2 opens
+    /// are already injected for real by `handle_openat2` itself.
+    fn openat2_fifo_inject(
+        &self,
+        syscall: &reverie::syscalls::Openat2,
+        how: Option<reverie::syscalls::OpenHow>,
+    ) -> Option<Syscall> {
+        let how = how?;
+        if how.resolve != 0 {
+            return None;
+        }
+        let flags = i32::try_from(how.flags).ok().and_then(OFlag::from_bits)?;
+        let mode = reverie::syscalls::Mode::from_bits(u32::try_from(how.mode).ok()?);
+        if mode.is_none() && how.mode != 0 {
+            return None;
+        }
+        Some(Syscall::Openat(
+            reverie::syscalls::Openat::new()
+                .with_dirfd(syscall.dirfd())
+                .with_path(syscall.path())
+                .with_flags(flags)
+                .with_mode(mode),
+        ))
     }
 
     async fn handle_confined_path_mutation<G: Guest<Self>>(
@@ -2330,29 +3306,338 @@ impl Replayer {
     /// narrow in practice, because a pre-existing host file is exactly what
     /// replay does NOT materialize -- the materialized set is dominated by
     /// files the guest itself created inside the replay root.
+    /// Materializes the placeholder a recorded open reserved, so a
+    /// following `flock` locks a real object: injects the recorded
+    /// open for real beneath the replay root, dups it onto the
+    /// placeholder's descriptor, and registers it. The pending entry
+    /// is retired by any syscall that may have operated on the
+    /// descriptor (`syscall_clears_pending`), so the placeholder
+    /// cannot have served I/O the real descriptor would miss.
+    ///
+    /// Late is not the recorded moment, and the differences that
+    /// matter refuse by name through `reason` rather than lock a
+    /// substitute (dh-gg5uv review): `(dirfd, path)` must still
+    /// resolve to the parent and object pinned at recorded-open time,
+    /// and an `O_TRUNC` against an object that already existed then
+    /// cannot be applied after I/O the recording did first. A fifo
+    /// open in a single access mode waited for its peer at the
+    /// recorded moment (a `flock` helper opens its lock fifo exactly
+    /// that way); re-issuing it blocking could wait forever on a
+    /// rendezvous that already happened, so it is re-issued with
+    /// `O_NONBLOCK` and the recorded status flags are restored with
+    /// `F_SETFL` once the real descriptor is in its slot. For a
+    /// writer open that fails `ENXIO` because no reader is real in
+    /// replay either, the failed open becomes the refusal reason.
+    async fn materialize_pending_open_for_flock<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        pending: &PendingPlaceholderOpen,
+    ) -> Result<(), String> {
+        if !self.open_materializes_in_replay_root(
+            guest,
+            pending.dirfd,
+            &pending.path,
+            pending.flags,
+        ) && !self.fifo_resolves_in_replay_root(guest, pending.dirfd, &pending.path)
+        {
+            return Err(format!(
+                "recorded open of {:?} does not resolve to a lockable object \
+                 beneath the replay root",
+                pending.path
+            ));
+        }
+        let now = pin_pending_open_object(guest.tid(), pending.dirfd, &pending.path);
+        if pending.parent.is_none() {
+            return Err(format!(
+                "recorded open of {:?} could not pin its directory at open                  time, so re-resolution cannot be verified",
+                pending.path
+            ));
+        }
+        if pending.object.is_none() && !pending.flags.contains(OFlag::O_CREAT) {
+            return Err(format!(
+                "recorded open of {:?} did not resolve to an object beneath                  the replay root at open time, so there is no pinned object                  to materialize",
+                pending.path
+            ));
+        }
+        if pending.parent.is_some() && now.parent != pending.parent {
+            return Err(format!(
+                "recorded open of {:?} resolved under a different directory \
+                 at flock time than at open time",
+                pending.path
+            ));
+        }
+        if pending.object.is_some() && now.object != pending.object {
+            return Err(format!(
+                "recorded open of {:?} named a different object at flock \
+                 time than at open time",
+                pending.path
+            ));
+        }
+        if pending.flags.contains(OFlag::O_TRUNC)
+            && (pending.object.is_some() || now.object.is_some())
+        {
+            return Err(format!(
+                "recorded open of {:?} truncated an existing object at open \
+                 time, which a late open cannot reproduce",
+                pending.path
+            ));
+        }
+        let access = pending.flags & OFlag::O_ACCMODE;
+        let restore_status_flags = now.object_is_fifo
+            && access != OFlag::O_RDWR
+            && !pending.flags.contains(OFlag::O_NONBLOCK);
+        let inject_flags = if restore_status_flags {
+            pending.flags | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK
+        } else {
+            pending.flags | OFlag::O_CLOEXEC
+        };
+        let path_bytes = pending.path.as_os_str().as_bytes();
+        // The path is staged on the guest stack in a fixed-size buffer
+        // (`Stack::push` copies one sized value), and that stack is
+        // far smaller than PATH_MAX — pushing a 4096-byte buffer for
+        // every path panics on it. Stage the smallest tier that holds
+        // the path, and refuse by name when no tier fits the stack
+        // this guest actually has.
+        async fn inject_open<const N: usize, G: Guest<Replayer>>(
+            guest: &mut G,
+            pending: &PendingPlaceholderOpen,
+            path_bytes: &[u8],
+            inject_flags: OFlag,
+        ) -> Result<i64, String> {
+            let mut path = [0_u8; N];
+            path[..path_bytes.len()].copy_from_slice(path_bytes);
+            let mut stack = guest.stack().await;
+            if N > stack.capacity() {
+                return Err(format!(
+                    "recorded open path {:?} ({} bytes) does not fit the \
+                     guest stack staging area ({} bytes)",
+                    pending.path,
+                    path_bytes.len(),
+                    stack.capacity()
+                ));
+            }
+            let path_addr = stack.push(path);
+            let path_ptr = PathPtr::from_ptr(unsafe {
+                path_addr.cast::<u8>().as_ptr().cast::<libc::c_char>()
+            })
+            .expect("guest stack address is non-null");
+            let _path_guard = stack
+                .commit()
+                .map_err(|error| format!("could not stage the open path: {error}"))?;
+            guest
+                .inject_with_retry(
+                    Openat::new()
+                        .with_dirfd(pending.dirfd)
+                        .with_path(Some(path_ptr))
+                        .with_flags(inject_flags)
+                        .with_mode(pending.mode),
+                )
+                .await
+                .map_err(|error| format!("re-issued open of {:?} failed: {error}", pending.path))
+        }
+        let opened = match path_bytes.len() + 1 {
+            0..=256 => inject_open::<256, _>(guest, pending, path_bytes, inject_flags).await,
+            257..=512 => inject_open::<512, _>(guest, pending, path_bytes, inject_flags).await,
+            513..=768 => inject_open::<768, _>(guest, pending, path_bytes, inject_flags).await,
+            769..=896 => inject_open::<896, _>(guest, pending, path_bytes, inject_flags).await,
+            897..=2048 => inject_open::<2048, _>(guest, pending, path_bytes, inject_flags).await,
+            2049..=4096 => inject_open::<4096, _>(guest, pending, path_bytes, inject_flags).await,
+            _ => Err(format!(
+                "recorded open path {:?} is too long to re-issue",
+                pending.path
+            )),
+        }?;
+        let opened = opened as libc::c_int;
+        // Note: the transient descriptor above needs one free slot
+        // beyond the recorded table. A guest exactly at its
+        // RLIMIT_NOFILE fails the re-issued open with EMFILE instead,
+        // which surfaces as this function's refusal reason rather than
+        // as a wrong lock.
+        if opened != pending.fd {
+            let dup_flags = if pending.flags.contains(OFlag::O_CLOEXEC) {
+                OFlag::O_CLOEXEC
+            } else {
+                OFlag::empty()
+            };
+            if let Err(error) = guest
+                .inject_with_retry(
+                    Dup3::new()
+                        .with_oldfd(opened)
+                        .with_newfd(pending.fd)
+                        .with_flags(dup_flags),
+                )
+                .await
+            {
+                // The swap failed; do not leak the materialized
+                // descriptor into a replay that is refusing anyway.
+                let _ = guest.inject_with_retry(Close::new().with_fd(opened)).await;
+                return Err(format!("dup onto placeholder failed: {error}"));
+            }
+            // The swap is complete: the recorded descriptor now names
+            // the real object, so a failed close of the transient
+            // duplicate must not discard the materialization (and must
+            // not be retried as a fresh close of a possibly reused
+            // number). It leaks one unnamed descriptor, stated here.
+            if let Err(error) = guest.inject_with_retry(Close::new().with_fd(opened)).await {
+                tracing::warn!(
+                    opened,
+                    %error,
+                    "close of materialized open's transient descriptor failed; leaking it"
+                );
+            }
+        } else if !pending.flags.contains(OFlag::O_CLOEXEC) {
+            // The re-issued open landed in the recorded slot itself
+            // (the placeholder was replaced between reservation and
+            // now), carrying the O_CLOEXEC the injection forced but
+            // the recorded open did not request: undo it, so a later
+            // recorded exec keeps the descriptor as recorded.
+            guest
+                .inject_with_retry(
+                    Fcntl::new()
+                        .with_fd(pending.fd)
+                        .with_cmd(FcntlCmd::F_SETFD(0)),
+                )
+                .await
+                .map_err(|error| {
+                    format!("clearing forced O_CLOEXEC on materialized open failed: {error}")
+                })?;
+        }
+        if restore_status_flags {
+            // Undo the O_NONBLOCK added for the re-issued fifo open:
+            // the recorded descriptor was blocking, and a later
+            // recorded read or write must meet the status flags the
+            // recording had. Only the F_SETFL-settable bits are
+            // anyone's to restore.
+            const SETTABLE: libc::c_int = libc::O_APPEND
+                | libc::O_ASYNC
+                | libc::O_DIRECT
+                | libc::O_NOATIME
+                | libc::O_NONBLOCK;
+            guest
+                .inject_with_retry(
+                    Fcntl::new()
+                        .with_fd(pending.fd)
+                        .with_cmd(FcntlCmd::F_SETFL(pending.flags.bits() & SETTABLE)),
+                )
+                .await
+                .map_err(|error| {
+                    format!("restoring status flags on materialized open failed: {error}")
+                })?;
+        }
+        // The pins were checked against a resolution the controller
+        // made; the injected open re-resolves in the guest kernel.
+        // Close that gap: the descriptor now in the slot must be the
+        // object the flock-time resolution named, or this refuses
+        // rather than locking whatever the name landed on.
+        if let Some(expected) = now.object {
+            let actual =
+                std::fs::metadata(format!("/proc/{}/fd/{}", guest.tid().as_raw(), pending.fd))
+                    .map(|metadata| ReplayFileIdentity::from_metadata(&metadata))
+                    .ok();
+            if actual != Some(expected) {
+                return Err(format!(
+                    "re-issued open of {:?} landed on a different object than                      the one pinned at flock time",
+                    pending.path
+                ));
+            }
+        }
+        remember_materialized_file(guest.tid(), pending.fd);
+        Ok(())
+    }
+
+    /// Whether `path` resolves to a fifo beneath the replay root. The
+    /// regular-file materialization decision above deliberately does
+    /// not cover fifos, but a fifo is lockable in place once the
+    /// recorded `mkfifo` has been replayed into the root.
+    fn fifo_resolves_in_replay_root<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        dirfd: libc::c_int,
+        path: &Path,
+    ) -> bool {
+        // The calling thread's own descriptors, not the leader's: a
+        // thread made without CLONE_FILES resolves `dirfd` in its own
+        // table. Resolution refuses procfs symlinks, as the pins do,
+        // so a magic link cannot name an out-of-root fifo as beneath
+        // the root (dh-gg5uv review).
+        let pid = guest.tid();
+        let Ok(root) = crate::record_replay_path::open_process_root(pid) else {
+            return false;
+        };
+        let start = if path.is_absolute() {
+            crate::record_replay_path::open_process_root(pid)
+        } else if dirfd == libc::AT_FDCWD {
+            crate::record_replay_path::open_process_cwd(pid)
+        } else {
+            crate::record_replay_path::open_process_directory_fd(pid, dirfd)
+        };
+        let Ok(start) = start else {
+            return false;
+        };
+        if !crate::record_replay_path::directory_is_beneath(&root, &start).unwrap_or(false) {
+            return false;
+        }
+        crate::record_replay_path::resolve_existing_path_without_procfs_symlinks(
+            &root, &start, path,
+        )
+        .map(|resolved| {
+            std::fs::metadata(format!("/proc/self/fd/{}", resolved.object.as_raw_fd()))
+                .is_ok_and(|metadata| metadata.file_type().is_fifo())
+        })
+        .unwrap_or(false)
+    }
+
     async fn handle_flock<G: Guest<Self>>(
         &self,
         guest: &mut G,
         syscall: Flock,
     ) -> Result<i64, Errno> {
-        // Never panic on an unregistered descriptor (issue 5007): a file the
-        // guest created itself can reach flock before replay registered it.
-        // Register it now when it lives beneath the replay root. A descriptor
-        // whose file is outside the root (an external file, or an eventfd
-        // placeholder for a virtually served open) still fails closed:
-        // returning the recorded result would falsely claim a lock was
-        // acquired on an object no contender inside the replay can observe.
-        if !self.fd_is_in_replay_root(guest.pid(), syscall.fd())
-            && file_is_beneath_replay_root(guest.pid(), syscall.fd())
+        // The calling thread's descriptor table, not the leader's
+        // (`guest.pid()`): a thread made without CLONE_FILES holds a
+        // different file at this number in the leader's table.
+        let tid = guest.tid();
+        // A recorded open answered with a placeholder is materialized
+        // FIRST, before any beneath-root admission of the descriptor
+        // as it stands: the placeholder's `anon_inode:[eventfd]` link
+        // must never be admitted as a lockable beneath-root object,
+        // or the lock below would land on the shared anon inode and
+        // every placeholder flock would contend with every other
+        // (dh-gg5uv review). Taking the entry spends its whole
+        // dup-alias family process-wide, so neither an alias nor an
+        // inherited table copy can materialize a second open file
+        // description for the one recorded open. The spend happens
+        // only where this thread's descriptor really is the plain
+        // placeholder, so a thread with a split descriptor table
+        // cannot spend its sibling's entry over its own real file.
+        if fd_is_plain_placeholder(tid, syscall.fd())
+            && let Some(pending) = take_pending_placeholder_open(tid, syscall.fd())
+            && let Err(reason) = self
+                .materialize_pending_open_for_flock(guest, &pending)
+                .await
         {
-            remember_materialized_file(guest.pid(), syscall.fd());
+            panic!(
+                "{FLOCK_OUTSIDE_REPLAY_ROOT_REFUSAL}: descriptor {} ({reason})",
+                syscall.fd()
+            );
         }
-        assert!(
-            self.fd_is_in_replay_root(guest.pid(), syscall.fd()),
-            "cannot replay flock side effects for descriptor {} outside the replay root; \
-             returning the recorded result would falsely claim a lock was acquired",
-            syscall.fd()
-        );
+        // Never panic on an unregistered descriptor (issue 5007): a
+        // file the guest created itself can reach flock before replay
+        // registered it. Register it now when the descriptor is a
+        // real pathname object beneath the replay root; the registry
+        // names fifos beside regular files, by object identity, so a
+        // later lock or unlock through any descriptor for the same
+        // object is judged the same way.
+        if !self.fd_is_in_replay_root(tid, syscall.fd())
+            && file_is_beneath_replay_root(tid, syscall.fd())
+        {
+            remember_materialized_file(tid, syscall.fd());
+        }
+        if !self.fd_is_in_replay_root(tid, syscall.fd()) {
+            panic!(
+                "{FLOCK_OUTSIDE_REPLAY_ROOT_REFUSAL}: descriptor {}",
+                syscall.fd()
+            );
+        }
         let recorded = next_event!(guest, Return);
         let call = Syscall::from(syscall);
         let actual = guest.inject_with_retry(call).await;
@@ -2682,7 +3967,38 @@ impl Replayer {
             // replay process.
             if actual != Err(Errno::EBADF) {
                 assert_eq!(actual, recorded, "dup2 fd-table mutation diverged");
+                if let Syscall::Dup2(call) = syscall {
+                    follow_pending_through_dup(guest.tid(), call.oldfd(), call.newfd(), false);
+                }
             }
+        }
+        recorded
+    }
+
+    /// A recorded dup-family call (`dup`, `dup3`, `fcntl(F_DUPFD*)`):
+    /// replayed as a side effect, then any pending flock open on the
+    /// source descriptor is cloned onto the descriptor the recording
+    /// produced, with that descriptor's close-on-exec bit.
+    async fn handle_dup_family<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        operation: &str,
+    ) -> Result<i64, Errno> {
+        let (oldfd, cloexec) = match syscall {
+            Syscall::Dup(call) => (call.oldfd(), false),
+            Syscall::Dup3(call) => (call.oldfd(), call.flags().contains(OFlag::O_CLOEXEC)),
+            Syscall::Fcntl(call) => (
+                call.fd(),
+                matches!(call.cmd(), FcntlCmd::F_DUPFD_CLOEXEC(_)),
+            ),
+            _ => unreachable!("dup-family handler received {syscall:?}"),
+        };
+        let recorded = self
+            .handle_replayed_side_effect(guest, syscall, operation)
+            .await;
+        if let Ok(newfd) = recorded {
+            follow_pending_through_dup(guest.tid(), oldfd, newfd as libc::c_int, cloexec);
         }
         recorded
     }
@@ -2804,6 +4120,106 @@ impl Replayer {
             assert_eq!(actual, recorded, "close_range side effects diverged");
         }
         recorded
+    }
+}
+
+#[cfg(test)]
+mod pending_flock_tests {
+    use super::*;
+
+    fn entry(
+        fd: libc::c_int,
+        open_id: u64,
+        placeholder_id: Option<&str>,
+    ) -> PendingPlaceholderOpen {
+        let pid = Pid::from_raw(std::process::id() as i32);
+        PendingPlaceholderOpen {
+            open_id,
+            root: replay_root_identity(pid).unwrap(),
+            tgid: guest_tgid_ppid(pid).unwrap().0,
+            opener_tid: pid.as_raw(),
+            fd,
+            dirfd: libc::AT_FDCWD,
+            path: PathBuf::from("pending-flock-test"),
+            flags: OFlag::O_RDWR,
+            mode: None,
+            parent: None,
+            object: None,
+            placeholder_id: placeholder_id.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn clearing_predicate_decodes_descriptors_and_keeps_queries() {
+        use reverie::syscalls::*;
+        let read9 = Syscall::Read(Read::new().with_fd(9));
+        assert!(syscall_clears_pending(read9, 9));
+        assert!(!syscall_clears_pending(read9, 8));
+        // A pure query leaves no open-file-description state behind.
+        assert!(!syscall_clears_pending(
+            Syscall::Fstat(Fstat::new().with_fd(9)),
+            9
+        ));
+        // The flock the entry exists for must not retire it first.
+        assert!(!syscall_clears_pending(
+            Syscall::Flock(Flock::new().with_fd(9)),
+            9
+        ));
+        // Memory-borne descriptor lists clear for every descriptor.
+        assert!(syscall_clears_pending(
+            Syscall::Poll(Poll::new().with_fds(AddrMut::from_raw(0x1000))),
+            9
+        ));
+        // close_range bounds are unsigned: ~0U covers descriptor 9.
+        // (Untyped in Reverie's list, so it arrives by number.)
+        let (_, mut args) = Syscall::Getpid(Getpid::new()).into_parts();
+        args.arg0 = 3;
+        args.arg1 = u32::MAX as usize;
+        assert!(syscall_clears_pending(
+            Syscall::from_raw(Sysno::close_range, args),
+            9
+        ));
+        // A proven descriptor-free call keeps the entry.
+        assert!(!syscall_clears_pending(Syscall::Getpid(Getpid::new()), 9));
+    }
+
+    #[test]
+    fn spending_one_alias_retires_the_whole_open_family() {
+        let pid = Pid::from_raw(std::process::id() as i32);
+        // One recorded open (open_id line unique to this test in the
+        // process-wide registry) under two descriptor aliases.
+        let open_id = 0xf10c_0001;
+        remember_pending_placeholder_open(entry(1_000_001, open_id, None));
+        remember_pending_placeholder_open(entry(1_000_002, open_id, None));
+        assert!(take_pending_placeholder_open(pid, 1_000_001).is_some());
+        assert!(
+            take_pending_placeholder_open(pid, 1_000_002).is_none(),
+            "the dup alias of a spent recorded open must not materialize again"
+        );
+    }
+
+    #[test]
+    fn distinct_placeholders_at_one_number_do_not_evict_each_other() {
+        // Two entries for the same thread and descriptor number but
+        // different placeholder eventfds (the split-table shape):
+        // remembering the second must not destroy the first, and the
+        // spend for a descriptor whose live eventfd-id matches
+        // neither (this process has no such descriptor) takes only
+        // an unpinned opener entry — pinned ones stay for their own
+        // tables.
+        remember_pending_placeholder_open(entry(1_000_003, 0xf10c_0002, Some("111")));
+        remember_pending_placeholder_open(entry(1_000_003, 0xf10c_0003, Some("222")));
+        let remaining = pending_placeholder_opens()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|pending| pending.fd == 1_000_003)
+            .count();
+        assert_eq!(remaining, 2);
+        pending_placeholder_opens()
+            .lock()
+            .unwrap()
+            .retain(|pending| pending.fd != 1_000_003);
     }
 }
 

@@ -393,6 +393,162 @@ fn record_replay_flocks_a_self_created_file_opened_by_relative_path() {
     );
 }
 
+/// A fifo the guest creates and then flocks (the JVM perf-data file
+/// pattern behind dh-gg5uv): the recorder marks a fifo open with no
+/// materialization. Replay must put a real descriptor for that fifo
+/// in the guest — it exists beneath the replay root because replay
+/// itself injected the recorded mkfifo — and take the lock for real,
+/// not panic with "cannot replay flock side effects" and not lock a
+/// placeholder in the fifo's place.
+#[test]
+fn record_replay_flocks_a_guest_created_fifo() {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mountpoint = tempfile::tempdir().expect("failed to create guest workdir");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg(format!("--workdir={}", mountpoint.path().display()))
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "mkfifo p && exec 9<>p && flock -n 9 && echo locked",
+        ]);
+    let output = command_output(command, "record/replay of flock on a guest-created fifo");
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined_output.contains("cannot replay flock side effects"),
+        "replay panicked on the recorded flock target:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("locked\n"),
+        "the guest did not take its lock:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+}
+
+/// Runs one record/verify of a shell flock guest and returns its combined
+/// output, for the fifo lock-domain tests below.
+fn flock_guest_output(script: &str, what: &str) -> String {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mountpoint = tempfile::tempdir().expect("failed to create guest workdir");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg(format!("--workdir={}", mountpoint.path().display()))
+        .args(["--", "/bin/sh", "-c", script]);
+    let output = command_output(command, what);
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// The lock a replayed `flock` takes must be on the recorded object, not
+/// on its placeholder: two distinct fifos are distinct lock domains, so
+/// locking both must succeed exactly as recorded. Placeholders are all
+/// `anon_inode:[eventfd]`, and locking those instead (dh-gg5uv review)
+/// made the second lock falsely contend with the first.
+#[test]
+fn record_replay_locks_two_guest_created_fifos() {
+    let combined_output = flock_guest_output(
+        "mkfifo p q && exec 9<>p 8<>q && flock -n 9 && flock -n 8 && echo both-locked",
+        "record/replay of locks on two guest-created fifos",
+    );
+    assert!(
+        combined_output.contains("both-locked\n"),
+        "the guest did not take both locks:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+}
+
+/// The converse: one fifo is one lock domain, so while the shell's
+/// descriptor holds an exclusive lock, a contender opening the same fifo
+/// separately must fail nonblocking exactly as recorded. A replay that
+/// locked two different placeholders would let the contender win and
+/// diverge from the recording.
+#[test]
+fn record_replay_fifo_lock_excludes_a_contender() {
+    let combined_output = flock_guest_output(
+        "mkfifo p && exec 9<>p && flock -n 9 && echo locked; \
+         flock -n p -c true && echo contender-won || echo contender-blocked",
+        "record/replay of fifo lock contention",
+    );
+    assert!(
+        combined_output.contains("locked\n"),
+        "the guest did not take its lock:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("contender-blocked\n")
+            && !combined_output.contains("contender-won"),
+        "the contender was not excluded by the fifo lock:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+}
+
+/// One recorded open is one lock domain however many descriptors
+/// alias it: locking through a dup'ed descriptor and again through
+/// the original succeeds both times natively (the second call names
+/// the lock the shared open file description already holds). Replay
+/// must not give the two descriptors separate open file descriptions
+/// to lock against each other (dh-gg5uv re-review).
+#[test]
+fn record_replay_locks_a_fifo_through_dup_aliases() {
+    let combined_output = flock_guest_output(
+        "mkfifo p && exec 9<>p && exec 8<&9 && flock -n 9 && flock -n 8 && echo alias-locked",
+        "record/replay of fifo locks through dup aliases",
+    );
+    assert!(
+        combined_output.contains("alias-locked\n"),
+        "the guest did not lock through both aliases:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+}
+
+/// A lock taken and released through an inherited descriptor is gone
+/// afterwards: a contender opening the fifo after the unlock takes
+/// it. Replay must neither lose the lock early (contender wins while
+/// the opener still holds the descriptor) nor keep it past the
+/// recorded unlock (contender blocked after release).
+#[test]
+fn record_replay_fifo_unlock_releases_for_a_contender() {
+    let combined_output = flock_guest_output(
+        "mkfifo p && exec 9<>p && flock -n 9 && flock -u 9 && flock -n p -c true && echo relocked",
+        "record/replay of fifo unlock and contender relock",
+    );
+    assert!(
+        combined_output.contains("relocked\n"),
+        "the contender did not lock after the recorded unlock:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+}
+
 /// A recording's guest gets a private, empty `/dev/shm`, as `hermit run`'s
 /// does: it neither sees the host's objects nor leaves its own there, and its
 /// replay matches.
