@@ -78,6 +78,13 @@ pub(super) fn select(
             (config, None, source)
         }
     };
+    // A standalone selection likewise has no launch view to resolve an
+    // unresolved `auto` from; name the profile the legacy standalone
+    // encoding reads anyway. A coordinated configuration arrives already
+    // resolved by its launcher and is left untouched.
+    if coordinator.is_none() && config.cpu_profile == detcore::CpuProfile::Auto {
+        config.cpu_profile = detcore::CpuProfile::X86_64V2;
+    }
     // The existing native executor owns the external sequential scheduler.
     // These are its original physical facts, not an alternate syscall policy.
     config.max_timeslice = None;
@@ -96,6 +103,12 @@ fn strict_default() -> Config {
         sequentialize_threads: true,
         deterministic_io: true,
         max_timeslice: None,
+        // A standalone in-guest launch has no launch view to resolve
+        // `--cpu-profile auto` from (the clap default `Config::default()`
+        // now carries), and the legacy standalone encoding never writes
+        // the profile and reads it as x86-64-v2. Name that profile, as
+        // this default did before `auto` existed.
+        cpu_profile: detcore::CpuProfile::X86_64V2,
         ..Config::default()
     }
 }
