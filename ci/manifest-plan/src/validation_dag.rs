@@ -6238,6 +6238,24 @@ sys.exit(37)
         assert_eq!(got, want);
     }
 
+    #[test]
+    fn quick_super_producer_cpu_cap_covers_cold_build() {
+        // Cold measurement 2026-11-04 (on the host recorded in docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts", pristine worktree,
+        // warm registry, width 16, host load 61-89): the producer
+        // took 1319.02 user + 96.35 system CPU seconds over 147.6 s
+        // wall. The musedraind front-door run at hermit 4627d1d9 was
+        // CPU-killed above the former 1200 s cap in 126.53 s wall.
+        // Project rule: cap is the next 300-second bucket above
+        // 1.5x the largest observed use.
+        const COLD_PEAK_CPU_SECONDS: f64 = 1415.37;
+        let required = (COLD_PEAK_CPU_SECONDS * 1.5 / 300.0).ceil() as i64 * 300;
+        assert!(
+            crate::validation_dag_static::RUST_SCRIPT_PRODUCER_QUICK_SUPER_CPU_SECONDS >= required,
+            "quick/super producer CPU cap {} below 1.5x cold peak (needs {required})",
+            crate::validation_dag_static::RUST_SCRIPT_PRODUCER_QUICK_SUPER_CPU_SECONDS
+        );
+    }
+
     fn owner(result_manifests: Vec<DagManifest>) -> Step {
         let text = r#"{"description":"","steps":[{"group":"e2e","job":"owner","cmd":"true","timeout":1,"cpu_timeout":1,"hint":{"rss_baseline_bytes":1,"hard_mem_max_bytes":1}}]}"#;
         let mut step = dag_from_json(text).unwrap().steps.remove(0);
