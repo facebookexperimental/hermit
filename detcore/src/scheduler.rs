@@ -8,6 +8,9 @@
 
 //! Deterministic scheduling algorithm.
 
+pub(crate) mod backend_signal_waits;
+#[cfg(test)]
+mod backend_signal_waits_tests;
 mod boundary_controller;
 mod boundary_replayer;
 pub(crate) mod child_exit_sigchld;
@@ -11121,6 +11124,10 @@ impl Scheduler {
         // way into a background call under a temporary mask has installed
         // it, so host timing cannot choose which thread takes the signal.
         self.send_signal_at();
+        // After every barrier too: a wait under a temporary mask that the
+        // backend's own calls serve ends when its reported state shows a
+        // signal that ends it (SIGSHARE S2b, `backend_signal_waits`).
+        self.wake_backend_signal_waits();
         Ok(())
     }
 
