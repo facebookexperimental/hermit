@@ -286,15 +286,18 @@ mod tests {
                 7200,
                 Some(10_737_418_240),
             ),
-            // 4 GiB since its width went from one core to 8 on 2026-09-30:
-            // a cold 8-core build peaked at 2.53 GiB. 600 s wall and 2100
-            // CPU-s since 2026-11-02 (ci/manifest-plan/src/step_limits.rs):
-            // 679 runs peaked at 625.7 CPU-s and 210.3 s of wall.
+            // 6 GiB hard cap since 2026-11-05 (#5165): retained runs sat
+            // at the former 4-GiB cap (set 2026-09-30 from a 2.53-GiB cold
+            // 8-core peak), and fresh uncapped cold builds peaked at
+            // 5.00 GiB, so the baseline is that worst peak and the hard
+            // cap is 6 GiB. 600 s wall and 2100 CPU-s since 2026-11-02
+            // (ci/manifest-plan/src/step_limits.rs): 679 runs peaked at
+            // 625.7 CPU-s and 210.3 s of wall.
             (
                 "setup.manifest_plan".to_string(),
                 600,
                 2100,
-                Some(4_294_967_296),
+                Some(6_442_450_944),
             ),
             ("gate.manifest".to_string(), 900, 900, Some(5_368_709_120)),
         ];
