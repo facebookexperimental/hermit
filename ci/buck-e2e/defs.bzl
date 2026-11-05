@@ -19,6 +19,14 @@ Routing (per cell, first match wins; see _route):
          A sabre or dbt verify cell also runs locally whenever its test's ptrace verify
          cell (its parity reference) does, so the pair always shares a route.
   re:    everything else.
+`-c hermit_e2e.cpuid_on_re=true` (default false: the routing above, unchanged) lifts
+only the host-capability gate for a liteinst or in-guest-trap verify cell needing
+cpuid-faulting alone: it then faces every later local rule and, on RE, requests a
+worker advertising the platform property cpuid_faulting=true. No ptrace cell moves
+under it (ptrace replay, chaos and verify need an exact retired-branch counter RE
+does not guarantee) and no kvm cell moves (RE has no /dev/kvm). A moved cell's ptrace
+reference stays local (HOST_LEVEL_BACKENDS), so that pair loses clean parity credit
+(ci/manifest-plan/src/parity.rs shares_route) until an exact-counter RE guarantee exists.
 `-c hermit_e2e.routing=local` runs every cell locally (the buck-local test mode).
 
 Container (per local cell; see _container): a privileged-lane cell and a pinned-root-only
@@ -92,8 +100,26 @@ def cell_slug(cell):
 def pmu_armed(cell):
     return cell["backend"] in ["ptrace", "liteinst", "in-guest-trap"] and cell["category"] != "compat" and cell_id(cell) not in PMU_FREE_CELLS
 
-def _route(cell, pmu_on_re, re_exclusions, local_candidates):
+def _cpuid_on_re_eligible(cell, cpuid_on_re):
+    # The in-guest backends refuse the preemption timer and every enabled verify cell
+    # runs --max-timeslice=disabled (ci/manifest-plan/src/runner.rs
+    # strict_run_arms_the_preemption_timer excludes them), so unlike ptrace they need
+    # no exact retired-branch counter; ptrace replay/chaos/verify stay local (exact
+    # PMU, no RE capability) and kvm stays local (/dev/kvm). Host capabilities are a
+    # closed vocabulary ({cpuid-faulting, kvm}), so cpuid-faulting without kvm is
+    # cpuid-faulting alone.
+    caps = cell.get("requires_host_capabilities") or []
+    return (
+        cpuid_on_re and
+        "cpuid-faulting" in caps and
+        "kvm" not in caps and
+        cell["backend"] in ["liteinst", "in-guest-trap"] and
+        cell["mode"] == "verify"
+    )
+
+def _route(cell, pmu_on_re, cpuid_on_re, re_exclusions, local_candidates):
     """Returns (where, reason): where is "local" or "re"."""
+    cpuid_eligible = _cpuid_on_re_eligible(cell, cpuid_on_re)
     if cell.get("category") == "compat":
         return ("local", "compatibility corpus: runs in the pinned root, not on a host or RE worker")
     if cell.get("category") == "system-utils":
@@ -102,7 +128,7 @@ def _route(cell, pmu_on_re, re_exclusions, local_candidates):
         return ("local", "kvm backend: RE workers have no /dev/kvm")
     if cell["lane"] == "privileged":
         return ("local", "privileged lane")
-    if cell.get("requires_host_capabilities"):
+    if cell.get("requires_host_capabilities") and not cpuid_eligible:
         return ("local", "needs host capability " + ",".join(cell["requires_host_capabilities"]))
     missing = [t for t in cell.get("requires", []) if t in RE_MISSING_TOOLS]
     if missing:
@@ -126,6 +152,8 @@ def _route(cell, pmu_on_re, re_exclusions, local_candidates):
         if len(backends) == 1:
             return ("local", "parity reference of a {} verify cell, which runs locally".format(backends[0]))
         return ("local", "parity reference of the {} verify cells, which run locally".format(", ".join(backends)))
+    if cpuid_eligible:
+        return ("re", "needs host capability cpuid-faulting; routes to RE workers advertising cpuid_faulting=true under -c hermit_e2e.cpuid_on_re=true")
     return ("re", "")
 
 def _container(cell, where):
@@ -146,10 +174,12 @@ def _container(cell, where):
 def _cell_test_impl(ctx):
     cmd = cmd_args(ctx.attrs.runner, ctx.attrs.args)
     remote = ctx.attrs.route == "re"
+    re_properties = dict(RE_PLATFORM)
+    re_properties.update(ctx.attrs.re_properties)
     executor = CommandExecutorConfig(
         local_enabled = not remote,
         remote_enabled = remote,
-        remote_execution_properties = RE_PLATFORM,
+        remote_execution_properties = re_properties,
         remote_execution_use_case = ctx.attrs.re_use_case,
         # Lookups only: Buck never uploads test results it executed locally.
         remote_cache_enabled = remote,
@@ -178,6 +208,7 @@ hermit_e2e_cell_test = rule(
         "bundle": attrs.dep(),
         "env": attrs.dict(attrs.string(), attrs.string(), default = {}),
         "labels": attrs.list(attrs.string(), default = []),
+        "re_properties": attrs.dict(attrs.string(), attrs.string(), default = {}),
         "re_use_case": attrs.string(default = "fbcode_re_tests"),
         "route": attrs.enum(["local", "re"]),
         "runner": attrs.source(),
@@ -237,6 +268,7 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
     if routing not in ["hybrid", "local"]:
         fail("-c hermit_e2e.routing must be hybrid or local, got " + routing)
     pmu_on_re = read_root_config("hermit_e2e", "pmu_on_re", "true") == "true"
+    cpuid_on_re = read_root_config("hermit_e2e", "cpuid_on_re", "false") == "true"
     # -c hermit_e2e.nonce=X gives every cell a fresh action digest: a cache-busting rerun.
     nonce = read_root_config("hermit_e2e", "nonce", "")
     # -c hermit_e2e.epoch=E gives every cell HERMIT_EPOCH=E. Backend parity compares a ptrace
@@ -252,22 +284,31 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
     # cell without consulting this map, which only moves ptrace cells.
     local_candidates = {}
     for c in plan["cells"]:
-        if c["mode"] == "verify" and c["backend"] in PARITY_LEADING_BACKENDS and _route(c, pmu_on_re, re_exclusions["tests"], {})[0] == "local":
+        if c["mode"] == "verify" and c["backend"] in PARITY_LEADING_BACKENDS and _route(c, pmu_on_re, cpuid_on_re, re_exclusions["tests"], {})[0] == "local":
             local_candidates[c["test"]] = sorted(local_candidates.get(c["test"], []) + [c["backend"]])
     references = {c["test"]: c for c in plan["cells"] if c["backend"] == "ptrace" and c["mode"] == "verify"}
     for cell in plan["cells"]:
-        where, reason = _route(cell, pmu_on_re, re_exclusions["tests"], local_candidates)
+        where, reason = _route(cell, pmu_on_re, cpuid_on_re, re_exclusions["tests"], local_candidates)
         reference = references.get(cell["test"]) if cell["backend"] in ["sabre", "dbt"] and cell["mode"] == "verify" else None
         if where == "re" and reference:
             # Backend parity credits this cell against its test's ptrace verify cell only
             # when both ran on one route (ci/manifest-plan/src/parity.rs shares_route), so
             # it follows that reference's whole routing decision, under every config. (The
             # DBT adapter takes the user namespace its --bind mounts need, so it runs anywhere.)
-            reference_where, reference_reason = _route(reference, pmu_on_re, re_exclusions["tests"], local_candidates)
+            reference_where, reference_reason = _route(reference, pmu_on_re, cpuid_on_re, re_exclusions["tests"], local_candidates)
             if reference_where == "local":
                 where, reason = "local", "its parity reference runs locally: " + reference_reason
         if routing == "local":
+            if where == "re" and reason:
+                # An RE audit reason must not survive onto a local cell.
+                if "cpuid-faulting" in (cell.get("requires_host_capabilities") or []):
+                    reason = "needs host capability cpuid-faulting; runs locally under -c hermit_e2e.routing=local"
+                else:
+                    reason = "runs locally under -c hermit_e2e.routing=local"
             where = "local"
+        re_properties = {}
+        if where == "re" and "cpuid-faulting" in (cell.get("requires_host_capabilities") or []):
+            re_properties = {"cpuid_faulting": "true"}
         container, container_reason = _container(cell, where)
         name = cell_slug(cell)
         env = {
@@ -293,7 +334,9 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
                 "hermit_e2e_backend_" + cell["backend"],
             ]
             + (["hermit_e2e_container_" + container.replace("-", "_")] if container else [])
+            + (["hermit_e2e_re_cpuid_faulting"] if re_properties else [])
             + labels,
+            re_properties = re_properties,
             route = where,
         )
         by_route[where].append(":" + name)

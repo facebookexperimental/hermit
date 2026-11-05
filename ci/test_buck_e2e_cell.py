@@ -28,9 +28,10 @@ excused diagnostic skip, a withheld cell and a cell that returned no result.
 ContainerChoiceTest evaluates defs.bzl's hermit_e2e_cells over the real
 ci/expected-e2e-plan.json with stand-ins for the Buck builtins and checks which cells
 get the pinned-root container in hybrid and local routing. ParityRouteTest and
-InGuestRouteTest evaluate the same plan for each candidate backend's route: every
-liteinst and in-guest-trap cell runs locally, and each parity candidate shares its
-ptrace reference's route.
+InGuestRouteTest evaluate the same plan for each candidate backend's route with
+-c hermit_e2e.cpuid_on_re off (the default): every liteinst and in-guest-trap cell
+runs locally, and each parity candidate shares its ptrace reference's route.
+CpuidOnReRouteTest evaluates the same plan with that switch on.
 """
 
 from __future__ import annotations
@@ -1411,8 +1412,14 @@ class _Anything:
         return self
 
 
-def evaluate_cells(routing: str, pmu_on_re: str = "true") -> dict[str, dict]:
-    """Runs defs.bzl's hermit_e2e_cells over the real plan; returns each target's attrs by name."""
+def evaluate_cells(routing: str, pmu_on_re: str = "true", cpuid_on_re: str | None = None) -> dict[str, dict]:
+    """Runs defs.bzl's hermit_e2e_cells over the real plan; returns each target's attrs by name.
+
+    cpuid_on_re=None leaves the key unset, so defs.bzl's own default applies; any
+    other value is supplied as -c hermit_e2e.cpuid_on_re. The stand-in rule only
+    captures target kwargs: _cell_test_impl never runs here, so executor
+    properties are checked through those kwargs, not an executed executor.
+    """
     targets: dict[str, dict] = {}
     rule_calls = []
 
@@ -1423,6 +1430,8 @@ def evaluate_cells(routing: str, pmu_on_re: str = "true") -> dict[str, dict]:
         return _Anything()
 
     config = {("hermit_e2e", "routing"): routing, ("hermit_e2e", "pmu_on_re"): pmu_on_re}
+    if cpuid_on_re is not None:
+        config[("hermit_e2e", "cpuid_on_re")] = cpuid_on_re
     namespace = {
         "rule": rule,
         "attrs": _Anything(),
@@ -1433,6 +1442,25 @@ def evaluate_cells(routing: str, pmu_on_re: str = "true") -> dict[str, dict]:
     assert "_cell_test_impl" in rule_calls, rule_calls
     namespace["hermit_e2e_cells"](json.loads(PLAN.read_text()), json.loads(RE_EXCLUSIONS.read_text()))
     return targets
+
+
+def load_defs() -> tuple[dict, list[str]]:
+    """Execs defs.bzl with Buck stand-ins; returns (namespace, cell rule attr names)."""
+    attr_names: list[str] = []
+
+    def rule(impl, attrs):
+        if impl.__name__ == "_cell_test_impl":
+            attr_names.extend(attrs)
+        return _Anything()
+
+    namespace = {
+        "rule": rule,
+        "attrs": _Anything(),
+        "read_root_config": lambda section, key, default=None: default,
+        "native": _Anything(),
+    }
+    exec(compile(DEFS.read_text(), str(DEFS), "exec"), namespace)
+    return namespace, attr_names
 
 
 class ContainerChoiceTest(unittest.TestCase):
@@ -1505,17 +1533,20 @@ class ParityRouteTest(unittest.TestCase):
     only when both ran on one route and container (ci/manifest-plan/src/parity.rs
     shares_route), so each pair must be routed alike."""
 
-    # Every routing configuration defs.bzl accepts: hybrid with the PMU allowed on RE or
-    # not (-c hermit_e2e.pmu_on_re), and all-local.
+    # Every routing configuration defs.bzl accepts with cpuid_on_re at its default
+    # (off): hybrid with the PMU allowed on RE or not (-c hermit_e2e.pmu_on_re), and
+    # all-local. Each tuple is (routing, pmu_on_re[, cpuid_on_re]) for evaluate_cells.
     CONFIGS = (("hybrid", "true"), ("hybrid", "false"), ("local", "true"))
+    # The same configurations with -c hermit_e2e.cpuid_on_re=true.
+    CPUID_ON_CONFIGS = (("hybrid", "true", "true"), ("hybrid", "false", "true"), ("local", "true", "true"))
 
-    def routes(self, routing: tuple[str, str]) -> dict[tuple[str, str], tuple[str, str]]:
+    def routes(self, routing: tuple[str, ...]) -> dict[tuple[str, str], tuple[str, str]]:
         targets = evaluate_cells(*routing)
         return {(t["args"][0], t["args"][2]): (t["route"], t["env"]["HERMIT_E2E_CONTAINER"])
                 for t in targets.values() if t["args"][1] == "verify"}
 
     def test_every_kvm_cells_ptrace_reference_shares_its_route(self) -> None:
-        for routing in self.CONFIGS:
+        for routing in self.CONFIGS + self.CPUID_ON_CONFIGS:
             routes = self.routes(routing)
             kvm = sorted(test for test, backend in routes if backend == "kvm")
             self.assertGreater(len(kvm), 250, routing)
@@ -1526,7 +1557,7 @@ class ParityRouteTest(unittest.TestCase):
     def test_every_sabre_cell_shares_its_references_route(self) -> None:
         # Moving a reference to the kvm cell's route must not leave the test's sabre cell,
         # compared with the same reference, on another route.
-        for routing in self.CONFIGS:
+        for routing in self.CONFIGS + self.CPUID_ON_CONFIGS:
             routes = self.routes(routing)
             sabre = sorted(test for test, backend in routes if backend == "sabre")
             # SaBRe is archived (ci/manifest-plan/src/archived.rs): its cells left
@@ -1539,7 +1570,7 @@ class ParityRouteTest(unittest.TestCase):
     def test_every_dbt_cell_shares_its_references_route(self) -> None:
         # A DBT verify cell is compared with its test's ptrace verify cell like any other
         # candidate, so it runs on that cell's route and container, local or RE.
-        for routing in self.CONFIGS:
+        for routing in self.CONFIGS + self.CPUID_ON_CONFIGS:
             routes = self.routes(routing)
             dbt = sorted(test for test, backend in routes if backend == "dbt")
             # DBT left core with the third-party split (2026-11-02): its cells
@@ -1550,8 +1581,10 @@ class ParityRouteTest(unittest.TestCase):
                     self.assertEqual(routes[(test, "dbt")], routes[(test, "ptrace")], (routing, test))
 
     def test_every_in_guest_cells_ptrace_reference_shares_its_route(self) -> None:
-        # A liteinst or in-guest-trap verify cell always runs locally (InGuestRouteTest), so
-        # its ptrace reference must run there too, or parity never credits the pair.
+        # With cpuid_on_re off (CONFIGS) a liteinst or in-guest-trap verify cell always
+        # runs locally (InGuestRouteTest), so its ptrace reference must run there too,
+        # or parity never credits the pair. With the switch on the moved pairs split
+        # on purpose; the next test pins that split instead of this equality.
         for routing in self.CONFIGS:
             routes = self.routes(routing)
             for backend in IN_GUEST_BACKENDS:
@@ -1561,6 +1594,26 @@ class ParityRouteTest(unittest.TestCase):
                     if (test, "ptrace") in routes:
                         self.assertEqual(routes[(test, "ptrace")], routes[(test, backend)],
                                          (routing, backend, test))
+
+    def test_cpuid_on_splits_moved_in_guest_pairs_from_their_local_reference(self) -> None:
+        # With cpuid_on_re on, a moved in-guest verify cell runs on RE while its ptrace
+        # reference stays local (HOST_LEVEL), so parity.rs shares_route gives the pair
+        # no clean credit until RE guarantees an exact branch counter. The pairs that
+        # did not move still share their reference's route.
+        routes = self.routes(("hybrid", "true", "true"))
+        moved = 0
+        for backend in IN_GUEST_BACKENDS:
+            tests = sorted(test for test, b in routes if b == backend)
+            self.assertGreater(len(tests), 250, backend)
+            for test in tests:
+                if routes[(test, backend)][0] == "re":
+                    moved += 1
+                    if (test, "ptrace") in routes:
+                        self.assertEqual(routes[(test, "ptrace")][0], "local", (backend, test))
+                elif (test, "ptrace") in routes:
+                    self.assertEqual(routes[(test, "ptrace")], routes[(test, backend)],
+                                     (backend, test))
+        self.assertEqual(moved, 469)
 
 
 # The two backends that run the in-guest LiteInst runtime.
@@ -1583,7 +1636,11 @@ class InGuestRouteTest(unittest.TestCase):
             self.assertIn("cpuid-faulting", row.get("requires_host_capabilities", []), row)
 
     def test_every_in_guest_cell_runs_locally_under_every_config(self) -> None:
-        for routing in ParityRouteTest.CONFIGS:
+        # ParityRouteTest.CONFIGS leaves cpuid_on_re at its default (off), which is
+        # the scope of this all-local assertion; CpuidOnReRouteTest covers the
+        # switch on. With the switch on but pmu_on_re off or routing local, every
+        # in-guest cell still runs locally, so those configs are in scope here too.
+        for routing in ParityRouteTest.CONFIGS + (("hybrid", "false", "true"), ("local", "true", "true")):
             targets = evaluate_cells(*routing)
             for backend in IN_GUEST_BACKENDS:
                 cells = [t for t in targets.values() if t["args"][2] == backend]
@@ -1600,13 +1657,137 @@ class HostLevelRouteTest(unittest.TestCase):
     keeps every such cell on the validation host."""
 
     def test_every_host_level_verify_cell_runs_locally_under_every_config(self) -> None:
-        for routing in ParityRouteTest.CONFIGS:
+        # cpuid_on_re never moves a ptrace or e9patch cell, so the cpuid-on
+        # configurations are in scope for this all-local assertion too.
+        for routing in ParityRouteTest.CONFIGS + ParityRouteTest.CPUID_ON_CONFIGS:
             targets = evaluate_cells(*routing)
             cells = [t for t in targets.values()
                      if t["args"][1] == "verify" and t["args"][2] in ("ptrace", "e9patch")]
             self.assertGreater(len(cells), 500, routing)
             remote = sorted(t["name"] for t in cells if t["route"] != "local")
             self.assertEqual(remote, [], routing)
+
+
+class CpuidOnReRouteTest(unittest.TestCase):
+    """-c hermit_e2e.cpuid_on_re=true lets an in-guest (liteinst, in-guest-trap) verify
+    cell that needs only cpuid-faulting run on an RE worker advertising
+    cpuid_faulting=true, through every later _route veto. evaluate_cells captures
+    target kwargs only (_cell_test_impl never runs), so the executor properties are
+    checked as the re_properties, route, labels and route-reason kwargs, not as an
+    executed executor."""
+
+    plan = json.loads(PLAN.read_text())["cells"]
+
+    def slug(self, cell: dict) -> str:
+        return "{}-{}-{}".format(cell["test"].replace("/", "-"), cell["mode"], cell["backend"])
+
+    def candidate_cells(self) -> list[dict]:
+        return [c for c in self.plan if c["backend"] in IN_GUEST_BACKENDS and c["mode"] == "verify"
+                and "cpuid-faulting" in (c.get("requires_host_capabilities") or [])
+                and "kvm" not in (c.get("requires_host_capabilities") or [])]
+
+    def expected_re_slugs(self) -> set[str]:
+        # The candidates that also clear every later veto, derived from the plan rows
+        # and defs.bzl's own veto data; pmu_on_re=true lifts the PMU veto, and the
+        # parity-reference veto moves ptrace cells only.
+        defs, _ = load_defs()
+        re_exclusions = json.loads(RE_EXCLUSIONS.read_text())["tests"]
+        expected = set()
+        for cell in self.candidate_cells():
+            if cell.get("category") in ("compat", "system-utils"):
+                continue
+            if cell["lane"] == "privileged":
+                continue
+            if any(t in defs["RE_MISSING_TOOLS"] for t in cell.get("requires", [])):
+                continue
+            if "{}/{}".format(cell["test"], cell["mode"]) in defs["PINNED_ROOT_ONLY"]:
+                continue
+            if cell["test"] in defs["LOCAL_TESTS"] or cell["test"] in re_exclusions:
+                continue
+            if cell["backend"] in defs["HOST_LEVEL_BACKENDS"]:
+                continue
+            expected.add(self.slug(cell))
+        return expected
+
+    def assert_no_re_and_no_cpuid_property(self, targets: dict[str, dict], config) -> None:
+        remote = sorted(n for n, t in targets.items() if t["route"] == "re")
+        self.assertEqual(remote, [], config)
+        for name, target in targets.items():
+            self.assertEqual(target.get("re_properties"), {}, (config, name))
+            self.assertNotIn("hermit_e2e_re_cpuid_faulting", target["labels"], (config, name))
+
+    def test_cell_rule_declares_re_properties(self) -> None:
+        _, attr_names = load_defs()
+        self.assertIn("re_properties", attr_names)
+
+    def test_cpuid_off_is_todays_routing_and_carries_no_cpuid_property(self) -> None:
+        # Unset exercises defs.bzl's default; explicit "false" must agree with it. At
+        # the current plan every cell runs locally under either.
+        for config in (("hybrid", "true"), ("hybrid", "true", "false"), ("hybrid", "false", "false")):
+            self.assert_no_re_and_no_cpuid_property(evaluate_cells(*config), config)
+
+    def test_cpuid_on_with_pmu_off_still_routes_nothing_to_re(self) -> None:
+        config = ("hybrid", "false", "true")
+        self.assert_no_re_and_no_cpuid_property(evaluate_cells(*config), config)
+
+    def test_cpuid_on_with_routing_local_routes_nothing_to_re(self) -> None:
+        config = ("local", "true", "true")
+        targets = evaluate_cells(*config)
+        self.assert_no_re_and_no_cpuid_property(targets, config)
+        # The forced-local override must not keep _route's RE audit reason: the
+        # cells that would run on RE under hybrid run here, and say so.
+        expected = self.expected_re_slugs()
+        self.assertEqual(len(expected), 469)
+        for name, target in targets.items():
+            self.assertNotIn("routes to RE", target["env"]["HERMIT_E2E_ROUTE_REASON"], (config, name))
+        for name in sorted(expected):
+            self.assertEqual(
+                targets[name]["env"]["HERMIT_E2E_ROUTE_REASON"],
+                "needs host capability cpuid-faulting; runs locally under -c hermit_e2e.routing=local",
+                name,
+            )
+
+    def test_cpuid_on_moves_exactly_the_eligible_in_guest_verify_cells(self) -> None:
+        targets = evaluate_cells("hybrid", "true", "true")
+        expected = self.expected_re_slugs()
+        self.assertEqual(len(expected), 469, "derived RE set at the current plan")
+        remote = {n for n, t in targets.items() if t["route"] == "re"}
+        self.assertEqual(remote, expected)
+        self.assertEqual(len(remote), 469)
+        by_slug = {self.slug(c): c for c in self.plan}
+        for name, target in targets.items():
+            cell = by_slug[name]
+            self.assertEqual(target["env"]["HERMIT_E2E_ROUTE"], target["route"], name)
+            if name in expected:
+                self.assertIn(cell["backend"], IN_GUEST_BACKENDS, name)
+                self.assertEqual(cell["mode"], "verify", name)
+                self.assertEqual(target.get("re_properties"), {"cpuid_faulting": "true"}, name)
+                self.assertIn("hermit_e2e_re_cpuid_faulting", target["labels"], name)
+                reason = target["env"]["HERMIT_E2E_ROUTE_REASON"]
+                self.assertIn("cpuid-faulting", reason, name)
+                self.assertIn("cpuid_faulting=true", reason, name)
+            else:
+                self.assertEqual(target.get("re_properties"), {}, name)
+                self.assertNotIn("hermit_e2e_re_cpuid_faulting", target["labels"], name)
+                if target["route"] == "re":
+                    self.assertEqual(target["env"]["HERMIT_E2E_ROUTE_REASON"], "", name)
+        self.assertFalse([n for n in remote if by_slug[n]["backend"] in ("ptrace", "kvm")])
+        defs, _ = load_defs()
+        subsets = {
+            "compat": [c for c in self.candidate_cells() if c.get("category") == "compat"],
+            "system-utils": [c for c in self.candidate_cells() if c.get("category") == "system-utils"],
+            "privileged": [c for c in self.candidate_cells() if c["lane"] == "privileged"],
+            "pinned-root-only": [c for c in self.candidate_cells()
+                                 if "{}/{}".format(c["test"], c["mode"]) in defs["PINNED_ROOT_ONLY"]],
+        }
+        for label, cells in subsets.items():
+            self.assertTrue(cells, label)
+            for cell in cells:
+                self.assertEqual(targets[self.slug(cell)]["route"], "local", (label, cell))
+        dual = targets["c-programs-cpuid-probe-verify-kvm"]
+        self.assertEqual(dual["route"], "local")
+        self.assertEqual(dual.get("re_properties"), {})
+        self.assertNotIn("hermit_e2e_re_cpuid_faulting", dual["labels"])
 
 
 if __name__ == "__main__":
