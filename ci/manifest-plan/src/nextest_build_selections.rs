@@ -145,6 +145,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "host_security_identity",
             "--test",
+            "image_archive",
+            "--test",
             "inode_nr_determinism",
             "--test",
             "integration_matrix",
@@ -997,7 +999,9 @@ mod tests {
             // its DynamoRIO owner: 713 + 7 - 1 = 719.
             // PR 4630's three fatal-core cases grow shard 2: 719 + 3 = 722,
             // measured by the batch3 donor validate at f7ec284e.
-            assert_eq!(population, 722);
+            // image_archive's eleven local-image tests join the second
+            // shard: 722 + 11 = 733, listed.
+            assert_eq!(population, 733);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
