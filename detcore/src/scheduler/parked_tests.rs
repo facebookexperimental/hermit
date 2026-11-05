@@ -86,6 +86,9 @@ struct Backend {
     /// The recipients `signal_recipients` reports for each signal other than
     /// `SIGALRM`, whose recipients stay `recipients`.
     signal_recipient_list: Mutex<Vec<(i32, SignalRecipient)>>,
+    /// The signal sets `signal_sets` reports, per thread ID; a thread with
+    /// none is not reported (`NotProvided`).
+    signal_sets: Mutex<std::collections::BTreeMap<i32, reverie::SignalSets>>,
 }
 impl std::fmt::Debug for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -296,6 +299,17 @@ impl ProcessSignalControl for Backend {
             .filter(|r| r.task.process == process)
             .copied()
             .collect())
+    }
+    fn signal_sets(
+        &self,
+        task: SignalTaskIdentity,
+    ) -> Result<reverie::SignalSets, reverie::FactError> {
+        self.signal_sets
+            .lock()
+            .unwrap()
+            .get(&task.tid.as_raw())
+            .copied()
+            .ok_or(reverie::FactError::NotProvided)
     }
     fn reserve_delivery(&self, permit: SignalDeliveryPermit) -> Result<(), reverie::Errno> {
         if self
@@ -4993,10 +5007,14 @@ fn dropping_admitted_child_publication_cleans_barrier_and_fails_run() {
     assert_eq!(backend.child_publications.lock().unwrap().len(), 1);
 }
 
+/// A controlled exit whose parent has more than one live thread keeps the
+/// backend's own decision: no `ChildExit` timer (SIGSHARE S4 decides only for
+/// a parent with one live thread, `a_controlled_exit_to_a_one_thread_parent_is_classified_at_its_grant`).
 #[test]
 fn controlled_exit_mode_never_enqueues_legacy_timed_sigchld() {
     let (mut s, _) = fixture();
     let _ = add(&mut s, 100, 100);
+    let _ = add(&mut s, 100, 101);
     let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
     let response = Ivar::new();
     assert!(
@@ -8628,5 +8646,351 @@ fn a_kvm_death_at_a_permitted_signal_boundary_places_and_publishes_as_an_exit_do
     assert_eq!(
         (field(0), field(8), field(16), field(20)),
         (libc::SIGTERM, libc::SI_USER, 200, 0)
+    );
+}
+
+// SIGSHARE S4: the child-exit SIGCHLD of a controlled exit to a parent with
+// one live thread is decided by the scheduler (`controlled_child_exit`).
+
+/// A scheduler with KVM's capabilities, sequentialized threads and the fake
+/// control installed.
+fn kvm_fixture() -> (Scheduler, Arc<Backend>) {
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::KVM)
+    });
+    assert!(!s.models_signal_targets);
+    let backend = Arc::new(Backend::default());
+    assert_eq!(
+        s.install_signal_control(
+            Some(BackendSignalControl {
+                process: backend.clone(),
+            }),
+            true,
+        )
+        .unwrap(),
+        BackendSignalControlMode::ToolControlled
+    );
+    (s, backend)
+}
+
+/// The parent's SIGCHLD state: blocked, explicitly ignored, caught.
+fn sigchld_sets(blocked: bool, ignored: bool, caught: bool) -> reverie::SignalSets {
+    let bit = kernel_signal_bit(libc::SIGCHLD);
+    let set = |on: bool| if on { bit } else { 0 };
+    reverie::SignalSets::new(0, 0, set(blocked), set(ignored), set(caught))
+}
+
+/// `tid`'s restartable pipe read, filed and queued, as a parked read is.
+fn file_restartable_read(s: &mut Scheduler, tid: DetTid) {
+    let mut request = Resources::new(tid);
+    request.insert(ResourceID::InternalIOPolling, Permission::W);
+    request.fyi("read");
+    request.set_signal_interrupt_errno(reverie::syscalls::Errno::ERESTARTSYS);
+    s.next_turns.get_mut(&tid).unwrap().req = Ivar::full(Ok(request));
+    s.runqueue_push_back(tid);
+}
+
+/// The committed `Exit` grant of `child`'s only thread (an `exit_group`).
+fn grant_group_exit(s: &mut Scheduler, child: DetTid, mm: MmId) {
+    assert!(
+        s.block_for_one_resource(
+            child,
+            &ResourceID::Exit {
+                group: true,
+                process: DetPid::from_raw(child.as_raw()),
+                mm,
+            },
+            &Permission::RW,
+            None,
+            None,
+            &Ivar::new(),
+        )
+        .is_ok()
+    );
+}
+
+fn child_exit_timers(s: &Scheduler) -> Vec<(DetPid, DetPid)> {
+    s.blocked
+        .timed_waiters
+        .iter()
+        .filter_map(|(_, event)| match event {
+            TimedEvent::SignalEvt(
+                timed_waiters::SignalTimerId::ChildExit { child, parent },
+                _,
+                _,
+            ) => Some((child, parent)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The parent's request is the scheduler's SIGCHLD wake (`InboundSignal`).
+fn woken_for_sigchld(s: &Scheduler, tid: DetTid) -> bool {
+    s.next_turns
+        .get(&tid)
+        .and_then(|turn| turn.req.try_read())
+        .and_then(Result::ok)
+        .is_some_and(|request| {
+            request
+                .resources
+                .contains_key(&ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD)))
+        })
+}
+
+/// Mutations "the controlled grant decides nothing" (S2b's behaviour: no
+/// timer for any row), "a multithreaded parent decided too", "the backend's
+/// state not read" (every row Undecided, so the ignored and default rows get
+/// a timer) and "classified outside the covered states". The parent (100)
+/// waits in a restartable read unless the row says otherwise; its child (200)
+/// exits.
+#[test]
+fn a_controlled_exit_to_a_one_thread_parent_is_classified_at_its_grant() {
+    use ChildExitNotification as N;
+    for (name, sets, parked, sibling, decision) in [
+        (
+            "caught",
+            sigchld_sets(false, false, true),
+            true,
+            false,
+            Some(N::Deliver),
+        ),
+        (
+            "blocked",
+            sigchld_sets(true, false, false),
+            true,
+            false,
+            Some(N::Deliver),
+        ),
+        (
+            "ignored",
+            sigchld_sets(false, true, true),
+            true,
+            false,
+            Some(N::None),
+        ),
+        (
+            "default",
+            sigchld_sets(false, false, false),
+            true,
+            false,
+            Some(N::Discard),
+        ),
+        (
+            "not parked",
+            sigchld_sets(false, true, false),
+            false,
+            false,
+            Some(N::Undecided),
+        ),
+        (
+            "two threads",
+            sigchld_sets(false, false, true),
+            true,
+            true,
+            None,
+        ),
+    ] {
+        let (mut s, backend) = kvm_fixture();
+        let (parent, _, _) = add(&mut s, 100, 100);
+        if sibling {
+            let _ = add(&mut s, 100, 101);
+        }
+        let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+        backend.signal_sets.lock().unwrap().insert(100, sets);
+        if parked {
+            file_restartable_read(&mut s, parent);
+        }
+        grant_group_exit(&mut s, child, child_mm);
+        let child_process = DetPid::from_raw(200);
+        assert_eq!(
+            s.controlled_child_exits_decision(child_process),
+            decision,
+            "{name}"
+        );
+        let timer = matches!(decision, Some(N::Deliver | N::Undecided));
+        assert_eq!(
+            child_exit_timers(&s),
+            if timer {
+                vec![(child_process, DetPid::from_raw(100))]
+            } else {
+                vec![]
+            },
+            "{name}"
+        );
+        // No hold waits for a kernel publication report on this backend.
+        assert!(s.child_exit_publications_pending.is_empty(), "{name}");
+    }
+}
+
+/// The cross-check table (design S4 and S0 correction 2): the only allowed
+/// disagreement is the default-ignored SIGCHLD the backend queues (G8).
+/// Mutation "every effect accepted" and "Discard against Queued refused".
+#[test]
+fn a_publication_effect_is_checked_against_the_grant_decision() {
+    use ChildExitNotification as N;
+    use ChildExitPublicationEffect as E;
+
+    use super::controlled_child_exit::child_exit_effect_mismatch as mismatch;
+    let all = [
+        E::Queued,
+        E::Coalesced,
+        E::SuppressedExplicitIgnore,
+        E::DiscardedByDispositionChange,
+    ];
+    for effect in all {
+        for waitable in [false, true] {
+            let ok = |decision| mismatch(decision, effect, waitable).is_none();
+            assert_eq!(
+                ok(N::None),
+                effect == E::SuppressedExplicitIgnore && !waitable,
+                "None {effect:?} {waitable}"
+            );
+            assert_eq!(
+                ok(N::Discard),
+                matches!(effect, E::Queued | E::Coalesced),
+                "Discard {effect:?} {waitable}"
+            );
+            assert_eq!(
+                ok(N::Deliver),
+                matches!(effect, E::Queued | E::Coalesced),
+                "Deliver {effect:?} {waitable}"
+            );
+            assert!(ok(N::Undecided), "Undecided {effect:?} {waitable}");
+        }
+    }
+}
+
+/// Run a controlled child exit from its grant to its `ChildExit` timer's pop:
+/// the terminal receipt, the two-poll publication with `effect`, then one
+/// timed pass. Returns the scheduler.
+fn controlled_child_exit_to_pop(
+    sets: reverie::SignalSets,
+    effect: ChildExitPublicationEffect,
+    waitable: bool,
+) -> (Scheduler, Arc<Backend>, DetTid) {
+    let (mut s, backend) = kvm_fixture();
+    let (parent, _, _) = add(&mut s, 100, 100);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    backend.signal_sets.lock().unwrap().insert(100, sets);
+    *backend.child_effect.lock().unwrap() = Some(effect);
+    file_restartable_read(&mut s, parent);
+    grant_group_exit(&mut s, child, child_mm);
+    let permit = s.parked.exit_fences[&child].permit;
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: 7 << 8,
+        },
+    })
+    .unwrap();
+    assert!(s.control_barrier());
+    let event = child_exit_event(
+        task(100, 100).process,
+        task(200, 200).process,
+        ExitStatus::Exited(7),
+        waitable,
+    );
+    let scheduler = Arc::new(Mutex::new(s));
+    let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        scheduler.clone(),
+        event,
+    ));
+    assert!(matches!(poll_child_exit(&mut publication), Poll::Pending));
+    assert!(matches!(
+        poll_child_exit(&mut publication),
+        Poll::Ready(Ok(()))
+    ));
+    drop(publication);
+    let mut s = Arc::try_unwrap(scheduler).unwrap().into_inner().unwrap();
+    assert!(!s.control_barrier());
+    // The next pass's committed time is past the timer's deadline, one
+    // nanosecond after the grant's.
+    s.committed_time = s.committed_time + LogicalTime::from_nanos(1);
+    let clock = committed_clock(&s);
+    s.step2b_process_timed(&clock);
+    (s, backend, parent)
+}
+
+/// Mutations "Queued wakes nobody" (design G5: the parent's read is never
+/// woken), "Coalesced wakes" (Linux does not queue a standard signal already
+/// pending, so no thread is woken) and "the publication's effect not kept for
+/// the timer" (the sink then refuses the send).
+#[test]
+fn a_controlled_child_exit_timer_acts_on_the_publication_effect() {
+    // Caught, queued: the parked read is woken as on ptrace.
+    let (s, _, parent) = controlled_child_exit_to_pop(
+        sigchld_sets(false, false, true),
+        ChildExitPublicationEffect::Queued,
+        true,
+    );
+    assert!(child_exit_timers(&s).is_empty());
+    assert!(woken_for_sigchld(&s, parent));
+    assert_eq!(s.controlled_child_exits.refusal_for_test(), None);
+
+    // Caught, coalesced into a pending SIGCHLD: no thread is woken.
+    let (s, _, parent) = controlled_child_exit_to_pop(
+        sigchld_sets(false, false, true),
+        ChildExitPublicationEffect::Coalesced,
+        true,
+    );
+    assert!(child_exit_timers(&s).is_empty());
+    assert!(!woken_for_sigchld(&s, parent));
+    assert_eq!(s.controlled_child_exits.refusal_for_test(), None);
+}
+
+/// Mutation "a mismatch passes silently": a parent that explicitly ignores
+/// SIGCHLD decides `None`, and a backend that queued it anyway ends the run
+/// by name. The same with a waitable child under SIG_IGN.
+#[test]
+fn a_publication_that_contradicts_the_decision_is_refused_by_name() {
+    for (effect, waitable) in [
+        (ChildExitPublicationEffect::Queued, false),
+        (ChildExitPublicationEffect::SuppressedExplicitIgnore, true),
+    ] {
+        let (s, _, parent) =
+            controlled_child_exit_to_pop(sigchld_sets(false, true, false), effect, waitable);
+        let refusal = s.controlled_child_exits.refusal_for_test().unwrap();
+        assert!(
+            refusal.contains("sigchld-decision-mismatch"),
+            "{effect:?}: {refusal}"
+        );
+        assert!(!woken_for_sigchld(&s, parent));
+    }
+    // The agreeing case: suppressed and reaped. No refusal, no timer, no wake.
+    let (s, _, parent) = controlled_child_exit_to_pop(
+        sigchld_sets(false, true, false),
+        ChildExitPublicationEffect::SuppressedExplicitIgnore,
+        false,
+    );
+    assert_eq!(s.controlled_child_exits.refusal_for_test(), None);
+    assert!(child_exit_timers(&s).is_empty());
+    assert!(!woken_for_sigchld(&s, parent));
+}
+
+/// Mutation "the send latch missing": under a signal control, a scheduler
+/// send that no child-exit publication stands for reaches no host process;
+/// it is refused by name.
+#[test]
+fn a_scheduler_send_under_a_signal_control_without_a_publication_is_refused() {
+    let (mut s, _) = kvm_fixture();
+    let (parent, _, _) = add(&mut s, 100, 100);
+    file_restartable_read(&mut s, parent);
+    s.send_guest_signal(
+        parent,
+        Signal::SIGUSR1,
+        None,
+        None,
+        parent,
+        discarded_at_send::SendFate::Classify(None),
+    );
+    assert_eq!(s.guest_send_landed, Some(false));
+    assert!(!woken_for_sigchld(&s, parent));
+    assert!(
+        s.controlled_child_exits
+            .refusal_for_test()
+            .is_some_and(|refusal| refusal.contains("sigchld-decision-mismatch"))
     );
 }

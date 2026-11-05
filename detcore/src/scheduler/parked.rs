@@ -959,9 +959,10 @@ impl Scheduler {
                     unreachable!("matched a ChildExit timer");
                 };
                 let receiver = match self.send_child_exit_sigchld(parent, tid, child) {
-                    super::child_exit_sigchld::ChildExitSend::NotOwned => {
-                        self.fire_child_exit_alarm(parent, tid, None, None)
-                    }
+                    super::child_exit_sigchld::ChildExitSend::NotOwned => self
+                        .sending_controlled_child_exit(child, |s| {
+                            s.fire_child_exit_alarm(parent, tid, None, None)
+                        }),
                     super::child_exit_sigchld::ChildExitSend::Nothing => {
                         // No copy will take the process's mark set above.
                         // Without publication, nothing would clear it before a
@@ -1007,7 +1008,15 @@ impl Scheduler {
                         _ => false,
                     };
                 if !nothing_to_send {
-                    self.fire_alarm(id.process(), tid, signal);
+                    match id {
+                        // A controlled child exit's send is its publication's
+                        // effect (`child_exit_sink`).
+                        SignalTimerId::ChildExit { child, .. } => self
+                            .sending_controlled_child_exit(child, |s| {
+                                s.fire_alarm(id.process(), tid, signal)
+                            }),
+                        _ => self.fire_alarm(id.process(), tid, signal),
+                    }
                 }
             }
         }

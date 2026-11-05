@@ -971,6 +971,10 @@ impl Scheduler {
             if receipt.completion != completion {
                 return Err(ProtocolFailure::Identity);
             }
+            // The scheduler's own decision at the exit grant, if it took one
+            // (SIGSHARE S4), is checked against the effect here, inside the
+            // barrier, and the effect kept for the child's `ChildExit` timer.
+            self.check_child_exit_publication(&receipt);
             // Waitability, never the signal-publication effect, decides whether
             // scheduler shadow state survives. A waitable child remains until
             // the Tool injects the backend wait (including WNOWAIT handling);
@@ -1155,6 +1159,23 @@ impl Scheduler {
             );
         }
         Ok(ExitReserveMode::Controlled)
+    }
+
+    /// Whether the exit of `child` reserved its publication to a live parent
+    /// (`prepare_child_exit_reservation`) and awaits its terminal status: the
+    /// reservation `reserve_exit_boundary` installed for the grant now being
+    /// committed.
+    pub(super) fn child_exit_reserved(&self, child: DetPid) -> bool {
+        self.parked
+            .child_exit_reservations
+            .values()
+            .any(|reservation| {
+                reservation.child.tgid.as_raw() == child.as_raw()
+                    && matches!(
+                        reservation.phase,
+                        ChildExitReservationPhase::AwaitingTerminalStatus
+                    )
+            })
     }
 
     /// Whether `process`'s final transition is already recorded, with exit

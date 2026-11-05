@@ -218,20 +218,21 @@ fn a_parked_suspend_ends_exactly_for_a_signal_its_temporary_mask_lets_in() {
     }
 }
 
-/// Mutation "SIGCHLD counted with a child" or "fallback missing": in a
-/// process with a child whose exit sends SIGCHLD, a pending SIGCHLD never
-/// ends a wait (a child's exit is S4's), and a suspend whose temporary mask
-/// lets in a caught SIGCHLD is woken with SIGCHLD whatever is pending, so its
-/// turn takes the decline it had before S2b.
+/// Mutation "SIGCHLD held with a child" (S2b's fallback, removed by S4): in a
+/// process with a child whose exit sends SIGCHLD, a pending child-exit SIGCHLD
+/// ends a suspend that lets it in as any other signal does, because the
+/// backend publishes it inside the exit's control barrier. A suspend with
+/// nothing pending stays parked: no wake is invented for a child that has not
+/// exited.
 #[test]
-fn with_a_sigchld_child_a_suspend_that_lets_in_a_caught_sigchld_takes_the_child_exit_path() {
+fn with_a_sigchld_child_a_pending_sigchld_ends_a_suspend_as_any_signal_does() {
     let chld = bit(libc::SIGCHLD);
     for (name, mask, sets, expected) in [
         (
             "caught, let in, nothing pending",
             0,
             state(0, 0, chld, 0, chld),
-            Some(vec![libc::SIGCHLD]),
+            None,
         ),
         (
             "caught, let in, pending",
@@ -246,15 +247,15 @@ fn with_a_sigchld_child_a_suspend_that_lets_in_a_caught_sigchld_takes_the_child_
             None,
         ),
         (
+            // Linux discarded it at generation; the woken waiter removes it.
             "default disposition, pending",
             0,
             state(0, chld, 0, 0, 0),
-            None,
+            Some(vec![libc::SIGCHLD]),
         ),
     ] {
         let (mut scheduler, _) = kvm(Ok(sets));
         scheduler.thread_tree.add_child(WAITER, CHILD, true);
-        assert!(scheduler.has_sigchld_child(PROCESS), "{name}");
         file(
             &mut scheduler,
             WAITER,
@@ -487,22 +488,10 @@ fn the_decision_is_pending_and_unblocked() {
     let usr2 = bit(libc::SIGUSR2);
     let sets =
         KernelSignalState::from_backend_sets(&state(usr1 | usr2, 0, usr1 | usr2, usr2, usr1));
-    assert_eq!(
-        Scheduler::backend_suspend_signals(&sets, 0, 0, false),
-        usr1 | usr2
-    );
-    assert_eq!(
-        Scheduler::backend_suspend_signals(&sets, usr1, 0, false),
-        usr2
-    );
-    assert_eq!(
-        Scheduler::backend_suspend_signals(&sets, usr1 | usr2, 0, false),
-        0
-    );
-    assert_eq!(
-        Scheduler::backend_suspend_signals(&sets, 0, usr1, false),
-        usr2
-    );
+    assert_eq!(Scheduler::backend_suspend_signals(&sets, 0, 0), usr1 | usr2);
+    assert_eq!(Scheduler::backend_suspend_signals(&sets, usr1, 0), usr2);
+    assert_eq!(Scheduler::backend_suspend_signals(&sets, usr1 | usr2, 0), 0);
+    assert_eq!(Scheduler::backend_suspend_signals(&sets, 0, usr1), usr2);
 }
 
 /// Mutations "the guard reads no waiter", "every pending signal counts" and

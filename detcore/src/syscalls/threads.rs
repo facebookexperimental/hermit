@@ -1830,13 +1830,12 @@ where
         .with_sigsetsize(KERNEL_SIGSET_SIZE);
     guest.inject_with_retry(block_signals).await?;
     let guest_mask: KernelSigset = guest.memory().read_value(old_mask_addr)?;
-    if crate::scheduler::child_exit_publication(&guest.config().backend).is_ok()
-        || crate::scheduler::discarded_at_send::records(guest.config())
-    {
-        // While the private mask is installed, the kernel reports Detcore's
-        // mask for this thread; the scheduler's child-exit classification and
-        // its record of copies Linux discarded at send must read the guest's
-        // own (the Claude re-check of the R2b-1 design, R4-3).
+    if scheduler_reads_saved_guest_mask(guest.config()) {
+        // While the private mask is installed, the kernel (or, on KVM, the
+        // backend's signal state) reports Detcore's mask for this thread; the
+        // scheduler's child-exit classification and its record of copies
+        // Linux discarded at send must read the guest's own (the Claude
+        // re-check of the R2b-1 design, R4-3; SIGSHARE S4 for KVM).
         crate::tool_global::set_saved_guest_sigmask(guest, Some(guest_mask)).await;
     }
     Ok(guest_mask)
@@ -1859,12 +1858,22 @@ where
             .with_sigsetsize(KERNEL_SIGSET_SIZE);
         guest.inject_with_retry(restore_signals).await?;
     }
-    if crate::scheduler::child_exit_publication(&guest.config().backend).is_ok()
-        || crate::scheduler::discarded_at_send::records(guest.config())
-    {
+    if scheduler_reads_saved_guest_mask(guest.config()) {
         crate::tool_global::set_saved_guest_sigmask(guest, None).await;
     }
     Ok(())
+}
+
+/// Whether the scheduler reads a thread's guest mask while a managed child
+/// wait holds it under Detcore's private mask (`saved_guest_sigmasks`): for
+/// its child-exit classification where publication is reported, or where it
+/// decides a controlled exit's notification from the backend's signal state
+/// (`reads_signal_state_from_backend`, SIGSHARE S4), and for its record of
+/// copies Linux discarded at send.
+fn scheduler_reads_saved_guest_mask(config: &Config) -> bool {
+    crate::scheduler::child_exit_publication(&config.backend).is_ok()
+        || reads_signal_state_from_backend(&config.backend)
+        || crate::scheduler::discarded_at_send::records(config)
 }
 
 async fn interrupted_child_wait_result<G, T, S>(

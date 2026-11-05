@@ -59,12 +59,12 @@
 //! a signal that became pending by any committed event is seen at the first
 //! drain after it, whoever sent it.
 //!
-//! A child's exit `SIGCHLD` is out of scope until SIGSHARE S4
-//! (<https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-ro7dr.md>):
-//! `SIGCHLD` never ends a wait of a process that has a child whose exit sends
-//! it. A suspended thread whose temporary mask lets in a caught `SIGCHLD` in
-//! such a process is woken once so that its own turn takes the path it had
-//! before (`rt_sigsuspend_takes_child_exit_fallback`).
+//! A child's exit `SIGCHLD` is no exception (SIGSHARE S4). The backend
+//! publishes it under the scheduler mutex, inside the child-exit reservation
+//! the exit grant installs, which is a control barrier: no drain runs between
+//! the grant and the publication's completion. So a `SIGCHLD` pending at a
+//! drain is pending by a committed event, whichever thread count the parent
+//! has, and it ends the wait as any other signal does.
 
 use reverie::syscalls::Errno;
 
@@ -78,21 +78,9 @@ use crate::resources::Resources;
 use crate::syscalls::KernelSignalState;
 use crate::syscalls::ignored_at_generation;
 use crate::syscalls::reads_signal_state_from_backend;
-use crate::types::ChildWaitExitClass;
-use crate::types::ChildWaitSelector;
-use crate::types::ChildWaitSpec;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::SigWrapper;
-
-/// Every process a child whose exit signal is `SIGCHLD` can belong to.
-fn sigchld_children() -> ChildWaitSpec {
-    ChildWaitSpec {
-        selector: ChildWaitSelector::Any,
-        owner: None,
-        exit_class: ChildWaitExitClass::Sigchld,
-    }
-}
 
 impl Scheduler {
     /// The temporary mask of `dettid`'s parked `rt_sigsuspend`, if its filed
@@ -130,42 +118,25 @@ impl Scheduler {
         }
     }
 
-    /// Whether `process` has a child, live or not yet reaped, whose exit
-    /// signal is `SIGCHLD`: then a `SIGCHLD` pending for it may be a child's
-    /// exit, which SIGSHARE S4 owns.
-    pub(crate) fn has_sigchld_child(&self, process: DetPid) -> bool {
-        self.has_child_wait_target(process, sigchld_children())
-    }
-
     /// The signals that end or settle a parked `rt_sigsuspend` under temporary
     /// mask `mask`, given the waiter's signal state as the backend reports it:
     /// pending for it, unblocked by `mask`, and caught or acting by default
     /// (`KernelSignalState::interrupting`), or ignored at generation
     /// (`ignored_at_generation`), which Linux discarded when they were sent
     /// and the woken thread removes in its own turn. Held: the signals a host-timed
-    /// source armed by a guest can post (`host_timed_signals`), and `SIGCHLD`
-    /// in a process with a `SIGCHLD` child (S4). A waiter whose mask lets in a
-    /// caught `SIGCHLD` in such a process gets `SIGCHLD` too, so that its turn
-    /// takes its child-exit path.
+    /// source armed by a guest can post (`host_timed_signals`). A child's exit
+    /// `SIGCHLD` counts as any other signal (see the module documentation).
     pub(crate) fn backend_suspend_signals(
         state: &KernelSignalState,
         mask: u64,
         host_timed: u64,
-        sigchld_child: bool,
     ) -> u64 {
-        let sigchld = kernel_signal_bit(libc::SIGCHLD);
-        let held = host_timed | if sigchld_child { sigchld } else { 0 };
-        let let_in =
-            state.pending & !held & !mask & !kernel_signal_bit(reverie::PERF_EVENT_SIGNAL as i32);
+        let let_in = state.pending
+            & !host_timed
+            & !mask
+            & !kernel_signal_bit(reverie::PERF_EVENT_SIGNAL as i32);
         let discarded = let_in & ignored_at_generation(state.ignored, state.caught);
-        let interrupting = (let_in & state.interrupting(mask)) | discarded;
-        let child_exit_fallback =
-            sigchld_child && mask & sigchld == 0 && state.caught & sigchld != 0;
-        if child_exit_fallback {
-            interrupting | sigchld
-        } else {
-            interrupting
-        }
+        (let_in & state.interrupting(mask)) | discarded
     }
 
     /// Whether an `rt_sigsuspend` of `process` whose temporary mask lets
@@ -290,12 +261,8 @@ impl Scheduler {
                     return;
                 }
             };
-            let signals = Self::backend_suspend_signals(
-                &state,
-                mask,
-                self.host_timed_signals(dettid),
-                self.has_sigchld_child(owner),
-            );
+            let signals =
+                Self::backend_suspend_signals(&state, mask, self.host_timed_signals(dettid));
             if signals == 0 {
                 continue;
             }

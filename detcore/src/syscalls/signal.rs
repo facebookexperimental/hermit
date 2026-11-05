@@ -1341,10 +1341,6 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///   fatal, and which of those Linux discards after the delivery depends
     ///   on the handler's own mask, which the backend's state does not
     ///   report. The call is refused by name before anything is removed;
-    /// - a caught `SIGCHLD` the mask lets in, in a process with a child whose
-    ///   exit sends it, keeps the answer this backend gave before: the decline
-    ///   goes to the guest after a strong yield. A child's exit `SIGCHLD` is
-    ///   SIGSHARE S4's (`rt_sigsuspend_takes_child_exit_fallback`);
     /// - otherwise the thread parks: a `SleepUntil(INDEFINITE)` request tagged
     ///   `RT_SIGSUSPEND_FYI` that carries the mask Linux installs, which the
     ///   scheduler ends when the backend's state shows a signal that ends the
@@ -1419,16 +1415,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                         reason,
                     )
                     .await;
-            }
-            if rt_sigsuspend_takes_child_exit_fallback(guest, &state, installed).await {
-                if self.cfg.max_timeslice.is_some() {
-                    guest
-                        .thread_state_mut()
-                        .reset_timeslice_for_explicit_yield();
-                }
-                let request = Self::sched_yield_request(guest);
-                resource_request(guest, request).await;
-                return Err(Errno::ENOSYS.into());
             }
             let mut request = Self::sleep_request_abs(guest, LogicalTime::INDEFINITE).await;
             request.fyi(crate::resources::RT_SIGSUSPEND_FYI);
@@ -5325,35 +5311,6 @@ pub(crate) fn settle_suspend_decline(
     } else {
         SuspendDecline::Waits
     }
-}
-
-/// Whether an `rt_sigsuspend` that the backend declined (SIGSHARE S2b,
-/// `Detcore::backend_rt_sigsuspend`) keeps the answer it had before S2b, the
-/// decline itself: its temporary mask `installed` lets in `SIGCHLD`, which the
-/// process catches (`state`, read in this thread's turn), and the process has
-/// a child whose exit sends it. A child's exit `SIGCHLD` is published by the
-/// backend, and its wake is SIGSHARE S4's
-/// (<https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-ro7dr.md>),
-/// so such a wait is not parked: the guest retries it, as it did.
-async fn rt_sigsuspend_takes_child_exit_fallback<G, T>(
-    guest: &mut G,
-    state: &crate::syscalls::KernelSignalState,
-    installed: KernelSigset,
-) -> bool
-where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    let sigchld = kernel_sigset_bit(libc::SIGCHLD);
-    if installed & sigchld != 0 || state.caught & sigchld == 0 {
-        return false;
-    }
-    let spec = crate::types::ChildWaitSpec {
-        selector: crate::types::ChildWaitSelector::Any,
-        owner: None,
-        exit_class: crate::types::ChildWaitExitClass::Sigchld,
-    };
-    crate::tool_global::ready_child_wait(guest, spec).await.1
 }
 
 /// Whether this backend's `rt_sigsuspend` returns at once rather than sleeping

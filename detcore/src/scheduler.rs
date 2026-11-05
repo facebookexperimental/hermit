@@ -14,6 +14,7 @@ mod backend_signal_waits_tests;
 mod boundary_controller;
 mod boundary_replayer;
 pub(crate) mod child_exit_sigchld;
+pub(crate) mod controlled_child_exit;
 #[cfg(test)]
 mod cpu_affinity_tests;
 pub(crate) mod discarded_at_send;
@@ -2028,6 +2029,10 @@ pub struct Scheduler {
     /// A SIGKILL fence that waited past `SIGKILL_FENCE_VALVE` for a death or
     /// a publication that never arrived: the run is refused.
     sigkill_fence_refusal: Option<sigkill_retirement::SigkillFenceRefusal>,
+
+    /// The scheduler's child-exit `SIGCHLD` decisions for controlled exits
+    /// (SIGSHARE S4), and the run's refusal if a publication disagreed.
+    controlled_child_exits: controlled_child_exit::ControlledChildExits,
 
     /// The bound on the SIGKILL fence and a sender's wait:
     /// `SIGKILL_FENCE_VALVE`, shortened only by tests that expire it.
@@ -4228,6 +4233,12 @@ async fn sched_loop_inner(
         if let Some(refusal) = sigkill_refusal {
             exit_on_scheduler_refusal(&refusal);
         }
+        // A controlled child exit whose publication disagreed with the
+        // scheduler's decision (`check_child_exit_publication`).
+        let sigchld_refusal = sched.lock().unwrap().take_sigchld_decision_refusal();
+        if let Some(refusal) = sigchld_refusal {
+            exit_on_scheduler_refusal(&refusal);
+        }
 
         // A terminal deadlock ends the run here, alongside the two
         // `--stop-after-*` exits above, rather than by panicking out of the
@@ -6137,6 +6148,7 @@ impl Scheduler {
             kernel_run_signal_refusal: None,
             sigkill_fence_wait_since: None,
             sigkill_fence_refusal: None,
+            controlled_child_exits: Default::default(),
             sigkill_fence_valve: Self::SIGKILL_FENCE_VALVE,
             group_exit_decider: None,
             rejoin_writer: match &cfg.replay_data {
@@ -10028,6 +10040,38 @@ impl Scheduler {
                 });
         if !covered {
             return ChildExitNotification::Undecided;
+        }
+        // Where the backend reports the guest's signal state (SIGSHARE S4),
+        // the receiving thread's sets stand for the three /proc fields: its
+        // dispositions are its process's. They are read at this grant, where
+        // the exiting child holds the turn, so only a committed event of
+        // another turn has changed them, unless a delivery permit of the
+        // parent's process is outstanding: its holder's host thread may still
+        // be selecting from the queues (`backend_signal_waits`), so that
+        // state is Undecided.
+        if let Some(state) = self.backend_signal_state(receiving) {
+            let permit_held = self
+                .parked
+                .permits
+                .values()
+                .any(|permit| permit.task.process.tgid.as_raw() == parent.as_raw());
+            let Ok(state) = state else {
+                return ChildExitNotification::Undecided;
+            };
+            if permit_held {
+                return ChildExitNotification::Undecided;
+            }
+            let blocked = self
+                .saved_guest_sigmasks
+                .get(&receiving)
+                .copied()
+                .unwrap_or(state.blocked);
+            let bit = 1_u64 << (libc::SIGCHLD - 1);
+            return classify_sigchld_notification(
+                state.ignored & bit != 0,
+                state.caught & bit != 0,
+                blocked & bit != 0,
+            );
         }
         let Some(ignored) = self.signal_mask_field(parent, None, "SigIgn") else {
             return ChildExitNotification::Undecided;
@@ -14626,6 +14670,14 @@ impl Scheduler {
             self.guest_send_landed = Some(true);
             return;
         }
+        // Where the backend owns signal delivery, a guest thread is no host
+        // task: the only send that reaches here is a controlled child exit's
+        // `SIGCHLD`, which the backend's publication already made
+        // (`child_exit_sink`). Anything else is refused there by name.
+        if self.signal_control_installed() {
+            self.child_exit_sink(dettid, signal, named);
+            return;
+        }
         // A thread's pidfd sends thread-directed either way.
         let queue = if thread_of.is_some() || self.physical_thread_pidfds.contains_key(&dettid) {
             discarded_at_send::QueueId::Thread(dettid)
@@ -19211,7 +19263,17 @@ impl Scheduler {
                 // own copy, at a host-timed moment, and the empty run queue was
                 // usually reported as a deadlock first
                 // (https://github.com/rrnewton/hermit/issues/3895).
-                if reserve_mode == signal_control::ExitReserveMode::Uncontrolled
+                // A controlled exit's notification is the backend's publication.
+                // Where the scheduler decides it (SIGSHARE S4: a parent with one
+                // live thread, `decides_controlled_child_exit`), it is decided
+                // here as an uncontrolled one is, and its `ChildExit` timer pops
+                // after the publication, whose effect stands for the send
+                // (`child_exit_sink`).
+                let controlled_parent = self.thread_tree.parent_process(process).filter(|parent| {
+                    self.decides_controlled_child_exit(reserve_mode, *process, *parent)
+                });
+                if (reserve_mode == signal_control::ExitReserveMode::Uncontrolled
+                    || controlled_parent.is_some())
                     && ends_process
                     && let Some(parent) = self.thread_tree.parent_process(process)
                     && self.should_synthesize_child_exit_signal(parent)
@@ -19242,11 +19304,18 @@ impl Scheduler {
                         );
                     let notification = if non_sigchld_exit_signal {
                         None
-                    } else if self.child_exit_publication().is_ok() && ends_named_process {
+                    } else if (self.child_exit_publication().is_ok() || controlled_parent.is_some())
+                        && ends_named_process
+                    {
                         Some(self.classify_child_exit_notification(*process, parent))
                     } else {
                         Some(ChildExitNotification::Undecided)
                     };
+                    if controlled_parent.is_some()
+                        && let Some(decision) = notification
+                    {
+                        self.record_controlled_child_exit(*process, decision);
+                    }
                     match notification {
                         None => {}
                         // Linux generates nothing (explicit SIG_IGN) or discards
@@ -19257,6 +19326,10 @@ impl Scheduler {
                         // kernel's own notification, which this hold places at
                         // the first scheduling pass after the backend reports its
                         // publication.
+                        // A controlled exit's publication is the backend's own,
+                        // inside the reservation's barrier: no hold.
+                        Some(ChildExitNotification::None | ChildExitNotification::Discard)
+                            if controlled_parent.is_some() => {}
                         Some(ChildExitNotification::None | ChildExitNotification::Discard) => {
                             // A publication already reported (the process was
                             // consumed before this grant) needs no hold: the
