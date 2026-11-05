@@ -504,54 +504,80 @@ static void scenario_mixed_waiters(void) {
 
 /* Whether every FLOCK row /proc/locks shows is this program's: no row was
    there before its first lock. Natively other processes' rows usually are,
-   and this program's rows are told apart by the lock file's inode number;
-   Hermit shows only the guest's rows, and numbers their identities itself,
-   so there the inode number cannot tell them apart and need not. */
+   and this program's rows are told apart by the lock file's full
+   MAJ:MIN:INO object (below); Hermit shows only the guest's rows, and
+   numbers their identities itself, so there the object cannot tell them
+   apart and need not. */
 static int all_flock_rows_are_ours;
+
+/* The lock file's MAJ:MIN:INO as /proc/locks prints it, learned from this
+   process's own row while it holds a lock. The device cannot come from
+   stat(): on btrfs, st_dev is the subvolume's anonymous device while
+   /proc/locks prints the superblock's, and an inode number alone also
+   matches unrelated files on other filesystems that reuse it (a native
+   false red: a foreign shared flock on a same-inode file counted as a
+   third holder here). */
+static char lock_object[64];
 
 /* The access of each /proc/locks row on the lock file, in row order, a
    waiter's (`->`) after `->`. */
 static void proc_locks_rows(char* out, size_t size) {
-  struct stat file;
-  if (stat(lock_path, &file) != 0) {
-    harness("stat the lock file");
-  }
-  char suffix[32];
-  snprintf(suffix, sizeof(suffix), ":%lu", (unsigned long)file.st_ino);
   FILE* locks = fopen("/proc/locks", "re");
   if (locks == NULL) {
     harness("open /proc/locks");
   }
-  out[0] = '\0';
+  /* Rows are collected first: this process's own row, which teaches
+     lock_object, need not come before the rows it must distinguish. */
+  struct parsed_row {
+    char access[16];
+    char object[64];
+    long pid;
+    int waits;
+  };
+  static struct parsed_row parsed[4096];
+  int count = 0;
   char row[256];
   while (fgets(row, sizeof(row), locks) != NULL) {
     char kind[16];
     char waiter[4];
     char mode[16];
-    char access[16];
-    char object[64];
+    char pid[16];
     /* N: [->] FLOCK ADVISORY ACCESS PID MAJ:MIN:INO START END */
     int waits = sscanf(row, "%*s %3s", waiter) == 1 && strcmp(waiter, "->") == 0;
-    const char* format = waits ? "%*s %*s %15s %15s %15s %*s %63s" : "%*s %15s %15s %15s %*s %63s";
-    if (sscanf(row, format, kind, mode, access, object) != 4) {
+    const char* format =
+        waits ? "%*s %*s %15s %15s %15s %15s %63s" : "%*s %15s %15s %15s %15s %63s";
+    if (count >= (int)(sizeof(parsed) / sizeof(parsed[0])) ||
+        sscanf(row, format, kind, mode, parsed[count].access, pid, parsed[count].object) != 5 ||
+        strcmp(kind, "FLOCK") != 0) {
       continue;
     }
-    size_t length = strlen(object);
-    size_t tail = strlen(suffix);
-    if (strcmp(kind, "FLOCK") != 0 ||
-        (!all_flock_rows_are_ours &&
-         (length < tail || strcmp(object + length - tail, suffix) != 0))) {
+    parsed[count].waits = waits;
+    parsed[count].pid = strtol(pid, NULL, 10);
+    count++;
+  }
+  fclose(locks);
+  if (lock_object[0] == '\0') {
+    for (int index = 0; index < count; index++) {
+      if (!parsed[index].waits && parsed[index].pid == (long)getpid()) {
+        snprintf(lock_object, sizeof(lock_object), "%s", parsed[index].object);
+        break;
+      }
+    }
+  }
+  out[0] = '\0';
+  for (int index = 0; index < count; index++) {
+    if (!all_flock_rows_are_ours &&
+        (lock_object[0] == '\0' || strcmp(parsed[index].object, lock_object) != 0)) {
       continue;
     }
     if (out[0] != '\0') {
       strncat(out, " ", size - strlen(out) - 1);
     }
-    if (waits) {
+    if (parsed[index].waits) {
       strncat(out, "->", size - strlen(out) - 1);
     }
-    strncat(out, access, size - strlen(out) - 1);
+    strncat(out, parsed[index].access, size - strlen(out) - 1);
   }
-  fclose(locks);
   if (out[0] == '\0') {
     snprintf(out, size, "none");
   }
