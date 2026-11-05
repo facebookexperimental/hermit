@@ -8,6 +8,7 @@ use std::process::Command;
 use std::process::ExitCode;
 use std::process::Output;
 use std::process::Stdio;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -141,7 +142,12 @@ Execution and output options:
   -h, --help                       Print this help";
 
 const PUBLIC_EXECUTION_ENVIRONMENT: &str =
-    "  E2E_RESULT_ROOT=<PATH>                 Result root (default: ignored/e2e)
+    "  HERMIT_E2E_FAIL_FAST=<0|1>             Early exit for run: unset/1 stop
+                                   dispatching new cells after the first
+                                   final FAIL/ERROR (in-flight cells finish;
+                                   un-run cells return no result and the run
+                                   reports that count); 0 runs every cell
+  E2E_RESULT_ROOT=<PATH>                 Result root (default: ignored/e2e)
   E2E_BUILD_ROOT=<PATH>                  Prepared-program build root
   E2E_RUN_ID=<ID>                        Run identifier and result subdirectory
   E2E_RUN_INDEX=<N>                      Non-negative run index recorded in results
@@ -1755,9 +1761,11 @@ fn collect_audit_results(
         .take(audits.len())
         .collect::<Vec<Option<AuditReport>>>();
     let mut output_error = None;
+    let never_stop = AtomicBool::new(false);
     for_each_parallel(
         audits.len(),
         ScheduledWorkerCapacity::new(jobs),
+        &never_stop,
         |index, emit| {
             if !emit(AuditEvent::Started, false) {
                 return;
@@ -2756,9 +2764,11 @@ fn build(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let mut results = std::iter::repeat_with(|| None)
         .take(cells.len())
         .collect::<Vec<Option<Result<(), String>>>>();
+    let never_stop = AtomicBool::new(false);
     for_each_parallel(
         cells.len(),
         capacity,
+        &never_stop,
         |index, emit| {
             let cell = &cells[index];
             let dir = context.build_root.join(cell.id.test.replace('/', "-"));
@@ -2876,9 +2886,35 @@ fn audit_compile(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode 
     }
 }
 
+/// The e2e fail-fast opt-out channel, mirroring `HERMIT_NEXTEST_FAIL_FAST`
+/// for nextest batches: early exit is the default (owner directive
+/// 2026-11-04), and validate stamps `=0` on every step only for a
+/// keep-going run. Unset or `1` stops dispatching new cells after the
+/// first cell whose final result fails the run; `0` runs every cell;
+/// anything else refuses, so a typo cannot silently disable early exit.
+const E2E_FAIL_FAST_ENV: &str = "HERMIT_E2E_FAIL_FAST";
+
+fn e2e_fail_fast_mode(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None | Some("1") => Ok(true),
+        Some("0") => Ok(false),
+        Some(other) => Err(format!(
+            "{E2E_FAIL_FAST_ENV} must be 0 or 1 (or unset), got {other:?}"
+        )),
+    }
+}
+
+fn e2e_fail_fast_from_env() -> Result<bool, String> {
+    e2e_fail_fast_mode(std::env::var(E2E_FAIL_FAST_ENV).ok().as_deref())
+}
+
 /// Execute `count` independent items with at most `jobs` workers, delivering
 /// each emitted value to `consume` immediately and waiting for its
 /// acknowledgement before the worker may continue.
+///
+/// `stop` is the fail-fast brake: the consumer sets it to keep workers
+/// from dispatching new items (callers that always run everything pass
+/// a flag that is never set).
 ///
 /// The consumer stays on the calling thread so durable publication is
 /// serialized even while the expensive cell executions overlap. This is
@@ -2888,6 +2924,7 @@ fn audit_compile(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode 
 fn for_each_parallel<T: Send>(
     count: usize,
     capacity: ScheduledWorkerCapacity,
+    stop: &AtomicBool,
     execute: impl Fn(usize, &mut dyn FnMut(T, bool) -> bool) + Sync,
     mut consume: impl FnMut(usize, T, bool) -> bool,
 ) {
@@ -2904,6 +2941,12 @@ fn for_each_parallel<T: Send>(
             let next = &next;
             scope.spawn(move || {
                 loop {
+                    // Fail-fast: once the consumer asks to stop, no NEW
+                    // item starts. An item already executing finishes and
+                    // still delivers, so completed rows are never lost.
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     if index >= count {
                         break;
@@ -3431,9 +3474,12 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let mut cell_cpu_usage_usec = Some(0u64);
     let mut cpu_measurements = 0usize;
     let expected = cells.len();
+    let fail_fast = e2e_fail_fast_from_env().unwrap_or_else(|error| fail(error));
+    let stop = AtomicBool::new(false);
     for_each_parallel(
         expected,
         capacity,
+        &stop,
         |index, emit| {
             let cell = &cells[index];
             if let Some(imported) = &imported {
@@ -3621,7 +3667,18 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         result.backend.as_deref().unwrap_or("native"),
                     );
                 } else {
-                    failed |= matches!(result.outcome.as_str(), "FAIL" | "ERROR");
+                    let fails_run = matches!(result.outcome.as_str(), "FAIL" | "ERROR");
+                    failed |= fails_run;
+                    if fails_run && fail_fast && !stop.swap(true, Ordering::SeqCst) {
+                        eprintln!(
+                            "test-harness: fail-fast: {} {} ({}/{}) ended {}; not dispatching further cells ({E2E_FAIL_FAST_ENV}=0 runs every cell)",
+                            result.outcome,
+                            result.test,
+                            result.mode,
+                            result.backend.as_deref().unwrap_or("native"),
+                            result.outcome
+                        );
+                    }
                 }
                 indexed_results.push((index, result));
             }
@@ -4630,6 +4687,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -4663,6 +4721,7 @@ mod tests {
     use super::command_jobs;
     use super::command_runs_exactly;
     use super::command_timeout_seconds;
+    use super::e2e_fail_fast_mode;
     use super::excused_diagnostic;
     use super::expected_plan_document;
     use super::for_each_parallel;
@@ -6691,6 +6750,10 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                 .env("E2E_RESULT_ROOT", path.join("artifacts"))
                 .env("E2E_BUILD_ROOT", path.join("build"))
                 .env("E2E_RUN_ID", "import-consumer")
+                // Republishing completeness is the subject here, so
+                // every selected cell must dispatch: opt out of
+                // fail-fast explicitly.
+                .env("HERMIT_E2E_FAIL_FAST", "0")
                 .env("E2E_MACHINE_SHORTNAME", "import-control")
                 .env("E2E_KERNEL_VERSION", "import-control")
                 .env("DAGRUN_TEST_COUNTS_PATH", path.join("counts.json"));
@@ -7599,6 +7662,9 @@ sys.exit(1 if failed else 0)
                 .env("E2E_RESULT_ROOT", &artifacts)
                 .env("E2E_BUILD_ROOT", fixture.join("build"))
                 .env("E2E_RUN_ID", "parity-post-pass-control")
+                // Full-output comparison needs every cell dispatched:
+                // opt out of fail-fast explicitly.
+                .env("HERMIT_E2E_FAIL_FAST", "0")
                 // One comparison epoch for every run, so HERMIT_EPOCH in each
                 // row's environment is the same across runs.
                 .env("HERMIT_EPOCH", "2021-12-31T23:59:59Z")
@@ -10392,6 +10458,7 @@ sys.exit(1 if failed else 0)
         for_each_parallel(
             8,
             ScheduledWorkerCapacity::new(4),
+            &AtomicBool::new(false),
             |index, emit| {
                 let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                 maximum.fetch_max(now, Ordering::SeqCst);
@@ -10410,6 +10477,40 @@ sys.exit(1 if failed else 0)
         assert!(maximum.load(Ordering::SeqCst) > 1);
         completed_audit_output_survives_an_unfinished_peer();
     }
+    #[test]
+    fn parallel_runner_stops_dispatching_new_items_when_asked() {
+        // Fail-fast (owner early-exit directive): once the consumer asks
+        // to stop, no NEW item starts; the item in flight finishes. One
+        // worker keeps this deterministic: items 0..=2 run, 3.. never do.
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let executed = Mutex::new(Vec::new());
+        for_each_parallel(
+            8,
+            ScheduledWorkerCapacity::new(1),
+            &stop,
+            |index, emit| {
+                executed.lock().unwrap().push(index);
+                assert!(emit(index, false));
+            },
+            |index, _value, _| {
+                if index == 2 {
+                    stop.store(true, Ordering::SeqCst);
+                }
+                true
+            },
+        );
+        assert_eq!(executed.into_inner().unwrap(), [0, 1, 2]);
+    }
+
+    #[test]
+    fn e2e_fail_fast_mode_parses_the_env_contract() {
+        assert_eq!(e2e_fail_fast_mode(None), Ok(true));
+        assert_eq!(e2e_fail_fast_mode(Some("1")), Ok(true));
+        assert_eq!(e2e_fail_fast_mode(Some("0")), Ok(false));
+        assert!(e2e_fail_fast_mode(Some("yes")).is_err());
+        assert!(e2e_fail_fast_mode(Some("")).is_err());
+    }
+
     #[test]
     fn retry_policy_retries_only_classified_product_failures() {
         assert!(cell_result_is_retryable(
@@ -10439,6 +10540,7 @@ sys.exit(1 if failed else 0)
         for_each_parallel(
             1,
             ScheduledWorkerCapacity::new(1),
+            &AtomicBool::new(false),
             |_, emit| {
                 run_with_retry(
                     1,
@@ -10506,6 +10608,7 @@ sys.exit(1 if failed else 0)
         for_each_parallel(
             CELL_COUNT,
             ScheduledWorkerCapacity::new(8),
+            &AtomicBool::new(false),
             |index, emit| {
                 run_with_retry(
                     1,
@@ -10797,6 +10900,9 @@ sys.exit(1 if failed else 0)
                 .env("E2E_RESULT_ROOT", fixture.join("artifacts"))
                 .env("E2E_BUILD_ROOT", fixture.join("build"))
                 .env("E2E_RUN_ID", "native-retry-control")
+                // This control measures the retry of every failing cell,
+                // so it opts out of fail-fast dispatch explicitly.
+                .env("HERMIT_E2E_FAIL_FAST", "0")
                 .env("E2E_MACHINE_SHORTNAME", "native-retry-control")
                 .env("E2E_KERNEL_VERSION", "native-retry-control")
                 .env("DAGRUN_TEST_COUNTS_PATH", fixture.join("counts.json"));
@@ -11779,6 +11885,7 @@ sys.exit(1 if failed else 0)
         for_each_parallel(
             2,
             ScheduledWorkerCapacity::new(2),
+            &AtomicBool::new(false),
             |index, emit| {
                 run_with_retry(
                     1,
@@ -11811,6 +11918,7 @@ sys.exit(1 if failed else 0)
         for_each_parallel(
             1,
             ScheduledWorkerCapacity::new(1),
+            &AtomicBool::new(false),
             |_, emit| {
                 run_with_retry(
                     1,

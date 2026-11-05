@@ -13511,13 +13511,17 @@ fn collapse_fail_fast_families(cfg: &mut DagConfig) {
 
 /// Record the run-everything opt-in on every step: the counted nextest
 /// wrapper reads `HERMIT_NEXTEST_FAIL_FAST=0` and keeps its batch running
-/// past the first failing test. Harmless on steps that never read it, and
-/// inserted before the selection is sealed so the committed bytes carry it.
+/// past the first failing test, and the e2e test-harness reads
+/// `HERMIT_E2E_FAIL_FAST=0` and keeps dispatching cells past the first
+/// failed one. Harmless on steps that never read them, and inserted
+/// before the selection is sealed so the committed bytes carry them.
 fn apply_keep_going_nextest_env(plan: &mut Plan) {
     for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
         for step in &mut cfg.steps {
             step.env
                 .insert("HERMIT_NEXTEST_FAIL_FAST".to_string(), "0".to_string());
+            step.env
+                .insert("HERMIT_E2E_FAIL_FAST".to_string(), "0".to_string());
         }
     }
 }
@@ -38181,6 +38185,14 @@ mod fail_fast_tests {
             "default mode must share the global eager-exit scope"
         );
         assert_eq!(deps_of(&finished.cfg), before);
+        for step in &finished.cfg.steps {
+            assert!(
+                !step.env.contains_key("HERMIT_NEXTEST_FAIL_FAST")
+                    && !step.env.contains_key("HERMIT_E2E_FAIL_FAST"),
+                "{} must not carry a keep-going marker by default",
+                step.tag()
+            );
+        }
     }
 
     /// The opt-in to run everything: -k/--keep-going keeps the committed
@@ -38207,6 +38219,12 @@ mod fail_fast_tests {
                     step.env.get("HERMIT_NEXTEST_FAIL_FAST").map(String::as_str),
                     Some("0"),
                     "{} must carry the keep-going nextest marker",
+                    step.tag()
+                );
+                assert_eq!(
+                    step.env.get("HERMIT_E2E_FAIL_FAST").map(String::as_str),
+                    Some("0"),
+                    "{} must carry the keep-going e2e marker",
                     step.tag()
                 );
             }
