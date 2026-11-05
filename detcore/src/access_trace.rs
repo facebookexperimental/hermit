@@ -1042,31 +1042,73 @@ struct WatchLedger {
     /// Whether the threads alive when the watches became due were entered.
     seeded: bool,
     threads: BTreeMap<DetTid, WatchThreadLedger>,
-    /// Intervals closed by a failed re-arm after an exec replaced the
-    /// image, in closing order. Each is summarized beside the thread's
-    /// current interval, so an earlier armed interval and its genuine
-    /// hits survive a later uncovered one.
-    closed: Vec<(DetTid, WatchThreadLedger)>,
 }
 
-/// One image interval of one thread: from when its watches were due
-/// (or from an exec that replaced its image) to its death or the next
-/// failed re-arm.
-#[derive(Debug, Default)]
+/// One thread's watch state: a single hit budget for the thread's whole
+/// life, plus the coverage intervals its images went through. The two
+/// are independent: an exec that cannot re-arm (or a later recovery)
+/// closes a coverage interval, but never resets the budget.
+#[derive(Debug)]
 struct WatchThreadLedger {
-    /// The first event the thread recorded with its watches armed in
-    /// this interval.
-    armed_before: Option<EventIndex>,
-    /// The last state it reported once the watches were due.
-    status: Option<crate::watch::WatchStatus>,
-    hits: u64,
-    recorded: u64,
+    /// Coverage intervals in order; the last is the current one.
+    intervals: Vec<WatchInterval>,
+    /// Every hit, counted toward the per-thread budget.
+    seen: u64,
     /// Its last hits after the first [`WATCH_HITS_WITH_STACKS`], without
-    /// stacks, written when the run ends.
-    last: std::collections::VecDeque<WatchHitRecord>,
+    /// stacks, written when the run ends, each tagged with the coverage
+    /// interval it fell in so that interval's summary can count it.
+    last: std::collections::VecDeque<(usize, WatchHitRecord)>,
+}
+
+impl Default for WatchThreadLedger {
+    fn default() -> Self {
+        WatchThreadLedger {
+            intervals: vec![WatchInterval::default()],
+            seen: 0,
+            last: std::collections::VecDeque::new(),
+        }
+    }
 }
 
 impl WatchThreadLedger {
+    fn current(&mut self) -> &mut WatchInterval {
+        self.intervals.last_mut().expect("one interval from birth")
+    }
+
+    /// Whether the current interval is an uncovered one: it reported a
+    /// refused re-arm and has not armed since.
+    fn uncovered(&self) -> bool {
+        let current = self.intervals.last().expect("one interval from birth");
+        current.armed_before.is_none()
+            && matches!(
+                current.status,
+                Some(
+                    crate::watch::WatchStatus::SigtrapBlocked
+                        | crate::watch::WatchStatus::SigtrapIgnored
+                )
+            )
+    }
+
+    fn close_interval(&mut self) {
+        self.intervals.push(WatchInterval::default());
+    }
+}
+
+/// One coverage interval of one thread: a span in which its watches were
+/// continuously armed, or continuously unable to arm, delimited by an
+/// exec's failed re-arm or by observation resuming afterwards.
+#[derive(Debug, Default)]
+struct WatchInterval {
+    /// The first event the thread recorded with its watches armed in
+    /// this interval.
+    armed_before: Option<EventIndex>,
+    /// The last state it reported in this interval.
+    status: Option<crate::watch::WatchStatus>,
+    hits: u64,
+    recorded: u64,
+}
+
+impl WatchInterval {
     fn unarmed(&self) -> Option<WatchUnarmed> {
         use crate::watch::WatchStatus;
         match (self.armed_before, self.status) {
@@ -1929,7 +1971,6 @@ impl AccessTraceWriter {
             due_at,
             seeded: false,
             threads: BTreeMap::new(),
-            closed: Vec::new(),
         });
     }
 
@@ -1976,29 +2017,27 @@ impl AccessTraceWriter {
         if index < ledger.due_at {
             return;
         }
+        // Coverage intervals close at both edges of an uncovered span.
         // A blocked or ignored report from a thread that has already
-        // armed in this interval is a failed re-arm: its image was
-        // replaced (which cleared the debug registers) and the new
-        // image could not arm again. Close the armed interval, hits
-        // intact, and summarize the new image as its own interval, so
-        // the earlier arm cannot suppress the coverage loss.
+        // armed is a failed re-arm: its image was replaced (which
+        // cleared the debug registers) and the new image could not arm
+        // again, so the armed interval ends here. And when a thread in
+        // an uncovered interval arms again, that interval ends too, so
+        // resuming observation cannot overwrite the coverage loss.
         let rearm_refused = matches!(
             status,
             crate::watch::WatchStatus::SigtrapBlocked | crate::watch::WatchStatus::SigtrapIgnored
         );
-        if rearm_refused
-            && ledger
-                .threads
-                .get(&tid)
-                .is_some_and(|thread| thread.armed_before.is_some())
-        {
-            let closed = ledger.threads.remove(&tid).expect("checked above");
-            ledger.closed.push((tid, closed));
-        }
         let thread = ledger.threads.entry(tid).or_default();
-        thread.status = Some(status);
-        if status == crate::watch::WatchStatus::Armed && thread.armed_before.is_none() {
-            thread.armed_before = Some(index);
+        if (rearm_refused && thread.current().armed_before.is_some())
+            || (status == crate::watch::WatchStatus::Armed && thread.uncovered())
+        {
+            thread.close_interval();
+        }
+        let current = thread.current();
+        current.status = Some(status);
+        if status == crate::watch::WatchStatus::Armed && current.armed_before.is_none() {
+            current.armed_before = Some(index);
         }
     }
 
@@ -2020,14 +2059,22 @@ impl AccessTraceWriter {
             return;
         };
         let thread = ledger.threads.entry(tid).or_default();
-        thread.hits += 1;
         // A hit is delivered only by an installed watchpoint, so it is
         // itself evidence the thread armed — the evidence the summary
         // otherwise only learns from a later recorded event carrying
         // `WatchStatus::Armed`, which a thread that runs to its death
-        // after arming never records.
-        if thread.armed_before.is_none() {
-            thread.armed_before = Some(after);
+        // after arming never records. A hit after an uncovered interval
+        // is observation resuming: close that interval first.
+        if thread.uncovered() {
+            thread.close_interval();
+        }
+        thread.seen += 1;
+        let seen = thread.seen;
+        let interval = thread.intervals.len() - 1;
+        let current = thread.current();
+        current.hits += 1;
+        if current.armed_before.is_none() {
+            current.armed_before = Some(after);
         }
         let mut record = WatchHitRecord {
             after,
@@ -2040,15 +2087,15 @@ impl AccessTraceWriter {
         if after < from {
             return;
         }
-        if thread.hits <= WATCH_HITS_WITH_STACKS {
-            thread.recorded += 1;
+        if seen <= WATCH_HITS_WITH_STACKS {
+            thread.current().recorded += 1;
             self.write(TraceRecord::WatchHit(record));
         } else {
             record.stack.clear();
             if thread.last.len() as u64 == WATCH_HITS_KEPT_LAST {
                 thread.last.pop_front();
             }
-            thread.last.push_back(record);
+            thread.last.push_back((interval, record));
         }
     }
 
@@ -2056,22 +2103,19 @@ impl AccessTraceWriter {
     /// intervals never did, and every hit.
     pub fn watch_run_summary(&self) -> Option<detcore_model::summary::WatchRunSummary> {
         let ledger = self.watch.as_ref()?;
-        let intervals = ledger
-            .closed
-            .iter()
-            .map(|(tid, thread)| (tid, thread))
-            .chain(ledger.threads.iter());
         let mut armed_threads = std::collections::BTreeSet::new();
         let mut unarmed = Vec::new();
         let mut hits = 0;
-        for (tid, thread) in intervals {
-            if thread.armed_before.is_some() {
-                armed_threads.insert(*tid);
+        for (tid, thread) in &ledger.threads {
+            for interval in &thread.intervals {
+                if interval.armed_before.is_some() {
+                    armed_threads.insert(*tid);
+                }
+                if let Some(why) = interval.unarmed() {
+                    unarmed.push((*tid, why));
+                }
+                hits += interval.hits;
             }
-            if let Some(why) = thread.unarmed() {
-                unarmed.push((*tid, why));
-            }
-            hits += thread.hits;
         }
         unarmed.sort_by_key(|(tid, _why)| *tid);
         Some(detcore_model::summary::WatchRunSummary {
@@ -2081,39 +2125,26 @@ impl AccessTraceWriter {
         })
     }
 
-    /// Write the kept last hits, then one summary per watched interval,
-    /// in thread order (a thread's closed intervals first).
+    /// Write the kept last hits, then one summary per coverage interval,
+    /// in thread order.
     fn finish_watch(&mut self) {
         let Some(mut ledger) = self.watch.take() else {
             return;
         };
-        for (_tid, thread) in &mut ledger.closed {
-            for record in std::mem::take(&mut thread.last) {
-                thread.recorded += 1;
-                self.write(TraceRecord::WatchHit(record));
-            }
-        }
         for thread in ledger.threads.values_mut() {
-            for record in std::mem::take(&mut thread.last) {
-                thread.recorded += 1;
+            for (interval, record) in std::mem::take(&mut thread.last) {
+                thread.intervals[interval].recorded += 1;
                 self.write(TraceRecord::WatchHit(record));
             }
-        }
-        let mut summaries: BTreeMap<DetTid, Vec<&WatchThreadLedger>> = BTreeMap::new();
-        for (tid, thread) in &ledger.closed {
-            summaries.entry(*tid).or_default().push(thread);
         }
         for (tid, thread) in &ledger.threads {
-            summaries.entry(*tid).or_default().push(thread);
-        }
-        for (tid, intervals) in &summaries {
-            for thread in intervals {
+            for interval in &thread.intervals {
                 self.write(TraceRecord::WatchSummary(WatchSummaryRecord {
                     tid: *tid,
-                    armed_before: thread.armed_before,
-                    unarmed: thread.unarmed(),
-                    hits: thread.hits,
-                    recorded: thread.recorded,
+                    armed_before: interval.armed_before,
+                    unarmed: interval.unarmed(),
+                    hits: interval.hits,
+                    recorded: interval.recorded,
                 }));
             }
         }
@@ -4294,6 +4325,116 @@ mod tests {
                     recorded: 0,
                 },
             ]
+        );
+    }
+
+    /// `--watch`: if the new image later unblocks SIGTRAP and arms again,
+    /// the uncovered interval in between is still reported: resuming
+    /// observation closes it rather than overwriting its blocked status.
+    #[test]
+    fn a_recovered_rearm_keeps_the_uncovered_interval() {
+        use crate::watch::WatchStatus;
+        let (mut writer, bytes) = in_memory_writer();
+        writer.enable_watch(0);
+        writer.note_watch(tid(3), 0, WatchStatus::Armed);
+        writer.watch_hit(1, tid(3), 0, 0x404010, 0x401000, vec![]);
+        // Blocked across the exec: the new image's first store is
+        // uncovered. It then unblocks SIGTRAP, arms again, and stores.
+        writer.note_watch(tid(3), 2, WatchStatus::SigtrapBlocked);
+        writer.note_watch(tid(3), 5, WatchStatus::Armed);
+        writer.watch_hit(6, tid(3), 0, 0x404010, 0x401001, vec![]);
+        assert_eq!(
+            writer.watch_run_summary(),
+            Some(detcore_model::summary::WatchRunSummary {
+                armed: 1,
+                unarmed: vec![(tid(3), WatchUnarmed::SigtrapBlocked)],
+                hits: 2,
+            })
+        );
+        writer.finish(500).unwrap();
+        let trace =
+            detcore_model::access_trace::read_access_trace(&bytes.lock().unwrap()[..]).unwrap();
+        let summaries: Vec<&WatchSummaryRecord> = trace
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                TraceRecord::WatchSummary(summary) => Some(summary),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            summaries,
+            vec![
+                &WatchSummaryRecord {
+                    tid: tid(3),
+                    armed_before: Some(0),
+                    unarmed: None,
+                    hits: 1,
+                    recorded: 1,
+                },
+                &WatchSummaryRecord {
+                    tid: tid(3),
+                    armed_before: None,
+                    unarmed: Some(WatchUnarmed::SigtrapBlocked),
+                    hits: 0,
+                    recorded: 0,
+                },
+                &WatchSummaryRecord {
+                    tid: tid(3),
+                    armed_before: Some(5),
+                    unarmed: None,
+                    hits: 1,
+                    recorded: 1,
+                },
+            ]
+        );
+    }
+
+    /// `--watch`: the first-64/last-64 hit budget is per thread, not per
+    /// coverage interval: closing and reopening intervals around a
+    /// blocked exec must not reset it.
+    #[test]
+    fn the_watch_hit_budget_spans_coverage_intervals() {
+        use crate::watch::WatchStatus;
+        let (mut writer, bytes) = in_memory_writer();
+        writer.enable_watch(0);
+        writer.note_watch(tid(3), 0, WatchStatus::Armed);
+        for n in 0..200 {
+            writer.watch_hit(n, tid(3), 0, 0x404010, 0x401000 + n, vec![]);
+        }
+        writer.note_watch(tid(3), 200, WatchStatus::SigtrapBlocked);
+        writer.note_watch(tid(3), 201, WatchStatus::Armed);
+        for n in 0..200 {
+            writer.watch_hit(202 + n, tid(3), 0, 0x404010, 0x402000 + n, vec![]);
+        }
+        writer.finish(500).unwrap();
+        let trace =
+            detcore_model::access_trace::read_access_trace(&bytes.lock().unwrap()[..]).unwrap();
+        let written: Vec<u64> = trace
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                TraceRecord::WatchHit(hit) => Some(hit.after),
+                _ => None,
+            })
+            .collect();
+        // The thread's first 64 hits, then its last 64 overall.
+        let expected: Vec<u64> = (0..64).chain(338..402).collect();
+        assert_eq!(written, expected);
+        let summaries: Vec<&WatchSummaryRecord> = trace
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                TraceRecord::WatchSummary(summary) => Some(summary),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| (summary.hits, summary.recorded))
+                .collect::<Vec<_>>(),
+            vec![(200, 64), (0, 0), (200, 64)]
         );
     }
 

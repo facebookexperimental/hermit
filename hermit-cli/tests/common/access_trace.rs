@@ -76,6 +76,10 @@ struct Guests {
     /// blocks SIGTRAP before it execs, so the new image cannot re-arm.
     exec_blocked: PathBuf,
     store_first: (PathBuf, u64),
+    /// `tests/fixtures/watch_store_unblock_store_nostdlib.c`, at a fixed
+    /// address: stores its global `watched`, unblocks SIGTRAP, stores
+    /// again.
+    store_unblock_store: (PathBuf, u64),
 }
 
 /// The address of `symbol` in the non-PIE executable `binary`.
@@ -188,6 +192,16 @@ fn guests() -> &'static Guests {
                         .join("tests/fixtures/watch_store_first_nostdlib.c"),
                     &["-O0", "-g", "-nostdlib", "-static", "-no-pie"],
                     "store_first",
+                );
+                let watched = symbol_address(&binary, "watched");
+                (binary, watched)
+            },
+            store_unblock_store: {
+                let binary = compile(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/watch_store_unblock_store_nostdlib.c"),
+                    &["-O0", "-g", "-nostdlib", "-static", "-no-pie"],
+                    "store_unblock_store",
                 );
                 let watched = symbol_address(&binary, "watched");
                 (binary, watched)
@@ -1594,6 +1608,89 @@ fn a_blocked_rearm_after_exec_reports_the_uncovered_interval() {
         "{summaries:?}"
     );
     assert_eq!(summaries[1].hits, 0, "{summaries:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--watch: some watch intervals were never armed")
+            && stderr.contains(&format!("thread {tid} (SigtrapBlocked)")),
+        "{stderr}"
+    );
+}
+
+/// The recovery twin: the blocked launcher execs an image that stores,
+/// unblocks SIGTRAP, and stores again. Only the second store is
+/// observed, and resuming observation must not erase the uncovered
+/// interval: three summaries for the thread (armed, uncovered, armed),
+/// one hit, and the incomplete-coverage warning.
+#[test]
+fn a_recovered_rearm_after_exec_keeps_the_uncovered_interval() {
+    let _guard = hermit_run_guard();
+    let guests = guests();
+    let (target, watched) = &guests.store_unblock_store;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let trace_path = directory.path().join("exec-recovered.access");
+    let args = vec![
+        "run".to_string(),
+        EPOCH.to_string(),
+        path_arg(
+            "--record-preemptions-to",
+            &directory.path().join("exec-recovered.events"),
+        ),
+        path_arg("--record-access-trace-to", &trace_path),
+        format!("--watch={watched:#x}:8:w"),
+        "--".to_string(),
+        guests.exec_blocked.display().to_string(),
+        target.display().to_string(),
+    ];
+    let output = run(&args);
+    assert!(output.status.success(), "{args:?}: {output:?}");
+    let trace = read_access_trace(fs::read(&trace_path).expect("no trace").as_slice())
+        .expect("trace does not parse");
+    let execs: Vec<&SyscallRecord> = trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::Syscall(call) if call.sysno.name() == "execve" => Some(call),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(execs.len(), 2, "the launcher's and the guest's: {execs:?}");
+    let tid = execs[1].tid;
+    let hits: Vec<_> = trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::WatchHit(hit) => Some(hit),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hits.len(), 1, "only the post-unblock store: {hits:?}");
+    assert_eq!((hits[0].tid, hits[0].addr), (tid, *watched));
+    let summaries: Vec<_> = trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::WatchSummary(summary) if summary.tid == tid => Some(summary),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(summaries.len(), 3, "{summaries:?}");
+    assert!(
+        summaries[0].armed_before.is_some() && summaries[0].unarmed.is_none(),
+        "the launcher image's armed interval is kept: {summaries:?}"
+    );
+    assert_eq!(summaries[1].armed_before, None, "{summaries:?}");
+    assert_eq!(
+        summaries[1].unarmed,
+        Some(detcore_model::access_trace::WatchUnarmed::SigtrapBlocked),
+        "{summaries:?}"
+    );
+    assert_eq!(summaries[1].hits, 0, "{summaries:?}");
+    assert!(
+        summaries[2].armed_before.is_some()
+            && summaries[2].unarmed.is_none()
+            && summaries[2].hits == 1,
+        "observation resumed after the unblock: {summaries:?}"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("--watch: some watch intervals were never armed")
