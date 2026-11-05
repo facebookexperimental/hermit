@@ -606,7 +606,11 @@ mod tests {
             for from_schedule in [true, false] {
                 let config = crate::Config {
                     rewrite_exclusives_in_memory: current.0,
-                    rewrite_exclusives_overlay: current.1,
+                    rewrite_exclusives_overlay: current
+                        .1
+                        .then(|| std::path::PathBuf::from("/bin/guest"))
+                        .into_iter()
+                        .collect(),
                     replay_schedule_from: from_schedule.then(|| path.clone()),
                     replay_preemptions_from: (!from_schedule).then(|| path.clone()),
                     ..crate::Config::default()

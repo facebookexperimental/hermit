@@ -8777,6 +8777,57 @@ mod tests {
         }
     }
 
+    /// The public entry admits a replay whose final config states the
+    /// same rewrite as its record: provenance is not the refusal. (On
+    /// this host the memory form may still be refused later for want of
+    /// FEAT_LSE; what must not appear is the admission refusal.)
+    #[test]
+    fn run_with_output_admits_the_matching_exclusive_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, json, in_memory, overlay) in [
+            (
+                "memory6.json",
+                r#"{"per_thread":{},"global":[],"rewrite_exclusives_in_memory":true,"rewrite_exclusives":{"mode":"memory","format_version":6}}"#,
+                true,
+                false,
+            ),
+            (
+                "overlay6.json",
+                r#"{"per_thread":{},"global":[],"rewrite_exclusives":{"mode":"overlay","format_version":6}}"#,
+                false,
+                true,
+            ),
+        ] {
+            let record = dir.path().join(name);
+            std::fs::write(&record, json).unwrap();
+            let config = super::DetConfig {
+                replay_schedule_from: Some(record),
+                rewrite_exclusives_in_memory: in_memory,
+<<<<<<< HEAD
+                rewrite_exclusives_overlay: overlay,
+=======
+                rewrite_exclusives_overlay: overlay
+                    .then(|| std::path::PathBuf::from("/bin/echo"))
+                    .into_iter()
+                    .collect(),
+                sequentialize_threads: true,
+                max_timeslice: None,
+>>>>>>> cb77f07909 (fixup! Validate CLI replay inputs against the effective rewrite settings)
+                ..super::DetConfig::default()
+            };
+            let mut command = super::Command::new("/bin/echo");
+            command.arg("PROVENANCE_GUEST_STARTED");
+            if let Err(error) = super::run_with_output(command, config, false, &None) {
+                assert!(
+                    !error
+                        .chain()
+                        .any(|cause| cause.is::<detcore::preemptions::RecordAdmissionRefusal>()),
+                    "{name}: {error:#}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn liteinst_public_dispatch_runs_in_guest_detcore() {
         if Backend::Liteinst.ensure_available().is_err() {

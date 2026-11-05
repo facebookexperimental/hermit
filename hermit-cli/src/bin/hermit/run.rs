@@ -6558,6 +6558,53 @@ fn replay_refuses_another_exclusive_rewrite_provenance() {
     }
 }
 
+/// A replay whose flags state the same rewrite its record does is
+/// admitted by the CLI's own early validation, which must run against
+/// the effective config -- the one the rewrite flags populate -- not
+/// the raw parsed one, whose rewrite fields are still off. Covers all
+/// three selections: memory, explicit overlay, and the default
+/// (namespaced) overlay, under both replay flags, through
+/// `resolve_guest_ids`, the first of the CLI's shared-preflight sites
+/// and the one analyze trials take.
+#[test]
+fn matching_exclusive_rewrite_replays_are_admitted_by_the_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, json: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, json).unwrap();
+        path
+    };
+    let memory6 = write(
+        "memory6.json",
+        r#"{"per_thread":{},"global":[],"rewrite_exclusives_in_memory":true,"rewrite_exclusives":{"mode":"memory","format_version":6}}"#,
+    );
+    let overlay6 = write(
+        "overlay6.json",
+        r#"{"per_thread":{},"global":[],"rewrite_exclusives":{"mode":"overlay","format_version":6}}"#,
+    );
+    for flag in ["--replay-schedule-from", "--replay-preemptions-from"] {
+        for (path, rewrite) in [
+            (
+                &memory6,
+                &["--rewrite-exclusives", "--rewrite-exclusives-mode=memory"][..],
+            ),
+            (
+                &overlay6,
+                &["--rewrite-exclusives", "--rewrite-exclusives-mode=overlay"][..],
+            ),
+            (&overlay6, &["--rewrite-exclusives"][..]),
+        ] {
+            let replay = format!("{flag}={}", path.display());
+            let mut argv = vec!["fakehermit".to_owned(), replay];
+            argv.extend(rewrite.iter().map(|flag| flag.to_string()));
+            argv.push("fakeprog".to_owned());
+            let mut ro = RunOpts::parse_from(&argv);
+            let result = ro.resolve_guest_ids();
+            assert!(result.is_ok(), "{argv:?}: {result:?}");
+        }
+    }
+}
+
 #[test]
 fn network_trace_is_reached_through_a_descriptor_opened_before_the_container() {
     let dir = tempfile::tempdir().unwrap();
@@ -14839,7 +14886,7 @@ impl RunOpts {
         // Analyze and other in-process callers bypass the outer CLI entry.
         self.refuse_exclusive_rewrite_in_an_image()?;
         self.refuse_an_invalid_replayed_record()?;
-        detcore::preemptions::validate_config_replay_inputs(&self.det_opts.det_config)?;
+        detcore::preemptions::validate_config_replay_inputs(&self.effective_det_config())?;
         <detcore::Detcore as reverie::Tool>::facility_admission(&self.det_opts.det_config)?;
         let mut options = self.clone();
         options.capture_launch_namespace_mounts();
@@ -14962,7 +15009,7 @@ impl RunOpts {
         // Chosen provenance admission. Inherited option-metadata validation
         // still runs; only this execution-specific replay preflight is bypassed.
         if !self.namespace_only {
-            detcore::preemptions::validate_config_replay_inputs(&self.det_opts.det_config)?;
+            detcore::preemptions::validate_config_replay_inputs(&self.effective_det_config())?;
         }
         Ok(())
     }
@@ -15145,7 +15192,7 @@ impl RunOpts {
         self.refuse_virtual_timeout_with_debugger()?;
         self.refuse_unready_exec_stop()?;
         if !self.namespace_only {
-            detcore::preemptions::validate_config_replay_inputs(&self.det_opts.det_config)?;
+            detcore::preemptions::validate_config_replay_inputs(&self.effective_det_config())?;
             <detcore::Detcore as reverie::Tool>::facility_admission(&self.det_opts.det_config)?;
         }
         let gdbserver_port = self.bind_gdbserver_port()?;
@@ -17877,7 +17924,10 @@ impl RunOpts {
         // mapping symbols, for the run's summary.
         config.rewrite_exclusives_unmarked = self.exclusive_rewrite_unmarked.clone();
         // A pure function of the flags, so every trial of an analysis and
-        // both runs of a `--verify` pair rewrite alike.
+        // both runs of a `--verify` pair rewrite alike. Replay admission
+        // compares a record's rewrite provenance against these fields, so
+        // its CLI sites validate this effective config, never the raw
+        // parsed one whose rewrite fields are still off.
         config.rewrite_exclusives_in_memory = self.rewrites_exclusives_in_memory();
         config.property_snapshot = self
             .property_snapshot
