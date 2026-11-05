@@ -24947,16 +24947,24 @@ fn run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec() {
 
 /// tests/c/parked_read_signal_then_exec.c on KVM: a parked pipe read that an
 /// ignored real-timer SIGALRM is observed in and resumes, then a sibling's
-/// SIGUSR2, which the reader blocks, wakes before the read's next turn; the
-/// read restarts, completes when the sibling writes, and the reader execs.
-/// The signal wake replaced the read's request, and the parked ownership of
-/// the replaced request outlived it. Once Detcore let reverie-kvm skip the
-/// empty signal boundary after the restart, nothing removed that ownership,
-/// and the exec was refused ("KVM parked signal protocol failed ...
-/// Identity"): the run printed only the first line, and the image after exec
-/// never ran. The scheduler now retires that ownership when it replaces the
-/// request (`retire_replaced_parked_request`). The run must print Linux's two
-/// lines and reach bitwise parity with INFO messages compared.
+/// SIGUSR2 wakes before the read's next turn; the read restarts, completes
+/// when the sibling writes, and the reader execs. The signal wake replaced
+/// the read's request, and the parked ownership of the replaced request
+/// outlived it. Once Detcore let reverie-kvm skip the empty signal boundary
+/// after the restart, nothing removed that ownership, and the exec was
+/// refused ("KVM parked signal protocol failed ... Identity"): the run printed
+/// only the first line, and the image after exec never ran. The scheduler now
+/// retires that ownership when it replaces the request
+/// (`retire_replaced_parked_request`). Each run must print Linux's two lines
+/// and reach bitwise parity with INFO messages compared.
+///
+/// The wake came from a SIGUSR2 the reader blocks until SIGSHARE S2, which
+/// made the drain decide KVM's wake from the reader's signal state, as on
+/// ptrace: a blocked signal no longer wakes the read, which completes without
+/// a restart (the default mode, checked below). The `caught` mode catches
+/// SIGUSR2 with SA_RESTART, so the wake, its replacement of the parked
+/// request and the restart still happen, and the path under test is checked
+/// there.
 #[test]
 fn run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec() {
     if kvm_unavailable("run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec") {
@@ -24967,84 +24975,104 @@ fn run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec() {
     let guest = parked_read_signal_then_exec_guest()
         .to_str()
         .expect("guest path should be UTF-8");
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let report = directory.path().join("verify.json");
-    let report_arg = report.to_str().expect("report path should be UTF-8");
-    let args = [
-        "--backend=kvm",
-        "run",
-        "--strict",
-        "--base-env=minimal",
-        "--epoch=2026-01-01T00:00:00Z",
-        "--verify",
-        "--verify-strict",
-        "--verify-json",
-        report_arg,
-        "--",
-        guest,
-    ];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    assert_eq!(
-        stdout(&output),
-        "read: n=1 byte=x\nafter: usr2 pending=1 blocked=1\n"
-    );
-    let verdict: serde_json::Value =
-        serde_json::from_slice(&fs::read(&report).expect("strict verification wrote no verdict"))
-            .expect("strict verification verdict is valid JSON");
-    assert_eq!(verdict["bitwise_parity"], true, "{verdict}");
-    for side in ["left", "right"] {
-        assert!(
-            verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
-            "no INFO messages compared: {verdict}"
-        );
-    }
+    for (mode, expected) in [
+        (None, "read: n=1 byte=x\nafter: usr2 pending=1 blocked=1\n"),
+        (
+            Some("caught"),
+            "read: n=1 byte=x handled=1\nafter: usr2 pending=0 blocked=0\n",
+        ),
+    ] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report = directory.path().join("verify.json");
+        let report_arg = report.to_str().expect("report path should be UTF-8");
+        let mut args = vec![
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_arg,
+            "--",
+            guest,
+        ];
+        args.extend(mode);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{mode:?}");
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(verdict["bitwise_parity"], true, "{mode:?}: {verdict}");
+        for side in ["left", "right"] {
+            assert!(
+                verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+                "{mode:?}: no INFO messages compared: {verdict}"
+            );
+        }
 
-    // The run took the path under test, read from its INFO log: while the
-    // reader's first one-byte `read` is still in flight, the alarm is handled
-    // (only a parked observation reaches a thread inside a call), then the
-    // SIGUSR2 wake replaces the read's request (its `WaitidSignals` grant),
-    // and the read returns ERESTARTSYS to be restarted. A schedule that
-    // avoided the observation or the replacement would no longer cover it.
-    let args = [
-        "--log=info",
-        "--backend=kvm",
-        "run",
-        "--strict",
-        "--base-env=minimal",
-        "--epoch=2026-01-01T00:00:00Z",
-        "--",
-        guest,
-    ];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    let log = stderr(&output);
-    let lines: Vec<&str> = log.lines().collect();
-    let is_read = |line: &str| line.contains("read(3, ") && line.contains(", 1) = ");
-    let start = lines
-        .iter()
-        .position(|line| line.contains("inbound syscall: read(3, ") && is_read(line))
-        .expect("the reader's one-byte read is in the INFO log");
-    let finish = start
-        + lines[start..]
+        // The run took the path under test, read from its INFO log: while the
+        // reader's first one-byte `read` is still in flight, the alarm is
+        // handled (only a parked observation reaches a thread inside a call).
+        // With SIGUSR2 caught, the SIGUSR2 wake then replaces the read's
+        // request (its `WaitidSignals` grant), and the read returns
+        // ERESTARTSYS to be restarted. With it blocked, nothing wakes the
+        // read, which returns the byte. A schedule that avoided the
+        // observation or the replacement would no longer cover it.
+        let mut args = vec![
+            "--log=info",
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--",
+            guest,
+        ];
+        args.extend(mode);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let log = stderr(&output);
+        let lines: Vec<&str> = log.lines().collect();
+        let is_read = |line: &str| line.contains("read(3, ") && line.contains(", 1) = ");
+        let start = lines
             .iter()
-            .position(|line| line.contains("finish syscall") && is_read(line))
-            .expect("the reader's first read finishes in the INFO log");
-    assert!(
-        lines[finish].contains("Err(Errno(ERESTARTSYS))"),
-        "the first read was not restarted: {}",
-        lines[finish]
-    );
-    let observed = lines[start..finish]
-        .iter()
-        .position(|line| line.contains("handling inbound signal (#0) SIGALRM"))
-        .expect("the alarm was not observed inside the read");
-    assert!(
-        lines[start + observed..finish]
+            .position(|line| line.contains("inbound syscall: read(3, ") && is_read(line))
+            .expect("the reader's one-byte read is in the INFO log");
+        let finish = start
+            + lines[start..]
+                .iter()
+                .position(|line| line.contains("finish syscall") && is_read(line))
+                .expect("the reader's first read finishes in the INFO log");
+        let observed = lines[start..finish]
             .iter()
-            .any(|line| line.contains("WaitidSignals([SigWrapper(12)])")),
-        "the SIGUSR2 wake did not replace the read's request after the observation"
-    );
+            .position(|line| line.contains("handling inbound signal (#0) SIGALRM"))
+            .expect("the alarm was not observed inside the read");
+        let woken = lines[start + observed..finish]
+            .iter()
+            .any(|line| line.contains("WaitidSignals([SigWrapper(12)])"));
+        if mode.is_some() {
+            assert!(
+                lines[finish].contains("Err(Errno(ERESTARTSYS))"),
+                "the first read was not restarted: {}",
+                lines[finish]
+            );
+            assert!(
+                woken,
+                "the SIGUSR2 wake did not replace the read's request after the observation"
+            );
+        } else {
+            assert!(
+                lines[finish].contains("= Ok(1)"),
+                "the blocked SIGUSR2 ended the first read: {}",
+                lines[finish]
+            );
+            assert!(!woken, "the blocked SIGUSR2 woke the read");
+        }
+    }
 }
 
 /// Runs tests/c/chaos_spinner_and_new_thread.c under `--chaos --sched-seed=7`
