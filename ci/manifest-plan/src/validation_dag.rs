@@ -6406,8 +6406,10 @@ sys.exit(37)
         refuse(OUTPUT, "the file", text);
     }
 
-    /// The PMU analyze node retains exactly the six other ignored integrations
-    /// while hello-race pinpointing is excluded for its tracked failure.
+    /// The PMU analyze node retains exactly the seven other ignored
+    /// integrations (the six refusal/workspace/timeout cases and the
+    /// racewrite selfcheck regression) while hello-race pinpointing is
+    /// excluded for its tracked failure.
     #[test]
     fn the_pmu_analyze_node_runs_the_ignored_analyze_integrations() {
         let source = include_str!("../../../hermit-cli/tests/analyze.rs");
@@ -6418,6 +6420,7 @@ sys.exit(37)
             "analyze_keeps_its_workspace_after_an_error",
             "analyze_cleans_up_when_a_signal_stops_it",
             "analyze_stops_a_run_whose_init_has_not_armed",
+            "analyze_racewrite_nostdlib",
         ];
         for case in cases {
             assert!(
@@ -6453,7 +6456,11 @@ sys.exit(37)
                 format!("{expected_filter}' -- --ignored"),
                 "{origin}"
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "6", "{origin}");
+            assert_eq!(
+                step.env["NEXTEST_EXPECTED_EXECUTED"],
+                cases.len().to_string().as_str(),
+                "{origin}"
+            );
             assert!(
                 !step.cmd.contains("test(=analyze_hello_race)"),
                 "{origin}: excluded hello-race must not run"
