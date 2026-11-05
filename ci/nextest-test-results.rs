@@ -25,7 +25,7 @@ use nextest_cpu::AttemptIdentity;
 use nextest_cpu::AttemptRecord;
 use nextest_cpu::BinaryMap;
 use nextest_cpu::CpuReport;
-use nextest_cpu::listed_count;
+use nextest_cpu::{listed_count, listed_identities};
 use nextest_cpu::read_attempt_records;
 use nextest_cpu::read_binary_map;
 use nextest_cpu::write_binary_map_atomic;
@@ -44,7 +44,7 @@ mod nextest_cpu;
 
 fn usage() {
     println!(
-        "usage: nextest-test-results.rs [--inventory NEXTEST_INVENTORY_JSON] EVENTS_JSONL NEXTEST_STATUS OUTPUT_OR_DASH [ATTEMPT_RECORD_DIR BINARY_MAP CPU_REPORT_OR_DASH]\n       nextest-test-results.rs --write-binary-map NEXTEST_INVENTORY_JSON OUTPUT\n       nextest-test-results.rs --listed-count NEXTEST_INVENTORY_JSON\n\n--inventory uses the same invocation's list JSON for typed event attribution, never for outcomes or CPU measurements. It is required with BINARY_MAP. Without a binary map it is optional, and overlapping same-name suites refuse."
+        "usage: nextest-test-results.rs [--inventory NEXTEST_INVENTORY_JSON] EVENTS_JSONL NEXTEST_STATUS OUTPUT_OR_DASH [ATTEMPT_RECORD_DIR BINARY_MAP CPU_REPORT_OR_DASH]\n       nextest-test-results.rs --write-binary-map NEXTEST_INVENTORY_JSON OUTPUT\n       nextest-test-results.rs --listed-count NEXTEST_INVENTORY_JSON\n       nextest-test-results.rs --listed-ids NEXTEST_INVENTORY_JSON OUTPUT\n\n--inventory uses the same invocation's list JSON for typed event attribution, never for outcomes or CPU measurements. It is required with BINARY_MAP. Without a binary map it is optional, and overlapping same-name suites refuse."
     );
 }
 
@@ -1155,6 +1155,29 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), ProducerError> {
             .map_err(|error| format!("cannot read nextest inventory {inventory}: {error}"))?;
         let listed = listed_count(&bytes)?;
         println!("{listed}");
+        return Ok(());
+    }
+    if first == "--listed-ids" {
+        let inventory = args
+            .next()
+            .ok_or_else(|| "nextest-test-results missing NEXTEST_INVENTORY_JSON".to_string())?;
+        let output = args
+            .next()
+            .ok_or_else(|| "nextest-test-results missing listed-ids OUTPUT".to_string())?;
+        if args.next().is_some() {
+            return Err(
+                "nextest-test-results listed-ids mode received too many arguments".into(),
+            );
+        }
+        let bytes = fs::read(&inventory)
+            .map_err(|error| format!("cannot read nextest inventory {inventory}: {error}"))?;
+        let identities = listed_identities(&bytes)?;
+        let mut text = identities.join("\n");
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        fs::write(&output, text)
+            .map_err(|error| format!("cannot write listed ids {output}: {error}"))?;
         return Ok(());
     }
     if first == "--write-binary-map" {
@@ -3152,6 +3175,42 @@ mod tests {
             listed_count(unknown.as_bytes())
                 .unwrap_err()
                 .contains("unknown Nextest filter status")
+        );
+    }
+
+    #[test]
+    fn listed_identities_are_the_sorted_census_of_the_same_population() {
+        // The census gate diffs these lists base vs candidate: identities
+        // are package/binary/test, sorted, exactly the `matches` population
+        // listed_count counts (a mismatched testcase is not listed here).
+        let inventory = br#"{
+            "rust-suites": {
+                "suite": {
+                    "package-name": "suite",
+                    "binary-id": "suite",
+                    "binary-name": "suite",
+                    "kind": "lib",
+                    "binary-path": "/tmp/suite-binary",
+                    "testcases": {
+                        "runs": {"ignored": false, "filter-match": {"status": "matches"}},
+                        "also_runs": {"ignored": false, "filter-match": {"status": "matches"}},
+                        "ignored_one": {"ignored": true, "filter-match": {"status": "matches"}},
+                        "filtered_out": {"ignored": false, "filter-match": {"status": "mismatch"}}
+                    }
+                }
+            }
+        }"#;
+        assert_eq!(
+            listed_identities(inventory).unwrap(),
+            [
+                "suite/suite/also_runs".to_string(),
+                "suite/suite/ignored_one".into(),
+                "suite/suite/runs".into(),
+            ]
+        );
+        assert_eq!(
+            listed_identities(inventory).unwrap().len() as u64,
+            listed_count(inventory).unwrap()
         );
     }
 

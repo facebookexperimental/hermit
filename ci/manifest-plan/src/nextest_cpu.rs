@@ -123,6 +123,35 @@ pub fn listed_count(bytes: &[u8]) -> Result<u64, String> {
     Ok(listed)
 }
 
+/// The sorted `package/binary/test` identities [`listed_count`] counts.
+///
+/// The census population for a selection: diffing these lists between a
+/// landing base and a candidate head names every test that stopped being
+/// listed, which a bare count cannot. Duplicate identities refuse, exactly
+/// as they do for attempt attribution: an ambiguous census is no census.
+pub fn listed_identities(bytes: &[u8]) -> Result<Vec<String>, String> {
+    BinaryMap::from_nextest_inventory(bytes)?;
+    let inventory: NextestInventory =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let mut identities = Vec::new();
+    for suite in inventory.rust_suites.into_values() {
+        for (test, case) in suite.testcases {
+            match case.filter_match.status.as_str() {
+                "matches" => {
+                    identities.push(format!("{}/{}/{}", suite.package, suite.binary, test))
+                }
+                "mismatch" => {}
+                status => return Err(format!("unknown Nextest filter status {status:?}")),
+            }
+        }
+    }
+    identities.sort();
+    if identities.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("duplicate listed Nextest identity".into());
+    }
+    Ok(identities)
+}
+
 pub const BUDGET_SCHEMA: u64 = 1;
 pub const CALIBRATION_PATH: &str = ".config/nextest-budgets.json";
 
