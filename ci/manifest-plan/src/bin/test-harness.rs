@@ -108,7 +108,8 @@ Selection options:
   --backend <ptrace|dbt|kvm|sabre|liteinst>
   --exclude-backend <ptrace|dbt|kvm|sabre|liteinst>
                                    Omit that backend's cells; may repeat
-  --execution-owner <OWNER>        Select the declared source owner (default: core)
+  --execution-owner <OWNER>        Select the declared source owner (default: the
+                                   --backend backend's owner, else core)
   --label <LABEL[,LABEL...]>        Keep tests carrying any named label; may repeat
   --exclude-category <CATEGORY>    Omit that manifest category's cells; may repeat
   --ci-only                        Select required CI cells
@@ -1070,14 +1071,34 @@ fn main() -> ExitCode {
     if matches!(command.as_str(), "build" | "run" | "plan" | "audit-compile") {
         let owners = hermit_manifest_plan::execution_owners::ExecutionOwners::load(&root)
             .unwrap_or_else(|e| fail(e));
-        args.selection.execution_backends = Some(
-            owners
-                .backends_for_selection(
-                    args.execution_owner.as_deref().unwrap_or("core"),
-                    &args.selection.labels,
-                )
+        // No --execution-owner: a --backend filter names its owner (see
+        // ExecutionOwners::default_selection_owner); only a selection
+        // naming no backend keeps the core default.
+        let owner = match args.execution_owner.as_deref() {
+            Some(owner) => owner,
+            None => owners
+                .default_selection_owner(args.selection.backend.as_deref())
                 .unwrap_or_else(|e| fail(e)),
-        );
+        };
+        let backends = owners
+            .backends_for_selection(owner, &args.selection.labels)
+            .unwrap_or_else(|e| fail(e));
+        // A backend outside the selected owner's set can only come from
+        // an explicit --execution-owner naming another owner. Refusing
+        // by name beats the empty selection it would otherwise produce,
+        // which reads as "no such cells" instead of "wrong owner".
+        if let Some(backend) = args.selection.backend.as_deref() {
+            if !backends.contains(backend) {
+                let backend_owner = owners.owner(Some(backend)).unwrap_or_else(|e| fail(e));
+                fail(format!(
+                    "--backend {backend} belongs to execution owner \
+                     {backend_owner:?}, but --execution-owner {owner:?} \
+                     selects only its own backends; name \
+                     --execution-owner {backend_owner} or omit it"
+                ));
+            }
+        }
+        args.selection.execution_backends = Some(backends);
     }
     let manifests = ManifestSet::load(&root).unwrap_or_else(|error| fail(error));
     hermit_manifest_plan::execution_owners::ExecutionOwners::load(&root)

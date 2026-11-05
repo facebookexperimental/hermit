@@ -153,6 +153,26 @@ impl ExecutionOwners {
             .map(String::as_str)
             .ok_or_else(|| format!("manifest backend {backend:?} has no execution owner"))
     }
+    /// The owner a selection belongs to when its caller names none: the
+    /// declared owner of its single `--backend`, or `core` when it names
+    /// no backend.
+    ///
+    /// A caller that names one backend has already named its owner; the
+    /// partition is unchanged, because the selection still runs exactly
+    /// that owner's backends. Defaulting a named non-core backend to
+    /// `core` instead retained every one of its cells out of the
+    /// selection, which read as an empty run rather than a wrong owner:
+    /// the nightly pressure sweep's generated single-cell commands
+    /// (`--backend sabre|dbt`, no `--execution-owner`) selected nothing
+    /// from the first-party split until this default, and 1,039 cells
+    /// reported INCOMPLETE on 2026-11-04 with no cell ever run. An
+    /// unowned backend name refuses here, naming the backend.
+    pub fn default_selection_owner(&self, backend: Option<&str>) -> Result<&str, String> {
+        match backend {
+            Some(backend) => self.owner(Some(backend)),
+            None => Ok("core"),
+        }
+    }
     pub fn names(&self) -> BTreeSet<&str> {
         self.backends.values().map(String::as_str).collect()
     }
@@ -391,5 +411,88 @@ mod tests {
                 .unwrap()
                 .contains("duplicate JSON object key")
         );
+    }
+    #[test]
+    fn a_backend_filter_defaults_to_that_backends_declared_owner() {
+        let source = include_bytes!("../../execution-owners.json");
+        let owners = ExecutionOwners::from_slice(source).unwrap();
+        // No --backend: the historical core default, unchanged.
+        assert_eq!(owners.default_selection_owner(None).unwrap(), "core");
+        // A single named backend names its owner exactly.
+        assert_eq!(
+            owners.default_selection_owner(Some("ptrace")).unwrap(),
+            "core"
+        );
+        assert_eq!(
+            owners.default_selection_owner(Some("native")).unwrap(),
+            "core"
+        );
+        assert_eq!(
+            owners.default_selection_owner(Some("dbt")).unwrap(),
+            "dynamorio"
+        );
+        assert_eq!(
+            owners.default_selection_owner(Some("sabre")).unwrap(),
+            "patching"
+        );
+        // An unowned backend name is a refusal, never a silent empty run.
+        assert!(
+            owners
+                .default_selection_owner(Some("no-such-backend"))
+                .is_err()
+        );
+    }
+    #[test]
+    fn a_single_backend_selection_under_its_default_owner_selects_its_cells() {
+        // Regression (nightly pressure sweep, 2026-11-04): generated
+        // single-cell commands name --backend sabre|dbt with no
+        // --execution-owner. Under the core default every such cell was
+        // retained out of the selection and the harness failed with
+        // "filters selected no cells", so the sweep reported 478 sabre
+        // and 561 dbt cells INCOMPLETE while ptrace judged normally.
+        let root = crate::git_environment::checkout_root();
+        let owners = ExecutionOwners::load(&root).unwrap();
+        let manifests = ManifestSet::load(&root).unwrap();
+        for backend in ["dbt", "sabre", "ptrace"] {
+            let mut selection = Selection {
+                population: Some(Population::Enabled),
+                backend: Some(backend.to_string()),
+                include_manual: true,
+                include_occasional: true,
+                all_run_types: true,
+                ..Default::default()
+            };
+            selection.execution_backends = Some(
+                owners
+                    .backends_for_selection(
+                        owners.default_selection_owner(Some(backend)).unwrap(),
+                        &[],
+                    )
+                    .unwrap(),
+            );
+            let cells = manifests.select(&selection).unwrap();
+            assert!(
+                !cells.is_empty(),
+                "no {backend} cells selected under its default owner"
+            );
+            assert!(
+                cells
+                    .iter()
+                    .all(|cell| cell.id.backend.as_deref() == Some(backend)),
+                "a {backend} selection selected another backend's cell"
+            );
+        }
+        // The pre-fix default, kept as the contrast: core owns no dbt
+        // cell, so the same selection under core is empty.
+        let mut under_core = Selection {
+            population: Some(Population::Enabled),
+            backend: Some("dbt".to_string()),
+            include_manual: true,
+            include_occasional: true,
+            all_run_types: true,
+            ..Default::default()
+        };
+        under_core.execution_backends = Some(owners.backends_for_selection("core", &[]).unwrap());
+        assert!(manifests.select(&under_core).unwrap().is_empty());
     }
 }
