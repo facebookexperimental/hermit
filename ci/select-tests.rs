@@ -249,6 +249,11 @@ fn str_vec(v: &Value) -> Vec<String> {
 
 struct Dag {
     all_nodes: BTreeSet<String>,
+    /// Every super-labelled node in the committed DAG (both tiers).
+    /// The hosted-portable universe above never contains them, but
+    /// affected-super selection reports them separately so the merge
+    /// queue can schedule exactly the super nodes a change touches.
+    super_nodes: BTreeSet<String>,
     deps: BTreeMap<String, Vec<String>>,
 }
 
@@ -259,23 +264,29 @@ impl Dag {
         let v: Value = serde_json::from_str(&raw)
             .unwrap_or_else(|e| fail_load(path, &format!("invalid JSON: {e}")));
         let mut all_nodes = BTreeSet::new();
+        let mut super_nodes = BTreeSet::new();
         let mut deps = BTreeMap::new();
         for s in v["steps"].as_array().unwrap_or(&vec![]) {
-            if !str_vec(&s["labels"])
-                .iter()
-                .any(|label| label == "hosted-portable")
-            {
-                continue;
-            }
+            let labels = str_vec(&s["labels"]);
             let tag = format!(
                 "{}.{}",
                 s["group"].as_str().unwrap_or(""),
                 s["job"].as_str().unwrap_or("")
             );
+            if labels.iter().any(|label| label == "super") {
+                super_nodes.insert(tag.clone());
+            }
+            if !labels.iter().any(|label| label == "hosted-portable") {
+                continue;
+            }
             deps.insert(tag.clone(), str_vec(&s["deps"]));
             all_nodes.insert(tag);
         }
-        Dag { all_nodes, deps }
+        Dag {
+            all_nodes,
+            super_nodes,
+            deps,
+        }
     }
 
     /// Add every transitive `deps` predecessor of the given nodes.
@@ -297,6 +308,7 @@ impl Dag {
     fn resolve_selection_node(&self, node: &str) -> Option<&str> {
         self.all_nodes
             .get(node)
+            .or_else(|| self.super_nodes.get(node))
             .or_else(|| self.all_nodes.get(&format!("{node}_on_host")))
             .map(String::as_str)
     }
@@ -423,6 +435,11 @@ enum Decision {
 struct Selection {
     decision: Decision,
     nodes: BTreeSet<String>,
+    /// Super-labelled nodes whose own inputs this change touches,
+    /// computed for every file including force_full ones (whose
+    /// footprint hits the portable decision otherwise discards).
+    /// Reported additively; never changes the portable decision.
+    super_nodes: BTreeSet<String>,
     /// Whether every backend's e2e cells may be affected (core/CLI/fixture change).
     e2e_all: bool,
     /// Backends whose e2e cells this change can affect (when not e2e_all).
@@ -450,13 +467,33 @@ fn backend_rule_matches(rule: &BackendRule, file: &str) -> bool {
     }
 }
 
+/// Super-labelled nodes whose own footprint inputs this change
+/// touches. Evaluated for every file, including force_full ones whose
+/// portable footprint hits select() otherwise discards, so a
+/// budget/test-list change under ci/** still names its super nodes.
+fn super_hits(fp: &Footprints, dag: &Dag, files: &[String]) -> BTreeSet<String> {
+    let mut hits = BTreeSet::new();
+    for f in files {
+        for entry in &fp.footprints {
+            if matches_any(&entry.paths, f) {
+                let mut expanded = BTreeSet::new();
+                fp.expand(&entry.nodes, &mut expanded, &mut BTreeSet::new());
+                hits.extend(expanded.intersection(&dag.super_nodes).cloned());
+            }
+        }
+    }
+    hits
+}
+
 fn select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
     let mut reasons = Vec::new();
 
     // Full-suite result: every node, and every e2e cell (e2e_all).
+    let super_hits = super_hits(fp, dag, files);
     let full = |nodes: BTreeSet<String>, reasons: Vec<String>| Selection {
         decision: Decision::Full,
         nodes,
+        super_nodes: super_hits.clone(),
         e2e_all: true,
         e2e_backends: BTreeSet::new(),
         backend_rules: Vec::new(),
@@ -599,6 +636,7 @@ fn select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
         return Selection {
             decision: Decision::Skip,
             nodes,
+            super_nodes: super_hits.clone(),
             e2e_all: false,
             e2e_backends: BTreeSet::new(),
             backend_rules: matched_rules,
@@ -694,6 +732,7 @@ fn select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
     Selection {
         decision: Decision::Selective,
         nodes: closed,
+        super_nodes: super_hits,
         e2e_all,
         e2e_backends,
         backend_rules: matched_rules,
@@ -1228,6 +1267,7 @@ fn main() {
                 let sel = Selection {
                     decision: Decision::Full,
                     nodes: dag.all_nodes.clone(),
+                    super_nodes: dag.super_nodes.clone(),
                     e2e_all: true,
                     e2e_backends: BTreeSet::new(),
                     backend_rules: Vec::new(),
@@ -1342,6 +1382,7 @@ fn emit(sel: &Selection, rp: &RunPlan, format: &str, n_files: usize) {
                 "full": sel.decision == Decision::Full,
                 "node_count": sel.nodes.len(),
                 "nodes": sel.nodes.iter().cloned().collect::<Vec<_>>(),
+                "super_nodes": sel.super_nodes.iter().cloned().collect::<Vec<_>>(),
                 "shards": rp.shards,
                 "shard_matrix": shard_matrix,
                 "cell_matrix": cell_matrix,
@@ -1368,7 +1409,7 @@ fn emit(sel: &Selection, rp: &RunPlan, format: &str, n_files: usize) {
                 sel.e2e_backends.iter().cloned().collect()
             };
             let lines = format!(
-                "decision={}\nskip={}\nfull={}\nnode_count={}\nnodes={}\n\
+                "decision={}\nskip={}\nfull={}\nnode_count={}\nnodes={}\nsuper_nodes={}\n\
                  shard_count={}\ncell_count={}\nbuild_debug={}\nbuild_dbt={}\nbuild_aux={}\n\
                  backends={}\nbackend_rules={}\nshard_matrix={}\ncell_matrix={}\n",
                 decision_str(&sel.decision),
@@ -1376,6 +1417,7 @@ fn emit(sel: &Selection, rp: &RunPlan, format: &str, n_files: usize) {
                 sel.decision == Decision::Full,
                 sel.nodes.len(),
                 sel.nodes.iter().cloned().collect::<Vec<_>>().join(" "),
+                sel.super_nodes.iter().cloned().collect::<Vec<_>>().join(" "),
                 rp.shards.len(),
                 rp.cells.len(),
                 rp.build_debug,
@@ -1467,9 +1509,11 @@ fn historical_select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection 
     let mut reasons = Vec::new();
 
     // Full-suite result: every node, and every e2e cell (e2e_all).
+    let super_hits = super_hits(fp, dag, files);
     let full = |nodes: BTreeSet<String>, reasons: Vec<String>| Selection {
         decision: Decision::Full,
         nodes,
+        super_nodes: super_hits.clone(),
         e2e_all: true,
         e2e_backends: BTreeSet::new(),
         backend_rules: Vec::new(),
@@ -1545,6 +1589,7 @@ fn historical_select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection 
         return Selection {
             decision: Decision::Skip,
             nodes: BTreeSet::new(),
+            super_nodes: super_hits.clone(),
             e2e_all: false,
             e2e_backends: BTreeSet::new(),
             backend_rules: Vec::new(),
@@ -1600,6 +1645,7 @@ fn historical_select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection 
     Selection {
         decision: Decision::Selective,
         nodes: closed,
+        super_nodes: super_hits,
         e2e_all,
         e2e_backends,
         backend_rules: Vec::new(),
@@ -1631,6 +1677,7 @@ fn historical_selection_bracket(root: &Path, check: &mut dyn FnMut(&str, bool)) 
             .into_iter()
             .map(String::from)
             .collect(),
+        super_nodes: BTreeSet::new(),
         deps: BTreeMap::new(),
     };
     check(
@@ -1744,6 +1791,7 @@ fn historical_selection_bracket(root: &Path, check: &mut dyn FnMut(&str, bool)) 
 
     let mut removed = Dag {
         all_nodes: dag.all_nodes.clone(),
+        super_nodes: BTreeSet::new(),
         deps: dag.deps.clone(),
     };
     check(
@@ -1759,6 +1807,7 @@ fn historical_selection_bracket(root: &Path, check: &mut dyn FnMut(&str, bool)) 
     );
     let mut removed = Dag {
         all_nodes: dag.all_nodes.clone(),
+        super_nodes: BTreeSet::new(),
         deps: dag.deps.clone(),
     };
     check(
@@ -1989,6 +2038,7 @@ fn historical_selection_bracket(root: &Path, check: &mut dyn FnMut(&str, bool)) 
     let only_regular = Selection {
         decision: Decision::Selective,
         nodes: BTreeSet::from(["test.regular_crates_on_host".into()]),
+        super_nodes: BTreeSet::new(),
         e2e_all: false,
         e2e_backends: BTreeSet::new(),
         backend_rules: Vec::new(),
@@ -2006,6 +2056,7 @@ fn historical_selection_bracket(root: &Path, check: &mut dyn FnMut(&str, bool)) 
     );
     let mut missing = Dag {
         all_nodes: dag.all_nodes.clone(),
+        super_nodes: BTreeSet::new(),
         deps: dag.deps.clone(),
     };
     check(
@@ -2090,6 +2141,7 @@ fn coarse_selection_bracket(root: &Path, check: &mut dyn FnMut(&str, bool)) {
             .into_iter()
             .map(String::from)
             .collect(),
+        super_nodes: BTreeSet::new(),
         deps: BTreeMap::new(),
     };
     check(
@@ -2232,6 +2284,7 @@ fn coarse_selection_bracket(root: &Path, check: &mut dyn FnMut(&str, bool)) {
 
     let mut removed = Dag {
         all_nodes: dag.all_nodes.clone(),
+        super_nodes: BTreeSet::new(),
         deps: dag.deps.clone(),
     };
     check(
@@ -2246,6 +2299,7 @@ fn coarse_selection_bracket(root: &Path, check: &mut dyn FnMut(&str, bool)) {
     );
     let mut removed = Dag {
         all_nodes: dag.all_nodes.clone(),
+        super_nodes: BTreeSet::new(),
         deps: dag.deps.clone(),
     };
     check(
@@ -2477,6 +2531,7 @@ fn coarse_selection_bracket(root: &Path, check: &mut dyn FnMut(&str, bool)) {
     let only_regular = Selection {
         decision: Decision::Selective,
         nodes: BTreeSet::from(["test.regular_crates_on_host".into()]),
+        super_nodes: BTreeSet::new(),
         e2e_all: false,
         e2e_backends: BTreeSet::new(),
         backend_rules: Vec::new(),
@@ -2494,6 +2549,7 @@ fn coarse_selection_bracket(root: &Path, check: &mut dyn FnMut(&str, bool)) {
     );
     let mut missing = Dag {
         all_nodes: dag.all_nodes.clone(),
+        super_nodes: BTreeSet::new(),
         deps: dag.deps.clone(),
     };
     check(
@@ -2983,6 +3039,44 @@ fn self_test() {
                 .all(|node| core_dag.resolve_selection_node(node).is_some())
         }),
     );
+    // Affected-super selection (4741 class): a super node's own input
+    // names that node even though the portable decision is Full (the
+    // files live under force_full ci/** / scripts/lib/**). Before this,
+    // a test added to a super node over its per-test CPU cap landed
+    // green because no selection ever named a super node.
+    let pmu = "super.pmu_analyze_hello_race_stress_calibrated_skid";
+    check(
+        "4741: super selector source selects its super node",
+        select(&core_fp, &core_dag, &["scripts/lib/validate_super.rs".into()])
+            .super_nodes
+            .contains(pmu),
+    );
+    check(
+        "4741: per-test budget file selects its super node",
+        select(
+            &core_fp,
+            &core_dag,
+            &["ci/nextest-timeout-config.rs".into()],
+        )
+        .super_nodes
+        .contains(pmu),
+    );
+    check(
+        "4741: super test file selects exactly its node family",
+        select(
+            &core_fp,
+            &core_dag,
+            &["hermit-cli/tests/hermit_modes.rs".into()],
+        )
+        .super_nodes
+        .contains("super.pmu_buck_chaos_cases"),
+    );
+    check(
+        "super group covers the committed super universe",
+        !core_dag.super_nodes.is_empty()
+            && super_hits(&core_fp, &core_dag, &["ci/run-nextest-counted.sh".into()])
+                == core_dag.super_nodes,
+    );
     let policy: Value = serde_json::from_slice(
         &std::fs::read(root.join("ci/test-footprints-policy.json")).unwrap(),
     )
@@ -2993,6 +3087,7 @@ fn self_test() {
             policy[*key].as_array().unwrap().iter().all(|rule| {
                 str_vec(&rule["nodes"])
                     .iter()
+                    .filter(|node| !node.starts_with('@'))
                     .all(|node| core_dag.resolve_selection_node(node).is_some())
                     && str_vec(&rule["packages"]).iter().all(|package| {
                         !matches!(
@@ -3081,6 +3176,7 @@ fn self_test() {
     );
     let mut stale_core = Dag {
         all_nodes: core_dag.all_nodes.clone(),
+        super_nodes: BTreeSet::new(),
         deps: core_dag.deps.clone(),
     };
     let had_consumer = stale_core.all_nodes.remove("test.detcore_unit_on_host");

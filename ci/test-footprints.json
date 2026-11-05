@@ -771,6 +771,164 @@
       "paths": [
         "scripts/check-dagrun-naming.sh"
       ]
+    },
+    {
+      "_why": "Super-tier own inputs (affected-super selection): node/test-list definitions and the budget files every super node runs under. A cap or selector change here can break any super node (the 4741 class) while full stays green, so every super-labelled node is named via the generated @super group.",
+      "nodes": [
+        "@super"
+      ],
+      "paths": [
+        "scripts/lib/validate_super.rs",
+        "ci/manifest-plan/src/validation_dag_static.rs",
+        "ci/manifest-plan/src/validation_dag.rs",
+        "ci/manifest-plan/src/step_limits.rs",
+        "ci/manifest-plan/src/timeouts.rs",
+        "ci/nextest-timeout-config.rs",
+        "ci/nextest-binaries.rs",
+        "ci/run-nextest-counted.sh",
+        ".config/nextest.toml",
+        "tests/e2e/manifests/defaults.yaml"
+      ]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "nodes": [
+        "super.relaxed_hermit_flag_matrix"
+      ],
+      "paths": [
+        "hermit-cli/tests/relaxed_flag_matrix.rs"
+      ]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "nodes": [
+        "super.pselect_signal_interruption_diagnostic"
+      ],
+      "paths": [
+        "hermit-cli/tests/pselect6_simulation.rs"
+      ]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "nodes": [
+        "super.record_replay_matrix_diagnostic"
+      ],
+      "paths": [
+        "hermit-cli/tests/record_replay.rs",
+        "hermit-cli/tests/record_replay/**"
+      ]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "nodes": [
+        "super.managed_jvm_strict_verify_diagnostics"
+      ],
+      "paths": [
+        "hermit-cli/tests/app_strict_verify.rs"
+      ]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "nodes": [
+        "super.ipc_determinism_diagnostic"
+      ],
+      "paths": [
+        "hermit-cli/tests/ipc_determinism.rs"
+      ]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "nodes": [
+        "super.random_source_determinism_diagnostic"
+      ],
+      "paths": [
+        "hermit-cli/tests/random_determinism.rs"
+      ]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "nodes": [
+        "super.threaded_integration_matrix_diagnostic"
+      ],
+      "paths": [
+        "hermit-cli/tests/integration_matrix.rs"
+      ]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "nodes": [
+        "super.chaos_hello_race_verification_diagnostic",
+        "super.pmu_buck_chaos_cases",
+        "super.weekly_relaxed_default_mode_cases"
+      ],
+      "paths": [
+        "hermit-cli/tests/hermit_modes.rs"
+      ]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "nodes": [
+        "super.weekly_ignored_portable_chaos_cases",
+        "super.weekly_portable_chaos_cases"
+      ],
+      "paths": [
+        "hermit-cli/tests/stress_suite.rs"
+      ]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "nodes": [
+        "super.build_pinned_leveldb_super_fixture",
+        "super.full_leveldb_strict_determinism"
+      ],
+      "paths": [
+        "hermit-cli/tests/leveldb.rs",
+        "hermit-cli/tests/prepare_leveldb.sh"
+      ]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "nodes": [
+        "super.sqlite_veryquick_strict_determinism"
+      ],
+      "paths": [
+        "hermit-cli/tests/sqlite_veryquick.rs"
+      ]
+    },
+    {
+      "_why": "The mem_race weekly diagnostics select tests_parallelism cases by exact name; the whole target directory is their own input.",
+      "nodes": [
+        "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore",
+        "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore",
+        "super.weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore",
+        "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore"
+      ],
+      "paths": [
+        "detcore/tests/parallelism/**"
+      ]
+    },
+    {
+      "_why": "The post-fork and network super diagnostics select tests_misc cases by name; the whole target directory is their own input.",
+      "nodes": [
+        "super.network_syscall_determinism_diagnostic",
+        "super.post_fork_scheduling_diagnostics"
+      ],
+      "paths": [
+        "detcore/tests/misc/**"
+      ]
+    },
+    {
+      "_why": "The super compat bucket selects the compat corpus heavy rows by the super label; its fixtures come from the compat prepare/workload scripts.",
+      "nodes": [
+        "super-compatprep.fixtures",
+        "supercompat.manifest_compat"
+      ],
+      "paths": [
+        "tests/e2e/manifests/compat.yaml",
+        "tests/compat/prepare_real_compat_fixtures.sh",
+        "tests/compat/real_compat_workload.sh",
+        "tests/compat/complex_shell_workload.sh"
+      ]
     }
   ],
   "force_full": [
@@ -786,6 +944,73 @@
     ".github/workflows/ci-privileged.yml",
     ".github/actions/**"
   ],
-  "groups": {},
+  "groups": {
+    "super": [
+      "pre.reverie_pin",
+      "pre.submodules",
+      "quick-super-build.rust_scripts",
+      "quick-super-build.rust_scripts_in_pinned_root",
+      "quick-super-gate.manifest",
+      "quick-super-selftest.core_build",
+      "quick-super-selftest.manifest_cli",
+      "quick-super-selftest.pressure_test",
+      "quick-super-selftest.scorecard",
+      "quick-super-selftest.scorecard_commands",
+      "quick-super-selftest.validate_rs",
+      "quick-super-setup.manifest_plan",
+      "quick-super-setup.manifest_plan_in_pinned_root",
+      "quick-super-setup.nextest",
+      "super-compatprep.fixtures",
+      "super.build_pinned_leveldb_super_fixture",
+      "super.build_release_hermit",
+      "super.build_workspace",
+      "super.chaos_hello_race_verification_diagnostic",
+      "super.full_leveldb_strict_determinism",
+      "super.ipc_determinism_diagnostic",
+      "super.managed_jvm_strict_verify_diagnostics",
+      "super.network_syscall_determinism_diagnostic",
+      "super.pmu_analyze_hello_race_stress_calibrated_skid",
+      "super.pmu_buck_chaos_cases",
+      "super.post_fork_scheduling_diagnostics",
+      "super.pselect_signal_interruption_diagnostic",
+      "super.random_source_determinism_diagnostic",
+      "super.record_replay_matrix_diagnostic",
+      "super.relaxed_hermit_flag_matrix",
+      "super.sqlite_veryquick_strict_determinism",
+      "super.threaded_integration_matrix_diagnostic",
+      "super.weekly_ignored_portable_chaos_cases",
+      "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore",
+      "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore",
+      "super.weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore",
+      "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore",
+      "super.weekly_portable_chaos_cases",
+      "super.weekly_relaxed_default_mode_cases",
+      "supercompat.manifest_compat",
+      "superstress.kvm_available",
+      "superstress.kvm_verify",
+      "superstress.ptrace_pipeline",
+      "superstress.ptrace_record_replay",
+      "superstress.ptrace_strict_verify"
+    ],
+    "super_alerting": [
+      "pre.reverie_pin",
+      "pre.submodules",
+      "quick-super-build.rust_scripts",
+      "quick-super-build.rust_scripts_in_pinned_root",
+      "quick-super-gate.manifest",
+      "quick-super-selftest.core_build",
+      "quick-super-selftest.manifest_cli",
+      "quick-super-selftest.pressure_test",
+      "quick-super-selftest.scorecard",
+      "quick-super-selftest.scorecard_commands",
+      "quick-super-selftest.validate_rs",
+      "quick-super-setup.manifest_plan",
+      "quick-super-setup.manifest_plan_in_pinned_root",
+      "quick-super-setup.nextest",
+      "super.build_pinned_leveldb_super_fixture",
+      "super.build_release_hermit",
+      "super.build_workspace"
+    ]
+  },
   "version": 2
 }
