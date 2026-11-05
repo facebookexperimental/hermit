@@ -97,11 +97,11 @@ fn wait_200ms(i: usize, fd: libc::c_int, timeouts: *const Timeouts) -> i64 {
 /// unsupported call may be met.
 #[test]
 fn kernel_run_poll_waits_time_out_through_ignored_signals() {
-    let config = Config {
+    let config = detcore_testutils::prepare_ptrace_timer_config(Config {
         sequentialize_threads: false,
         max_timeslice: None,
         ..Default::default()
-    };
+    });
     let (output, mut state) = detcore_testutils::test_fn_with_config::<Detcore, _>(
         || {
             let mut fds = [0; 2];

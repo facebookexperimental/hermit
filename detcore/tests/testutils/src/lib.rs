@@ -82,17 +82,35 @@ struct DetTestState {
     test_run_num: u64,
 }
 
-/// Bind the timer mechanism provided by the ptrace launcher used by these tests.
-/// Keep each test's configured maximum (including `None`) and every other
-/// backend fact unchanged; the generic helpers also serve non-Detcore tools.
+/// Bind the timer mechanism provided by the ptrace launcher used by these tests,
+/// and resolve the CPU profile the way a launch must. Keep each test's
+/// configured maximum (including `None`) and every other backend fact
+/// unchanged; the generic helpers also serve non-Detcore tools.
+///
+/// These helpers launch Detcore directly, with no CLI launch view to classify
+/// a first image from, so an unresolved `auto` (the clap default every
+/// `Config::default()` carries) names the profile `auto` itself selects for
+/// an unmarked image, x86-64-v2. A guest image declaring more is then refused
+/// by Detcore's per-exec ISA check, as under an explicit v2 launch. Named
+/// profiles pass through untouched, and Detcore's own refusal of an
+/// unresolved `auto` still guards every other launch path.
 pub fn prepare_ptrace_timer_config(mut config: Config) -> Config {
     config.backend.delivers_preemption_timer_events =
         <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities()
             .delivers_preemption_timer_events;
+    if config.cpu_profile == detcore::CpuProfile::Auto {
+        config.cpu_profile = detcore::CpuProfile::X86_64V2;
+    }
     config
 }
 
-static DEFAULT_CFG: LazyLock<Config> = LazyLock::new(Default::default);
+static DEFAULT_CFG: LazyLock<Config> = LazyLock::new(|| {
+    let mut config = Config::default();
+    if config.cpu_profile == detcore::CpuProfile::Auto {
+        config.cpu_profile = detcore::CpuProfile::X86_64V2;
+    }
+    config
+});
 
 /// Standardized test config: all options off.
 /// (This is the bottom element of a lattice containing exponentially many possibly Configs.)
@@ -1338,6 +1356,43 @@ mod tests {
         let mut received = [0u8; 128];
         let size = reader.recv(&mut received).expect("oracle was not reached");
         std::assert_eq!(&received[..size], expected);
+    }
+
+    /// A direct Detcore test launch has no CLI launch view to resolve
+    /// `--cpu-profile auto` from, so preparation names the profile `auto`
+    /// selects for an unmarked image; named profiles pass through. (The
+    /// clap default every `Config::default()` carries is `auto`, which
+    /// Detcore itself refuses unresolved.)
+    #[test]
+    fn prepare_resolves_an_unresolved_auto_cpu_profile() {
+        use detcore::CpuProfile;
+
+        let auto = crate::Config {
+            cpu_profile: CpuProfile::Auto,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::prepare_ptrace_timer_config(auto).cpu_profile,
+            CpuProfile::X86_64V2
+        );
+        assert_eq!(
+            super::prepare_ptrace_timer_config(crate::Config::default()).cpu_profile,
+            CpuProfile::X86_64V2
+        );
+        for named in [
+            CpuProfile::X86_64V2,
+            CpuProfile::X86_64V3,
+            CpuProfile::HostNoRdrand,
+        ] {
+            let config = crate::Config {
+                cpu_profile: named,
+                ..Default::default()
+            };
+            assert_eq!(
+                super::prepare_ptrace_timer_config(config).cpu_profile,
+                named
+            );
+        }
     }
 
     #[test]

@@ -170,6 +170,7 @@ pub use config::to_legacy_backend_json;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1120): Review the public canonical Detcore root identity.
 pub use consts::ROOT_DETPID;
+pub use detcore_model::cpu_profile::CpuProfile;
 pub use detcore_model::pid::GuestIds;
 pub use digest::Digest;
 pub use finalization::FinalizationFailure;

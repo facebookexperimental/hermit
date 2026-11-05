@@ -879,12 +879,12 @@ fn timer_slack_virtual_state_is_isolated_from_physical_tracee_body() {
         })
     };
 
-    let config = detcore::Config {
+    let config = detcore_testutils::prepare_ptrace_timer_config(detcore::Config {
         max_timeslice: None,
         sequentialize_threads: true,
         proc_level: detcore_model::config::ProcLevel::Standard,
         ..Default::default()
-    };
+    });
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
