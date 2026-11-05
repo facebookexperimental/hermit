@@ -7020,6 +7020,15 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub replaying_lone_slice_end: Option<u64>,
 
+    /// While such an end is processed: it is taken with the stop of the
+    /// check-in that follows it at its own branch count, because a replay
+    /// does not allow it without a stop
+    /// (`Detcore::catch_up_lone_slice_ends`). Its recorded event carries
+    /// that stop's RIP instead of a `stopless` mark, so a re-record below
+    /// `STOPLESS_SLICE_ENDS_FORMAT` keeps the end visible.
+    #[serde(default)]
+    pub lone_slice_end_at_check_in: bool,
+
     /// Set when a grant while such an end was processed did not find the
     /// thread alone, which the scheduler's predicate rules out; taken by
     /// `Detcore::catch_up_lone_slice_ends`, which reports it.
@@ -7900,6 +7909,7 @@ impl<T> ThreadState<T> {
             lone_grant: false,
             lone_slice_end: None,
             replaying_lone_slice_end: None,
+            lone_slice_end_at_check_in: false,
             lone_replay_unsound: false,
             replayed_stopless_end: None,
             record_or_replay,

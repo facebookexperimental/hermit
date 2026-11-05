@@ -1789,7 +1789,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// through the same code as a timer event there (`take_timer_event`).
     /// Called first in every callback that sees the guest stopped, before
     /// that callback changes anything, so these ends come where the stops
-    /// would have put them: before what the guest did next.
+    /// would have put them: before what the guest did next. An end a replay
+    /// does not allow without a stop is processed with one, at the check-in
+    /// that stopped the guest.
     ///
     /// Equivalent to the stops: the scheduler marked each grant lone
     /// (`Scheduler::runs_alone_until_it_enters_detcore`), so until now nothing
@@ -1804,20 +1806,34 @@ impl<T: RecordOrReplay> Detcore<T> {
             return;
         };
         let reached = guest.read_clock().expect("Couldn't read clock");
-        // Every end up to `reached` is past, so each is processed here
-        // without a stop, the first by the grant's decision and the rest at
-        // the counts the post-hook notes. A recording marks them all; a
-        // faithful replay enters Detcore at the same count and finds the
-        // same ends marked. A replay that does not is already desynced, and
-        // the missing RIP is reported as a desync at that end.
+        // Every end up to `reached` is past, so each is processed here,
+        // the first by the grant's decision and the rest at the counts the
+        // post-hook notes. A recording marks the ones it took without a
+        // stop; a faithful replay enters Detcore at the same count and
+        // finds the same ends marked. A replay that does not is already
+        // desynced, and the missing RIP is reported as a desync at that
+        // end.
         while end <= reached {
+            // An end the replay does not allow without a stop
+            // (`replay_allows_stopless_end`) is taken with the stop of the
+            // check-in whose callback this is: the recording's next event
+            // for such an end is that check-in, at the end's own branch
+            // count, so the guest is stopped there now. It is processed
+            // like the run's earlier skipped ends, which keep the skip
+            // that brought the thread here; only its recorded event
+            // differs, carrying the check-in's RIP instead of a `stopless`
+            // mark (`ThreadState::lone_slice_end_at_check_in`).
+            let stopless = self.replay_allows_stopless_end(guest.thread_state(), end);
             {
                 let thread_state = guest.thread_state_mut();
                 thread_state.lone_slice_end = None;
                 thread_state.replaying_lone_slice_end = Some(end);
+                thread_state.lone_slice_end_at_check_in = !stopless;
             }
             self.take_timer_event(guest).await;
-            STOPLESS_SLICE_ENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if stopless {
+                STOPLESS_SLICE_ENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if std::mem::take(&mut guest.thread_state_mut().lone_replay_unsound) {
                 // Another thread could run at an end this thread had already
                 // run past: the run is no longer the one a stop gives.
@@ -1832,6 +1848,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             let thread_state = guest.thread_state_mut();
             thread_state.replaying_lone_slice_end = None;
+            thread_state.lone_slice_end_at_check_in = false;
             end = thread_state
                 .lone_slice_end
                 .expect("a processed slice end notes the next one");
@@ -1973,7 +1990,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .expect("should not have more than 2^32 branches at once"),
                     ),
                 );
-                let ev = if guest.thread_state().replaying_lone_slice_end.is_some() {
+                let ev = if guest.thread_state().replaying_lone_slice_end.is_some()
+                    && guest.thread_state().lone_slice_end_at_check_in
+                {
+                    // A slice end taken with its check-in's stop: the guest
+                    // is stopped at that check-in, so its RIP is this end's.
+                    with_guest_rip(guest, ev).await
+                } else if guest.thread_state().replaying_lone_slice_end.is_some() {
                     // A slice end taken without a stop: the guest stopped
                     // later, so no RIP is this end's.
                     ev.taken_without_stop()
@@ -5593,6 +5616,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     lone_grant: false,
                     lone_slice_end: None,
                     replaying_lone_slice_end: None,
+                    lone_slice_end_at_check_in: false,
                     lone_replay_unsound: false,
                     replayed_stopless_end: None,
 

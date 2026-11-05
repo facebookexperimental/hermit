@@ -536,15 +536,35 @@ impl Replayer {
     /// (`SchedEvent::stopless`) always end a timeslice, whatever follows: the
     /// thread's own check-in may follow with no branch between, which the
     /// rule above would read as branches that reach a check-in.
+    ///
+    /// This legacy schedule replay re-records below
+    /// `STOPLESS_SLICE_ENDS_FORMAT`: a following same-thread non-Branch would
+    /// hide that end in the re-record once its mark is dropped, so the replay
+    /// takes it with a stop instead (`Detcore::catch_up_lone_slice_ends`
+    /// honors the same refusal for an end a skipped run already passed). A
+    /// following Branch, another thread's event, or the record's own end
+    /// keeps the slice end visible without the mark, so those ends may still
+    /// be taken without a stop.
     fn resolve_time_to_run(&self, next: &SchedEvent) -> Option<ReplayedSliceEnd> {
         let branches = if next.stopless {
             Some(next.count)
         } else {
             self.timer_preemption_branches(next)
         };
-        branches.map(|count| ReplayedSliceEnd {
-            length: LogicalTime::from_rcbs(u64::from(count)),
-            stopless: next.stopless,
+        branches.map(|count| {
+            let mut end = ReplayedSliceEnd {
+                length: LogicalTime::from_rcbs(u64::from(count)),
+                stopless: next.stopless,
+            };
+            if next.stopless {
+                let end_stays_visible = self.cursor.peek_nth(1).is_none_or(|following| {
+                    following.op == Op::Branch || following.dettid != next.dettid
+                });
+                if !end_stays_visible {
+                    end = end.with_a_stop();
+                }
+            }
+            end
         })
     }
 
@@ -2020,10 +2040,12 @@ mod tests {
     }
 
     /// A lone thread's slice end the recording took without a stop is
-    /// replayed as a slice end, marked so the replay may take it the same
-    /// way, even when its own check-in follows with no branch between: the
-    /// unmarked shape (branches, then the thread's OtherInstructions and its
-    /// syscall) reaches a check-in and gets no end at all.
+    /// replayed as a slice end even when its own check-in follows with no
+    /// branch between: the unmarked shape (branches, then the thread's
+    /// OtherInstructions and its syscall) reaches a check-in and gets no end
+    /// at all. A schedule replay re-records below
+    /// `STOPLESS_SLICE_ENDS_FORMAT`, where that following check-in would hide
+    /// the end without its mark, so this replay takes it with a stop instead.
     #[test]
     fn a_stopless_end_is_a_slice_end_whatever_follows() {
         for stopless in [true, false] {
@@ -2040,7 +2062,7 @@ mod tests {
             let mut replayer = Replayer::new(schedule.clone());
             let end = stopless.then_some(ReplayedSliceEnd {
                 length: LogicalTime::from_rcbs(123),
-                stopless: true,
+                stopless: false,
             });
             assert_eq!(
                 replayer.observe_event(&schedule[0]),
@@ -2048,6 +2070,67 @@ mod tests {
                 "stopless: {stopless}"
             );
         }
+    }
+
+    /// A marked end that stays visible in a lowered re-record without its
+    /// mark (a following Branch, another thread's event, or the record's own
+    /// end) may still be taken without a stop.
+    #[test]
+    fn a_visible_stopless_end_may_still_be_taken_without_a_stop() {
+        for following in ["branch", "other thread", "record end"] {
+            let mut b = builder::SchedTestBuilder::new();
+            let mut schedule = vec![
+                b.other(SOME_RIP, tid(3)),
+                b.branch(123, tid(3)).taken_without_stop(),
+            ];
+            match following {
+                "branch" => schedule.push(b.branch(7, tid(3))),
+                "other thread" => schedule.push(b.other(SOME_RIP, tid(5))),
+                "record end" => {}
+                _ => unreachable!(),
+            }
+            let mut replayer = Replayer::new(schedule.clone());
+            assert_eq!(
+                replayer.observe_event(&schedule[0]),
+                ReplayAction::Continue(Some(ReplayedSliceEnd {
+                    length: LogicalTime::from_rcbs(123),
+                    stopless: true,
+                })),
+                "following: {following}"
+            );
+        }
+    }
+
+    /// In a run of marked ends that ends at the thread's own check-in, only
+    /// the last end keeps its stop: every earlier end stays visible in a
+    /// lowered re-record without its mark, because a Branch follows it
+    /// (`resolve_time_to_run`). The skipped run is still stopped at that
+    /// last end, at the check-in that processes it
+    /// (`Detcore::catch_up_lone_slice_ends`).
+    #[test]
+    fn only_the_last_end_of_a_run_that_ends_at_its_own_check_in_keeps_its_stop() {
+        let mut b = builder::SchedTestBuilder::new();
+        let schedule = vec![
+            b.other(SOME_RIP, tid(3)),
+            b.branch(123, tid(3)).taken_without_stop(),
+            b.branch(7, tid(3)).taken_without_stop(),
+            b.other(SOME_RIP, tid(3)),
+        ];
+        let mut replayer = Replayer::new(schedule.clone());
+        assert_eq!(
+            replayer.observe_event(&schedule[0]),
+            ReplayAction::Continue(Some(ReplayedSliceEnd {
+                length: LogicalTime::from_rcbs(123),
+                stopless: true,
+            }))
+        );
+        assert_eq!(
+            replayer.observe_event(&schedule[1]),
+            ReplayAction::Continue(Some(ReplayedSliceEnd {
+                length: LogicalTime::from_rcbs(7),
+                stopless: false,
+            }))
+        );
     }
 
     /// A replay that stopped at an end its recording took without a stop
