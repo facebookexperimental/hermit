@@ -709,6 +709,74 @@ pub struct ModeRecipe {
 /// the portable, hosted and quick profiles' subsets of them) select no label.
 pub const DEFAULT_RUN_TYPE: &str = "full";
 
+/// The expected-pass nightly run type. A cell earns this test-row label only
+/// after passing in the hermetic validation image at a stated head.
+pub const SUPER_RUN_TYPE: &str = "super";
+
+/// The negative-space nightly run type for tests that have not yet qualified
+/// for [`SUPER_RUN_TYPE`]. Their results structure the backlog; they are not
+/// expected-pass regression cells.
+pub const PRESSURE_RUN_TYPE: &str = "pressure";
+
+/// Manifest buckets whose every test row must carry exactly one tier marker.
+const TIERED_BUCKETS: [&str; 2] = ["gvisor", "rr"];
+
+/// The one tier marker shared by the gVisor and rr corpora and their
+/// selectors. It is authored as a test-row [`TestRecipe::labels`] value;
+/// projections serialize this derived value under the JSON key `tier`.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Serialize,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord
+)]
+#[serde(rename_all = "lowercase")]
+pub enum CellTier {
+    Super,
+    Pressure,
+}
+
+impl CellTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Super => SUPER_RUN_TYPE,
+            Self::Pressure => PRESSURE_RUN_TYPE,
+        }
+    }
+
+    fn from_labels(labels: &BTreeSet<&str>) -> Result<Option<Self>, String> {
+        match (
+            labels.contains(SUPER_RUN_TYPE),
+            labels.contains(PRESSURE_RUN_TYPE),
+        ) {
+            (true, false) => Ok(Some(Self::Super)),
+            (false, true) => Ok(Some(Self::Pressure)),
+            (false, false) => Ok(None),
+            (true, true) => Err(format!(
+                "labels contain both `{SUPER_RUN_TYPE}` and `{PRESSURE_RUN_TYPE}`"
+            )),
+        }
+    }
+}
+
+/// This cell's derived tier, or `None` for rows outside the tiered corpora.
+/// Manifest validation rejects a cell carrying both markers, and mode labels
+/// may not carry either marker, so a validated manifest cannot make this
+/// return an error.
+pub fn cell_tier(
+    test: &TestRecipe,
+    recipe: &ModeRecipe,
+    backend: Option<&str>,
+) -> Result<Option<CellTier>, String> {
+    CellTier::from_labels(&cell_labels(test, recipe, backend))
+        .map_err(|error| format!("{}: {error}", test.id))
+}
+
 /// The run types a cell belongs to: its test's `labels`, plus its mode's
 /// `labels` for its backend, or [`DEFAULT_RUN_TYPE`] alone when both are
 /// empty. A selection keeps a cell when the cell's run types meet the
@@ -2648,6 +2716,7 @@ fn validate_document_with_cpu(
             return Err(format!("{}: modes must be exactly {expected:?}", test.id));
         }
         validate_labels(&test.id, &test.labels)?;
+        validate_tier_marker(&test.id, stem, &test.labels)?;
         for (mode, recipe) in &test.modes {
             validate_mode_with_cpu(
                 &test.id,
@@ -10672,6 +10741,14 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
             return Err(format!("{id}: {mode} labels for `{backend}` are empty"));
         }
         validate_labels(&format!("{id}: {mode} on {backend}"), labels)?;
+        if let Some(label) = labels
+            .iter()
+            .find(|label| matches!(label.as_str(), SUPER_RUN_TYPE | PRESSURE_RUN_TYPE))
+        {
+            return Err(format!(
+                "{id}: {mode} labels for `{backend}` cannot carry tier label `{label}`; author it once on the test row"
+            ));
+        }
     }
     for (backend, reason) in &recipe.diagnostic {
         if !stripped {
@@ -10697,6 +10774,17 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
     if mode == "custom" {
         MaxTimeslice::from_options(&recipe.args)
             .map_err(|error| format!("{id}: custom args: {error}"))?;
+    }
+    Ok(())
+}
+
+fn validate_tier_marker(id: &str, bucket: &str, labels: &[String]) -> Result<(), String> {
+    let label_set: BTreeSet<&str> = labels.iter().map(String::as_str).collect();
+    let tier = CellTier::from_labels(&label_set).map_err(|error| format!("{id}: {error}"))?;
+    if tier.is_none() && TIERED_BUCKETS.contains(&bucket) {
+        return Err(format!(
+            "{id}: bucket `{bucket}` requires exactly one tier label, `{SUPER_RUN_TYPE}` or `{PRESSURE_RUN_TYPE}`"
+        ));
     }
     Ok(())
 }
@@ -12544,6 +12632,43 @@ corpus:
             let labels = bad.iter().map(|l| l.to_string()).collect::<Vec<_>>();
             assert!(validate_labels("t", &labels).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn tier_marker_is_exactly_one_row_label() {
+        let labels = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        validate_tier_marker("gvisor/x", "gvisor", &labels(&["pressure"])).unwrap();
+        validate_tier_marker("rr/x", "rr", &labels(&["full", "super"])).unwrap();
+        validate_tier_marker("c-programs/x", "c-programs", &labels(&[])).unwrap();
+        assert!(validate_tier_marker("gvisor/x", "gvisor", &labels(&[])).is_err());
+        assert!(validate_tier_marker("rr/x", "rr", &labels(&["super", "pressure"])).is_err());
+
+        let mut test = recipe(true);
+        test.labels = labels(&["full", "super"]);
+        assert_eq!(
+            cell_tier(&test, &test.modes["verify"], Some("ptrace")).unwrap(),
+            Some(CellTier::Super)
+        );
+        test.labels = labels(&["pressure"]);
+        assert_eq!(
+            cell_tier(&test, &test.modes["verify"], Some("ptrace")).unwrap(),
+            Some(CellTier::Pressure)
+        );
+        assert_eq!(CellTier::Super.as_str(), "super");
+        assert_eq!(
+            serde_json::to_string(&CellTier::Pressure).unwrap(),
+            "\"pressure\""
+        );
+
+        let mut mode = test.modes["verify"].clone();
+        mode.labels = BTreeMap::from([("ptrace".into(), vec!["pressure".into()])]);
+        let error = validate_mode_extensions(&test.id, "verify", &mode).unwrap_err();
+        assert!(error.contains("cannot carry tier label"), "{error}");
     }
 
     /// A mode's per-backend labels put that backend's cell in their run type
