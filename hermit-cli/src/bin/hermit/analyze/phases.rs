@@ -42,7 +42,6 @@ use crate::app::analyze::types::ContinuationTimeslice;
 use crate::app::analyze::types::ExitStatusConstraint;
 use crate::app::analyze::types::Report;
 use crate::app::analyze::types::ReportCriticalEvent;
-use crate::app::analyze::types::TrialTimeout;
 use crate::app::analyze::workspace::Retention;
 use crate::app::analyze::workspace::Workspace;
 use crate::app::analyze::workspace::note;
@@ -668,12 +667,13 @@ fn require_repeated_outcomes(replays: &[(&str, bool, bool)], inspect: &str) -> a
 }
 
 /// Whether `ran` is the event `expected`, as the scheduler compares them when
-/// it takes a stack: the count and the time aside.
+/// it takes a stack: the count and the time aside, and only instruction
+/// pointers present in the recorded event constrain the observed ones.
 fn same_event(expected: &SchedEvent, ran: &SchedEvent) -> bool {
     expected.dettid == ran.dettid
         && expected.op == ran.op
-        && expected.start_rip == ran.start_rip
-        && expected.end_rip == ran.end_rip
+        && (expected.start_rip.is_none() || expected.start_rip == ran.start_rip)
+        && (expected.end_rip.is_none() || expected.end_rip == ran.end_rip)
 }
 
 /// The first of the first `until` events of `requested` at which `realized`
@@ -1143,6 +1143,13 @@ impl AnalyzeOpts {
     /// return whether it met the target with the stack at schedule position
     /// `position`: a replayed event, or, at `len`, the first event the
     /// scheduler ran after the prefix.
+    ///
+    /// The stack is requested by schedule position
+    /// (`--stacktrace-at-schedule-positions`), not by traced index: the trial
+    /// can observe events its schedule does not hold before `position`, such
+    /// as a polling retry the recording did not make, and a traced index
+    /// would then name a neighbouring event
+    /// (https://github.com/rrnewton/hermit/issues/4917).
     fn prefix_stack(
         &self,
         runname: &str,
@@ -1151,10 +1158,8 @@ impl AnalyzeOpts {
         position: usize,
         continuation: MaybeTimeslice,
     ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)> {
-        let mut run = self.prefix_trial(runname, schedule, len, continuation)?;
-        let stack_path = run.root_path().with_extension("stack");
-        run.runopts.det_opts.det_config.stacktrace_event =
-            vec![(position as u64, Some(stack_path.clone()))];
+        let (mut run, stack_path) =
+            self.prefix_stack_trial(runname, schedule, len, position, continuation)?;
         let is_match = self.launch_prefix_trial(&mut run, RunData::launch)?;
         eprintln!(
             ":: {}\n{}",
@@ -1168,6 +1173,24 @@ impl AnalyzeOpts {
             Err(_) => None,
         };
         Ok((is_match, stack))
+    }
+
+    /// The prefix trial `prefix_stack` launches, and the file its stack goes
+    /// to: the stack at schedule `position`, requested by position.
+    fn prefix_stack_trial(
+        &self,
+        runname: &str,
+        schedule: &PreemptionRecord,
+        len: usize,
+        position: usize,
+        continuation: MaybeTimeslice,
+    ) -> anyhow::Result<(RunData, PathBuf)> {
+        let mut run = self.prefix_trial(runname, schedule, len, continuation)?;
+        let stack_path = run.root_path().with_extension("stack");
+        let config = &mut run.runopts.det_opts.det_config;
+        config.stacktrace_event = vec![(position as u64, Some(stack_path.clone()))];
+        config.stacktrace_at_schedule_positions = true;
+        Ok((run, stack_path))
     }
 
     /// The completed outcome and schedule of a prefix trial: the replayed
@@ -1259,8 +1282,8 @@ impl AnalyzeOpts {
             );
         }
         // The thread the scheduler runs at event #decision once the prefix
-        // ends. `--stacktrace-event` names a position of the replayed schedule
-        // only, so the prefix trial without event #decision runs first with its
+        // ends. A stack is requested by a position of the replayed schedule,
+        // so the prefix trial without event #decision runs first with its
         // schedule recorded, and the stack is taken from a replay of that
         // schedule's first decision + 1 events.
         let (completed, continued_path) = continuation(&schedule, decision)?;
@@ -1511,16 +1534,14 @@ impl AnalyzeOpts {
                             end: usize,
                             expected: bool|
              -> anyhow::Result<Option<PrettyBacktrace>> {
-                if end == decision {
-                    // A slice of one event ends where it starts. Reuse the
-                    // captured deciding stack; no new replay has an outcome
-                    // to compare with the search.
-                    Ok(deciding.clone())
-                } else {
-                    let (observed, captured) = stack(runname, variant, end + 1, end)?;
-                    require_repeated_outcomes(&[(runname, expected, observed)], runname)?;
-                    Ok(captured)
-                }
+                // Even a one-event slice has this continuation's endpoint:
+                // its operation batch can differ from the target event's,
+                // including after a soft count mismatch in the target
+                // continuation itself. Capture it from its own record and
+                // check the outcome even when no stack was captured.
+                let (observed, captured) = stack(runname, variant, end + 1, end)?;
+                require_repeated_outcomes(&[(runname, expected, observed)], runname)?;
+                Ok(captured)
             };
             let with_end = stack_at(
                 "final_target_slice_end_for_stacktraces",
@@ -1730,7 +1751,7 @@ impl AnalyzeOpts {
     /// Create our workspace and verify the input run matches the criteria, or find one that does.
     /// Returns the results of the target run.
     fn phase1_establish_target_run(&mut self) -> Result<RunData, Error> {
-        let mut run1data = RunData::new_run1_target(self, "run1_target".to_string())?;
+        let run1data = RunData::new_run1_target(self, "run1_target".to_string())?;
         eprintln!(
             // `to_repro` is already a complete `hermit ... run ...` command.
             ":: {} {}",
@@ -1738,27 +1759,26 @@ impl AnalyzeOpts {
             run1data.to_repro()
         );
 
-        if let Some(p) = &self.run1_preemptions {
-            let preempts_path = run1data.preempts_path_out();
-            // Copy preempts to the output location as though they were recorded by this run:
-            std::fs::copy(p, preempts_path).expect("copy file to succeed");
-            if self.trial_timeout == TrialTimeout::Auto {
-                eprintln!(
-                    ":: --run1-preemptions runs no target run to measure, so runs are not \
-                     bounded until analyze replays the record to verify it (not every search \
-                     does); pass --trial-timeout=SECONDS to bound every trial."
-                );
-            }
-            // Careful, returning a NON-launched RunData just to contain the output path.
-            return Ok(run1data);
-        }
-
-        // Translate the seed into a set of preemptions we can work from.
+        // Run the target, from its seed or by replaying --run1-preemptions, and
+        // record the preemptions and schedule the search works from. A replay
+        // of the record is the target run like a seed's: it is measured for the
+        // trial bound, and --selfcheck compares its log.
         let mut run1data = run1data.with_preemption_recording();
         run1data.launch()?;
         self.record_endpoint(&run1data);
 
         if !run1data.is_a_match() {
+            if let Some(record) = &self.run1_preemptions {
+                bail!(
+                    "the replay of --run1-preemptions {} did not meet the target criteria ({}). \
+                     A record replays the same only under the run arguments it was recorded \
+                     with (after `--`), --seed included: it sets the guest's random and fuzz \
+                     seeds and is not stored in the record. --search does not apply to a record; \
+                     to search, pass --run1-seed.",
+                    record.display(),
+                    self.display_criteria()
+                );
+            }
             if self.search {
                 eprintln!(
                     ":: {}",
@@ -2388,6 +2408,7 @@ impl AnalyzeOpts {
         .into_iter()
         .filter_map(|(option, path)| Some((option, path?)))
         .collect();
+        Self::refuse_recordings_numbered_apart(&recordings)?;
         self.adopt_recorded_epoch(&recordings)?;
         // Every trial charges expired timed waits as the target did.
         self.adopt_expired_wait_charge(run1.as_deref())?;
@@ -2396,7 +2417,8 @@ impl AnalyzeOpts {
         // Every trial runs under the timeslice its recordings drew.
         self.adopt_recorded_timeslice(&recordings)?;
         self.refuse_unsound_continuation_timeslice()?;
-        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
+        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)?;
+        self.prepare_trial_guest_ids(&recordings)
     }
 
     /// Take the settings `analyze` inherits from the global options: every
@@ -3114,10 +3136,10 @@ mod tests {
         }
     }
 
-    /// A one-event slice reuses the already-captured deciding stack. There
-    /// is no new slice-end replay whose outcome could be true or false.
+    /// A one-event slice still belongs to its own continuation. Capture both
+    /// endpoints and retain the separately labelled original deciding stack.
     #[test]
-    fn timing_reports_reuse_single_event_stacks_without_inventing_an_outcome() {
+    fn timing_reports_capture_single_event_slices_from_their_own_records() {
         let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
         for target_is_short in [false, true] {
             let (with, without, ends) = if target_is_short {
@@ -3136,7 +3158,9 @@ mod tests {
                     (true, &deciding),
                     (&without, Path::new("final_baseline_schedule.preempts")),
                     (
-                        |_, _| {
+                        |seen, len| {
+                            assert_eq!(seen, &record);
+                            assert_eq!(len, 2);
                             Ok((
                                 CompletedScheduleTrial {
                                     target_met: true,
@@ -3145,51 +3169,265 @@ mod tests {
                                 PathBuf::from("final_target_schedule.preempts"),
                             ))
                         },
-                        |runname, _, len, position| {
+                        |runname, variant, len, position| {
                             calls.borrow_mut().push(runname.to_owned());
-                            match runname {
+                            let (expected, end, met, stack) = match runname {
                                 "final_target_next_for_stacktraces" => {
-                                    assert_eq!((len, position), (ends[0] + 2, ends[0] + 1));
-                                    Ok((true, Some(timing_report_stack(7, 0x10))))
+                                    (&with, ends[0] + 1, true, timing_report_stack(7, 0x10))
                                 }
                                 "final_baseline_next_for_stacktraces" => {
-                                    assert_eq!((len, position), (ends[1] + 2, ends[1] + 1));
-                                    Ok((false, Some(timing_report_stack(5, 0x10))))
+                                    (&without, ends[1] + 1, false, timing_report_stack(5, 0x10))
                                 }
-                                "final_target_slice_end_for_stacktraces" => {
-                                    assert!(!target_is_short, "the target stack is reused");
-                                    assert_eq!((len, position), (4, 3));
-                                    Ok((true, Some(timing_report_stack(3, 0x30))))
-                                }
+                                "final_target_slice_end_for_stacktraces" => (
+                                    &with,
+                                    ends[0],
+                                    true,
+                                    timing_report_stack(
+                                        3,
+                                        if target_is_short { 0x20 } else { 0x30 },
+                                    ),
+                                ),
                                 "final_baseline_slice_end_for_stacktraces" => {
-                                    assert!(target_is_short, "the baseline stack is reused");
-                                    assert_eq!((len, position), (3, 2));
-                                    Ok((false, Some(timing_report_stack(3, 0x40))))
+                                    (&without, ends[1], false, timing_report_stack(3, 0x40))
                                 }
                                 other => panic!("unexpected replay {other}"),
-                            }
+                            };
+                            assert_eq!(variant.schedevents(), expected);
+                            assert_eq!((len, position), (end + 1, end));
+                            Ok((met, Some(stack)))
                         },
                     ),
                 )
                 .unwrap()
-                .expect("reusing a stack must not fabricate a contradictory replay");
+                .expect("each continuation certifies its own endpoint");
             assert_eq!(
-                calls.borrow().len(),
-                3,
-                "two next-thread and one slice-end replay"
+                *calls.borrow(),
+                [
+                    "final_target_next_for_stacktraces",
+                    "final_baseline_next_for_stacktraces",
+                    "final_target_slice_end_for_stacktraces",
+                    "final_baseline_slice_end_for_stacktraces",
+                ],
+                "two next-thread and two slice-end replays"
             );
             assert_eq!(report.critical_event1.event_index, ends[0]);
             assert_eq!(report.critical_event2.event_index, ends[1]);
-            let reused = if target_is_short {
-                &report.critical_event1.stack
-            } else {
-                &report.critical_event2.stack
-            };
-            assert!(same_frames(
-                reused.as_ref().unwrap(),
-                deciding.as_ref().unwrap()
-            ));
+            assert_eq!(
+                report.critical_event1.stack,
+                Some(timing_report_stack(
+                    3,
+                    if target_is_short { 0x20 } else { 0x30 }
+                ))
+            );
+            assert_eq!(
+                report.critical_event2.stack,
+                Some(timing_report_stack(3, 0x40))
+            );
+            assert_eq!(report.deciding_event.unwrap().stack, deciding);
         }
+    }
+
+    /// Completed, admitted checkpoint-free records can have one-event slices
+    /// at the same index but different operation batches. The target can also
+    /// realize a different count than the original deciding event. Model the
+    /// completed producer through the real file reader, not a native guest.
+    fn single_event_timing_report_for_test(
+        target_count: u32,
+        target_met: bool,
+        baseline_met: bool,
+        captured: bool,
+    ) -> (anyhow::Result<Option<Report>>, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        options.tmp_dir = Some(dir.path().to_path_buf());
+        let source =
+            PreemptionRecord::from_sched_events(branch_events(&[(5, 1), (3, 100), (7, 1), (5, 1)]));
+        source.validate().unwrap();
+        let with = branch_events(&[(5, 1), (3, target_count), (7, 1), (5, 1)]);
+        let without = branch_events(&[(5, 1), (3, 1), (7, 1), (5, 1)]);
+        let (baseline, baseline_path) = recorded_continuation_for_test(
+            &options,
+            "single_event_baseline",
+            &source,
+            1,
+            false,
+            &without,
+        );
+        assert!(!baseline.target_met);
+        let calls = std::cell::RefCell::new(Vec::new());
+        let deciding = Some(timing_report_stack(3, 0x20));
+        let result = options.report_timing_decision_with(
+            &source,
+            1,
+            None,
+            (true, &deciding),
+            (&baseline.schedule, &baseline_path),
+            (
+                |seen, len| {
+                    assert_eq!(seen, &source);
+                    assert_eq!(len, 2);
+                    Ok(recorded_continuation_for_test(
+                        &options,
+                        "single_event_target",
+                        seen,
+                        len,
+                        true,
+                        &with,
+                    ))
+                },
+                |runname, variant, len, position| {
+                    calls.borrow_mut().push(runname.to_owned());
+                    let (expected, prefix_len, end, met, stack) = match runname {
+                        "final_target_next_for_stacktraces" => {
+                            (&with, 2, 2, true, Some(timing_report_stack(7, 0x10)))
+                        }
+                        "final_baseline_next_for_stacktraces" => {
+                            (&without, 1, 2, false, Some(timing_report_stack(7, 0x10)))
+                        }
+                        "final_target_slice_end_for_stacktraces" => (
+                            &with,
+                            2,
+                            1,
+                            target_met,
+                            captured.then(|| {
+                                timing_report_stack(
+                                    3,
+                                    if target_count == 100 { 0x20 } else { 0x30 },
+                                )
+                            }),
+                        ),
+                        "final_baseline_slice_end_for_stacktraces" => (
+                            &without,
+                            1,
+                            1,
+                            baseline_met,
+                            captured.then(|| timing_report_stack(3, 0x40)),
+                        ),
+                        other => panic!("unexpected replay {other}"),
+                    };
+                    variant.validate().unwrap();
+                    assert_eq!(variant.schedevents(), expected);
+                    assert_prefix_metadata(variant, &source, prefix_len);
+                    assert_eq!((len, position), (end + 1, end));
+                    Ok((met, stack))
+                },
+            ),
+        );
+        let retained = PreemptionReader::try_new(&baseline_path)
+            .unwrap()
+            .into_inner();
+        assert_eq!(retained.schedevents(), &without);
+        (result, calls.into_inner())
+    }
+
+    #[test]
+    fn one_event_timing_slices_report_their_own_dynamic_endpoints() {
+        for target_count in [100, 101] {
+            let (result, calls) =
+                single_event_timing_report_for_test(target_count, true, false, true);
+            let report = result
+                .unwrap()
+                .expect("opposite completed outcomes certify the report");
+            assert_eq!(
+                report.critical_event2.stack,
+                Some(timing_report_stack(3, 0x40)),
+                "the one-branch baseline endpoint must not use the target deciding stack"
+            );
+            assert_eq!(
+                report.critical_event1.stack,
+                Some(timing_report_stack(
+                    3,
+                    if target_count == 100 { 0x20 } else { 0x30 }
+                )),
+                "the realized target endpoint must come from its own continued record"
+            );
+            assert_eq!(
+                (
+                    report.critical_event1.event_index,
+                    report.critical_event2.event_index
+                ),
+                (1, 1)
+            );
+            let deciding = report.deciding_event.unwrap();
+            assert_eq!(deciding.event_index, 1);
+            assert_eq!(deciding.stack, Some(timing_report_stack(3, 0x20)));
+            assert!(
+                report.header.contains(&format!(
+                    "runs 1 events ({target_count} retired conditional branches)"
+                )),
+                "{}",
+                report.header
+            );
+            assert!(
+                report
+                    .header
+                    .contains("runs 1 events (1 retired conditional branches)"),
+                "{}",
+                report.header
+            );
+            assert!(
+                !report.header.contains("same stack at both events"),
+                "{}",
+                report.header
+            );
+            assert_eq!(
+                calls,
+                [
+                    "final_target_next_for_stacktraces",
+                    "final_baseline_next_for_stacktraces",
+                    "final_target_slice_end_for_stacktraces",
+                    "final_baseline_slice_end_for_stacktraces",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn one_event_timing_slice_replays_must_repeat_their_own_outcomes() {
+        for (target_met, baseline_met, contradicted, expected_calls) in [
+            (true, true, "final_baseline_slice_end_for_stacktraces", 4),
+            (false, false, "final_target_slice_end_for_stacktraces", 3),
+        ] {
+            for captured in [true, false] {
+                let (result, calls) =
+                    single_event_timing_report_for_test(100, target_met, baseline_met, captured);
+                let error = result
+                    .expect_err(
+                        "a contradictory one-event slice replay cannot certify the decision",
+                    )
+                    .to_string();
+                assert!(
+                    error.contains(&format!("{contradicted} observed the opposite")),
+                    "{error}"
+                );
+                assert!(
+                    error.contains("no opposite-outcome pair was established"),
+                    "{error}"
+                );
+                assert_eq!(calls.len(), expected_calls);
+                assert_eq!(calls.last().unwrap(), contradicted);
+            }
+        }
+        let (result, calls) = single_event_timing_report_for_test(100, true, false, false);
+        let report = result
+            .unwrap()
+            .expect("missing stacks do not invent a contradictory outcome");
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            (
+                report.critical_event1.event_index,
+                report.critical_event2.event_index
+            ),
+            (2, 2)
+        );
+        assert_eq!(
+            report.critical_event1.stack,
+            Some(timing_report_stack(7, 0x10))
+        );
+        assert_eq!(
+            report.critical_event2.stack,
+            Some(timing_report_stack(7, 0x10))
+        );
     }
 
     /// The timing report creates another prefix continuation after the
@@ -4155,6 +4393,41 @@ mod tests {
         }
     }
 
+    /// A prefix stack trial asks for its stack by schedule position
+    /// (`--stacktrace-at-schedule-positions`), not by traced index: a trial
+    /// that makes a polling retry its recording did not make would otherwise
+    /// print a neighbouring event's stack
+    /// (https://github.com/rrnewton/hermit/issues/4917). The request names the
+    /// position, its stack file, and the replayed prefix, and the trial's
+    /// repro command carries the option.
+    #[test]
+    fn a_prefix_stack_trial_requests_its_stack_by_schedule_position() {
+        let parent = tempfile::tempdir().unwrap();
+        let tmp_dir = format!("--tmp-dir={}", parent.path().display());
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
+        let _workspace = options.phase0_initialize(Retention::Remove).unwrap();
+        let tid = detcore::types::DetTid::from_raw(3);
+        let target = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 4),
+            SchedEvent::branches(tid, 5),
+        ]);
+        let (run, stack_path) = options
+            .prefix_stack_trial("final_target_for_stacktraces", &target, 3, 2, None)
+            .unwrap();
+        let config = &run.runopts.det_opts.det_config;
+        assert!(config.stacktrace_at_schedule_positions);
+        assert_eq!(config.stacktrace_event, vec![(2, Some(stack_path))]);
+        assert!(config.replay_schedule_from.is_some());
+        assert!(
+            run.to_repro()
+                .contains(" --stacktrace-at-schedule-positions"),
+            "{}",
+            run.to_repro()
+        );
+    }
+
     /// The final prefix report repeats the trial's counter caveat in its
     /// JSON and immediately below its banner, and omits it for exact counters.
     #[test]
@@ -4272,7 +4545,8 @@ mod tests {
         let tmp_dir = format!("--tmp-dir={}", parent.path().display());
         let mut options =
             AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
-        let _workspace = options.phase0_initialize(Retention::Remove).unwrap();
+        let retention = options.workspace_retention();
+        let _workspace = options.phase0_initialize(retention).unwrap();
         let branches = |tid: u64, count: u32| {
             serde_json::json!({
                 "dettid": tid, "op": "Branch", "count": count,
@@ -4913,6 +5187,107 @@ mod tests {
             departure(&requested, &events(&[3, 5]), 5),
             Some(Departure::Ended { events: 2 })
         );
+    }
+
+    /// An unrecorded RIP is a wildcard, not a departure. This classification
+    /// determines which replay supplies the report's stack, not just wording.
+    #[test]
+    fn recorded_rip_wildcards_preserve_the_replays_stack_source() {
+        let tid = DetTid::from_raw;
+        for (start, end, observed_start, observed_end) in [
+            (None, None, Some(0x1000), None),
+            (None, None, None, Some(0x2000)),
+            (None, None, Some(0x1000), Some(0x2000)),
+            (Some(0x1000), None, Some(0x1000), Some(0x2000)),
+            (None, Some(0x2000), Some(0x1000), Some(0x2000)),
+        ] {
+            let mut requested = events(&[3, 5]);
+            requested[0].start_rip = start.and_then(std::num::NonZeroUsize::new);
+            requested[0].end_rip = end.and_then(std::num::NonZeroUsize::new);
+            let mut observed = requested.clone();
+            observed[0].start_rip = observed_start.and_then(std::num::NonZeroUsize::new);
+            observed[0].end_rip = observed_end.and_then(std::num::NonZeroUsize::new);
+            observed[0].count = 99;
+            let left_schedule = departure(&requested, &observed, 2);
+            assert_eq!(
+                left_schedule, None,
+                "extra unrecorded RIP information is not a departure"
+            );
+            let baseline = StackReplay {
+                met_target: false,
+                stacks: [
+                    Some(timing_report_stack(3, 0x31)),
+                    Some(timing_report_stack(5, 0x51)),
+                ],
+                left_schedule,
+                ran: [Some(tid(3)), Some(tid(5))],
+            };
+            let target = StackReplay {
+                met_target: true,
+                stacks: [
+                    Some(timing_report_stack(5, 0x52)),
+                    Some(timing_report_stack(3, 0x32)),
+                ],
+                left_schedule: None,
+                ran: [Some(tid(5)), Some(tid(3))],
+            };
+            assert_eq!(
+                merge_stacks(&baseline, &target, 1, [tid(3), tid(5)]),
+                [
+                    Some((
+                        timing_report_stack(3, 0x31),
+                        "the baseline replay".to_owned()
+                    )),
+                    Some((
+                        timing_report_stack(5, 0x51),
+                        "the baseline replay".to_owned()
+                    )),
+                ]
+            );
+        }
+        let mut requested = events(&[3, 5]);
+        requested[0].start_rip = std::num::NonZeroUsize::new(0x1000);
+        requested[0].end_rip = std::num::NonZeroUsize::new(0x2000);
+        assert_eq!(departure(&requested, &requested, 2), None);
+        for (start, end) in [
+            (None, Some(0x2000)),
+            (Some(0x1001), Some(0x2000)),
+            (Some(0x1000), None),
+            (Some(0x1000), Some(0x2001)),
+        ] {
+            let mut observed = requested.clone();
+            observed[0].start_rip = start.and_then(std::num::NonZeroUsize::new);
+            observed[0].end_rip = end.and_then(std::num::NonZeroUsize::new);
+            assert_eq!(
+                departure(&requested, &observed, 2),
+                Some(Departure::OtherEvent {
+                    index: 0,
+                    expected: requested[0].clone(),
+                    ran: observed[0].clone(),
+                }),
+                "a specified RIP must still be present and equal"
+            );
+        }
+        for other in [
+            SchedEvent::branches(tid(7), 10),
+            SchedEvent::syscall(
+                tid(3),
+                reverie::syscalls::Sysno::write,
+                detcore_model::schedule::SyscallPhase::Posthook,
+            ),
+        ] {
+            let requested = events(&[3, 5]);
+            let observed = vec![other.clone(), requested[1].clone()];
+            assert_eq!(
+                departure(&requested, &observed, 2),
+                Some(Departure::OtherEvent {
+                    index: 0,
+                    expected: requested[0].clone(),
+                    ran: other,
+                }),
+                "wildcard RIPs do not excuse a changed thread or operation"
+            );
+        }
     }
 
     /// A stack either replay captured is reported, in the passing order, with
