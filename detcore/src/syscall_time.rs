@@ -192,10 +192,8 @@ pub(crate) const MAX_UNCHARGED_BOOTSTRAP_SYSCALLS: u32 = 32768;
 /// wall-clock and monotonic clocks, the CPU-time clocks and counters, uptime,
 /// the time left on a timer, and the `time` field an `adjtimex` or
 /// `clock_adjtime` query returns (glibc's `ntp_gettime` reads the clock that
-/// way). Timerfd calls currently pass through to a host timer
-/// (https://github.com/rrnewton/hermit/issues/1923), so `timerfd_gettime`
-/// reports host time left, not virtual time; it is listed because its result
-/// is a timer value.
+/// way). For timerfds on Detcore's virtual clock, `timerfd_gettime` reports
+/// virtual time remaining (see [`crate::syscalls::timerfd`]).
 ///
 /// Inside a backend-runtime bootstrap window these syscalls are always charged,
 /// so two such reads on the bootstrapping thread differ by at least one syscall
