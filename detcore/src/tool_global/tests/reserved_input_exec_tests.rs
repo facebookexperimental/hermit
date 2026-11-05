@@ -232,6 +232,9 @@ async fn actual_root_start_and_same_leader_exec_retain_turn_for_timer_take_back(
         },
         sequentialize_threads: true,
         max_timeslice: None,
+        // No image is launched, so nothing resolves auto: post-exec runs
+        // under the named profile a launch would have resolved.
+        cpu_profile: detcore_model::cpu_profile::CpuProfile::X86_64V2,
         ..Config::default()
     };
     let mut state = GlobalState::initialize(&config, false);
@@ -358,6 +361,9 @@ async fn actual_nonleader_exec_resumes_once_before_new_image_timer_take_back() {
         },
         sequentialize_threads: true,
         max_timeslice: None,
+        // No image is launched, so nothing resolves auto: post-exec runs
+        // under the named profile a launch would have resolved.
+        cpu_profile: detcore_model::cpu_profile::CpuProfile::X86_64V2,
         ..Config::default()
     };
     let mut state = GlobalState::initialize(&config, false);
