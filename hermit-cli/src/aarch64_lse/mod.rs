@@ -31,20 +31,7 @@ pub use detcore::aarch64_lse::insn;
 pub use detcore::aarch64_lse::mapping;
 pub use detcore::aarch64_lse::rewrite;
 
-/// Bumped whenever the rewrite's output for the same input can change. It is
-/// part of the cache key, so a cached artifact from an older rewriter is
-/// never reused. 3: only code is rewritten, as [`mapping`] tells it from
-/// data; none of the changes since 2 had bumped it, though the canonical
-/// shapes the refusal census added, the conditional compare-and-swap
-/// refusal, the direct-entry decoding and the positive allow-list each
-/// changed what the rewrite writes. 4: a sequence a known entry (the
-/// loader's entry, a defined function symbol or an FDE start) points into
-/// is refused, as is a sub-word compare whose head is one. 5: literal loads
-/// of an FDE entry protect its instruction bytes from rewriting; only ADR
-/// address-taking can use the function-entry exemption. 6: literal readers
-/// in unknown executable ranges protect the bytes they reference, including
-/// bytes in other sections; only proven data is excluded from that scan.
-pub const REWRITE_FORMAT_VERSION: u32 = 6;
+pub use detcore::aarch64_lse::REWRITE_FORMAT_VERSION;
 
 /// Whether this host executes the FEAT_LSE atomics the rewrite emits.
 ///

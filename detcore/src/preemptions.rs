@@ -98,6 +98,64 @@ pub struct BackgroundStart {
     pub call: u64,
 }
 
+/// Where a run's rewrite of exclusive loops applied (`RewriteExclusives`).
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewriteExclusivesMode {
+    /// Rewritten copies of the named files, bind-mounted over the
+    /// originals before the guest ran (the default namespaced form of
+    /// `hermit run --rewrite-exclusives`).
+    Overlay,
+    /// Every executable file mapping rewritten in the guest's memory as
+    /// it was mapped (`Config::rewrite_exclusives_in_memory`).
+    Memory,
+}
+
+/// The exclusive-loop rewrite a record's run applied: where it applied and
+/// the rewrite format that produced the rewritten instructions
+/// (`crate::aarch64_lse::REWRITE_FORMAT_VERSION`). The rewrite changes the
+/// instructions the guest retires while the files stay the same, so a
+/// replay must apply the same rewrite; another mode, or another format
+/// version under the same mode, cannot be shown to retire the same
+/// instructions and is refused (`rewrite_exclusives_mismatch`).
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RewriteExclusives {
+    /// Where the rewrite applied.
+    pub mode: RewriteExclusivesMode,
+    /// The format of the rewriter that produced the rewritten code.
+    pub format_version: u32,
+}
+
+impl RewriteExclusives {
+    /// The rewrite this Hermit applies in `mode`: the current rewriter's
+    /// format version.
+    pub fn current(mode: RewriteExclusivesMode) -> Self {
+        Self {
+            mode,
+            format_version: crate::aarch64_lse::REWRITE_FORMAT_VERSION,
+        }
+    }
+
+    /// Whether this rewrite is the in-memory one, as the record's older
+    /// `rewrite_exclusives_in_memory` field states it.
+    fn in_memory(&self) -> bool {
+        self.mode == RewriteExclusivesMode::Memory
+    }
+
+    fn describe(&self) -> String {
+        let where_ = match self.mode {
+            RewriteExclusivesMode::Overlay => {
+                "exclusive loops rewritten in overlaid files (--rewrite-exclusives)"
+            }
+            RewriteExclusivesMode::Memory => {
+                "exclusive loops rewritten in the guest's memory (--rewrite-exclusives)"
+            }
+        };
+        format!("{where_} by rewrite format {}", self.format_version)
+    }
+}
+
 /// A record of all the preemptions and other scheduling events that occur during execution.
 #[derive(PartialEq, Default, Debug, Eq, Clone, Hash)]
 pub struct PreemptionRecord {
@@ -273,6 +331,9 @@ pub struct PreemptionRecord {
     /// file stays the same, so a replay under the other setting would run
     /// other code with nothing to tell it apart, and is refused. Written only
     /// when on, so absent means off, as for every record made before it.
+    /// Kept beside `rewrite_exclusives` so a reader that predates the
+    /// provenance still refuses the in-memory mismatch it can see; the two
+    /// never disagree in a record this Hermit writes.
     rewrite_exclusives_in_memory: bool,
     /// Whether the record holds rows alone, without the schedule trace and
     /// jumps of global time of the run they came from: a copy of a record's
@@ -293,6 +354,14 @@ pub struct PreemptionRecord {
     /// format instead and never has it, so a record main writes is unchanged.
     /// Written only when set.
     background_starts_unnoted: bool,
+    /// The exclusive-loop rewrite the record's run applied, if any
+    /// (`RewriteExclusives`): its mode and rewrite format version. `None`
+    /// in a record whose run rewrote nothing and in every record made
+    /// before the field existed — including an in-memory one whose
+    /// `rewrite_exclusives_in_memory` is set — whose rewritten
+    /// instructions no replay that rewrites can be shown to reproduce,
+    /// and which is therefore refused for such a replay.
+    rewrite_exclusives: Option<RewriteExclusives>,
 }
 
 /// A count a record's run observed on its host rather than decided: it is
@@ -585,6 +654,7 @@ impl PreemptionRecord {
             rewrite_exclusives_in_memory: false,
             rows_alone: false,
             background_starts_unnoted: false,
+            rewrite_exclusives: None,
         }
     }
 
@@ -660,6 +730,7 @@ impl PreemptionRecord {
             rewrite_exclusives_in_memory,
             rows_alone,
             background_starts_unnoted,
+            rewrite_exclusives,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -748,6 +819,7 @@ impl PreemptionRecord {
             rewrite_exclusives_in_memory: *rewrite_exclusives_in_memory,
             rows_alone: *rows_alone,
             background_starts_unnoted: *background_starts_unnoted,
+            rewrite_exclusives: *rewrite_exclusives,
         };
         // The background starts are points of the recorded run too, and go
         // the same way, as an edited record's do (`forget_run_points`): a
@@ -1154,9 +1226,28 @@ impl PreemptionRecord {
 
     /// The same record, stating whether the trials it came from rewrote
     /// exclusive loops in the guest's memory; analyze stamps it on every
-    /// record it writes, as it stamps the pipe-wake latency.
-    pub fn with_rewrite_exclusives_in_memory(mut self, on: bool) -> Self {
-        self.rewrite_exclusives_in_memory = on;
+    /// record it writes, as it stamps the pipe-wake latency. Stating it on
+    /// states the current rewriter's provenance with it
+    /// (`with_rewrite_exclusives`); stating it off clears any provenance,
+    /// so use that setter for an overlay rewrite.
+    pub fn with_rewrite_exclusives_in_memory(self, on: bool) -> Self {
+        self.with_rewrite_exclusives(
+            on.then(|| RewriteExclusives::current(RewriteExclusivesMode::Memory)),
+        )
+    }
+
+    /// The exclusive-loop rewrite the run this record came from applied,
+    /// if it states one.
+    pub fn rewrite_exclusives(&self) -> Option<RewriteExclusives> {
+        self.rewrite_exclusives
+    }
+
+    /// The same record, stating the exclusive-loop rewrite the trials it
+    /// came from applied, if any; analyze stamps it on every record it
+    /// writes. The older in-memory field is set to agree.
+    pub fn with_rewrite_exclusives(mut self, rewrite: Option<RewriteExclusives>) -> Self {
+        self.rewrite_exclusives = rewrite;
+        self.rewrite_exclusives_in_memory = rewrite.is_some_and(|rewrite| rewrite.in_memory());
         self
     }
 
@@ -1367,6 +1458,7 @@ impl PreemptionRecord {
             rows_alone: self.rows_carry_instruction_offsets(),
             // Rows alone note no starts by that mark (`notes_background_starts`).
             background_starts_unnoted: false,
+            rewrite_exclusives: self.rewrite_exclusives,
         }
     }
 
@@ -1448,6 +1540,7 @@ impl PreemptionRecord {
             rewrite_exclusives_in_memory: false,
             rows_alone: false,
             background_starts_unnoted: false,
+            rewrite_exclusives: None,
         }
     }
 
@@ -3537,6 +3630,177 @@ mod tests {
                     .is_some(),
                 recorded != replay,
                 "{recorded} replayed with {replay}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_exclusive_rewrite_provenance_round_trips_and_is_compared() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("record.json");
+        for mode in [
+            RewriteExclusivesMode::Overlay,
+            RewriteExclusivesMode::Memory,
+        ] {
+            let rewrite = RewriteExclusives::current(mode);
+            let written = PreemptionWriter::new(None)
+                .with_rewrite_exclusives(Some(rewrite))
+                .into_string();
+            let name = match mode {
+                RewriteExclusivesMode::Overlay => "overlay",
+                RewriteExclusivesMode::Memory => "memory",
+            };
+            assert!(
+                written.contains(&format!(
+                    "\"rewrite_exclusives\":{{\"mode\":\"{name}\",\"format_version\":{}}}",
+                    crate::aarch64_lse::REWRITE_FORMAT_VERSION
+                )),
+                "{written}"
+            );
+            // The older field agrees, so a pre-provenance reader still
+            // refuses the in-memory mismatch it can see.
+            assert_eq!(
+                written.contains("\"rewrite_exclusives_in_memory\":true"),
+                rewrite.in_memory(),
+                "{written}"
+            );
+            let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+            assert_eq!(back.rewrite_exclusives(), Some(rewrite));
+            assert_eq!(
+                back.clone_preemptions_only().rewrite_exclusives(),
+                Some(rewrite)
+            );
+            std::fs::write(&path, &written).unwrap();
+            assert_eq!(
+                read_recorded_rewrite_exclusives(&path),
+                Ok(RecordedRewriteExclusives {
+                    rewrite: Some(rewrite),
+                    in_memory: rewrite.in_memory(),
+                    stripped_heuristic: false,
+                })
+            );
+        }
+        // A record that states nothing, one that states only the older
+        // in-memory field, and one of the removed heuristic, read as what
+        // they are.
+        for (json, expected) in [
+            (
+                r#"{"per_thread":{},"global":[]}"#,
+                RecordedRewriteExclusives::default(),
+            ),
+            (
+                r#"{"per_thread":{},"global":[],"rewrite_exclusives_in_memory":true}"#,
+                RecordedRewriteExclusives {
+                    rewrite: None,
+                    in_memory: true,
+                    stripped_heuristic: false,
+                },
+            ),
+            (
+                r#"{"per_thread":{},"global":[],"rewrite_exclusives_stripped_heuristic":true}"#,
+                RecordedRewriteExclusives {
+                    rewrite: None,
+                    in_memory: false,
+                    stripped_heuristic: true,
+                },
+            ),
+        ] {
+            std::fs::write(&path, json).unwrap();
+            assert_eq!(
+                read_recorded_rewrite_exclusives(&path),
+                Ok(expected),
+                "{json}"
+            );
+            let back: PreemptionRecord = serde_json::from_str(json).unwrap();
+            assert_eq!(back.rewrite_exclusives(), None, "{json}");
+            if !expected.stripped_heuristic {
+                // A legacy key no record field owns is read for admission
+                // only, and is not written back.
+                assert_eq!(serde_json::to_string(&back).unwrap(), json, "{json}");
+            }
+        }
+        let provenance = |mode, format_version| {
+            Some(RewriteExclusives {
+                mode,
+                format_version,
+            })
+        };
+        let stated = |rewrite, in_memory| RecordedRewriteExclusives {
+            rewrite,
+            in_memory,
+            stripped_heuristic: false,
+        };
+        let heuristic = RecordedRewriteExclusives {
+            rewrite: None,
+            in_memory: false,
+            stripped_heuristic: true,
+        };
+        for (recorded, replay, refused) in [
+            (heuristic, None, true),
+            (
+                heuristic,
+                provenance(RewriteExclusivesMode::Overlay, 6),
+                true,
+            ),
+            (
+                heuristic,
+                provenance(RewriteExclusivesMode::Memory, 6),
+                true,
+            ),
+            (stated(None, false), None, false),
+            (
+                stated(None, false),
+                provenance(RewriteExclusivesMode::Overlay, 6),
+                true,
+            ),
+            (
+                stated(None, false),
+                provenance(RewriteExclusivesMode::Memory, 6),
+                true,
+            ),
+            (stated(None, true), None, true),
+            // Same in-memory setting on both sides, but the record states
+            // no format version.
+            (
+                stated(None, true),
+                provenance(RewriteExclusivesMode::Memory, 6),
+                true,
+            ),
+            (
+                stated(provenance(RewriteExclusivesMode::Memory, 6), true),
+                provenance(RewriteExclusivesMode::Memory, 6),
+                false,
+            ),
+            (
+                stated(provenance(RewriteExclusivesMode::Memory, 5), true),
+                provenance(RewriteExclusivesMode::Memory, 6),
+                true,
+            ),
+            (
+                stated(provenance(RewriteExclusivesMode::Memory, 6), true),
+                provenance(RewriteExclusivesMode::Overlay, 6),
+                true,
+            ),
+            (
+                stated(provenance(RewriteExclusivesMode::Overlay, 6), false),
+                provenance(RewriteExclusivesMode::Overlay, 6),
+                false,
+            ),
+            (
+                stated(provenance(RewriteExclusivesMode::Overlay, 6), false),
+                None,
+                true,
+            ),
+            (
+                stated(provenance(RewriteExclusivesMode::Overlay, 5), false),
+                provenance(RewriteExclusivesMode::Overlay, 6),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                rewrite_exclusives_mismatch("--replay-schedule-from=x", recorded, replay).is_some(),
+                refused,
+                "{recorded:?} replayed with {replay:?}"
             );
         }
     }
@@ -5645,9 +5909,21 @@ impl PreemptionWriter {
     }
 
     /// Store whether the run rewrites exclusive loops in the guest's memory
-    /// (`Config::rewrite_exclusives_in_memory`).
-    pub fn with_rewrite_exclusives_in_memory(mut self, on: bool) -> Self {
-        self.inner.rewrite_exclusives_in_memory = on;
+    /// (`Config::rewrite_exclusives_in_memory`). On states the current
+    /// rewriter's provenance with it (`with_rewrite_exclusives`); off
+    /// clears any provenance, so use that setter for an overlay rewrite.
+    pub fn with_rewrite_exclusives_in_memory(self, on: bool) -> Self {
+        self.with_rewrite_exclusives(
+            on.then(|| RewriteExclusives::current(RewriteExclusivesMode::Memory)),
+        )
+    }
+
+    /// Store the exclusive-loop rewrite the run applies, if any
+    /// (`RewriteExclusives`). The older in-memory field is set to agree.
+    pub fn with_rewrite_exclusives(mut self, rewrite: Option<RewriteExclusives>) -> Self {
+        self.inner.rewrite_exclusives = rewrite;
+        self.inner.rewrite_exclusives_in_memory =
+            rewrite.is_some_and(|rewrite| rewrite.in_memory());
         self
     }
 
@@ -6654,6 +6930,102 @@ pub fn read_recorded_rewrite_exclusives_in_memory(path: &Path) -> Result<bool, S
         rewrite_exclusives_in_memory: bool,
     }
     Ok(boundary_recording::read_settings::<RewriteOnly>(path)?.rewrite_exclusives_in_memory)
+}
+
+/// What a preemption record file states about its run's exclusive-loop
+/// rewrite, for replay admission (`rewrite_exclusives_mismatch`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecordedRewriteExclusives {
+    /// The stated provenance, when the record carries one.
+    pub rewrite: Option<RewriteExclusives>,
+    /// The older in-memory field, the only rewrite a record made before
+    /// the provenance could state.
+    pub in_memory: bool,
+    /// A record of the removed stripped-file heuristic rewrite
+    /// (`rewrite_exclusives_stripped_heuristic`), whose rewritten
+    /// instructions no supported rewrite reproduces.
+    pub stripped_heuristic: bool,
+}
+
+/// Read only what a preemption record file states about its run's
+/// exclusive-loop rewrite, as [`read_recorded_epoch`] reads the epoch.
+pub fn read_recorded_rewrite_exclusives(path: &Path) -> Result<RecordedRewriteExclusives, String> {
+    #[derive(Deserialize)]
+    struct RewriteOnly {
+        #[serde(default)]
+        rewrite_exclusives: Option<RewriteExclusives>,
+        #[serde(default)]
+        rewrite_exclusives_in_memory: bool,
+        #[serde(default)]
+        rewrite_exclusives_stripped_heuristic: bool,
+    }
+    let read = boundary_recording::read_settings::<RewriteOnly>(path)?;
+    Ok(RecordedRewriteExclusives {
+        rewrite: read.rewrite_exclusives,
+        in_memory: read.rewrite_exclusives_in_memory,
+        stripped_heuristic: read.rewrite_exclusives_stripped_heuristic,
+    })
+}
+
+/// The refusal of a replay whose exclusive-loop rewrite (`replay`, this
+/// Hermit's current provenance, or `None` for no rewrite) is not the one
+/// the record states, naming the record by `source` (an option and a
+/// path); `None` when the replay can be shown to retire the same
+/// instructions. A record of the removed stripped-file heuristic is
+/// always refused, and so is a record that states no provenance — made
+/// before records carried it, an in-memory one included — when the
+/// replay rewrites at all: its rewritten instructions are unknown. Only
+/// a replay that rewrites nothing still follows such a record, as it did
+/// before the provenance existed, unless the record states the in-memory
+/// rewrite.
+pub fn rewrite_exclusives_mismatch(
+    source: &str,
+    recorded: RecordedRewriteExclusives,
+    replay: Option<RewriteExclusives>,
+) -> Option<String> {
+    if recorded.stripped_heuristic {
+        return Some(format!(
+            "{source} was recorded with exclusive loops rewritten by the removed stripped-file \
+             heuristic. No rewrite this Hermit applies reproduces the instructions that \
+             heuristic wrote, so the replay cannot reproduce the run. Re-record the run with \
+             --rewrite-exclusives."
+        ));
+    }
+    let show = |rewrite: Option<RewriteExclusives>| match rewrite {
+        Some(rewrite) => rewrite.describe(),
+        None => "exclusive loops as the files have them".to_owned(),
+    };
+    if recorded.rewrite == replay {
+        // Equal stated provenance, or neither side rewrites and the
+        // record states none (checked against the older field below).
+        if replay.is_some() || !recorded.in_memory {
+            return None;
+        }
+    }
+    if recorded.rewrite.is_none() && replay.is_some() {
+        return Some(format!(
+            "{source} does not state how its run rewrote exclusive loops (it was made before \
+             records carried the rewrite's mode and format version), and this replay would \
+             run with {}. Its rewritten instructions cannot be shown to be the recording's, \
+             so the replay cannot reproduce the run. Re-record the run.",
+            show(replay),
+        ));
+    }
+    let recorded_show = match recorded.rewrite {
+        Some(rewrite) => rewrite.describe(),
+        None if recorded.in_memory => {
+            "exclusive loops rewritten in the guest's memory by a rewrite format it does \
+             not state"
+                .to_owned()
+        }
+        None => show(None),
+    };
+    Some(format!(
+        "{source} was recorded with {recorded_show} and would be replayed with {}. The \
+         rewrite changes the instructions the guest retires, so the replay cannot reproduce \
+         the run. Replay with {recorded_show}.",
+        show(replay),
+    ))
 }
 
 /// The refusal of a replay that would rewrite exclusive loops in the guest's

@@ -1914,9 +1914,10 @@ impl AnalyzeOpts {
     /// copy setting, `--expired-wait-charge` and `--sleep-registration`, as
     /// every record analyze writes must be: a record that omitted one would
     /// be accepted when replayed under another value
-    /// Whether the trials rewrite exclusive loops in the guest's memory.
-    pub fn trial_rewrite_exclusives_in_memory(&self) -> bool {
-        RunData::get_raw_runopts(self).rewrites_exclusives_in_memory()
+    /// The exclusive-loop rewrite the trials apply, if any, as a record
+    /// states it.
+    pub fn trial_rewrite_exclusives(&self) -> Option<detcore::preemptions::RewriteExclusives> {
+        RunData::get_raw_runopts(self).rewrite_exclusives_provenance()
     }
 
     /// The post-crash bound in effect in the trials
@@ -1946,7 +1947,7 @@ impl AnalyzeOpts {
             .with_queued_sleeps_registered_at_first_pass(
                 self.trial_sleep_registration() == SleepRegistration::FirstPass,
             )
-            .with_rewrite_exclusives_in_memory(self.trial_rewrite_exclusives_in_memory())
+            .with_rewrite_exclusives(self.trial_rewrite_exclusives())
             .with_post_crash_timeslice(self.trial_post_crash_timeslice());
         // Under `--no-namespace`, the guest IDs every trial takes, resolved
         // before the first (`prepare_trial_guest_ids`): a record without them
@@ -2134,12 +2135,12 @@ impl AnalyzeOpts {
                     anyhow::Error::new(crate::app::container::PolicyRefusal).context(refusal)
                 );
             }
-            let recorded = detcore::preemptions::read_recorded_rewrite_exclusives_in_memory(path)
+            let recorded = detcore::preemptions::read_recorded_rewrite_exclusives(path)
                 .map_err(anyhow::Error::msg)?;
-            if let Some(refusal) = detcore::preemptions::rewrite_exclusives_in_memory_mismatch(
+            if let Some(refusal) = detcore::preemptions::rewrite_exclusives_mismatch(
                 &format!("{option} {}", path.display()),
                 recorded,
-                self.trial_rewrite_exclusives_in_memory(),
+                self.trial_rewrite_exclusives(),
             ) {
                 return Err(
                     anyhow::Error::new(crate::app::container::PolicyRefusal).context(refusal)

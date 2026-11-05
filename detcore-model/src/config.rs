@@ -4202,6 +4202,9 @@ mod legacy_backend_json {
     /// rewrite of aarch64 exclusive loops is done by the ptrace backend's
     /// global state, and no backend that reads the legacy form does it, so it
     /// is never written and reads as false.
+    /// `rewrite_exclusives_overlay` came after it too: the CLI replaced the
+    /// files before the run, and only the record states it, so it is never
+    /// written and reads as false.
     /// `post_crash_timeslice` came after it too, and the scheduler acts on it
     /// as well, so it is never written and reads as off.
     /// `stacktrace_at_schedule_positions` came after it too. It is never
@@ -4269,6 +4272,7 @@ mod legacy_backend_json {
         "standard_stream_aliases",
         "rewrite_exclusives_unmarked",
         "rewrite_exclusives_in_memory",
+        "rewrite_exclusives_overlay",
         "count_store_exclusives",
         "stacktrace_at_schedule_positions",
         "property_snapshot",
@@ -4801,6 +4805,7 @@ mod legacy_backend_json {
                 | "access_trace_max_records"
                 | "access_trace_max_bytes"
                 | "rewrite_exclusives_in_memory"
+                | "rewrite_exclusives_overlay"
                 | "count_store_exclusives"
                 | "stacktrace_at_schedule_positions"
                 | "property_snapshot"
@@ -5821,6 +5826,7 @@ mod tests {
                 | "access_trace_max_records"
                 | "access_trace_max_bytes"
                 | "rewrite_exclusives_in_memory"
+                | "rewrite_exclusives_overlay"
                 | "count_store_exclusives"
                 | "stacktrace_at_schedule_positions"
                 | "property_snapshot"
@@ -6566,26 +6572,23 @@ mod tests {
         };
         let on = Config {
             rewrite_exclusives_in_memory: true,
+            rewrite_exclusives_overlay: vec!["/bin/guest".into()],
             ..off.clone()
         };
         let json = to_legacy_backend_json(&on).unwrap();
         assert_eq!(json, to_legacy_backend_json(&off).unwrap());
-        assert!(!json.contains("rewrite_exclusives_in_memory"), "{json}");
-        assert!(
-            !from_legacy_backend_json(&json)
-                .unwrap()
-                .rewrite_exclusives_in_memory
-        );
+        assert!(!json.contains("rewrite_exclusives"), "{json}");
+        let back = from_legacy_backend_json(&json).unwrap();
+        assert!(!back.rewrite_exclusives_in_memory);
+        assert!(back.rewrite_exclusives_overlay.is_empty());
         let values: Vec<serde_json::Value> = ordered_entries(&json)
             .into_iter()
             .map(|(_, value)| value)
             .collect();
         let array = serde_json::to_string(&values).unwrap();
-        assert!(
-            !from_legacy_backend_json(&array)
-                .unwrap()
-                .rewrite_exclusives_in_memory
-        );
+        let back = from_legacy_backend_json(&array).unwrap();
+        assert!(!back.rewrite_exclusives_in_memory);
+        assert!(back.rewrite_exclusives_overlay.is_empty());
     }
 
     /// `rewrite_exclusives_overlay` never enters the legacy form, whatever
