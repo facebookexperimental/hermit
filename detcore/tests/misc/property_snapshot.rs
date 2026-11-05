@@ -172,7 +172,20 @@ fn a_property_snapshot_serves_every_read_of_the_files_it_copied() {
 /// chain of exactly the kernel's 40 nested links is likewise
 /// refused (Linux creates through 40 traversals), while a 41-link
 /// chain reaches the real open and fails there with `ELOOP`, as
-/// natively, creating nothing.
+/// natively, creating nothing. An overlong guest-only descriptor
+/// parent is refused under every spelling that resolves to it in
+/// the guest (`.` and `..` components and repeated slashes, by
+/// `self`, `thread-self` and `/dev/fd`, through an intermediate
+/// symlink alias to the guest descriptor, and including a spelling
+/// whose resolution on the host succeeds but names the tracer's
+/// own, different directory for the same descriptor number), and
+/// a parent that cannot be proven outside the area in the guest
+/// (a missing parent, or any overlong spelled parent, including
+/// one naming a real outside directory) fails closed with the
+/// named refusal rather than being treated as outside on the
+/// strength of any host-side resolution; outside creations the
+/// guest probe can prove (plain, chained, and short descriptor
+/// spellings) still succeed.
 #[test]
 fn a_late_property_file_is_refused_through_alias_spellings() {
     let area = area();
@@ -194,6 +207,10 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
     let outside = tempfile::tempdir_in(area.live.path().parent().unwrap()).unwrap();
     let alias_dir = outside.path().join("alias-area");
     std::os::unix::fs::symlink(area.live.path(), &alias_dir).unwrap();
+    // An intermediate symlink alias to a guest-only descriptor: in
+    // the guest it names the area through the guest's fd 900, while
+    // the tracer has no fd 900 at all.
+    std::os::unix::fs::symlink("/proc/self/fd/900", outside.path().join("fd-alias")).unwrap();
     let dangling_link = outside.path().join("dangling-final");
     std::os::unix::fs::symlink(&dangling_target, &dangling_link).unwrap();
     // A dangling final symlink whose target names the area only
@@ -310,6 +327,34 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
         !Path::new("/proc/self/fd/900").exists(),
         "control: fd 900 must be absent in the tracer"
     );
+    assert!(
+        !Path::new("/nonexistent-4791-property-area").exists(),
+        "control: the missing-parent directory must be absent"
+    );
+    // A descriptor this (tracer) process holds on the outside
+    // directory, at a number the guest rebinds to the live area:
+    // resolving `/proc/self/fd/902/...` on the host succeeds and
+    // names the outside directory, while the guest's own fd 902 is
+    // the area, so host evidence must never promote that spelling.
+    let tracer_outside = std::fs::File::open(outside.path()).unwrap();
+    {
+        use std::os::fd::AsRawFd;
+        assert!(
+            !Path::new("/proc/self/fd/902").exists(),
+            "control: fd 902 must be absent in the tracer before setup"
+        );
+        // SAFETY: duplicating an open directory descriptor.
+        assert_eq!(unsafe { libc::dup2(tracer_outside.as_raw_fd(), 902) }, 902);
+    }
+    {
+        let via_fd = std::fs::metadata("/proc/self/fd/902").unwrap();
+        let direct = std::fs::metadata(outside.path()).unwrap();
+        assert_eq!(
+            (via_fd.dev(), via_fd.ino()),
+            (direct.dev(), direct.ino()),
+            "control: the tracer's fd 902 names the outside directory"
+        );
+    }
     let outside_chain_host = outside_chain_target.clone();
     let outside_plain_host = outside_plain_target.clone();
     let guest = move || {
@@ -567,32 +612,158 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
         // A parent named through a guest-only descriptor, too long
         // to resolve staged, cannot be decided from the tracer's
         // descriptor table: creation through it is refused before
-        // it runs, while a short descriptor spelling of an outside
+        // it runs, under every spelling that resolves to it in the
+        // guest, while a short descriptor spelling of an outside
         // directory is decided in the guest and still creates.
+        // Outcomes are collected so one run names every spelling
+        // that was not refused; the host files must stay absent.
         {
             let directory = std::fs::File::open(&live_dir).unwrap();
             // SAFETY: duplicating an open directory descriptor.
             assert_eq!(unsafe { libc::dup2(directory.as_raw_fd(), 900) }, 900);
-            let spelling = format!("/proc/self/fd/900/{}long-proc-fd-created", "./".repeat(300));
-            assert!(spelling.len() > 512);
-            let c = std::ffi::CString::new(spelling).unwrap();
-            // SAFETY: a valid NUL-terminated path and a creation mode.
-            let fd = unsafe {
-                libc::open(
-                    c.as_ptr(),
-                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-                    0o600,
-                )
-            };
-            assert_eq!(fd, -1, "long guest-only fd parent creation must be refused");
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::EOPNOTSUPP),
-                "long guest-only fd parent"
-            );
-            // SAFETY: the descriptor duplicated above.
+            // The guest's fd 902 is the area, where the tracer's
+            // own fd 902 (held by the test) names the outside dir.
+            // SAFETY: duplicating an open directory descriptor.
+            assert_eq!(unsafe { libc::dup2(directory.as_raw_fd(), 902) }, 902);
+            let dots = "./".repeat(300);
+            let spellings: [(&str, String); 10] = [
+                (
+                    "long guest-only fd parent",
+                    format!("/proc/self/fd/900/{dots}long-proc-fd-created"),
+                ),
+                (
+                    "dot proc self fd parent",
+                    format!("/proc/./self/fd/900/{dots}dot-proc-fd-created"),
+                ),
+                (
+                    "dot proc thread-self fd parent",
+                    format!("/proc/./thread-self/fd/900/{dots}dot-thread-fd-created"),
+                ),
+                (
+                    "dot dev fd parent",
+                    format!("/dev/./fd/900/{dots}dot-dev-fd-created"),
+                ),
+                (
+                    "repeated-slash proc fd parent",
+                    format!("//proc//self//fd/900/{dots}slashes-proc-fd-created"),
+                ),
+                (
+                    "dotdot proc fd parent",
+                    format!("/tmp/../proc/self/fd/900/{dots}dotdot-proc-fd-created"),
+                ),
+                (
+                    "inner dotdot proc fd parent",
+                    format!("/proc/self/fd/../fd/900/{dots}inner-dotdot-proc-fd-created"),
+                ),
+                (
+                    "leading dot proc fd parent",
+                    format!("/./proc/self/fd/900/{dots}leading-dot-proc-created"),
+                ),
+                (
+                    "host-success divergent fd parent",
+                    format!("/proc/./self/fd/902/{dots}host-alias-fd-created"),
+                ),
+                (
+                    "symlink alias to guest fd parent",
+                    format!(
+                        "{}/fd-alias/{dots}alias-to-fd-created",
+                        outside_dir.display()
+                    ),
+                ),
+            ];
+            let mut failures: Vec<String> = Vec::new();
+            for (what, spelling) in &spellings {
+                assert!(spelling.len() > 512, "{what}");
+                let c = std::ffi::CString::new(spelling.as_str()).unwrap();
+                // SAFETY: a valid NUL-terminated path and a creation mode.
+                let fd = unsafe {
+                    libc::open(
+                        c.as_ptr(),
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                        0o600,
+                    )
+                };
+                if fd >= 0 {
+                    // SAFETY: the descriptor opened above.
+                    unsafe { libc::close(fd) };
+                    failures.push(format!("{what}: open succeeded"));
+                } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EOPNOTSUPP) {
+                    failures.push(format!(
+                        "{what}: refused with {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+            // SAFETY: the descriptors duplicated above.
             unsafe { libc::close(900) };
+            unsafe { libc::close(902) };
             drop(directory);
+            // A parent that cannot be proven outside the area fails
+            // closed with the named refusal: a resolution that fails,
+            // in the guest probe or on the host, is not proof of
+            // outside. Natively both spellings fail `ENOENT`.
+            for (what, spelling) in [
+                (
+                    "short missing parent",
+                    "/nonexistent-4791-property-area/missing-short-created".to_owned(),
+                ),
+                (
+                    "long missing parent",
+                    format!("/nonexistent-4791-property-area/{dots}missing-long-created"),
+                ),
+            ] {
+                let c = std::ffi::CString::new(spelling).unwrap();
+                // SAFETY: a valid NUL-terminated path and a creation mode.
+                let fd = unsafe {
+                    libc::open(
+                        c.as_ptr(),
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                        0o600,
+                    )
+                };
+                if fd >= 0 {
+                    // SAFETY: the descriptor opened above.
+                    unsafe { libc::close(fd) };
+                    failures.push(format!("{what}: open succeeded"));
+                } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EOPNOTSUPP) {
+                    failures.push(format!(
+                        "{what}: refused with {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+            // An overlong spelling of a real outside directory is
+            // the stated fail-closed bound: only host-side
+            // resolution could decide it, and host resolution never
+            // decides a spelled parent, so it is refused by name
+            // even though it is in fact outside. Guest-provable
+            // outside creations are the short controls above and
+            // below (plain, chained, short descriptor spellings).
+            {
+                let spelling = format!("{}/{dots}long-outside-created", outside_dir.display());
+                assert!(spelling.len() > 512);
+                let c = std::ffi::CString::new(spelling).unwrap();
+                // SAFETY: a valid NUL-terminated path and a creation mode.
+                let fd = unsafe {
+                    libc::open(
+                        c.as_ptr(),
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                        0o600,
+                    )
+                };
+                if fd >= 0 {
+                    // SAFETY: the descriptor opened above.
+                    unsafe { libc::close(fd) };
+                    failures
+                        .push("long host-only-resolvable outside parent: open succeeded".into());
+                } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EOPNOTSUPP) {
+                    failures.push(format!(
+                        "long host-only-resolvable outside parent: refused with {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+            assert!(failures.is_empty(), "guest-context spellings: {failures:?}");
             let outside_directory = std::fs::File::open(&outside_dir).unwrap();
             // SAFETY: duplicating an open directory descriptor.
             assert_eq!(
@@ -660,6 +831,30 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
         !procfd_absent_host.exists(),
         "a refused long guest-only fd parent O_CREAT made a file"
     );
+    for name in [
+        "dot-proc-fd-created",
+        "dot-thread-fd-created",
+        "dot-dev-fd-created",
+        "slashes-proc-fd-created",
+        "dotdot-proc-fd-created",
+        "inner-dotdot-proc-fd-created",
+        "leading-dot-proc-created",
+        "host-alias-fd-created",
+        "alias-to-fd-created",
+    ] {
+        assert!(
+            !area.live.path().join(name).exists(),
+            "a refused {name} O_CREAT made a file"
+        );
+    }
+    assert!(
+        !Path::new("/nonexistent-4791-property-area").exists(),
+        "a refused missing-parent O_CREAT made its directory"
+    );
+    assert!(
+        !outside.path().join("long-outside-created").exists(),
+        "a refused long host-only-resolvable outside O_CREAT made a file"
+    );
     assert!(
         procfd_outside_host.exists(),
         "a short proc-fd creation outside the area made no file"
@@ -672,6 +867,13 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
         outside_plain_host.exists(),
         "a plain creation outside the area made no file"
     );
+    assert!(
+        !outside.path().join("host-alias-fd-created").exists(),
+        "a refused host-success divergent fd O_CREAT made a file outside"
+    );
+    // SAFETY: the descriptor duplicated in this process above.
+    unsafe { libc::close(902) };
+    drop(tracer_outside);
 }
 
 /// A redirected open serves its copy through a non-`AT_FDCWD` dirfd and

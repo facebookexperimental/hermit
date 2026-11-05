@@ -1274,15 +1274,16 @@ enum LiveCheck {
 /// Whether a creation's parent directory, resolved as the pending
 /// open resolves it, is the live property area (`resolved_parent_area`).
 enum ParentArea {
-    /// The resolved parent is the live area itself.
+    /// The resolved parent is the live area itself, proven by identity.
     Area,
-    /// The resolved parent is some other directory, or cannot be
-    /// resolved at all, in which case the pending open fails natively
-    /// the same way and creates nothing.
+    /// The resolved parent is some other directory, proven by a
+    /// successful resolution whose identity differs from the area's.
+    /// A resolution that fails is never `Outside`.
     Outside,
-    /// The resolved parent could not be determined (its spelling does
-    /// not fit the staged probe, or the probe itself failed), so the
-    /// creation cannot be shown to be outside the area.
+    /// The resolved parent could not be determined, or could not be
+    /// proven outside (its spelling does not fit the staged probe,
+    /// its resolution failed, or it resolves only in the guest's own
+    /// context), so the creation fails closed by name.
     Unknown,
 }
 
@@ -5984,8 +5985,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// spelling was replaced and a parent reached through symlinks
     /// are both decided correctly. A probe the kernel refuses while
     /// resolving the parent (a missing or non-directory component, a
-    /// symlink loop) is `Outside`: the pending open resolves its
-    /// parent the same way and fails natively without creating.
+    /// symlink loop, a permission failure) is `Unknown`, never
+    /// `Outside`: only a resolved directory whose identity differs
+    /// from the area's proves the parent outside, and a failed
+    /// resolution is no proof at all, so the creation fails closed
+    /// by name instead of being allowed as a proven outside parent.
     async fn resolved_parent_area<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -6013,19 +6017,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         .await;
         let (opened, _) = match opened {
             Ok(opened) => opened,
-            Err(
-                Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP | Errno::EACCES | Errno::ENAMETOOLONG,
-            ) => return ParentArea::Outside,
+            // A failed resolution is not proof of outside.
             Err(_) => return ParentArea::Unknown,
         };
         let Ok(fd) = RawFd::try_from(opened) else {
             return ParentArea::Unknown;
         };
         if fd < 0 {
-            return ParentArea::Outside;
+            return ParentArea::Unknown;
         }
         let dir = self.inject_fstat(guest, fd).await;
         let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+        // `Outside` only on a successful identity mismatch; every
+        // other outcome stays `Unknown`.
         match (dir, crate::util::raw_stat(&snapshot.guest_dir)) {
             (Ok(dir), Ok(area)) if (dir.st_dev, dir.st_ino) == (area.st_dev, area.st_ino) => {
                 ParentArea::Area
@@ -6079,57 +6083,24 @@ impl<T: RecordOrReplay> Detcore<T> {
                 String::from_utf8_lossy(name)
             )
         }
-        /// Whether a spelling resolves in the resolving process's
-        /// own context (its descriptor table or task identity), so
-        /// the tracer's filesystem cannot decide it for the guest:
-        /// `/proc/self/...`, `/proc/thread-self/...`, any
-        /// `/proc/<tid>/...` form (including `task/<tid>/fd/...`),
-        /// and `/dev/fd/...`.
-        fn guest_context_spelling(bytes: &[u8]) -> bool {
-            let mut components = bytes.split(|byte| *byte == b'/').filter(|c| !c.is_empty());
-            match (components.next(), components.next()) {
-                (Some(b"proc"), Some(second)) => {
-                    second == b"self"
-                        || second == b"thread-self"
-                        || second.iter().all(|byte| byte.is_ascii_digit())
-                }
-                (Some(b"dev"), Some(b"fd")) => true,
-                _ => false,
-            }
-        }
         let spelled_ptr = call.path()?;
         let spelled: PathBuf = spelled_ptr.read(&guest.memory()).ok()?;
         let bytes = spelled.as_os_str().as_bytes();
         let (parent, name) = split(bytes);
-        let mut parent_area = self
+        // Only the guest-side probe may decide a spelled parent:
+        // host resolution is never consulted, on success or on
+        // failure, because in the tracer's context the same bytes
+        // can name different objects (its own descriptors and task
+        // identity, symlink aliases, a different root). A parent
+        // the probe cannot prove outside — including any spelling
+        // too long for the staged probe — stays `Unknown` and is
+        // refused by name below. That refuses some overlong outside
+        // creations too; it is the accepted bound at this layer,
+        // where no guest-resolution primitive can decide a spelling
+        // beyond the staged probe.
+        let parent_area = self
             .resolved_parent_area(guest, call.dirfd(), parent, snapshot)
             .await;
-        // An absolute spelling the staged probe cannot fit can still
-        // be shown outside the area on the host, as the caller's
-        // spelled-parent check itself resolves it; a relative one
-        // depends on the guest's dirfd and cannot. A spelling that
-        // resolves in the guest's own context (a descriptor-table
-        // or task spelling) likewise cannot: host resolution there
-        // names the tracer's descriptors, so neither its success
-        // nor its failure is evidence about the guest's parent.
-        // Such a parent stays `Unknown` and is refused by name
-        // below; that is the accepted bound for a guest-context
-        // spelling too long for the staged guest probe.
-        if matches!(parent_area, ParentArea::Unknown)
-            && bytes.first() == Some(&b'/')
-            && !guest_context_spelling(bytes)
-        {
-            let parent_path =
-                Path::new(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(parent));
-            parent_area = match (
-                crate::util::canonicalize(parent_path),
-                crate::util::canonicalize(&snapshot.guest_dir),
-            ) {
-                (Ok(resolved), Ok(area)) if resolved == area => ParentArea::Area,
-                (Ok(_), Ok(_)) | (Err(_), _) => ParentArea::Outside,
-                _ => ParentArea::Unknown,
-            };
-        }
         match parent_area {
             ParentArea::Area => return Some(area_reason(name)),
             ParentArea::Unknown => return Some(unknown_reason(name)),
