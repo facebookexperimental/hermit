@@ -96,6 +96,7 @@ pub(crate) use threads::keep_status_files_open;
 pub(crate) use threads::kernel_sigset_bit;
 pub(crate) use threads::read_guest_signal_state;
 pub(crate) use threads::read_guest_thread_signal_state;
+pub(crate) use threads::read_guest_wait_signal_state;
 pub(crate) use threads::read_kernel_signal_state;
 pub(crate) use threads::read_thread_signal_state;
 pub(crate) use threads::reads_signal_state_from_backend;

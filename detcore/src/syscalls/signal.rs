@@ -1206,6 +1206,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         // would let a caller in a higher band win every turn (the Codex
         // review).
         if rt_sigsuspend_never_sleeps(&self.cfg.backend) {
+            // Under the scheduler (and outside record and replay, which this
+            // backend refuses anyway), the call waits as Linux's does: parked
+            // in the scheduler between two runs of the backend's own call
+            // (SIGSHARE S2b, `backend_rt_sigsuspend`).
+            if self.cfg.sequentialize_threads && !self.cfg.recordreplay_modes {
+                return Box::pin(self.backend_rt_sigsuspend(
+                    guest,
+                    call,
+                    mask_copy,
+                    temporary_mask,
+                ))
+                .await;
+            }
             let result = self.record_or_replay(guest, call).await;
             if result == Err(Errno::ENOSYS) && self.cfg.sequentialize_threads {
                 if self.cfg.max_timeslice.is_some() {
@@ -1232,6 +1245,99 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             self.record_or_replay_rt_sigsuspend(guest, call, installed_mask)
                 .await
+        }
+    }
+
+    /// SIGSHARE S2b: `rt_sigsuspend` on a backend whose own call never sleeps
+    /// (`rt_sigsuspend_never_sleeps`, KVM), waiting as Linux's does. The
+    /// backend's call, `call`, which reads the private copy of the temporary
+    /// mask at `mask_copy`, returns `EINTR` with the temporary mask installed
+    /// for the delivery when a pending signal the mask lets in ends it, and
+    /// declines to wait otherwise (`ENOSYS`). Each decline is settled here, in
+    /// this thread's own turn, from the signal state the backend reports
+    /// (`read_guest_wait_signal_state`):
+    ///
+    /// - ignored signals the mask lets in are removed, as Linux discards them
+    ///   as the call returns `ERESTARTNOHAND` before it restarts the call
+    ///   (`get_signal`, kernel/signal.c), and the call runs again at once;
+    /// - any other such signal can only be one the backend cannot act on
+    ///   inside the call, a stop, and the call is refused by name;
+    /// - a caught `SIGCHLD` the mask lets in, in a process with a child whose
+    ///   exit sends it, keeps the answer this backend gave before: the decline
+    ///   goes to the guest after a strong yield. A child's exit `SIGCHLD` is
+    ///   SIGSHARE S4's (`rt_sigsuspend_takes_child_exit_fallback`);
+    /// - otherwise the thread parks: a `SleepUntil(INDEFINITE)` request tagged
+    ///   `RT_SIGSUSPEND_FYI` that carries the mask Linux installs, which the
+    ///   scheduler ends when the backend's state shows a signal that ends the
+    ///   wait (`Scheduler::wake_backend_signal_waits`). Every resume runs the
+    ///   call again, so a wake whose signal is gone by this thread's turn only
+    ///   parks it again, as a Linux sigsuspend that finds nothing sleeps on.
+    async fn backend_rt_sigsuspend<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::RtSigsuspend,
+        mask_copy: AddrMut<'_, u64>,
+        temporary_mask: KernelSigset,
+    ) -> Result<i64, Error> {
+        let installed = kernel_installed_signal_mask(temporary_mask);
+        loop {
+            // A removal's scratch stack below the red zone may have covered
+            // the copy, so it is written before every run.
+            guest.memory().write_value(mask_copy, &temporary_mask)?;
+            let result = self.record_or_replay(guest, call).await;
+            if result != Err(Errno::ENOSYS) {
+                return Ok(result?);
+            }
+            let state = crate::syscalls::read_guest_wait_signal_state(guest)?;
+            let let_in = state.pending & !installed;
+            let ignored =
+                let_in & crate::syscalls::ignored_at_generation(state.ignored, state.caught);
+            if ignored != 0 {
+                crate::syscalls::helpers::remove_signals_discarded_under_a_temporary_mask(
+                    guest, ignored,
+                )
+                .await?;
+                continue;
+            }
+            if let_in != 0 {
+                const REASON: &str = "an rt_sigsuspend whose temporary signal mask lets in a \
+                    pending signal that would stop the process cannot be served on this \
+                    backend: it cannot act on that signal inside the call";
+                crate::syscalls::helpers::report_refusal_reason(
+                    self.cfg.panic_on_unsupported_syscalls,
+                    &format!(
+                        "[dtid {}] rt_sigsuspend refused: {REASON}",
+                        guest.thread_state().dettid
+                    ),
+                );
+                if !self.cfg.panic_on_unsupported_syscalls {
+                    crate::tool_global::report_unsupported_syscall(guest, Sysno::rt_sigsuspend)
+                        .await;
+                }
+                return self
+                    .refuse_unserviceable_operation_because(
+                        guest,
+                        Sysno::rt_sigsuspend,
+                        Errno::ENOSYS,
+                        REASON,
+                    )
+                    .await;
+            }
+            if rt_sigsuspend_takes_child_exit_fallback(guest, &state, installed).await {
+                if self.cfg.max_timeslice.is_some() {
+                    guest
+                        .thread_state_mut()
+                        .reset_timeslice_for_explicit_yield();
+                }
+                let request = Self::sched_yield_request(guest);
+                resource_request(guest, request).await;
+                return Err(Errno::ENOSYS.into());
+            }
+            let mut request = Self::sleep_request_abs(guest, LogicalTime::INDEFINITE).await;
+            request.fyi(crate::resources::RT_SIGSUSPEND_FYI);
+            request.blocked_signal_mask = Some(installed);
+            // Whatever the resume, the backend's call decides again.
+            let _ = resource_request(guest, request).await;
         }
     }
 
@@ -5024,6 +5130,35 @@ where
     } else {
         SleepSignal::None
     })
+}
+
+/// Whether an `rt_sigsuspend` that the backend declined (SIGSHARE S2b,
+/// `Detcore::backend_rt_sigsuspend`) keeps the answer it had before S2b, the
+/// decline itself: its temporary mask `installed` lets in `SIGCHLD`, which the
+/// process catches (`state`, read in this thread's turn), and the process has
+/// a child whose exit sends it. A child's exit `SIGCHLD` is published by the
+/// backend, and its wake is SIGSHARE S4's
+/// (<https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-ro7dr.md>),
+/// so such a wait is not parked: the guest retries it, as it did.
+async fn rt_sigsuspend_takes_child_exit_fallback<G, T>(
+    guest: &mut G,
+    state: &crate::syscalls::KernelSignalState,
+    installed: KernelSigset,
+) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let sigchld = kernel_sigset_bit(libc::SIGCHLD);
+    if installed & sigchld != 0 || state.caught & sigchld == 0 {
+        return false;
+    }
+    let spec = crate::types::ChildWaitSpec {
+        selector: crate::types::ChildWaitSelector::Any,
+        owner: None,
+        exit_class: crate::types::ChildWaitExitClass::Sigchld,
+    };
+    crate::tool_global::ready_child_wait(guest, spec).await.1
 }
 
 /// Whether this backend's `rt_sigsuspend` returns at once rather than sleeping

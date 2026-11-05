@@ -1716,6 +1716,30 @@ where
         .unwrap_or_else(|| read_thread_signal_state(guest.pid(), guest.tid()))
 }
 
+/// [`read_thread_wait_signal_state`] of the calling thread, read from the
+/// backend where its guest threads are not host tasks
+/// ([`reads_signal_state_from_backend`]). There, a thread the backend no
+/// longer knows (`ESRCH`) ends the call with `ERESTARTNOINTR`, which nothing
+/// observes, and any other failure ends the run, as for the `/proc` read.
+pub(crate) fn read_guest_wait_signal_state<G, T>(guest: &G) -> Result<KernelSignalState, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match backend_signal_state_of_caller(guest) {
+        None => read_thread_wait_signal_state(guest.pid(), guest.tid()),
+        Some(Ok(state)) => Ok(state),
+        Some(Err(Errno::ESRCH)) => Err(Errno::ERESTARTNOINTR.into()),
+        Some(Err(errno)) => Err(Error::Tool(anyhow::Error::new(
+            BlockedWaitSignalError::StateUnreadable {
+                pid: guest.pid(),
+                tid: guest.tid(),
+                errno,
+            },
+        ))),
+    }
+}
+
 /// A test seam in front of the `/proc` read in [`read_kernel_signal_state`].
 #[cfg(test)]
 pub(crate) mod signal_state_read_seam {
