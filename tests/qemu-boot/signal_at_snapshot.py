@@ -76,10 +76,25 @@ def main():
         ],
         stdin=subprocess.DEVNULL,
     )
-    while not os.path.exists(qmp_path):
-        time.sleep(0.001)
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(qmp_path)
+    # The socket file can exist before QEMU listens on it, so connect
+    # with retries until a bounded deadline instead of once.
+    deadline = time.monotonic() + 30
+    while True:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(qmp_path)
+            break
+        except (ConnectionRefusedError, FileNotFoundError) as error:
+            sock.close()
+            if proc.poll() is not None:
+                fail(
+                    "QEMU exited with status {} before QMP was ready".format(
+                        proc.returncode
+                    )
+                )
+            if time.monotonic() >= deadline:
+                fail("QMP socket {} not connectable within 30 s: {}".format(qmp_path, error))
+            time.sleep(0.005)
     sock_file = sock.makefile("rwb")
     json.loads(sock_file.readline())
     qmp(sock_file, "qmp_capabilities")

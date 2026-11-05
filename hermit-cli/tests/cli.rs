@@ -15923,6 +15923,14 @@ fn signal_at_snapshot_controller_counts_only_a_completed_snapshot() {
         .join("tests/qemu-boot");
     for (case, env, expected) in [
         ("completed", &[][..], None),
+        // The fake creates its socket file 0.2 s before it listens; the
+        // controller must still connect (the bind/listen window a loaded
+        // host widened into an ECONNREFUSED crash).
+        (
+            "delayed listen",
+            &[("FAKE_QEMU_LISTEN_DELAY_S", "0.2")][..],
+            None,
+        ),
         (
             "failed",
             &[("FAKE_QEMU_MIGRATION_STATUS", "failed")][..],
@@ -15957,35 +15965,93 @@ fn signal_at_snapshot_controller_counts_only_a_completed_snapshot() {
             .arg(scripts.join("fake_qmp_qemu.py"))
             .arg(&dir)
             .envs(env.iter().copied())
+            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("start the controller");
-        let mut stderr_lines = std::io::BufReader::new(child.stderr.take().unwrap()).lines();
-        let ready = stderr_lines.next().and_then(Result::ok).unwrap_or_default();
-        assert_eq!(ready, "waiting for SIGUSR1", "{case}");
+        // On any mismatch the panic carries the controller's exit status
+        // and the bounded tail of its whole stderr: its first line alone
+        // ("Traceback (most recent call last):") once hid a startup crash.
+        let bounded_tail = |text: &str| -> String {
+            const BOUND: usize = 4096;
+            if text.len() <= BOUND {
+                return text.to_string();
+            }
+            let mut start = text.len() - BOUND;
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            format!("[...{} earlier bytes]\n{}", start, &text[start..])
+        };
+        // Stderr is read on its own thread: a controller that crashes at
+        // startup leaves the fake QEMU holding the pipe, so draining it
+        // here could block forever instead of reporting the crash.
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::channel::<String>();
+        let stderr_pipe = child.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr_pipe).lines() {
+                let Ok(line) = line else { break };
+                if stderr_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let ready = stderr_rx.recv().unwrap_or_default();
+        if ready != "waiting for SIGUSR1" {
+            let mut rest = Vec::new();
+            while let Ok(line) = stderr_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                rest.push(line);
+            }
+            // SAFETY: `killpg` has no memory-safety preconditions; the group
+            // was created for this run by `process_group(0)`, and killing it
+            // reaps the fake QEMU a crashed controller left behind.
+            unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+            let full = std::iter::once(ready.as_str())
+                .chain(rest.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let output = child.wait_with_output().expect("wait for the controller");
+            panic!(
+                "{case}: the controller never became ready: exit status {:?}, stderr (bounded tail):\n{}",
+                output.status,
+                bounded_tail(&full)
+            );
+        }
         let pid = nix::unistd::Pid::from_raw(child.id() as i32);
         nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGUSR1).expect("signal it");
-        let rest: Vec<String> = stderr_lines.map_while(Result::ok).collect();
+        let rest: Vec<String> = stderr_rx.iter().collect();
         let output = child.wait_with_output().expect("wait for the controller");
         let out = String::from_utf8_lossy(&output.stdout);
+        let full = std::iter::once(ready.as_str())
+            .chain(rest.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let context = format!(
+            "exit status {:?}, stderr (bounded tail):\n{}",
+            output.status,
+            bounded_tail(&full)
+        );
         match expected {
             None => {
-                assert!(output.status.success(), "{case}: {rest:?}");
+                assert!(output.status.success(), "{case}: {context}");
                 assert!(
                     out.starts_with("snapshot bytes=13 sha256="),
-                    "{case}: {out}"
+                    "{case}: {out} ({context})"
                 );
             }
             Some(reason) => {
                 // EXIT-CLASS: guest. The controller runs natively, not under
                 // hermit, and exits 1 when the snapshot is not a snapshot.
-                assert_eq!(output.status.code(), Some(1), "{case}: {rest:?}");
-                assert!(out.is_empty(), "{case}: printed a snapshot: {out}");
+                assert_eq!(output.status.code(), Some(1), "{case}: {context}");
+                assert!(
+                    out.is_empty(),
+                    "{case}: printed a snapshot: {out} ({context})"
+                );
                 assert!(
                     rest.iter().any(|line| line.contains(reason)),
-                    "{case}: {rest:?}"
+                    "{case}: {context}"
                 );
             }
         }

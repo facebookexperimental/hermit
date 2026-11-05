@@ -13,6 +13,7 @@ It serves the `-qmp unix:PATH,...` socket it is given. Environment:
   FAKE_QEMU_ERROR_ON          a command answered with a QMP error instead
   FAKE_QEMU_EXIT              the status it exits with after quit (default 0)
   FAKE_QEMU_EMPTY_SNAPSHOT    if set, `migrate` writes an empty file
+  FAKE_QEMU_LISTEN_DELAY_S    seconds to wait between bind and listen
 `migrate` writes the bytes FAKE-SNAPSHOT to its file: URI.
 """
 
@@ -20,6 +21,7 @@ import json
 import os
 import socket
 import sys
+import time
 
 
 def main():
@@ -29,8 +31,17 @@ def main():
     error_on = os.environ.get("FAKE_QEMU_ERROR_ON")
     exit_status = int(os.environ.get("FAKE_QEMU_EXIT", "0"))
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(path)
+    # Publish the socket path only once it is listening: bind under a
+    # temporary name, listen, then rename into place. Binding the final
+    # name first would let the controller see the file and connect into
+    # the bind/listen window, which refuses the connection.
+    temporary = "{}.tmp-{}".format(path, os.getpid())
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+    listener.bind(temporary)
+    time.sleep(float(os.environ.get("FAKE_QEMU_LISTEN_DELAY_S", "0")))
     listener.listen(1)
+    os.rename(temporary, path)
     connection, _ = listener.accept()
     stream = connection.makefile("rwb")
     stream.write(b'{"QMP": {"version": {}, "capabilities": []}}\n')
