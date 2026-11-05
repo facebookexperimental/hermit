@@ -10273,7 +10273,14 @@ impl RunOpts {
                 )));
             }
         }
-        if !config.cpu_profile.is_default() {
+        // `auto` is the unset default, not a named nondefault profile: it
+        // resolves (or is refused by name) at launch admission, where a
+        // profile it resolves to that this backend is not qualified for is
+        // refused there. Refusing it here would preempt every other
+        // unqualified-option refusal for a run that named no profile.
+        if !config.cpu_profile.is_default()
+            && config.cpu_profile != detcore_model::cpu_profile::CpuProfile::Auto
+        {
             return Err(Error::new(PolicyRefusal).context(
                 hermit::cpu_profile_admission::CpuProfileRefusal::new(
                     config.cpu_profile,

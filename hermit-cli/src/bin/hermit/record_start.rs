@@ -681,10 +681,38 @@ impl StartOpts {
             let program = self
                 .mapped_launch_path(&found)
                 .ok_or_else(|| refuse(format!("{} is hidden by a mount", found.display())))?;
-            let (profile, why) = hermit::cpu_profile_admission::resolve_auto(&program, |guest| {
-                self.mapped_launch_path(guest)
-            })
-            .map_err(refuse)?;
+            let (profile, why) =
+                match hermit::cpu_profile_admission::resolve_auto(&program, |guest| {
+                    self.mapped_launch_path(guest)
+                }) {
+                    Ok(resolved) => resolved,
+                    Err(why) => {
+                        // A readable initial program that is neither an ELF
+                        // image nor a script declares no ISA level, and its
+                        // exec cannot succeed: it keeps its own ENOEXEC fault
+                        // (which the recorder rejects with its explanation),
+                        // under the profile an unmarked image gets. Anything
+                        // else auto could not read or decide still refuses.
+                        let not_an_image = matches!(
+                            detcore::exec_record::script_interpreter(&program),
+                            detcore::exec_record::Script::Not
+                        ) && std::fs::File::open(&program)
+                            .and_then(|mut file| {
+                                use std::io::Read;
+                                let mut magic = [0_u8; 4];
+                                file.read_exact(&mut magic).map(|()| magic)
+                            })
+                            .is_ok_and(|magic| magic != *b"\x7fELF");
+                        if !not_an_image {
+                            return Err(refuse(why));
+                        }
+                        (
+                        detcore_model::cpu_profile::CpuProfile::X86_64V2,
+                        "the initial executable is not an ELF image; its exec keeps its own fault"
+                            .to_owned(),
+                    )
+                    }
+                };
             let mut resolved = self.clone();
             resolved.cpu_profile = profile;
             resolved.auto_resolution =
