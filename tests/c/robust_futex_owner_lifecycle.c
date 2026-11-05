@@ -8,6 +8,7 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/futex.h>
 #include <pthread.h>
 #include <sched.h>
@@ -1135,6 +1136,103 @@ struct two_waiters_state {
 };
 static struct two_waiters_state* tw;
 
+/* Reads one small /proc file of a waiter child into `buf` with raw
+ * open/read/close (three syscalls; stdio would multiply them).
+ * Returns 1 when the file was read, 0 when this environment does not
+ * expose it. */
+static int read_waiter_proc(pid_t pid, const char* name, char* buf, size_t cap) {
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%ld/%s", (long)pid, name);
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return 0;
+  }
+  ssize_t read_count = read(fd, buf, cap - 1);
+  close(fd);
+  if (read_count <= 0) {
+    return 0;
+  }
+  buf[read_count] = '\0';
+  return 1;
+}
+
+/* Whether one waiter is provably blocked in its FUTEX_WAIT: /proc
+ * state S plus a futex wait channel or the futex syscall number.
+ * Sets `*observable` when either witness file yielded contents at
+ * all, so the caller can tell "not blocked yet" from "this procfs
+ * cannot say" (a synthesized procfs may have stat but neither
+ * wchan nor syscall). */
+static int waiter_provably_blocked(pid_t pid, int* observable) {
+  char stat_buf[512];
+  if (!read_waiter_proc(pid, "stat", stat_buf, sizeof(stat_buf))) {
+    return 0;
+  }
+  const char* close_paren = strrchr(stat_buf, ')');
+  if (close_paren == NULL || close_paren[1] != ' ' || close_paren[2] != 'S') {
+    return 0;
+  }
+  char wchan[128];
+  if (read_waiter_proc(pid, "wchan", wchan, sizeof(wchan)) &&
+      strcmp(wchan, "0") != 0) {
+    *observable = 1;
+    return strstr(wchan, "futex") != NULL;
+  }
+  char syscall_buf[256];
+  if (read_waiter_proc(pid, "syscall", syscall_buf, sizeof(syscall_buf))) {
+    *observable = 1;
+    return strtol(syscall_buf, NULL, 10) == SYS_futex;
+  }
+  return 0;
+}
+
+/* Proves both raw waiters are blocked in their FUTEX_WAIT before the
+ * exec is triggered. `parked` alone only proves a waiter is between
+ * incrementing the counter and issuing the syscall; under load the
+ * exec's robust walk could then mark the word before the late waiter
+ * queues, and its FUTEX_WAIT would return EAGAIN and be counted as
+ * neither woken nor timed out (the native-oracle race in dh-wmzqx,
+ * observed as "woken=1 timed_out=0"). A waiter past `parked` does
+ * nothing but the FUTEX_WAIT, so state S in a futex wait proves it
+ * queued: the kernel enqueues under the hash-bucket lock the waker
+ * must also take.
+ *
+ * Observability is decided by one probe up front, never by burning
+ * the waiters' timeout waiting for witnesses this procfs does not
+ * have (a synthesized procfs, as under Hermit, has stat but neither
+ * wchan nor syscall; polling for them there once let both waiters
+ * time out). Unobservable falls back to the same settle the sibling
+ * modes use after `parked`; observable-but-never-blocked fails
+ * rather than let the string comparison misattribute the oracle's
+ * own race. */
+static void wait_until_two_waiters_blocked(const pid_t* waiters, int count) {
+  int observable = 0;
+  (void)waiter_provably_blocked(waiters[0], &observable);
+  if (!observable) {
+    struct timespec settle = {0, 30000000};
+    while (nanosleep(&settle, &settle) < 0 && errno == EINTR) {
+    }
+    return;
+  }
+  for (int poll = 0; poll < 200000; ++poll) {
+    int blocked = 0;
+    for (int i = 0; i < count; ++i) {
+      int ignored = 0;
+      blocked += waiter_provably_blocked(waiters[i], &ignored);
+    }
+    if (blocked == count) {
+      return;
+    }
+    sched_yield();
+    if (poll % 1024 == 1023) {
+      struct timespec pause = {0, 100000};
+      while (nanosleep(&pause, &pause) < 0 && errno == EINTR) {
+      }
+    }
+  }
+  fputs("waiters did not provably block in FUTEX_WAIT\n", stderr);
+  _exit(5);
+}
+
 static void two_waiters_raw_waiter(void) {
   _Atomic uint32_t* word = (_Atomic uint32_t*)&tw->mutex;
   uint32_t value = atomic_load(word);
@@ -1189,11 +1287,11 @@ static int exec_two_waiters_main(void) {
     if (waiters[i] == 0) {
       two_waiters_raw_waiter();
     }
-    boundary_spin_until(&tw->parked, i + 1);
-    for (int y = 0; y < 50; ++y) {
-      sched_yield();
-    }
   }
+  boundary_spin_until(&tw->parked, 2);
+  /* `parked` said each waiter is about to issue FUTEX_WAIT; prove both
+   * are actually queued in it before the exec may run (dh-wmzqx). */
+  wait_until_two_waiters_blocked(waiters, 2);
   atomic_store(&tw->trigger, 1);
   for (int i = 0; i < 2; ++i) {
     if (waitpid(waiters[i], NULL, 0) != waiters[i]) {

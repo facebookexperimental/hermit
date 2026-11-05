@@ -770,18 +770,41 @@ fn assert_an_exec_wakes_one_waiter_per_word(backend: &str) {
         .join(format!("robust-futex-exec-two-waiters-{backend}"));
     let guest = build_lifecycle_guest(&build_root);
     let expected = "EXEC-TWO-WAITERS: woken=1 timed_out=1 word=0xc0000000";
-    let mut native = Command::new(&guest);
-    native.arg("exec-two-waiters");
-    let native = run_captured(
-        native,
-        "native robust-futex exec-two-waiters",
-        &build_root.join("native.out"),
-        &build_root.join("native.err"),
-        true,
-    );
+    // The native run is the oracle for the Hermit runs below, and the
+    // oracle itself races under load: a waiter that had announced
+    // itself parked but not yet queued in its FUTEX_WAIT when the
+    // exec marked the word got EAGAIN and printed "woken=1
+    // timed_out=0", falsely failing an unrelated queue PR (dh-wmzqx).
+    // The guest now proves both waiters are blocked (see
+    // wait_until_two_waiters_blocked in the lifecycle guest); as a
+    // backstop the ORACLE run alone may retry, bounded and counted
+    // here. The expected string never changes, and the Hermit runs
+    // below are never retried.
+    let mut native = None;
+    for attempt in 1..=2 {
+        let mut command = Command::new(&guest);
+        command.arg("exec-two-waiters");
+        let run = run_captured(
+            command,
+            "native robust-futex exec-two-waiters",
+            &build_root.join(format!("native-{attempt}.out")),
+            &build_root.join(format!("native-{attempt}.err")),
+            true,
+        );
+        eprintln!(
+            "native oracle exec-two-waiters attempt {attempt}/2: {}",
+            run.stdout.trim()
+        );
+        let matched = run.stdout.contains(expected);
+        native = Some(run);
+        if matched {
+            break;
+        }
+    }
+    let native = native.expect("native oracle ran at least once");
     assert!(
         native.stdout.contains(expected),
-        "native: {}",
+        "native oracle (after bounded attempts): {}",
         native.stdout
     );
     for verify in [true, false] {
