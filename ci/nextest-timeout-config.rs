@@ -43,6 +43,10 @@ use nextest_cpu::ResolvedBudget;
 use nextest_cpu::ResolvedBudgets;
 
 const CPU_WRAPPER_BIN_ENV: &str = "HERMIT_NEXTEST_CPU_WRAPPER_BIN";
+/// Executor early-exit selector: unset or `1` stops the nextest batch at
+/// the first failing test (the default); `0` is the run-everything opt-in
+/// validate records on every step of a keep-going run.
+const FAIL_FAST_ENV: &str = "HERMIT_NEXTEST_FAIL_FAST";
 const CPU_WRAPPER_NAME: &str = "hermit-per-test-cpu";
 const PMU_INTEGRATION_BUDGET_ENV: &str = "HERMIT_NEXTEST_BUDGET_SCOPE";
 const PMU_INTEGRATION_BUDGET_SCOPE: &str = "pmu-integration";
@@ -902,6 +906,7 @@ fn add_wall_allowances(
     Ok(())
 }
 
+#[cfg(test)]
 fn scaled_config(
     source: &str,
     multiplier: f64,
@@ -910,16 +915,37 @@ fn scaled_config(
     scaled_config_with_allowances(source, multiplier, cpu_wrapper, &[])
 }
 
+#[cfg(test)]
 fn scaled_config_with_allowances(
     source: &str,
     multiplier: f64,
     cpu_wrapper: Option<(&Path, f64)>,
     selected_allowances: &[MeasuredCpuAllowance],
 ) -> Result<String, String> {
+    scaled_config_with_allowances_and_fail_fast(
+        source,
+        multiplier,
+        cpu_wrapper,
+        selected_allowances,
+        true,
+    )
+}
+
+fn scaled_config_with_allowances_and_fail_fast(
+    source: &str,
+    multiplier: f64,
+    cpu_wrapper: Option<(&Path, f64)>,
+    selected_allowances: &[MeasuredCpuAllowance],
+    fail_fast: bool,
+) -> Result<String, String> {
     timeouts::validate_timeout_multiplier(multiplier, "wall multiplier")?;
     let mut document = source
         .parse::<DocumentMut>()
         .map_err(|error| format!("cannot parse nextest TOML: {error}"))?;
+    // The rendered config, not the checked-in source, decides the batch
+    // shape: early exit unless this invocation opted in to running
+    // everything. Custom profiles inherit `default`, so one key suffices.
+    document["profile"]["default"]["fail-fast"] = value(fail_fast);
     let mut wall_deadlines = Vec::new();
     visit_table(document.as_table_mut(), multiplier, &mut wall_deadlines)?;
     if wall_deadlines.is_empty() {
@@ -1010,6 +1036,18 @@ fn scaled_config_with_allowances(
 
 fn cpu_wrapper_from_env() -> Option<std::path::PathBuf> {
     env::var_os(CPU_WRAPPER_BIN_ENV).map(Into::into)
+}
+
+fn fail_fast_from_env() -> Result<bool, String> {
+    match env::var(FAIL_FAST_ENV) {
+        Err(env::VarError::NotPresent) => Ok(true),
+        Ok(value) if value == "1" => Ok(true),
+        Ok(value) if value == "0" => Ok(false),
+        Ok(value) => Err(format!(
+            "{FAIL_FAST_ENV} must be 0 or 1, got {value:?}"
+        )),
+        Err(error) => Err(format!("{FAIL_FAST_ENV} must be UTF-8: {error}")),
+    }
 }
 
 fn exact_filter(identity: &nextest_cpu::AttemptIdentity) -> String {
@@ -1373,11 +1411,12 @@ fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
         ),
         || fs::read(&args[3]).map_err(|error| error.to_string()),
     )?;
-    let rendered = scaled_config_with_allowances(
+    let rendered = scaled_config_with_allowances_and_fail_fast(
         &source,
         wall_multiplier,
         Some((&wrapper, cpu_multiplier)),
         &selected_allowances,
+        fail_fast_from_env()?,
     )?;
     let mut document = rendered.parse::<DocumentMut>().map_err(|e| e.to_string())?;
     let context: Option<BudgetContext> =
@@ -1546,10 +1585,12 @@ fn run() -> Result<(), String> {
     } else {
         1.0
     };
-    let rendered = scaled_config(
+    let rendered = scaled_config_with_allowances_and_fail_fast(
         &source_text,
         multiplier,
         cpu_wrapper.as_deref().map(|path| (path, cpu_multiplier)),
+        &[],
+        fail_fast_from_env()?,
     )?;
     fs::write(Path::new(&output), rendered)
         .map_err(|error| format!("cannot write {}: {error}", Path::new(&output).display()))
@@ -2048,6 +2089,33 @@ mod tests {
                 .unwrap_err()
                 .contains("no slow-timeout.period")
         );
+    }
+
+    /// Early exit is the executor default (owner directive 2026-11-04):
+    /// the rendered config stops the batch at the first failing test
+    /// unless the run opted in to running everything.
+    #[test]
+    fn rendered_fail_fast_follows_the_requested_mode() {
+        let source = concat!(
+            "[profile.default]\n",
+            "fail-fast = false\n",
+            "slow-timeout = { period = \"57s\", terminate-after = 1 }\n",
+        );
+        for (fail_fast, expected) in [(true, true), (false, false)] {
+            let rendered =
+                scaled_config_with_allowances_and_fail_fast(source, 1.0, None, &[], fail_fast)
+                    .unwrap();
+            let document = rendered.parse::<DocumentMut>().unwrap();
+            assert_eq!(
+                document["profile"]["default"]["fail-fast"].as_bool(),
+                Some(expected),
+                "fail_fast={fail_fast} must render fail-fast = {expected}"
+            );
+        }
+        // The plain entry point defaults to early exit.
+        let rendered = scaled_config(source, 1.0, None).unwrap();
+        let document = rendered.parse::<DocumentMut>().unwrap();
+        assert_eq!(document["profile"]["default"]["fail-fast"].as_bool(), Some(true));
     }
 
     #[test]

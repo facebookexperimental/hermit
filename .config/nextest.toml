@@ -13,7 +13,12 @@ nextest-version = "0.9.100"
 # unless it restates it; both profiles state it so the budget gate in
 # ci/nextest-timeout-config.rs can require the exact value.
 retries = 2
-fail-fast = false
+# Early exit is the default (owner directive 2026-11-04): stop the batch at
+# the first failing test (after its retries above). A keep-going validate
+# run renders this back to false via HERMIT_NEXTEST_FAIL_FAST=0 (see
+# ci/nextest-timeout-config.rs); direct nextest invocations can pass
+# --no-fail-fast for a full list.
+fail-fast = true
 test-threads = "num-cpus"
 status-level = "pass"
 final-status-level = "slow"
