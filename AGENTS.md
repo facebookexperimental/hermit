@@ -36,9 +36,10 @@ external network dependencies.
 ## Supported Environment
 
 - Use x86_64 Linux. AArch64 support is incomplete, and macOS is not supported.
-- The repository's `rust-toolchain.toml` selects Rust nightly. Let `rustup` and
-  Cargo honor that file; do not substitute stable Rust without a task that is
-  specifically about stable support.
+- The repository's `rust-toolchain.toml` selects the Rust toolchain. Let
+  `rustup` and Cargo honor that file. The workspace also builds on stable
+  Rust 1.97.1; the pinned default switches to it in a separate change so
+  validation moves in one step.
 - Install libunwind development headers before building. On Debian/Ubuntu use
   `sudo apt-get install -y libunwind-dev`; on Fedora/CentOS use
   `sudo dnf install -y libunwind-devel`.
@@ -101,7 +102,7 @@ hardware-sensitive test merely to make a local VM green.
 
 ## Lint And Format
 
-The checked-in rustfmt configuration requires the selected nightly toolchain.
+The checked-in rustfmt configuration requires the selected toolchain.
 Before finishing a Rust change, run:
 
 ```bash

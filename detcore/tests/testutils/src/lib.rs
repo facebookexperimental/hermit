@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![feature(internal_output_capture)]
+#![cfg_attr(feature = "nightly", feature(internal_output_capture))]
 
 //! Testing utilities.
 
@@ -1130,7 +1130,13 @@ fn run_function_test_driver(run: impl Fn()) {
     // Match spawn_fn's handling of libtest's thread-local output capture. Child
     // diagnostics go to the inherited streams, while the parent regains its
     // original capture even when fork fails. Do not drop the parent's capture
-    // allocation in the child.
+    // allocation in the child. Clearing capture needs std's unstable
+    // internal_output_capture, behind this crate's off-by-default `nightly`
+    // feature; without it (stable Rust) the child subtree's printing-macro
+    // output reaches the streams only under an uncaptured runner — nextest,
+    // as validation runs, or `cargo test -- --nocapture` — the same stable
+    // contract reverie-ptrace documents for `spawn_fn_with_config`.
+    #[cfg(feature = "nightly")]
     let output_capture = std::io::set_output_capture(None);
     let pid = unsafe { libc::fork() };
     let fork_error = (pid < 0).then(io::Error::last_os_error);
@@ -1148,6 +1154,7 @@ fn run_function_test_driver(run: impl Fn()) {
         }
         unsafe { libc::_exit(status) };
     }
+    #[cfg(feature = "nightly")]
     std::io::set_output_capture(output_capture);
     if let Some(error) = fork_error {
         panic!("cannot fork function-test driver: {error}");

@@ -102,7 +102,13 @@ rust_library(
 rust_library(
     name = "detcore-testutils",
     srcs = ["tests/testutils/src/lib.rs"],
-    autocargo = {"cargo_toml_dir": "tests/testutils/"},
+    autocargo = {
+        "cargo_toml_config": {
+            "features": {"nightly": []},
+        },
+        "cargo_toml_dir": "tests/testutils/",
+    },
+    features = ["nightly"],
     deps = [
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:pretty_assertions",

@@ -23,8 +23,10 @@ usage, see the documentation below.
 
 Hermit currently supports x86-64 Linux. Building and running it requires:
 
-- Rust nightly through [rustup](https://rustup.rs/); `rust-toolchain.toml`
-  selects the repository toolchain automatically.
+- Rust through [rustup](https://rustup.rs/); `rust-toolchain.toml`
+  selects the repository toolchain automatically. The workspace also
+  builds on stable Rust 1.97.1; the pinned default switches to it in a
+  separate change so validation moves in one step.
 - Linux user, PID, and mount namespaces.
 - Parent-child ptrace and seccomp filter support.
 - libunwind and LZMA development packages.

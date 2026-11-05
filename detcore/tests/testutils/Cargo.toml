@@ -9,6 +9,9 @@ repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
 publish = false
 
+[features]
+nightly = []
+
 [dependencies]
 libc = "0.2.186"
 hermit-test-workdir = { version = "0.5.4", path = "../../../common/test-workdir" }
