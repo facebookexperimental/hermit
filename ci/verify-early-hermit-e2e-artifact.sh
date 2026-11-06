@@ -91,7 +91,66 @@ cmp -s "$source_binary" "$bundle/hermit" ||
 current_manifest=$(mktemp)
 trap 'rm -f "$current_manifest"' EXIT
 tree_manifest "$source_install" >"$current_manifest"
-cmp -s "$current_manifest" "$bundle/resources.sha256" ||
-    fail "early-published resources differ from the final staged install tree"
+# Every runtime file must byte-match. The one exception is the Detcore
+# staging receipt: it is per-run provenance (evidence log paths with a
+# per-run serial, elapsed times, the staging run's build environment),
+# and prepare's hermit-install rebuild restages it even when the
+# qualified runtime is unchanged, so its bytes can never match an
+# earlier staging run. Its substantive bindings are compared instead:
+# the qualified artifact and installed hashes, the exact compiled
+# sources, the compiled qualifier, the profile, and the completed
+# source close must all agree across the two receipts.
+set +e
+python3 - "$bundle/resources.sha256" "$current_manifest" \
+    "$bundle/install/rsrcs/libdetcore_liteinst.package.json" \
+    "$source_install/rsrcs/libdetcore_liteinst.package.json" <<'PYEOF'
+import json, sys
+RECEIPT = "rsrcs/libdetcore_liteinst.package.json"
+def manifest(path):
+    try:
+        text = open(path).read()
+    except OSError:
+        return None
+    out = {}
+    for line in text.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            out[parts[1].strip()] = parts[0]
+    return out
+early, final = manifest(sys.argv[1]), manifest(sys.argv[2])
+if early is None or final is None:
+    sys.exit(3)
+early.pop(RECEIPT, None)
+final.pop(RECEIPT, None)
+if early != final:
+    sys.exit(3)
+try:
+    a = json.load(open(sys.argv[3]))
+    b = json.load(open(sys.argv[4]))
+except Exception:
+    sys.exit(4)
+def binding(r):
+    return (
+        r.get("schema"),
+        r.get("reverie_pin"),
+        r.get("profile_name"),
+        r.get("profile_objects"),
+        r.get("compiled_qualifier_sha256"),
+        r.get("compiled_sources"),
+        r.get("source_close_completed"),
+        (r.get("qualification") or {}).get("artifact", {}).get("sha256"),
+        (r.get("installed") or {}).get("sha256"),
+    )
+if binding(a) != binding(b) or binding(a)[6] is not True:
+    sys.exit(4)
+PYEOF
+comparison=$?
+set -e
+case $comparison in
+    0) ;;
+    3) fail "early-published resources differ from the final staged install tree" ;;
+    4) fail "early-published Detcore receipt binding differs from the final staged receipt" ;;
+    *) fail "early artifact comparison failed with status $comparison" ;;
+esac
 
 printf 'verify-early-hermit-e2e-artifact: final binary and resources match %s\n' "$bundle"
