@@ -8892,14 +8892,23 @@ sys.exit(1 if failed else 0)
         // The 7 left are the SaBRe-run-type-only rows above. The flip's
         // other cells (replay ptrace, shred/sysctl-random-uuid/top@kvm)
         // were already reported and add nothing here.
-        assert_eq!(unreported.len(), 7, "{unreported:?}");
+        // 7 + 2 on 2026-11-06: logger's ptrace verify cell left full again
+        // (re-measured red in the merge-queue pinned root: no /dev/log
+        // socket; the sweep CLEAN was host-contaminated), so logger@dbt
+        // and logger@sabre are unreported again. pkg-config stays
+        // promoted and reported.
+        assert_eq!(unreported.len(), 9, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
             .count();
         // 9 on #5199 main (7 + 2 for the split's extra SaBRe cells),
-        // minus logger@sabre and pkg-config@sabre promoted by the flip.
-        assert_eq!(sabre_only, 7, "{unreported:?}");
+        // minus logger@sabre and pkg-config@sabre promoted by the flip,
+        // plus logger@sabre again when logger's ptrace verify cell left
+        // full on 2026-11-06 (7 - 2 + 1 = 6 on the flip's own terms;
+        // enumerated here as 8: the seven SaBRe-run-type-only rows'
+        // sabre cells plus logger@sabre).
+        assert_eq!(sabre_only, 8, "{unreported:?}");
     }
 
     #[test]

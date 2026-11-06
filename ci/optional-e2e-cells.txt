@@ -5,7 +5,9 @@ c-programs/signal-waitstatus-identity verify dbt
 c-programs/writev-determinism custom ptrace
 compat/cscope replay ptrace
 compat/gcov verify dbt
+compat/logger replay ptrace
 compat/logger verify dbt
+compat/logger verify ptrace
 compat/lsof replay ptrace
 compat/pkg-config verify dbt
 compat/zip-unzip replay ptrace

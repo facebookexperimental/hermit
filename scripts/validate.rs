@@ -16239,13 +16239,16 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     // The full run's compat rows: the 193 of the portable strict corpus
     // extracted from validate.sh, the 25 of
     // https://github.com/rrnewton/hermit/issues/4269, less the 4 heavy rows
-    // the super run type runs (218 - 4 = 214). The logger and pkg-config
-    // rows deselected with the pinned-image move were promoted to
-    // Required by the 2026-11-05 sweep flip, so they no longer subtract.
+    // the super run type runs (218 - 4 = 214). The pkg-config row
+    // deselected with the pinned-image move was promoted to Required by
+    // the 2026-11-05 sweep flip, so it no longer subtracts; logger was
+    // promoted by the same flip but re-measured red in the pinned root
+    // on 2026-11-06 (no /dev/log socket; sweep CLEAN was host-contaminated),
+    // so it subtracts again (214 - 1 = 213).
     // The cargo and gcov rows deselected 2026-10-31 under issue 4997
     // came back the same day once the fixture race was fixed
     // (271ec81bd4).
-    let expected = 214;
+    let expected = 213;
     if rows.len() != expected {
         return Err(format!(
             "strict-compat bucket: compat.yaml has {} CI rows; the full run has {expected}",
@@ -20573,8 +20576,11 @@ mod nextest_timeout_tests {
                 // c-programs/sigsuspend-sibling-signal-wake. 2998 with the
                 // 2026-11-05 sweep flip's fourteen required cells (PR #5183,
                 // 2984 + 14, disjoint from the guard/SIGSHARE cells),
-                // recounted by enumeration at the rebase head.
-                assert_eq!(all.len(), 2998, "the original all-owner population is retained");
+                // recounted by enumeration at the rebase head. 2996 after
+                // logger's two ptrace cells (verify, replay) left again on
+                // 2026-11-06, re-measured red in the merge-queue pinned root
+                // (no /dev/log socket; sweep CLEAN was host-contaminated).
+                assert_eq!(all.len(), 2996, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");

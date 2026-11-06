@@ -12983,22 +12983,8 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/logger",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
           "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
-          "mode": "verify",
-          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -18084,22 +18070,8 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/logger",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
           "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
-          "mode": "verify",
-          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -21354,13 +21326,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/ln",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
           "mode": "replay",
           "backend": "ptrace"
         },
@@ -39124,20 +39089,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/logger",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/logname",
           "mode": "replay",
           "backend": "ptrace"
@@ -56818,22 +56769,8 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/logger",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
           "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
-          "mode": "verify",
-          "backend": "ptrace"
         },
         {
           "lane": "portable",

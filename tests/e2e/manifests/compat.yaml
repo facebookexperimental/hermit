@@ -1673,6 +1673,27 @@ corpus:
   # this bucket): each stays enabled with ci: false and its failure class's
   # issue, so the SaBRe run type does not require it.
   unselected:
+    # Re-measured red on 2026-11-06 in the merge-queue pinned root
+    # (validate-merge-queue-d864ef93d9a6, both attempts): the pinned root
+    # lacks a journal socket at /dev/log under ptrace, so logger (nix
+    # util-linux) exits 1 on connect even with --stderr --no-act, while the
+    # same cell passes under KVM, whose guest provides the socket. The
+    # 2026-11-05 sweep CLEAN evidence for this cell was host-contaminated:
+    # the sweep host had a /dev/log socket that the pinned root does not.
+    # The /dev/log stub or new argv rework stays tracked in the evidence
+    # bead; pkg-config, flipped with logger, is not implicated by that run.
+    - backend: ptrace
+      result: crash-error
+      evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
+      reason: >-
+        In the pinned root, logger (nix util-linux) opens /dev/log even
+        with --stderr --no-act and exits 1 with no journal socket present;
+        the sweep CLEAN evidence was host-contaminated (sweep host had
+        /dev/log, pinned root does not)
+      rows:
+        [
+          logger
+        ]
     # Measured red on 2026-10-30 in the pinned hermetic image (full validate
     # validate-museland-9ab8418de603, 7 cells): the same image difference on
     # the remaining backends, plus gcov's DBT determinism failure.
@@ -1829,6 +1850,19 @@ corpus:
     # sixth, joined once https://github.com/rrnewton/hermit/issues/3964 and
     # https://github.com/rrnewton/hermit/issues/3963 were fixed.)
     unselected:
+      # Same pinned-root /dev/log absence as the verify cell above,
+      # re-measured 2026-11-06 (validate-merge-queue-d864ef93d9a6): the
+      # recorded guest exits 1 on connect to /dev/log, so replay has no
+      # passing recording to require. The sweep CLEAN evidence was
+      # host-contaminated (sweep host had /dev/log, pinned root does not).
+      - result: replay-failure
+        evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
+        reason: >-
+          In the pinned root, logger (nix util-linux) opens /dev/log even
+          with --stderr --no-act and exits 1 with no journal socket present;
+          the sweep CLEAN evidence was host-contaminated (sweep host had
+          /dev/log, pinned root does not)
+        rows: [logger]
       - result: replay-failure
         evidence: https://github.com/rrnewton/hermit/issues/3966
         reason: >-
