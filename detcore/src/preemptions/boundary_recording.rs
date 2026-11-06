@@ -88,18 +88,82 @@ impl TryFrom<IdentityWire> for HistoryIdentity {
     }
 }
 
+/// `recording` inside the `rcb_history` envelope stating `identity`.
+fn identity_envelope<R>(identity: &HistoryIdentity, recording: R) -> IdentityEnvelope<R> {
+    IdentityEnvelope {
+        rcb_history: IdentityBody {
+            format: RCB_HISTORY_FORMAT,
+            identity: identity.into(),
+            recording,
+        },
+    }
+}
+
 /// Serializes `record` alone: in the `rcb_history` envelope if it states an
 /// identity, otherwise in the legacy format.
 pub(super) fn encode_record(record: &PreemptionRecord) -> serde_json::Result<String> {
     match record.identity() {
         None => serde_json::to_string(record),
-        Some(identity) => serde_json::to_string(&IdentityEnvelope {
-            rcb_history: IdentityBody {
-                format: RCB_HISTORY_FORMAT,
-                identity: identity.into(),
-                recording: record,
-            },
-        }),
+        Some(identity) => serde_json::to_string(&identity_envelope(identity, record)),
+    }
+}
+
+/// Streams `record` alone to `path` as [`encode_record`] serializes it,
+/// without allocating its complete serialization. Writing the record's
+/// own `Serialize` form instead would drop the envelope, because the
+/// identity travels around the record rather than inside it.
+pub(super) fn write_record(path: &Path, record: &PreemptionRecord) -> anyhow::Result<()> {
+    match record.identity() {
+        None => super::streaming::write_file(path, record),
+        Some(identity) => super::streaming::write_file(path, &identity_envelope(identity, record)),
+    }
+}
+
+/// Streams a borrowed boundary recording to `path`, in the identity
+/// envelope when its record states `identity`.
+pub(super) fn write_borrowed(
+    path: &Path,
+    identity: Option<&HistoryIdentity>,
+    output: &BorrowedEnvelope<'_>,
+) -> anyhow::Result<()> {
+    match identity {
+        None => super::streaming::write_file(path, output),
+        Some(identity) => super::streaming::write_file(path, &identity_envelope(identity, output)),
+    }
+}
+
+/// Serializes a borrowed boundary recording, in the identity envelope
+/// when its record states `identity`.
+pub(super) fn borrowed_string(
+    identity: Option<&HistoryIdentity>,
+    output: &BorrowedEnvelope<'_>,
+) -> serde_json::Result<String> {
+    match identity {
+        None => serde_json::to_string(output),
+        Some(identity) => serde_json::to_string(&identity_envelope(identity, output)),
+    }
+}
+
+/// The INFO-projection digest of `record` alone: its exact serialization,
+/// identity envelope included, minus the host-observed store-exclusive
+/// count (`record_serde::InfoProjection`).
+pub(super) fn info_digest(record: &PreemptionRecord) -> anyhow::Result<[u8; 32]> {
+    let projected = super::record_serde::InfoProjection(record);
+    match record.identity() {
+        None => super::streaming::digest_json(&projected),
+        Some(identity) => super::streaming::digest_json(&identity_envelope(identity, &projected)),
+    }
+}
+
+/// The INFO-projection digest of a borrowed boundary recording, as
+/// [`info_digest`] digests a record alone.
+pub(super) fn borrowed_info_digest(
+    identity: Option<&HistoryIdentity>,
+    output: &BorrowedInfoEnvelope<'_>,
+) -> anyhow::Result<[u8; 32]> {
+    match identity {
+        None => super::streaming::digest_json(output),
+        Some(identity) => super::streaming::digest_json(&identity_envelope(identity, output)),
     }
 }
 
@@ -2137,6 +2201,52 @@ mod identity_tests {
             assert_eq!(again, boundaries);
             assert!(again.require_strict_mode(true).is_ok());
         }
+    }
+
+    /// The streamed disk writers state the identity too: a record alone
+    /// and a boundary writer written to disk (or serialized to a string)
+    /// decode stating the identity, never as a legacy file whose
+    /// producer is unknown.
+    #[test]
+    fn disk_writers_state_the_identity_they_write() {
+        use crate::preemptions::PreemptionWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy.json");
+        PreemptionRecord::from_sched_events_with_identity(
+            vec![SchedEvent::branches(DetTid::from_raw(3), 7)],
+            Some(known()),
+        )
+        .write_to_disk(&legacy_path)
+        .unwrap();
+        assert_eq!(
+            Recording::read(&legacy_path).unwrap().identity(),
+            Some(&known())
+        );
+
+        let boundary_path = dir.path().join("boundary.json");
+        let mut writer = PreemptionWriter::new(Some(boundary_path.clone()))
+            .with_slice_boundaries()
+            .unwrap()
+            .with_identity(known());
+        writer.register_thread(
+            DetTid::from_raw(3),
+            crate::scheduler::runqueue::DEFAULT_PRIORITY,
+        );
+        writer.flush().unwrap();
+        let written = Recording::read(&boundary_path).unwrap();
+        assert_eq!(written.identity(), Some(&known()));
+        assert!(written.require_strict_mode(true).is_ok());
+
+        let text = PreemptionWriter::new(None)
+            .with_slice_boundaries()
+            .unwrap()
+            .with_identity(known())
+            .into_string();
+        assert_eq!(
+            Recording::decode(text.as_bytes()).unwrap().identity(),
+            Some(&known())
+        );
     }
 
     #[test]

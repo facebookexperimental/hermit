@@ -2118,7 +2118,7 @@ impl PreemptionRecord {
 
     /// Save to disk.
     pub fn write_to_disk(&self, path: &Path) -> Result<(), String> {
-        streaming::write_file(path, self).map_err(|error| {
+        boundary_recording::write_record(path, self).map_err(|error| {
             format!(
                 "Failed to write preemption record to file {:?}, error: {error:#}",
                 path
@@ -7910,9 +7910,9 @@ impl PreemptionWriter {
         let digest = if let Some(records) = &self.boundary_records {
             let output = boundary_recording::BorrowedInfoEnvelope::new(&self.inner, records)
                 .map_err(|error| error.to_string())?;
-            streaming::digest_json(&output)
+            boundary_recording::borrowed_info_digest(self.inner.identity(), &output)
         } else {
-            streaming::digest_json(&record_serde::InfoProjection(&self.inner))
+            boundary_recording::info_digest(&self.inner)
         }
         .map_err(|error| error.to_string())?;
         let digest = digest
@@ -7949,7 +7949,7 @@ impl PreemptionWriter {
                 self.boundary_records.as_ref().unwrap(),
             )
             .map_err(|error| error.to_string())?;
-            streaming::write_file(&path, &output).map_err(|e| {
+            boundary_recording::write_borrowed(&path, self.inner.identity(), &output).map_err(|e| {
                 format!(
                     "Failed to write boundary recording {}: {e:#}",
                     path.display()
@@ -7977,7 +7977,7 @@ impl PreemptionWriter {
         record.stopless_lowering_refusal()?;
         let output = boundary_recording::BorrowedEnvelope::new(&record, records)
             .map_err(|e| e.to_string())?;
-        serde_json::to_string(&output).map_err(|e| e.to_string())
+        boundary_recording::borrowed_string(record.identity(), &output).map_err(|e| e.to_string())
     }
 }
 
