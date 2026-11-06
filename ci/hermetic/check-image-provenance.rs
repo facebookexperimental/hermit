@@ -36,10 +36,10 @@ use sha2::Sha256;
 const PROVENANCE: &str = "ci/hermetic/image.provenance.json";
 const PIN: &str = "ci/hermetic/image.digest";
 const METHOD: &str = "two-clean-isolated-nix-stores-v1";
-const SUPERSEDED_REFERENCE: &str = "localhost/hermit-hermetic-validate@sha256:7facbb1c720365215f215030c6e1c652628db55ddabbfddad4b5c3725f19b17c";
+const SUPERSEDED_REFERENCE: &str = "localhost/hermit-hermetic-validate@sha256:4e1605ecbb13a6c5c6f45f4259f49e2c07efb21a7e6e7b7aabb5b97329232d6e";
 const SUPERSEDED_ARCHIVE_SHA256: &str =
-    "92d3399bf185179c7b56544d636a8280c2e9938ab8c71c7bbfcdb8fe72c773e8";
-/// The replaced 7facbb1c root has no gVisor C++ test libraries; the rationale must name the property
+    "df1f0dd4f9aa0c82fd6fedceac64d5607143add2f8d0d40a0163850b19289453";
+/// The replaced 4e1605ec root pins nightly Rust; the rationale must name the property
 /// this repin repairs (the pin is now the reproducible isolated build).
 const RATIONALE_MARKER: &str = "reproducible";
 /// Both isolated builds recorded `nix --version` before building.
@@ -70,20 +70,20 @@ struct ExpectedRun {
 
 const EXPECTED_RUNS: [ExpectedRun; 2] = [
     ExpectedRun {
-        run_id: "hermetic-gtest-repin-a.service",
-        source_snapshot_identity: "src@48:6415744274",
-        nix_store_identity: "nix-root/nix@48:6415748303",
-        podman_store_identity: "gtest-repin-a/podman-data",
-        memory_peak_bytes: 8_589_938_688,
-        cpu_nanoseconds: 1_472_214_479_000,
+        run_id: "hermetic-stable-repin2-a.service",
+        source_snapshot_identity: "src@50:3659107834",
+        nix_store_identity: "nix-root/nix@50:3659114750",
+        podman_store_identity: "stable-repin-a/podman-data",
+        memory_peak_bytes: 8_589_934_592,
+        cpu_nanoseconds: 1_527_828_915_000,
     },
     ExpectedRun {
-        run_id: "hermetic-gtest-repin-b.service",
-        source_snapshot_identity: "src@48:6417250157",
-        nix_store_identity: "nix-root/nix@48:6417254190",
-        podman_store_identity: "gtest-repin-b/podman-data",
+        run_id: "hermetic-stable-repin2-b.service",
+        source_snapshot_identity: "src@50:3659111292",
+        nix_store_identity: "nix-root/nix@50:3659114751",
+        podman_store_identity: "stable-repin-b/podman-data",
         memory_peak_bytes: 8_589_934_592,
-        cpu_nanoseconds: 1_388_853_031_000,
+        cpu_nanoseconds: 1_518_053_090_000,
     },
 ];
 
@@ -507,13 +507,13 @@ fn validate_semantics(root: &Value) -> Result<(), String> {
     let new = string(repin, "replacement_reference", "repin")?;
     if old != SUPERSEDED_REFERENCE {
         return Err(format!(
-            "repin.superseded_reference must retain the replaced 7facbb1c reference {SUPERSEDED_REFERENCE:?}"
+            "repin.superseded_reference must retain the replaced 4e1605ec reference {SUPERSEDED_REFERENCE:?}"
         ));
     }
     let old_archive = string(repin, "superseded_archive_sha256", "repin")?;
     if old_archive != SUPERSEDED_ARCHIVE_SHA256 {
         return Err(format!(
-            "repin.superseded_archive_sha256 must retain the 7facbb1c build's 92d3399b archive SHA-256 {SUPERSEDED_ARCHIVE_SHA256:?}"
+            "repin.superseded_archive_sha256 must retain the 4e1605ec build's df1f0dd4 archive SHA-256 {SUPERSEDED_ARCHIVE_SHA256:?}"
         ));
     }
     if old == new || !string(repin, "rationale", "repin")?.contains(RATIONALE_MARKER) {
@@ -955,7 +955,7 @@ mod tests {
         assert!(
             validate_semantics(&reference)
                 .unwrap_err()
-                .contains("must retain the replaced 7facbb1c reference")
+                .contains("must retain the replaced 4e1605ec reference")
         );
 
         let mut archive = record();
@@ -963,7 +963,7 @@ mod tests {
         assert!(
             validate_semantics(&archive)
                 .unwrap_err()
-                .contains("must retain the 7facbb1c build's 92d3399b archive SHA-256")
+                .contains("must retain the 4e1605ec build's df1f0dd4 archive SHA-256")
         );
     }
 
