@@ -97,7 +97,8 @@
         "test.hermit_integration",
         "test.cli_on_host",
         "test.arbitrary_binaries",
-        "test.applications_e2e"
+        "test.applications_e2e",
+        "e2e.manifest_rr_on_host"
       ]
     },
     {
