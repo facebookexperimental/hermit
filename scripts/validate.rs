@@ -1023,6 +1023,11 @@ struct Args {
     /// Explicit phase-two opt-in. Cargo remains the default; the committed DAG
     /// carries the closed mode branch and exact-artifact propagation.
     buck_release_dotslash: Option<PathBuf>,
+    /// Explicit Reverie build-mode selector (--build-mode cargo|buck), the
+    /// CLI form of HERMIT_VALIDATE_BUILD_MODE for admission paths (ci-hub)
+    /// that forward no undeclared environment. Wins over the ambient value;
+    /// an unsupported ambient value still refuses.
+    build_mode: Option<String>,
     /// Who runs the full level's E2E cells: [`E2E_RUNNER_CARGO`] (the manifest
     /// buckets) or a Buck mode (`e2e.buck_cells` and the `_buck` import twins).
     e2e_runner: &'static str,
@@ -1551,6 +1556,11 @@ fn usage() -> &'static str {
      \x20 --label-pr       Publish a receipt and label the PR after a full green (default).\n\
      \x20 --no-label-pr    Disable the non-fatal receipt publication and label update.\n\
      \x20 --ignore-cache   Force a real run even on a tree-keyed cache hit.\n\
+     \x20 --build-mode cargo|buck\n\
+     \x20                  Select how the Reverie test set is compiled (default\n\
+     \x20                  cargo, or HERMIT_VALIDATE_BUILD_MODE). buck runs the M2\n\
+     \x20                  Cut 3 harvest. Admission paths that forward no\n\
+     \x20                  environment use this flag.\n\
      \x20 --buck-release DOTSLASH\n\
      \x20                  Build release Hermit with Buck2 through the named absolute\n\
      \x20                  public DotSlash launcher. Cargo remains the default. Buck\n\
@@ -1720,6 +1730,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         selected: None,
         ignore_selected_deps: false,
         buck_release_dotslash: None,
+        build_mode: None,
         e2e_runner: E2E_RUNNER_CARGO,
         buck2: None,
     };
@@ -1863,6 +1874,24 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 args.skip_inner_dirty_working_tree_and_rebase_freshness_checks = true
             }
             "--ignore-cache" => args.ignore_cache = true,
+            "--build-mode" => {
+                i += 1;
+                match argv.get(i) {
+                    Some(v) if (v == BUILD_MODE_CARGO || v == BUILD_MODE_BUCK)
+                        && args.build_mode.is_none() =>
+                    {
+                        args.build_mode = Some(v.clone());
+                    }
+                    Some(_) if args.build_mode.is_some() => {
+                        eprintln!("validate: --build-mode may be supplied only once");
+                        return Err(2);
+                    }
+                    _ => {
+                        eprintln!("validate: --build-mode needs cargo or buck");
+                        return Err(2);
+                    }
+                }
+            }
             "--buck-release" => {
                 i += 1;
                 match argv.get(i) {
@@ -5189,6 +5218,24 @@ fn self_test() -> Result<(), String> {
         .map_err(|code| format!("release mode: Cargo default refused with exit {code}"))?;
     if cargo_default.buck_release_dotslash.is_some() {
         return Err("release mode: Cargo is not the default".into());
+    }
+    if cargo_default.build_mode.is_some() {
+        return Err("build mode: Cargo is not the default".into());
+    }
+    let buck_build = parse_argv(&["full".into(), "--build-mode".into(), "buck".into()])
+        .map_err(|code| format!("build mode: explicit Buck opt-in refused with exit {code}"))?;
+    if buck_build.build_mode.as_deref() != Some(BUILD_MODE_BUCK)
+        || parse_argv(&["full".into(), "--build-mode".into(), "banana".into()]).is_ok()
+        || parse_argv(&[
+            "full".into(),
+            "--build-mode".into(),
+            "buck".into(),
+            "--build-mode".into(),
+            "cargo".into(),
+        ])
+        .is_ok()
+    {
+        return Err("build mode: opt-in parsing/refusal drifted".into());
     }
     let buck = parse_argv(&[
         "full".into(),
@@ -29900,7 +29947,10 @@ fn run(
     if let Err(error) = establish_e2e_runner_environment(&args) {
         return RunSummary::refused(2, args.level.name(), "E2E runner", vec![error]);
     }
-    if let Err(error) = establish_build_mode_environment(ambient_build_mode, ambient_run_mode) {
+    if let Err(error) = establish_build_mode_environment(
+        args.build_mode.clone().or(ambient_build_mode),
+        ambient_run_mode,
+    ) {
         return RunSummary::refused(2, args.level.name(), "build mode", vec![error]);
     }
 
