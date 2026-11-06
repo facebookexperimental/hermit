@@ -610,6 +610,13 @@ EOF
         # then run it with the combined row's exact java flags.
         printf 'javac-run-class:'
         sha256sum "$FIXTURE_ROOT/java/CompilerCompat.class" | cut -d' ' -f1
+        # Start the JVM once before the observed run. In the combined row,
+        # this JVM started after the javac JVM had initialized its
+        # perf-data state; preserve that second-JVM path instead of
+        # dropping its coverage.
+        java -Duser.name=hermit -Duser.home="$WORK_DIR" \
+            -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
+            -version >/dev/null 2>&1
         # Direct execution avoids a parent/child command-substitution pipe.
         java -Duser.name=hermit -Duser.home="$WORK_DIR" \
             -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
@@ -673,6 +680,12 @@ EOF
         # exercised the same bytes, then the combined row's exact java flags.
         printf 'java-run-class:'
         sha256sum "$FIXTURE_ROOT/java/Compat.class" | cut -d' ' -f1
+        # Start the JVM once before the observed run. In the combined row,
+        # this JVM started after the javac JVM had initialized its
+        # perf-data state; preserve that second-JVM path instead of
+        # dropping its coverage.
+        java -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
+            -version >/dev/null 2>&1
         java -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
             -cp "$FIXTURE_ROOT/java" Compat "$WORK_DIR"
         ;;

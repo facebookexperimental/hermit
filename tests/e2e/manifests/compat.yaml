@@ -2110,20 +2110,23 @@ corpus:
     # ptrace cells the super run type runs too (the `heavy` section's labels).
     - {label: "rustc", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "rustc"], labels: [sabre-compat-only]}
     # Power/weight 2026-11-05 @ Hermit 1db0a95883, ptrace, 316-core host:
-    # java/javac split into compile+run cells (one JVM startup each).
-    # Production replay-cell CPU medians (n=55 to 2026-11-05): java 77.1 s,
-    # javac 76.7 s combined. Local strict-run walls (medians of 3): java
-    # 8.7 s -> compile 6.7 s + run 3.8 s; javac 6.9 s -> compile 7.4 s +
-    # run 2.5 s. Hermit coverage (hermit-code-coverage collect per case,
-    # pairwise diffs + union of normalized sets): java baseline 29037
-    # lines/41854 regions, javac 28912/41649; each split union loses the
-    # same 6 lines/8 regions, all the legacy stat dispatch
-    # (detcore/src/lib.rs:7207, syscalls/files.rs:3134-3138) the second JVM
-    # reached over the first JVM's perf-data in one guest; every other
-    # dispatched syscall type is retained (no other dispatch arm lost).
-    # Guest stdout and milestones (JVM startup, compile, file I/O, SHA-256,
-    # worker thread; fibonacci assertion) preserved; run cells print the
-    # fixture class digest the compile cells produce.
+    # java/javac split javac and application execution into parallel cells.
+    # Each run cell first makes a discarded `java -version` JVM start so the
+    # observed JVM remains the second JVM over initialized perf-data state,
+    # as in the combined rows. Production replay-cell CPU medians (n=55 to
+    # 2026-11-05): java 77.1 s, javac 76.7 s combined. Local strict-run
+    # walls (medians of 3): java 8.1 s -> compile 6.0 s + run 3.3 s; javac
+    # 5.9 s -> compile 5.7 s + run 2.8 s. An interleaved five-repetition A/B
+    # against the single-start run cells measured the discarded JVM start
+    # at +0.74 s (java-run) and +0.84 s (javac-run) local wall. Hermit
+    # coverage (hermit-code-coverage collect for each compile+run pair):
+    # java baseline 30151 lines/41841 regions -> pair 30243 / 41952, and
+    # javac baseline 30017 / 41636 -> pair 30118 / 41766; the official
+    # `diff --fail-on-loss` preserves every normalized baseline line and
+    # region for both pairs (lost 0/0). Guest stdout and milestones (JVM
+    # startup, compile, file I/O, SHA-256, worker thread; fibonacci
+    # assertion) preserved; run cells print the fixture class digest the
+    # compile cells produce.
     - {label: "javac-compile", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "javac-compile"], labels: [sabre-compat-only]}
     - {label: "javac-run", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "javac-run"], labels: [sabre-compat-only]}
     - {label: "java-compile", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "java-compile"], labels: [sabre-compat-only]}
