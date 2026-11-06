@@ -153,6 +153,16 @@ impl Scheduler {
         if !self.models_signal_targets && !self.in_guest_signal_delivery {
             return None;
         }
+        // Where the backend owns signal delivery (KVM), a parked sleep is
+        // ended by the backend's own observation of the parked call
+        // (`select_parked_alarm`, `observe_parked_thread_woken_by_its_own_signal`),
+        // which takes the signal in the same pass. A drain wake here as well
+        // would take the thread out of the park first, so that observation
+        // never saw it, and a process signal published in the same pass
+        // would then be chosen for another thread.
+        if self.signal_control_installed() {
+            return None;
+        }
         let resources = self.next_turns.get(&dettid)?.req.try_read()?.ok()?;
         if resources.resources.len() != 1 {
             return None;

@@ -1938,8 +1938,11 @@ impl Scheduler {
                 // such a thread over, only the Linux rule reaches it, so this
                 // decides only what DEBUG names and whether a fatal copy is
                 // refused.
-                let outside = self.blocked.external_io_blockers.contains_key(&thread)
-                    || self.blocked.rt_sigsuspend_blockers.contains_key(&thread);
+                // A vfork parent is read: no host timing ends its call or
+                // posts it a signal (`Scheduler::kernel_sent_wants`).
+                let outside = (self.blocked.external_io_blockers.contains_key(&thread)
+                    || self.blocked.rt_sigsuspend_blockers.contains_key(&thread))
+                    && !self.vfork_barriers.contains_key(&thread);
                 let busy = !outside
                     && self.read_guest_signal_state(thread).is_ok_and(|state| {
                         let mask = temporary.unwrap_or(state.blocked) & !waited;

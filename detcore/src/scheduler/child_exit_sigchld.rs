@@ -1352,13 +1352,25 @@ impl Scheduler {
     /// could if the mask leaves SIGCHLD unblocked, or, whatever the mask, if
     /// the call is an I/O one (not `sigsuspend`, `descriptors` false) of a
     /// process holding a signalfd for SIGCHLD (a fork inherits the record):
-    /// the call may be a read of it.
+    /// the call may be a read of it. A vfork parent's wait (`vfork_barriers`,
+    /// installed at its grant) takes nothing: Linux sleeps it killable
+    /// (`wait_for_vfork_done`), so a caught SIGCHLD neither ends the wait nor
+    /// is dequeued in it, and the parent takes it only on its return, after
+    /// its continuation, a committed point the window orders. Before, a vfork
+    /// parent leaving SIGCHLD unblocked stopped its process from using the
+    /// window, so a child's SIGCHLD that merged into the one it held moved
+    /// `curr_target` on ptrace (`coalesced-child-curr` in
+    /// tests/c/process_signal_target.c; the revastra2 review of SIGSHARE S3b's
+    /// fix round, delta F1).
     pub(crate) fn note_outside_blocker(
         &mut self,
         thread: DetTid,
         mask: Option<u64>,
         descriptors: bool,
     ) {
+        if self.vfork_barriers.contains_key(&thread) {
+            return;
+        }
         let sigchld = super::kernel_signal_bit(libc::SIGCHLD);
         let process = self.sigchld_process(thread);
         let reads_signalfd = descriptors

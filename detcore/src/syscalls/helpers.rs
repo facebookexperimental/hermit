@@ -4947,19 +4947,31 @@ enum NamedRealTime {
 /// Whether a poll or a parked pipe write decides interruption at its own turn
 /// (`signals_interrupting_poll`): where the record of copies Linux discarded
 /// at send is kept (`discarded_at_send::records`, ptrace with sequentialized
-/// threads) and the thread's state can be read (`task`, its
+/// threads), the thread's state can be read (`task`, its
 /// `Resources::signal_state_task`, which needs guest thread IDs that name host
-/// tasks). Elsewhere the earlier decision stands: on KVM the backend restarts
-/// the call unless it would deliver a signal, and its polled-read observation
-/// (`Guest::polled_read_signal_site`) takes a caught signal before the turn,
-/// where a `/proc` read could not see it (the Claude re-check of the R2b-1
-/// design, R4-4).
+/// tasks), and the pending sets that state holds are the kernel's own
+/// (`kernel_signal_state_is_guests`), so a process-directed copy pending there
+/// reaches the poller as Linux delivers it. Elsewhere the earlier decision
+/// stands: on KVM the backend restarts the call unless it would deliver a
+/// signal, and its polled-read observation (`Guest::polled_read_signal_site`)
+/// takes a caught signal before the turn, where a `/proc` read could not see
+/// it (the Claude re-check of the R2b-1 design, R4-4). KVM keeps the record
+/// since SIGSHARE S3b, but its shared queue is not delivered by a kernel: a
+/// copy goes to the thread the tool reserves a delivery permit for, so a
+/// poller's turn that took any shared copy would take one the tool did not
+/// choose (a POSIX timer's SIGUSR1 that Linux leaves to a `sigtimedwait`
+/// waiter: `posix-sigwait` in `process_signal_target.c`).
 fn decides_interruption_at_turn<T, G>(guest: &G, task: Option<(i32, i32)>) -> bool
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    task.is_some() && crate::scheduler::discarded_at_send::records(guest.config())
+    task.is_some() && turn_decides_interruption(guest.config())
+}
+
+/// The configuration half of [`decides_interruption_at_turn`].
+fn turn_decides_interruption(cfg: &crate::config::Config) -> bool {
+    crate::scheduler::discarded_at_send::records(cfg) && cfg.backend.kernel_signal_state_is_guests
 }
 
 /// Install the private mask of a pipe `writev` that decides at its turn
@@ -10365,6 +10377,7 @@ pub(crate) mod kernel_signal_wait_failures {
             let (mut guest, kernel) = WaitGuest::new(Pid::from_raw(3), own_mask);
             guest.config.sequentialize_threads = true;
             guest.config.backend.kernel_signal_targets_are_predictable = true;
+            guest.config.backend.kernel_signal_state_is_guests = true;
             guest.thread.dettid = DetTid::from_raw(3);
             guest.thread.detpid = Some(DetPid::from_raw(3));
             let (reader, _writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_NONBLOCK).unwrap();
@@ -10448,6 +10461,7 @@ pub(crate) mod kernel_signal_wait_failures {
         guest.config.record_preemptions = true;
         guest.config.panic_on_unsupported_syscalls = false;
         guest.config.backend.kernel_signal_targets_are_predictable = true;
+        guest.config.backend.kernel_signal_state_is_guests = true;
         guest.thread.dettid = DetTid::from_raw(3);
         guest.thread.detpid = Some(DetPid::from_raw(3));
         let (reader, _writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_NONBLOCK).unwrap();
@@ -10678,6 +10692,7 @@ pub(crate) mod kernel_signal_wait_failures {
             let (mut guest, kernel) = WaitGuest::new(Pid::from_raw(3), own_mask);
             guest.config.sequentialize_threads = true;
             guest.config.backend.kernel_signal_targets_are_predictable = true;
+            guest.config.backend.kernel_signal_state_is_guests = true;
             guest.thread.dettid = DetTid::from_raw(3);
             guest.thread.detpid = Some(DetPid::from_raw(3));
             let (_reader, writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_NONBLOCK).unwrap();
