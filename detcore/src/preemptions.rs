@@ -7090,7 +7090,12 @@ pub struct RecordedRewriteExclusives {
 pub fn config_rewrite_exclusives(config: &crate::Config) -> Option<RewriteExclusives> {
     if config.rewrite_exclusives_in_memory {
         Some(RewriteExclusives::current(RewriteExclusivesMode::Memory))
-    } else if !config.rewrite_exclusives_overlay.is_empty() {
+    } else if config.rewrite_exclusives_overlay_requested
+        || !config.rewrite_exclusives_overlay.is_empty()
+    {
+        // The requested overlay states the mode before its files are
+        // prepared (early replay admission); a populated covered list
+        // states it for a final config built without the request flag.
         Some(RewriteExclusives::current(RewriteExclusivesMode::Overlay))
     } else {
         None

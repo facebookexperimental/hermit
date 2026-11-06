@@ -17962,6 +17962,12 @@ impl RunOpts {
             } else {
                 Vec::new()
             };
+        // The requested overlay, from the flags alone: early replay
+        // admission runs before `prepare_exclusive_rewrite` populates
+        // the covered files above, and must still state this run's
+        // rewrite provenance.
+        config.rewrite_exclusives_overlay_requested =
+            self.rewrite_exclusives && !self.rewrites_exclusives_in_memory();
         config
     }
 

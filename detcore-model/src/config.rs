@@ -350,6 +350,16 @@ pub struct Config {
     #[serde(default)]
     pub rewrite_exclusives_overlay: Vec<PathBuf>,
 
+    /// aarch64: whether `--rewrite-exclusives` rewrites by overlaying
+    /// rewritten files, as the run's flags request. Set by the CLI from
+    /// the flags alone, so early replay admission can state the run's
+    /// rewrite provenance while `rewrite_exclusives_overlay` -- the
+    /// files the overlay was given, known only once they are prepared
+    /// -- is still empty; never read from a recording.
+    #[clap(skip)]
+    #[serde(default)]
+    pub rewrite_exclusives_overlay_requested: bool,
+
     /// The host facts a v3 guest's leaf 0xD and xstate answers come from, set
     /// by the CLI after the host qualifies; `None` under v2. Neither profile
     /// field enters the legacy form the DBT runtime reads (DBT refuses v3).
@@ -4220,7 +4230,10 @@ mod legacy_backend_json {
     /// every other backend, so it is never written and reads as 0.
     /// `rewrite_exclusives_unmarked` likewise: it is never written and reads
     /// as empty.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 57] = [
+    /// `rewrite_exclusives_overlay_requested` came after it too: the CLI
+    /// states the requested overlay from its flags, and only the record
+    /// states its provenance, so it is never written and reads as false.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 59] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4273,12 +4286,12 @@ mod legacy_backend_json {
         "rewrite_exclusives_unmarked",
         "rewrite_exclusives_in_memory",
         "rewrite_exclusives_overlay",
+        "rewrite_exclusives_overlay_requested",
         "count_store_exclusives",
         "stacktrace_at_schedule_positions",
         "property_snapshot",
         "watch",
         "watch_from",
-        "rewrite_exclusives_overlay",
         "chaos_instruction_offset",
     ];
 
@@ -4429,6 +4442,7 @@ mod legacy_backend_json {
                     | "replay_continue_fairly"
                     | "strict_binder"
                     | "rewrite_exclusives_in_memory"
+                    | "rewrite_exclusives_overlay_requested"
                     | "count_store_exclusives"
                     | "stacktrace_at_schedule_positions",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
@@ -4806,6 +4820,7 @@ mod legacy_backend_json {
                 | "access_trace_max_bytes"
                 | "rewrite_exclusives_in_memory"
                 | "rewrite_exclusives_overlay"
+                | "rewrite_exclusives_overlay_requested"
                 | "count_store_exclusives"
                 | "stacktrace_at_schedule_positions"
                 | "property_snapshot"
@@ -5827,6 +5842,7 @@ mod tests {
                 | "access_trace_max_bytes"
                 | "rewrite_exclusives_in_memory"
                 | "rewrite_exclusives_overlay"
+                | "rewrite_exclusives_overlay_requested"
                 | "count_store_exclusives"
                 | "stacktrace_at_schedule_positions"
                 | "property_snapshot"
@@ -5874,11 +5890,12 @@ mod tests {
         // `post_crash_timeslice`, `rewrite_exclusives_in_memory`,
         // `stacktrace_at_schedule_positions`, `count_store_exclusives`,
         // `property_snapshot`, `watch`, `watch_from`, `rewrite_exclusives_overlay`,
-        // `chaos_instruction_offset`, `rewrite_exclusives_unmarked`
+        // `chaos_instruction_offset`, `rewrite_exclusives_overlay_requested`,
+        // `rewrite_exclusives_unmarked`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // fifty-six fewer, so forty-two keys fewer than fields.
+        // fifty-eight fewer, so forty-four keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 42);
+        assert_eq!(fields.len(), keys.len() + 44);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -6573,6 +6590,7 @@ mod tests {
         let on = Config {
             rewrite_exclusives_in_memory: true,
             rewrite_exclusives_overlay: vec!["/bin/guest".into()],
+            rewrite_exclusives_overlay_requested: true,
             ..off.clone()
         };
         let json = to_legacy_backend_json(&on).unwrap();
@@ -6581,6 +6599,7 @@ mod tests {
         let back = from_legacy_backend_json(&json).unwrap();
         assert!(!back.rewrite_exclusives_in_memory);
         assert!(back.rewrite_exclusives_overlay.is_empty());
+        assert!(!back.rewrite_exclusives_overlay_requested);
         let values: Vec<serde_json::Value> = ordered_entries(&json)
             .into_iter()
             .map(|(_, value)| value)
@@ -6589,6 +6608,7 @@ mod tests {
         let back = from_legacy_backend_json(&array).unwrap();
         assert!(!back.rewrite_exclusives_in_memory);
         assert!(back.rewrite_exclusives_overlay.is_empty());
+        assert!(!back.rewrite_exclusives_overlay_requested);
     }
 
     /// `rewrite_exclusives_overlay` never enters the legacy form, whatever
