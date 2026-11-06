@@ -39,7 +39,8 @@
     "selftest.pressure_test",
     "selftest.validate_rs",
     "selftest.manifest_cli",
-    "selftest.core_build"
+    "selftest.core_build",
+    "check.gvisor_vendoring"
   ],
   "build_debug_nodes": [
     "e2e.audit_compile_c_programs",
@@ -98,6 +99,7 @@
         "test.cli_on_host",
         "test.arbitrary_binaries",
         "test.applications_e2e",
+        "e2e.manifest_gvisor_on_host",
         "e2e.manifest_rr_on_host"
       ]
     },
