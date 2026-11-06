@@ -16052,9 +16052,6 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
             && !cell.is_applicable()
             && executable(cell)
     })?;
-    let red = fixture_id(&|cell| {
-        cell.id.backend == "kvm" && cell.status == "red" && cell.is_applicable()
-    })?;
     let green = fixture_id(&|cell| {
         cell.id.backend == "kvm" && cell.status == "green" && cell.is_applicable()
     })?;
@@ -16064,6 +16061,34 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
             && !cell.is_applicable()
             && !executable(cell)
     })?;
+    // A live red KVM cell is used as it is. Once every red KVM verify
+    // cell has been flipped green the live scorecard has none, so plant
+    // one red in a copy of the tracked cells (as the cells-file plan
+    // self-test does) instead of dropping the mixed-list refusal check.
+    let (red, planted) = match tracked.cells.iter().find(|cell| {
+        cell.id.backend == "kvm" && cell.status == "red" && cell.is_applicable()
+    }) {
+        Some(cell) => (cell.id.clone(), None),
+        None => {
+            let mut planted_tracked = tracked.clone();
+            let index = planted_tracked
+                .cells
+                .iter()
+                .position(|cell| {
+                    cell.id.backend == "kvm"
+                        && cell.status == "green"
+                        && cell.id.mode == "verify"
+                        && cell.is_applicable()
+                        && cell.id != green
+                })
+                .ok_or_else(|| {
+                    "disabled cells-file self-test lacks its mixed-list fixture".to_string()
+                })?;
+            planted_tracked.cells[index].status = "red".into();
+            let id = planted_tracked.cells[index].id.clone();
+            (id, Some(PlantedTrackedCells::install(planted_tracked)))
+        }
+    };
     let mut unknown = ids[0].clone();
     unknown.test.push_str("-not-in-scorecard");
     for (label, extra, expected) in [
@@ -16116,6 +16141,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
             }
         }
     }
+    drop(planted);
     let ordinary = CellSelection {
         probe_disabled: false,
         backend: None,
