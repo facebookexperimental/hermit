@@ -318,7 +318,7 @@ mod tests {
         // to 47, the next revision after main's landed 46
         // (https://github.com/rrnewton/hermit/pull/4769); digest re-measured
         // at this head.
-        (47, "0b69f906251b5e6a", "f013e36743d8d9e6"),
+        (47, "3626cafe4551d074", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

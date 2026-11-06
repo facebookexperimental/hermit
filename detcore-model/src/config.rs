@@ -4826,7 +4826,6 @@ mod legacy_backend_json {
                 | "property_snapshot"
                 | "watch"
                 | "watch_from"
-                | "rewrite_exclusives_overlay"
                 | "chaos_instruction_offset" => Ok(()),
                 "replay_continue_fairly" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
@@ -5848,7 +5847,6 @@ mod tests {
                 | "property_snapshot"
                 | "watch"
                 | "watch_from"
-                | "rewrite_exclusives_overlay"
                 | "chaos_instruction_offset" => {}
                 "replay_continue_fairly" => {}
                 other => expected.push(other.to_owned()),

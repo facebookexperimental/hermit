@@ -990,6 +990,7 @@ mod tests {
             rows_alone: _,
             background_starts_unnoted: _,
             rewrite_exclusives: _,
+            rewrite_exclusives_stripped_heuristic: _,
         } = record;
         // A stated overlay provenance round-trips byte for byte, as the
         // last field of the raw form.

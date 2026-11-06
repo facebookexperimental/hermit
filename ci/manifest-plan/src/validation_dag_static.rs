@@ -1292,7 +1292,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // only_a_chaos_instruction_offset_needs_a_stop_at_every_slice_end and
     // chaos_instruction_offset_never_enters_the_legacy_form
     // (--chaos-instruction-offset): 1964 + 2 = 1966.
-    ("test.regular_crates", 1966),
+    ("test.regular_crates", 1968),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2031,7 +2031,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (--chaos-instruction-offset): 1329 + 4 = 1333.
     // PR #4746's 37 added hermit-run lib units (budget, checkpoint, journal,
     // resume and their refusals; nextest-list delta): 1333 + 37 = 1370.
-    ("test.hermit_unit", 1370),
+    ("test.hermit_unit", 1382),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3341,7 +3341,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_record_that_drops_its_starts_refuses_an_invisible_stopless_end and
     // an_offset_free_record_is_written_exactly_as_before_the_offsets:
     // 3573 + 16 = 3589.
-    ("test.detcore_unit", 3589),
+    ("test.detcore_unit", 3653),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5454,7 +5454,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4796: the same two units (same growth as test.regular_crates): 1947 + 2 = 1949.
     // And the same two --chaos-instruction-offset detcore-model units:
     // 1950 + 2 = 1952.
-    ("test.regular_crates_on_host", 1952),
+    ("test.regular_crates_on_host", 1954),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6041,7 +6041,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4796: the same ten units (same growth as test.detcore_unit): 3563 + 10 = 3573.
     // And the same sixteen --chaos-instruction-offset units:
     // 3573 + 16 = 3589.
-    ("test.detcore_unit_on_host", 3589),
+    ("test.detcore_unit_on_host", 3653),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6473,7 +6473,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same four --chaos-instruction-offset units:
     // 1323 + 4 = 1327.
     // PR #4746: the same 37 hermit-run units: 1327 + 37 = 1364.
-    ("test.hermit_unit_on_host", 1364),
+    ("test.hermit_unit_on_host", 1376),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6719,7 +6719,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4796: the same two units (same growth as test.regular_crates): 1947 + 2 = 1949.
     // And the same two --chaos-instruction-offset detcore-model units:
     // 1950 + 2 = 1952.
-    ("test.regular_crates_on_host", 1952),
+    ("test.regular_crates_on_host", 1954),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
