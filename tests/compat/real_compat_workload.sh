@@ -564,7 +564,13 @@ EOF
             "$WORK_DIR/main.c" -o "$WORK_DIR/program"
         "$WORK_DIR/program"
         ;;
-    javac)
+    javac-compile)
+        # Compile half of the split javac row (2026-11-05): the combined row
+        # ran javac then java in one guest, two interpreted JVM startups in
+        # one cell, which made it a longest-pole cell. This cell keeps the
+        # guest-javac surface with the combined row's exact flags on the
+        # tracked source; javac-run executes the fixture-prepared class of
+        # the same source, so the pair keeps the original surface.
         cat >"$WORK_DIR/CompilerCompat.java" <<'EOF'
 public final class CompilerCompat {
     public static void main(String[] args) {
@@ -582,6 +588,10 @@ public final class CompilerCompat {
     }
 }
 EOF
+        # The heredoc above must stay byte-identical to the tracked source
+        # the fixture preparation compiles for javac-run; refuse drift.
+        script_dir=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+        cmp "$WORK_DIR/CompilerCompat.java" "$script_dir/CompilerCompat.java"
         # Avoid live NSS queries while the JVM initializes user properties.
         # An explicit class path keeps javac from listing its working directory
         # (its default class path is "."). The manifest gate gives each cell a
@@ -591,12 +601,24 @@ EOF
         javac -J-Duser.name=hermit -J-Duser.home="$WORK_DIR" \
             -J-Xint -J-XX:+UseSerialGC -J-XX:ActiveProcessorCount=1 \
             -g:none -cp "$WORK_DIR" -d "$WORK_DIR" "$WORK_DIR/CompilerCompat.java"
+        printf 'javac-compile:'
+        sha256sum "$WORK_DIR/CompilerCompat.class" | cut -d' ' -f1
+        ;;
+    javac-run)
+        # Run half of the split javac row: print the fixture class digest so
+        # the logs show this cell ran the bytes the compile cell produced,
+        # then run it with the combined row's exact java flags.
+        printf 'javac-run-class:'
+        sha256sum "$FIXTURE_ROOT/java/CompilerCompat.class" | cut -d' ' -f1
         # Direct execution avoids a parent/child command-substitution pipe.
         java -Duser.name=hermit -Duser.home="$WORK_DIR" \
             -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
-            -cp "$WORK_DIR" CompilerCompat
+            -cp "$FIXTURE_ROOT/java" CompilerCompat
         ;;
-    java)
+    java-compile)
+        # Compile half of the split java row (2026-11-05), as in javac-compile
+        # above: guest-javac surface on the tracked source, exact flags of
+        # the combined row, class digest as the observable result.
         cat >"$WORK_DIR/Compat.java" <<'EOF'
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -633,13 +655,26 @@ class Compat {
     }
 }
 EOF
+        # The heredoc above must stay byte-identical to the tracked source
+        # the fixture preparation compiles for java-run; refuse drift.
+        script_dir=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+        cmp "$WORK_DIR/Compat.java" "$script_dir/Compat.java"
         # Bound JVM-internal workers while retaining Compat's application thread.
         # An explicit class path keeps javac from listing its working
         # directory, as in the javac row.
         javac -J-Xint -J-XX:+UseSerialGC -J-XX:ActiveProcessorCount=1 \
             -cp "$WORK_DIR" -d "$WORK_DIR" "$WORK_DIR/Compat.java"
+        printf 'java-compile:'
+        sha256sum "$WORK_DIR/Compat.class" | cut -d' ' -f1
+        ;;
+    java-run)
+        # Run half of the split java row: fixture-prepared class of the same
+        # tracked source, digest printed so the logs show both cells
+        # exercised the same bytes, then the combined row's exact java flags.
+        printf 'java-run-class:'
+        sha256sum "$FIXTURE_ROOT/java/Compat.class" | cut -d' ' -f1
         java -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
-            -cp "$WORK_DIR" Compat "$WORK_DIR"
+            -cp "$FIXTURE_ROOT/java" Compat "$WORK_DIR"
         ;;
     git)
         if [[ -x /usr/local/bin/git.meta.real ]]; then

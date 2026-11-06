@@ -8,8 +8,8 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 3120,
-      "applicable": 2270,
+      "cells": 3130,
+      "applicable": 2272,
       "selectable": 1779,
       "population": 3055,
       "population_candidate_selected": 1779,
@@ -18,7 +18,7 @@
     },
     "by_backend": {
       "dbt": {
-        "cells": 624,
+        "cells": 626,
         "applicable": 560,
         "selectable": 555,
         "population": 611,
@@ -27,7 +27,7 @@
         "population_candidate_disabled": 54
       },
       "in-guest-trap": {
-        "cells": 624,
+        "cells": 626,
         "applicable": 314,
         "selectable": 314,
         "population": 611,
@@ -36,7 +36,7 @@
         "population_candidate_disabled": 297
       },
       "kvm": {
-        "cells": 624,
+        "cells": 626,
         "applicable": 604,
         "selectable": 595,
         "population": 611,
@@ -45,7 +45,7 @@
         "population_candidate_disabled": 13
       },
       "liteinst": {
-        "cells": 624,
+        "cells": 626,
         "applicable": 315,
         "selectable": 315,
         "population": 611,
@@ -54,8 +54,8 @@
         "population_candidate_disabled": 296
       },
       "sabre": {
-        "cells": 624,
-        "applicable": 477,
+        "cells": 626,
+        "applicable": 479,
         "selectable": 0,
         "population": 611,
         "population_candidate_selected": 0,
@@ -2065,16 +2065,26 @@
     {"test_id":"compat/ip","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/ip","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/ip","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
-    {"test_id":"compat/java","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
-    {"test_id":"compat/java","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
-    {"test_id":"compat/java","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
-    {"test_id":"compat/java","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
-    {"test_id":"compat/java","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
-    {"test_id":"compat/javac","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
-    {"test_id":"compat/javac","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
-    {"test_id":"compat/javac","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
-    {"test_id":"compat/javac","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
-    {"test_id":"compat/javac","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/java-compile","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/java-compile","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/java-compile","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/java-compile","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/java-compile","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/java-run","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/java-run","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/java-run","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/java-run","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/java-run","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/javac-compile","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/javac-compile","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/javac-compile","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/javac-compile","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/javac-compile","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/javac-run","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/javac-run","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/javac-run","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/javac-run","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/javac-run","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only, super run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/join","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/join","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its first verify run on in-guest-trap failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/join","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

@@ -4,7 +4,8 @@ bucket: compat
 # validation host, each run under Hermit's verify. The verify cells of the rows
 # labelled sabre-compat-only, and every row's SaBRe cell (`focused`), belong to
 # the SaBRe run type alone; the full validation runs the ptrace verify cells of
-# the other rows (since 2026-10-13 only rustc, javac, java, node and timeout
+# the other rows (since 2026-10-13 only rustc, javac, java, node and timeout;
+# javac and java split into compile/run rows on 2026-11-05
 # carry that label: https://github.com/rrnewton/hermit/issues/4269 moved 25
 # rows into the full run, so that parity compares them), and the liteinst and in-guest-trap verify cells of the rows
 # each `additional` entry names. The rr lane's rows also have a replay cell
@@ -16,8 +17,9 @@ bucket: compat
 # 2026-10-13 the `variants` entry repeated every row as a second test,
 # compat/strict-<row>, for a strict run type, while this cell always ran
 # relaxed (https://github.com/rrnewton/hermit/issues/4276).
-# The scheduled super suite runs the four heavy rows' ptrace cells (rustc,
-# javac, java, node: the `heavy` section's `labels`) through
+# The scheduled super suite runs the heavy rows' ptrace cells (rustc,
+# javac-compile, javac-run, java-compile, java-run, node: the `heavy`
+# section's `labels`) through
 # supercompat.manifest_compat, against the super run type's release Hermit. Lane settings are stated once below and every
 # row is expanded into an ordinary test recipe
 # (ci/manifest-plan/src/manifest_corpus.rs). The rows were moved verbatim from
@@ -66,8 +68,10 @@ corpus:
     labels: [super]
     rows:
       rustc: compiles and runs a Rust program
-      javac: compiles a Java program
-      java: compiles and runs a Java program
+      javac-compile: compiles a Java program
+      javac-run: runs the fixture-prepared Java program
+      java-compile: compiles a Java program
+      java-run: runs the fixture-prepared Java program
       node: starts the Node.js runtime
   # The SaBRe run type (scripts/validate.rs --sabre-compat-only): every row
   # also runs on SaBRe, except the four the SaBRe corpus never had. Until
@@ -1541,7 +1545,7 @@ corpus:
         Not in the 2026-10-13 KVM survey: its KVM verify cell was not green
         on the compatibility ledger
       disabled:
-        java: >-
+        java-compile: >-
           The JVM's shared file mappings beside its other threads now go ahead
           on KVM (https://github.com/rrnewton/reverie/issues/1108). At Hermit
           534dd831, before Detcore's flock model was in this base, the run
@@ -1551,8 +1555,21 @@ corpus:
           which KVM refused by name (`KVM flock is unsupported`,
           HERMIT_POLICY_REFUSAL, exit 122) in 10 of 10 KVM verify runs. What
           stops it on this tree, which has the flock model, is unmeasured; it
-          stays off KVM until it is measured
-        javac: >-
+          stays off KVM until it is measured. Measured then on the combined
+          java row; both split halves start a JVM, so both inherit this.
+        java-run: >-
+          The JVM's shared file mappings beside its other threads now go ahead
+          on KVM (https://github.com/rrnewton/reverie/issues/1108). At Hermit
+          534dd831, before Detcore's flock model was in this base, the run
+          then stopped at flock: the pinned root's OpenJDK
+          (openjdk-headless-21.0.12+8) creates its perf-data file
+          /tmp/hsperfdata_root/<pid> and calls flock(LOCK_EX|LOCK_NB) on it,
+          which KVM refused by name (`KVM flock is unsupported`,
+          HERMIT_POLICY_REFUSAL, exit 122) in 10 of 10 KVM verify runs. What
+          stops it on this tree, which has the flock model, is unmeasured; it
+          stays off KVM until it is measured. Measured then on the combined
+          java row; both split halves start a JVM, so both inherit this.
+        javac-compile: >-
           javac's JVM gets past its shared file mappings beside its threads on
           KVM too (https://github.com/rrnewton/reverie/issues/1108). At Hermit
           534dd831, before Detcore's flock model was in this base, it stopped
@@ -1560,7 +1577,18 @@ corpus:
           which KVM refused by name (`KVM flock is unsupported`,
           HERMIT_POLICY_REFUSAL, exit 122) in 10 of 10 KVM verify runs. What
           stops it on this tree, which has the flock model, is unmeasured; it
-          stays off KVM until it is measured
+          stays off KVM until it is measured. Measured then on the combined
+          javac row; both split halves start a JVM, so both inherit this.
+        javac-run: >-
+          javac's JVM gets past its shared file mappings beside its threads on
+          KVM too (https://github.com/rrnewton/reverie/issues/1108). At Hermit
+          534dd831, before Detcore's flock model was in this base, it stopped
+          at the same flock of its perf-data file /tmp/hsperfdata_root/<pid>,
+          which KVM refused by name (`KVM flock is unsupported`,
+          HERMIT_POLICY_REFUSAL, exit 122) in 10 of 10 KVM verify runs. What
+          stops it on this tree, which has the flock model, is unmeasured; it
+          stays off KVM until it is measured. Measured then on the combined
+          javac row; both split halves start a JVM, so both inherit this.
         lsof: >-
           lsof stats every process's /proc/<pid> directory, which KVM's /proc
           does not serve (another process's:
@@ -1706,7 +1734,7 @@ corpus:
           dd, df, diff, diff3, dos2unix, egrep, elfedit, env, envsubst, expand,
           factor, fallocate, fgrep, file, find, flex, flock, fmt, fold, "g++",
           gcc, gcov, getconf, git, gprof, grep, gzip, gzip-roundtrip, hexdump,
-          iconv, install, ionice, ip, javac, join, jq, ld, ln, logname, lscpu,
+          iconv, install, ionice, ip, javac-compile, javac-run, join, jq, ld, ln, logname, lscpu,
           lua, m4, mkdir, mkfifo, mktemp, mountpoint, msgfmt, msgunfmt, mv,
           namei, nice, nl, nm, nohup, objcopy, objdump, od, paste, patch,
           pathchk, perl, pgrep, pkg-config, pkill, printenv, ptx, ranlib,
@@ -1752,10 +1780,13 @@ corpus:
       evidence: https://github.com/rrnewton/hermit/issues/3492
       reason: >-
         The java row's javac step aborts on the in-guest Detcore invariant
-        "end_of_timeslice is None during update_logical_time_rcbs"
+        "end_of_timeslice is None during update_logical_time_rcbs". Since
+        the 2026-11-05 split that step is the java-compile row; java-run
+        is grouped here unmeasured until its SaBRe cell is measured, as
+        the combined row never got past the compile step on SaBRe
       rows:
         [
-          java
+          java-compile, java-run
         ]
     - backend: sabre
       result: determinism-failure
@@ -1855,9 +1886,10 @@ corpus:
           to create /tmp/cscope.9 (the guest's deterministic pid) and zip-unzip
           finding /tmp/hermit-compat-zip removed under it
         rows: [cscope, zip-unzip]
-    # The three heavy compile and JVM rows replay at 20 to 31 CPU seconds,
+    # The heavy compile and JVM rows replay at 20 to 31 CPU seconds,
     # about half the section's 59, and their wall needs more than double that
-    # on a loaded host.
+    # on a loaded host. The java/javac rows split into compile and run cells
+    # on 2026-11-05; each half keeps this backstop.
     slow:
       - timeout_seconds: 177
         cpu_timeout_seconds: 59
@@ -1873,7 +1905,7 @@ corpus:
           about twice the largest measured use; the wall bound is three times
           it, the host-load backstop ci/nextest-timeout-config.rs gives the
           liteinst_stacks tests
-        rows: [java, javac, rustc]
+        rows: [java-compile, java-run, javac-compile, javac-run, rustc]
   rows:
     - {label: "echo", argv: ["/bin/echo", "hermit-compat"]}
     - {label: "true", argv: ["/usr/bin/true"]}
@@ -2077,8 +2109,25 @@ corpus:
     # corpus's programs this corpus lacks, and the four heavy rows, whose
     # ptrace cells the super run type runs too (the `heavy` section's labels).
     - {label: "rustc", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "rustc"], labels: [sabre-compat-only]}
-    - {label: "javac", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "javac"], labels: [sabre-compat-only]}
-    - {label: "java", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "java"], labels: [sabre-compat-only]}
+    # Power/weight 2026-11-05 @ Hermit 1db0a95883, ptrace, 316-core host:
+    # java/javac split into compile+run cells (one JVM startup each).
+    # Production replay-cell CPU medians (n=55 to 2026-11-05): java 77.1 s,
+    # javac 76.7 s combined. Local strict-run walls (medians of 3): java
+    # 8.7 s -> compile 6.7 s + run 3.8 s; javac 6.9 s -> compile 7.4 s +
+    # run 2.5 s. Hermit coverage (hermit-code-coverage collect per case,
+    # pairwise diffs + union of normalized sets): java baseline 29037
+    # lines/41854 regions, javac 28912/41649; each split union loses the
+    # same 6 lines/8 regions, all the legacy stat dispatch
+    # (detcore/src/lib.rs:7207, syscalls/files.rs:3134-3138) the second JVM
+    # reached over the first JVM's perf-data in one guest; every other
+    # dispatched syscall type is retained (no other dispatch arm lost).
+    # Guest stdout and milestones (JVM startup, compile, file I/O, SHA-256,
+    # worker thread; fibonacci assertion) preserved; run cells print the
+    # fixture class digest the compile cells produce.
+    - {label: "javac-compile", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "javac-compile"], labels: [sabre-compat-only]}
+    - {label: "javac-run", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "javac-run"], labels: [sabre-compat-only]}
+    - {label: "java-compile", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "java-compile"], labels: [sabre-compat-only]}
+    - {label: "java-run", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "java-run"], labels: [sabre-compat-only]}
     - {label: "node", argv: ["/bin/node", "-e", "console.log(42)"], labels: [sabre-compat-only]}
     - {label: "timeout", argv: ["/usr/bin/timeout", "1", "/usr/bin/true"], labels: [sabre-compat-only]}
     - {label: "truncate", argv: ["bash", "-c", "set -euo pipefail; f=$(mktemp); printf \"Hermit\\n\" >\"$f\"; /usr/bin/truncate -s 4096 \"$f\"; test \"$(stat -c %s \"$f\")\" = 4096; /usr/bin/truncate -s 7 \"$f\"; test \"$(stat -c %s \"$f\")\" = 7; test \"$(cat \"$f\")\" = Hermit; rm -f \"$f\"; printf \"truncate:4096-to-7-ok\\n\""]}

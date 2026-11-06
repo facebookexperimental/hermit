@@ -31,7 +31,8 @@ trap 'rm -rf "$BUILD_ROOT" "$OLD_ROOT"' EXIT
 rm -rf "$BUILD_ROOT" "$OLD_ROOT"
 FIXTURE_ROOT=$BUILD_ROOT
 mkdir -p "$FIXTURE_ROOT/binutils" "$FIXTURE_ROOT/gprof" "$FIXTURE_ROOT/gcov" \
-    "$FIXTURE_ROOT/lsof" "$FIXTURE_ROOT/df" "$FIXTURE_ROOT/toolchain"
+    "$FIXTURE_ROOT/lsof" "$FIXTURE_ROOT/df" "$FIXTURE_ROOT/toolchain" \
+    "$FIXTURE_ROOT/java"
 
 # Compatibility probes run from an otherwise-empty /test. Snapshot the one
 # repository input used by the coreutils rows instead of accidentally relying
@@ -127,6 +128,20 @@ EOF
 cat >"$FIXTURE_ROOT/df/mountinfo" <<'EOF'
 1 0 0:1 / / rw,relatime - rootfs rootfs rw
 EOF
+
+# The split java/javac rows (2026-11-05): the run cells execute classes
+# compiled here from the tracked sources the compile cells also compile, so
+# each guest pays one JVM startup instead of two. Same javac flags as the
+# workload rows (CompilerCompat with -g:none, Compat with defaults), so the
+# class bytes are the bytes the compile cells produce and print.
+cp "$PWD/tests/compat/Compat.java" "$PWD/tests/compat/CompilerCompat.java" \
+    "$FIXTURE_ROOT/java/"
+javac -cp "$FIXTURE_ROOT/java" -d "$FIXTURE_ROOT/java" \
+    "$FIXTURE_ROOT/java/Compat.java"
+javac -g:none -cp "$FIXTURE_ROOT/java" -d "$FIXTURE_ROOT/java" \
+    "$FIXTURE_ROOT/java/CompilerCompat.java"
+test -s "$FIXTURE_ROOT/java/Compat.class"
+test -s "$FIXTURE_ROOT/java/CompilerCompat.class"
 
 # Prevent host build time from becoming guest-visible input.
 find "$FIXTURE_ROOT" -exec touch -h -d @1 {} +

@@ -17019,7 +17019,15 @@ fi
         // times the shared 59 s CPU budget (compat.yaml's replay `slow`).
         for ((test, _, backend), bounds) in &compat_replay {
             assert_eq!(*backend, "ptrace", "{test}");
-            let wall = if ["compat/java", "compat/javac", "compat/rustc"].contains(test) {
+            let wall = if [
+                "compat/java-compile",
+                "compat/java-run",
+                "compat/javac-compile",
+                "compat/javac-run",
+                "compat/rustc",
+            ]
+            .contains(test)
+            {
                 177
             } else {
                 60

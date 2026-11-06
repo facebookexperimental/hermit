@@ -1358,9 +1358,10 @@ mod tests {
     /// three-run survey on 2026-10-09, 76 of the 77 rows the rr lane never
     /// listed as passing. Each is the replay cell of its row's own test,
     /// carrying the full and rr run types (the full validation selects them
-    /// since 2026-10-20) and none of the verify cell's settings. 215 are
-    /// selected (212 plus compat/df, compat/lua and compat/perl, whose
-    /// replay cells the 338-cell flip of 2026-10-30 made required), and the
+    /// since 2026-10-20) and none of the verify cell's settings. 217 are
+    /// selected (214 plus compat/df, compat/lua and compat/perl, whose
+    /// replay cells the 338-cell flip of 2026-10-30 made required; the
+    /// java/javac compile+run split of 2026-11-05 took 215 to 217), and the
     /// 3 seen to fail stay enabled with `ci: false` and the
     /// issue of their failure (`UNSELECTED_REPLAY`).
     /// A row moved into or out of the run type, a second test for a program,
@@ -1399,7 +1400,15 @@ mod tests {
             // The heavy compile and JVM rows' replay cells get a three-times
             // wall backstop (the section's `slow` group); every other row
             // keeps the section's 60 seconds.
-            let wall = if ["compat/java", "compat/javac", "compat/rustc"].contains(&id) {
+            let wall = if [
+                "compat/java-compile",
+                "compat/java-run",
+                "compat/javac-compile",
+                "compat/javac-run",
+                "compat/rustc",
+            ]
+            .contains(&id)
+            {
                 "{ptrace: 177}"
             } else {
                 "{ptrace: 60}"
@@ -1426,8 +1435,9 @@ mod tests {
         // deselected with the pinned-image move (logger, pkg-config,
         // mountpoint) = 212. The cargo, gcov and rustc replay cells came
         // back the day they left, once the issue-4997 fixture race was
-        // fixed (271ec81bd4).
-        assert_eq!((gated, refused), (212, UNSELECTED_REPLAY.len()));
+        // fixed (271ec81bd4). The java/javac compile+run split of
+        // 2026-11-05 adds two net rows: 214.
+        assert_eq!((gated, refused), (214, UNSELECTED_REPLAY.len()));
     }
 
     /// The replay cells seen to fail, each with its issue: lsof in the

@@ -16237,7 +16237,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
 }
 
 /// Red cells the default run type does not select: a row label on the verify
-/// cells (compat/java on ptrace, compat/comm on SaBRe). No test carries a
+/// cells (compat/java-run on ptrace, compat/comm on SaBRe). No test carries a
 /// test-level label since the compat/strict-<row> tests were retired
 /// (<https://github.com/rrnewton/hermit/issues/4276>), and no replay cell is
 /// the rr run type's alone since the full validation selects them too
@@ -16245,7 +16245,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
 /// [`focused_red_cells`] puts an [`ordinary_red_cell`] beside them.
 const FOCUSED_LABELLED_RED_CELLS: [(&str, &str, &str); 2] = [
     ("compat/comm", "verify", "sabre"),
-    ("compat/java", "verify", "ptrace"),
+    ("compat/java-run", "verify", "ptrace"),
 ];
 
 /// A cell as the self-tests name one: (test, mode, backend).
@@ -30379,7 +30379,7 @@ mod pressure_sample_tests {
             .iter()
             .filter(|cell| cell.id.mode == "verify" && cell.id.backend == "ptrace")
             .filter(|cell| !committed_tests.contains(&cell.id.test))
-            // Ten repetitions of a heavy row (600 s, such as compat/java) do
+            // Ten repetitions of a heavy row (600 s, such as compat/java-run) do
             // not fit the run's wall bound, so the planner would refuse them
             // (https://github.com/rrnewton/hermit/issues/4538).
             .filter(|cell| {
@@ -34568,7 +34568,7 @@ mod harness_selection_tests {
 
     /// Red cells whose run type is not the default one (a test-level label, a
     /// per-backend label, and an rr-compat replay cell), beside a red cell of
-    /// the default run type. compat/java prepares through its ptrace cell,
+    /// the default run type. compat/java-run prepares through its ptrace cell,
     /// whose verify-cell label also excludes it from the default selection.
     #[test]
     fn red_cells_of_focused_run_types_select_their_cells() {
@@ -34606,7 +34606,7 @@ mod harness_selection_tests {
     fn a_command_without_its_run_type_filter_selects_nothing() {
         let manifests = ManifestSet::load(&checkout_root()).unwrap();
         let labelled = "env X=1 target/debug/test-harness run --include-manual \
-             --include-occasional --prebuilt --test 'compat/java' --mode 'verify' \
+             --include-occasional --prebuilt --test 'compat/java-run' --mode 'verify' \
              --backend 'ptrace' --label 'sabre-compat-only' --results 'r' --junit 'j' || status=$?";
         let (command, selection) = harness_command_selection(labelled).unwrap();
         assert_eq!(command, "run");

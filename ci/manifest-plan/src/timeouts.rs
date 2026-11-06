@@ -162,12 +162,13 @@ pub const STRICT_COMPAT_FOLD_2026_10_01_EVIDENCE_SHA: &str =
 pub const STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT: usize = 214;
 /// Since 2026-10-20 the full run also has the compat corpus's ptrace replay
 /// cells (`replay.full` in `tests/e2e/manifests/compat.yaml`), with the rr run
-/// type's 59/60 s bounds, except java, javac and rustc at 59/177 (the replay
-/// section's `slow` group, 2026-10-21): 212 selected after two clean nightly
-/// pressure sweeps, and 3 enabled with `ci: false` (lsof, cscope and zip-unzip).
-/// The 338-cell flip of 2026-10-30 selected df, lua and perl as well: 215
-/// selected, 218 enabled.
-pub const COMPAT_REPLAY_FULL_2026_10_20_ENABLED_CELL_COUNT: usize = 218;
+/// type's 59/60 s bounds, except the java/javac compile+run rows and rustc at
+/// 59/177 (the replay section's `slow` group, 2026-10-21): 212 selected after
+/// two clean nightly pressure sweeps, and 3 enabled with `ci: false` (lsof,
+/// cscope and zip-unzip). The 338-cell flip of 2026-10-30 selected df, lua
+/// and perl as well: 215 selected, 218 enabled. The java/javac compile+run
+/// split of 2026-11-05 adds two net rows: 217 selected, 220 enabled.
+pub const COMPAT_REPLAY_FULL_2026_10_20_ENABLED_CELL_COUNT: usize = 220;
 /// Ptrace replay cells selected when
 /// <https://github.com/rrnewton/hermit/pull/3580> taught the recorder and
 /// replayer `select` and `pselect6`. Before it, replay of both programs

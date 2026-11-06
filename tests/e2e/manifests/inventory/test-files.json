@@ -3721,6 +3721,18 @@
       "why": "tests/chaos/thread_interleaving.c is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/compat/Compat.java",
+      "runner": "tests/compat/prepare_real_compat_fixtures.sh and tests/compat/real_compat_workload.sh",
+      "why": "tests/compat/Compat.java is owned by tests/compat/prepare_real_compat_fixtures.sh and tests/compat/real_compat_workload.sh: The fixture builder compiles this Java source into the immutable class the java-run compat cell executes, and the java-compile cell compiles the same tracked source in the guest; it is compiler input for those drivers rather than a standalone guest program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/compat/CompilerCompat.java",
+      "runner": "tests/compat/prepare_real_compat_fixtures.sh and tests/compat/real_compat_workload.sh",
+      "why": "tests/compat/CompilerCompat.java is owned by tests/compat/prepare_real_compat_fixtures.sh and tests/compat/real_compat_workload.sh: The fixture builder compiles this Java source into the immutable class the javac-run compat cell executes, and the javac-compile cell compiles the same tracked source in the guest; it is compiler input for those drivers rather than a standalone guest program."
+    },
+    {
       "disposition": "special-driver",
       "path": "tests/compat/complex_shell_workload.sh",
       "runner": "scripts/validate.rs compatibility partitions",

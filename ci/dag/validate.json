@@ -12647,14 +12647,28 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/java",
+          "test": "compat/java-compile",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/javac",
+          "test": "compat/java-run",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/javac-compile",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/javac-run",
           "mode": "replay",
           "backend": "ptrace"
         },
@@ -17685,14 +17699,28 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/java",
+          "test": "compat/java-compile",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/javac",
+          "test": "compat/java-run",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/javac-compile",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/javac-run",
           "mode": "replay",
           "backend": "ptrace"
         },
@@ -20955,14 +20983,28 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/java",
+          "test": "compat/java-compile",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/javac",
+          "test": "compat/java-run",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/javac-compile",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/javac-run",
           "mode": "replay",
           "backend": "ptrace"
         },
@@ -21890,14 +21932,28 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/java",
+          "test": "compat/java-compile",
           "mode": "verify",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/javac",
+          "test": "compat/java-run",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/javac-compile",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/javac-run",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -38417,14 +38473,28 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/java",
+          "test": "compat/java-compile",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/javac",
+          "test": "compat/java-run",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/javac-compile",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/javac-run",
           "mode": "replay",
           "backend": "ptrace"
         },
@@ -55843,14 +55913,28 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/java",
+          "test": "compat/java-compile",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/javac",
+          "test": "compat/java-run",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/javac-compile",
+          "mode": "replay",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/javac-run",
           "mode": "replay",
           "backend": "ptrace"
         },

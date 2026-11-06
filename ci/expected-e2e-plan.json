@@ -34104,44 +34104,6 @@
       "requires_host_capabilities": [
         "cpuid-faulting"
       ],
-      "test": "compat/java",
-      "timeout_seconds": 177
-    },
-    {
-      "backend": "ptrace",
-      "category": "compat",
-      "classification": "required",
-      "cpu_timeout_seconds": 59,
-      "lane": "portable",
-      "mode": "replay",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "compat/javac",
-      "timeout_seconds": 177
-    },
-    {
-      "backend": "ptrace",
-      "category": "compat",
-      "classification": "required",
-      "cpu_timeout_seconds": 59,
-      "lane": "portable",
-      "mode": "replay",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
       "test": "compat/join",
       "timeout_seconds": 60
     },
@@ -45676,6 +45638,82 @@
       ],
       "test": "c-programs/shared-file-threads",
       "timeout_seconds": 180
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "replay",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "compat/java-compile",
+      "timeout_seconds": 177
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "replay",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "compat/java-run",
+      "timeout_seconds": 177
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "replay",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "compat/javac-compile",
+      "timeout_seconds": 177
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "replay",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "compat/javac-run",
+      "timeout_seconds": 177
     }
   ],
   "schema": 1
