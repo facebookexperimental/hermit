@@ -270,9 +270,15 @@ mod tests {
         assert_eq!(owners.owner_for_cell("ptrace", &full).unwrap(), "core");
         assert_eq!(owners.owner_for_cell("liteinst", &full).unwrap(), "core");
         let archived = BTreeSet::from(["archived-nightly".to_string()]);
-        assert_eq!(owners.owner_for_cell("sabre", &archived).unwrap(), "patching");
+        assert_eq!(
+            owners.owner_for_cell("sabre", &archived).unwrap(),
+            "patching"
+        );
         let focused = BTreeSet::from(["sabre-compat-only".to_string()]);
-        assert_eq!(owners.owner_for_cell("ptrace", &focused).unwrap(), "patching");
+        assert_eq!(
+            owners.owner_for_cell("ptrace", &focused).unwrap(),
+            "patching"
+        );
         assert!(owners.owner_for_cell("unknown", &full).is_err());
     }
     #[test]
@@ -301,9 +307,7 @@ mod tests {
                 mode: Some("verify".into()),
                 backend: Some(backend.into()),
                 labels: labels.clone(),
-                execution_backends: Some(
-                    owners.backends_for_selection(&owner, &labels).unwrap(),
-                ),
+                execution_backends: Some(owners.backends_for_selection(&owner, &labels).unwrap()),
                 ..Default::default()
             };
             let cells = manifests.select(&exact).unwrap();
