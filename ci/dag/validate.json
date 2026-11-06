@@ -834,7 +834,8 @@
       "networkonly": false,
       "engine_only": false,
       "timeout": 600,
-      "cpu_timeout": 7200,
+      "cpu_timeout": 600,
+      "priority": 50,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {

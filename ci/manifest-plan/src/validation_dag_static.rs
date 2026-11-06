@@ -8090,7 +8090,10 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"gate.manifest"########, r########"build.workspace_in_pinned_root"########],
+        deps: &[
+            r########"gate.manifest"########,
+            r########"build.workspace_in_pinned_root"########,
+        ],
         env: &[],
         hint: HintSpec {
             resources: &[],
@@ -8105,7 +8108,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 7200,
+        cpu_timeout: 600,
         jobs_flag: None,
         jobs_env: None,
     },

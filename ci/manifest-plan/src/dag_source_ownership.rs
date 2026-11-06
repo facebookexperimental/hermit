@@ -154,11 +154,10 @@ pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[
     ExtensionNode {
         tag: "build.reverie_buck",
         labels: &["full"],
-        deps: &["gate.manifest"],
+        deps: &["gate.manifest", "build.workspace_in_pinned_root"],
         populations: &[],
     },
 ];
-
 
 /// Tags admitted by `extension`, after validating it against `source`.
 fn validate_extension_registry(
@@ -624,6 +623,52 @@ pub fn source_profile(
     }
     Ok(selected)
 }
+/// Frozen core profile plus admitted post-split extension nodes, by label,
+/// with dependency closure over frozen-core and extension tags. The frozen
+/// lineage (`source_profile`) stays asserted separately; this is the live
+/// population a generated plan must equal.
+pub fn admitted_profile(label: &str, closure: bool) -> Result<BTreeSet<String>, String> {
+    let source = contract();
+    let mut selected = source_profile(label, true, false)?;
+    let extension = validate_extension_registry(&source, POST_SPLIT_CORE_NODES)?;
+    let mut nodes: BTreeMap<String, (Vec<String>, Vec<String>)> = source
+        .nodes
+        .iter()
+        .map(|(tag, node)| (tag.clone(), (node.labels.clone(), node.deps.clone())))
+        .collect();
+    for node in POST_SPLIT_CORE_NODES {
+        nodes.insert(
+            node.tag.to_string(),
+            (
+                node.labels.iter().map(ToString::to_string).collect(),
+                node.deps.iter().map(ToString::to_string).collect(),
+            ),
+        );
+    }
+    for tag in &extension {
+        if nodes[tag].0.iter().any(|value| value == label) {
+            selected.insert(tag.clone());
+        }
+    }
+    if closure {
+        let mut pending = selected.iter().cloned().collect::<Vec<_>>();
+        while let Some(tag) = pending.pop() {
+            let (_, deps) = &nodes[&tag];
+            for dependency in deps {
+                let admitted = source
+                    .nodes
+                    .get(dependency)
+                    .is_some_and(|node| node.owner == "core")
+                    || extension.contains(dependency);
+                if admitted && selected.insert(dependency.clone()) {
+                    pending.push(dependency.clone());
+                }
+            }
+        }
+    }
+    Ok(selected)
+}
+
 /// The original complete source sets remain asserted (19/22); the real current
 /// core split must equal their exact first-party owner subset, not a new count.
 pub fn hosted_split_tags(closure: bool) -> BTreeSet<String> {

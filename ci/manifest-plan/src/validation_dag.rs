@@ -776,11 +776,12 @@ const PROFILES: [Profile; 11] = [
         // privileged-test.deadline_slice_cap_kvm, the deadline_slice_cap suite
         // on KVM held to its gap ledger, adds one full-only node: 102/103
         // before.
-        // build.reverie_buck, the inert M2 Cut 2 Reverie Buck-build bracket,
-        // adds one full-only node: 103/104 before.
+        // build.reverie_buck (M2) is a post-split extension node: these
+        // counts stay the frozen lineage (103/104); the node joins through
+        // POST_SPLIT_CORE_NODES, not this table.
         label: "full",
-        direct_steps: 104,
-        selected_steps: 105,
+        direct_steps: 103,
+        selected_steps: 104,
     },
     Profile {
         // 81/82 with the same host-fixtures retirement: 82/83 before.
@@ -2107,6 +2108,13 @@ fn is_buck_import_twin(step: &Step) -> bool {
 pub fn buck_e2e_selection(committed: &DagConfig) -> Result<DagConfig, String> {
     let replaced = buck_replaced_tags(committed)?;
     let mut pruned = committed.clone();
+    // Post-split extension brackets (build.reverie_buck, M2) are not part of
+    // the Buck E2E replacement composition: they carry the `full` label for
+    // the ordinary full profile, and selecting them here would keep the
+    // bracket inside the very mode whose selection it brackets. Exclude
+    // extension tags explicitly; the frozen population is unchanged.
+    let extension = crate::dag_source_ownership::extension_tags();
+    pruned.steps.retain(|step| !extension.contains(&step.tag()));
     for step in &mut pruned.steps {
         if replaced.contains(&step.tag()) {
             step.labels.retain(|label| label != "full");
@@ -3894,10 +3902,18 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
             "the Buck E2E selection still selects replaced node(s) {kept_replaced:?}"
         ));
     }
-    let expected_dropped = replaced
+    // Post-split extension brackets (build.reverie_buck, M2) are excluded
+    // from the Buck E2E selection by buck_e2e_selection itself, so they are
+    // dropped without being replaced; they are the only such nodes.
+    let extension_dropped = crate::dag_source_ownership::extension_tags()
         .intersection(&full_tags)
         .cloned()
         .collect::<BTreeSet<_>>();
+    let mut expected_dropped = replaced
+        .intersection(&full_tags)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    expected_dropped.extend(extension_dropped);
     if dropped != expected_dropped {
         return Err(format!(
             "the Buck E2E selection drops {dropped:?}, but replaces {replaced:?} (of which full had {expected_dropped:?})"
@@ -5317,10 +5333,8 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
                 profile.label
             ));
         }
-        let source_direct =
-            crate::dag_source_ownership::source_profile(profile.label, true, false)?;
-        let source_selected =
-            crate::dag_source_ownership::source_profile(profile.label, true, true)?;
+        let source_direct = crate::dag_source_ownership::admitted_profile(profile.label, false)?;
+        let source_selected = crate::dag_source_ownership::admitted_profile(profile.label, true)?;
         let direct = cfg
             .steps
             .iter()
