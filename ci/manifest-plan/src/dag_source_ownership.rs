@@ -14,6 +14,7 @@
 //!     tag: "e2e.manifest_example",
 //!     labels: &["full", "portable"],
 //!     deps: &["gate.manifest", /* core or extension tags only */],
+//!     populations: &["manifest_publishers"],
 //! }
 //! ```
 //!
@@ -25,6 +26,10 @@
 //! generated twin (`_on_host`, `_buck`) as its own entry. The admitted core
 //! population is then exactly frozen core tags ∪ extension tags
 //! ([`admitted_core_tags`]); anything else is refused as an extra node.
+//! Named-population membership (the contract's `named_populations`, today
+//! only `manifest_publishers`) is declared the same way, per node, in
+//! `populations`; an undeclared extension node is never a member, and an
+//! unknown population name is refused.
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -55,6 +60,8 @@ pub struct ExtensionNode {
     pub tag: &'static str,
     pub labels: &'static [&'static str],
     pub deps: &'static [&'static str],
+    /// Contract named populations this node joins (see module docs).
+    pub populations: &'static [&'static str],
 }
 
 /// The ONE registry for validation-DAG nodes created after the split.
@@ -73,6 +80,7 @@ pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[
             "setup.manifest_plan_in_pinned_root",
             "setup.pinned_root_fetch",
         ],
+        populations: &["manifest_publishers"],
     },
     ExtensionNode {
         tag: "e2e.manifest_rr_on_host",
@@ -84,6 +92,7 @@ pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[
             "pre.reverie_pin",
             "setup.manifest_plan",
         ],
+        populations: &["manifest_publishers"],
     },
     ExtensionNode {
         tag: "e2e.manifest_rr_buck",
@@ -95,6 +104,7 @@ pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[
             "pre.reverie_pin",
             "setup.manifest_plan",
         ],
+        populations: &["manifest_publishers"],
     },
 ];
 
@@ -117,11 +127,23 @@ fn validate_extension_registry(
         if !tags.insert(node.tag.to_string()) {
             return Err(format!("duplicate post-split extension node {}", node.tag));
         }
-        for (name, values) in [("label", node.labels), ("dependency", node.deps)] {
+        for (name, values) in [
+            ("label", node.labels),
+            ("dependency", node.deps),
+            ("population", node.populations),
+        ] {
             let unique = values.iter().collect::<BTreeSet<_>>();
             if unique.len() != values.len() || values.iter().any(|value| value.is_empty()) {
                 return Err(format!(
                     "post-split extension node {} has empty/duplicate {name}",
+                    node.tag
+                ));
+            }
+        }
+        for population in node.populations {
+            if !source.named_populations.contains_key(*population) {
+                return Err(format!(
+                    "post-split extension node {} joins unknown source population {population}",
                     node.tag
                 ));
             }
@@ -352,10 +374,22 @@ fn unique_tags(cfg: &dagrun::model::DagConfig) -> Result<BTreeSet<String>, Strin
 }
 /// Keep the complete original count and compare the actual exact core subset.
 /// External members are required in their catalog, never inferred as executed.
+/// Post-split extension nodes join the expected set only by declaring the
+/// population in their registry entry ([`ExtensionNode::populations`]);
+/// `original_count` still pins the frozen list's length.
 pub fn assert_named_population(
     name: &str,
     original_count: usize,
     actual: BTreeSet<String>,
+) -> Result<(), String> {
+    assert_named_population_with(name, original_count, actual, POST_SPLIT_CORE_NODES)
+}
+
+fn assert_named_population_with(
+    name: &str,
+    original_count: usize,
+    actual: BTreeSet<String>,
+    extension: &[ExtensionNode],
 ) -> Result<(), String> {
     let source = contract();
     let original = source
@@ -365,11 +399,37 @@ pub fn assert_named_population(
     if original.len() != original_count {
         return Err(format!("original {name} count changed"));
     }
-    let expected = original
+    let frozen_core = original
         .iter()
         .filter(|tag| source.nodes[*tag].owner == "core")
         .cloned()
         .collect::<BTreeSet<_>>();
+    validate_extension_registry(&source, extension)?;
+    let declared = extension
+        .iter()
+        .filter(|node| node.populations.contains(&name))
+        .map(|node| node.tag.to_string())
+        .collect::<BTreeSet<_>>();
+    if !frozen_core.is_disjoint(&declared) {
+        return Err(format!(
+            "declared {name} extension members duplicate frozen core members"
+        ));
+    }
+    // The total is asserted, not just implied by set equality: the frozen
+    // core-owned subset plus exactly the declared extension members, no
+    // duplicates. (Frozen rows owned externally stay in their catalog and
+    // never count here.)
+    let expected_count = frozen_core.len() + declared.len();
+    if actual.len() != expected_count {
+        return Err(format!(
+            "actual {name} population count changed: {} != {} frozen core + {} declared",
+            actual.len(),
+            frozen_core.len(),
+            declared.len()
+        ));
+    }
+    let mut expected = frozen_core;
+    expected.extend(declared);
     if actual != expected {
         return Err(format!(
             "actual {name} core owner population changed: {actual:?} != {expected:?}"
@@ -710,6 +770,7 @@ mod tests {
         tag: "e2e.manifest_example",
         labels: &["full", "portable"],
         deps: &["gate.manifest"],
+        populations: &["manifest_publishers"],
     }];
 
     fn one_step_cfg(deps: &[&str]) -> dagrun::model::DagConfig {
@@ -757,12 +818,70 @@ mod tests {
     }
 
     #[test]
+    fn named_population_admits_only_declared_extension_members() {
+        let source = contract();
+        let frozen_core_members = source.named_populations["manifest_publishers"]
+            .iter()
+            .filter(|tag| source.nodes[*tag].owner == "core")
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let original_count = source.named_populations["manifest_publishers"].len();
+        // Positive: the declared extension member joins the expected set.
+        let mut with_example = frozen_core_members.clone();
+        with_example.insert("e2e.manifest_example".to_string());
+        assert_named_population_with(
+            "manifest_publishers",
+            original_count,
+            with_example.clone(),
+            EXAMPLE,
+        )
+        .unwrap();
+        // Negative: an undeclared tag in the actual set is still refused.
+        let mut with_undeclared = with_example.clone();
+        with_undeclared.insert("e2e.manifest_unregistered".to_string());
+        assert!(
+            assert_named_population_with(
+                "manifest_publishers",
+                original_count,
+                with_undeclared,
+                EXAMPLE,
+            )
+            .unwrap_err()
+            .contains("population count changed")
+        );
+        // Negative: a declared member missing from the actual set is refused.
+        assert!(
+            assert_named_population_with(
+                "manifest_publishers",
+                original_count,
+                frozen_core_members,
+                EXAMPLE,
+            )
+            .unwrap_err()
+            .contains("population count changed")
+        );
+        // Negative: an unknown population name in the registry is refused.
+        let unknown_population = [ExtensionNode {
+            tag: "e2e.manifest_example",
+            labels: &["full"],
+            deps: &["gate.manifest"],
+            populations: &["no_such_population"],
+        }];
+        assert!(
+            validate_extension_registry(&source, &unknown_population)
+                .unwrap_err()
+                .contains("joins unknown source population no_such_population")
+        );
+    }
+
+    #[test]
     fn extension_registry_refuses_collision_crossed_and_unknown_deps() {
         let source = contract();
         let collision = [ExtensionNode {
             tag: "pre.submodules",
             labels: &["full"],
             deps: &[],
+            populations: &[],
         }];
         assert!(
             validate_extension_registry(&source, &collision)
@@ -773,6 +892,7 @@ mod tests {
             tag: "e2e.manifest_example",
             labels: &["full"],
             deps: &["check.dbt_runtime_abi"],
+            populations: &[],
         }];
         assert!(validate_extension_registry(&source, &crossed)
             .unwrap_err()
@@ -781,6 +901,7 @@ mod tests {
             tag: "e2e.manifest_example",
             labels: &["full"],
             deps: &["no.such.node"],
+            populations: &[],
         }];
         assert!(
             validate_extension_registry(&source, &unknown)
@@ -802,6 +923,7 @@ mod tests {
             tag: "e2e.manifest_example",
             labels: &["full", "portable"],
             deps: &["gate.manifest"],
+            populations: &[],
         }];
         assert!(transfer_diagnostic_dependencies_with(&mut crossed, &crossed_registry)
             .unwrap_err()
