@@ -23,8 +23,23 @@ set -euo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$ROOT_DIR"
 
-BUCK2=${HERMIT_VALIDATE_BUCK2:-buck2}
 MANIFEST=target/validate/harvested-files.json
+
+# Resolve buck2: an explicit HERMIT_VALIDATE_BUCK2 wins. Otherwise prefer a
+# real buck2 on PATH, but the PATH entry in a fresh validate checkout is a
+# DotSlash shim that cannot read its descriptor there, so fall back to the
+# DotSlash cache's extracted binary. Refuse if none exists.
+if [[ -n ${HERMIT_VALIDATE_BUCK2:-} ]]; then
+  BUCK2=$HERMIT_VALIDATE_BUCK2
+elif command -v buck2 >/dev/null 2>&1 && buck2 --version >/dev/null 2>&1; then
+  BUCK2=buck2
+else
+  BUCK2=$(find "$HOME/.cache/dotslash" -maxdepth 4 -name 'buck2-*-unknown-linux-*' -type f 2>/dev/null | sort | tail -n 1)
+  if [[ -z $BUCK2 ]]; then
+    echo "harvest-reverie-buck: no usable buck2 (set HERMIT_VALIDATE_BUCK2)" >&2
+    exit 2
+  fi
+fi
 
 # target| harvested name (the Cargo test-binary stem)
 TARGETS=(
