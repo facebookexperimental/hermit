@@ -598,8 +598,17 @@ EOF
         # fresh private one, but a run from a shared directory, such as an
         # ad-hoc run from the repository root, would otherwise compare entries
         # other jobs change (https://github.com/rrnewton/hermit/issues/3987).
+        # -XX:-UsePerfData keeps every JVM in the java/javac rows out of
+        # the shared /tmp/hsperfdata_<user> directory: with perf data on,
+        # JVM startup cleanup opens, flocks and unlinks whichever stale
+        # <pid> files other jobs left there, so what the guest observes
+        # depends on leftover state no run here created (dh-gg5uv). Perf
+        # data off is the same kind of JVM-internal bound as
+        # -Xint/+UseSerialGC; TMPDIR and -Djava.io.tmpdir do not move
+        # hsperfdata (measured on the pinned OpenJDK 21).
         javac -J-Duser.name=hermit -J-Duser.home="$WORK_DIR" \
             -J-Xint -J-XX:+UseSerialGC -J-XX:ActiveProcessorCount=1 \
+            -J-XX:-UsePerfData \
             -g:none -cp "$WORK_DIR" -d "$WORK_DIR" "$WORK_DIR/CompilerCompat.java"
         printf 'javac-compile:'
         sha256sum "$WORK_DIR/CompilerCompat.class" | cut -d' ' -f1
@@ -610,16 +619,13 @@ EOF
         # then run it with the combined row's exact java flags.
         printf 'javac-run-class:'
         sha256sum "$FIXTURE_ROOT/java/CompilerCompat.class" | cut -d' ' -f1
-        # Start the JVM once before the observed run. In the combined row,
-        # this JVM started after the javac JVM had initialized its
-        # perf-data state; preserve that second-JVM path instead of
-        # dropping its coverage.
-        java -Duser.name=hermit -Duser.home="$WORK_DIR" \
-            -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
-            -version >/dev/null 2>&1
         # Direct execution avoids a parent/child command-substitution pipe.
+        # Perf data off (dh-gg5uv, javac-compile above): no second-JVM
+        # perf-data path remains to preserve once no JVM here
+        # initializes perf-data state.
         java -Duser.name=hermit -Duser.home="$WORK_DIR" \
             -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
+            -XX:-UsePerfData \
             -cp "$FIXTURE_ROOT/java" CompilerCompat
         ;;
     java-compile)
@@ -670,6 +676,7 @@ EOF
         # An explicit class path keeps javac from listing its working
         # directory, as in the javac row.
         javac -J-Xint -J-XX:+UseSerialGC -J-XX:ActiveProcessorCount=1 \
+            -J-XX:-UsePerfData \
             -cp "$WORK_DIR" -d "$WORK_DIR" "$WORK_DIR/Compat.java"
         printf 'java-compile:'
         sha256sum "$WORK_DIR/Compat.class" | cut -d' ' -f1
@@ -680,13 +687,9 @@ EOF
         # exercised the same bytes, then the combined row's exact java flags.
         printf 'java-run-class:'
         sha256sum "$FIXTURE_ROOT/java/Compat.class" | cut -d' ' -f1
-        # Start the JVM once before the observed run. In the combined row,
-        # this JVM started after the javac JVM had initialized its
-        # perf-data state; preserve that second-JVM path instead of
-        # dropping its coverage.
+        # Perf data off (dh-gg5uv), as in javac-run above.
         java -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
-            -version >/dev/null 2>&1
-        java -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
+            -XX:-UsePerfData \
             -cp "$FIXTURE_ROOT/java" Compat "$WORK_DIR"
         ;;
     git)
