@@ -26,9 +26,16 @@
 //! ([`Scheduler::wake_backend_signal_waits`]).
 //! It reads the waiter's signal state from the backend
 //! (`backend_signal_state`) and wakes it when a pending signal is unblocked by
-//! the temporary mask and is caught or acts by default (Linux's
-//! `signal_pending` once `sigsuspend` has installed the mask, with ignored
-//! signals discarded). The woken thread runs the backend's call again in its
+//! the temporary mask (Linux's `signal_pending` once `sigsuspend` has
+//! installed the mask). A caught or default-acting one ends the wait. An
+//! ignored one is one Linux discarded when it was sent (`sig_ignored`,
+//! kernel/signal.c: the mask installed then lets it in), which the backend
+//! keeps pending because the thread's own mask, not the temporary one, is
+//! installed while it waits; the woken thread removes it in its own turn
+//! (`settle_suspend_decline`) and parks again, before a later disposition
+//! change could make it deliverable (the other half of that rule is
+//! `Scheduler::suspend_holds_discarded`, which a call that stops ignoring a
+//! signal asks first). The woken thread runs the backend's call again in its
 //! own turn, and that call decides what the guest sees; if the signal is gone
 //! by then, the call declines again and the thread parks again, so a wake that
 //! finds nothing is never visible to the guest.
@@ -69,6 +76,7 @@ use crate::resources::RT_SIGSUSPEND_FYI;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::syscalls::KernelSignalState;
+use crate::syscalls::ignored_at_generation;
 use crate::syscalls::reads_signal_state_from_backend;
 use crate::types::ChildWaitExitClass;
 use crate::types::ChildWaitSelector;
@@ -118,10 +126,12 @@ impl Scheduler {
         self.has_child_wait_target(process, sigchld_children())
     }
 
-    /// The signals that end a parked `rt_sigsuspend` under temporary mask
-    /// `mask`, given the waiter's signal state as the backend reports it:
+    /// The signals that end or settle a parked `rt_sigsuspend` under temporary
+    /// mask `mask`, given the waiter's signal state as the backend reports it:
     /// pending for it, unblocked by `mask`, and caught or acting by default
-    /// (`KernelSignalState::interrupting`). Held: the signals a host-timed
+    /// (`KernelSignalState::interrupting`), or ignored at generation
+    /// (`ignored_at_generation`), which Linux discarded when they were sent
+    /// and the woken thread removes in its own turn. Held: the signals a host-timed
     /// source armed by a guest can post (`host_timed_signals`), and `SIGCHLD`
     /// in a process with a `SIGCHLD` child (S4). A waiter whose mask lets in a
     /// caught `SIGCHLD` in such a process gets `SIGCHLD` too, so that its turn
@@ -134,7 +144,10 @@ impl Scheduler {
     ) -> u64 {
         let sigchld = kernel_signal_bit(libc::SIGCHLD);
         let held = host_timed | if sigchld_child { sigchld } else { 0 };
-        let interrupting = state.pending & !held & state.interrupting(mask);
+        let let_in =
+            state.pending & !held & !mask & !kernel_signal_bit(reverie::PERF_EVENT_SIGNAL as i32);
+        let discarded = let_in & ignored_at_generation(state.ignored, state.caught);
+        let interrupting = (let_in & state.interrupting(mask)) | discarded;
         let child_exit_fallback =
             sigchld_child && mask & sigchld == 0 && state.caught & sigchld != 0;
         if child_exit_fallback {
@@ -142,6 +155,36 @@ impl Scheduler {
         } else {
             interrupting
         }
+    }
+
+    /// Whether a parked `rt_sigsuspend` of `process` (`backend_suspend_mask`)
+    /// whose temporary mask lets `signal` in has it pending, on its own queue
+    /// or the process's, while the process ignores it: Linux discarded it when
+    /// it was sent (`sig_ignored`, kernel/signal.c), and the waiter has not yet
+    /// removed it in its own turn (`wake_backend_signal_waits`). A call that
+    /// would stop ignoring `signal` (`Detcore::handle_rt_sigaction`) asks this
+    /// first, and lets the waiter run until it is false, so the change never
+    /// makes deliverable a signal Linux no longer holds. Only waiters this
+    /// module decides are read, from their committed state, in DetTid order;
+    /// a gone or unreadable one holds nothing (the scan names the latter).
+    pub(crate) fn suspend_holds_discarded(&self, process: DetPid, signal: i32) -> bool {
+        if !reads_signal_state_from_backend(&self.backend)
+            || self.in_guest_signal_delivery
+            || !(1..=64).contains(&signal)
+        {
+            return false;
+        }
+        let bit = kernel_signal_bit(signal);
+        self.next_turns.keys().any(|&dettid| {
+            self.backend_suspend_mask(dettid)
+                .is_some_and(|mask| mask & bit == 0)
+                && self.registered_process(dettid) == Some(process)
+                && self.backend_waiter_is_current(process, dettid)
+                && self.backend_wait_state(dettid).is_ok_and(|state| {
+                    state.pending & bit != 0
+                        && ignored_at_generation(state.ignored, state.caught) & bit != 0
+                })
+        })
     }
 
     /// `dettid`'s signal state for a wait decision, through the backend.
@@ -246,7 +289,7 @@ impl Scheduler {
                 .map(SigWrapper)
                 .collect();
             tracing::info!(
-                "[dtid {}] signals {:?} end its rt_sigsuspend under mask {:#x}, as the backend \
+                "[dtid {}] signals {:?} end or settle its rt_sigsuspend under mask {:#x}, as the backend \
                  reports its signal state.",
                 dettid,
                 signals,

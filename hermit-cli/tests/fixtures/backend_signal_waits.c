@@ -38,6 +38,21 @@
  *   ppoll-ignored: a 20 ms ppoll whose temporary mask lets in a pending,
  *                  default-ignored SIGWINCH: it times out (0), and SIGWINCH is
  *                  no longer pending.
+ *   mixed:         SIGWINCH (default-ignored) and SIGUSR1 are queued on the
+ *                  thread while blocked; SIGUSR1's handler blocks SIGWINCH
+ *                  (sa_mask). sigsuspend(empty): Linux dequeues SIGUSR1 (10)
+ *                  before SIGWINCH (28) and runs the handler, under whose mask
+ *                  SIGWINCH stays pending, and it is still pending after the
+ *                  call restores the thread's mask.
+ *   ignored-first: the same with SIGPWR (30) for SIGUSR1: Linux dequeues
+ *                  SIGWINCH first and discards it, then runs SIGPWR's handler.
+ *   late-ignored:  a sibling sends SIGWINCH (default-ignored) while the main
+ *                  thread waits in sigsuspend(empty), later installs a
+ *                  SIGWINCH handler, then sends SIGUSR1. Linux discarded
+ *                  SIGWINCH when it was sent (the temporary mask let it in),
+ *                  so only SIGUSR1's handler runs.
+ *   late-ignored-same-turn: the same, with the handler installed and SIGUSR1
+ *                  sent at once after SIGWINCH.
  */
 
 #define _GNU_SOURCE
@@ -45,6 +60,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -339,6 +355,97 @@ static int ppoll_ignored(void) {
   return 0;
 }
 
+static volatile sig_atomic_t winch_runs;
+static volatile sig_atomic_t winch_in_handler = -1;
+static volatile sig_atomic_t winch_blocked_in_handler = -1;
+
+static void note_winch(int signo) {
+  (void)signo;
+  sigset_t set;
+  sigemptyset(&set);
+  sigpending(&set);
+  winch_in_handler = sigismember(&set, SIGWINCH);
+  sigprocmask(SIG_SETMASK, NULL, &set);
+  winch_blocked_in_handler = sigismember(&set, SIGWINCH);
+  if (signo == SIGUSR1) {
+    usr1_runs++;
+  }
+}
+
+static void on_winch(int signo) {
+  (void)signo;
+  winch_runs++;
+}
+
+/* SIGWINCH and `caught` queued on the thread while both are blocked;
+   `caught`'s handler blocks SIGWINCH; then sigsuspend(empty). */
+static int queued_pair(const char* name, int caught) {
+  block(SIG_BLOCK, SIGWINCH);
+  block(SIG_BLOCK, caught);
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sigemptyset(&sa.sa_mask);
+  sigaddset(&sa.sa_mask, SIGWINCH);
+  sa.sa_handler = note_winch;
+  sigaction(caught, &sa, NULL);
+  raise(SIGWINCH);
+  raise(caught);
+  int before = pending(SIGWINCH);
+  int eintr = suspend_empty();
+  sigset_t now;
+  sigprocmask(SIG_SETMASK, NULL, &now);
+  printf(
+      "%s before=%d eintr=%d winch_in_handler=%d winch_blocked_in_handler=%d "
+      "winch_after=%d mask_restored=%d\n",
+      name,
+      before,
+      eintr,
+      (int)winch_in_handler,
+      (int)winch_blocked_in_handler,
+      pending(SIGWINCH),
+      sigismember(&now, SIGWINCH) == 1 && sigismember(&now, caught) == 1);
+  return 0;
+}
+
+static int late_same_turn;
+
+static void* late_sender(void* arg) {
+  (void)arg;
+  while (!atomic_load(&waiting)) {
+    sched_yield();
+  }
+  sleep_ms(50);
+  syscall(SYS_tgkill, getpid(), waiter_tid, SIGWINCH);
+  if (!late_same_turn) {
+    sleep_ms(50);
+  }
+  install(SIGWINCH, on_winch);
+  syscall(SYS_tgkill, getpid(), waiter_tid, SIGUSR1);
+  return NULL;
+}
+
+static int late_ignored(const char* name, int same_turn) {
+  late_same_turn = same_turn;
+  install(SIGUSR1, on_usr1);
+  install(SIGWINCH, SIG_DFL);
+  block(SIG_BLOCK, SIGUSR1);
+  block(SIG_BLOCK, SIGWINCH);
+  waiter_tid = (pid_t)syscall(SYS_gettid);
+  pthread_t thread;
+  pthread_create(&thread, NULL, late_sender, NULL);
+  atomic_store(&waiting, 1);
+  int eintr = suspend_empty();
+  pthread_join(thread, NULL);
+  printf(
+      "%s eintr=%d usr1_runs=%d winch_runs=%d winch_after=%d\n",
+      name,
+      eintr,
+      (int)usr1_runs,
+      (int)winch_runs,
+      pending(SIGWINCH));
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     puts("BACKEND_SIGNAL_WAITS_USAGE");
@@ -365,6 +472,14 @@ int main(int argc, char** argv) {
     return ppoll_sibling();
   } else if (strcmp(mode, "ppoll-ignored") == 0) {
     return ppoll_ignored();
+  } else if (strcmp(mode, "mixed") == 0) {
+    return queued_pair("mixed", SIGUSR1);
+  } else if (strcmp(mode, "ignored-first") == 0) {
+    return queued_pair("ignored-first", SIGPWR);
+  } else if (strcmp(mode, "late-ignored") == 0) {
+    return late_ignored("late-ignored", 0);
+  } else if (strcmp(mode, "late-ignored-same-turn") == 0) {
+    return late_ignored("late-ignored-same-turn", 1);
   }
   puts("BACKEND_SIGNAL_WAITS_USAGE");
   return 2;

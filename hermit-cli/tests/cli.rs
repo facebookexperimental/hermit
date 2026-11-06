@@ -47419,6 +47419,22 @@ fn run_kvm_the_drain_decides_a_polled_call_from_the_backends_signal_state() {
 /// return is host timing (https://github.com/rrnewton/hermit/issues/5172).
 /// Before S2b every KVM line but `sigchld`'s differed (the suspend returned
 /// ENOSYS at once, and the masked ppoll was refused by name).
+///
+/// Ignored signals follow Linux's dequeue order and its discard at send
+/// (review of https://github.com/rrnewton/hermit/pull/5175). `mixed` queues a
+/// caught SIGUSR1 and an ignored SIGWINCH that its handler's mask blocks:
+/// Linux runs the handler first and SIGWINCH stays pending (the native line,
+/// which ptrace matches at L2). KVM refuses it by name, before it removes
+/// anything: which ignored signals Linux discards behind a delivery depends
+/// on the handler's mask, which the backend's state does not report; at
+/// c1c6342f it removed SIGWINCH first. `ignored-first` is the control: Linux
+/// reaches SIGWINCH first and discards it. `late-ignored` sends SIGWINCH
+/// during the wait and later installs a handler: Linux discarded it at send,
+/// and at c1c6342f KVM ran the new handler. `late-ignored-same-turn` installs
+/// the handler at once, which the call's settle-before-unignore covers; it
+/// runs on KVM alone, since ptrace keeps a traced thread's ignored signal
+/// for its delivery stop and runs the handler
+/// (https://github.com/rrnewton/hermit/issues/5179).
 #[test]
 fn run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux() {
     if kvm_unavailable("run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux") {
@@ -47426,33 +47442,62 @@ fn run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux() {
     }
     let guest = backend_signal_waits_guest().to_str().unwrap().to_owned();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    for (mode, expected) in [
-        ("timer", "timer eintr=1 alarm_runs=1\n"),
-        ("posix-timer", "posix-timer eintr=1 usr1_runs=1\n"),
-        ("two-waiters", "two-waiters eintr=1,1 usr1_runs=1\n"),
+    let both = ["ptrace", "kvm"].as_slice();
+    // https://github.com/rrnewton/hermit/issues/5179 (see above).
+    let kvm_only = ["kvm"].as_slice();
+    for (mode, expected, backends) in [
+        ("timer", "timer eintr=1 alarm_runs=1\n", both),
+        ("posix-timer", "posix-timer eintr=1 usr1_runs=1\n", both),
+        ("two-waiters", "two-waiters eintr=1,1 usr1_runs=1\n", both),
         (
             "ignored-let-in",
             "ignored-let-in before=1 eintr=1 usr1_runs=1 winch_after=0\n",
+            both,
         ),
         (
             "blocked-by-mask",
             "blocked-by-mask eintr=1 usr1_in_wait=1 usr2_in_wait=1 usr1_runs=1\n",
+            both,
         ),
-        ("fatal", "fatal signaled=1 termsig=15\n"),
-        ("sigchld", "sigchld exited=1 status=7\n"),
-        ("ppoll-timer", "ppoll-timer rc=-4 alarm_runs=1\n"),
-        ("ppoll-sibling", "ppoll-sibling rc=-4 usr1_runs=1\n"),
+        ("fatal", "fatal signaled=1 termsig=15\n", both),
+        ("sigchld", "sigchld exited=1 status=7\n", both),
+        ("ppoll-timer", "ppoll-timer rc=-4 alarm_runs=1\n", both),
+        ("ppoll-sibling", "ppoll-sibling rc=-4 usr1_runs=1\n", both),
         (
             "ppoll-ignored",
             "ppoll-ignored before=1 rc=0 winch_after=0\n",
+            both,
+        ),
+        (
+            "mixed",
+            "mixed before=1 eintr=1 winch_in_handler=1 winch_blocked_in_handler=1 \
+             winch_after=1 mask_restored=1\n",
+            both,
+        ),
+        (
+            "ignored-first",
+            "ignored-first before=1 eintr=1 winch_in_handler=0 winch_blocked_in_handler=1 \
+             winch_after=0 mask_restored=1\n",
+            both,
+        ),
+        (
+            "late-ignored",
+            "late-ignored eintr=1 usr1_runs=1 winch_runs=0 winch_after=0\n",
+            both,
+        ),
+        (
+            "late-ignored-same-turn",
+            "late-ignored-same-turn eintr=1 usr1_runs=1 winch_runs=0 winch_after=0\n",
+            kvm_only,
         ),
     ] {
-        for backend in ["ptrace", "kvm"] {
+        for &backend in backends {
             let backend_arg = format!("--backend={backend}");
             let report = directory.path().join(format!("{mode}-{backend}.json"));
             let report_arg = report.to_str().unwrap().to_owned();
             // https://github.com/rrnewton/hermit/issues/5172 (see above).
-            let verify = !(backend == "ptrace" && mode == "ignored-let-in");
+            let refused = backend == "kvm" && mode == "mixed";
+            let verify = !(backend == "ptrace" && mode == "ignored-let-in") && !refused;
             let mut args = vec![backend_arg.as_str(), "run", "--strict"];
             if verify {
                 args.extend(["--verify", "--verify-strict", "--verify-json", &report_arg]);
@@ -47465,6 +47510,24 @@ fn run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux() {
                 mode,
             ]);
             let output = hermit(&args);
+            if refused {
+                let stderr = stderr(&output);
+                assert_eq!(
+                    output.status.code(),
+                    Some(HERMIT_POLICY_REFUSAL_EXIT),
+                    "{backend} {mode}: the mixed set must be refused\nstderr:\n{stderr}"
+                );
+                assert!(
+                    stderr.contains(
+                        "rt_sigsuspend refused: an rt_sigsuspend whose temporary signal mask \
+                         lets in an ignored or stopping signal behind a signal Linux delivers \
+                         first"
+                    ),
+                    "{backend} {mode}: the refusal is not named\nstderr:\n{stderr}"
+                );
+                assert_eq!(stdout(&output), "", "{backend} {mode}: the guest went on");
+                continue;
+            }
             assert_success(&output, &args);
             assert_eq!(stdout(&output), expected, "{backend} {mode}");
             if !verify {

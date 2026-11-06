@@ -133,13 +133,14 @@ fn still_waits(scheduler: &Scheduler, thread: DetTid) -> bool {
 }
 
 /// Mutations: "temporary mask ignored" (the own mask decides), "pending not
-/// read" (an empty state wakes), "dispositions not read" (an ignored or
-/// default-ignored signal wakes), "stops not counted". Each row is checked
-/// parked in the timed waiters and still queued.
+/// read" (an empty state wakes), "ignored ones left" (an ignored or
+/// default-ignored signal the mask lets in, which Linux discarded when it was
+/// sent, does not wake the waiter to remove it), "stops not counted". Each
+/// row is checked parked in the timed waiters and still queued.
 #[test]
 fn a_parked_suspend_ends_exactly_for_a_signal_its_temporary_mask_lets_in() {
     let usr1 = bit(libc::SIGUSR1);
-    let rows: [(&str, u64, SignalSets, Option<Vec<i32>>); 10] = [
+    let rows: [(&str, u64, SignalSets, Option<Vec<i32>>); 11] = [
         (
             "caught, blocked outside the call only",
             0,
@@ -159,18 +160,29 @@ fn a_parked_suspend_ends_exactly_for_a_signal_its_temporary_mask_lets_in() {
             None,
         ),
         ("nothing pending", 0, state(0, 0, usr1, 0, usr1), None),
-        ("SIG_IGN", 0, state(usr1, 0, usr1, usr1, 0), None),
         (
-            "default-ignored SIGWINCH",
+            "SIG_IGN (to remove)",
             0,
+            state(usr1, 0, usr1, usr1, 0),
+            Some(vec![libc::SIGUSR1]),
+        ),
+        (
+            "default-ignored SIGWINCH (to remove)",
+            0,
+            state(bit(libc::SIGWINCH), 0, bit(libc::SIGWINCH), 0, 0),
+            Some(vec![libc::SIGWINCH]),
+        ),
+        (
+            "default-ignored SIGWINCH blocked by the temporary mask",
+            bit(libc::SIGWINCH),
             state(bit(libc::SIGWINCH), 0, bit(libc::SIGWINCH), 0, 0),
             None,
         ),
         (
-            "default-ignored SIGURG and SIGCONT",
+            "default-ignored SIGURG and SIGCONT (to remove)",
             0,
             state(bit(libc::SIGURG) | bit(libc::SIGCONT), 0, 0, 0, 0),
-            None,
+            Some(vec![libc::SIGCONT, libc::SIGURG]),
         ),
         (
             "default-fatal SIGTERM",
@@ -466,14 +478,95 @@ fn the_step2_drain_ends_a_backend_wait() {
 }
 
 /// The decision itself, without a scheduler: Linux's `signal_pending` after
-/// `sigsuspend` installs the temporary mask, with ignored signals discarded.
+/// `sigsuspend` installs the temporary mask. A caught signal ends the wait,
+/// and an ignored one (SIGUSR2) settles it: Linux discarded it when it was
+/// sent, and the woken waiter removes it.
 #[test]
-fn the_decision_is_pending_and_unblocked_and_not_ignored() {
+fn the_decision_is_pending_and_unblocked() {
     let usr1 = bit(libc::SIGUSR1);
     let usr2 = bit(libc::SIGUSR2);
     let sets =
         KernelSignalState::from_backend_sets(&state(usr1 | usr2, 0, usr1 | usr2, usr2, usr1));
-    assert_eq!(Scheduler::backend_suspend_signals(&sets, 0, 0, false), usr1);
-    assert_eq!(Scheduler::backend_suspend_signals(&sets, usr1, 0, false), 0);
-    assert_eq!(Scheduler::backend_suspend_signals(&sets, 0, usr1, false), 0);
+    assert_eq!(
+        Scheduler::backend_suspend_signals(&sets, 0, 0, false),
+        usr1 | usr2
+    );
+    assert_eq!(
+        Scheduler::backend_suspend_signals(&sets, usr1, 0, false),
+        usr2
+    );
+    assert_eq!(
+        Scheduler::backend_suspend_signals(&sets, usr1 | usr2, 0, false),
+        0
+    );
+    assert_eq!(
+        Scheduler::backend_suspend_signals(&sets, 0, usr1, false),
+        usr2
+    );
+}
+
+/// Mutations "the guard reads no waiter", "every pending signal counts" and
+/// "another process's waiter counts": a call that stops ignoring a signal
+/// asks whether a parked suspend of its process still holds it although
+/// Linux discarded it at send; only one whose temporary mask lets it in, with
+/// it pending and still ignored, does.
+#[test]
+fn a_parked_suspend_holds_a_discarded_signal_only_while_it_is_ignored_and_let_in() {
+    let winch = bit(libc::SIGWINCH);
+    for (name, mask, sets, process, expected) in [
+        (
+            "pending, default-ignored, let in",
+            0,
+            state(winch, 0, winch, 0, 0),
+            PROCESS,
+            true,
+        ),
+        (
+            "process-directed",
+            0,
+            state(0, winch, winch, 0, 0),
+            PROCESS,
+            true,
+        ),
+        (
+            "blocked by the temporary mask",
+            winch,
+            state(winch, 0, winch, 0, 0),
+            PROCESS,
+            false,
+        ),
+        (
+            "caught now",
+            0,
+            state(winch, 0, winch, 0, winch),
+            PROCESS,
+            false,
+        ),
+        ("not pending", 0, state(0, 0, winch, 0, 0), PROCESS, false),
+        (
+            "another process",
+            0,
+            state(winch, 0, winch, 0, 0),
+            DetPid::from_raw(99),
+            false,
+        ),
+    ] {
+        let (scheduler, _) = parked_suspend(mask, sets);
+        assert_eq!(
+            scheduler.suspend_holds_discarded(process, libc::SIGWINCH),
+            expected,
+            "{name}"
+        );
+    }
+    let (mut scheduler, _) = kvm(Ok(state(winch, 0, winch, 0, 0)));
+    file(
+        &mut scheduler,
+        WAITER,
+        masked_poll_request(WAITER, 0),
+        Place::Parked,
+    );
+    assert!(
+        !scheduler.suspend_holds_discarded(PROCESS, libc::SIGWINCH),
+        "a masked poll"
+    );
 }

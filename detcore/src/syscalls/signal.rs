@@ -1248,6 +1248,79 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// SIGSHARE S2b: before an `rt_sigaction` that gives `signal` the action
+    /// `handler`, on a backend whose own `rt_sigsuspend` never sleeps (KVM),
+    /// under the scheduler. When the action stops ignoring a signal the
+    /// process ignores now, a parked `rt_sigsuspend` whose temporary mask lets
+    /// it in may still hold it pending: Linux discarded it when it was sent
+    /// (`sig_ignored`, kernel/signal.c, since the mask installed then let it
+    /// in), but the backend keeps it until the waiter removes it in its own
+    /// turn (`Scheduler::wake_backend_signal_waits`). While the scheduler
+    /// reports such a waiter (`Scheduler::suspend_holds_discarded`), this
+    /// thread hands its turn on with a strong yield, so the woken waiter runs
+    /// and removes it; the change then never makes deliverable a signal Linux
+    /// no longer holds. Every answer is read in this thread's turn from
+    /// committed state, so how often it yields is a function of the schedule.
+    /// A waiter that has not removed it after `SUSPEND_DISCARD_YIELDS` turns
+    /// refuses the call by name rather than reviving the signal.
+    async fn settle_suspend_discards_before_unignore<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: i32,
+        handler: u64,
+    ) -> Result<(), Error> {
+        const SUSPEND_DISCARD_YIELDS: usize = 1024;
+        if !(1..=64).contains(&signal) {
+            return Ok(());
+        }
+        let bit = kernel_sigset_bit(signal);
+        let ignores = handler == libc::SIG_IGN as u64
+            || (handler == libc::SIG_DFL as u64
+                && crate::syscalls::threads::default_ignored_signals() & bit != 0);
+        let Some(process) = guest.thread_state().detpid else {
+            return Ok(());
+        };
+        if ignores {
+            return Ok(());
+        }
+        for _ in 0..SUSPEND_DISCARD_YIELDS {
+            let state = crate::syscalls::read_guest_wait_signal_state(guest)?;
+            if crate::syscalls::ignored_at_generation(state.ignored, state.caught) & bit == 0
+                || !crate::tool_global::suspend_holds_discarded(guest, process, signal).await
+            {
+                return Ok(());
+            }
+            if self.cfg.max_timeslice.is_some() {
+                guest
+                    .thread_state_mut()
+                    .reset_timeslice_for_explicit_yield();
+            }
+            let request = Self::sched_yield_request(guest);
+            resource_request(guest, request).await;
+        }
+        const REASON: &str = "an rt_sigaction that stops ignoring a signal a parked \
+            rt_sigsuspend still holds, which Linux discarded when it was sent, cannot be \
+            served on this backend: the waiter did not remove it in its own turns";
+        crate::syscalls::helpers::report_refusal_reason(
+            self.cfg.panic_on_unsupported_syscalls,
+            &format!(
+                "[dtid {}] rt_sigaction refused: {REASON}",
+                guest.thread_state().dettid
+            ),
+        );
+        if !self.cfg.panic_on_unsupported_syscalls {
+            crate::tool_global::report_unsupported_syscall(guest, Sysno::rt_sigaction).await;
+        }
+        self.refuse_unserviceable_operation_because(
+            guest,
+            Sysno::rt_sigaction,
+            Errno::ENOSYS,
+            REASON,
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// SIGSHARE S2b: `rt_sigsuspend` on a backend whose own call never sleeps
     /// (`rt_sigsuspend_never_sleeps`, KVM), waiting as Linux's does. The
     /// backend's call, `call`, which reads the private copy of the temporary
@@ -1257,11 +1330,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// this thread's own turn, from the signal state the backend reports
     /// (`read_guest_wait_signal_state`):
     ///
-    /// - ignored signals the mask lets in are removed, as Linux discards them
-    ///   as the call returns `ERESTARTNOHAND` before it restarts the call
-    ///   (`get_signal`, kernel/signal.c), and the call runs again at once;
-    /// - any other such signal can only be one the backend cannot act on
-    ///   inside the call, a stop, and the call is refused by name;
+    /// - the pending signals the mask lets in are taken in Linux's dequeue
+    ///   order (`settle_suspend_decline`): the ignored ones Linux reaches
+    ///   before anything else are removed, as `get_signal` discards them
+    ///   (kernel/signal.c) before the call restarts, and the call runs again
+    ///   at once;
+    /// - a stop that Linux reaches first, or an ignored or stopping signal
+    ///   left behind a signal Linux delivers first, cannot be served: the
+    ///   backend acts only when every signal the mask lets in is caught or
+    ///   fatal, and which of those Linux discards after the delivery depends
+    ///   on the handler's own mask, which the backend's state does not
+    ///   report. The call is refused by name before anything is removed;
     /// - a caught `SIGCHLD` the mask lets in, in a process with a child whose
     ///   exit sends it, keeps the answer this backend gave before: the decline
     ///   goes to the guest after a strong yield. A child's exit `SIGCHLD` is
@@ -1289,24 +1368,38 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Ok(result?);
             }
             let state = crate::syscalls::read_guest_wait_signal_state(guest)?;
-            let let_in = state.pending & !installed;
-            let ignored =
-                let_in & crate::syscalls::ignored_at_generation(state.ignored, state.caught);
-            if ignored != 0 {
-                crate::syscalls::helpers::remove_signals_discarded_under_a_temporary_mask(
-                    guest, ignored,
-                )
-                .await?;
-                continue;
-            }
-            if let_in != 0 {
-                const REASON: &str = "an rt_sigsuspend whose temporary signal mask lets in a \
-                    pending signal that would stop the process cannot be served on this \
-                    backend: it cannot act on that signal inside the call";
+            let reason = match settle_suspend_decline(&state, installed) {
+                SuspendDecline::Waits => None,
+                SuspendDecline::Discard(ignored) => {
+                    crate::syscalls::helpers::remove_signals_discarded_under_a_temporary_mask(
+                        guest, ignored,
+                    )
+                    .await?;
+                    continue;
+                }
+                SuspendDecline::Stop => Some(
+                    "an rt_sigsuspend whose temporary signal mask lets in a pending signal \
+                     that would stop the process cannot be served on this backend: it cannot \
+                     act on that signal inside the call",
+                ),
+                SuspendDecline::Mixed => Some(
+                    "an rt_sigsuspend whose temporary signal mask lets in an ignored or \
+                     stopping signal behind a signal Linux delivers first cannot be served on \
+                     this backend: whether Linux then discards it depends on the handler's \
+                     own mask, which the backend's signal state does not report",
+                ),
+                SuspendDecline::Declined => Some(
+                    "an rt_sigsuspend that the backend declined although every pending \
+                     signal its temporary signal mask lets in is caught or fatal cannot be \
+                     served on this backend",
+                ),
+            };
+            if let Some(reason) = reason {
+                let reason: &str = reason;
                 crate::syscalls::helpers::report_refusal_reason(
                     self.cfg.panic_on_unsupported_syscalls,
                     &format!(
-                        "[dtid {}] rt_sigsuspend refused: {REASON}",
+                        "[dtid {}] rt_sigsuspend refused: {reason}",
                         guest.thread_state().dettid
                     ),
                 );
@@ -1319,7 +1412,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         guest,
                         Sysno::rt_sigsuspend,
                         Errno::ENOSYS,
-                        REASON,
+                        reason,
                     )
                     .await;
             }
@@ -1501,6 +1594,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             {
                 refuse_sigalrm(guest, SigalrmControl::HandlerToDefault).await?;
             }
+        }
+        // SIGSHARE S2b: a parked rt_sigsuspend may still hold a signal Linux
+        // discarded when it was sent; let it remove that first.
+        if let Some(action) = kernel_action
+            && rt_sigsuspend_never_sleeps(&self.cfg.backend)
+            && self.cfg.sequentialize_threads
+            && !self.cfg.recordreplay_modes
+        {
+            Box::pin(self.settle_suspend_discards_before_unignore(
+                guest,
+                call.signum(),
+                action.handler,
+            ))
+            .await?;
         }
         // Whether this call moves the signal from `SIG_IGN` to an action that
         // does not ignore it, read before the change: Linux then re-queues a
@@ -5132,6 +5239,77 @@ where
     })
 }
 
+/// How an `rt_sigsuspend` that the backend declined (SIGSHARE S2b,
+/// `Detcore::backend_rt_sigsuspend`) goes on: the backend acts inside its
+/// call only when every pending signal the temporary mask lets in is caught
+/// or fatal (`ENOSYS` otherwise).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SuspendDecline {
+    /// No pending signal is let in: the call waits.
+    Waits,
+    /// Linux discards these ignored signals before it reaches any other
+    /// signal the mask lets in: remove them and run the call again.
+    Discard(KernelSigset),
+    /// A signal that would stop the process comes first.
+    Stop,
+    /// An ignored or stopping signal stays let in behind a signal Linux
+    /// delivers first.
+    Mixed,
+    /// Every let-in signal is caught or fatal, yet the backend declined.
+    Declined,
+}
+
+/// SIGSHARE S2b: what a declined `rt_sigsuspend` under the temporary mask
+/// `installed` does, from the thread's signal state `state`, read in its own
+/// turn. Linux's sigsuspend returns `ERESTARTNOHAND` once a signal the mask
+/// lets in is pending, and the return to user mode takes the pending signals
+/// in dequeue order (`dequeue_signal`, `next_signal`, kernel/signal.c: the
+/// thread's queue before the shared one, a synchronous signal before the
+/// lowest-numbered other one, `KernelSignalState::next_dequeued`). `get_signal`
+/// discards each ignored one (`sig_ignored` at generation already discards one
+/// sent while the mask lets it in, `prepare_signal`), and stops at the first
+/// that it delivers or that stops the process. So the ignored signals before
+/// that one are the ones to remove; the ones behind it stay pending under the
+/// handler's mask or are discarded after the delivery, depending on that mask,
+/// and the backend's state does not report it, so they are `Mixed`.
+pub(crate) fn settle_suspend_decline(
+    state: &crate::syscalls::KernelSignalState,
+    installed: KernelSigset,
+) -> SuspendDecline {
+    let mask = installed | kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32);
+    let ignored = crate::syscalls::ignored_at_generation(state.ignored, state.caught);
+    let stops = state.default_job_control_stops() | kernel_sigset_bit(libc::SIGSTOP);
+    let mut rest = *state;
+    let mut discard = 0;
+    while let Some((signal, queue)) = rest.next_dequeued(mask) {
+        let bit = kernel_sigset_bit(signal);
+        match queue {
+            crate::syscalls::threads::SignalQueue::Thread => rest.thread_pending &= !bit,
+            crate::syscalls::threads::SignalQueue::Shared => rest.shared_pending &= !bit,
+        }
+        if ignored & bit != 0 {
+            discard |= bit;
+            continue;
+        }
+        if stops & bit != 0 {
+            return SuspendDecline::Stop;
+        }
+        let behind = (rest.thread_pending | rest.shared_pending) & !mask;
+        return if behind & (ignored | stops) != 0 {
+            SuspendDecline::Mixed
+        } else if discard != 0 {
+            SuspendDecline::Discard(discard)
+        } else {
+            SuspendDecline::Declined
+        };
+    }
+    if discard != 0 {
+        SuspendDecline::Discard(discard)
+    } else {
+        SuspendDecline::Waits
+    }
+}
+
 /// Whether an `rt_sigsuspend` that the backend declined (SIGSHARE S2b,
 /// `Detcore::backend_rt_sigsuspend`) keeps the answer it had before S2b, the
 /// decline itself: its temporary mask `installed` lets in `SIGCHLD`, which the
@@ -8248,6 +8426,130 @@ mod own_process_signal_tests {
                 got,
                 refuses.then_some(OwnProcessSignalRefusal::UndeliveredSchedulerSignal(bit)),
                 "pending {pending}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod suspend_decline_tests {
+    use super::*;
+    use crate::syscalls::KernelSignalState;
+    use crate::syscalls::threads::kernel_sigset_bit as bit;
+
+    /// A thread's state: `thread` and `shared` pending, the dispositions.
+    fn state(
+        thread: KernelSigset,
+        shared: KernelSigset,
+        ignored: KernelSigset,
+        caught: KernelSigset,
+    ) -> KernelSignalState {
+        KernelSignalState {
+            pending: thread | shared,
+            thread_pending: thread,
+            shared_pending: shared,
+            blocked: !0,
+            ignored,
+            caught,
+        }
+    }
+
+    /// Linux's dequeue order decides (`next_signal`, `dequeue_signal`):
+    /// mutations "remove every ignored signal" (the mixed rows), "ignore the
+    /// order" (ignored-first and the queue rows), "stops as signals the
+    /// backend acts on" and "a refusal after a removal" (the stop rows).
+    #[test]
+    fn a_declined_suspend_follows_linux_dequeue_order() {
+        let usr1 = bit(libc::SIGUSR1);
+        let winch = bit(libc::SIGWINCH);
+        let pwr = bit(libc::SIGPWR);
+        let cont = bit(libc::SIGCONT);
+        let tstp = bit(libc::SIGTSTP);
+        let rows = [
+            (
+                "nothing pending",
+                state(0, 0, 0, usr1),
+                0,
+                SuspendDecline::Waits,
+            ),
+            (
+                "only a blocked signal",
+                state(usr1, 0, 0, usr1),
+                usr1,
+                SuspendDecline::Waits,
+            ),
+            (
+                "one ignored",
+                state(winch, 0, 0, 0),
+                0,
+                SuspendDecline::Discard(winch),
+            ),
+            (
+                "SIG_IGN",
+                state(usr1, 0, usr1, 0),
+                0,
+                SuspendDecline::Discard(usr1),
+            ),
+            (
+                "ignored first, then caught",
+                state(winch | pwr, 0, 0, pwr),
+                0,
+                SuspendDecline::Discard(winch),
+            ),
+            (
+                "caught first, then ignored",
+                state(usr1 | winch, 0, 0, usr1),
+                0,
+                SuspendDecline::Mixed,
+            ),
+            (
+                "caught first, the ignored one blocked by the mask",
+                state(usr1 | winch, 0, 0, usr1),
+                winch,
+                SuspendDecline::Declined,
+            ),
+            (
+                "ignored on the thread's queue before a caught shared one",
+                state(winch, usr1, 0, usr1),
+                0,
+                SuspendDecline::Discard(winch),
+            ),
+            (
+                "a caught one on the thread's queue before an ignored shared one",
+                state(usr1, winch, 0, usr1),
+                0,
+                SuspendDecline::Mixed,
+            ),
+            (
+                "a default stop first",
+                state(tstp | winch, 0, 0, 0),
+                0,
+                SuspendDecline::Stop,
+            ),
+            (
+                "an ignored one, then a stop: nothing is removed",
+                state(cont | tstp, 0, 0, 0),
+                0,
+                SuspendDecline::Stop,
+            ),
+            (
+                "caught, then a stop",
+                state(usr1 | tstp, 0, 0, usr1),
+                0,
+                SuspendDecline::Mixed,
+            ),
+            (
+                "only caught",
+                state(usr1, 0, 0, usr1),
+                0,
+                SuspendDecline::Declined,
+            ),
+        ];
+        for (name, state, installed, expected) in rows {
+            assert_eq!(
+                settle_suspend_decline(&state, installed),
+                expected,
+                "{name}"
             );
         }
     }
