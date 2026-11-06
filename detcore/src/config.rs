@@ -299,7 +299,7 @@ mod tests {
         // run names in its summary; its fields cross the wire positionally.
         // Renumbered from 41 to 42 at this rebase onto main's 41 while 33
         // to 39 remain reserved; digest re-measured at this head.
-        (42, "424f7d348b80d8be", "f013e36743d8d9e6"),
+        (42, "7ba6b2766bf2230a", "f013e36743d8d9e6"),
         // Retypes `GlobalRequest::TraceSchedEvent`; adds
         // `GlobalResponse::WithWatchOrder` (#4796). Live-computed as 45 at
         // its rebase onto main's 41, skipping reserved 42 to 44; digest
