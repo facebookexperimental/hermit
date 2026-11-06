@@ -100,6 +100,37 @@ impl ExecutionOwners {
         }
         self.backends(owner)
     }
+    /// Whether `label` names a focused run type with a declared
+    /// source owner (as opposed to an unowned run type such as
+    /// `super`, whose cells remain the backend owner's).
+    pub fn is_run_type_owned(&self, label: &str) -> bool {
+        self.run_type_owners.contains_key(label)
+    }
+    /// The execution owner an exact cell on `backend` carrying
+    /// `run_types` must be selected under: a focused run type with a
+    /// declared owner wins (its selection spans backends, per
+    /// [`Self::backends_for_selection`]); otherwise the backend's own
+    /// owner. Callers that build one exact-cell command per cell
+    /// (pressure-test) pass the result as `--execution-owner`, so a
+    /// cell on a non-core backend is not dropped by the default
+    /// core-only execution filter.
+    pub fn owner_for_cell(
+        &self,
+        backend: &str,
+        run_types: &BTreeSet<String>,
+    ) -> Result<String, String> {
+        let focused = run_types
+            .iter()
+            .filter_map(|label| self.run_type_owners.get(label))
+            .collect::<BTreeSet<_>>();
+        if focused.len() > 1 {
+            return Err("run-type selection crosses declared source owners".into());
+        }
+        if let Some(owner) = focused.into_iter().next() {
+            return Ok(owner.clone());
+        }
+        Ok(self.owner(Some(backend))?.to_string())
+    }
     pub fn validate_manifest_backends(
         &self,
         manifests: &crate::runner::ManifestSet,
@@ -226,6 +257,67 @@ mod tests {
             assert_eq!(
                 union, expected,
                 "an owned cell disappeared or changed identity"
+            );
+        }
+    }
+    #[test]
+    fn owner_for_cell_names_the_declared_owner_per_backend_and_run_type() {
+        let source = include_bytes!("../../execution-owners.json");
+        let owners = ExecutionOwners::from_slice(source).unwrap();
+        let full = BTreeSet::from(["full".to_string()]);
+        assert_eq!(owners.owner_for_cell("dbt", &full).unwrap(), "dynamorio");
+        assert_eq!(owners.owner_for_cell("sabre", &full).unwrap(), "patching");
+        assert_eq!(owners.owner_for_cell("ptrace", &full).unwrap(), "core");
+        assert_eq!(owners.owner_for_cell("liteinst", &full).unwrap(), "core");
+        let archived = BTreeSet::from(["archived-nightly".to_string()]);
+        assert_eq!(owners.owner_for_cell("sabre", &archived).unwrap(), "patching");
+        let focused = BTreeSet::from(["sabre-compat-only".to_string()]);
+        assert_eq!(owners.owner_for_cell("ptrace", &focused).unwrap(), "patching");
+        assert!(owners.owner_for_cell("unknown", &full).is_err());
+    }
+    #[test]
+    fn exact_disabled_dbt_and_sabre_cells_select_exactly_one_under_their_owner() {
+        // Regression: pressure-test exact cells ran test-harness with the
+        // default core execution owner, whose backend set excludes dbt
+        // and sabre, so every exact dbt/sabre selection came back empty
+        // ("filters selected no cells") and the nightly survey parts
+        // recorded all cells INCOMPLETE (2026-11-05/06 sweeps).
+        let root = crate::git_environment::checkout_root();
+        let owners = ExecutionOwners::load(&root).unwrap();
+        let manifests = ManifestSet::load(&root).unwrap();
+        for (backend, labels) in [
+            ("dbt", Vec::new()),
+            ("sabre", vec!["archived-nightly".to_string()]),
+        ] {
+            let run_types = if labels.is_empty() {
+                BTreeSet::from([crate::runner::DEFAULT_RUN_TYPE.to_string()])
+            } else {
+                labels.iter().cloned().collect()
+            };
+            let owner = owners.owner_for_cell(backend, &run_types).unwrap();
+            let exact = Selection {
+                population: Some(Population::Disabled),
+                test: Some("applications/git-repository-workflow".into()),
+                mode: Some("verify".into()),
+                backend: Some(backend.into()),
+                labels: labels.clone(),
+                execution_backends: Some(
+                    owners.backends_for_selection(&owner, &labels).unwrap(),
+                ),
+                ..Default::default()
+            };
+            let cells = manifests.select(&exact).unwrap();
+            assert_eq!(
+                cells.len(),
+                1,
+                "exact {backend} cell must select exactly one cell under owner {owner}"
+            );
+            assert_eq!(cells[0].id.backend.as_deref(), Some(backend));
+            let mut core_only = exact.clone();
+            core_only.execution_backends = Some(owners.backends("core").unwrap());
+            assert!(
+                manifests.select(&core_only).unwrap().is_empty(),
+                "the core-only execution filter must select no {backend} cell"
             );
         }
     }

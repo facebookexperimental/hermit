@@ -68,6 +68,7 @@ use hermit_manifest_plan::environmental_block::EnvBlockClass;
 use hermit_manifest_plan::environmental_block::EnvBlockObservation;
 use hermit_manifest_plan::environmental_block::environmental_block_observation;
 use hermit_manifest_plan::host_capability::CapabilityVerdict;
+use hermit_manifest_plan::execution_owners::ExecutionOwners;
 use hermit_manifest_plan::host_capability::HostCapability;
 use hermit_manifest_plan::invocation_cgroup::ALLOW_PROCESS_GROUP_CPU_SCAN_ENV;
 use hermit_manifest_plan::parity;
@@ -1056,16 +1057,35 @@ fn tracked_cell_facts(
 
 /// The `test-harness` selection words that admit a cell of `run_types`: none
 /// for a cell of the default run type, else `--label` naming its run types.
-fn run_type_filter(run_types: &BTreeSet<String>) -> Result<String, String> {
+fn run_type_filter(
+    run_types: &BTreeSet<String>,
+    owners: &ExecutionOwners,
+) -> Result<String, String> {
     if run_types.is_empty() {
         return Err("a manifest cell has no run type".into());
     }
     if run_types.contains(hermit_manifest_plan::runner::DEFAULT_RUN_TYPE) {
         return Ok(String::new());
     }
+    // A cell carrying a source-owned focused run type (e.g.
+    // sabre-compat-only) beside another run type (e.g. super) must be
+    // selected by the focused label alone: test-harness rejects a
+    // focused-owner selection naming more than one label
+    // (backends_for_selection), and one matching label already
+    // selects the cell (labelled() is an intersection test).
+    let focused: Vec<_> = run_types
+        .iter()
+        .filter(|label| owners.is_run_type_owned(label))
+        .cloned()
+        .collect();
+    let labels = if focused.len() == 1 {
+        focused
+    } else {
+        run_types.iter().cloned().collect::<Vec<_>>()
+    };
     Ok(format!(
         " --label {}",
-        shell_quote(&run_types.iter().cloned().collect::<Vec<_>>().join(","))
+        shell_quote(&labels.join(","))
     ))
 }
 
@@ -8465,8 +8485,17 @@ fn write_plan_after_scorecard_check(
             .get(&(cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
             .ok_or_else(|| format!("no manifest facts for {}", display_id(cell)))
     };
-    let run_types_of =
-        |cell: &CellId| -> Result<String, String> { run_type_filter(&facts_of(cell)?.run_types) };
+    // test-harness restricts every selection to the caller's execution
+    // owner (default core); an exact cell on a non-core backend must
+    // name its owner or it is retained out of its own selection.
+    let execution_owners = ExecutionOwners::load(root)?;
+    let run_types_of = |cell: &CellId| -> Result<String, String> {
+        run_type_filter(&facts_of(cell)?.run_types, &execution_owners)
+    };
+    let owner_arg_of = |cell: &CellId| -> Result<String, String> {
+        let owner = execution_owners.owner_for_cell(&cell.backend, &facts_of(cell)?.run_types)?;
+        Ok(format!(" --execution-owner {}", shell_quote(&owner)))
+    };
     // Validation fills the real-compat fixtures once per run, before the cells
     // that read them; so does this graph, with validation's own node.
     let mut reads_compat_fixtures = false;
@@ -8596,15 +8625,17 @@ fn write_plan_after_scorecard_check(
         };
         let pressure_seconds = preparation_timeout(budget)?;
         let run_types = run_types_of(&cell)?;
+        let owner_arg = owner_arg_of(&cell)?;
         let cmd = format!(
             "mkdir -p {status_dir}; {rerun_guard}\
              printf '{incomplete}\\n' > {status}; status=0; \
              timeout --kill-after=10s {pressure_seconds}s env \
              E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} \
              VALIDATE_RUN_STATE={run_state} \
-             target/debug/test-harness build --include-manual --include-occasional \
+             target/debug/test-harness build --include-manual --include-occasional{owner} \
              --test {test} --mode {mode}{backend}{run_types} || status=$?; \
              printf '%s\\n' \"$status\" > {status}; exit 0",
+            owner = owner_arg,
             status_dir = shell_quote(&status_path.parent().unwrap().to_string_lossy()),
             results = shell_quote(&results.to_string_lossy()),
             build_root = shell_quote(&build_root.to_string_lossy()),
@@ -8736,6 +8767,7 @@ fn write_plan_after_scorecard_check(
             };
             let namespaces = dbt_namespace_prefix(&cell.backend);
             let run_types = run_types_of(cell)?;
+            let owner_arg = owner_arg_of(cell)?;
             let harness = if selection.is_exact() {
                 let prebuilt = if selection.uses_shared_preparation() {
                     " --prebuilt"
@@ -8743,7 +8775,8 @@ fn write_plan_after_scorecard_check(
                     ""
                 };
                 format!(
-                    "{hermit_bin} {namespaces}target/debug/test-harness run {selector} --include-occasional{prebuilt}{no_retry} --test {test} --mode {mode}{backend}{run_types} --results {result_file} --junit {junit}",
+                    "{hermit_bin} {namespaces}target/debug/test-harness run {selector} --include-occasional{prebuilt}{no_retry}{owner} --test {test} --mode {mode}{backend}{run_types} --results {result_file} --junit {junit}",
+                    owner = owner_arg,
                     hermit_bin = EXACT_CELL_HERMIT_BIN,
                     selector = selector,
                     prebuilt = prebuilt,
@@ -8757,7 +8790,8 @@ fn write_plan_after_scorecard_check(
                 )
             } else {
                 format!(
-                    "{namespaces}./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run {selector} --include-occasional --prebuilt{no_retry} --test {test} --mode {mode}{backend}{run_types} --results {result_file} --junit {junit}",
+                    "{namespaces}./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run {selector} --include-occasional --prebuilt{no_retry}{owner} --test {test} --mode {mode}{backend}{run_types} --results {result_file} --junit {junit}",
+                    owner = owner_arg,
                     selector = selector,
                     no_retry = no_retry,
                     test = shell_quote(&cell.test),
@@ -16359,6 +16393,7 @@ const FOCUSED_DISABLED_SABRE_CELLS: [(&str, &str, &str); 1] = [("compat/comm", "
 /// named run types, and no `--label` the default run type.
 fn harness_command_selection(
     cmd: &str,
+    owners: &ExecutionOwners,
 ) -> Result<(String, hermit_manifest_plan::runner::Selection), String> {
     use hermit_manifest_plan::runner::Population;
     let marker = "target/debug/test-harness ";
@@ -16376,6 +16411,7 @@ fn harness_command_selection(
         .map(|word| word.trim_matches('\'').to_string());
     let command = words.next().ok_or("empty harness invocation")?;
     let mut selection = hermit_manifest_plan::runner::Selection::default();
+    let mut execution_owner: Option<String> = None;
     while let Some(word) = words.next() {
         let mut value = || {
             words
@@ -16387,6 +16423,7 @@ fn harness_command_selection(
             "--include-occasional" => selection.include_occasional = true,
             "--probe-disabled" => selection.population = Some(Population::Disabled),
             "--prebuilt" | "--no-retry" => {}
+            "--execution-owner" => execution_owner = Some(value()?),
             "--test" => selection.test = Some(value()?),
             "--mode" => selection.mode = Some(value()?),
             "--backend" => selection.backend = Some(value()?),
@@ -16403,6 +16440,14 @@ fn harness_command_selection(
             Population::Required
         });
     }
+    // Mirror test-harness: every build/run/plan selection is restricted
+    // to the caller's execution owner (default core).
+    selection.execution_backends = Some(
+        owners.backends_for_selection(
+            execution_owner.as_deref().unwrap_or("core"),
+            &selection.labels,
+        )?,
+    );
     Ok((command, selection))
 }
 
@@ -16451,6 +16496,7 @@ fn focused_run_type_plan_selects_each_cell(
     let (_, dag) =
         write_plan_after_scorecard_check(&checked, &plan, &plan.join("dag.json"), &selection)?;
     let manifests = ManifestSet::load(root)?;
+    let owners = ExecutionOwners::load(root)?;
     let mut prepared = BTreeSet::new();
     let mut ran = BTreeSet::new();
     for step in dag
@@ -16458,7 +16504,7 @@ fn focused_run_type_plan_selects_each_cell(
         .iter()
         .filter(|step| matches!(step.group.as_str(), "prepare" | "cell"))
     {
-        let (command, harness_selection) = harness_command_selection(&step.cmd)?;
+        let (command, harness_selection) = harness_command_selection(&step.cmd, &owners)?;
         let selected = manifests.select(&harness_selection)?;
         let [selected] = selected.as_slice() else {
             return Err(format!(
@@ -34612,15 +34658,17 @@ mod harness_selection_tests {
     /// The check itself refuses a command whose run-type filter is lost.
     #[test]
     fn a_command_without_its_run_type_filter_selects_nothing() {
-        let manifests = ManifestSet::load(&checkout_root()).unwrap();
+        let root = checkout_root();
+        let manifests = ManifestSet::load(&root).unwrap();
+        let owners = ExecutionOwners::load(&root).unwrap();
         let labelled = "env X=1 target/debug/test-harness run --include-manual \
-             --include-occasional --prebuilt --test 'compat/java-run' --mode 'verify' \
+             --include-occasional --prebuilt --execution-owner 'patching' --test 'compat/java-run' --mode 'verify' \
              --backend 'ptrace' --label 'sabre-compat-only' --results 'r' --junit 'j' || status=$?";
-        let (command, selection) = harness_command_selection(labelled).unwrap();
+        let (command, selection) = harness_command_selection(labelled, &owners).unwrap();
         assert_eq!(command, "run");
         assert_eq!(manifests.select(&selection).unwrap().len(), 1);
         let unlabelled = labelled.replace(" --label 'sabre-compat-only'", "");
-        let (_, selection) = harness_command_selection(&unlabelled).unwrap();
+        let (_, selection) = harness_command_selection(&unlabelled, &owners).unwrap();
         assert!(manifests.select(&selection).unwrap().is_empty());
     }
 }
