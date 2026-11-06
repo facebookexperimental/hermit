@@ -89,9 +89,9 @@ mod tests {
     /// Revisions reserved for a change that is not on this base yet, which
     /// `GLOBAL_RPC_REVISIONS` therefore skips: 33 to 39 are reserved for
     /// pending changes in the coordinator's allocation table (39 for kvm
-    /// 2b-1), and 41 to 44 are queued or advisory claims at this rebase
-    /// (41 on queued heads, 42 on drain/4759, 43 for PR 4627, 44 for
-    /// kvm-2b-3 in the allocation table). At this head 28 is
+    /// 2b-1), and 42 to 44 and 46 are reserved claims at this rebase
+    /// (42 and 46 for PR 4769, 43 for PR 4627, 44 for kvm-2b-3 in the
+    /// allocation table). At this head 28 is
     /// https://github.com/rrnewton/hermit/pull/4789's, 29 is
     /// https://github.com/rrnewton/hermit/pull/4884's, 30 is
     /// https://github.com/rrnewton/hermit/pull/4728's, 31 is
@@ -101,9 +101,10 @@ mod tests {
     /// `HostFileIdentity::content` layout of
     /// https://github.com/rrnewton/hermit/pull/4791, 45 is
     /// https://github.com/rrnewton/hermit/pull/4796's
-    /// `TraceSchedEvent`/`WithWatchOrder` revision, and 46, this
-    /// change's (https://github.com/rrnewton/hermit/pull/4769), is the
-    /// current revision.
+    /// `TraceSchedEvent`/`WithWatchOrder` revision, and 46 is
+    /// https://github.com/rrnewton/hermit/pull/4769's
+    /// `PublishInstructionOffset` revision. 47 is this change's
+    /// `StoreExclusive` payload layout and is current.
     /// 42 to 44 are queued or advisory claims at this rebase
     /// (42 on drain/4759, 43 for PR 4627, 44 for kvm-2b-3 in the
     /// allocation table). Remove an entry when its change lands, with
@@ -294,12 +295,6 @@ mod tests {
         // 4 to 6 because main's 30 took domain 4 for the scheduled event
         // and domain 5 for its reply; digests measured at this head).
         (41, "aeb38079447d34fb", "f013e36743d8d9e6"),
-        // The `StoreExclusive` payload's `Rewrite` says whether a mapping's
-        // file holds loops no mapping symbol proves (`unmarked`), which the
-        // run names in its summary; its fields cross the wire positionally.
-        // Renumbered from 41 to 42 at this rebase onto main's 41 while 33
-        // to 39 remain reserved; digest re-measured at this head.
-        (42, "7ba6b2766bf2230a", "f013e36743d8d9e6"),
         // Retypes `GlobalRequest::TraceSchedEvent`; adds
         // `GlobalResponse::WithWatchOrder` (#4796). Live-computed as 45 at
         // its rebase onto main's 41, skipping reserved 42 to 44; digest
@@ -316,6 +311,14 @@ mod tests {
         // the reserved 33 to 39 and 42 to 44; digests measured at this
         // head).
         (46, "0dbbe4f192bc0983", "f013e36743d8d9e6"),
+        // The `StoreExclusive` payload's `Rewrite` says whether a mapping's
+        // file holds loops no mapping symbol proves (`unmarked`), which the
+        // run names in its summary; its fields cross the wire positionally.
+        // Numbered 42 at this change's rebase onto main's 41 and renumbered
+        // to 47, the next revision after main's landed 46
+        // (https://github.com/rrnewton/hermit/pull/4769); digest re-measured
+        // at this head.
+        (47, "0b69f906251b5e6a", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

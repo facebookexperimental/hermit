@@ -8244,9 +8244,11 @@ pub enum SignalScope {
 /// rebase onto 41 skipping reserved 42 to 44.
 /// https://github.com/rrnewton/hermit/pull/4769's `PublishInstructionOffset`
 /// pair, appended after the `CpuClockProcess` pair at the tail of each
-/// enum, is revision 46, the next revision after 45, and is the current
-/// revision.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 46;
+/// enum, is revision 46, the next revision after 45. 47 adds
+/// `Rewrite::unmarked` to the `StoreExclusive` payload (numbered 42 at
+/// this change's rebase onto main's 41, renumbered to 47, the next
+/// revision after the landed 46), and is current.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 47;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
