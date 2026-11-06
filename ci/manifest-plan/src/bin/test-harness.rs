@@ -8643,7 +8643,9 @@ sys.exit(1 if failed else 0)
         // after backend-parity-c was folded into c-programs
         // (https://github.com/rrnewton/hermit/issues/3301), plus compat since
         // fold 1 of https://github.com/rrnewton/hermit/issues/3448, plus rr
-        // (e2e.manifest_rr_on_host, the first post-split extension bucket).
+        // (e2e.manifest_rr_on_host, the first post-split extension bucket)
+        // and gvisor (e2e.manifest_gvisor_on_host,
+        // https://github.com/rrnewton/hermit/pull/5194): fifteen.
         assert_eq!(hosted, 14, "hosted-portable harness steps");
         assert_eq!(portable_focused, 1, "portable-strict-compat-only steps");
         assert!(local > hosted, "local harness steps: {local}");
@@ -8719,7 +8721,10 @@ sys.exit(1 if failed else 0)
         // split, 2026-11-02). The rr extension bucket adds +1 pinned
         // (e2e.manifest_rr, the portable bucket in the pinned root) and
         // +2 direct (e2e.manifest_rr_on_host on the host, and
-        // e2e.manifest_rr_buck, its full-buck-e2e import twin).
+        // e2e.manifest_rr_buck, its full-buck-e2e import twin). The
+        // gvisor extension bucket adds the same shape: +1 pinned
+        // (e2e.manifest_gvisor) and +2 direct (its _on_host and _buck
+        // twins, https://github.com/rrnewton/hermit/pull/5194).
         assert_eq!((pinned, direct), (21, 37));
     }
 
@@ -8786,7 +8791,9 @@ sys.exit(1 if failed else 0)
         // cell, so the selected cells and their reports are unchanged.
         // 17 since e2e.manifest_rr (rr Batch 0); every rr cell is
         // pressure-tier ci:false today, so it likewise plans no parity cell
-        // and the reports below are unchanged.
+        // and the reports below are unchanged. 18 with
+        // e2e.manifest_gvisor, the vendored gVisor bucket's full node
+        // (https://github.com/rrnewton/hermit/pull/5194).
         assert_eq!(nodes, 17);
         // The size of the population is not pinned here: parity.rs derives it
         // from the manifests and parity-cells.json snapshots it. This pins
@@ -9973,7 +9980,10 @@ sys.exit(1 if failed else 0)
         // sabre (test.sabre_examples), left core with DBT and SaBRe in the
         // third-party split (2026-11-02; 21 to 19), and with them their
         // hosted aliases. e2e.manifest_rr_on_host joined the integration
-        // shard with rr Batch 0 (19 to 20).
+        // shard with rr Batch 0 (19 to 20), and
+        // e2e.manifest_gvisor_on_host joined the same shard with the
+        // vendored gVisor bucket
+        // (https://github.com/rrnewton/hermit/pull/5194; 20 to 21).
         assert_eq!(physical_rows, 20);
         assert_eq!(resolved.len(), 20);
         assert_eq!(actual_aliases, expected_aliases);
