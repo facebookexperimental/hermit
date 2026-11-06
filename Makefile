@@ -228,6 +228,7 @@ LINT_CHECK_TARGETS := \
     lint-check-apt-install-cached \
     lint-check-pinned-root-cache \
     lint-check-checker-scheduling \
+    lint-check-early-artifact-gate \
     lint-check-validate-refusal-predicate \
     lint-check-audit-test-binary-registration \
     lint-check-shellcheck \
@@ -344,6 +345,9 @@ lint-check-pinned-root-cache:
 lint-check-checker-scheduling:
 	./scripts/check-checker-scheduling.rs --self-test
 	./scripts/check-checker-scheduling.rs
+
+lint-check-early-artifact-gate:
+	./ci/verify-early-hermit-e2e-artifact.sh --self-test
 
 lint-check-validate-refusal-predicate:
 	python3 ./scripts/check-validate-refusal-predicate.py --self-test
