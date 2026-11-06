@@ -8639,11 +8639,12 @@ sys.exit(1 if failed else 0)
                 );
             }
         }
-        // Thirteen hosted-portable manifest buckets, one step each: twelve
+        // Fourteen hosted-portable manifest buckets, one step each: twelve
         // after backend-parity-c was folded into c-programs
         // (https://github.com/rrnewton/hermit/issues/3301), plus compat since
-        // fold 1 of https://github.com/rrnewton/hermit/issues/3448.
-        assert_eq!(hosted, 13, "hosted-portable harness steps");
+        // fold 1 of https://github.com/rrnewton/hermit/issues/3448, plus rr
+        // (e2e.manifest_rr_on_host, the first post-split extension bucket).
+        assert_eq!(hosted, 14, "hosted-portable harness steps");
         assert_eq!(portable_focused, 1, "portable-strict-compat-only steps");
         assert!(local > hosted, "local harness steps: {local}");
     }
@@ -8715,8 +8716,11 @@ sys.exit(1 if failed else 0)
         // e2e.manifest_compat is pinned now, its _on_host twin stays direct.
         // -1 direct when sabrecompat.manifest_compat left core with the SaBRe
         // run type for the hermit-3rdparty-patching CI catalog (third-party
-        // split, 2026-11-02).
-        assert_eq!((pinned, direct), (20, 35));
+        // split, 2026-11-02). The rr extension bucket adds +1 pinned
+        // (e2e.manifest_rr, the portable bucket in the pinned root) and
+        // +2 direct (e2e.manifest_rr_on_host on the host, and
+        // e2e.manifest_rr_buck, its full-buck-e2e import twin).
+        assert_eq!((pinned, direct), (21, 37));
     }
 
     /// The full profile's harness nodes together report each cell of the
@@ -8780,7 +8784,10 @@ sys.exit(1 if failed else 0)
         // 16 since e2e.manifest_compat (fold 1 of
         // https://github.com/rrnewton/hermit/issues/3448); it plans no parity
         // cell, so the selected cells and their reports are unchanged.
-        assert_eq!(nodes, 16);
+        // 17 since e2e.manifest_rr (rr Batch 0); every rr cell is
+        // pressure-tier ci:false today, so it likewise plans no parity cell
+        // and the reports below are unchanged.
+        assert_eq!(nodes, 17);
         // The size of the population is not pinned here: parity.rs derives it
         // from the manifests and parity-cells.json snapshots it. This pins
         // what no generator checks: each population cell is reported by
@@ -9965,9 +9972,10 @@ sys.exit(1 if failed else 0)
         // The two release shards, dbt-runtime-abi (check.dbt_runtime_abi) and
         // sabre (test.sabre_examples), left core with DBT and SaBRe in the
         // third-party split (2026-11-02; 21 to 19), and with them their
-        // hosted aliases.
-        assert_eq!(physical_rows, 19);
-        assert_eq!(resolved.len(), 19);
+        // hosted aliases. e2e.manifest_rr_on_host joined the integration
+        // shard with rr Batch 0 (19 to 20).
+        assert_eq!(physical_rows, 20);
+        assert_eq!(resolved.len(), 20);
         assert_eq!(actual_aliases, expected_aliases);
         // Run the complete real budget audit too: all original workflow,
         // critical-path and exact inversion-baseline comparisons remain active.
