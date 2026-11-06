@@ -46566,6 +46566,7 @@ fn run_kvm_a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux() {
         ),
         ("restart", "thread read: 1 byte 'x', handled 1\n"),
         ("ignored", "thread read: 1 byte 'x', handled 0\n"),
+        ("default-ignored", "thread read: 1 byte 'x', handled 0\n"),
         ("blocked", "thread read: 1 byte 'x', handled 0\n"),
         ("ready", "thread read: 1 byte 'x'\n"),
         ("eof", "thread read: 0 byte '-'\n"),
@@ -46587,6 +46588,7 @@ fn run_kvm_a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux() {
             "waitpid",
             "waitpid: -1 Interrupted system call, handled 1\nchild exited 0\n",
         ),
+        ("sigchld-default", "child exited 7\n"),
     ] {
         let args = [
             "--backend=kvm",
@@ -46610,6 +46612,133 @@ fn run_kvm_a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux() {
             log.contains(":: Success: deterministic. Determinism verified."),
             "mode {mode}: verification failed:\n{log}"
         );
+    }
+}
+
+/// SIGSHARE S2 (ai_docs/2026-10-29-kvm-sigshare-design.md): on KVM the
+/// scheduler decides at the step-2 drain, from the signal state the backend
+/// reports for the thread, whether a pending signal ends a restartable
+/// internal poll, as it decides on ptrace from `/proc`. So a blocked,
+/// ignored or default-ignored signal leaves a polled `read` or `write`
+/// polling, with the same turns and syscall events as on ptrace, and a
+/// delivery with no Detcore copy of the dispositions (a caught signal, or a
+/// child's SIGCHLD under SIG_DFL in `sigchld-default`) reads the backend's
+/// state rather than a refused host `/proc` read. Each mode runs on ptrace
+/// and on KVM: the output is the native line, each backend verifies at
+/// bitwise parity with nonzero compared INFO counts, KVM's log has exactly as
+/// many `read` syscall events as ptrace's (before S2, a blocked or ignored
+/// signal woke the poll and the backend restarted the read, one more event),
+/// names the thread's signal-state task in its poll requests as ptrace's
+/// does, and has no refused host `/proc` signal-state read.
+#[test]
+fn run_kvm_the_drain_decides_a_polled_call_from_the_backends_signal_state() {
+    if kvm_unavailable("run_kvm_the_drain_decides_a_polled_call_from_the_backends_signal_state") {
+        return;
+    }
+    let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for (mode, expected, polls) in [
+        ("blocked", "thread read: 1 byte 'x', handled 0\n", true),
+        ("ignored", "thread read: 1 byte 'x', handled 0\n", true),
+        (
+            "default-ignored",
+            "thread read: 1 byte 'x', handled 0\n",
+            true,
+        ),
+        (
+            "eintr",
+            "thread read: -1 Interrupted system call, handled 1\n",
+            true,
+        ),
+        ("restart", "thread read: 1 byte 'x', handled 1\n", true),
+        (
+            "write-partial-blocked",
+            "write: two pipe capacities, handled 0\n",
+            true,
+        ),
+        (
+            "write-partial-ignored",
+            "write: two pipe capacities, handled 0\n",
+            true,
+        ),
+        ("sigchld-default", "child exited 7\n", false),
+    ] {
+        let mut logs = Vec::new();
+        for backend in ["ptrace", "kvm"] {
+            let backend_arg = format!("--backend={backend}");
+            let report = directory.path().join(format!("{mode}-{backend}.json"));
+            let report_arg = report.to_str().unwrap().to_owned();
+            let args = [
+                backend_arg.as_str(),
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                &report_arg,
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--",
+                guest.as_str(),
+                mode,
+            ];
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{backend} {mode}");
+            let verdict: serde_json::Value =
+                serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+            assert_eq!(
+                verdict["bitwise_parity"], true,
+                "{backend} {mode}: {verdict}"
+            );
+            let compared = &verdict["compared_log_messages"];
+            assert!(
+                compared["left"].as_u64().is_some_and(|count| count > 0)
+                    && compared["left"] == compared["right"],
+                "{backend} {mode} compared no INFO messages: {verdict}"
+            );
+
+            let log = directory.path().join(format!("{mode}-{backend}.log"));
+            let log_arg = format!("--log-file={}", log.display());
+            let args = [
+                "--log=info",
+                log_arg.as_str(),
+                backend_arg.as_str(),
+                "run",
+                "--strict",
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--",
+                guest.as_str(),
+                mode,
+            ];
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{backend} {mode}");
+            logs.push((backend, fs::read_to_string(&log).unwrap()));
+        }
+        let read_events = |text: &str| text.matches("inbound syscall: read(").count();
+        assert_eq!(
+            read_events(&logs[1].1),
+            read_events(&logs[0].1),
+            "{mode}: KVM made {} read syscall events, ptrace {}:\n{}",
+            read_events(&logs[1].1),
+            read_events(&logs[0].1),
+            logs[1].1
+        );
+        for (backend, text) in &logs {
+            assert!(
+                !text.contains("refused a host /proc signal state read"),
+                "{backend} {mode}: a host /proc signal-state read was refused:\n{text}"
+            );
+            if polls {
+                assert!(
+                    text.lines().any(|line| line.contains("InternalIOPolling")
+                        && line.contains("signal_state_task: (")),
+                    "{backend} {mode}: no poll request names its signal-state task:\n{text}"
+                );
+            }
+        }
     }
 }
 
@@ -46640,6 +46769,7 @@ fn a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux() {
         // single held slot; before, SIGUSR1 was lost
         // (https://github.com/rrnewton/reverie/issues/1012).
         ("ready2", "thread read: 1 byte 'x', usr1 1, usr2 1\n"),
+        ("default-ignored", "thread read: 1 byte 'x', handled 0\n"),
         ("blocked", "thread read: 1 byte 'x', handled 0\n"),
         ("ready", "thread read: 1 byte 'x'\n"),
         ("eof", "thread read: 0 byte '-'\n"),
@@ -46666,6 +46796,7 @@ fn a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux() {
             "waitpid",
             "waitpid: -1 Interrupted system call, handled 1\nchild exited 0\n",
         ),
+        ("sigchld-default", "child exited 7\n"),
     ] {
         let args = [
             "run",

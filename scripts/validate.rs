@@ -21092,8 +21092,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // slice F2-d0's run_kvm_another_threads_directory_links_are_refused_by_name:
         // 131. And its
         // run_kvm_descriptor_links_through_a_descriptor_directory_answer_as_linux:
-        // 132, matching the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 132usize),
+        // 132. And SIGSHARE S2a's
+        // run_kvm_the_drain_decides_a_polled_call_from_the_backends_signal_state:
+        // 133, matching the DAG pin in validation_dag_static.
+        ("privileged-only-test.cli_kvm", 133usize),
     ] {
         let step = privileged
             .steps

@@ -1296,6 +1296,35 @@ fn assert_flock_model_matches_linux_at_l2(backend: &str) {
             run.combined()
         );
     }
+    // A waiter a signal interrupts asks whether a job-control stop is pending
+    // (`flock_wait_stopped`): on KVM through the backend's signal state, never
+    // a host `/proc` read of an unrelated host task, which Detcore refuses and
+    // logs at ERROR (SIGSHARE S2). A run under --verify keeps its logs to
+    // itself, so this one runs once, logging to its own stderr.
+    let native = native_model_run("signal-interrupts");
+    let run = hermit_run_model(backend, "info", &["--strict"], "signal-interrupts");
+    assert!(
+        run.status.success(),
+        "{backend} strict flock model run of signal-interrupts failed\n{}",
+        run.combined()
+    );
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "{backend} printed other answers than native Linux for signal-interrupts\n{}",
+        run.combined()
+    );
+    assert!(
+        run.combined().contains("INFO"),
+        "{backend}: the signal-interrupts run logged nothing to its stderr\n{}",
+        run.combined()
+    );
+    assert!(
+        !run.combined()
+            .contains("refused a host /proc signal state read"),
+        "{backend} flock model run of signal-interrupts reached a refused host /proc read\n{}",
+        run.combined()
+    );
 }
 
 #[test]
