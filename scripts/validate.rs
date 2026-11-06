@@ -648,17 +648,19 @@ fn reverie_buck_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
         .cmd
         .contains("${HERMIT_VALIDATE_BUILD_MODE:-cargo}")
         || !reverie_buck.cmd.contains("cargo) : ;;")
-        || !reverie_buck
-            .cmd
-            .contains("buck) echo \"HERMIT_VALIDATE_BUILD_MODE=buck is not wired yet")
+        || !reverie_buck.cmd.contains("buck) ./ci/harvest-reverie-buck.sh ;;")
         || !reverie_buck
             .cmd
             .contains("*) echo \"unknown Hermit build mode:")
-        || reverie_buck.cmd.contains("buck2 build")
+        || reverie_buck.cmd.contains("not wired yet")
         || !reverie_buck
             .deps
             .iter()
             .any(|dep| dep == "gate.manifest")
+        || !reverie_buck
+            .deps
+            .iter()
+            .any(|dep| dep == "build.workspace_in_pinned_root")
     {
         return Err(
             "reverie-buck bracket: Reverie Buck producer lost its closed mode branch".into(),
@@ -1328,7 +1330,7 @@ fn ambient_mode_value(
         None => Ok(None),
         Some(value) => value.into_string().map(Some).map_err(|_| {
             format!(
-                "{name} has a non-UTF-8 value: cargo is the only supported mode until Cut 4"
+                "{name} has a non-UTF-8 value: supported modes are cargo (default) and buck"
             )
         }),
     }
@@ -1342,14 +1344,9 @@ fn check_ambient_build_modes(
     ambient_run: Option<&str>,
 ) -> Result<(), String> {
     if let Some(value) = ambient_build {
-        if value == BUILD_MODE_BUCK {
+        if value != BUILD_MODE_CARGO && value != BUILD_MODE_BUCK {
             return Err(format!(
-                "{BUILD_MODE_ENV}=buck is not supported yet: cargo is the only supported mode until Cut 4"
-            ));
-        }
-        if value != BUILD_MODE_CARGO {
-            return Err(format!(
-                "unknown {BUILD_MODE_ENV} {value:?}: cargo is the only supported mode until Cut 4"
+                "unknown {BUILD_MODE_ENV} {value:?}: supported modes are cargo (default) and buck (M2 Cut 3 harvest)"
             ));
         }
     }
@@ -1373,9 +1370,10 @@ fn establish_build_mode_environment(
     ambient_run: Option<String>,
 ) -> Result<(), String> {
     check_ambient_build_modes(ambient_build.as_deref(), ambient_run.as_deref())?;
+    let build_mode = ambient_build.as_deref().unwrap_or(BUILD_MODES[0]);
     std::env::remove_var(BUILD_MODE_ENV);
     std::env::remove_var(RUN_MODE_ENV);
-    std::env::set_var(BUILD_MODE_ENV, BUILD_MODES[0]);
+    std::env::set_var(BUILD_MODE_ENV, build_mode);
     std::env::set_var(RUN_MODE_ENV, RUN_MODE_CARGO);
     Ok(())
 }
@@ -1392,20 +1390,14 @@ mod build_mode_environment_tests {
             assert_eq!(std::env::var(BUILD_MODE_ENV).unwrap(), BUILD_MODE_CARGO);
             assert_eq!(std::env::var(RUN_MODE_ENV).unwrap(), RUN_MODE_CARGO);
         }
-        // Buck build mode is refused until Cut 4, not silently downgraded.
-        let error = establish_build_mode_environment(Some(BUILD_MODE_BUCK.into()), None)
-            .unwrap_err();
-        assert!(
-            error.contains("cargo is the only supported mode until Cut 4"),
-            "{error}"
-        );
+        // Buck build mode establishes buck (M2 Cut 3 harvest).
+        establish_build_mode_environment(Some(BUILD_MODE_BUCK.into()), None).unwrap();
+        assert_eq!(std::env::var(BUILD_MODE_ENV).unwrap(), BUILD_MODE_BUCK);
+        assert_eq!(std::env::var(RUN_MODE_ENV).unwrap(), RUN_MODE_CARGO);
         // An unknown build mode is refused by name.
         let error =
             establish_build_mode_environment(Some("banana".into()), None).unwrap_err();
-        assert!(
-            error.contains("cargo is the only supported mode until Cut 4"),
-            "{error}"
-        );
+        assert!(error.contains(BUILD_MODE_ENV), "{error}");
         // An unsupported run mode is refused too.
         let error =
             establish_build_mode_environment(None, Some(BUILD_MODE_BUCK.into())).unwrap_err();
@@ -1425,10 +1417,7 @@ mod build_mode_environment_tests {
                 )
                 .unwrap_err();
                 assert!(error.contains(name), "{error}");
-                assert!(
-                    error.contains("cargo is the only supported mode until Cut 4"),
-                    "{error}"
-                );
+                assert!(error.contains("supported modes are cargo"), "{error}");
             }
         }
     }
@@ -1547,9 +1536,11 @@ fn usage() -> &'static str {
      \x20                  mode refuses unsupported plans and never falls back.\n\
      \x20 HERMIT_VALIDATE_BUILD_MODE=cargo|buck\n\
      \x20                  How the Reverie test set is compiled (environment only;\n\
-     \x20                  there is no CLI selector yet). cargo is the only supported\n\
-     \x20                  mode until Cut 4: buck or any other value is refused with\n\
-     \x20                  a nonzero exit, never silently replaced by cargo.\n\
+     \x20                  there is no CLI selector yet). cargo (default) stages\n\
+     \x20                  through nextest-binaries; buck runs the M2 Cut 3 harvest\n\
+     \x20                  (ci/harvest-reverie-buck.sh) after the workspace build.\n\
+     \x20                  Any other value is refused with a nonzero exit, never\n\
+     \x20                  silently replaced by cargo.\n\
      \x20 HERMIT_VALIDATE_RUN_MODE=cargo\n\
      \x20                  Who executes the tests (environment only). cargo is the\n\
      \x20                  only supported run mode until the deferred RUN switch;\n\

@@ -33,3 +33,4 @@ thiserror
 tokio-stream
 typed-arena
 unwind
+linux-raw-sys
