@@ -11,9 +11,9 @@ remain ignored because they can be regenerated.
 - Git, and enough network access to reach `github.com`, `index.crates.io`,
   `static.rust-lang.org`, and the Buck2 GitHub release assets.
 - `rustup`. The build compiler is pinned by `rust-toolchain.toml`
-  (`nightly-2026-07-12`, rustc 1.99.0-nightly `be8e82435`); rustup installs it
+  (`1.97.1`, rustc 1.97.1 `8bab26f4f`); rustup installs it
   on first use. `components = ["clippy", "rustfmt"]` is part of that pin
-  because rustup does not add them to a freshly installed dated toolchain
+  because rustup does not add them to a freshly installed pinned toolchain
   otherwise.
 - `flock` (util-linux). The first Reindeer invocation on a cache builds
   under a lock.
@@ -587,7 +587,7 @@ The wrappers use immutable versions rather than live branch tips:
   binary in the cache — those two numbers differing is expected.
 - Reindeer `e3d72748131d3a70378055f091e0647c1edad85e`
 - Reindeer's own Rust toolchain `nightly-2026-05-22`
-- The build compiler, `nightly-2026-07-12` in `rust-toolchain.toml`
+- The build compiler, `1.97.1` in `rust-toolchain.toml`
 
 The compiler pin matters as much as the others. The shim uses
 `system_rust_toolchain`, which runs whatever `rustc` is on `PATH`; under rustup

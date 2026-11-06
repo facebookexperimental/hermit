@@ -11,9 +11,10 @@
   # depends on staying available; the honest answer is not "nothing".
   #
   # WHAT THE IMAGE PINS, and why each is here rather than inherited from the host:
-  #   * the Rust toolchain. `rust-toolchain.toml` says `channel = "nightly"`,
-  #     which is a MOVING target -- the single largest source of "it built
-  #     differently today". Pinned here to an exact dated nightly.
+  #   * the Rust toolchain. `rust-toolchain.toml` pins an exact stable
+  #     release, and this image must carry that same release or host and
+  #     pinned-root validation silently use different compilers. Pinned
+  #     here to the same exact stable.
   #   * the C/C++ toolchain and native development libraries. Measured on this
   #     project: host `gcc` defaulting to `-march=x86-64-v2` put SSE4.1 into a
   #     static glibc that the emulator did not advertise, and a missing
@@ -58,9 +59,9 @@
         overlays = [ (import rust-overlay) ];
       };
 
-      # Exact dated nightly. Bumping this is a reviewed change to the lock and
-      # the digest together, never a silent drift.
-      rustToolchain = pkgs.rust-bin.nightly."2026-07-29".default.override {
+      # Exact stable release, matching rust-toolchain.toml. Bumping this is a
+      # reviewed change to the lock and the digest together, never a drift.
+      rustToolchain = pkgs.rust-bin.stable."1.97.1".default.override {
         extensions = [ "rust-src" "rustfmt" "clippy" ];
       };
 
