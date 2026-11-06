@@ -2634,6 +2634,58 @@ fn population_accepts(population: Population, ci: bool, enabled: bool) -> bool {
     }
 }
 
+/// Where a manifest program stands in this checkout. Every consumer
+/// that resolves manifest programs (this validator, the scorecard and
+/// generator through it, test-harness, manifest-metadata) goes
+/// through [`resolve_program`] so they cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgramResolution {
+    /// Present on disk here.
+    Present,
+    /// Inside a submodule this checkout deliberately leaves
+    /// uninitialized (missing or empty directory): the sources are
+    /// populated where validation builds guests, so absence here is
+    /// not a defect in the row.
+    NotAvailableHere,
+    /// Absent where it should exist (including a typo inside a
+    /// populated submodule): a real missing-program defect.
+    Missing,
+}
+
+/// Submodule paths declared in the checkout's `.gitmodules`, if any.
+fn submodule_paths(root: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(root.join(".gitmodules")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("path = "))
+        .map(|path| path.trim().trim_end_matches('/').to_string())
+        .collect()
+}
+
+/// The one resolver for manifest program paths (see
+/// [`ProgramResolution`]). Validation checkouts leave update=none
+/// submodules empty by design (third-party/rr for the rr corpus), so
+/// existence is only refused where this checkout could have known.
+pub fn resolve_program(root: &Path, program: &str) -> ProgramResolution {
+    if root.join(program).exists() {
+        return ProgramResolution::Present;
+    }
+    for submodule in submodule_paths(root) {
+        if program.starts_with(&format!("{submodule}/")) {
+            let dir = root.join(&submodule);
+            let uninitialized = match std::fs::read_dir(&dir) {
+                Ok(mut entries) => entries.next().is_none(),
+                Err(_) => true,
+            };
+            if uninitialized {
+                return ProgramResolution::NotAvailableHere;
+            }
+        }
+    }
+    ProgramResolution::Missing
+}
+
 #[cfg(test)]
 fn validate_document(
     document: &ManifestDocument,
@@ -2705,7 +2757,7 @@ fn validate_document_with_cpu(
             (Some(program), None) => {
                 let below_tests = program.starts_with("tests/")
                     || program.starts_with("third-party/rr/src/test/");
-                if !below_tests || !root.join(program).exists() {
+                if !below_tests || resolve_program(root, program) == ProgramResolution::Missing {
                     return Err(format!("{}: missing program {program}", test.id));
                 }
             }
@@ -12641,6 +12693,97 @@ corpus:
             error.contains("is not lowercase-words-with-dashes"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn program_in_uninitialized_submodule_is_not_available_here() {
+        // Validation checkouts deliberately leave update=none submodules
+        // empty (third-party/rr for the rr corpus rows). A program
+        // inside an uninitialized submodule is not available in this
+        // checkout, which must not read as a missing-program defect;
+        // the same path typo'd inside a populated submodule still is.
+        let root = std::env::temp_dir().join(format!(
+            "manifest-plan-submodule-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("third-party/rr")).unwrap();
+        std::fs::write(
+            root.join(".gitmodules"),
+            "[submodule \"third-party/rr\"]\n\tpath = third-party/rr\n\turl = https://example.invalid/rr\n",
+        )
+        .unwrap();
+        let five_modes = || {
+            let mut test = recipe(true);
+            for mode in ["naked", "replay", "chaos", "custom"] {
+                let backends: &[&str] = if mode == "naked" {
+                    &["native"]
+                } else {
+                    &["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"]
+                };
+                test.modes.insert(
+                    mode.into(),
+                    ModeRecipe {
+                        ci: CiSelectionSpec::Uniform(false),
+                        ci_disabled_reason: Some(CiDisabledReasonSpec::Uniform(
+                            "fixture cell: only the verify mode is measured here".into(),
+                        )),
+                        backends_disabled: backends
+                            .iter()
+                            .map(|backend| ((*backend).into(), "fixture mode is not run".into()))
+                            .collect(),
+                        ..ModeRecipe::default()
+                    },
+                );
+            }
+            test
+        };
+        let mut test = five_modes();
+        test.program = Some("third-party/rr/src/test/simple.c".into());
+        test.direct = None;
+        let document = ManifestDocument {
+            image: None,
+            schema: MANIFEST_SCHEMA,
+            bucket: "fixture".into(),
+            timeout_seconds: None,
+            slow_reason: None,
+            test: vec![test.clone()],
+        };
+        validate_document_with_cpu(
+            &document,
+            "fixture",
+            &root,
+            15,
+            DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+        )
+        .unwrap();
+        // Populated submodule, missing file: still a defect.
+        std::fs::write(root.join("third-party/rr/README.md"), "x").unwrap();
+        let error = validate_document_with_cpu(
+            &document,
+            "fixture",
+            &root,
+            15,
+            DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+        )
+        .unwrap_err();
+        assert!(error.contains("missing program"), "{error}");
+        // Outside tests/ (and outside any submodule): unchanged refusal.
+        let mut outside = test;
+        outside.program = Some("src/test/simple.c".into());
+        let error = validate_document_with_cpu(
+            &ManifestDocument {
+                test: vec![outside],
+                ..document
+            },
+            "fixture",
+            &root,
+            15,
+            DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+        )
+        .unwrap_err();
+        assert!(error.contains("missing program"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

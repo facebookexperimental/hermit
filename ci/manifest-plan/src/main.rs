@@ -25,9 +25,11 @@ use hermit_manifest_plan::ci_selection::CiSelection;
 use hermit_manifest_plan::ci_selection::CiSelectionSpec;
 use hermit_manifest_plan::cli_help::is_help_flag;
 use hermit_manifest_plan::runner::ExpectedGuestExit;
+use hermit_manifest_plan::runner::ProgramResolution;
 #[cfg(test)]
 use hermit_manifest_plan::runner::REQUIRES_VOCABULARY;
 use hermit_manifest_plan::runner::requires_capability;
+use hermit_manifest_plan::runner::resolve_program;
 use hermit_manifest_plan::runner::validate_expected_guest_exit;
 use hermit_manifest_plan::runner::validate_mode_workdir;
 #[cfg(test)]
@@ -1114,6 +1116,7 @@ fn cell_timeout_overrides(
     resolved
 }
 
+#[cfg(test)]
 fn is_file_or_symlink(path: &Path) -> bool {
     path.is_file()
         || std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -1209,7 +1212,10 @@ fn validate_and_expand(
                 ));
             }
             let path = repo_root.join(program);
-            if !is_file_or_symlink(&path) {
+            // Same resolver as manifest validation: a program inside a
+            // submodule this checkout leaves uninitialized is not
+            // available here, not a missing-program defect.
+            if resolve_program(repo_root, program) == ProgramResolution::Missing {
                 die(format!("{id}: program path does not exist: {program}"));
             }
             program_path = Some(path);
