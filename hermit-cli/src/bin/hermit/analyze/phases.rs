@@ -46,7 +46,6 @@ use crate::app::analyze::types::ContinuationTimeslice;
 use crate::app::analyze::types::ExitStatusConstraint;
 use crate::app::analyze::types::Report;
 use crate::app::analyze::types::ReportCriticalEvent;
-use crate::app::analyze::types::TrialTimeout;
 use crate::app::analyze::verdict::AlternativeTiming;
 use crate::app::analyze::verdict::AnalyzeFailure;
 use crate::app::analyze::verdict::AnalyzePrecondition;
@@ -3924,12 +3923,12 @@ mod tests {
                 .unwrap()
                 .expect("opposite completed outcomes certify the report");
             assert_eq!(
-                report.critical_event2.stack,
+                report.critical_event2.as_ref().unwrap().stack,
                 Some(timing_report_stack(3, 0x40)),
                 "the one-branch baseline endpoint must not use the target deciding stack"
             );
             assert_eq!(
-                report.critical_event1.stack,
+                report.critical_event1.as_ref().unwrap().stack,
                 Some(timing_report_stack(
                     3,
                     if target_count == 100 { 0x20 } else { 0x30 }
@@ -3938,8 +3937,8 @@ mod tests {
             );
             assert_eq!(
                 (
-                    report.critical_event1.event_index,
-                    report.critical_event2.event_index
+                    report.critical_event1.as_ref().unwrap().event_index,
+                    report.critical_event2.as_ref().unwrap().event_index
                 ),
                 (1, 1)
             );
@@ -4010,17 +4009,17 @@ mod tests {
         assert_eq!(calls.len(), 4);
         assert_eq!(
             (
-                report.critical_event1.event_index,
-                report.critical_event2.event_index
+                report.critical_event1.as_ref().unwrap().event_index,
+                report.critical_event2.as_ref().unwrap().event_index
             ),
             (2, 2)
         );
         assert_eq!(
-            report.critical_event1.stack,
+            report.critical_event1.as_ref().unwrap().stack,
             Some(timing_report_stack(7, 0x10))
         );
         assert_eq!(
-            report.critical_event2.stack,
+            report.critical_event2.as_ref().unwrap().stack,
             Some(timing_report_stack(7, 0x10))
         );
     }
