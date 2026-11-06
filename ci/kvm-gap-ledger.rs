@@ -42,7 +42,7 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "5f92b018acb168a120e3b9a97da6bcffebcbcaef" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "fae1ebce0ccab8749e12fd0ecec2fc42741ada50" }
 //! hermit-manifest-plan = { path = "manifest-plan" }
 //! serde_json = "1"
 //! ```
