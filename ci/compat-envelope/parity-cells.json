@@ -8,7 +8,7 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 3140,
+      "cells": 3145,
       "applicable": 2273,
       "selectable": 1780,
       "population": 3065,
@@ -18,7 +18,7 @@
     },
     "by_backend": {
       "dbt": {
-        "cells": 628,
+        "cells": 629,
         "applicable": 560,
         "selectable": 555,
         "population": 613,
@@ -27,7 +27,7 @@
         "population_candidate_disabled": 56
       },
       "in-guest-trap": {
-        "cells": 628,
+        "cells": 629,
         "applicable": 314,
         "selectable": 314,
         "population": 613,
@@ -36,7 +36,7 @@
         "population_candidate_disabled": 299
       },
       "kvm": {
-        "cells": 628,
+        "cells": 629,
         "applicable": 605,
         "selectable": 596,
         "population": 613,
@@ -45,7 +45,7 @@
         "population_candidate_disabled": 14
       },
       "liteinst": {
-        "cells": 628,
+        "cells": 629,
         "applicable": 315,
         "selectable": 315,
         "population": 613,
@@ -54,7 +54,7 @@
         "population_candidate_disabled": 298
       },
       "sabre": {
-        "cells": 628,
+        "cells": 629,
         "applicable": 479,
         "selectable": 0,
         "population": 613,
@@ -2975,6 +2975,11 @@
     {"test_id":"language-runtimes/tcl-rand-clock","backend":"kvm","category":"language-runtimes","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"language-runtimes/tcl-rand-clock","backend":"liteinst","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: LiteInst Tcl qualification is tracked by backend compatibility"},
     {"test_id":"language-runtimes/tcl-rand-clock","backend":"sabre","category":"language-runtimes","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe requires its external runtime"},
+    {"test_id":"rr/simple","backend":"dbt","category":"rr","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super."},
+    {"test_id":"rr/simple","backend":"in-guest-trap","category":"rr","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super."},
+    {"test_id":"rr/simple","backend":"kvm","category":"rr","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super."},
+    {"test_id":"rr/simple","backend":"liteinst","category":"rr","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super."},
+    {"test_id":"rr/simple","backend":"sabre","category":"rr","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super."},
     {"test_id":"shared-futex-c/qemu-exec-init","backend":"dbt","category":"shared-futex-c","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"},
     {"test_id":"shared-futex-c/qemu-exec-init","backend":"in-guest-trap","category":"shared-futex-c","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"},
     {"test_id":"shared-futex-c/qemu-exec-init","backend":"kvm","category":"shared-futex-c","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit"},
