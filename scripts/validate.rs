@@ -20570,8 +20570,11 @@ mod nextest_timeout_tests {
                 // and c-programs/madvise-guard-regions, verify and replay on
                 // ptrace, and madvise-guard-regions verify on KVM. 2984 with
                 // SIGSHARE S2b's KVM verify of
-                // c-programs/sigsuspend-sibling-signal-wake.
-                assert_eq!(all.len(), 2984, "the original all-owner population is retained");
+                // c-programs/sigsuspend-sibling-signal-wake. 2998 with the
+                // 2026-11-05 sweep flip's fourteen required cells (PR #5183,
+                // 2984 + 14, disjoint from the guard/SIGSHARE cells),
+                // recounted by enumeration at the rebase head.
+                assert_eq!(all.len(), 2998, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
