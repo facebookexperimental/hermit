@@ -18493,6 +18493,8 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
         write_domain_guarantee: None,
         explains: Vec::new(),
         fail_fast_family: None,
+        publishes: Vec::new(),
+        artifact_deps: Vec::new(),
     };
     let requirements: BTreeMap<String, HostCapability> =
         [("cpuid.faulting".to_string(), HostCapability::CpuidFaulting)]
