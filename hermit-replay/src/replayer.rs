@@ -2542,20 +2542,29 @@ impl Replayer {
     /// refused before any directory is created. Its text names a path inside
     /// the replay root, but the guest's kernel follows the link to the linked
     /// object, which may be a host file outside it.
-    fn open_materializes_in_replay_root<G: Guest<Self>>(
+    ///
+    /// Returns why a recorded regular-file open may not be opened for real, or
+    /// `None` when it may. Keeping the refusal as a named reason, not a
+    /// bare `false`, is what lets a later flock refusal say which gate
+    /// fired (dh-gg5uv: the landing validation of the recorded-base
+    /// fix still refused `/tmp/hsperfdata_root/9` on its first attempt,
+    /// and a boolean gate could not say whether the object was
+    /// missing, its parent was missing, or it resolved to the wrong
+    /// kind of object in the fresh replay root).
+    fn open_materialization_refusal(
         &self,
-        guest: &G,
+        pid: Pid,
         dirfd: libc::c_int,
         path: &Path,
         flags: OFlag,
-    ) -> bool {
+    ) -> Option<String> {
         // The recorded open's cwd and dirfd live in the calling thread's
         // state, not its leader's: a JVM service thread enters its perf
         // directory itself, and resolving through the leader looks in the
         // leader's (different) cwd and descriptor table.
-        let pid = guest.tid();
-        let Ok(root) = crate::record_replay_path::open_process_root(pid) else {
-            return false;
+        let root = match crate::record_replay_path::open_process_root(pid) {
+            Ok(root) => root,
+            Err(error) => return Some(format!("could not open the replay root: {error}")),
         };
         let start = if path.is_absolute() {
             crate::record_replay_path::open_process_root(pid)
@@ -2564,11 +2573,26 @@ impl Replayer {
         } else {
             crate::record_replay_path::open_process_directory_fd(pid, dirfd)
         };
-        let Ok(start) = start else {
-            return false;
+        let start = match start {
+            Ok(start) => start,
+            Err(error) => {
+                return Some(format!(
+                    "could not open the resolution base for {path:?}: {error}"
+                ));
+            }
         };
-        if !crate::record_replay_path::directory_is_beneath(&root, &start).unwrap_or(false) {
-            return false;
+        match crate::record_replay_path::directory_is_beneath(&root, &start) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Some(format!(
+                    "the resolution base for {path:?} is not beneath the replay root"
+                ));
+            }
+            Err(error) => {
+                return Some(format!(
+                    "could not check the resolution base for {path:?} against the replay root: {error}"
+                ));
+            }
         }
         let parent = path
             .parent()
@@ -2581,7 +2605,9 @@ impl Replayer {
                 )
             && error.raw_os_error() == Some(libc::ELOOP)
         {
-            return false;
+            return Some(format!(
+                "creating the parent of {path:?} would cross a procfs symlink: {error}"
+            ));
         }
         let metadata =
             |object: &OwnedFd| std::fs::metadata(format!("/proc/self/fd/{}", object.as_raw_fd()));
@@ -2589,7 +2615,15 @@ impl Replayer {
             &root, &start, path,
         ) {
             Ok(resolved) => match metadata(&resolved.object) {
-                Ok(found) if flags.contains(OFlag::O_TMPFILE) => found.is_dir(),
+                Ok(found) if flags.contains(OFlag::O_TMPFILE) => {
+                    if found.is_dir() {
+                        None
+                    } else {
+                        Some(format!(
+                            "{path:?} resolves to a non-directory for an O_TMPFILE open"
+                        ))
+                    }
+                }
                 Ok(found) if found.file_type().is_file() => {
                     // A regular file already beneath the replay root is a
                     // real lockable object whether or not an earlier replay
@@ -2604,9 +2638,15 @@ impl Replayer {
                     {
                         let _ = register_materialized(root_identity, object);
                     }
-                    true
+                    None
                 }
-                _ => false,
+                Ok(found) => Some(format!(
+                    "{path:?} resolves to a {:?}, not a regular file",
+                    found.file_type()
+                )),
+                Err(error) => Some(format!(
+                    "could not stat the object {path:?} resolves to: {error}"
+                )),
             },
             Err(error)
                 if error.raw_os_error() == Some(libc::ENOENT)
@@ -2615,17 +2655,25 @@ impl Replayer {
             {
                 // Only the final component may be missing.
                 match parent {
-                    None => true,
+                    None => None,
                     Some(parent) => {
-                        crate::record_replay_path::resolve_existing_path_without_procfs_symlinks(
+                        match crate::record_replay_path::resolve_existing_path_without_procfs_symlinks(
                             &root, &start, parent,
                         )
+                        .and_then(|resolved| metadata(&resolved.object))
+                        {
+                            Ok(found) if found.is_dir() => None,
+                            Ok(_) => Some(format!(
+                                "the parent of {path:?} does not resolve to a directory"
+                            )),
+                            Err(parent_error) => Some(format!(
+                                "{path:?} does not exist and its parent cannot be resolved: {parent_error}"
+                            )),
+                        }
                     }
-                    .and_then(|resolved| metadata(&resolved.object))
-                    .is_ok_and(|found| found.is_dir()),
                 }
             }
-            Err(_) => false,
+            Err(error) => Some(format!("{path:?} cannot be resolved: {error}")),
         }
     }
 
@@ -2714,12 +2762,28 @@ impl Replayer {
                     .unwrap_or_else(|error| {
                         panic!("failed to materialize recorded open directory: {error}")
                     }),
-                OpenMaterialization::RegularFile => self.open_materializes_in_replay_root(
-                    guest,
-                    materialization_dirfd,
-                    &materialization_path,
-                    flags,
-                ),
+                OpenMaterialization::RegularFile => {
+                    match self.open_materialization_refusal(
+                        guest.tid(),
+                        materialization_dirfd,
+                        &materialization_path,
+                        flags,
+                    ) {
+                        None => true,
+                        Some(reason) => {
+                            // A regular file that replay answers with a
+                            // placeholder here is exactly the descriptor a
+                            // later flock must materialize or refuse; say
+                            // which gate made it a placeholder.
+                            tracing::debug!(
+                                ?syscall,
+                                reason,
+                                "recorded regular-file open stays virtual"
+                            );
+                            false
+                        }
+                    }
+                }
                 OpenMaterialization::None => false,
             };
             if materialize {
@@ -3486,8 +3550,8 @@ impl Replayer {
         guest: &mut G,
         pending: &PendingPlaceholderOpen,
     ) -> Result<(), String> {
-        if !self.open_materializes_in_replay_root(
-            guest,
+        if let Some(reason) = self.open_materialization_refusal(
+            guest.tid(),
             pending.dirfd,
             &pending.path,
             pending.flags,
@@ -3495,7 +3559,7 @@ impl Replayer {
         {
             return Err(format!(
                 "recorded open of {:?} does not resolve to a lockable object \
-                 beneath the replay root",
+                 beneath the replay root ({reason})",
                 pending.path
             ));
         }
@@ -4399,6 +4463,50 @@ mod pending_flock_tests {
             crate::record_replay_path::process_cwd_path(pid)
                 .ok()
                 .map(|cwd| cwd.join("9"))
+        );
+    }
+
+    #[test]
+    fn materialization_refusal_names_its_gate() {
+        // The flock refusal is only diagnosable if the gate that made
+        // a recorded open virtual names itself: an existing regular
+        // file and a creatable missing file pass, while a missing
+        // file, a non-directory parent, and a directory target each
+        // refuse for a different stated reason.
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("9");
+        std::fs::write(&file, b"perf").unwrap();
+        let pid = Pid::from_raw(std::process::id() as i32);
+        let replayer = Replayer::default();
+        let refusal = |path: &Path, flags: OFlag| {
+            replayer.open_materialization_refusal(pid, libc::AT_FDCWD, path, flags)
+        };
+        assert_eq!(refusal(&file, OFlag::O_RDONLY), None);
+        let missing = directory.path().join("missing");
+        let reason = refusal(&missing, OFlag::O_RDONLY).unwrap();
+        assert!(
+            reason.contains("cannot be resolved"),
+            "missing-file reason: {reason}"
+        );
+        assert_eq!(
+            refusal(&missing, OFlag::O_RDWR | OFlag::O_CREAT),
+            None,
+            "a missing final component under an existing parent is creatable"
+        );
+        assert!(
+            !missing.exists(),
+            "the decision alone must not create the file"
+        );
+        let through_file = file.join("9");
+        let reason = refusal(&through_file, OFlag::O_RDWR | OFlag::O_CREAT).unwrap();
+        assert!(
+            reason.contains("cannot be resolved"),
+            "non-directory-parent reason: {reason}"
+        );
+        let reason = refusal(directory.path(), OFlag::O_RDONLY).unwrap();
+        assert!(
+            reason.contains("not a regular file"),
+            "directory-target reason: {reason}"
         );
     }
 
