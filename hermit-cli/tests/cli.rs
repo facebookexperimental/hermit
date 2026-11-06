@@ -70258,12 +70258,15 @@ fn proc_other_process_stat_guest() -> &'static Path {
     compiled_c_guest(&PROC_OTHER_PROCESS_STAT_GUEST, "proc_other_process_stat")
 }
 
-/// The other-process stat guest's transcript run natively, with the lines
-/// that name each answer checked first, so a host that answers otherwise
-/// fails here rather than in the comparison.
+/// The other-process stat guest's transcript run natively under
+/// [`without_core_dumps`], with the lines that name each answer checked
+/// first, so a host that answers otherwise fails here rather than in the
+/// comparison.
 fn proc_other_process_stat_native(backend: &str) -> String {
     let args = proc_other_process_stat_args(backend);
-    let output = Command::new(proc_other_process_stat_guest())
+    let mut command = Command::new(proc_other_process_stat_guest());
+    without_core_dumps(&mut command);
+    let output = command
         .args(args)
         .stdin(Stdio::null())
         .output()
@@ -70295,12 +70298,77 @@ fn proc_other_process_stat_native(backend: &str) -> String {
             "{line}: {native}"
         );
     }
+    // With the core limit at 1 no process dumps core, so the kernel reports
+    // each crash as CLD_KILLED with the bare signal as its exit code.
+    if core_limit_can_be_one() {
+        for line in [
+            "SIGSEGV zombie: state=Z si_code=2 si_status=11 exit_code=11 as its waitid shows=1",
+            "abort zombie: state=Z si_code=2 si_status=6 exit_code=6 as its waitid shows=1",
+        ] {
+            assert!(
+                native.lines().any(|native| native == line),
+                "{line}: {native}"
+            );
+        }
+    }
     native
+}
+
+/// Whether this process's hard `RLIMIT_CORE` lets [`without_core_dumps`] set
+/// a soft limit of 1. A child inherits the limit, so the answer holds for the
+/// processes the tests start.
+fn core_limit_can_be_one() -> bool {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit(2) only writes the struct passed to it.
+    let read = unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) };
+    assert_eq!(
+        read,
+        0,
+        "getrlimit(RLIMIT_CORE): {}",
+        std::io::Error::last_os_error()
+    );
+    limit.rlim_max >= 1
+}
+
+/// Sets the soft `RLIMIT_CORE` of the process `command` starts to 1, or to
+/// its hard limit when that is 0, so that whether a crash dumps core, and so
+/// whether its wait status is CLD_DUMPED or CLD_KILLED, does not depend on
+/// the host. Linux skips a dump at a limit of 1 for every `core_pattern`: a
+/// piped pattern (`|helper`) ignores RLIMIT_CORE except for exactly 1, its
+/// guard against recursive dumps ("RLIMIT_CORE is set to 1, aborting core",
+/// fs/coredump.c `coredump_pipe` in 6.17), so 0 does not stop a piped dump;
+/// a file pattern needs at least `min_coredump`, a page. Under Hermit the
+/// guest inherits the limit from hermit's process: a guest's own
+/// `setrlimit` changes only Detcore's virtual limit.
+fn without_core_dumps(command: &mut Command) {
+    // SAFETY: getrlimit(2) and setrlimit(2) change only the child about to
+    // exec, and are async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_CORE, &mut limit) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            limit.rlim_cur = limit.rlim_max.min(1);
+            if libc::setrlimit(libc::RLIMIT_CORE, &limit) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 /// The other-process stat guest's transcript under Hermit on `backend` at
 /// L2: two runs at bitwise parity under `--verify-strict`, with the same
-/// nonzero number of INFO records compared.
+/// nonzero number of INFO records compared. Hermit runs under
+/// [`without_core_dumps`], as the native run does, and its guest processes
+/// inherit that limit.
 fn proc_other_process_stat_at_l2(backend: &str) -> String {
     let guest = proc_other_process_stat_guest();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -70323,7 +70391,9 @@ fn proc_other_process_stat_at_l2(backend: &str) -> String {
     .into_iter()
     .chain(proc_other_process_stat_args(backend).iter().copied())
     .collect::<Vec<_>>();
-    let output = hermit(&args);
+    let mut command = hermit_command(&args);
+    without_core_dumps(&mut command);
+    let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
     assert_success(&output, &args);
     let verdict: serde_json::Value =
         serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
