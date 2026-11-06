@@ -7816,12 +7816,14 @@ mod e2e_runner_tests {
             .cloned()
             .collect::<BTreeSet<_>>();
         // The two runner nodes (e2e.buck_stage, e2e.buck_cells) plus 18
-        // `_buck` import twins: 17 until e2e.manifest_rr_buck (rr Batch 0).
+        // `_buck` import twins: 17 until e2e.manifest_gvisor_buck, the
+        // vendored gVisor bucket's twin
+        // (https://github.com/rrnewton/hermit/pull/5194).
         assert_eq!(added.len(), 20, "{added:?}");
         assert!(added.contains("e2e.buck_stage"));
         assert!(added.contains("e2e.buck_cells"));
         assert!(added.contains("full-scorecard.compatibility_buck"));
-        assert!(added.contains("e2e.manifest_rr_buck"));
+        assert!(added.contains("e2e.manifest_gvisor_buck"));
         for tag in &added {
             if tag != "e2e.buck_cells" && tag != "e2e.buck_stage" {
                 let cargo_tag = tag.strip_suffix("_buck").unwrap();
@@ -7831,7 +7833,8 @@ mod e2e_runner_tests {
         // 21 dropped since the host compatprep.fixtures step retired from
         // full (issue 4997, one writer): the Cargo full plan no longer
         // carries it for the Buck plan to drop. 22 before, and 22 again with
-        // e2e.manifest_rr swapped for its _buck twin (rr Batch 0).
+        // e2e.manifest_gvisor swapped for its _buck twin
+        // (https://github.com/rrnewton/hermit/pull/5194).
         assert_eq!(dropped.len(), 22, "{dropped:?}");
         assert_eq!(buck_tags.len(), cargo_tags.len() - 22 + 20);
         assert_eq!(buck.profile, "full");
@@ -20509,8 +20512,8 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
         // retired with the compat/strict-<row> tests
         // (https://github.com/rrnewton/hermit/issues/4276). 56 with
         // supercompat.manifest_compat, the super run type's heavy compat rows
-        // (same issue). The frozen original stays 56; the rr extension
-        // bucket's three nodes (e2e.manifest_rr and twins) join the actual
+        // (same issue). The frozen original stays 56; the gVisor extension
+        // bucket's three nodes (e2e.manifest_gvisor and twins) join the actual
         // population by registry declaration; with the one patching-owned frozen
         // row (sabrecompat.manifest_compat) never in the core set, 55 frozen
         // core + 3 declared = 58 steps match below.
@@ -37608,8 +37611,8 @@ mod raw_census_publication_tests {
         // retired with the compat/strict-<row> tests
         // (https://github.com/rrnewton/hermit/issues/4276). 56 with
         // supercompat.manifest_compat, the super run type's heavy compat rows
-        // (same issue). The frozen original stays 56; the rr extension
-        // bucket's three nodes (e2e.manifest_rr and twins) join the actual
+        // (same issue). The frozen original stays 56; the gVisor extension
+        // bucket's three nodes (e2e.manifest_gvisor and twins) join the actual
         // population by registry declaration; with the one patching-owned frozen
         // row (sabrecompat.manifest_compat) never in the core set, 55 frozen
         // core + 3 declared = 58 publishers match below.
