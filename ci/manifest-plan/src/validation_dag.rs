@@ -6669,11 +6669,12 @@ sys.exit(37)
         refuse(OUTPUT, "the file", text);
     }
 
-    /// The PMU analyze node retains exactly the eight other ignored
+    /// The PMU analyze node retains exactly the ten other ignored
     /// integrations (the six refusal/workspace/timeout cases, the
-    /// racewrite selfcheck regression and the race finder's fd_reuse
-    /// case) while hello-race pinpointing and the race-candidates case
-    /// are excluded for their tracked reasons.
+    /// racewrite selfcheck regression, the race finder's fd_reuse
+    /// case and the verdict change's two) while hello-race
+    /// pinpointing and the race-candidates case are excluded for
+    /// their tracked reasons.
     #[test]
     fn the_pmu_analyze_node_runs_the_ignored_analyze_integrations() {
         let source = include_str!("../../../hermit-cli/tests/analyze.rs");
