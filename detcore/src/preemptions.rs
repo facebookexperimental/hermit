@@ -3233,6 +3233,72 @@ mod tests {
         }
     }
 
+    /// Rewrite provenance is compared evidence: the bounded INFO summary
+    /// must distinguish runs that rewrote exclusive loops differently, as
+    /// the raw record does. (revastra2 P2 on PR 4735.)
+    #[test]
+    fn bounded_summary_distinguishes_rewrite_provenance() {
+        let off = PreemptionWriter::new(None).summary().unwrap();
+        let overlay = PreemptionWriter::new(None)
+            .with_rewrite_exclusives(Some(RewriteExclusives::current(
+                RewriteExclusivesMode::Overlay,
+            )))
+            .summary()
+            .unwrap();
+        assert_ne!(off, overlay, "off vs Overlay must differ");
+
+        let v5 = PreemptionWriter::new(None)
+            .with_rewrite_exclusives(Some(RewriteExclusives {
+                mode: RewriteExclusivesMode::Overlay,
+                format_version: 5,
+            }))
+            .summary()
+            .unwrap();
+        let v6 = PreemptionWriter::new(None)
+            .with_rewrite_exclusives(Some(RewriteExclusives {
+                mode: RewriteExclusivesMode::Overlay,
+                format_version: 6,
+            }))
+            .summary()
+            .unwrap();
+        assert_ne!(v5, v6, "same-mode differing format versions must differ");
+
+        let plain = PreemptionWriter::new(None).summary().unwrap();
+        let mut heuristic_writer = PreemptionWriter::new(None);
+        heuristic_writer.inner.rewrite_exclusives_stripped_heuristic = true;
+        let heuristic = heuristic_writer.summary().unwrap();
+        assert_ne!(plain, heuristic, "stripped-heuristic marker must differ");
+
+        // The boundary INFO form carries the same provenance.
+        let boundary_off = PreemptionWriter::new(None)
+            .with_slice_boundaries()
+            .unwrap()
+            .summary()
+            .unwrap();
+        let boundary_overlay = PreemptionWriter::new(None)
+            .with_slice_boundaries()
+            .unwrap()
+            .with_rewrite_exclusives(Some(RewriteExclusives::current(
+                RewriteExclusivesMode::Overlay,
+            )))
+            .summary()
+            .unwrap();
+        assert_ne!(
+            boundary_off, boundary_overlay,
+            "boundary off vs Overlay must differ"
+        );
+        let mut boundary_heuristic_writer =
+            PreemptionWriter::new(None).with_slice_boundaries().unwrap();
+        boundary_heuristic_writer
+            .inner
+            .rewrite_exclusives_stripped_heuristic = true;
+        let boundary_heuristic = boundary_heuristic_writer.summary().unwrap();
+        assert_ne!(
+            boundary_off, boundary_heuristic,
+            "boundary heuristic must differ"
+        );
+    }
+
     /// Every streaming write/summary path runs the writer's stopless
     /// lowering refusal (`finalize`) before serializing, as the legacy
     /// write path does: a below-format record whose stopless end would

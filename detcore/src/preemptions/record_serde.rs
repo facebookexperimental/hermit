@@ -154,6 +154,10 @@ struct InfoRecord {
     rows_alone: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     background_starts_unnoted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rewrite_exclusives: Option<super::RewriteExclusives>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    rewrite_exclusives_stripped_heuristic: bool,
 }
 
 struct InfoLegacyFields<'a>(&'a PreemptionRecord);
@@ -1000,5 +1004,94 @@ mod tests {
         );
         assert!(!record.rewrite_exclusives_in_memory());
         assert_eq!(serde_json::to_string(&record).unwrap(), overlay);
+    }
+
+    /// The INFO projection (`InfoRecord`) must carry the rewrite provenance
+    /// (`rewrite_exclusives`, `rewrite_exclusives_stripped_heuristic`) in
+    /// legacy, marked and boundary forms, as `RawRecord` does. Before the
+    /// fix the projection ended at `rewrite_exclusives_in_memory` and both
+    /// fields were dropped, so compared summaries collapsed. (PR 4735 P2.)
+    #[test]
+    fn info_projection_carries_rewrite_provenance_in_every_form() {
+        use crate::preemptions::RewriteExclusives;
+        use crate::preemptions::RewriteExclusivesMode;
+        let overlay6 = RewriteExclusives {
+            mode: RewriteExclusivesMode::Overlay,
+            format_version: 6,
+        };
+        let base: PreemptionRecord = serde_json::from_str(
+            r#"{"per_thread":{},"global":[],"rewrite_exclusives":{"mode":"overlay","format_version":6},"rewrite_exclusives_stripped_heuristic":true}"#,
+        )
+        .unwrap();
+        assert_eq!(base.rewrite_exclusives(), Some(overlay6));
+        assert!(base.rewrite_exclusives_stripped_heuristic());
+
+        // Legacy INFO form carries both fields.
+        let legacy_info = serde_json::to_string(&InfoProjection(&base)).unwrap();
+        assert!(
+            legacy_info.contains(r#""rewrite_exclusives":{"mode":"overlay","format_version":6}"#),
+            "{legacy_info}"
+        );
+        assert!(
+            legacy_info.contains(r#""rewrite_exclusives_stripped_heuristic":true"#),
+            "{legacy_info}"
+        );
+        let back: PreemptionRecord = serde_json::from_str(&legacy_info).unwrap();
+        assert_eq!(back, base);
+
+        // Off vs Overlay vs differing versions vs heuristic differ in INFO form.
+        let off: PreemptionRecord =
+            serde_json::from_str(r#"{"per_thread":{},"global":[]}"#).unwrap();
+        let off_info = serde_json::to_string(&InfoProjection(&off)).unwrap();
+        assert_ne!(off_info, legacy_info);
+        let v5: PreemptionRecord = serde_json::from_str(
+            r#"{"per_thread":{},"global":[],"rewrite_exclusives":{"mode":"overlay","format_version":5}}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            serde_json::to_string(&InfoProjection(&v5)).unwrap(),
+            legacy_info
+        );
+        // Heuristic alone (no rewrite) still differs.
+        let heur_only: PreemptionRecord = serde_json::from_str(
+            r#"{"per_thread":{},"global":[],"rewrite_exclusives_stripped_heuristic":true}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            off_info,
+            serde_json::to_string(&InfoProjection(&heur_only)).unwrap()
+        );
+
+        // Marked INFO form carries both fields inside its envelope payload.
+        let mut marked = base.clone();
+        marked.replay_departed_at = Some(7);
+        let marked_info = serde_json::to_string(&InfoProjection(&marked)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&marked_info).unwrap();
+        let payload = &value[ENVELOPE]["record"];
+        assert_eq!(payload["rewrite_exclusives"]["mode"], "overlay");
+        assert_eq!(payload["rewrite_exclusives"]["format_version"], 6);
+        assert_eq!(payload["rewrite_exclusives_stripped_heuristic"], true);
+        let marked_back: PreemptionRecord = serde_json::from_str(&marked_info).unwrap();
+        assert_eq!(marked_back.rewrite_exclusives(), Some(overlay6));
+        assert!(marked_back.rewrite_exclusives_stripped_heuristic());
+
+        // Boundary INFO form carries both fields.
+        let boundary_info = serde_json::to_string(
+            &crate::preemptions::boundary_recording::BorrowedInfoEnvelope::new(&base, &[]).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            boundary_info.contains(r#""rewrite_exclusives":{"mode":"overlay","format_version":6}"#),
+            "{boundary_info}"
+        );
+        assert!(
+            boundary_info.contains(r#""rewrite_exclusives_stripped_heuristic":true"#),
+            "{boundary_info}"
+        );
+        let boundary_off = serde_json::to_string(
+            &crate::preemptions::boundary_recording::BorrowedInfoEnvelope::new(&off, &[]).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(boundary_off, boundary_info);
     }
 }
