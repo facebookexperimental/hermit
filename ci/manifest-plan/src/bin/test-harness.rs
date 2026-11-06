@@ -8801,12 +8801,15 @@ sys.exit(1 if failed else 0)
         // 10 + 1 for language-runtimes/go-os-exec-output@kvm: its verify
         // cells are enabled on ptrace and KVM but stay out of full until the
         // pinned validation root carries a Go toolchain.
-        assert_eq!(unreported.len(), 11, "{unreported:?}");
+        // 11 + 2 with the java/javac compile+run split of 2026-11-05: each
+        // combined row became two rows, so their two SaBRe parity cells
+        // became four; full still plans neither side of any of them.
+        assert_eq!(unreported.len(), 13, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
             .count();
-        assert_eq!(sabre_only, 7, "{unreported:?}");
+        assert_eq!(sabre_only, 9, "{unreported:?}");
     }
 
     #[test]
