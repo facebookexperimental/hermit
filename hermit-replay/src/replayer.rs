@@ -139,6 +139,29 @@ fn replay_root_identity(pid: Pid) -> io::Result<ReplayFileIdentity> {
 pub struct ReplayMaterializationScope {
     identity: ReplayFileIdentity,
     _root: OwnedFd,
+    pending_at_start: Vec<PendingPlaceholderKey>,
+}
+
+/// The identity under which one pending placeholder entry is remembered,
+/// used to tell entries that predated a scope from entries it created.
+type PendingPlaceholderKey = (
+    u64,
+    ReplayFileIdentity,
+    libc::pid_t,
+    libc::pid_t,
+    libc::c_int,
+    Option<String>,
+);
+
+fn pending_placeholder_key(pending: &PendingPlaceholderOpen) -> PendingPlaceholderKey {
+    (
+        pending.open_id,
+        pending.root,
+        pending.tgid,
+        pending.opener_tid,
+        pending.fd,
+        pending.placeholder_id.clone(),
+    )
 }
 
 impl ReplayMaterializationScope {
@@ -149,9 +172,26 @@ impl ReplayMaterializationScope {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push((identity, root.try_clone()?));
+        // Pending flock entries are keyed by the root their recorded
+        // open resolved under, and a guest that chroots mid-run opens
+        // under a *different* root than this scope was created for.
+        // Removing only this scope's identity below would leave those
+        // entries spendable by a later run, so remember exactly which
+        // entries predate the scope and remove every other one.
+        let pending_at_start = PENDING_PLACEHOLDER_OPENS
+            .get()
+            .map_or_else(Vec::new, |registry| {
+                registry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .iter()
+                    .map(pending_placeholder_key)
+                    .collect()
+            });
         Ok(Self {
             identity,
             _root: root,
+            pending_at_start,
         })
     }
 }
@@ -162,15 +202,20 @@ impl Drop for ReplayMaterializationScope {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.identity);
-        // Pending flock entries for this root die with its scope, like
-        // its materialized files, so a later run reusing a descriptor
-        // number and thread-group id cannot spend a stale entry. The
-        // registry itself is declared with the pending-open type below.
+        // Pending flock entries created during this scope die with it,
+        // like its materialized files, so a later run reusing a descriptor
+        // number and thread-group id cannot spend a stale entry. This
+        // includes entries opened under a root a guest `chroot` moved it
+        // to mid-run, which are not keyed by this scope's own identity.
+        // The registry itself is declared with the pending-open type below.
         if let Some(registry) = PENDING_PLACEHOLDER_OPENS.get() {
             registry
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .retain(|pending| pending.root != self.identity);
+                .retain(|pending| {
+                    self.pending_at_start
+                        .contains(&pending_placeholder_key(pending))
+                });
         }
         replay_roots()
             .lock()
@@ -823,6 +868,33 @@ fn pin_pending_open_object(tid: Pid, dirfd: libc::c_int, path: &Path) -> Pending
     }
 }
 
+/// The absolute guest path a recorded relative open named for the
+/// opening thread, right now: the recorded path joined onto the
+/// guest-visible name of its base directory (the thread's cwd for
+/// `AT_FDCWD`, the directory behind `dirfd` otherwise). A pending
+/// entry must remember this form, not the raw `(dirfd, path)` pair:
+/// by the recorded `flock`, the guest may have restored another cwd
+/// (the JVM's secure-open shape does exactly that after its
+/// `openat(AT_FDCWD, "9")` inside the hsperf directory and before
+/// the flock) or closed the dirfd, and re-resolving the raw pair then
+/// names the wrong directory - the dh-gg5uv landing-validation
+/// refusal. Resolving the joined absolute path from the replay
+/// root at materialization names the same object the recorded open
+/// named. `None` when the base directory cannot be named in guest
+/// terms (deleted, or outside the thread's root); the caller keeps
+/// the raw pair then and accepts today's behaviour for that open.
+fn guest_absolute_open_path(tid: Pid, dirfd: libc::c_int, path: &Path) -> Option<PathBuf> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return None;
+    }
+    let base = if dirfd == libc::AT_FDCWD {
+        crate::record_replay_path::process_cwd_path(tid).ok()?
+    } else {
+        crate::record_replay_path::process_directory_fd_path(tid, dirfd).ok()?
+    };
+    Some(base.join(path))
+}
+
 /// Builds the registry entry for one placeholder-answered recorded
 /// open, pinning `(dirfd, path)` as it resolves for the opening thread.
 /// Returns `None` when the opening thread's root or thread group
@@ -836,6 +908,14 @@ fn pending_placeholder_open(
     flags: OFlag,
     mode: Option<reverie::syscalls::Mode>,
 ) -> Option<PendingPlaceholderOpen> {
+    // Remember the recorded open under the absolute guest path it
+    // named for this thread, so a later cwd restore or dirfd close
+    // cannot move its target. The pins are taken against that same
+    // stored form, matching what materialization will resolve.
+    let (dirfd, path) = match guest_absolute_open_path(tid, dirfd, &path) {
+        Some(absolute) => (libc::AT_FDCWD, absolute),
+        None => (dirfd, path),
+    };
     let pins = pin_pending_open_object(tid, dirfd, &path);
     Some(PendingPlaceholderOpen {
         open_id: PENDING_OPEN_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -2469,7 +2549,11 @@ impl Replayer {
         path: &Path,
         flags: OFlag,
     ) -> bool {
-        let pid = guest.pid();
+        // The recorded open's cwd and dirfd live in the calling thread's
+        // state, not its leader's: a JVM service thread enters its perf
+        // directory itself, and resolving through the leader looks in the
+        // leader's (different) cwd and descriptor table.
+        let pid = guest.tid();
         let Ok(root) = crate::record_replay_path::open_process_root(pid) else {
             return false;
         };
@@ -2553,14 +2637,14 @@ impl Replayer {
         path: &Path,
         flags: OFlag,
     ) -> io::Result<bool> {
-        let root = crate::record_replay_path::open_process_root(guest.pid())?;
+        let root = crate::record_replay_path::open_process_root(guest.tid())?;
         let start = if path.is_absolute() {
-            crate::record_replay_path::open_process_root(guest.pid())?
+            crate::record_replay_path::open_process_root(guest.tid())?
         } else if dirfd == libc::AT_FDCWD {
-            crate::record_replay_path::open_process_cwd(guest.pid())?
+            crate::record_replay_path::open_process_cwd(guest.tid())?
         } else {
             let start =
-                match crate::record_replay_path::open_process_directory_fd(guest.pid(), dirfd) {
+                match crate::record_replay_path::open_process_directory_fd(guest.tid(), dirfd) {
                     Ok(start) => start,
                     Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => {
                         tracing::debug!(
@@ -2607,15 +2691,35 @@ impl Replayer {
                     panic!("could not decode successful recorded open: {error}")
                 });
 
+            // Decide materialization against the absolute guest path the
+            // recorded open named for this thread, for the same reason a
+            // pending entry remembers that form: the raw relative pair's
+            // base (this thread's cwd or dirfd) is the right base only at
+            // this moment, and resolving it through any other state -
+            // including the leader's - can name the wrong directory.
+            let (materialization_dirfd, materialization_path) =
+                match guest_absolute_open_path(guest.tid(), dirfd, &path) {
+                    Some(absolute) => (libc::AT_FDCWD, absolute),
+                    None => (dirfd, path.clone()),
+                };
             let materialize = match event.materialize {
                 OpenMaterialization::Directory => self
-                    .materialize_recorded_directory(guest, syscall, dirfd, &path, flags)
+                    .materialize_recorded_directory(
+                        guest,
+                        syscall,
+                        materialization_dirfd,
+                        &materialization_path,
+                        flags,
+                    )
                     .unwrap_or_else(|error| {
                         panic!("failed to materialize recorded open directory: {error}")
                     }),
-                OpenMaterialization::RegularFile => {
-                    self.open_materializes_in_replay_root(guest, dirfd, &path, flags)
-                }
+                OpenMaterialization::RegularFile => self.open_materializes_in_replay_root(
+                    guest,
+                    materialization_dirfd,
+                    &materialization_path,
+                    flags,
+                ),
                 OpenMaterialization::None => false,
             };
             if materialize {
@@ -2625,7 +2729,7 @@ impl Replayer {
                             actual, fd,
                             "replay materialized open returned a different descriptor"
                         );
-                        remember_materialized_file(guest.pid(), actual as libc::c_int);
+                        remember_materialized_file(guest.tid(), actual as libc::c_int);
                         if flags.contains(OFlag::O_TRUNC) {
                             mmap::truncate_shared_backing(guest.tid(), actual as libc::c_int, 0)
                                 .unwrap_or_else(|error| {
@@ -2654,7 +2758,14 @@ impl Replayer {
                     }
                 }
             } else if self
-                .try_materialize_fifo_open(guest, syscall, dirfd, &path, flags, fd)
+                .try_materialize_fifo_open(
+                    guest,
+                    syscall,
+                    materialization_dirfd,
+                    &materialization_path,
+                    flags,
+                    fd,
+                )
                 .await
             {
                 // The recorded open now names the real fifo in this
@@ -2987,7 +3098,7 @@ impl Replayer {
                     remember_pending_placeholder_open(pending);
                 }
             };
-            if self.dirfd_is_confined(guest.pid(), syscall.dirfd()) {
+            if self.dirfd_is_confined(guest.tid(), syscall.dirfd()) {
                 match guest.inject_with_retry(syscall).await {
                     Ok(actual) => {
                         assert_eq!(actual, fd, "replayed openat2 returned a different fd")
@@ -4169,6 +4280,14 @@ impl Replayer {
 mod pending_flock_tests {
     use super::*;
 
+    /// The pending registry is process-wide, so tests that remember or
+    /// spend entries (or drop a materialization scope over them) must not
+    /// run concurrently with each other.
+    fn registry_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn entry(
         fd: libc::c_int,
         open_id: u64,
@@ -4227,6 +4346,7 @@ mod pending_flock_tests {
 
     #[test]
     fn spending_one_alias_retires_the_whole_open_family() {
+        let _registry_guard = registry_test_lock();
         let pid = Pid::from_raw(std::process::id() as i32);
         // One recorded open (open_id line unique to this test in the
         // process-wide registry) under two descriptor aliases.
@@ -4241,7 +4361,82 @@ mod pending_flock_tests {
     }
 
     #[test]
+    fn pending_open_preserves_its_recorded_base_directory() {
+        // The JVM hsperf shape: the recorded open is relative to a
+        // directory descriptor that is closed (or a cwd that is
+        // restored) before the recorded flock. The pending entry must
+        // remember the absolute guest path the open named, not the raw
+        // (dirfd, "9") pair whose meaning dies with that state.
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("perf");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("9"), b"perf").unwrap();
+        let dir_file = File::open(&nested).unwrap();
+        let pid = Pid::from_raw(std::process::id() as i32);
+        let pending = pending_placeholder_open(
+            pid,
+            1_000_004,
+            dir_file.as_raw_fd(),
+            PathBuf::from("9"),
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        assert_eq!(pending.dirfd, libc::AT_FDCWD);
+        assert_eq!(pending.path, nested.join("9"));
+        assert_eq!(
+            pending.parent,
+            Some(identity_for_fd(dir_file.as_raw_fd()).unwrap())
+        );
+        assert_eq!(
+            pending.object,
+            Some(identity_for_fd(File::open(nested.join("9")).unwrap().as_raw_fd()).unwrap())
+        );
+        // The AT_FDCWD form names the same transformation through the
+        // opening thread's cwd at record time.
+        assert_eq!(
+            guest_absolute_open_path(pid, libc::AT_FDCWD, Path::new("9")),
+            crate::record_replay_path::process_cwd_path(pid)
+                .ok()
+                .map(|cwd| cwd.join("9"))
+        );
+    }
+
+    #[test]
+    fn scope_drop_removes_pending_entries_keyed_by_a_later_root() {
+        let _registry_guard = registry_test_lock();
+        // A guest chroot mid-run opens under a different root identity
+        // than the scope was created with; entries remembered under
+        // that later root must still die with the scope.
+        let scope_root = tempfile::tempdir().unwrap();
+        let scope_fd = crate::record_replay_path::open_directory_path(scope_root.path()).unwrap();
+        let scope = ReplayMaterializationScope::new(scope_fd.as_raw_fd()).unwrap();
+        let later_root = tempfile::tempdir().unwrap();
+        let later_fd = crate::record_replay_path::open_directory_path(later_root.path()).unwrap();
+        let mut pending = entry(1_000_005, 0xf10c_0004, None);
+        pending.root = identity_for_fd(later_fd.as_raw_fd()).unwrap();
+        remember_pending_placeholder_open(pending);
+        assert!(
+            pending_placeholder_opens()
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|pending| pending.open_id == 0xf10c_0004)
+        );
+        drop(scope);
+        assert!(
+            !pending_placeholder_opens()
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|pending| pending.open_id == 0xf10c_0004),
+            "pending entry keyed by the post-chroot root survived scope drop"
+        );
+    }
+
+    #[test]
     fn distinct_placeholders_at_one_number_do_not_evict_each_other() {
+        let _registry_guard = registry_test_lock();
         // Two entries for the same thread and descriptor number but
         // different placeholder eventfds (the split-table shape):
         // remembering the second must not destroy the first, and the

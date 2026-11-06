@@ -437,6 +437,49 @@ fn record_replay_flocks_a_guest_created_fifo() {
     );
 }
 
+/// The JVM hsperfdata shape from dh-gg5uv's landing validation: a
+/// non-leader thread changes into a perf directory, creates and closes
+/// its PID-named file by a bare relative path, then reopens that same
+/// bare path read-only and flocks it. Replay must resolve both opens
+/// against the opening thread's base directory, not the leader's state
+/// at the later flock.
+#[test]
+fn record_replay_flocks_thread_reopened_relative_file_after_chdir() {
+    let combined_output = flock_guest_output(
+        concat!(
+            "cat > reopen.py <<'PY'\n",
+            "import fcntl, os, threading\n",
+            "\n",
+            "def worker():\n",
+            "    os.chdir(\"perf\")\n",
+            "    created = os.open(\"9\", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)\n",
+            "    os.close(created)\n",
+            "    fd = os.open(\"9\", os.O_RDONLY | os.O_CLOEXEC)\n",
+            "    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n",
+            "    print(\"locked-thread-reopen-9\", flush=True)\n",
+            "\n",
+            "thread = threading.Thread(target=worker)\n",
+            "thread.start()\n",
+            "thread.join()\n",
+            "PY\n",
+            "mkdir perf && python3 reopen.py"
+        ),
+        "record/replay of thread reopened relative flock after chdir",
+    );
+    assert!(
+        !combined_output.contains("cannot replay flock side effects"),
+        "replay panicked on the recorded flock target:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("locked-thread-reopen-9\n"),
+        "the guest did not take its lock:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+}
+
 /// Runs one record/verify of a shell flock guest and returns its combined
 /// output, for the fifo lock-domain tests below.
 fn flock_guest_output(script: &str, what: &str) -> String {

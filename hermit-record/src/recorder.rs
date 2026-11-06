@@ -848,7 +848,7 @@ impl Recorder {
         let materialize = result
             .ok()
             .and_then(|fd| {
-                std::fs::metadata(format!("/proc/{}/fd/{fd}", guest.pid().as_raw())).ok()
+                std::fs::metadata(format!("/proc/{}/fd/{fd}", guest.tid().as_raw())).ok()
             })
             .map_or(OpenMaterialization::None, |metadata| {
                 if metadata.file_type().is_dir() {
