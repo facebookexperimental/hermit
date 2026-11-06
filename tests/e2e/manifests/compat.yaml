@@ -1728,8 +1728,7 @@ corpus:
     # returns to unselected with that reason. Main never selected this
     # cell: at the flip base it sat in the pre-flip KVM crash-error
     # block (pkg-config, shred, sysctl-random-uuid, top) and in
-    # ci/optional-e2e-cells.txt. The other KVM promotions
-    # (sysctl-random-uuid, top) stay required.
+    # ci/optional-e2e-cells.txt.
     - backend: kvm
       result: crash-error
       evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
@@ -1740,6 +1739,41 @@ corpus:
       rows:
         [
           shred
+        ]
+    # Dropped 2026-11-06 under DROP-7 (coordinator ruling A): compat/
+    # sysctl-random-uuid verify/kvm, promoted by the 2026-11-05 sweep
+    # flip (1258b8ad), is the sole failure at 930ece78 (635/636 passed,
+    # both attempts, crash-error: verify exited with status 125 before
+    # producing a terminal comparison), so it returns to unselected.
+    # Main never selected it: same pre-flip KVM crash-error block and
+    # ci/optional-e2e-cells.txt line as shred above.
+    - backend: kvm
+      result: crash-error
+      evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
+      reason: >-
+        Dropped under DROP-7: measured crash-error under KVM at
+        930ece78, sole failure 635/636 (both attempts): verify exited
+        with status 125 before producing a terminal comparison
+      rows:
+        [
+          sysctl-random-uuid
+        ]
+    # Dropped 2026-11-06 under DROP-7 (coordinator ruling A): compat/top
+    # verify/kvm, the third cell named in the same deleted pre-flip KVM
+    # crash-error block, has no passing run at 930ece78 or later (it was
+    # CANCELLED, not dispatched, after sysctl's fail-fast in the drop-6
+    # targeted run), so it returns to unselected with its block-mates.
+    - backend: kvm
+      result: crash-error
+      evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
+      reason: >-
+        Dropped under DROP-7: no passing run at 930ece78 or later
+        (CANCELLED, not dispatched, after sysctl fail-fast in the
+        drop-6 targeted run); named with shred and sysctl-random-uuid
+        in the pre-flip KVM crash-error block deleted by 1258b8ad
+      rows:
+        [
+          top
         ]
     # Measured red on 2026-10-30 in the pinned hermetic image (full validate
     # validate-museland-9ab8418de603, 7 cells): the same image difference on
