@@ -69,16 +69,25 @@ for entry in "${TARGETS[@]}"; do
     echo "harvest-reverie-buck: no build output for $target" >&2
     exit 2
   fi
-  # Place over the Cargo counterpart when one exists, else buck-harvest/.
+  # Place over the Cargo counterpart when exactly one exists, else
+  # buck-harvest/. Multiple stale counterparts are a refusal: picking the
+  # first glob match could replace a binary prepare does not name.
   dest=""
   placed=false
+  matches=()
   for candidate in target/validate/deps/${name}-*; do
     if [[ -f $candidate && -x $candidate && $candidate != *.d ]]; then
-      dest=$candidate
-      placed=true
-      break
+      matches+=("$candidate")
     fi
   done
+  if [[ ${#matches[@]} -gt 1 ]]; then
+    echo "harvest-reverie-buck: multiple Cargo counterparts for $name: ${matches[*]}" >&2
+    exit 2
+  fi
+  if [[ ${#matches[@]} -eq 1 ]]; then
+    dest=${matches[0]}
+    placed=true
+  fi
   if [[ -z $dest ]]; then
     dest=target/validate/buck-harvest/${name}
   fi

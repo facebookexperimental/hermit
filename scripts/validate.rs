@@ -1329,9 +1329,15 @@ fn ambient_mode_value(
     match raw {
         None => Ok(None),
         Some(value) => value.into_string().map(Some).map_err(|_| {
-            format!(
-                "{name} has a non-UTF-8 value: supported modes are cargo (default) and buck"
-            )
+            if name == RUN_MODE_ENV {
+                format!(
+                    "{name} has a non-UTF-8 value: cargo is the only supported run mode until the deferred RUN switch"
+                )
+            } else {
+                format!(
+                    "{name} has a non-UTF-8 value: supported modes are cargo (default) and buck"
+                )
+            }
         }),
     }
 }
@@ -1394,10 +1400,15 @@ mod build_mode_environment_tests {
         establish_build_mode_environment(Some(BUILD_MODE_BUCK.into()), None).unwrap();
         assert_eq!(std::env::var(BUILD_MODE_ENV).unwrap(), BUILD_MODE_BUCK);
         assert_eq!(std::env::var(RUN_MODE_ENV).unwrap(), RUN_MODE_CARGO);
-        // An unknown build mode is refused by name.
+        // An unknown build mode is refused by name, with the supported
+        // modes pinned in the message.
         let error =
             establish_build_mode_environment(Some("banana".into()), None).unwrap_err();
         assert!(error.contains(BUILD_MODE_ENV), "{error}");
+        assert!(
+            error.contains("supported modes are cargo (default) and buck"),
+            "{error}"
+        );
         // An unsupported run mode is refused too.
         let error =
             establish_build_mode_environment(None, Some(BUILD_MODE_BUCK.into())).unwrap_err();
@@ -1417,7 +1428,17 @@ mod build_mode_environment_tests {
                 )
                 .unwrap_err();
                 assert!(error.contains(name), "{error}");
-                assert!(error.contains("supported modes are cargo"), "{error}");
+                if name == RUN_MODE_ENV {
+                    assert!(
+                        error.contains("cargo is the only supported run mode"),
+                        "{error}"
+                    );
+                } else {
+                    assert!(
+                        error.contains("supported modes are cargo (default) and buck"),
+                        "{error}"
+                    );
+                }
             }
         }
     }
