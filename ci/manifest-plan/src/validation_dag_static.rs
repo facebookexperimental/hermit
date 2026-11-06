@@ -3351,7 +3351,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // untrapped_passthrough_syscalls_are_plain_passthroughs: 3653 + 2 = 3655, listed.
     // And facility_admission_refuses_untrapping_without_its_prerequisites
     // (the same pull request's post-facto review): 3655 + 1 = 3656.
-    ("test.detcore_unit", 3656),
+    ("test.detcore_unit", 3659),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -6056,7 +6056,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same sixteen --chaos-instruction-offset units:
     // 3573 + 16 = 3589.
     // PR #4764: the same three detcore untrap units: 3653 + 3 = 3656.
-    ("test.detcore_unit_on_host", 3656),
+    ("test.detcore_unit_on_host", 3659),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
