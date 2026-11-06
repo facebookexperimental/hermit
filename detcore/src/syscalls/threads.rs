@@ -1348,6 +1348,32 @@ pub(crate) fn host_signal_state_reads_refused() -> bool {
     }
 }
 
+/// Whether a host signal syscall that `site` would make to guest thread
+/// `tid` of process `pid` (or to the process, where `tid` is its leader) is
+/// refused: exactly where host signal state reads are
+/// ([`host_signal_state_reads_refused`]), because the backend's guest thread
+/// IDs do not name host tasks (KVM). There the number names an unrelated host
+/// task, if any, chosen by host thread-ID allocation, or one of Hermit's own
+/// (https://github.com/rrnewton/hermit/issues/4950), so the send must not
+/// happen. A refusal is logged by name (`host-signal-send`) and the caller
+/// skips the send, as a refused `/proc` read is skipped
+/// ([`read_kernel_signal_state`]). This is the send latch of SIGSHARE's
+/// design (section 7.3): every scheduler send on such a backend goes through
+/// the backend's publication instead, and this backstop catches a path that
+/// misses its gate.
+pub(crate) fn host_signal_send_refused(site: &str, pid: i32, tid: i32, signal: i32) -> bool {
+    if !host_signal_state_reads_refused() {
+        return false;
+    }
+    error!(
+        "HERMIT_REFUSAL host-signal-send: {} would send host signal {} to guest thread {} \
+         (process {}): this backend's guest thread IDs do not name host tasks, so nothing \
+         was sent",
+        site, signal, tid, pid
+    );
+    true
+}
+
 /// Read `tid`'s signal state from the kernel.
 ///
 /// On a backend whose guest thread IDs do not name host tasks
@@ -8033,6 +8059,22 @@ mod tests {
         assert!(host_signal_state_reads_refused());
         assert_eq!(read_kernel_signal_state(pid, tid), Err(Errno::ENOSYS));
         assert_eq!(read_thread_signal_state(pid, tid), Err(Errno::ENOSYS));
+    }
+
+    /// SIGSHARE S3a-2's send latch: a host signal send to a guest thread ID
+    /// is allowed where guest thread IDs name host tasks, and refused, by
+    /// name, once the refusal is latched for a backend whose do not (KVM,
+    /// https://github.com/rrnewton/hermit/issues/4950). Every guarded send
+    /// (the unignore re-queue, the host-timed parent-death kill,
+    /// `--stacktrace-signal` and the two fault hooks) asks this before it
+    /// sends.
+    #[test]
+    fn a_latched_refusal_refuses_every_host_signal_send() {
+        refuse_host_signal_state_reads(&BackendCapabilities::PTRACE);
+        assert!(!host_signal_send_refused("a test", 1, 1, libc::SIGUSR1));
+        refuse_host_signal_state_reads(&BackendCapabilities::KVM);
+        assert!(host_signal_send_refused("a test", 1, 1, libc::SIGUSR1));
+        assert!(host_signal_send_refused("a test", 1, 2, libc::SIGKILL));
     }
 
     /// A kept status file is read afresh each time: a signal blocked after

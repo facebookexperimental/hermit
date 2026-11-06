@@ -482,7 +482,14 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if take_claim_fault(fault) {
+    if take_claim_fault(fault)
+        && !crate::syscalls::host_signal_send_refused(
+            "the claim fault hook",
+            guest.pid().as_raw(),
+            guest.tid().as_raw(),
+            libc::SIGUSR1,
+        )
+    {
         // SAFETY: tgkill only sends a signal.
         let sent = unsafe {
             libc::syscall(

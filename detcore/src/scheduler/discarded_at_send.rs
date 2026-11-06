@@ -1615,6 +1615,18 @@ impl Scheduler {
         let Some(target) = target else {
             return;
         };
+        let addressee = match queue {
+            QueueId::Thread(thread) => thread,
+            QueueId::Process(_) => target,
+        };
+        if crate::syscalls::host_signal_send_refused(
+            "the re-queue of a timer expiry at unignore",
+            process.as_raw(),
+            addressee.as_raw(),
+            signal,
+        ) {
+            return;
+        }
         let token = self.discard_kept_token(queue, signal);
         // Decided before the send, as `fire_alarm_with` decides it.
         let every_thread_blocks = matches!(queue, QueueId::Process(_))

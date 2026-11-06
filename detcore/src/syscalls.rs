@@ -90,6 +90,7 @@ pub(crate) use threads::default_action_ends_process;
 pub(crate) use threads::fatal_default_delivery;
 pub(crate) use threads::fatal_delivery_observation;
 pub(crate) use threads::forget_thread_status;
+pub(crate) use threads::host_signal_send_refused;
 pub(crate) use threads::host_signal_state_reads_refused;
 pub(crate) use threads::ignored_at_generation;
 pub(crate) use threads::keep_status_files_open;

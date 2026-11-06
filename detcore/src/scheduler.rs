@@ -8017,7 +8017,14 @@ impl Scheduler {
                         HostTimedSignalScope::Caller,
                         kernel_signal_bit(signal as libc::c_int),
                     );
-                    let _ = signal::kill(Pid::from_raw(child.as_raw()), signal);
+                    if !crate::syscalls::host_signal_send_refused(
+                        "a host-timed parent-death signal",
+                        child.as_raw(),
+                        child.as_raw(),
+                        signal as libc::c_int,
+                    ) {
+                        let _ = signal::kill(Pid::from_raw(child.as_raw()), signal);
+                    }
                 }
             }
             match heir {

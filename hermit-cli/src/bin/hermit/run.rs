@@ -7800,6 +7800,41 @@ fn a_work_span_report_path_with_a_parent_component_is_refused() {
     plain.validate_work_span_report_visibility().unwrap();
 }
 
+/// `--stacktrace-signal` is refused before launch on a backend whose guest
+/// threads are not host tasks (KVM), where the host signal would reach
+/// another host task (https://github.com/rrnewton/hermit/issues/4950), and
+/// accepted on ptrace, where the guest thread is the host task it names.
+#[test]
+fn stacktrace_signal_is_refused_where_guest_threads_are_not_host_tasks() {
+    let argv = |backend: &str| {
+        [
+            "hermit".to_owned(),
+            format!("--backend={backend}"),
+            "run".to_owned(),
+            "--stacktrace-signal=SIGINT".to_owned(),
+            "fakeprog".to_owned(),
+        ]
+    };
+    let ptrace = argv("ptrace");
+    let ptrace: Vec<&str> = ptrace.iter().map(String::as_str).collect();
+    if let Err(error) = run_opts_for(&ptrace).validate_args_with_perf_support(true) {
+        assert!(
+            !error.to_string().contains("stacktrace-signal"),
+            "{ptrace:?}: {error}"
+        );
+    }
+    let kvm = argv("kvm");
+    let kvm: Vec<&str> = kvm.iter().map(String::as_str).collect();
+    let error = run_opts_for(&kvm)
+        .validate_args_with_perf_support(true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("--stacktrace-signal") && error.contains("backend `kvm`"),
+        "{kvm:?}: {error}"
+    );
+}
+
 /// `--signal-at` is accepted on the ptrace backend, and refused before launch
 /// wherever it would not reach the guest: every other backend (on KVM a host
 /// kill reaches the sandbox monitor), `--namespace-only` and `--lite`,
@@ -13159,6 +13194,24 @@ impl RunOpts {
                 self.application_backend.unwrap_or(backend.as_str()),
                 cfg!(target_arch = "aarch64"),
             )?;
+        }
+        // `--stacktrace-signal` sends a host signal to the guest thread's ID
+        // at each `--stacktrace-event`. On a backend that owns signal
+        // delivery because its guest threads are not host tasks
+        // (`provides_process_signal_control`, KVM) that ID names an unrelated
+        // host task, if any, or one of Hermit's own, and the signal killed
+        // Hermit's container (https://github.com/rrnewton/hermit/issues/4950),
+        // so it is refused before launch, keyed on the capability. Detcore's
+        // send latch refuses the send itself too (`host_signal_send_refused`).
+        if config.stacktrace_signal.is_some()
+            && hermit::backend_capabilities(backend).provides_process_signal_control
+        {
+            anyhow::bail!(
+                "--stacktrace-signal sends a host signal to the guest thread's ID; backend `{}` \
+                 runs guest threads that are not host tasks, so the signal would reach another \
+                 host task (https://github.com/rrnewton/hermit/issues/4950)",
+                backend.as_str()
+            );
         }
         // `--signal-at` is sent by Detcore's scheduler, through the signal
         // path of the ptrace backend (with or without e9patch preprocessing).

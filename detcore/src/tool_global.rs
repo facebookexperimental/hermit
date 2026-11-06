@@ -7864,6 +7864,14 @@ impl GlobalState {
                 dettid, sig.0
             );
             let tid = Pid::from_raw(dettid.as_raw());
+            if crate::syscalls::host_signal_send_refused(
+                "--stacktrace-signal",
+                dettid.as_raw(),
+                dettid.as_raw(),
+                sig.raw(),
+            ) {
+                return;
+            }
             // TODO(T78538674): virtualize pid/tid:
             // We send a raw signal here and let the guest pick it up WHENEVER it resumes.
             // We don't use the "signal_guest" method because we don't necessarily respect that
