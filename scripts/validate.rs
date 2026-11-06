@@ -20586,7 +20586,9 @@ mod nextest_timeout_tests {
                 // 2993 after pkg-config's three cells (verify ptrace, replay
                 // ptrace, verify KVM) left under dh-jn0hh part 2 (pkg-config
                 // 0.29.2 in the pinned root emits -D before -I).
-                assert_eq!(all.len(), 2993, "the original all-owner population is retained");
+                // 2992 after compat/shred verify/KVM left under DROP-6
+                // (unsupported KVM zero-count read on guest fd 3).
+                assert_eq!(all.len(), 2992, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");

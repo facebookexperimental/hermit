@@ -1722,6 +1722,25 @@ corpus:
         [
           pkg-config
         ]
+    # Dropped 2026-11-06 under DROP-6 (coordinator ruling): compat/shred
+    # verify/kvm, promoted by the 2026-11-05 sweep flip (1258b8ad), fails
+    # locally 6/6 with the KVM zero-count-read refusal below, so it
+    # returns to unselected with that reason. Main never selected this
+    # cell: at the flip base it sat in the pre-flip KVM crash-error
+    # block (pkg-config, shred, sysctl-random-uuid, top) and in
+    # ci/optional-e2e-cells.txt. The other KVM promotions
+    # (sysctl-random-uuid, top) stay required.
+    - backend: kvm
+      result: crash-error
+      evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
+      reason: >-
+        Dropped under DROP-6: measured crash-error under KVM locally
+        6/6: unsupported KVM zero-count read on guest fd 3: the endpoint
+        may wait in the host
+      rows:
+        [
+          shred
+        ]
     # Measured red on 2026-10-30 in the pinned hermetic image (full validate
     # validate-museland-9ab8418de603, 7 cells): the same image difference on
     # the remaining backends, plus gcov's DBT determinism failure.
