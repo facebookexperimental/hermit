@@ -45889,60 +45889,6 @@
       "timeout_seconds": 60
     },
     {
-      "backend": "ptrace",
-      "category": "compat",
-      "classification": "required",
-      "cpu_timeout_seconds": 59,
-      "lane": "portable",
-      "mode": "replay",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "compat/pkg-config",
-      "timeout_seconds": 60
-    },
-    {
-      "backend": "kvm",
-      "category": "compat",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace"
-      ],
-      "requires_host_capabilities": [
-        "kvm"
-      ],
-      "test": "compat/pkg-config",
-      "timeout_seconds": 180
-    },
-    {
-      "backend": "ptrace",
-      "category": "compat",
-      "classification": "required",
-      "cpu_timeout_seconds": 59,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace"
-      ],
-      "test": "compat/pkg-config",
-      "timeout_seconds": 60
-    },
-    {
       "backend": "kvm",
       "category": "compat",
       "classification": "required",

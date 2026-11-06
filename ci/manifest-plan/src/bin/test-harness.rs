@@ -8897,7 +8897,11 @@ sys.exit(1 if failed else 0)
         // socket; the sweep CLEAN was host-contaminated), so logger@dbt
         // and logger@sabre are unreported again. pkg-config stays
         // promoted and reported.
-        assert_eq!(unreported.len(), 9, "{unreported:?}");
+        // 9 + 3 the same day: pkg-config's ptrace and KVM verify cells
+        // left full under dh-jn0hh part 2 (pkg-config 0.29.2 in the
+        // pinned root emits -D before -I), so pkg-config@dbt,
+        // pkg-config@kvm and pkg-config@sabre are unreported again.
+        assert_eq!(unreported.len(), 12, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
@@ -8907,8 +8911,10 @@ sys.exit(1 if failed else 0)
         // plus logger@sabre again when logger's ptrace verify cell left
         // full on 2026-11-06 (7 - 2 + 1 = 6 on the flip's own terms;
         // enumerated here as 8: the seven SaBRe-run-type-only rows'
-        // sabre cells plus logger@sabre).
-        assert_eq!(sabre_only, 8, "{unreported:?}");
+        // sabre cells plus logger@sabre), plus pkg-config@sabre again
+        // when its verify cells left full under dh-jn0hh part 2 the same
+        // day (enumerated here as 9).
+        assert_eq!(sabre_only, 9, "{unreported:?}");
     }
 
     #[test]

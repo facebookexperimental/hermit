@@ -16244,11 +16244,14 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     // the 2026-11-05 sweep flip, so it no longer subtracts; logger was
     // promoted by the same flip but re-measured red in the pinned root
     // on 2026-11-06 (no /dev/log socket; sweep CLEAN was host-contaminated),
-    // so it subtracts again (214 - 1 = 213).
+    // so it subtracts again (214 - 1 = 213). Pkg-config left again the
+    // same day under dh-jn0hh part 2 (pkg-config 0.29.2 in the pinned
+    // root emits -D before -I), so it subtracts again too
+    // (213 - 1 = 212).
     // The cargo and gcov rows deselected 2026-10-31 under issue 4997
     // came back the same day once the fixture race was fixed
     // (271ec81bd4).
-    let expected = 213;
+    let expected = 212;
     if rows.len() != expected {
         return Err(format!(
             "strict-compat bucket: compat.yaml has {} CI rows; the full run has {expected}",
@@ -20580,7 +20583,10 @@ mod nextest_timeout_tests {
                 // logger's two ptrace cells (verify, replay) left again on
                 // 2026-11-06, re-measured red in the merge-queue pinned root
                 // (no /dev/log socket; sweep CLEAN was host-contaminated).
-                assert_eq!(all.len(), 2996, "the original all-owner population is retained");
+                // 2993 after pkg-config's three cells (verify ptrace, replay
+                // ptrace, verify KVM) left under dh-jn0hh part 2 (pkg-config
+                // 0.29.2 in the pinned root emits -D before -I).
+                assert_eq!(all.len(), 2993, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
