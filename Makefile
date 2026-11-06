@@ -240,6 +240,7 @@ LINT_CHECK_TARGETS := \
     lint-check-record-version-floor \
     lint-check-known-gap-ledgers \
     lint-check-buck-reindeer-features \
+    lint-check-buck-graph-drift \
     lint-check-core-review-protocol \
     lint-check-audit-test-binary-registration-test \
     lint-check-buck-e2e-ingest \
@@ -393,6 +394,9 @@ lint-check-known-gap-ledgers:
 
 lint-check-buck-reindeer-features:
 	./scripts/check-buck-reindeer-features.rs
+
+lint-check-buck-graph-drift:
+	./scripts/check-buck-graph-drift.rs
 
 lint-check-core-review-protocol:
 	./scripts/core-review-protocol-lint-test.sh
