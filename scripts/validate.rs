@@ -408,7 +408,6 @@ fn privileged_artifact_barriers(build: &Step) -> Result<(), String> {
 /// node's final gate compares against (for its early publisher) or the
 /// runtime file the node's preparation record hashed (hosted), then drop a
 /// Buck runtime closure and take that validate-profile binary.
-const CARGO_PAYLOAD_BRANCH: &str = "cargo) ./ci/nextest-binaries.rs assert full && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;;";
 const EARLY_CARGO_PAYLOAD_BRANCH: &str = "cargo) target/validate/stage-detcore-liteinst --git target && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;;";
 const HOSTED_CARGO_PAYLOAD_BRANCH: &str = "cargo) ./ci/nextest-binaries.rs assert hosted-portable && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;;";
 const BUCK_PAYLOAD_BRANCH: &str = "buck) ./scripts/build-buck-release.rs --validate-dag-install && hermit_payload=target/ci/hermit-strict ;;";
