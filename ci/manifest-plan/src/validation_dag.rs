@@ -86,6 +86,10 @@ const PINNED_ROOT_TWIN_SUFFIX: &str = "_in_pinned_root";
 /// finalizer. The preparation needs the prebuilt rust-script tools.
 pub const PINNED_WORKSPACE_COMPILE_TAG: &str = "build.workspace_compile_in_pinned_root";
 pub const PINNED_WORKSPACE_PREPARE_TAG: &str = "build.workspace_in_pinned_root";
+pub const PINNED_E2E_ARTIFACT_TAG: &str = "build.e2e_artifact_in_pinned_root";
+pub const HERMIT_BIN_ARTIFACT: &str = "hermit-bin";
+const HERMIT_BIN_SIGNAL_SUFFIX: &str = " --message-format json-render-diagnostics > >(python3 ./ci/cargo-artifact-ready.py hermit-bin)";
+pub const EARLY_ARTIFACT_GATE_SUFFIX: &str = " && ./ci/verify-early-hermit-e2e-artifact.sh";
 const PINNED_WORKSPACE_COMPILE_JOB: &str = "workspace_compile_in_pinned_root";
 const PINNED_RUST_SCRIPTS_TAG: &str = "build.rust_scripts_in_pinned_root";
 /// The ordinary in-guest Detcore runtime's prebuild: the packaged-LiteInst
@@ -96,9 +100,9 @@ const LITEINST_RUNTIME_TAG: &str = "build.liteinst_runtime";
 /// is Cargo, everything after the ` && ` is preparation.
 const WORKSPACE_PREPARATION_BOUNDARY: &str = " && ./ci/nextest-binaries.rs prepare ";
 const PINNED_WORKSPACE_COMPILE_DESC: &str = "Build every workspace target, the backend plugins and the one Hermit binary in the validate profile, beside the rust-script build";
-const PINNED_WORKSPACE_COMPILE_DESCRIPTION: &str = "The Cargo half of the pinned-root workspace build and the one Cargo compilation of Hermit in the full and portable validations, in the [profile.validate] profile: release optimisation with debug assertions and overflow checks on, so cells run an optimised Hermit with detcore's debug_assert invariants and the determinism-log hash lines --verify compares. It first builds exactly the nextest preparation's guest build, `-p hermetic_infra_hermit_tests --bins`, in the same profile, so that build finds every unit it links already fresh. The workspace build cannot serve it: it resolves 14 shared dependencies with wider features (parking_lot gains send_guard, bytes serde, syn fold), which gives every reverie and hermit-detcore unit a new hash, and building hermit-install alone instead (def08d743) made the guest build compile them inside build.workspace_in_pinned_root, 46 s, so it was reverted. Until 2026-10-18 this first build was `-p detcore-dbt`, a superset of the guest build's units plus reverie-dbt's DynamoRIO build script (25.8 s) and detcore-dbt itself (24.4 s), both rebuilt by the workspace build anyway, which also builds reverie-dbt before hermit-install's build script reads its DynamoRIO cache (the cache publishes by atomic rename, so concurrent builders are safe). In the 32-job timings of 601df499 the first build took 55.9 s and the guest build's own units end at about 47 s; the workspace build's critical chain (163.4 s replayed) does not move when the DynamoRIO build script joins it, since it finishes before detcore-dbt can start, then builds the whole workspace, all targets, with the union of the features every prepared Nextest selection names. Nothing in it runs a rust-script (run-with-reverie-dbt-budget.sh compiles its pin checks with rustc, and no build script calls one), so it does not wait for build.rust_scripts_in_pinned_root and the two compile side by side in the same pinned root, writing different target directories; it keeps the rust-script environment, with HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1, so a rust-script added here later fails at once instead of compiling or running unprepared. Its only consumer is build.workspace_in_pinned_root, which lists the executables this build produced. Until 2026-10-06 the two halves were one node that waited for the rust-script tools, about 183 seconds, before this 175-to-182-second Cargo phase began. preferred_inner_jobs=32 is kept from the cold measurement at hermit@846baeca. CPU RE-DERIVATION 2026-11-01: across 265 retained full-run step profiles (ci-hub history node-cpu-budgets, kill samples excluded) this node's worst valid CPU was 7336.6 seconds (p99 7316.1), and a composite rerun was killed at the former 7200-second cap at about 7330 CPU-seconds while the same node at the same commit passed at about 6090; the shared workspace CPU budget is now 11100, the next 300-second bucket above 1.5 times that worst (11004.8).";
+const PINNED_WORKSPACE_COMPILE_DESCRIPTION: &str = "The Cargo half of the pinned-root workspace build and the one Cargo compilation of Hermit in the full and portable validations, in the [profile.validate] profile: release optimisation with debug assertions and overflow checks on, so cells run an optimised Hermit with detcore's debug_assert invariants and the determinism-log hash lines --verify compares. It first builds exactly the nextest preparation's guest build, `-p hermetic_infra_hermit_tests --bins`, in the same profile, so that build finds every unit it links already fresh. The workspace build cannot serve it: it resolves 14 shared dependencies with wider features (parking_lot gains send_guard, bytes serde, syn fold), which gives every reverie and hermit-detcore unit a new hash, and building hermit-install alone instead (def08d743) made the guest build compile them inside build.workspace_in_pinned_root, 46 s, so it was reverted. Until 2026-10-18 this first build was `-p detcore-dbt`, a superset of the guest build's units plus reverie-dbt's DynamoRIO build script (25.8 s) and detcore-dbt itself (24.4 s), both rebuilt by the workspace build anyway, which also builds reverie-dbt before hermit-install's build script reads its DynamoRIO cache (the cache publishes by atomic rename, so concurrent builders are safe). In the 32-job timings of 601df499 the first build took 55.9 s and the guest build's own units end at about 47 s; the workspace build's critical chain (163.4 s replayed) does not move when the DynamoRIO build script joins it, since it finishes before detcore-dbt can start, then builds the whole workspace, all targets, with the union of the features every prepared Nextest selection names. Nothing in it runs a rust-script (run-with-reverie-dbt-budget.sh compiles its pin checks with rustc, and no build script calls one), so it does not wait for build.rust_scripts_in_pinned_root and the two compile side by side in the same pinned root, writing different target directories; it keeps the rust-script environment, with HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1, so a rust-script added here later fails at once instead of compiling or running unprepared. Its completion consumer is build.workspace_in_pinned_root, which lists the executables this build produced; it also publishes the hermit-bin artifact signal for the early E2E publisher once Cargo links that binary and its staged LiteInst inputs. Until 2026-10-06 the two halves were one node that waited for the rust-script tools, about 183 seconds, before this 175-to-182-second Cargo phase began. preferred_inner_jobs=32 is kept from the cold measurement at hermit@846baeca. CPU RE-DERIVATION 2026-11-01: across 265 retained full-run step profiles (ci-hub history node-cpu-budgets, kill samples excluded) this node's worst valid CPU was 7336.6 seconds (p99 7316.1), and a composite rerun was killed at the former 7200-second cap at about 7330 CPU-seconds while the same node at the same commit passed at about 6090; the shared workspace CPU budget is now 11100, the next 300-second bucket above 1.5 times that worst (11004.8).";
 const PINNED_WORKSPACE_PREPARE_DESC: &str = "List every prepared Nextest executable from the one validate-profile build and record each selection's subset";
-const PINNED_WORKSPACE_PREPARE_DESCRIPTION: &str = "The preparation half of the pinned-root workspace build. Once build.workspace_compile_in_pinned_root has built every workspace target and build.rust_scripts_in_pinned_root has published the prebuilt rust-script tools, `nextest-binaries.rs prepare full` runs in the same pinned root, target directory and Cargo home: one `cargo nextest list` over the unified validate-profile build, the hermit_modes guests and record workloads from that build, and a dev-profile build of the nextest-cpu-wrapper. It hashes every listed executable and publishes all selections in one record, so no selection recompiles anything or relinks target/validate/hermit. After the final preparation Cargo invocation, `target/validate/stage-detcore-liteinst --git target` builds the ordinary preload in the existing liteinst-runtime profile, applies the unchanged source/constructor proof and atomically stages its receipt and bytes. Every consumer of the workspace build names this node, so none starts before both preparation and finalization complete. COLD ORDINARY FINALIZATION 2026-10-17: at Hermit 9b0e652d, eight admitted CPUs, with only target/liteinst-runtime removed before the run, the complete preparation plus ordinary finalizer took 294.965 wall seconds and 1383.852 CPU-seconds (1327.116 user, 56.736 system), with a 4.9-GiB peak and no OOM. This includes preparation rebuilding the stamped CLI and install staging; it is not just a warm artifact check. The former 1200-CPU-second cap interrupted the added dedicated-profile build. 2100 CPU-seconds is the next 300-second bucket above 1.5 times the complete measured cost (2075.778); the 600-second wall and 8-GiB memory bounds remain. CPU RE-DERIVATION 2026-11-01: across 274 retained full-run step profiles (ci-hub history node-cpu-budgets, kill samples excluded) the preparation's worst valid CPU was 3618.0 seconds (p99 3562.4), so the cap is now 5700, the next 300-second bucket above 1.5 times that worst (5427.0). The constructor/source proof and every prepared selection are unchanged. The budget is measured: in eight full validations on 2026-10-06 the unsplit node took 235 to 241 seconds, of which Cargo reported 45 to 46 for detcore-dbt and 130 to 136 for the workspace, leaving 58 to 60 seconds for container start and preparation. The CPU-wrapper build is the largest part, 27 to 28 seconds at 32 workers in those runs; a cold 16-worker build of it outside the root took 28 seconds, 135 CPU-seconds and a 2.4 GB memory peak. The 32-worker preference is the width preparation ran at inside the unsplit node.";
+const PINNED_WORKSPACE_PREPARE_DESCRIPTION: &str = "The preparation half of the pinned-root workspace build. Once build.workspace_compile_in_pinned_root has built every workspace target and build.rust_scripts_in_pinned_root has published the prebuilt rust-script tools, `nextest-binaries.rs prepare full` runs in the same pinned root, target directory and Cargo home: one `cargo nextest list` over the unified validate-profile build, the hermit_modes guests and record workloads from that build, and a dev-profile build of the nextest-cpu-wrapper. It hashes every listed executable and publishes all selections in one record, so no selection recompiles anything or relinks target/validate/hermit. After the final preparation Cargo invocation, `target/validate/stage-detcore-liteinst --git target` builds the ordinary preload in the existing liteinst-runtime profile, applies the unchanged source/constructor proof and atomically stages its receipt and bytes. Every completion consumer of the workspace build names this node, so none starts before both preparation and finalization complete; it finally verifies the early-published E2E artifact still matches this node's final binary and staged resources. COLD ORDINARY FINALIZATION 2026-10-17: at Hermit 9b0e652d, eight admitted CPUs, with only target/liteinst-runtime removed before the run, the complete preparation plus ordinary finalizer took 294.965 wall seconds and 1383.852 CPU-seconds (1327.116 user, 56.736 system), with a 4.9-GiB peak and no OOM. This includes preparation rebuilding the stamped CLI and install staging; it is not just a warm artifact check. The former 1200-CPU-second cap interrupted the added dedicated-profile build. 2100 CPU-seconds is the next 300-second bucket above 1.5 times the complete measured cost (2075.778); the 600-second wall and 8-GiB memory bounds remain. CPU RE-DERIVATION 2026-11-01: across 274 retained full-run step profiles (ci-hub history node-cpu-budgets, kill samples excluded) the preparation's worst valid CPU was 3618.0 seconds (p99 3562.4), so the cap is now 5700, the next 300-second bucket above 1.5 times that worst (5427.0). The constructor/source proof and every prepared selection are unchanged. The budget is measured: in eight full validations on 2026-10-06 the unsplit node took 235 to 241 seconds, of which Cargo reported 45 to 46 for detcore-dbt and 130 to 136 for the workspace, leaving 58 to 60 seconds for container start and preparation. The CPU-wrapper build is the largest part, 27 to 28 seconds at 32 workers in those runs; a cold 16-worker build of it outside the root took 28 seconds, 135 CPU-seconds and a 2.4 GB memory peak. The 32-worker preference is the width preparation ran at inside the unsplit node.";
 /// Measured preparation budget; see PINNED_WORKSPACE_PREPARE_DESCRIPTION.
 const PINNED_WORKSPACE_PREPARE_EST_SECONDS: f64 = 60.0;
 const PINNED_WORKSPACE_PREPARE_WALL_SECONDS: i64 = 600;
@@ -1392,6 +1396,10 @@ fn pinned_root_command(step: &Step) -> String {
     {
         env_names.insert("DAGRUN_TEST_COUNTS_PATH");
     }
+    if !step.publishes.is_empty() {
+        env_names.insert("DAGRUN_ARTIFACT_READY_DIR");
+        env_names.insert("DAGRUN_OUTER_RUN");
+    }
     env_names.extend(step.env.keys().map(String::as_str));
     // A width channel that the root does not forward leaves the command at its
     // own default however wide the step was admitted.
@@ -2427,9 +2435,23 @@ pub(crate) fn split_workspace_payload(payload: &str) -> Result<(String, String),
     Ok((compile.to_string(), prepare))
 }
 
+fn workspace_compile_payload_with_signal(payload: &str) -> String {
+    format!("{payload}{HERMIT_BIN_SIGNAL_SUFFIX}")
+}
+
+fn workspace_prepare_payload_with_gate(payload: &str) -> String {
+    format!("{payload}{EARLY_ARTIFACT_GATE_SUFFIX}")
+}
+
 /// Rejoin the two halves into the payload the unsplit producer ran: the Cargo
 /// half, ` && `, then the preparation half without its repeated environment.
 pub fn join_workspace_payloads(compile: &str, prepare: &str) -> Result<String, String> {
+    let compile = compile
+        .strip_suffix(HERMIT_BIN_SIGNAL_SUFFIX)
+        .unwrap_or(compile);
+    let prepare = prepare
+        .strip_suffix(EARLY_ARTIFACT_GATE_SUFFIX)
+        .unwrap_or(prepare);
     let environment = crate::validation_dag_static::RUST_SCRIPT_ENVIRONMENT;
     let preparation = &WORKSPACE_PREPARATION_BOUNDARY[" && ".len()..];
     let Some(prepare_tail) = prepare.strip_prefix(environment) else {
@@ -2457,7 +2479,8 @@ pub fn join_workspace_payloads(compile: &str, prepare: &str) -> Result<String, S
 
 /// The complete payload of the pinned-root workspace producer, rejoined from
 /// its two nodes. Refuses unless both nodes exist, run under byte-identical
-/// pinned-root wrappers (the same --src, --out, --cargo-home, forwarded
+/// pinned-root wrappers apart from the compile node's artifact-signal
+/// environment (the same --src, --out, --cargo-home, other forwarded
 /// environment and guard), and the prepare node depends directly on the
 /// compile node. Checks written for the unsplit producer apply unchanged to
 /// the returned bytes.
@@ -2486,7 +2509,24 @@ pub fn pinned_workspace_producer_payload(cfg: &DagConfig) -> Result<String, Stri
         let mut argv =
             shell_words::split(&step.cmd).map_err(|error| format!("{}: {error}", step.tag()))?;
         argv.pop();
-        Ok(argv)
+        // Only the publishing compile node forwards the scheduler-owned
+        // artifact-ready channel. Every other wrapper argument must match.
+        let mut normalized = Vec::with_capacity(argv.len());
+        let mut index = 0;
+        while index < argv.len() {
+            if argv[index] == "--env"
+                && matches!(
+                    argv.get(index + 1).map(String::as_str),
+                    Some("DAGRUN_ARTIFACT_READY_DIR" | "DAGRUN_OUTER_RUN")
+                )
+            {
+                index += 2;
+            } else {
+                normalized.push(std::mem::take(&mut argv[index]));
+                index += 1;
+            }
+        }
+        Ok(normalized)
     };
     if wrapper(compile)? != wrapper(prepare)? {
         return Err(format!(
@@ -2508,7 +2548,11 @@ fn split_pinned_workspace_twin(twin: Step) -> Result<[Step; 2], String> {
     compile.job = PINNED_WORKSPACE_COMPILE_JOB.into();
     compile.desc = PINNED_WORKSPACE_COMPILE_DESC.into();
     compile.description = PINNED_WORKSPACE_COMPILE_DESCRIPTION.into();
-    compile.cmd = compile_payload;
+    compile.cmd = workspace_compile_payload_with_signal(&compile_payload);
+    compile.publishes = vec![dagrun::model::PublishedArtifact {
+        name: HERMIT_BIN_ARTIFACT.into(),
+        path: Some("target/validate/hermit".into()),
+    }];
     compile
         .deps
         .retain(|dependency| dependency != PINNED_RUST_SCRIPTS_TAG);
@@ -2518,7 +2562,7 @@ fn split_pinned_workspace_twin(twin: Step) -> Result<[Step; 2], String> {
     let mut prepare = twin;
     prepare.desc = PINNED_WORKSPACE_PREPARE_DESC.into();
     prepare.description = PINNED_WORKSPACE_PREPARE_DESCRIPTION.into();
-    prepare.cmd = prepare_payload;
+    prepare.cmd = workspace_prepare_payload_with_gate(&prepare_payload);
     // The twin's own dependencies, build.rust_scripts_in_pinned_root among
     // them, stay on the prepare node.
     prepare.deps.push(PINNED_WORKSPACE_COMPILE_TAG.into());
@@ -2709,6 +2753,35 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
         if producer.tag() == "compatprep.hermit_release" {
             twin.deps.push("gate.manifest".into());
         }
+        if producer.tag() == "build.e2e_artifact" {
+            // The pinned publisher is the one early consumer of the compile
+            // node's hermit-bin signal. It stages the LiteInst runtime itself
+            // and publishes while that compile finishes; the prepare node
+            // later gates the snapshot against the final staged tree. The
+            // hosted publisher keeps its prepared-record assertion.
+            let local_assert = "./ci/nextest-binaries.rs assert full && ";
+            if twin.cmd.matches(local_assert).count() != 1 {
+                return Err(
+                    "pinned E2E publisher lost its exact Cargo preparation assertion".into(),
+                );
+            }
+            twin.cmd = twin.cmd.replace(
+                local_assert,
+                "target/validate/stage-detcore-liteinst --git target && ",
+            );
+            twin.deps
+                .retain(|dependency| dependency != PINNED_WORKSPACE_PREPARE_TAG);
+            if producer_tags.contains(LITEINST_RUNTIME_TAG) {
+                twin.deps.push(pinned_root_twin_tag(LITEINST_RUNTIME_TAG));
+            }
+            twin.artifact_deps.push(dagrun::model::ArtifactDep {
+                step: PINNED_WORKSPACE_COMPILE_TAG.into(),
+                artifact: HERMIT_BIN_ARTIFACT.into(),
+            });
+            twin.description.push_str(
+                " EARLY IN THE PINNED ROOT: this twin stages the LiteInst runtime itself and publishes on the compile node's hermit-bin signal, before Nextest preparation; build.workspace_in_pinned_root depends on it and verifies the snapshot against the final binary and staged resources.",
+            );
+        }
         twin.deps.push(PINNED_ROOT_FETCH_TAG.into());
         twin.deps.sort();
         twin.deps.dedup();
@@ -2728,6 +2801,14 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
                 prepare.deps.sort();
                 prepare.deps.dedup();
             }
+            if producer_tags.contains("build.e2e_artifact") {
+                let prepare = &mut halves[1];
+                prepare
+                    .deps
+                    .push(pinned_root_twin_tag("build.e2e_artifact"));
+                prepare.deps.sort();
+                prepare.deps.dedup();
+            }
             twins.extend(halves);
             continue;
         }
@@ -2744,6 +2825,31 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
     cfg.steps.push(pinned_root_fetch()?);
     cfg.steps.extend(twins);
     route_host_consumers_to_pinned_build(cfg)?;
+    // Prepared-executable consumers used to reach the prepare node
+    // transitively through the E2E publisher. That edge now runs the other
+    // way (prepare gates the publisher's early snapshot), so a consumer
+    // carrying a prepared Cargo selection must name the prepare node
+    // directly; its executables are not ready at the hermit-bin signal.
+    if cfg
+        .steps
+        .iter()
+        .any(|step| step.tag() == PINNED_E2E_ARTIFACT_TAG)
+    {
+        for step in &mut cfg.steps {
+            if step
+                .deps
+                .iter()
+                .any(|dependency| dependency == PINNED_E2E_ARTIFACT_TAG)
+                && step
+                    .env
+                    .contains_key(crate::nextest_binaries::SELECTION_ENV)
+            {
+                step.deps.push(PINNED_WORKSPACE_PREPARE_TAG.into());
+                step.deps.sort();
+                step.deps.dedup();
+            }
+        }
+    }
     // Retire after routing: clearing the host fixtures step's labels first
     // would exempt it from routing, leaving its dependency on the host
     // build producers in place and keeping those retired producers alive.
@@ -3849,9 +3955,13 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
 
 /// The pinned-root workspace producer's two nodes. The Cargo half has no path
 /// to the rust-script producer, the preparation half depends directly on both,
-/// nothing but the preparation half consumes the Cargo half (so no consumer
-/// can read target/validate before its executables are listed and hashed),
-/// and the two payloads rejoin to exactly the unsplit producer's payload.
+/// nothing but the preparation half consumes the Cargo half by completion
+/// (so no ordinary consumer can read target/validate before its executables
+/// are listed and hashed), and the two payloads rejoin to exactly the
+/// unsplit producer's payload. The one artifact consumer is the pinned E2E
+/// publisher: it may snapshot the signalled Hermit binary early, and the
+/// preparation half then depends on it and gates that snapshot against the
+/// final staged tree.
 fn assert_pinned_workspace_split(cfg: &DagConfig) -> Result<(), String> {
     let by_tag = cfg
         .steps
@@ -3897,6 +4007,79 @@ fn assert_pinned_workspace_split(cfg: &DagConfig) -> Result<(), String> {
             consumer.tag()
         ));
     }
+    if compile.publishes
+        != [dagrun::model::PublishedArtifact {
+            name: HERMIT_BIN_ARTIFACT.into(),
+            path: Some("target/validate/hermit".into()),
+        }]
+    {
+        return Err(format!(
+            "{PINNED_WORKSPACE_COMPILE_TAG} must publish exactly the {HERMIT_BIN_ARTIFACT} artifact"
+        ));
+    }
+    for step in &cfg.steps {
+        for artifact_dep in &step.artifact_deps {
+            if step.tag() != PINNED_E2E_ARTIFACT_TAG
+                || artifact_dep.step != PINNED_WORKSPACE_COMPILE_TAG
+                || artifact_dep.artifact != HERMIT_BIN_ARTIFACT
+            {
+                return Err(format!(
+                    "{} has an unexpected artifact dependency on {}:{}; only {PINNED_E2E_ARTIFACT_TAG} may consume {PINNED_WORKSPACE_COMPILE_TAG}:{HERMIT_BIN_ARTIFACT} early",
+                    step.tag(),
+                    artifact_dep.step,
+                    artifact_dep.artifact
+                ));
+            }
+        }
+    }
+    if let Some(publisher) = by_tag.get(PINNED_E2E_ARTIFACT_TAG) {
+        if publisher.artifact_deps
+            != [dagrun::model::ArtifactDep {
+                step: PINNED_WORKSPACE_COMPILE_TAG.into(),
+                artifact: HERMIT_BIN_ARTIFACT.into(),
+            }]
+            || publisher
+                .deps
+                .iter()
+                .any(|dependency| dependency == PINNED_WORKSPACE_PREPARE_TAG)
+            || !publisher
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.liteinst_runtime_in_pinned_root")
+        {
+            return Err(format!(
+                "{PINNED_E2E_ARTIFACT_TAG} lost its early hermit-bin artifact dependency shape"
+            ));
+        }
+        if !prepare
+            .deps
+            .iter()
+            .any(|dependency| dependency == PINNED_E2E_ARTIFACT_TAG)
+        {
+            return Err(format!(
+                "{PINNED_WORKSPACE_PREPARE_TAG} must gate the early snapshot from {PINNED_E2E_ARTIFACT_TAG}"
+            ));
+        }
+        for step in &cfg.steps {
+            if step
+                .deps
+                .iter()
+                .any(|dependency| dependency == PINNED_E2E_ARTIFACT_TAG)
+                && step
+                    .env
+                    .contains_key(crate::nextest_binaries::SELECTION_ENV)
+                && !step
+                    .deps
+                    .iter()
+                    .any(|dependency| dependency == PINNED_WORKSPACE_PREPARE_TAG)
+            {
+                return Err(format!(
+                    "{} carries a prepared Cargo selection but does not depend on {PINNED_WORKSPACE_PREPARE_TAG} directly",
+                    step.tag()
+                ));
+            }
+        }
+    }
     if compile.labels != prepare.labels {
         return Err(format!(
             "{PINNED_WORKSPACE_COMPILE_TAG} labels {:?} differ from {PINNED_WORKSPACE_PREPARE_TAG} labels {:?}",
@@ -3905,8 +4088,10 @@ fn assert_pinned_workspace_split(cfg: &DagConfig) -> Result<(), String> {
     }
     let payload = pinned_workspace_producer_payload(cfg)?;
     let (compile_payload, prepare_payload) = split_workspace_payload(&payload)?;
-    if compile_payload != crate::nextest_build_selections::execution_command(compile)?
-        || prepare_payload != crate::nextest_build_selections::execution_command(prepare)?
+    if workspace_compile_payload_with_signal(&compile_payload)
+        != crate::nextest_build_selections::execution_command(compile)?
+        || workspace_prepare_payload_with_gate(&prepare_payload)
+            != crate::nextest_build_selections::execution_command(prepare)?
     {
         return Err(format!(
             "{PINNED_WORKSPACE_COMPILE_TAG} and {PINNED_WORKSPACE_PREPARE_TAG} are not the exact halves of one workspace payload"
@@ -5122,6 +5307,34 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
             .iter()
             .map(Step::tag)
             .collect::<BTreeSet<_>>();
+        // Early-publisher transfer: in the frozen source graph the E2E
+        // publisher depends on the prepare node, but generation reverses
+        // that edge (the publisher releases on the compile node's signal;
+        // prepare gates its snapshot). A profile whose every frozen path
+        // to the prepare node runs through the publisher, and which no
+        // prepared-selection consumer pulls back in with a direct prepare
+        // dependency, therefore no longer closes over the prepare node.
+        let mut source_selected = source_selected;
+        if source_selected.contains(PINNED_E2E_ARTIFACT_TAG)
+            && source_selected.contains(PINNED_WORKSPACE_PREPARE_TAG)
+            && !source_direct.contains(PINNED_WORKSPACE_PREPARE_TAG)
+            && !crate::dag_source_ownership::source_profile_avoiding(
+                profile.label,
+                true,
+                PINNED_E2E_ARTIFACT_TAG,
+            )?
+            .contains(PINNED_WORKSPACE_PREPARE_TAG)
+            && !selected.steps.iter().any(|step| {
+                step.env
+                    .contains_key(crate::nextest_binaries::SELECTION_ENV)
+                    && step
+                        .deps
+                        .iter()
+                        .any(|dependency| dependency == PINNED_WORKSPACE_PREPARE_TAG)
+            })
+        {
+            source_selected.remove(PINNED_WORKSPACE_PREPARE_TAG);
+        }
         if selected_tags != source_selected || selected_tags.len() != selected.steps.len() {
             return Err(format!(
                 "{} core dependency-closed source owners changed: expected={source_selected:?}, actual={selected_tags:?}",
@@ -8720,21 +8933,49 @@ sys.exit(37)
         assert_eq!(joined, producer.cmd);
         let compile_payload = crate::nextest_build_selections::execution_command(&compile).unwrap();
         let prepare_payload = crate::nextest_build_selections::execution_command(&prepare).unwrap();
-        assert!(prepare_payload.ends_with("./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target"));
+        assert!(prepare_payload.ends_with(&format!(
+            "./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target{EARLY_ARTIFACT_GATE_SUFFIX}"
+        )));
         assert!(!compile_payload.contains("nextest-binaries.rs"));
+        assert!(compile_payload.ends_with(HERMIT_BIN_SIGNAL_SUFFIX));
+        let (split_compile, split_prepare) = split_workspace_payload(&producer.cmd).unwrap();
         assert_eq!(
-            split_workspace_payload(&producer.cmd).unwrap(),
+            (
+                workspace_compile_payload_with_signal(&split_compile),
+                workspace_prepare_payload_with_gate(&split_prepare)
+            ),
             (compile_payload.clone(), prepare_payload.clone())
         );
         assert_eq!(
             join_workspace_payloads(&compile_payload, &prepare_payload).unwrap(),
             producer.cmd
         );
+        // Only the compile half forwards the artifact-ready channel; every
+        // other wrapper argument must stay identical between the halves.
         let wrapper = |step: &Step| {
             let mut argv = shell_words::split(&step.cmd).unwrap();
             argv.pop();
-            argv
+            let mut normalized = Vec::with_capacity(argv.len());
+            let mut index = 0;
+            while index < argv.len() {
+                if argv[index] == "--env"
+                    && matches!(
+                        argv.get(index + 1).map(String::as_str),
+                        Some("DAGRUN_ARTIFACT_READY_DIR" | "DAGRUN_OUTER_RUN")
+                    )
+                {
+                    index += 2;
+                } else {
+                    normalized.push(std::mem::take(&mut argv[index]));
+                    index += 1;
+                }
+            }
+            normalized
         };
+        for name in ["DAGRUN_ARTIFACT_READY_DIR", "DAGRUN_OUTER_RUN"] {
+            assert!(compile.cmd.contains(&format!("--env {name}")), "{name}");
+            assert!(!prepare.cmd.contains(name), "{name}");
+        }
         assert_eq!(wrapper(&compile), wrapper(&prepare));
         for needle in [
             "--out",

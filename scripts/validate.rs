@@ -370,7 +370,10 @@ fn prepared_nextest_commands_bracket(workspace: &Step, privileged: &Step) -> Res
         || !privileged_command.contains(NEXTEST_PRIVILEGED_ASSERT_COMMAND)
         || !privileged_command.contains(TESTS_MISC_EXECUTABLE_READ_COMMAND)
         || privileged_command.contains("cargo ")
-        || !workspace_command.ends_with(NEXTEST_FULL_PREPARE_COMMAND)
+        || !workspace_command.ends_with(&format!(
+            "{NEXTEST_FULL_PREPARE_COMMAND}{}",
+            hermit_manifest_plan::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX
+        ))
     {
         return Err("full-plan bracket: prepared Nextest population must come from the workspace producer and the privileged barrier must verify it without Cargo compilation".into());
     }
@@ -401,10 +404,12 @@ fn privileged_artifact_barriers(build: &Step) -> Result<(), String> {
 }
 
 /// The exact Cargo-mode payload branches of the E2E publishers: prove, without
-/// compiling, that target/validate/hermit is the runtime file the node's
-/// preparation record hashed, drop a Buck runtime closure, take that
-/// validate-profile binary.
+/// compiling, that target/validate/hermit is the binary the pinned prepare
+/// node's final gate compares against (for its early publisher) or the
+/// runtime file the node's preparation record hashed (hosted), then drop a
+/// Buck runtime closure and take that validate-profile binary.
 const CARGO_PAYLOAD_BRANCH: &str = "cargo) ./ci/nextest-binaries.rs assert full && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;;";
+const EARLY_CARGO_PAYLOAD_BRANCH: &str = "cargo) target/validate/stage-detcore-liteinst --git target && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;;";
 const HOSTED_CARGO_PAYLOAD_BRANCH: &str = "cargo) ./ci/nextest-binaries.rs assert hosted-portable && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;;";
 const BUCK_PAYLOAD_BRANCH: &str = "buck) ./scripts/build-buck-release.rs --validate-dag-install && hermit_payload=target/ci/hermit-strict ;;";
 
@@ -520,7 +525,7 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             || !source.contains(if tag.ends_with("_on_host") {
                 HOSTED_CARGO_PAYLOAD_BRANCH
             } else {
-                CARGO_PAYLOAD_BRANCH
+                EARLY_CARGO_PAYLOAD_BRANCH
             })
             || source.contains("cargo build")
             || !source.contains(BUCK_PAYLOAD_BRANCH)
@@ -545,6 +550,47 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
                 .any(|name| publisher.cmd.matches(&format!("--env {name}")).count() != 1)
         {
             return Err("release-artifact bracket: pinned mode transport drifted".into());
+        }
+        if tag == "build.e2e_artifact_in_pinned_root" {
+            // The early publisher replaces the prepared-record assertion
+            // with the other half of a two-part barrier: only the compile
+            // node's signalled Hermit binary may release it, and the prepare
+            // node (which now depends on the publisher) must still gate the
+            // snapshot against the final staged tree before any prepared
+            // consumer runs.
+            let compile_tag =
+                hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_COMPILE_TAG;
+            let prepare_tag =
+                hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_PREPARE_TAG;
+            let artifact_name = hermit_manifest_plan::validation_dag::HERMIT_BIN_ARTIFACT;
+            let compile = step(compile_tag)?;
+            let prepare = step(prepare_tag)?;
+            let prepare_source = guarded_command_source(prepare_tag, &prepare.cmd)?;
+            if compile.publishes
+                != [dagrun::model::PublishedArtifact {
+                    name: artifact_name.into(),
+                    path: Some("target/validate/hermit".into()),
+                }]
+                || publisher.artifact_deps
+                    != [dagrun::model::ArtifactDep {
+                        step: compile_tag.into(),
+                        artifact: artifact_name.into(),
+                    }]
+                || publisher
+                    .deps
+                    .iter()
+                    .any(|dependency| dependency == prepare_tag)
+                || !prepare
+                    .deps
+                    .iter()
+                    .any(|dependency| dependency == tag)
+                || !prepare_source.contains("./ci/verify-early-hermit-e2e-artifact.sh")
+            {
+                return Err(
+                    "release-artifact bracket: early E2E publisher lost its signal or final gate"
+                        .into(),
+                );
+            }
         }
     }
     // Each selected core publication has its real first-party direct consumer.
@@ -5419,15 +5465,48 @@ cleared-caps refusal names {} starved step(s)",
             .iter()
             .find(|s| s.tag() == "build.e2e_artifact_in_pinned_root")
             .ok_or("full-plan bracket: verified E2E artifact publisher disappeared")?;
+        let prepare_step = full
+            .cfg
+            .steps
+            .iter()
+            .find(|s| {
+                s.tag()
+                    == hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_PREPARE_TAG
+            })
+            .ok_or("full-plan bracket: workspace preparation disappeared")?;
+        // The barrier is two-part since the early publisher: the publisher
+        // snapshots the signalled binary, then preparation (which depends on
+        // the publisher) gates that snapshot against the final staged tree
+        // before any prepared consumer can start.
         if !artifact.cmd.contains("ci/publish-hermit-e2e-artifact.sh")
             || !artifact.cmd.contains("target/ci/hermit ")
             || !artifact.cmd.contains(" target/install_pkg")
-            || ![
-                "build.workspace_in_pinned_root",
-                "build.buck_release_artifact",
-            ]
-            .iter()
-            .all(|dep| artifact.deps.iter().any(|actual| actual == dep))
+            || !artifact
+                .deps
+                .iter()
+                .any(|actual| actual == "build.buck_release_artifact")
+            || artifact.artifact_deps
+                != [dagrun::model::ArtifactDep {
+                    step: hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_COMPILE_TAG
+                        .into(),
+                    artifact: hermit_manifest_plan::validation_dag::HERMIT_BIN_ARTIFACT.into(),
+                }]
+            || artifact
+                .deps
+                .iter()
+                .any(|actual| {
+                    actual
+                        == hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_PREPARE_TAG
+                })
+            || !prepare_step
+                .deps
+                .iter()
+                .any(|actual| actual == "build.e2e_artifact_in_pinned_root")
+            || !guarded_command_source(
+                hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_PREPARE_TAG,
+                &prepare_step.cmd,
+            )?
+            .contains("./ci/verify-early-hermit-e2e-artifact.sh")
         {
             return Err(
                 "full-plan bracket: E2E publisher is not a complete binary+resource barrier".into(),
@@ -33849,6 +33928,11 @@ output.chmod(0o755)
             .find(|step| step.tag() == "build.workspace_in_pinned_root")
             .unwrap();
         let workspace_payload = guarded_command_source(&workspace.tag(), &workspace.cmd).unwrap();
+        // The prepare node ends with its early-artifact gate; the fixture
+        // exercises exactly the preparation command before that gate.
+        let workspace_payload = workspace_payload
+            .strip_suffix(hermit_manifest_plan::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX)
+            .expect("prepare payload must end with the early-artifact gate");
         assert!(workspace_payload.ends_with(NEXTEST_FULL_PREPARE_COMMAND));
         let preparation =
             &workspace_payload[workspace_payload.len() - NEXTEST_FULL_PREPARE_COMMAND.len()..];

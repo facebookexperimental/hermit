@@ -367,6 +367,52 @@ pub fn core_tags() -> BTreeSet<String> {
         .filter_map(|(tag, node)| (node.owner == "core").then_some(tag))
         .collect()
 }
+/// The dependency closure of a profile in the frozen source graph that
+/// never traverses through `avoid`: seeds and other nodes are still
+/// selected, but `avoid`'s own dependencies are not followed. Judges
+/// whether a node is reachable only through `avoid`.
+pub fn source_profile_avoiding(
+    label: &str,
+    core_only: bool,
+    avoid: &str,
+) -> Result<BTreeSet<String>, String> {
+    let source = contract();
+    if !source.nodes.contains_key(avoid) {
+        return Err(format!("unknown source owner {avoid}"));
+    }
+    let admitted = |tag: &str| {
+        source
+            .nodes
+            .get(tag)
+            .is_some_and(|node| !core_only || node.owner == "core")
+    };
+    let mut selected = source
+        .nodes
+        .iter()
+        .filter_map(|(tag, node)| {
+            (admitted(tag) && node.labels.iter().any(|value| value == label)).then_some(tag.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut pending = selected.iter().cloned().collect::<Vec<_>>();
+    while let Some(tag) = pending.pop() {
+        if tag == avoid {
+            continue;
+        }
+        let node = source
+            .nodes
+            .get(&tag)
+            .ok_or_else(|| format!("unknown source owner {tag}"))?;
+        for dependency in &node.deps {
+            if !source.nodes.contains_key(dependency) {
+                return Err(format!("unprovided original dependency {dependency}"));
+            }
+            if admitted(dependency) && selected.insert(dependency.clone()) {
+                pending.push(dependency.clone());
+            }
+        }
+    }
+    Ok(selected)
+}
 pub fn source_profile(
     label: &str,
     core_only: bool,
@@ -704,5 +750,26 @@ mod tests {
         let mut unlisted = one_step_cfg(&["gate.manifest"]);
         let err = select_core_with(&mut unlisted, &[]).unwrap_err();
         assert!(err.contains("core DAG source population differs"), "{err}");
+    }
+
+    #[test]
+    fn avoiding_closure_stops_at_the_early_publisher() {
+        // Frozen rr-compat-only reaches the prepare and compile nodes only
+        // through the E2E publisher (publisher -> prepare -> compile).
+        let closed = source_profile("rr-compat-only", true, true).unwrap();
+        assert!(closed.contains("build.workspace_in_pinned_root"));
+        assert!(closed.contains("build.workspace_compile_in_pinned_root"));
+        let avoiding =
+            source_profile_avoiding("rr-compat-only", true, "build.e2e_artifact_in_pinned_root")
+                .unwrap();
+        assert!(avoiding.contains("build.e2e_artifact_in_pinned_root"));
+        assert!(!avoiding.contains("build.workspace_in_pinned_root"));
+        assert!(!avoiding.contains("build.workspace_compile_in_pinned_root"));
+        // The full profile seeds the prepare node by label, so avoiding
+        // the publisher must not remove it.
+        let full =
+            source_profile_avoiding("full", true, "build.e2e_artifact_in_pinned_root").unwrap();
+        assert!(full.contains("build.workspace_in_pinned_root"));
+        assert!(source_profile_avoiding("full", true, "no.such.node").is_err());
     }
 }

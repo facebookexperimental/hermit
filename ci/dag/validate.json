@@ -24804,6 +24804,7 @@
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -24854,6 +24855,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -24904,6 +24906,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -24954,6 +24957,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -25004,6 +25008,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -25054,6 +25059,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -25237,6 +25243,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -25420,6 +25427,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -25603,6 +25611,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -25655,6 +25664,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -25798,6 +25808,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -25851,6 +25862,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -25905,6 +25917,7 @@
         "build.e2e_artifact_in_pinned_root",
         "build.liteinst_allocator_fixtures_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -25959,6 +25972,7 @@
         "build.e2e_artifact_in_pinned_root",
         "build.liteinst_allocator_fixtures_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -26012,6 +26026,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -26120,6 +26135,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -26225,6 +26241,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -26278,6 +26295,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -26332,6 +26350,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -26385,6 +26404,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -26474,6 +26494,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -27054,6 +27075,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "privileged-build.privileged_tests",
@@ -27239,6 +27261,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "privileged-build.privileged_tests",
@@ -42631,6 +42654,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -62209,12 +62233,12 @@
       "group": "build",
       "job": "workspace_compile_in_pinned_root",
       "desc": "Build every workspace target, the backend plugins and the one Hermit binary in the validate profile, beside the rust-script build",
-      "description": "The Cargo half of the pinned-root workspace build and the one Cargo compilation of Hermit in the full and portable validations, in the [profile.validate] profile: release optimisation with debug assertions and overflow checks on, so cells run an optimised Hermit with detcore's debug_assert invariants and the determinism-log hash lines --verify compares. It first builds exactly the nextest preparation's guest build, `-p hermetic_infra_hermit_tests --bins`, in the same profile, so that build finds every unit it links already fresh. The workspace build cannot serve it: it resolves 14 shared dependencies with wider features (parking_lot gains send_guard, bytes serde, syn fold), which gives every reverie and hermit-detcore unit a new hash, and building hermit-install alone instead (def08d743) made the guest build compile them inside build.workspace_in_pinned_root, 46 s, so it was reverted. Until 2026-10-18 this first build was `-p detcore-dbt`, a superset of the guest build's units plus reverie-dbt's DynamoRIO build script (25.8 s) and detcore-dbt itself (24.4 s), both rebuilt by the workspace build anyway, which also builds reverie-dbt before hermit-install's build script reads its DynamoRIO cache (the cache publishes by atomic rename, so concurrent builders are safe). In the 32-job timings of 601df499 the first build took 55.9 s and the guest build's own units end at about 47 s; the workspace build's critical chain (163.4 s replayed) does not move when the DynamoRIO build script joins it, since it finishes before detcore-dbt can start, then builds the whole workspace, all targets, with the union of the features every prepared Nextest selection names. Nothing in it runs a rust-script (run-with-reverie-dbt-budget.sh compiles its pin checks with rustc, and no build script calls one), so it does not wait for build.rust_scripts_in_pinned_root and the two compile side by side in the same pinned root, writing different target directories; it keeps the rust-script environment, with HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1, so a rust-script added here later fails at once instead of compiling or running unprepared. Its only consumer is build.workspace_in_pinned_root, which lists the executables this build produced. Until 2026-10-06 the two halves were one node that waited for the rust-script tools, about 183 seconds, before this 175-to-182-second Cargo phase began. preferred_inner_jobs=32 is kept from the cold measurement at hermit@846baeca. CPU RE-DERIVATION 2026-11-01: across 265 retained full-run step profiles (ci-hub history node-cpu-budgets, kill samples excluded) this node's worst valid CPU was 7336.6 seconds (p99 7316.1), and a composite rerun was killed at the former 7200-second cap at about 7330 CPU-seconds while the same node at the same commit passed at about 6090; the shared workspace CPU budget is now 11100, the next 300-second bucket above 1.5 times that worst (11004.8).",
+      "description": "The Cargo half of the pinned-root workspace build and the one Cargo compilation of Hermit in the full and portable validations, in the [profile.validate] profile: release optimisation with debug assertions and overflow checks on, so cells run an optimised Hermit with detcore's debug_assert invariants and the determinism-log hash lines --verify compares. It first builds exactly the nextest preparation's guest build, `-p hermetic_infra_hermit_tests --bins`, in the same profile, so that build finds every unit it links already fresh. The workspace build cannot serve it: it resolves 14 shared dependencies with wider features (parking_lot gains send_guard, bytes serde, syn fold), which gives every reverie and hermit-detcore unit a new hash, and building hermit-install alone instead (def08d743) made the guest build compile them inside build.workspace_in_pinned_root, 46 s, so it was reverted. Until 2026-10-18 this first build was `-p detcore-dbt`, a superset of the guest build's units plus reverie-dbt's DynamoRIO build script (25.8 s) and detcore-dbt itself (24.4 s), both rebuilt by the workspace build anyway, which also builds reverie-dbt before hermit-install's build script reads its DynamoRIO cache (the cache publishes by atomic rename, so concurrent builders are safe). In the 32-job timings of 601df499 the first build took 55.9 s and the guest build's own units end at about 47 s; the workspace build's critical chain (163.4 s replayed) does not move when the DynamoRIO build script joins it, since it finishes before detcore-dbt can start, then builds the whole workspace, all targets, with the union of the features every prepared Nextest selection names. Nothing in it runs a rust-script (run-with-reverie-dbt-budget.sh compiles its pin checks with rustc, and no build script calls one), so it does not wait for build.rust_scripts_in_pinned_root and the two compile side by side in the same pinned root, writing different target directories; it keeps the rust-script environment, with HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1, so a rust-script added here later fails at once instead of compiling or running unprepared. Its completion consumer is build.workspace_in_pinned_root, which lists the executables this build produced; it also publishes the hermit-bin artifact signal for the early E2E publisher once Cargo links that binary and its staged LiteInst inputs. Until 2026-10-06 the two halves were one node that waited for the rust-script tools, about 183 seconds, before this 175-to-182-second Cargo phase began. preferred_inner_jobs=32 is kept from the cold measurement at hermit@846baeca. CPU RE-DERIVATION 2026-11-01: across 265 retained full-run step profiles (ci-hub history node-cpu-budgets, kill samples excluded) this node's worst valid CPU was 7336.6 seconds (p99 7316.1), and a composite rerun was killed at the former 7200-second cap at about 7330 CPU-seconds while the same node at the same commit passed at about 6090; the shared workspace CPU budget is now 11100, the next 300-second bucket above 1.5 times that worst (11004.8).",
       "labels": [
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_NEXTEST_FILTER_EXPR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export HERMIT_INSTALL_FORCE_RESTAGE=\"${DAGRUN_STEP_STARTED_MONOTONIC_NS:-$(date +%s%N)}\" && HERMIT_CARGO_TIMINGS_DIR=\"${E2E_RESULT_ROOT:+$E2E_RESULT_ROOT/cargo-timings}\" ./ci/run-with-core-build.sh cargo build --locked --profile validate -p hermetic_infra_hermit_tests --bins && HERMIT_CARGO_TIMINGS_DIR=\"${E2E_RESULT_ROOT:+$E2E_RESULT_ROOT/cargo-timings}\" ./ci/run-with-core-build.sh cargo build --locked --profile validate --workspace --all-targets --features hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/liteinst'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_ARTIFACT_READY_DIR --env DAGRUN_OUTER_RUN --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_NEXTEST_FILTER_EXPR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export HERMIT_INSTALL_FORCE_RESTAGE=\"${DAGRUN_STEP_STARTED_MONOTONIC_NS:-$(date +%s%N)}\" && HERMIT_CARGO_TIMINGS_DIR=\"${E2E_RESULT_ROOT:+$E2E_RESULT_ROOT/cargo-timings}\" ./ci/run-with-core-build.sh cargo build --locked --profile validate -p hermetic_infra_hermit_tests --bins && HERMIT_CARGO_TIMINGS_DIR=\"${E2E_RESULT_ROOT:+$E2E_RESULT_ROOT/cargo-timings}\" ./ci/run-with-core-build.sh cargo build --locked --profile validate --workspace --all-targets --features hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/liteinst --message-format json-render-diagnostics > >(python3 ./ci/cargo-artifact-ready.py hermit-bin)'",
       "result_manifests": [],
       "deps": [
         "pre.reverie_pin",
@@ -62240,20 +62264,27 @@
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
-      "fail_fast_family": "build.workspace_compile_in_pinned_root"
+      "fail_fast_family": "build.workspace_compile_in_pinned_root",
+      "publishes": [
+        {
+          "name": "hermit-bin",
+          "path": "target/validate/hermit"
+        }
+      ]
     },
     {
       "group": "build",
       "job": "workspace_in_pinned_root",
       "desc": "List every prepared Nextest executable from the one validate-profile build and record each selection's subset",
-      "description": "The preparation half of the pinned-root workspace build. Once build.workspace_compile_in_pinned_root has built every workspace target and build.rust_scripts_in_pinned_root has published the prebuilt rust-script tools, `nextest-binaries.rs prepare full` runs in the same pinned root, target directory and Cargo home: one `cargo nextest list` over the unified validate-profile build, the hermit_modes guests and record workloads from that build, and a dev-profile build of the nextest-cpu-wrapper. It hashes every listed executable and publishes all selections in one record, so no selection recompiles anything or relinks target/validate/hermit. After the final preparation Cargo invocation, `target/validate/stage-detcore-liteinst --git target` builds the ordinary preload in the existing liteinst-runtime profile, applies the unchanged source/constructor proof and atomically stages its receipt and bytes. Every consumer of the workspace build names this node, so none starts before both preparation and finalization complete. COLD ORDINARY FINALIZATION 2026-10-17: at Hermit 9b0e652d, eight admitted CPUs, with only target/liteinst-runtime removed before the run, the complete preparation plus ordinary finalizer took 294.965 wall seconds and 1383.852 CPU-seconds (1327.116 user, 56.736 system), with a 4.9-GiB peak and no OOM. This includes preparation rebuilding the stamped CLI and install staging; it is not just a warm artifact check. The former 1200-CPU-second cap interrupted the added dedicated-profile build. 2100 CPU-seconds is the next 300-second bucket above 1.5 times the complete measured cost (2075.778); the 600-second wall and 8-GiB memory bounds remain. CPU RE-DERIVATION 2026-11-01: across 274 retained full-run step profiles (ci-hub history node-cpu-budgets, kill samples excluded) the preparation's worst valid CPU was 3618.0 seconds (p99 3562.4), so the cap is now 5700, the next 300-second bucket above 1.5 times that worst (5427.0). The constructor/source proof and every prepared selection are unchanged. The budget is measured: in eight full validations on 2026-10-06 the unsplit node took 235 to 241 seconds, of which Cargo reported 45 to 46 for detcore-dbt and 130 to 136 for the workspace, leaving 58 to 60 seconds for container start and preparation. The CPU-wrapper build is the largest part, 27 to 28 seconds at 32 workers in those runs; a cold 16-worker build of it outside the root took 28 seconds, 135 CPU-seconds and a 2.4 GB memory peak. The 32-worker preference is the width preparation ran at inside the unsplit node.",
+      "description": "The preparation half of the pinned-root workspace build. Once build.workspace_compile_in_pinned_root has built every workspace target and build.rust_scripts_in_pinned_root has published the prebuilt rust-script tools, `nextest-binaries.rs prepare full` runs in the same pinned root, target directory and Cargo home: one `cargo nextest list` over the unified validate-profile build, the hermit_modes guests and record workloads from that build, and a dev-profile build of the nextest-cpu-wrapper. It hashes every listed executable and publishes all selections in one record, so no selection recompiles anything or relinks target/validate/hermit. After the final preparation Cargo invocation, `target/validate/stage-detcore-liteinst --git target` builds the ordinary preload in the existing liteinst-runtime profile, applies the unchanged source/constructor proof and atomically stages its receipt and bytes. Every completion consumer of the workspace build names this node, so none starts before both preparation and finalization complete; it finally verifies the early-published E2E artifact still matches this node's final binary and staged resources. COLD ORDINARY FINALIZATION 2026-10-17: at Hermit 9b0e652d, eight admitted CPUs, with only target/liteinst-runtime removed before the run, the complete preparation plus ordinary finalizer took 294.965 wall seconds and 1383.852 CPU-seconds (1327.116 user, 56.736 system), with a 4.9-GiB peak and no OOM. This includes preparation rebuilding the stamped CLI and install staging; it is not just a warm artifact check. The former 1200-CPU-second cap interrupted the added dedicated-profile build. 2100 CPU-seconds is the next 300-second bucket above 1.5 times the complete measured cost (2075.778); the 600-second wall and 8-GiB memory bounds remain. CPU RE-DERIVATION 2026-11-01: across 274 retained full-run step profiles (ci-hub history node-cpu-budgets, kill samples excluded) the preparation's worst valid CPU was 3618.0 seconds (p99 3562.4), so the cap is now 5700, the next 300-second bucket above 1.5 times that worst (5427.0). The constructor/source proof and every prepared selection are unchanged. The budget is measured: in eight full validations on 2026-10-06 the unsplit node took 235 to 241 seconds, of which Cargo reported 45 to 46 for detcore-dbt and 130 to 136 for the workspace, leaving 58 to 60 seconds for container start and preparation. The CPU-wrapper build is the largest part, 27 to 28 seconds at 32 workers in those runs; a cold 16-worker build of it outside the root took 28 seconds, 135 CPU-seconds and a 2.4 GB memory peak. The 32-worker preference is the width preparation ran at inside the unsplit node.",
       "labels": [
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_NEXTEST_FILTER_EXPR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_NEXTEST_FILTER_EXPR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target && ./ci/verify-early-hermit-e2e-artifact.sh'",
       "result_manifests": [],
       "deps": [
+        "build.e2e_artifact_in_pinned_root",
         "build.liteinst_runtime_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
         "build.workspace_compile_in_pinned_root",
@@ -62323,17 +62354,17 @@
       "group": "build",
       "job": "e2e_artifact_in_pinned_root",
       "desc": "Publish the one Hermit binary at target/ci/hermit and as a verified content-addressed bundle with its backend resources",
-      "description": "This is the publication barrier between the one Hermit producer and every consumer. Cargo-default mode takes target/validate/hermit, the validate-profile binary (release optimisation with debug assertions and overflow checks), after `nextest-binaries.rs assert full` has proved without compiling that it is byte-for-byte the runtime file every prepared test selection recorded, i.e. the CARGO_BIN_EXE_hermit the nextest consumers run; the explicit Buck mode installs the reconciled Buck release candidate through build-buck-release.rs --validate-dag-install and takes its target/ci/hermit-strict copy. Either way the selected bytes are installed at target/ci/hermit, the ONE path every direct consumer names (compatibility cells, test.cli, test.sabre_examples, test.envelope_levels), with libdetcore_sabre.so copied beside it and hashed before and after the copy; resources resolve through target/install_pkg. The same bytes are then published as a unique content-addressed directory plus pointer: the publisher hashes the binary before and after copying, snapshots target/install_pkg with symlinks dereferenced, verifies the required DBT/SaBRe/LiteInst/e9patch resources and the complete resource hash manifest, and atomically updates the pointer that the E2E manifest runs and ci/run-with-hermit-e2e-artifact.sh consumers read. The validate ledger records the choice as release_builder and e2e_payload, and a Buck row is neither a Cargo cache hit nor a receipt. Cargo does not hash-suffix binary outputs, so each preparation selection that links the Hermit bin relinks target/validate/hermit; the preparation record hashes it after the last selection, and this node publishes exactly those bytes instead of rebuilding (a rebuild here recompiled Hermit and hit the 120-second cap in the first one-build validation, and would have diverged from the recorded runtime file). Cargo mode removes any Buck hermit-runtime closure left in target/install_pkg, as build.runtime_release did before it was merged into this node on 2026-09-30.",
+      "description": "This is the publication barrier between the one Hermit producer and every consumer. Cargo-default mode takes target/validate/hermit, the validate-profile binary (release optimisation with debug assertions and overflow checks), after `nextest-binaries.rs assert full` has proved without compiling that it is byte-for-byte the runtime file every prepared test selection recorded, i.e. the CARGO_BIN_EXE_hermit the nextest consumers run; the explicit Buck mode installs the reconciled Buck release candidate through build-buck-release.rs --validate-dag-install and takes its target/ci/hermit-strict copy. Either way the selected bytes are installed at target/ci/hermit, the ONE path every direct consumer names (compatibility cells, test.cli, test.sabre_examples, test.envelope_levels), with libdetcore_sabre.so copied beside it and hashed before and after the copy; resources resolve through target/install_pkg. The same bytes are then published as a unique content-addressed directory plus pointer: the publisher hashes the binary before and after copying, snapshots target/install_pkg with symlinks dereferenced, verifies the required DBT/SaBRe/LiteInst/e9patch resources and the complete resource hash manifest, and atomically updates the pointer that the E2E manifest runs and ci/run-with-hermit-e2e-artifact.sh consumers read. The validate ledger records the choice as release_builder and e2e_payload, and a Buck row is neither a Cargo cache hit nor a receipt. Cargo does not hash-suffix binary outputs, so each preparation selection that links the Hermit bin relinks target/validate/hermit; the preparation record hashes it after the last selection, and this node publishes exactly those bytes instead of rebuilding (a rebuild here recompiled Hermit and hit the 120-second cap in the first one-build validation, and would have diverged from the recorded runtime file). Cargo mode removes any Buck hermit-runtime closure left in target/install_pkg, as build.runtime_release did before it was merged into this node on 2026-09-30. EARLY IN THE PINNED ROOT: this twin stages the LiteInst runtime itself and publishes on the compile node's hermit-bin signal, before Nextest preparation; build.workspace_in_pinned_root depends on it and verifies the snapshot against the final binary and staged resources.",
       "labels": [
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_NEXTEST_FILTER_EXPR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; case \"${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}\" in cargo) ./ci/nextest-binaries.rs assert full && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;; buck) ./scripts/build-buck-release.rs --validate-dag-install && hermit_payload=target/ci/hermit-strict ;; *) echo \"unknown Hermit release build mode: ${HERMIT_VALIDATE_RELEASE_BUILD_MODE}\" >&2; exit 2 ;; esac && mkdir -p target/ci && install -m 755 \"$hermit_payload\" target/ci/hermit && ./ci/publish-hermit-e2e-artifact.sh target/ci/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path --core-complete target/install_pkg'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_NEXTEST_FILTER_EXPR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; case \"${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}\" in cargo) target/validate/stage-detcore-liteinst --git target && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;; buck) ./scripts/build-buck-release.rs --validate-dag-install && hermit_payload=target/ci/hermit-strict ;; *) echo \"unknown Hermit release build mode: ${HERMIT_VALIDATE_RELEASE_BUILD_MODE}\" >&2; exit 2 ;; esac && mkdir -p target/ci && install -m 755 \"$hermit_payload\" target/ci/hermit && ./ci/publish-hermit-e2e-artifact.sh target/ci/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path --core-complete target/install_pkg'",
       "result_manifests": [],
       "deps": [
         "build.buck_release_artifact",
+        "build.liteinst_runtime_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
-        "build.workspace_in_pinned_root",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
       ],
@@ -62357,7 +62388,13 @@
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
-      "fail_fast_family": "build.e2e_artifact_in_pinned_root"
+      "fail_fast_family": "build.e2e_artifact_in_pinned_root",
+      "artifact_deps": [
+        {
+          "step": "build.workspace_compile_in_pinned_root",
+          "artifact": "hermit-bin"
+        }
+      ]
     },
     {
       "group": "build",

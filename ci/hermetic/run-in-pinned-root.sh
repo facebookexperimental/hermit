@@ -56,6 +56,11 @@
 # --env, its parent directory is mounted at /dagrun-test-counts and the child is
 # given the translated path. This lets an in-container test producer atomically
 # publish the same evidence file the host scheduler will read after podman exits.
+#
+# DAGRUN_ARTIFACT_READY_DIR is likewise scheduler-owned. When requested through
+# --env, the directory is mounted at /dagrun-artifact-ready so an in-container
+# producer can atomically publish the signal file the host scheduler polls
+# while the producer continues running.
 
 set -euo pipefail
 
@@ -522,6 +527,15 @@ for name in "${pass_env[@]}"; do
             mkdir -p "$counts_dir"
             extra_mounts+=(--mount "type=bind,source=$counts_dir,destination=/dagrun-test-counts")
             env_args+=(-e "DAGRUN_TEST_COUNTS_PATH=/dagrun-test-counts/$counts_file")
+            ;;
+        DAGRUN_ARTIFACT_READY_DIR)
+            [[ ${!name} == /* ]] || {
+                echo "run-in-pinned-root: DAGRUN_ARTIFACT_READY_DIR must be absolute" >&2
+                exit 2
+            }
+            mkdir -p "${!name}"
+            extra_mounts+=(--mount "type=bind,source=${!name},destination=/dagrun-artifact-ready")
+            env_args+=(-e DAGRUN_ARTIFACT_READY_DIR=/dagrun-artifact-ready)
             ;;
         *) env_args+=(--env "$name") ;;
     esac

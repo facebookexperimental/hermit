@@ -691,7 +691,9 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
 }
 
 // `prepare` is one fixed command; only its fixed, profile-matched packaging
-// finalizer may follow it. Never truncate an arbitrary shell command at `&&`.
+// finalizer may follow it, plus, for the pinned workspace prepare node
+// alone, its fixed early-artifact gate after that finalizer. Never truncate
+// an arbitrary shell command at `&&`.
 fn preparation_profile<'a>(tag: &str, command: &'a str) -> Result<Option<&'a str>, String> {
     let marker = "./ci/nextest-binaries.rs prepare ";
     let Some((_, rest)) = command.split_once(marker) else {
@@ -704,7 +706,19 @@ fn preparation_profile<'a>(tag: &str, command: &'a str) -> Result<Option<&'a str
     let finalized = crate::nextest_binaries::cargo_profile_for(profile).map(|directory| {
         format!("{profile} && target/{directory}/stage-detcore-liteinst --git target")
     });
-    if profile.is_empty() || (rest != profile && finalized.as_deref() != Some(rest)) {
+    let gated = (tag == crate::validation_dag::PINNED_WORKSPACE_PREPARE_TAG)
+        .then(|| {
+            finalized.as_ref().map(|tail| {
+                format!(
+                    "{tail}{}",
+                    crate::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX
+                )
+            })
+        })
+        .flatten();
+    if profile.is_empty()
+        || (rest != profile && finalized.as_deref() != Some(rest) && gated.as_deref() != Some(rest))
+    {
         return Err(format!(
             "{tag} has an ambiguous prepared profile or finalizer"
         ));
@@ -1104,6 +1118,18 @@ mod tests {
                 );
             }
         }
+        // The pinned workspace prepare node alone may append its fixed
+        // early-artifact gate after the finalizer; no other producer may.
+        let gated = format!(
+            "prefix && ./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target{}",
+            crate::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX
+        );
+        assert_eq!(
+            preparation_profile(crate::validation_dag::PINNED_WORKSPACE_PREPARE_TAG, &gated)
+                .unwrap(),
+            Some("full")
+        );
+        assert!(preparation_profile("producer", &gated).is_err());
         for profile in ["quick", "super"] {
             let bare = format!("./ci/nextest-binaries.rs prepare {profile}");
             assert_eq!(
@@ -1282,7 +1308,12 @@ mod tests {
             (
                 "test.regular_crates_on_host",
                 hosted.tag(),
-                image.cmd.clone(),
+                // The pinned prepare payload's early-artifact gate is
+                // admitted only on that node's own tag; strip it so the
+                // transplanted command stays a well-formed preparation.
+                image
+                    .cmd
+                    .replace(crate::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX, ""),
             ),
         ] {
             let mut wrong_root = graph.clone();
@@ -1435,12 +1466,16 @@ mod tests {
             .find(|step| step.tag() == "build.workspace_in_pinned_root")
             .unwrap();
         assert!(
-            execution_command(producer)
-                .unwrap()
-                .ends_with("./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target")
+            execution_command(producer).unwrap().ends_with(&format!(
+                "./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target{}",
+                crate::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX
+            ))
         );
         producer.cmd = producer.cmd.replace(
-            "./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target",
+            &format!(
+                "./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target{}",
+                crate::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX
+            ),
             "./ci/nextest-binaries.rs prepare portable",
         );
         missing_hardware
