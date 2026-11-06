@@ -132,6 +132,22 @@ fn admitted_core_tags_with(extension: &[ExtensionNode]) -> BTreeSet<String> {
 pub fn admitted_core_tags() -> BTreeSet<String> {
     admitted_core_tags_with(POST_SPLIT_CORE_NODES)
 }
+
+/// Whether `tag` is frozen core or admitted by `extension` (validated
+/// registry). Generation-time filters and graph-purity checks that
+/// must accept registered post-split buckets use this; frozen
+/// population comparisons keep using [`is_core`]/[`core_tags`].
+fn is_admitted_core_with(tag: &str, extension: &[ExtensionNode]) -> bool {
+    is_core(tag)
+        || validate_extension_registry(&contract(), extension)
+            .expect("post-split extension registry")
+            .contains(tag)
+}
+
+/// Whether `tag` is frozen core or a registered post-split extension node.
+pub fn is_admitted_core(tag: &str) -> bool {
+    is_admitted_core_with(tag, POST_SPLIT_CORE_NODES)
+}
 fn parse_contract(bytes: &[u8]) -> Result<Document, String> {
     if bytes.len() > 1024 * 1024 {
         return Err("source ownership contract exceeds bound".into());
@@ -615,6 +631,22 @@ mod tests {
             live.extend(extension_tags());
             live
         });
+    }
+
+    #[test]
+    fn admitted_core_predicate_accepts_registered_and_refuses_the_rest() {
+        // Positive: a registered extension bucket is admitted core,
+        // exactly the selective-bracket acceptance for rr/gVisor.
+        assert!(is_admitted_core_with("e2e.manifest_example", EXAMPLE));
+        // Frozen core stays admitted under any registry.
+        assert!(is_admitted_core_with("gate.manifest", EXAMPLE));
+        // Negative: an unregistered bucket-shaped tag is refused.
+        assert!(!is_admitted_core_with("e2e.manifest_unregistered", EXAMPLE));
+        // Negative: a dynamorio-owned frozen node is never core.
+        assert!(!is_admitted_core_with("check.dbt_runtime_abi", EXAMPLE));
+        // The frozen-only predicate is unchanged by the registry.
+        assert!(!is_core("e2e.manifest_example"));
+        assert!(is_core("gate.manifest"));
     }
 
     #[test]

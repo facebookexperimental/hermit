@@ -6866,10 +6866,13 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
             cell["backend"].as_str(),
             Some("ptrace" | "kvm" | "liteinst" | "in-guest-trap")
         )
-    }) || full_tags
-        .iter()
-        .any(|tag| !hermit_manifest_plan::dag_source_ownership::is_core(tag))
-    {
+    }) || full_tags.iter().any(|tag| {
+        // Admitted core = frozen core plus extension-registry nodes
+        // (post-split buckets such as rr/gVisor). Anything else -
+        // patching/dynamorio-owned or simply unregistered - is still
+        // an external node reappearing in the core graph.
+        !hermit_manifest_plan::dag_source_ownership::is_admitted_core(tag)
+    }) {
         return Err(
             "selective bracket: external cells or nodes reappeared in the core graph".into(),
         );
