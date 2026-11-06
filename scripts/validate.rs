@@ -16239,11 +16239,13 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     // The full run's compat rows: the 193 of the portable strict corpus
     // extracted from validate.sh, the 25 of
     // https://github.com/rrnewton/hermit/issues/4269, less the 4 heavy rows
-    // the super run type runs (218 - 4), less the logger and pkg-config
-    // rows deselected with the pinned-image move (214 - 2). The cargo and
-    // gcov rows deselected 2026-10-31 under issue 4997 came back the same
-    // day once the fixture race was fixed (271ec81bd4).
-    let expected = 212;
+    // the super run type runs (218 - 4 = 214). The logger and pkg-config
+    // rows deselected with the pinned-image move were promoted to
+    // Required by the 2026-11-05 sweep flip, so they no longer subtract.
+    // The cargo and gcov rows deselected 2026-10-31 under issue 4997
+    // came back the same day once the fixture race was fixed
+    // (271ec81bd4).
+    let expected = 214;
     if rows.len() != expected {
         return Err(format!(
             "strict-compat bucket: compat.yaml has {} CI rows; the full run has {expected}",
