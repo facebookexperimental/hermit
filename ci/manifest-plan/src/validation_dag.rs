@@ -776,9 +776,11 @@ const PROFILES: [Profile; 11] = [
         // privileged-test.deadline_slice_cap_kvm, the deadline_slice_cap suite
         // on KVM held to its gap ledger, adds one full-only node: 102/103
         // before.
+        // build.reverie_buck, the inert M2 Cut 2 Reverie Buck-build bracket,
+        // adds one full-only node: 103/104 before.
         label: "full",
-        direct_steps: 103,
-        selected_steps: 104,
+        direct_steps: 104,
+        selected_steps: 105,
     },
     Profile {
         // 81/82 with the same host-fixtures retirement: 82/83 before.
@@ -4929,6 +4931,8 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // outside the per-commit smoke pair, in the SaBRe run type (442 + 1).
     // 446 with the rr bucket (e2e.manifest_rr and its on-host/Buck twins),
     // the first post-split extension nodes (443 + 3).
+    // build.reverie_buck (M2 Cut 2/3) is admitted post-split through
+    // POST_SPLIT_CORE_NODES, so the admitted population is frozen core + 1.
     let actual_tags = cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
     let expected_tags = crate::dag_source_ownership::admitted_core_tags();
     if actual_tags != expected_tags || actual_tags.len() != cfg.steps.len() {
@@ -7964,6 +7968,9 @@ sys.exit(37)
         // and 101 since the host fixtures route through build.host_hermit_link
         // and the retired base producers stay retired (104 full nodes), and
         // 102 with privileged-test.deadline_slice_cap_kvm (105 full nodes).
+        // build.reverie_buck (M2) is a post-split extension node, not a
+        // frozen core tag, so it is filtered from `expected` by is_core and
+        // must not appear in the Buck selection population either.
         // The Buck profile composes the full profile with Cargo owners replaced,
         // rather than selecting the Buck label alone.
         let original_full =

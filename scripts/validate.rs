@@ -638,6 +638,35 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+fn reverie_buck_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
+    let reverie_buck = cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == "build.reverie_buck")
+        .ok_or("reverie-buck bracket: build.reverie_buck is absent")?;
+    if !reverie_buck
+        .cmd
+        .contains("${HERMIT_VALIDATE_BUILD_MODE:-cargo}")
+        || !reverie_buck.cmd.contains("cargo) : ;;")
+        || !reverie_buck
+            .cmd
+            .contains("buck) echo \"HERMIT_VALIDATE_BUILD_MODE=buck is not wired yet")
+        || !reverie_buck
+            .cmd
+            .contains("*) echo \"unknown Hermit build mode:")
+        || reverie_buck.cmd.contains("buck2 build")
+        || !reverie_buck
+            .deps
+            .iter()
+            .any(|dep| dep == "gate.manifest")
+    {
+        return Err(
+            "reverie-buck bracket: Reverie Buck producer lost its closed mode branch".into(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod artifact_plan_tests {
     use super::*;
@@ -646,6 +675,7 @@ mod artifact_plan_tests {
     fn actual_host_and_pinned_consumers_require_their_artifact_and_resource_producers() {
         let cfg = validate_plan::validation_config(&test_source_root()).unwrap();
         release_artifact_plan_bracket(&cfg).unwrap();
+        reverie_buck_plan_bracket(&cfg).unwrap();
         let mut tags = hermit_manifest_plan::validation_dag::hermit_integration_shard_tags();
         tags.push("test.hermit_integration_on_host".into());
         for tag in tags {
@@ -5651,6 +5681,7 @@ cleared-caps refusal names {} starved step(s)",
             );
         }
         release_artifact_plan_bracket(&full.cfg)?;
+        reverie_buck_plan_bracket(&full.cfg)?;
         // The local Hermit integration node runs as shards; each must consume
         // the published artifact.
         for shard in hermit_manifest_plan::validation_dag::hermit_integration_shard_tags() {

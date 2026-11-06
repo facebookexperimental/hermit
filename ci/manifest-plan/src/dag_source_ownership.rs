@@ -151,7 +151,14 @@ pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[
         ],
         populations: &["manifest_publishers"],
     },
+    ExtensionNode {
+        tag: "build.reverie_buck",
+        labels: &["full"],
+        deps: &["gate.manifest"],
+        populations: &[],
+    },
 ];
+
 
 /// Tags admitted by `extension`, after validating it against `source`.
 fn validate_extension_registry(

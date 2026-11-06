@@ -817,6 +817,39 @@
     },
     {
       "group": "build",
+      "job": "reverie_buck",
+      "desc": "Reverie Buck-build bracket for the validate test set",
+      "description": "M2 Cut 2 bracket for the Reverie BUILD switch (HERMIT_VALIDATE_BUILD_MODE, default cargo). Cargo mode is an inert no-op: build.workspace still compiles and stages the Reverie test set through nextest-binaries. Buck mode is not wired yet and refuses with exit 2: M2 Cut 3 will buck2-build the Reverie validate test set under the asan-ubsan-dev configuration validate expects and harvest only the files readers read into target/validate staging, so no consumer changes in this cut. No step consumes this node yet; it exists so the generated plan carries the closed mode branch ahead of the harvest.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "case \"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\" in cargo) : ;; buck) echo \"HERMIT_VALIDATE_BUILD_MODE=buck is not wired yet (M2 Cut 3 harvest pins asan-ubsan-dev)\" >&2; exit 2 ;; *) echo \"unknown Hermit build mode: ${HERMIT_VALIDATE_BUILD_MODE}\" >&2; exit 2 ;; esac",
+      "result_manifests": [],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 600,
+      "cpu_timeout": 7200,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 5.0,
+        "rss_baseline_bytes": 536870912,
+        "hard_mem_max_bytes": 2147483648,
+        "classification": "light",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "build.reverie_buck"
+    },
+    {
+      "group": "build",
       "job": "host_hermit_link",
       "desc": "Link the host target/ci/hermit and artifact pointer to the one Hermit the pinned root published",
       "description": "The focused compatibility run types (portablecompat, sabrecompat, supercompat, rrcompat) exercise programs installed on the host, which the pinned image does not carry, so they and their fixtures run on the host. (The full-profile bucket e2e.manifest_compat ran here too until 2026-10-30; the pinned image now carries every program its rows name, so it runs in the pinned root and no longer needs this link.) They run the one validate-profile Hermit that build.e2e_artifact_in_pinned_root published, not a second, host-built copy. This node points the host's target/ci/hermit at those exact bytes (ignored/hermetic/split/target is the pinned root's /src/target) and proves the binary runs here. It does because the binary's loader and libraries are the host nix store paths that ci/hermetic/build-image.sh built the image from; if nix garbage collection has removed them, the node fails and names the missing store paths. It also writes the host artifact pointer target/ci/hermit-e2e-artifact.path, naming the same content-addressed bundle by its host path, and verifies it with ci/verify-hermit-e2e-artifact.sh, so the corpus bucket reaches the binary and its resources through the same verified wrapper as every other manifest bucket.",
