@@ -26859,16 +26859,25 @@ mod test {
                 rows.format_version(),
                 offset.map(|_| crate::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT)
             );
+            // The replay admits only a history stating the qualified test
+            // identity, on a run prepared for that clock, as the replay
+            // above states them.
+            let rows = rows.with_identity(Some(crate::clock_identity::test_sources::known()));
             let path = dir.path().join("rows.json");
             std::fs::write(&path, rows.to_string()).unwrap();
-            let mut sched = Scheduler::new(&Config {
-                replay_schedule_from: Some(path),
-                record_preemptions: true,
-                ..Config::default()
-            });
-            let written: crate::preemptions::PreemptionRecord =
-                serde_json::from_str(&sched.preemption_writer.take().unwrap().into_string())
-                    .unwrap();
+            let mut sched =
+                Scheduler::new(&crate::clock_identity::test_sources::qualified(Config {
+                    replay_schedule_from: Some(path),
+                    record_preemptions: true,
+                    ..Config::default()
+                }));
+            let written_text = sched.preemption_writer.take().unwrap().into_string();
+            let crate::preemptions::boundary_recording::Recording::Legacy(written) =
+                crate::preemptions::boundary_recording::Recording::decode(written_text.as_bytes())
+                    .unwrap()
+            else {
+                panic!("a legacy replay writes a legacy record");
+            };
             (
                 sched.charge_replayed_switch_ins,
                 sched.time_skip_mode == TimeSkipMode::Legacy,

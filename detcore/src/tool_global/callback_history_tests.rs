@@ -1198,7 +1198,11 @@ async fn an_instruction_offset_slice_is_armed_recorded_and_replayed_alike() {
         .take()
         .unwrap()
         .into_string();
-    let history = serde_json::from_str::<crate::preemptions::PreemptionRecord>(&record)
+    // The writer states its clock identity in an envelope around the
+    // record; read the record it carries through the decoder.
+    let history = crate::preemptions::boundary_recording::Recording::decode(record.as_bytes())
+        .unwrap()
+        .into_legacy("instruction-offset record")
         .unwrap()
         .extract_all()
         .remove(&tid)

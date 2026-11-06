@@ -1323,8 +1323,16 @@ mod callback_history_scheduler_tests {
             let filed = filed.try_read().unwrap().unwrap();
             // A change point ends the turn whether or not it carries an offset.
             assert!(s.step4_resource_block(thread, &filed, &response).is_err());
-            let record: serde_json::Value =
-                serde_json::from_str(&s.preemption_writer.take().unwrap().into_string()).unwrap();
+            // The writer states its clock identity in an envelope around
+            // the record; read the record it carries through the decoder.
+            let text = s.preemption_writer.take().unwrap().into_string();
+            let inner = crate::preemptions::boundary_recording::Recording::decode(
+                text.as_bytes(),
+            )
+            .unwrap()
+            .into_legacy("instruction-offset record")
+            .unwrap();
+            let record: serde_json::Value = serde_json::to_value(&inner).unwrap();
             let offsets =
                 record["per_thread"][thread.to_string()]["preemption_instruction_offsets"].clone();
             assert!(s.instruction_offsets.is_empty());
