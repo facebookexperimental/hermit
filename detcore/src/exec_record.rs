@@ -781,6 +781,13 @@ const PAGE_SIZE: u64 = 4096;
 /// (`load_elf_binary`): at most a page, at least two bytes, the last of
 /// them NUL, and the name is the string up to its first NUL.
 pub fn program_interpreter(path: &Path) -> Result<Option<PathBuf>, &'static str> {
+    program_interpreter_of(path, EM_X86_64)
+}
+
+/// [`program_interpreter`] of an ELF64 image built for ELF machine
+/// `machine` (`e_machine`) instead of x86-64: the `PT_INTERP` it names is
+/// read the same way on every little-endian ELF64 machine.
+pub fn program_interpreter_of(path: &Path, machine: u16) -> Result<Option<PathBuf>, &'static str> {
     use std::os::unix::ffi::OsStrExt;
     let file = crate::util::RawFd::open(path, libc::O_RDONLY).map_err(|_| "unreadable")?;
     let read_exact = |offset: u64, buffer: &mut [u8]| {
@@ -790,8 +797,12 @@ pub fn program_interpreter(path: &Path) -> Result<Option<PathBuf>, &'static str>
     read_exact(0, &mut header).ok_or("shorter than an ELF header")?;
     let u16_at = |at: usize| u16::from_le_bytes([header[at], header[at + 1]]);
     let u64_at = |at: usize| u64::from_le_bytes(header[at..at + 8].try_into().unwrap());
-    if header[..4] != *b"\x7fELF" || header[4] != 2 || header[5] != 1 || u16_at(18) != EM_X86_64 {
-        return Err("not an x86-64 ELF64 image");
+    if header[..4] != *b"\x7fELF" || header[4] != 2 || header[5] != 1 || u16_at(18) != machine {
+        return Err(if machine == EM_X86_64 {
+            "not an x86-64 ELF64 image"
+        } else {
+            "not an ELF64 image for this machine"
+        });
     }
     let (phoff, phentsize, phnum) = (u64_at(32), usize::from(u16_at(54)), u16_at(56));
     if phentsize < 56 {

@@ -446,7 +446,64 @@ const MAX_SCRIPT_HOPS: usize = 4;
 /// launch; Detcore's check of each executed image and interpreter
 /// (`Detcore::isa_refusal`) is still what refuses a run whose actual
 /// objects need more, so a pathname read here can never admit one.
+///
+/// On a host that is not x86-64 no CPU profile is presented: an ELF64 image
+/// built for the host's own machine declares no x86-64 ISA level, so auto
+/// names the default profile, which there serves nothing
+/// ([`isa_needs_on`]). Every other read and refusal is the same as on an
+/// x86-64 host.
 pub fn resolve_auto(
+    program: &Path,
+    to_host: impl Fn(&Path) -> Option<PathBuf>,
+) -> Result<(CpuProfile, String), String> {
+    resolve_auto_on(host_machine(), program, to_host)
+}
+
+/// `EM_X86_64`.
+const EM_X86_64: u16 = 62;
+/// `EM_AARCH64`.
+const EM_AARCH64: u16 = 183;
+
+/// This host's ELF machine (`e_machine`), or 0 for one auto does not know.
+fn host_machine() -> u16 {
+    match std::env::consts::ARCH {
+        "x86_64" => EM_X86_64,
+        "aarch64" => EM_AARCH64,
+        _ => 0,
+    }
+}
+
+/// The `e_machine` of the little-endian ELF64 image at `path`, or `None`
+/// for a file that is unreadable or not one.
+fn elf64_machine(path: &Path) -> Option<u16> {
+    use std::io::Read as _;
+    let mut header = [0_u8; 20];
+    std::fs::File::open(path)
+        .ok()?
+        .read_exact(&mut header)
+        .ok()?;
+    // ELFMAG, ELFCLASS64, ELFDATA2LSB.
+    (header[..4] == *b"\x7fELF" && header[4] == 2 && header[5] == 1)
+        .then(|| u16::from_le_bytes([header[18], header[19]]))
+}
+
+/// What the image at `path` declares for auto on a host of ELF machine
+/// `host`: its x86-64 ISA declaration, read strictly; and on a host that is
+/// not x86-64, where no CPU profile is presented, nothing (`Unmarked`) for
+/// an ELF64 image built for the host's own machine, which no x86-64 level
+/// applies to. Anything else unreadable or not x86-64 stays `None`, which
+/// auto refuses.
+fn isa_needs_on(host: u16, path: &Path) -> Option<detcore::exec_record::IsaNeeds> {
+    let needs = detcore::exec_record::IsaNeeds::read_path_strict(path);
+    if needs.is_none() && host != EM_X86_64 && host != 0 && elf64_machine(path) == Some(host) {
+        return Some(detcore::exec_record::IsaNeeds::Unmarked);
+    }
+    needs
+}
+
+/// [`resolve_auto`] on a host of ELF machine `host`.
+fn resolve_auto_on(
+    host: u16,
     program: &Path,
     to_host: impl Fn(&Path) -> Option<PathBuf>,
 ) -> Result<(CpuProfile, String), String> {
@@ -480,16 +537,21 @@ pub fn resolve_auto(
             program.display()
         ));
     }
-    let needs = IsaNeeds::read_path_strict(&image);
+    let needs = isa_needs_on(host, &image);
     let mut objects = vec![(format!("the executable {}", image.display()), needs)];
     if matches!(needs, None | Some(IsaNeeds::Malformed(_))) {
         // Refused as unreadable or malformed, before its interpreter.
-        return detcore::exec_record::auto_profile(&objects);
+        return auto_profile_on(host, &objects);
     }
-    match detcore::exec_record::program_interpreter(&image) {
+    // An image built for this host's own machine, on a host that is not
+    // x86-64, names its interpreter in the same `PT_INTERP`.
+    let machine = elf64_machine(&image)
+        .filter(|&machine| host != EM_X86_64 && machine == host)
+        .unwrap_or(EM_X86_64);
+    match detcore::exec_record::program_interpreter_of(&image, machine) {
         Ok(None) => {}
         Ok(Some(interpreter)) => {
-            let Some(host) = to_host(&interpreter) else {
+            let Some(interpreter_on_host) = to_host(&interpreter) else {
                 return Err(format!(
                     "its program interpreter {} is hidden by a mount",
                     interpreter.display()
@@ -497,12 +559,41 @@ pub fn resolve_auto(
             };
             objects.push((
                 format!("its program interpreter {}", interpreter.display()),
-                IsaNeeds::read_path_strict(&host),
+                isa_needs_on(host, &interpreter_on_host),
             ));
         }
         Err(why) => return Err(format!("{} cannot be read: {why}", image.display())),
     }
-    detcore::exec_record::auto_profile(&objects)
+    auto_profile_on(host, &objects)
+}
+
+/// [`detcore::exec_record::auto_profile`] of `objects` on a host of ELF
+/// machine `host`, whose refusal of an object it could not read names what
+/// that host runs: on a host that is not x86-64, an image of the host's own
+/// machine or an x86-64 image, not an x86-64 image alone.
+fn auto_profile_on(
+    host: u16,
+    objects: &[(String, Option<detcore::exec_record::IsaNeeds>)],
+) -> Result<(CpuProfile, String), String> {
+    use detcore::exec_record::IsaNeeds;
+    if host != EM_X86_64 && host != 0 {
+        // The first object auto would refuse, in the order it refuses them.
+        let first = objects
+            .iter()
+            .find(|(_, needs)| matches!(needs, None | Some(IsaNeeds::Malformed(_))));
+        if let Some((what, None)) = first {
+            return Err(format!(
+                "{what} is unreadable, or neither a little-endian ELF64 image for this \
+                 {} host nor an x86-64 one",
+                if host == EM_AARCH64 {
+                    "aarch64"
+                } else {
+                    "non-x86-64"
+                }
+            ));
+        }
+    }
+    detcore::exec_record::auto_profile(objects)
 }
 
 /// Resolve a configuration's auto profile for a library launch of `command`
@@ -1763,6 +1854,67 @@ mod tests {
                 .unwrap_err()
                 .contains("XSAVEERPTR")
         );
+    }
+
+    /// On a host that is not x86-64, `--cpu-profile auto` names the default
+    /// profile for an ELF64 image built for that host's machine, and for its
+    /// program interpreter, instead of refusing it as not x86-64. An x86-64
+    /// host still refuses such an image, every host still refuses a file
+    /// that is not an ELF64 image, and a missing interpreter is still
+    /// refused by name.
+    #[test]
+    fn auto_names_the_default_for_an_image_of_a_host_that_is_not_x86_64() {
+        let directory = tempfile::tempdir().unwrap();
+        // A little-endian ELF64 executable for `machine`, naming `interpreter`
+        // in a PT_INTERP right after its one program header, if any.
+        let image = |name: &str, machine: u16, interpreter: Option<&std::path::Path>| {
+            let mut bytes = vec![0_u8; 64];
+            bytes[..4].copy_from_slice(b"\x7fELF");
+            bytes[4] = 2; // ELFCLASS64
+            bytes[5] = 1; // ELFDATA2LSB
+            bytes[6] = 1; // EV_CURRENT
+            bytes[16..18].copy_from_slice(&2_u16.to_le_bytes()); // ET_EXEC
+            bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+            bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+            bytes[52..54].copy_from_slice(&64_u16.to_le_bytes()); // e_ehsize
+            bytes[54..56].copy_from_slice(&56_u16.to_le_bytes()); // e_phentsize
+            if let Some(interpreter) = interpreter {
+                bytes[32..40].copy_from_slice(&64_u64.to_le_bytes()); // e_phoff
+                bytes[56..58].copy_from_slice(&1_u16.to_le_bytes()); // e_phnum
+                let mut name = interpreter.as_os_str().as_encoded_bytes().to_vec();
+                name.push(0);
+                let mut header = vec![0_u8; 56];
+                header[..4].copy_from_slice(&3_u32.to_le_bytes()); // PT_INTERP
+                header[8..16].copy_from_slice(&120_u64.to_le_bytes()); // p_offset
+                header[32..40].copy_from_slice(&(name.len() as u64).to_le_bytes());
+                bytes.extend(header);
+                bytes.extend(name);
+            }
+            let path = directory.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let same = |path: &std::path::Path| Some(path.to_path_buf());
+        let loader = image("loader", super::EM_AARCH64, None);
+        let program = image("program", super::EM_AARCH64, Some(&loader));
+        let (profile, _) = super::resolve_auto_on(super::EM_AARCH64, &program, same)
+            .expect("an aarch64 image on an aarch64 host resolves");
+        assert_eq!(profile, super::CpuProfile::X86_64V2);
+        let why = super::resolve_auto_on(super::EM_X86_64, &program, same).unwrap_err();
+        assert!(why.contains("not an x86-64 ELF64 image"), "{why}");
+        let text = directory.path().join("text");
+        std::fs::write(&text, b"not an image\n").unwrap();
+        let why = super::resolve_auto_on(super::EM_X86_64, &text, same).unwrap_err();
+        assert!(why.contains("not an x86-64 ELF64 image"), "{why}");
+        let why = super::resolve_auto_on(super::EM_AARCH64, &text, same).unwrap_err();
+        assert!(why.contains("neither a little-endian ELF64 image"), "{why}");
+        let orphan = image(
+            "orphan",
+            super::EM_AARCH64,
+            Some(&directory.path().join("no-such-loader")),
+        );
+        let why = super::resolve_auto_on(super::EM_AARCH64, &orphan, same).unwrap_err();
+        assert!(why.contains("no-such-loader"), "{why}");
     }
 
     /// `--cpu-profile auto` follows a valid script chain (script to
