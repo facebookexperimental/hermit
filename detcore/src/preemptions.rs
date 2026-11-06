@@ -8017,8 +8017,35 @@ pub fn read_trace(path: &Path) -> Vec<SchedEvent> {
 }
 
 fn read_preemption_record(path: &Path) -> PreemptionRecord {
-    let parsed = boundary_recording::Recording::read(path)
-        .and_then(|recording| recording.into_legacy("legacy preemption reader"));
+    // This reader historically read the file as a String, so invalid UTF-8
+    // anywhere — including a field the typed record ignores — is refused.
+    // `Recording::read` streams without that check, so validate UTF-8 in a
+    // first streaming pass, then decode the identity envelope as `Recording`
+    // does. A boundary recording is refused by `into_legacy`, as its legacy
+    // parse always failed.
+    let parsed = (|| -> anyhow::Result<PreemptionRecord> {
+        use std::io::Read;
+        use std::io::Seek;
+        use std::io::SeekFrom;
+
+        use anyhow::Context;
+
+        let mut file = std::fs::File::open(path)?;
+        let start = file.stream_position().unwrap_or(0);
+        let recording = if file.seek(SeekFrom::Start(start)).is_ok() {
+            streaming::parse_utf8_pass::<serde::de::IgnoredAny, _>(&mut file)?;
+            file.seek(SeekFrom::Start(start))?;
+            boundary_recording::Recording::read_from(&mut file)
+                .with_context(|| format!("reading schedule {}", path.display()))?
+        } else {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            std::str::from_utf8(&bytes)
+                .map_err(|e| anyhow::anyhow!("invalid UTF-8 history input: {e}"))?;
+            boundary_recording::Recording::decode_from(path, &bytes)?
+        };
+        recording.into_legacy("legacy preemption reader")
+    })();
     let pr = parsed.unwrap_or_else(|error| {
         panic!(
             "Error reading preemption record {}: {error:#}",

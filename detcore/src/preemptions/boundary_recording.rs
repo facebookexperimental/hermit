@@ -1706,6 +1706,16 @@ pub(super) mod tests {
             .is_err()
         );
         assert!(FormatProbe::is_boundary_recording(b"{\"global\": [").is_err());
+        let identity_probe = |text: &str| FormatProbe::has_rcb_history(text.as_bytes()).unwrap();
+        assert!(!identity_probe(r#"{"per_thread": {}, "global": []}"#));
+        assert!(identity_probe(r#"{"rcb_history": {"format": 2}}"#));
+        assert!(identity_probe(r#"{"rcb_history": null}"#));
+        assert!(!identity_probe(
+            r#"{"per_thread": {"3": {"rcb_history": 1}}, "global": []}"#
+        ));
+        assert!(
+            FormatProbe::has_rcb_history(br#"{"rcb_history": null, "rcb_history": null}"#).is_err()
+        );
     }
 
     #[test]
