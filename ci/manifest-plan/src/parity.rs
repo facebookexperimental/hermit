@@ -6320,8 +6320,10 @@ mod tests {
         // (madvise guard regions, https://github.com/rrnewton/hermit/issues/5154)
         // add one row each per candidate backend: 3140.
         // rr/simple (first upstream rr guest, pressure tier) adds one row
-        // per candidate backend: 3145.
-        assert_eq!(parsed.cells.len(), 3145);
+        // per candidate backend: 3145. The gvisor bucket's 148 vendored
+        // cases add one row per candidate backend each (148 x 5) on top:
+        // 3885.
+        assert_eq!(parsed.cells.len(), 3885);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448
