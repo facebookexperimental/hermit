@@ -10073,16 +10073,19 @@ test:
       verify:
         ci:
           ptrace: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - kvm
         guest_args:
           ptrace:
+            - masked
+          kvm:
             - masked
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: Config::backend_supports_blocked_wait_signal_interruption is false on DBT, so the scheduler does not model signal targets and a sibling's signal neither arms a pooled rt_sigsuspend waiter for the release barrier nor is noted at a posted rt_sigsuspend request; qualify DBT separately
-          kvm: 'KVM gap (https://github.com/rrnewton/hermit/issues/5040): KVM''s rt_sigsuspend never sleeps (Detcore''s rt_sigsuspend_never_sleeps); a wait for a signal not yet pending returns ENOSYS at once, so a sibling''s signal cannot end it and the guest exits 1 (`SIGSUSPEND_SIBLING_SIGNAL_WAKE_FAILED`) in 3 of 3 KVM verify runs at Hermit 26eb116d; ptrace and native Linux end the wait with EINTR'
           sabre: Config::backend_supports_blocked_wait_signal_interruption is false on SaBRe, so the scheduler does not model signal targets and a sibling's signal neither arms a pooled rt_sigsuspend waiter for the release barrier nor is noted at a posted rt_sigsuspend request; qualify SaBRe separately
           liteinst: Config::backend_supports_blocked_wait_signal_interruption is false on LiteInst, so the scheduler does not model signal targets and a sibling's signal neither arms a pooled rt_sigsuspend waiter for the release barrier nor is noted at a posted rt_sigsuspend request; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)

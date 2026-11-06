@@ -20194,8 +20194,10 @@ mod nextest_timeout_tests {
                 // cells in this default population).
                 // 2983 with #5154's guard cells: c-programs/madvise-guard-fault
                 // and c-programs/madvise-guard-regions, verify and replay on
-                // ptrace, and madvise-guard-regions verify on KVM.
-                assert_eq!(all.len(), 2983, "the original all-owner population is retained");
+                // ptrace, and madvise-guard-regions verify on KVM. 2984 with
+                // SIGSHARE S2b's KVM verify of
+                // c-programs/sigsuspend-sibling-signal-wake.
+                assert_eq!(all.len(), 2984, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
@@ -21197,9 +21199,11 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // 132. And SIGSHARE S2a's
         // run_kvm_the_drain_decides_a_polled_call_from_the_backends_signal_state:
         // 133. And package K item 2b slice 2b-1's
-        // run_kvm_another_processs_stat_and_comm_answer_as_linux: 134, matching
+        // run_kvm_another_processs_stat_and_comm_answer_as_linux: 134. And
+        // SIGSHARE S2b's
+        // run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux: 135, matching
         // the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 134usize),
+        ("privileged-only-test.cli_kvm", 135usize),
     ] {
         let step = privileged
             .steps

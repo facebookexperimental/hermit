@@ -993,10 +993,10 @@ fn itimer_generation_discard_follows_the_wait_mask() {
 /// (blocked means not ignored), so a copy is pending 45 ms later. A mask
 /// left published from the wait (SIGALRM unblocked) would discard it.
 ///
-/// `ppoll_mask` runs last: on KVM it is a known gap (F' of
+/// `ppoll_mask` runs last: on KVM it was a known gap (F' of
 /// https://github.com/rrnewton/hermit/issues/4929: a masked ppoll that would
-/// wait is refused by name), so the ledger row that records its refusal also
-/// shows that every other kind passed there first.
+/// wait was refused by name) until SIGSHARE S2b let it wait there, and KVM
+/// now requires it.
 #[test]
 fn itimer_a_wait_mask_is_withdrawn_when_the_wait_returns() {
     let guest = fixture(&ITIMER_COALESCE, "itimer_coalesce");

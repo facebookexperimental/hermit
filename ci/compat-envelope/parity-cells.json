@@ -12,9 +12,9 @@
       "applicable": 2273,
       "selectable": 1780,
       "population": 3065,
-      "population_candidate_selected": 1780,
+      "population_candidate_selected": 1781,
       "population_candidate_not_selected": 475,
-      "population_candidate_disabled": 810
+      "population_candidate_disabled": 809
     },
     "by_backend": {
       "dbt": {
@@ -40,9 +40,9 @@
         "applicable": 605,
         "selectable": 596,
         "population": 613,
-        "population_candidate_selected": 596,
+        "population_candidate_selected": 597,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 14
+        "population_candidate_disabled": 13
       },
       "liteinst": {
         "cells": 777,
@@ -1337,7 +1337,7 @@
     {"test_id":"c-programs/sigreturn-preemption","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: The defect this cell guards is in the ptrace backend's reported rt_sigreturn stop; SaBRe reports no sigreturns"},
     {"test_id":"c-programs/sigsuspend-sibling-signal-wake","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Config::backend_supports_blocked_wait_signal_interruption is false on DBT, so the scheduler does not model signal targets and a sibling's signal neither arms a pooled rt_sigsuspend waiter for the release barrier nor is noted at a posted rt_sigsuspend request; qualify DBT separately"},
     {"test_id":"c-programs/sigsuspend-sibling-signal-wake","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
-    {"test_id":"c-programs/sigsuspend-sibling-signal-wake","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM gap (https://github.com/rrnewton/hermit/issues/5040): KVM's rt_sigsuspend never sleeps (Detcore's rt_sigsuspend_never_sleeps); a wait for a signal not yet pending returns ENOSYS at once, so a sibling's signal cannot end it and the guest exits 1 (`SIGSUSPEND_SIBLING_SIGNAL_WAKE_FAILED`) in 3 of 3 KVM verify runs at Hermit 26eb116d; ptrace and native Linux end the wait with EINTR"},
+    {"test_id":"c-programs/sigsuspend-sibling-signal-wake","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/sigsuspend-sibling-signal-wake","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Config::backend_supports_blocked_wait_signal_interruption is false on LiteInst, so the scheduler does not model signal targets and a sibling's signal neither arms a pooled rt_sigsuspend waiter for the release barrier nor is noted at a posted rt_sigsuspend request; qualify LiteInst separately"},
     {"test_id":"c-programs/sigsuspend-sibling-signal-wake","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Config::backend_supports_blocked_wait_signal_interruption is false on SaBRe, so the scheduler does not model signal targets and a sibling's signal neither arms a pooled rt_sigsuspend waiter for the release barrier nor is noted at a posted rt_sigsuspend request; qualify SaBRe separately"},
     {"test_id":"c-programs/sigtimedwait-no-timeout","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},

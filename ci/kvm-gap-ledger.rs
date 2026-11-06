@@ -1505,10 +1505,10 @@ mod tests {
         }
     }
 
-    /// The deadline_slice_cap ledger's rows name their gaps' issues. Its last six rows, the
-    /// lettered gaps of https://github.com/rrnewton/hermit/issues/4929, are skipped on KVM since
-    /// the owner's directive of 2026-11-01 (minibeads dh-j7ocf tracks the fix), each citing the
-    /// issue of its own gap.
+    /// The deadline_slice_cap ledger's rows name their gaps' issues. Its rows, the lettered gaps
+    /// of https://github.com/rrnewton/hermit/issues/4929, are skipped on KVM since the owner's
+    /// directive of 2026-11-01 (minibeads dh-j7ocf tracks the fix), each citing the issue of its
+    /// own gap. C and F' left with SIGSHARE S2b, which KVM now requires.
     #[test]
     fn the_deadline_slice_cap_rows_name_their_issues() {
         let declaration =
@@ -1519,12 +1519,6 @@ mod tests {
                 "itimer_a_private_descriptor_table_consumer_re_arms",
                 "D",
                 4485,
-            ),
-            ("itimer_a_sigsuspend_loop_takes_every_expiry", "C", 5040),
-            (
-                "itimer_a_wait_mask_is_withdrawn_when_the_wait_returns",
-                "F'",
-                4995,
             ),
             (
                 "itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue",
