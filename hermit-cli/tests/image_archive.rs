@@ -8,14 +8,16 @@
 
 //! End-to-end coverage for the local `--image` inputs
 //! (`--image=oci-dir:...` and `--image=docker-archive:...`): both formats
-//! materialize and run a statically linked guest with identical trees,
+//! materialize and run a no-libc guest with identical trees,
 //! malformed inputs are refused by name with exit 125 before any guest
 //! starts, and the pre-existing podman-store path keeps working (driven by
 //! a scripted fake `podman`), while prefixed runs never invoke podman.
 //!
 //! Fixtures are built in-test from the same layer tars — no network, no
-//! real podman. The guest is compiled `cc -static` like the DBT guests in
-//! `cli.rs`, because the image rootfs contains nothing but the fixture.
+//! real podman. The guest is a no-libc binary (`cc -nostdlib
+//! -nodefaultlibs -static`, raw syscalls only), because the image rootfs
+//! contains nothing but the fixture and the pinned validation root has
+//! no static libc to link a `cc -static` guest against.
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
@@ -35,8 +37,14 @@ const APPDIR_MTIME: i64 = 1_600_000_123;
 
 static GUEST: OnceLock<PathBuf> = OnceLock::new();
 
-/// The statically linked guest: prints a marker, the image-declared env, and
-/// its working directory so tests can prove config application.
+/// The no-libc guest: prints a marker, the image-declared env, and its
+/// working directory so tests can prove config application. It uses raw
+/// x86_64 syscalls (write, getcwd, exit) from its own `_start` and links
+/// with `-nostdlib -nodefaultlibs`, so building it needs no libc at all —
+/// the pinned validation root ships no static libc for `cc -static`.
+/// Its stdout is byte-for-byte the old libc guest's: the marker line,
+/// `TEST_ENV=`/`STORE_ENV=` (or `(unset)`), and `CWD=` when getcwd
+/// succeeds.
 fn guest_binary() -> &'static Path {
     GUEST.get_or_init(|| {
         let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -47,29 +55,86 @@ fn guest_binary() -> &'static Path {
         std::fs::write(
             &source,
             r#"
-#include <limits.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-
-int main(void) {
-    char cwd[PATH_MAX];
-    const char *test_env = getenv("TEST_ENV");
-    const char *store_env = getenv("STORE_ENV");
-    printf("GUEST_MARKER=hello-from-image\n");
-    printf("TEST_ENV=%s\n", test_env ? test_env : "(unset)");
-    printf("STORE_ENV=%s\n", store_env ? store_env : "(unset)");
-    if (getcwd(cwd, sizeof(cwd)) != NULL) {
-        printf("CWD=%s\n", cwd);
-    }
-    return 0;
+/* No-libc guest: raw x86_64 syscalls only (write=1, getcwd=79, exit=60). */
+typedef unsigned long u64;
+static inline long sys3(long n, long a, long b, long c) {
+    long ret;
+    __asm__ volatile("syscall" : "=a"(ret)
+                     : "a"(n), "D"(a), "S"(b), "d"(c)
+                     : "rcx", "r11", "memory");
+    return ret;
 }
+static u64 slen(const char *s) {
+    u64 n = 0;
+    while (s[n] != '\0') n++;
+    return n;
+}
+static void write_str(const char *s) {
+    u64 left = slen(s);
+    const char *p = s;
+    while (left > 0) {
+        long w = sys3(1, 1, (long)p, (long)left);
+        if (w <= 0) return;
+        p += w;
+        left -= (u64)w;
+    }
+}
+static const char *find_env(char **envp, const char *name) {
+    u64 nlen = slen(name);
+    for (u64 i = 0; envp[i] != 0; i++) {
+        const char *e = envp[i];
+        u64 j = 0;
+        while (j < nlen && e[j] == name[j]) j++;
+        if (j == nlen && e[j] == '=') return e + nlen + 1;
+    }
+    return "(unset)";
+}
+static char cwd_buf[4096];
+void guest_main(long *stack) {
+    long argc = stack[0];
+    char **argv = (char **)(stack + 1);
+    char **envp = argv + argc + 1;
+    write_str("GUEST_MARKER=hello-from-image\n");
+    write_str("TEST_ENV=");
+    write_str(find_env(envp, "TEST_ENV"));
+    write_str("\n");
+    write_str("STORE_ENV=");
+    write_str(find_env(envp, "STORE_ENV"));
+    write_str("\n");
+    long r = sys3(79, (long)cwd_buf, (long)sizeof(cwd_buf), 0);
+    if (r > 0) {
+        cwd_buf[sizeof(cwd_buf) - 1] = '\0';
+        write_str("CWD=");
+        write_str(cwd_buf);
+        write_str("\n");
+    }
+}
+__asm__(
+    ".globl _start\n"
+    "_start:\n"
+    " mov %rsp, %rdi\n"
+    " and $-16, %rsp\n"
+    " call guest_main\n"
+    " mov $60, %rax\n"
+    " xor %edi, %edi\n"
+    " syscall\n");
 "#,
         )
         .expect("write guest source");
         let guest = build_root.join("guest");
         let output = Command::new("cc")
-            .args(["-static", "-O2", "-Wall", "-Wextra", "-Werror", "-o"])
+            .args([
+                "-nostdlib",
+                "-nodefaultlibs",
+                "-ffreestanding",
+                "-fno-builtin",
+                "-static",
+                "-O2",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-o",
+            ])
             .arg(&guest)
             .arg(&source)
             .output()
