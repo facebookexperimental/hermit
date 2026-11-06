@@ -47547,6 +47547,61 @@ fn run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux() {
             );
         }
     }
+    // Review of https://github.com/rrnewton/hermit/pull/5175 at 048870af: the
+    // roles swapped (`root-sender`: the main thread sends SIGWINCH to a
+    // suspended thread, then installs a handler at once) under targeted
+    // chaos, which can place the woken waiter behind the setter's yield. At
+    // 048870af seeds 1, 3 and 4 of these (and 5, 7, 8) ran the stale handler
+    // (`winch_runs=1`): the guard saw only the park, not the woken but
+    // unserved waiter. Linux discarded SIGWINCH at send. KVM only
+    // (https://github.com/rrnewton/hermit/issues/5179).
+    for (mode, expected, seeds) in [
+        (
+            "root-sender",
+            "root-sender eintr=1 usr1_runs=1 winch_runs=0 mask_ok=1 winch_after=0\n",
+            1..=4,
+        ),
+        (
+            "late-ignored-same-turn",
+            "late-ignored-same-turn eintr=1 usr1_runs=1 winch_runs=0 winch_after=0\n",
+            1..=2,
+        ),
+    ] {
+        for seed in seeds {
+            let seed_arg = format!("--seed={seed}");
+            let fuzz_arg = format!("--fuzz-seed={seed}");
+            let report = directory.path().join(format!("{mode}-chaos-{seed}.json"));
+            let report_arg = report.to_str().unwrap().to_owned();
+            let args = [
+                "--backend=kvm",
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                report_arg.as_str(),
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--chaos",
+                seed_arg.as_str(),
+                "--max-timeslice=0",
+                "--chaos-target-races",
+                fuzz_arg.as_str(),
+                "--",
+                guest.as_str(),
+                mode,
+            ];
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "kvm {mode} chaos seed {seed}");
+            let verdict: serde_json::Value =
+                serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+            assert_eq!(
+                verdict["bitwise_parity"], true,
+                "kvm {mode} chaos seed {seed}: {verdict}"
+            );
+        }
+    }
 }
 
 /// A signal sent to a guest blocked in a call Detcore polls internally (a

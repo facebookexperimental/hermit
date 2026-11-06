@@ -1843,6 +1843,13 @@ pub struct Scheduler {
     /// under `models_signal_targets`. False on every run today: no host sets
     /// the gate before step 3c.1f.
     in_guest_signal_delivery: bool,
+    /// SIGSHARE S2b: each parked KVM `rt_sigsuspend` the step-2 drain woke
+    /// (`wake_backend_signal_waits`) and that has not been granted its turn
+    /// yet, with its temporary mask. Its request is then the signal set, no
+    /// longer the park, but an ignored signal it was woken to remove is still
+    /// pending (`suspend_holds_discarded`). Removed at the thread's grant
+    /// (`unblock_guest`), in whose turn the waiter settles.
+    backend_suspend_woken: BTreeMap<DetTid, u64>,
     /// While a timed signal is dispatched (`dispatch_timed_signal`), the
     /// time it was due; `None` for a send at the commit point itself, whose
     /// time is `committed_time`. See `signal_sent_at`.
@@ -6062,6 +6069,7 @@ impl Scheduler {
             pending_cross_task_signals: Default::default(),
             models_signal_targets: cfg.models_signal_targets(),
             in_guest_signal_delivery: cfg.in_guest_signal_delivery,
+            backend_suspend_woken: BTreeMap::new(),
             signal_sent_at: None,
             in_guest_reserved_signals: cfg.in_guest_reserved_signals,
             host_timed_signals: Default::default(),
@@ -16511,6 +16519,7 @@ impl Scheduler {
             self.fail_parked(dettid, failure);
             return false;
         }
+        self.note_backend_suspend_replaced(dettid);
         match self.next_turns.get_mut(&dettid) {
             Some(next_turn) => {
                 next_turn.req = req;
@@ -16587,6 +16596,7 @@ impl Scheduler {
         // The substituted request resolves any polling wait the thread was in.
         self.end_sigalrm_polling_wait(dettid);
 
+        self.note_backend_suspend_replaced(dettid);
         if let Some(nxt) = self.next_turns.get_mut(&dettid) {
             // Counterfeit the entry as though the thread had requested this resource from the start:
             nxt.req = Ivar::full(Ok(rsrcs));
@@ -20940,6 +20950,8 @@ impl Scheduler {
     /// Precondition: guest is stopped.
     /// Postcondition: guest is running concurrently with this scheduler/tracer thread.
     fn unblock_guest(&mut self, dtid: DetTid, resp: &Ivar<SchedResponse>) -> Result<(), SkipTurn> {
+        // A woken KVM rt_sigsuspend settles in the turn granted here.
+        self.backend_suspend_woken.remove(&dtid);
         self.prepare_boundary_grant(dtid)
             .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
         trace!(

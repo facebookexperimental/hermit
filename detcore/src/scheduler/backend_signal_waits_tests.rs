@@ -570,3 +570,34 @@ fn a_parked_suspend_holds_a_discarded_signal_only_while_it_is_ignored_and_let_in
         "a masked poll"
     );
 }
+
+/// Mutation "only the park holds" (review of
+/// https://github.com/rrnewton/hermit/pull/5175 at 048870af): once the drain
+/// wakes a waiter for an ignored signal, its request is the signal set, not
+/// the park, but the signal is still pending until the waiter's own turn
+/// removes it, so the query still holds; it stops holding at the waiter's
+/// grant, in whose turn the removal runs.
+#[test]
+fn a_woken_waiter_holds_a_discarded_signal_until_its_turn() {
+    let winch = bit(libc::SIGWINCH);
+    let sets = state(winch, 0, winch, 0, 0);
+    let (mut scheduler, control) = parked_suspend(0, sets);
+    control.script(WAITER, vec![Ok(sets)]);
+    assert!(
+        scheduler.suspend_holds_discarded(PROCESS, libc::SIGWINCH),
+        "parked"
+    );
+    scheduler.wake_backend_signal_waits();
+    assert_eq!(woken(&scheduler, WAITER), Some(vec![libc::SIGWINCH]));
+    assert_eq!(scheduler.backend_suspend_mask(WAITER), None);
+    assert!(
+        scheduler.suspend_holds_discarded(PROCESS, libc::SIGWINCH),
+        "woken, not yet granted"
+    );
+    let response = scheduler.next_turns[&WAITER].resp.clone();
+    assert!(scheduler.unblock_guest(WAITER, &response).is_ok());
+    assert!(
+        !scheduler.suspend_holds_discarded(PROCESS, libc::SIGWINCH),
+        "granted: the waiter's own turn removes it"
+    );
+}

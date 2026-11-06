@@ -119,6 +119,17 @@ impl Scheduler {
         }
     }
 
+    /// Called wherever a thread's filed request is replaced (a wake): if it
+    /// was a parked `rt_sigsuspend` this module decides, the thread's
+    /// temporary mask is kept (`backend_suspend_woken`) until its grant, so
+    /// `suspend_holds_discarded` still sees the waiter while it is woken but
+    /// not yet served, whatever woke it.
+    pub(crate) fn note_backend_suspend_replaced(&mut self, dettid: DetTid) {
+        if let Some(mask) = self.backend_suspend_mask(dettid) {
+            self.backend_suspend_woken.insert(dettid, mask);
+        }
+    }
+
     /// Whether `process` has a child, live or not yet reaped, whose exit
     /// signal is `SIGCHLD`: then a `SIGCHLD` pending for it may be a child's
     /// exit, which SIGSHARE S4 owns.
@@ -157,16 +168,19 @@ impl Scheduler {
         }
     }
 
-    /// Whether a parked `rt_sigsuspend` of `process` (`backend_suspend_mask`)
-    /// whose temporary mask lets `signal` in has it pending, on its own queue
-    /// or the process's, while the process ignores it: Linux discarded it when
-    /// it was sent (`sig_ignored`, kernel/signal.c), and the waiter has not yet
-    /// removed it in its own turn (`wake_backend_signal_waits`). A call that
+    /// Whether an `rt_sigsuspend` of `process` whose temporary mask lets
+    /// `signal` in has it pending, on its own queue or the process's, while
+    /// the process ignores it: Linux discarded it when it was sent
+    /// (`sig_ignored`, kernel/signal.c), and the waiter has not yet removed it
+    /// in its own turn. The waiter is either parked (`backend_suspend_mask`)
+    /// or woken by the drain and not yet granted its turn
+    /// (`backend_suspend_woken`): its request is then the signal set, not the
+    /// park, and the signal is still pending until that turn. A call that
     /// would stop ignoring `signal` (`Detcore::handle_rt_sigaction`) asks this
-    /// first, and lets the waiter run until it is false, so the change never
-    /// makes deliverable a signal Linux no longer holds. Only waiters this
-    /// module decides are read, from their committed state, in DetTid order;
-    /// a gone or unreadable one holds nothing (the scan names the latter).
+    /// first, and does not change the action while it is true, so the change
+    /// never makes deliverable a signal Linux no longer holds. Waiters are
+    /// read from their committed state, in DetTid order; a gone or unreadable
+    /// one holds nothing (the scan names the latter).
     pub(crate) fn suspend_holds_discarded(&self, process: DetPid, signal: i32) -> bool {
         if !reads_signal_state_from_backend(&self.backend)
             || self.in_guest_signal_delivery
@@ -177,6 +191,7 @@ impl Scheduler {
         let bit = kernel_signal_bit(signal);
         self.next_turns.keys().any(|&dettid| {
             self.backend_suspend_mask(dettid)
+                .or_else(|| self.backend_suspend_woken.get(&dettid).copied())
                 .is_some_and(|mask| mask & bit == 0)
                 && self.registered_process(dettid) == Some(process)
                 && self.backend_waiter_is_current(process, dettid)

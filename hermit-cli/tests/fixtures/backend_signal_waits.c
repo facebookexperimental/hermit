@@ -53,6 +53,11 @@
  *                  so only SIGUSR1's handler runs.
  *   late-ignored-same-turn: the same, with the handler installed and SIGUSR1
  *                  sent at once after SIGWINCH.
+ *   root-sender:   the roles swapped: a second thread waits in
+ *                  sigsuspend(empty), and the main thread sends it SIGWINCH,
+ *                  at once installs a SIGWINCH handler, then sends SIGUSR1
+ *                  (review of PR 5175 at 048870af). Linux discarded SIGWINCH
+ *                  at send, so only SIGUSR1's handler runs.
  */
 
 #define _GNU_SOURCE
@@ -446,6 +451,48 @@ static int late_ignored(const char* name, int same_turn) {
   return 0;
 }
 
+static int root_eintr;
+static int root_mask_ok;
+static int root_winch_after;
+
+static void* root_waiter(void* arg) {
+  (void)arg;
+  waiter_tid = (pid_t)syscall(SYS_gettid);
+  atomic_store(&waiting, 1);
+  root_eintr = suspend_empty();
+  sigset_t now;
+  sigprocmask(SIG_SETMASK, NULL, &now);
+  root_mask_ok =
+      sigismember(&now, SIGUSR1) == 1 && sigismember(&now, SIGWINCH) == 1;
+  root_winch_after = pending(SIGWINCH);
+  return NULL;
+}
+
+static int root_sender(void) {
+  install(SIGUSR1, on_usr1);
+  install(SIGWINCH, SIG_DFL);
+  block(SIG_BLOCK, SIGUSR1);
+  block(SIG_BLOCK, SIGWINCH);
+  pthread_t thread;
+  pthread_create(&thread, NULL, root_waiter, NULL);
+  while (!atomic_load(&waiting)) {
+    sched_yield();
+  }
+  sleep_ms(50);
+  syscall(SYS_tgkill, getpid(), waiter_tid, SIGWINCH);
+  install(SIGWINCH, on_winch);
+  syscall(SYS_tgkill, getpid(), waiter_tid, SIGUSR1);
+  pthread_join(thread, NULL);
+  printf(
+      "root-sender eintr=%d usr1_runs=%d winch_runs=%d mask_ok=%d winch_after=%d\n",
+      root_eintr,
+      (int)usr1_runs,
+      (int)winch_runs,
+      root_mask_ok,
+      root_winch_after);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     puts("BACKEND_SIGNAL_WAITS_USAGE");
@@ -480,6 +527,8 @@ int main(int argc, char** argv) {
     return late_ignored("late-ignored", 0);
   } else if (strcmp(mode, "late-ignored-same-turn") == 0) {
     return late_ignored("late-ignored-same-turn", 1);
+  } else if (strcmp(mode, "root-sender") == 0) {
+    return root_sender();
   }
   puts("BACKEND_SIGNAL_WAITS_USAGE");
   return 2;

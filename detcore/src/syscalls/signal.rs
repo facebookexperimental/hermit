@@ -1359,6 +1359,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         temporary_mask: KernelSigset,
     ) -> Result<i64, Error> {
         let installed = kernel_installed_signal_mask(temporary_mask);
+        // Whether the thread has parked: every let-in signal pending after
+        // that arrived while it waited (the park follows a decline that found
+        // none), and an ignored one Linux discarded when it was sent.
+        let mut parked = false;
         loop {
             // A removal's scratch stack below the red zone may have covered
             // the copy, so it is written before every run.
@@ -1368,7 +1372,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Ok(result?);
             }
             let state = crate::syscalls::read_guest_wait_signal_state(guest)?;
-            let reason = match settle_suspend_decline(&state, installed) {
+            let reason = match settle_suspend_decline(&state, installed, parked) {
                 SuspendDecline::Waits => None,
                 SuspendDecline::Discard(ignored) => {
                     crate::syscalls::helpers::remove_signals_discarded_under_a_temporary_mask(
@@ -1429,6 +1433,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut request = Self::sleep_request_abs(guest, LogicalTime::INDEFINITE).await;
             request.fyi(crate::resources::RT_SIGSUSPEND_FYI);
             request.blocked_signal_mask = Some(installed);
+            parked = true;
             // Whatever the resume, the backend's call decides again.
             let _ = resource_request(guest, request).await;
         }
@@ -5272,12 +5277,24 @@ pub(crate) enum SuspendDecline {
 /// that one are the ones to remove; the ones behind it stay pending under the
 /// handler's mask or are discarded after the delivery, depending on that mask,
 /// and the backend's state does not report it, so they are `Mixed`.
+///
+/// After the thread has parked (`parked`), every let-in signal pending
+/// arrived while it waited, under the temporary mask: each ignored one was
+/// discarded when it was sent (`sig_ignored`, `prepare_signal`), wherever it
+/// falls in dequeue order, so all of them are removed first. A call that
+/// would stop ignoring one waits for that removal
+/// (`Scheduler::suspend_holds_discarded`), so it is still ignored here.
 pub(crate) fn settle_suspend_decline(
     state: &crate::syscalls::KernelSignalState,
     installed: KernelSigset,
+    parked: bool,
 ) -> SuspendDecline {
     let mask = installed | kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32);
     let ignored = crate::syscalls::ignored_at_generation(state.ignored, state.caught);
+    let discarded_at_send = state.pending & !mask & ignored;
+    if parked && discarded_at_send != 0 {
+        return SuspendDecline::Discard(discarded_at_send);
+    }
     let stops = state.default_job_control_stops() | kernel_sigset_bit(libc::SIGSTOP);
     let mut rest = *state;
     let mut discard = 0;
@@ -8547,10 +8564,53 @@ mod suspend_decline_tests {
         ];
         for (name, state, installed, expected) in rows {
             assert_eq!(
-                settle_suspend_decline(&state, installed),
+                settle_suspend_decline(&state, installed, false),
                 expected,
                 "{name}"
             );
         }
+    }
+
+    /// Mutation "dequeue order after the park": once the thread has parked,
+    /// every ignored let-in signal arrived while it waited, and Linux
+    /// discarded it at send wherever it falls behind a caught one or a stop.
+    #[test]
+    fn after_the_park_every_ignored_signal_was_discarded_at_send() {
+        let usr1 = bit(libc::SIGUSR1);
+        let winch = bit(libc::SIGWINCH);
+        let urg = bit(libc::SIGURG);
+        let tstp = bit(libc::SIGTSTP);
+        for (name, state, expected) in [
+            (
+                "caught, then ignored",
+                state(usr1 | winch, 0, 0, usr1),
+                SuspendDecline::Discard(winch),
+            ),
+            (
+                "two ignored, two queues",
+                state(winch, urg, 0, usr1),
+                SuspendDecline::Discard(winch | urg),
+            ),
+            (
+                "only caught",
+                state(usr1, 0, 0, usr1),
+                SuspendDecline::Declined,
+            ),
+            (
+                "a stop, then ignored",
+                state(tstp | winch, 0, 0, 0),
+                SuspendDecline::Discard(winch),
+            ),
+            ("a stop alone", state(tstp, 0, 0, 0), SuspendDecline::Stop),
+            ("nothing", state(0, 0, 0, usr1), SuspendDecline::Waits),
+        ] {
+            assert_eq!(settle_suspend_decline(&state, 0, true), expected, "{name}");
+        }
+        let blocked = state(usr1 | winch, 0, 0, usr1);
+        assert_eq!(
+            settle_suspend_decline(&blocked, winch, true),
+            SuspendDecline::Declined,
+            "an ignored one the temporary mask blocks stays"
+        );
     }
 }
