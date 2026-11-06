@@ -1282,7 +1282,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the departed shell py_hello replay (dh-9r2mg): 1950 - 1 = 1949.
     // PR 4920 (3): two model/config units: 1955 + 2 = 1957.
     // drain/4709: main + this change's detcore-model cpu_profile test (+1).
-    ("test.regular_crates", 1959),
+    ("test.regular_crates", 1961),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2008,7 +2008,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the five concurrent-probe xstate_probe tests (dh-jqhfx, PR 5182;
     // xstate_probe tests in mod.rs 11 -> 16): 1268 + 5 = 1273, composed as
     // main + (head - base).
-    ("test.hermit_unit", 1301),
+    ("test.hermit_unit", 1314),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3309,7 +3309,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler a_replayed_switch_wakes_its_due_target, restored from
     // https://github.com/rrnewton/hermit/pull/4889: 3492 + 2 = 3494
     // (wake unit + deferred-SIGCHLD negative arm).
-    ("test.detcore_unit", 3544),
+    ("test.detcore_unit", 3548),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5404,7 +5404,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (dh-9r2mg) named losses: 1937 - 2 = 1935.
     // PR 4920 (3): the same two units: 1941 + 2 = 1943.
     // drain/4709: main + this change's detcore-model cpu_profile test (+1).
-    ("test.regular_crates_on_host", 1945),
+    ("test.regular_crates_on_host", 1947),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5986,7 +5986,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unit (same growth as test.detcore_unit, PR #4926): 3469 + 1 = 3470.
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
-    ("test.detcore_unit_on_host", 3544),
+    ("test.detcore_unit_on_host", 3548),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6413,7 +6413,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // bisection-checkpoint, workspace-source and guest-log units): +8.
     // And the same five concurrent-probe xstate_probe tests as
     // test.hermit_unit (dh-jqhfx, PR 5182): 1262 + 5 = 1267.
-    ("test.hermit_unit_on_host", 1295),
+    ("test.hermit_unit_on_host", 1308),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6656,7 +6656,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (dh-9r2mg) named losses: 1937 - 2 = 1935.
     // PR 4920 (3): the same two units: 1941 + 2 = 1943.
     // drain/4709: main + this change's detcore-model cpu_profile test (+1).
-    ("test.regular_crates_on_host", 1945),
+    ("test.regular_crates_on_host", 1947),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
