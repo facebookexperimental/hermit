@@ -8643,6 +8643,8 @@ fn write_plan_after_scorecard_check(
             // this graph had before the runner learned about fail-fast families.
             // Scoping the pressure graph into families is a separate decision.
             fail_fast_family: None,
+            publishes: Vec::new(),
+            artifact_deps: Vec::new(),
             hint: ResourceHint {
                 resources: BTreeMap::from([("cargo_writer".into(), 1)]),
                 rss_baseline_bytes: Some(1_073_741_824),
@@ -8875,6 +8877,8 @@ fn write_plan_after_scorecard_check(
                 // this graph had before the runner learned about fail-fast families.
                 // Scoping the pressure graph into families is a separate decision.
                 fail_fast_family: None,
+                publishes: Vec::new(),
+                artifact_deps: Vec::new(),
                 hint: ResourceHint {
                     resources,
                     rss_baseline_bytes: Some(memory / 3),
@@ -8934,6 +8938,8 @@ fn write_plan_after_scorecard_check(
         // this graph had before the runner learned about fail-fast families.
         // Scoping the pressure graph into families is a separate decision.
         fail_fast_family: None,
+        publishes: Vec::new(),
+        artifact_deps: Vec::new(),
         hint: ResourceHint {
             rss_baseline_bytes: Some(268_435_456),
             hard_mem_max_bytes: Some(1_073_741_824),
@@ -9398,6 +9404,8 @@ fn full_memory_dag(
                 write_domain_guarantee: None,
                 explains: Vec::new(),
                 fail_fast_family: None,
+                publishes: Vec::new(),
+                artifact_deps: Vec::new(),
             });
             step.group = "cell".into();
             step.job = slug;
