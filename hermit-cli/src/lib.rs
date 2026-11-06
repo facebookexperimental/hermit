@@ -8988,22 +8988,35 @@ mod tests {
     #[test]
     fn run_with_output_admits_the_matching_exclusive_rewrite() {
         let dir = tempfile::tempdir().unwrap();
-        // Records of this Hermit's rewriter, whatever its format version.
+        // Records of this Hermit's rewriter, whatever its format version,
+        // stating this host's qualified RCB identity in the envelope every
+        // current recording carries: admission reaches the rewrite check
+        // this test exercises only past identity admission, as the
+        // refusing sibling above (whose bare records take the earlier
+        // rewrite refusal) does not need to.
+        let host = reverie::pmu_config::resolve_host_clock()
+            .expect("admitting a replay needs this host's RCB clock qualified");
+        let enveloped = |json: String| {
+            format!(
+                r#"{{"rcb_history":{{"format":2,"identity":"{}","recording":{json}}}}}"#,
+                host.metric.id()
+            )
+        };
         let current = crate::aarch64_lse::REWRITE_FORMAT_VERSION;
         for (name, json, in_memory, overlay) in [
             (
                 "memory-now.json",
-                format!(
+                enveloped(format!(
                     r#"{{"per_thread":{{}},"global":[],"rewrite_exclusives_in_memory":true,"rewrite_exclusives":{{"mode":"memory","format_version":{current}}}}}"#
-                ),
+                )),
                 true,
                 false,
             ),
             (
                 "overlay-now.json",
-                format!(
+                enveloped(format!(
                     r#"{{"per_thread":{{}},"global":[],"rewrite_exclusives":{{"mode":"overlay","format_version":{current}}}}}"#
-                ),
+                )),
                 false,
                 true,
             ),
