@@ -633,10 +633,17 @@ fn require_declared_diagnostics(
 
 /// The default schema-2 structured report: one terminal row per executed
 /// cell, `pass` only for a PASS (an ERROR is a `fail`), with its attempt
-/// count. A HOST-INAPPLICABLE cell executed nothing and has no row.
+/// count. A HOST-INAPPLICABLE cell executed nothing and has no row. A cell
+/// fail-fast never dispatched (report 279) has an empty history: it was
+/// cancelled, not measured, so it has no row either — skipping it is what
+/// lets the verdict cells' rows be written at all instead of the whole
+/// report being refused for "cell result has no attempts".
 fn terminal_test_results(histories: &[Vec<CellResult>]) -> Result<TestResults, String> {
     let mut rows = Vec::new();
     for history in histories {
+        if history.is_empty() {
+            continue;
+        }
         let (result, attempts) = cell_result_and_attempts_after_retries(history)?;
         if result.outcome == "HOST-INAPPLICABLE" {
             continue;
@@ -666,6 +673,11 @@ fn terminal_test_results(histories: &[Vec<CellResult>]) -> Result<TestResults, S
 fn structured_test_results(histories: &[Vec<CellResult>]) -> Result<TestResults, String> {
     let mut rows = Vec::new();
     for history in histories {
+        // Cancelled by fail-fast (empty history): no row, as in
+        // `terminal_test_results`; the verdict cells still write.
+        if history.is_empty() {
+            continue;
+        }
         let (result, _) = cell_result_and_attempts_after_retries(history)?;
         if result.outcome == "HOST-INAPPLICABLE" {
             continue;
@@ -3696,6 +3708,33 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         .filter(|index| !returned.contains(index))
         .map(|index| tpx_test_name(&cells[index].id))
         .collect::<Vec<_>>();
+    // Cells fail-fast never dispatched are cancelled, not errors without
+    // attempts (report 279): name each one as cancelled, in the run's own
+    // words, and carry the set in summary.json below. A missing cell with
+    // a non-empty history was dispatched and lost its result another way;
+    // it stays in `missing` above and is never relabelled cancelled.
+    let cancelled_cells = (0..expected)
+        .filter(|index| !returned.contains(index) && attempt_results[*index].is_empty())
+        .map(|index| {
+            let cell = &cells[index];
+            println!(
+                "CANCELLED {} ({}/{}): not dispatched{}",
+                cell.id.test,
+                cell.id.mode,
+                cell.id.backend.as_deref().unwrap_or("native"),
+                if stop.load(Ordering::Relaxed) {
+                    " (fail-fast stopped dispatching)"
+                } else {
+                    ""
+                }
+            );
+            serde_json::json!({
+                "test": cell.id.test,
+                "mode": cell.id.mode,
+                "backend": cell.id.backend,
+            })
+        })
+        .collect::<Vec<_>>();
     if indexed_results.len() != expected {
         let reason = format!(
             "only {} of {expected} selected cells returned a result",
@@ -3921,6 +3960,10 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             .map(|retried| retried_attempt_json(retried))
             .collect::<Vec<_>>(),
         "host_inapplicable": host_inapplicable,
+        // Selected cells that never dispatched (fail-fast): cancelled,
+        // never counted as passed/failed/errors above.
+        "cancelled": cancelled_cells.len(),
+        "cancelled_cells": cancelled_cells,
         "cell_cpu_usage_usec": cell_cpu_usage_usec,
         "host_inapplicable_cells": results
             .iter()
@@ -4735,6 +4778,7 @@ mod tests {
     use super::scheduled_worker_capacity;
     use super::shell_quote_one;
     use super::structured_test_results;
+    use super::terminal_test_results;
     use super::unique_plan_rows;
     use super::validate_args;
     use super::validation_audit_worker_capacity;
@@ -8947,6 +8991,66 @@ sys.exit(1 if failed else 0)
             "shell_command": "", "attempts": [], "artifact_dir": "/repo/a",
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn structured_results_write_verdict_cells_and_skip_cancelled_cells() {
+        // Report 279: fail-fast stops dispatching after a verdict ERROR;
+        // the undispatched cell has an empty history. The structured
+        // write must still carry every cell that reached a verdict, and
+        // the cancelled cell must not turn the whole write into
+        // "cell result has no attempts".
+        let histories = vec![
+            vec![attempt_row(
+                "t/pass",
+                1,
+                "PASS",
+                None,
+                "required",
+                &[],
+                None,
+            )],
+            vec![attempt_row(
+                "t/error",
+                1,
+                "ERROR",
+                Some("no_result"),
+                "required",
+                &[],
+                Some("verification recorded no comparison at all"),
+            )],
+            vec![],
+        ];
+        assert!(terminal_test_results(&histories).is_ok());
+        let report = structured_test_results(&histories).unwrap();
+        let wire: serde_json::Value =
+            serde_json::from_slice(&report.to_diagnostic_json().unwrap()).unwrap();
+        let ids: Vec<&str> = wire["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["t/pass [ptrace/verify]", "t/error [ptrace/verify]"]);
+    }
+
+    #[test]
+    fn structured_results_name_the_cell_whose_history_is_malformed() {
+        let histories = vec![vec![attempt_row(
+            "t/malformed",
+            2,
+            "FAIL",
+            None,
+            "required",
+            &[],
+            None,
+        )]];
+        let error = structured_test_results(&histories).unwrap_err();
+        assert!(error.contains("t/malformed"), "{error:?}");
+        assert!(
+            error.contains("no attempts") || error.contains("expected 1"),
+            "{error:?}"
+        );
     }
 
     #[test]

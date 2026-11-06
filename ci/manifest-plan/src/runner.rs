@@ -4342,22 +4342,43 @@ pub fn skid_retry_within_generic_lifecycle(results: &[CellResult]) -> bool {
 /// past the generic bound is refused unless it is skid-qualified
 /// ([`history_past_generic_bound_is_skid_qualified`]).
 pub fn cell_result_after_retries(results: &[CellResult]) -> Result<&CellResult, String> {
+    // Name the cell in every refusal that its rows can name (report 279:
+    // a bare "cell result has no attempts" / "expected 1" left the reader
+    // hunting 762 cells for the one history at fault). An empty history
+    // has no row to name it by; callers that know the cell name it there.
+    let cell = results.first().map(|result| {
+        format!(
+            "{} ({}/{})",
+            result.test,
+            result.mode,
+            result.backend.as_deref().unwrap_or("native")
+        )
+    });
+    let named = |error: String| match &cell {
+        Some(cell) => format!("{cell}: {error}"),
+        None => error,
+    };
     if !history_past_generic_bound_is_skid_qualified(results) {
-        return Err(format!(
+        return Err(named(format!(
             "cell result history of {} attempt(s) exceeds the generic maximum of {MAX_ATTEMPTS_PER_CELL} without skid-only evidence for every attempt before the final one",
             results.len()
-        ));
+        )));
     }
     let outcome = outcome_after_retries(
         results
             .iter()
             .map(|result| (result.attempt, result.outcome.as_str())),
-    )?;
+    )
+    .map_err(named)?;
     results
         .iter()
         .rev()
         .find(|result| result.outcome == outcome)
-        .ok_or_else(|| format!("cell result history selected {outcome} without a matching row"))
+        .ok_or_else(|| {
+            named(format!(
+                "cell result history selected {outcome} without a matching row"
+            ))
+        })
 }
 
 /// Return both the selected result row and the number of attempts in its
@@ -4367,10 +4388,11 @@ pub fn cell_result_and_attempts_after_retries(
     results: &[CellResult],
 ) -> Result<(&CellResult, u64), String> {
     let selected = cell_result_after_retries(results)?;
-    let attempts = results
-        .last()
-        .map(|result| result.attempt)
-        .ok_or_else(|| "cell result has no attempts".to_string())?;
+    let attempts = results.last().map(|result| result.attempt).ok_or_else(|| {
+        // Unreachable after a successful selection above, but name the
+        // shape of the failure, never a bare refusal.
+        "cell result has no attempts".to_string()
+    })?;
     Ok((selected, attempts))
 }
 
