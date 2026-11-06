@@ -437,7 +437,7 @@ where
     T: RecordOrReplay,
 {
     let bit = crate::syscalls::kernel_sigset_bit(signal);
-    crate::syscalls::read_thread_signal_state(guest.pid(), guest.tid())
+    crate::syscalls::read_guest_thread_signal_state(guest)
         .is_ok_and(|state| state.blocked & bit != 0)
 }
 

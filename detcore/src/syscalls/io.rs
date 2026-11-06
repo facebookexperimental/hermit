@@ -84,8 +84,6 @@ use crate::syscalls::signal::STACK_RED_ZONE;
 use crate::syscalls::signal::kernel_installed_signal_mask;
 use crate::syscalls::signal::read_kernel_sigset;
 use crate::syscalls::threads::KernelSigset;
-use crate::syscalls::threads::read_thread_signal_state;
-use crate::syscalls::threads::read_thread_wait_signal_state;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
 use crate::types::DetTid;
@@ -553,7 +551,7 @@ async fn end_replayed_pselect6_under_its_temporary_mask<G, T>(
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let Ok(state) = read_thread_signal_state(guest.pid(), guest.tid()) else {
+    let Ok(state) = crate::syscalls::read_guest_thread_signal_state(guest) else {
         return;
     };
     if state.pending
@@ -2113,9 +2111,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
                     if pending != 0 {
                         let (observable, discarded) = match (signals.as_ref(), sigmask) {
-                            (Some(signals), _) => (signals.observable_now()?, 0),
+                            (Some(signals), _) => (signals.observable_now(guest)?, 0),
                             (None, Some(mask)) => unblocked_by(
-                                &read_thread_wait_signal_state(guest.pid(), guest.tid())?,
+                                &crate::syscalls::read_guest_wait_signal_state(guest)?,
                                 mask,
                             ),
                             (None, None) => (0, 0),
@@ -2280,7 +2278,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         );
                     }
                     if let Some(signals) = signals.as_ref() {
-                        match signals.interrupted_with_state() {
+                        match signals.interrupted_with_state(guest) {
                             Ok((false, _)) => {}
                             Ok((true, state)) => {
                                 self.write_pselect6_remaining(guest, call, deadline).await?;
@@ -2611,7 +2609,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if pending != 0
                         && let Some(signals) = signals.as_ref()
                     {
-                        let observable = signals.observable_now()?;
+                        let observable = signals.observable_now(guest)?;
                         act_on_pending_real_time(guest, pending, observable, 0).await;
                     }
                     // Every turn probes before it looks at pending signals, as Linux
@@ -2682,7 +2680,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         }
                     }
                     if let Some(signals) = signals.as_ref() {
-                        match signals.interrupted_with_state() {
+                        match signals.interrupted_with_state(guest) {
                             Ok((false, _)) => {}
                             Ok((true, _)) => {
                                 self.write_select_remaining(guest, call, deadline).await?;
@@ -3437,7 +3435,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if !probe.syscall_would_have_blocked(injected) {
                 break injected.map_err(Into::into);
             }
-            match signals.interrupted_with_state() {
+            match signals.interrupted_with_state(guest) {
                 Ok((false, _)) => {}
                 // The next probe ends the call for it (see above).
                 Ok((true, state))

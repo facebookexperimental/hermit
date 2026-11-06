@@ -120,8 +120,6 @@ use super::discarded_at_send::STANDARD_SIGNALS;
 use super::kernel_signal_bit;
 use crate::resources::ResourceID;
 use crate::syscalls::KernelSignalState;
-#[cfg(not(test))]
-use crate::syscalls::read_kernel_signal_state;
 use crate::types::DetPid;
 use crate::types::DetTid;
 
@@ -651,9 +649,10 @@ impl Scheduler {
         }
         #[cfg(not(test))]
         {
-            read_kernel_signal_state(
-                reverie::Pid::from_raw(self.sigchld_process(thread).as_raw()),
-                reverie::Pid::from_raw(thread.as_raw()),
+            self.guest_signal_state(
+                thread,
+                self.sigchld_process(thread).as_raw(),
+                thread.as_raw(),
             )
         }
     }

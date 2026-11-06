@@ -76,8 +76,6 @@ use crate::resources::RT_SIGSUSPEND_FYI;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::syscalls::KernelSignalState;
-use crate::syscalls::read_thread_signal_state;
-use crate::syscalls::thread_is_gone;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::SigWrapper;
@@ -265,15 +263,16 @@ impl Scheduler {
         if let Some(failure) = self.test_sleeper_read_failures.get(&dettid) {
             return Err(*failure);
         }
-        let process = reverie::Pid::from_raw(self.sigchld_process(dettid).as_raw());
-        let thread = reverie::Pid::from_raw(dettid.as_raw());
-        read_thread_signal_state(process, thread).map_err(|errno| {
-            if thread_is_gone(process, thread) {
-                SleeperStateUnreadable::Gone
-            } else {
-                SleeperStateUnreadable::Unreadable(errno)
-            }
-        })
+        let process = self.sigchld_process(dettid).as_raw();
+        let thread = dettid.as_raw();
+        self.guest_thread_signal_state(dettid, process, thread)
+            .map_err(|errno| {
+                if self.guest_thread_is_gone(dettid, process, thread) {
+                    SleeperStateUnreadable::Gone
+                } else {
+                    SleeperStateUnreadable::Unreadable(errno)
+                }
+            })
     }
 
     /// Applies cross-task `signals` drained for `dettid`, whose request is

@@ -268,8 +268,17 @@ impl Scheduler {
     }
 
     /// `process`'s shared pending set, read through the thread group
-    /// (`/proc/<tgid>/status`, valid while any thread lives).
-    fn read_process_shared_pending(&self, process: DetPid) -> Option<u64> {
+    /// (`/proc/<tgid>/status`, valid while any thread lives). Where Detcore
+    /// reads signal state from the backend, any live thread of the process
+    /// reports the process's shared queue (`Scheduler::backend_signal_state`).
+    pub(super) fn read_process_shared_pending(&self, process: DetPid) -> Option<u64> {
+        if crate::syscalls::reads_signal_state_from_backend(&self.backend) {
+            return self
+                .process_signal_targets(process)
+                .into_iter()
+                .find_map(|thread| self.backend_signal_state(thread)?.ok())
+                .map(|state| state.shared_pending);
+        }
         #[cfg(test)]
         {
             let leader = DetTid::from_raw(process.as_raw());

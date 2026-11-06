@@ -55,7 +55,6 @@ use crate::resources::ResourceID;
 use crate::scheduler::kernel_signal_bit;
 use crate::syscalls::KernelSignalState;
 use crate::syscalls::ignored_at_generation;
-use crate::syscalls::read_kernel_signal_state;
 use crate::types::DetPid;
 use crate::types::DetTid;
 
@@ -1123,11 +1122,8 @@ impl Scheduler {
             return Some(*state);
         }
         let process = self.thread_tree.process_of(named).unwrap_or(named);
-        read_kernel_signal_state(
-            reverie::Pid::from_raw(process.as_raw()),
-            reverie::Pid::from_raw(named.as_raw()),
-        )
-        .ok()
+        self.guest_signal_state(named, process.as_raw(), named.as_raw())
+            .ok()
     }
 
     /// Whether `queue` holds a copy of `signal`, as the kernel shows it now

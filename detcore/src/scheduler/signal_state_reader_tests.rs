@@ -576,3 +576,153 @@ fn the_kvm_drain_never_reads_host_proc() {
         assert_eq!(woke.is_empty(), installed, "installed {installed}");
     }
 }
+
+// SIGSHARE S3a: every scheduler reader of a guest thread's signal state goes
+// through one reader (`Scheduler::guest_signal_state`,
+// `guest_thread_signal_state`, `guest_thread_is_gone`), which asks the backend
+// where Detcore reads it there and host `/proc` elsewhere, exactly as before.
+// Mutations each test catches:
+// - "a converted reader keeps its `/proc` read on KVM": the host reads are
+//   refused in these KVM tests (the latch), so a `/proc` read answers ENOSYS
+//   and never the scripted sets;
+// - "the reader keys the backend on the host task numbers": the host numbers
+//   passed are ones no guest thread has, and the control records which
+//   lifetime it was asked about;
+// - "ptrace asks the backend": the ptrace scheduler answers from the `/proc`
+//   seam, with the numbers the caller passed, and never from a control;
+// - "an unreadable thread taken as gone" / "a gone thread taken as
+//   unreadable": only ESRCH is gone.
+
+/// Host numbers no guest thread has, which a `/proc` read would open.
+const HOST_PID: i32 = i32::MAX - 1;
+const HOST_TID: i32 = i32::MAX;
+
+#[test]
+fn every_scheduler_reader_asks_the_backend_on_kvm() {
+    crate::syscalls::refuse_host_signal_state_reads(&reverie::BackendCapabilities::KVM);
+    let control = Arc::new(ScriptedControl::default());
+    let mut scheduler = kvm_scheduler(&control, true);
+    add_bound_thread(&mut scheduler, PROCESS, LEADER);
+    add_bound_thread(&mut scheduler, PROCESS, SIBLING);
+    let leader = SignalSets::new(
+        bit(libc::SIGUSR2),
+        bit(libc::SIGTERM),
+        bit(libc::SIGUSR1),
+        bit(libc::SIGWINCH),
+        bit(libc::SIGHUP),
+    );
+    control.script(LEADER, vec![Ok(leader)]);
+    control.script(SIBLING, vec![Ok(sets(bit(libc::SIGINT), 0, 0))]);
+    let expected = KernelSignalState::from_backend_sets(&leader);
+
+    assert_eq!(
+        scheduler.guest_signal_state(LEADER, HOST_PID, HOST_TID),
+        Ok(expected)
+    );
+    assert_eq!(
+        scheduler.guest_thread_signal_state(LEADER, HOST_PID, HOST_TID),
+        Ok(expected)
+    );
+    assert!(!scheduler.guest_thread_is_gone(LEADER, HOST_PID, HOST_TID));
+    // The wrappers the scheduler's decisions call.
+    assert_eq!(
+        scheduler.read_thread_blocked_mask_result(SIBLING),
+        Ok(bit(libc::SIGINT))
+    );
+    assert_eq!(
+        scheduler.read_shared_pending(LEADER),
+        Some(bit(libc::SIGTERM))
+    );
+    // A process-wide `/proc/<pid>/status` field is the leader's.
+    assert_eq!(
+        scheduler.signal_mask_field(PROCESS, None, "SigIgn"),
+        Some(bit(libc::SIGWINCH))
+    );
+    assert_eq!(
+        scheduler.signal_mask_field(PROCESS, None, "SigCgt"),
+        Some(bit(libc::SIGHUP))
+    );
+    assert_eq!(
+        scheduler.signal_mask_field(PROCESS, Some(SIBLING), "SigBlk"),
+        Some(bit(libc::SIGINT))
+    );
+    assert_eq!(scheduler.signal_mask_field(PROCESS, None, "SigQ"), None);
+    assert!(
+        control
+            .asked()
+            .iter()
+            .all(|task| task.tid.as_raw() == LEADER.as_raw()
+                || task.tid.as_raw() == SIBLING.as_raw()),
+        "asked {:?}",
+        control.asked()
+    );
+}
+
+#[test]
+fn only_a_task_the_backend_does_not_know_is_gone_on_kvm() {
+    crate::syscalls::refuse_host_signal_state_reads(&reverie::BackendCapabilities::KVM);
+    let control = Arc::new(ScriptedControl::default());
+    let mut scheduler = kvm_scheduler(&control, true);
+    add_bound_thread(&mut scheduler, PROCESS, LEADER);
+    control.script(LEADER, vec![Err(FactError::Errno(reverie::Errno::ESRCH))]);
+    assert!(scheduler.guest_thread_is_gone(LEADER, HOST_PID, HOST_TID));
+    assert_eq!(
+        scheduler.guest_signal_state(LEADER, HOST_PID, HOST_TID),
+        Err(reverie::Errno::ESRCH)
+    );
+    // Unreadable, but not gone.
+    control.script(LEADER, vec![Err(FactError::NotProvided)]);
+    assert!(!scheduler.guest_thread_is_gone(LEADER, HOST_PID, HOST_TID));
+    control.script(LEADER, vec![Err(FactError::Errno(reverie::Errno::EIO))]);
+    assert!(!scheduler.guest_thread_is_gone(LEADER, HOST_PID, HOST_TID));
+    assert_eq!(
+        scheduler.guest_signal_state(LEADER, HOST_PID, HOST_TID),
+        Err(reverie::Errno::EIO)
+    );
+    // A thread with no bound lifetime names no task of the run.
+    scheduler.thread_tree.add_child(PROCESS, SIBLING, false);
+    scheduler.register_thread_for_test(SIBLING);
+    assert!(scheduler.guest_thread_is_gone(SIBLING, HOST_PID, HOST_TID));
+    // A process with no thread the backend can read reports no shared queue.
+    assert_eq!(scheduler.read_process_shared_pending(PROCESS), None);
+}
+
+#[test]
+fn ptrace_scheduler_readers_keep_their_proc_read() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::syscalls::signal_state_read_seam;
+
+    let mut scheduler = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        ..Config::default()
+    });
+    scheduler.thread_tree.add_child(LEADER, LEADER, true);
+    scheduler.register_thread_for_test(LEADER);
+    let opened = Rc::new(RefCell::new(Vec::new()));
+    let state = KernelSignalState {
+        blocked: bit(libc::SIGUSR1),
+        ..KernelSignalState::default()
+    };
+    let _seam = {
+        let opened = opened.clone();
+        signal_state_read_seam::install(move |pid, tid| {
+            opened.borrow_mut().push((pid.as_raw(), tid.as_raw()));
+            Some(Ok(state))
+        })
+    };
+    assert_eq!(
+        scheduler.guest_signal_state(LEADER, HOST_PID, HOST_TID),
+        Ok(state)
+    );
+    assert_eq!(
+        scheduler.guest_thread_signal_state(LEADER, HOST_PID, HOST_TID),
+        Ok(state)
+    );
+    assert_eq!(
+        *opened.borrow(),
+        vec![(HOST_PID, HOST_TID), (HOST_PID, HOST_TID)],
+        "the /proc read opens the host task the caller names"
+    );
+}

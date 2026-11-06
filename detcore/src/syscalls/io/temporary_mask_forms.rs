@@ -434,8 +434,7 @@ impl TemporaryMaskCall {
         if !crate::syscalls::timerfd::holds_armed_virtual_timerfd(guest) {
             return Ok(call);
         }
-        let state =
-            crate::syscalls::threads::read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+        let state = crate::syscalls::read_guest_wait_signal_state(guest)?;
         let reserved = guest.config().in_guest_reserved_signals;
         let own = crate::syscalls::helpers::gated_own_mask(guest, state.blocked);
         let ignored = crate::ignored_signals::pending_ignored(&state, reserved);
@@ -596,8 +595,7 @@ impl TemporaryMaskCall {
         if self.settled {
             return Ok(());
         }
-        let state =
-            crate::syscalls::threads::read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+        let state = crate::syscalls::read_guest_wait_signal_state(guest)?;
         let reserved = guest.config().in_guest_reserved_signals;
         let outside = crate::ignored_signals::pending_ignored(&state, reserved) & !self.mask;
         if outside == 0 {

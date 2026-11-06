@@ -804,7 +804,7 @@ where
         return FatalDeliveryObservation::Nonfatal;
     }
     let kernel = (copied.is_none() || may_retire_others)
-        .then(|| read_thread_signal_state(guest.pid(), guest.tid()).ok())
+        .then(|| crate::syscalls::read_guest_thread_signal_state(guest).ok())
         .flatten();
     match copied.or_else(|| kernel.map(|state| state.default_action_ends_process(signal))) {
         Some(true) => FatalDeliveryObservation::Fatal {
@@ -1038,6 +1038,21 @@ pub(crate) struct KernelSignalState {
     pub(crate) ignored: KernelSigset,
     /// Signals with a handler installed (`SigCgt`).
     pub(crate) caught: KernelSigset,
+}
+
+impl KernelSignalState {
+    /// The value of one of the three signal-mask fields of
+    /// `/proc/<pid>/status` that these sets carry (`SigBlk`, `SigIgn` or
+    /// `SigCgt`), for a reader that names the field as it names a `/proc`
+    /// line; `None` for any other name.
+    pub(crate) fn status_field(&self, field: &str) -> Option<KernelSigset> {
+        match field {
+            "SigBlk" => Some(self.blocked),
+            "SigIgn" => Some(self.ignored),
+            "SigCgt" => Some(self.caught),
+            _ => None,
+        }
+    }
 }
 
 /// [`KernelSignalState::default_action_ends_process`] given only the
@@ -1682,12 +1697,80 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    backend_signal_state_of(guest, guest.tid())
+}
+
+/// Guest thread `tid`'s signal state, from the backend where Detcore reads
+/// it there ([`reads_signal_state_from_backend`]: `Guest::signal_sets`,
+/// which names any live guest thread of this run, numbered as `Guest::tid`
+/// numbers it), and `None` elsewhere, where the caller keeps its `/proc`
+/// read.
+fn backend_signal_state_of<G, T>(guest: &G, tid: Pid) -> Option<Result<KernelSignalState, Errno>>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
     reads_signal_state_from_backend(&guest.config().backend).then(|| {
         guest
-            .signal_sets(guest.tid())
+            .signal_sets(tid)
             .map(|sets| KernelSignalState::from_backend_sets(&sets))
             .map_err(signal_sets_errno)
     })
+}
+
+/// [`read_thread_signal_state`] of guest thread `tid` (of process `pid`, as
+/// the caller names it), read in a handler of any guest thread: from the
+/// backend where its guest threads are not host tasks
+/// ([`reads_signal_state_from_backend`]), so that no host task's `/proc`
+/// state reaches a decision there, and from `/proc` elsewhere, as before
+/// (SIGSHARE S3a).
+pub(crate) fn read_guest_task_signal_state<G, T>(
+    guest: &G,
+    pid: Pid,
+    tid: Pid,
+) -> Result<KernelSignalState, Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    backend_signal_state_of(guest, tid).unwrap_or_else(|| read_thread_signal_state(pid, tid))
+}
+
+/// [`read_wait_signal_state`] of the calling thread, read from the backend
+/// where its guest threads are not host tasks
+/// ([`reads_signal_state_from_backend`]), with the same errors as
+/// [`read_guest_wait_signal_state`] there. Elsewhere it is exactly
+/// [`read_wait_signal_state`], which, unlike [`read_thread_wait_signal_state`],
+/// reads only `/proc/<pid>/task/<tid>` (SIGSHARE S3a).
+pub(crate) fn read_guest_group_wait_signal_state<G, T>(
+    guest: &G,
+) -> Result<KernelSignalState, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match backend_signal_state_of_caller(guest) {
+        None => read_wait_signal_state(guest.pid(), guest.tid()),
+        Some(read) => backend_wait_answer(guest.pid(), guest.tid(), read),
+    }
+}
+
+/// A blocked wait's reading of a backend's answer: the state, or
+/// `ERESTARTNOINTR` for a thread the backend no longer knows (`ESRCH`), which
+/// nothing observes, or the end of the run for any other failure, as for the
+/// `/proc` read.
+fn backend_wait_answer(
+    pid: Pid,
+    tid: Pid,
+    read: Result<KernelSignalState, Errno>,
+) -> Result<KernelSignalState, Error> {
+    match read {
+        Ok(state) => Ok(state),
+        Err(Errno::ESRCH) => Err(Errno::ERESTARTNOINTR.into()),
+        Err(errno) => Err(Error::Tool(anyhow::Error::new(
+            BlockedWaitSignalError::StateUnreadable { pid, tid, errno },
+        ))),
+    }
 }
 
 /// [`read_kernel_signal_state`] of the calling thread, read from the backend
@@ -1728,15 +1811,7 @@ where
 {
     match backend_signal_state_of_caller(guest) {
         None => read_thread_wait_signal_state(guest.pid(), guest.tid()),
-        Some(Ok(state)) => Ok(state),
-        Some(Err(Errno::ESRCH)) => Err(Errno::ERESTARTNOINTR.into()),
-        Some(Err(errno)) => Err(Error::Tool(anyhow::Error::new(
-            BlockedWaitSignalError::StateUnreadable {
-                pid: guest.pid(),
-                tid: guest.tid(),
-                errno,
-            },
-        ))),
+        Some(read) => backend_wait_answer(guest.pid(), guest.tid(), read),
     }
 }
 
@@ -4152,7 +4227,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // the park, or still pending after a wake, ends the
             // wait with the futex's restart errno, its end
             // recorded for the restart checkpoint (D40).
-            let state = read_wait_signal_state(guest.pid(), guest.tid())?;
+            let state = read_guest_group_wait_signal_state(guest)?;
             let mask = super::helpers::gated_own_mask(guest, state.blocked);
             if let Some(end) = crate::wait_signal_end::wait_end(
                 &state,
@@ -4185,7 +4260,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else if signal_interruption {
             // A failed read is never the call's errno
             // (`read_wait_signal_state`).
-            let state = read_wait_signal_state(guest.pid(), guest.tid())?;
+            let state = read_guest_group_wait_signal_state(guest)?;
             // A timed futex wait lets a default job-control stop
             // wait for its deadline (`KernelSignalState::interrupting_wait`).
             let defers_default_stops = call.restart_keeps_deadline();

@@ -53,7 +53,6 @@ use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
 use crate::syscalls::threads::KernelSigset;
 use crate::syscalls::threads::kernel_sigset_bit;
-use crate::syscalls::threads::read_thread_wait_signal_state;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::SigalrmControl;
 use crate::tool_global::alarm_remaining;
@@ -360,7 +359,7 @@ where
     if stays_ignored {
         return Ok(());
     }
-    let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+    let state = crate::syscalls::read_guest_wait_signal_state(guest)?;
     if crate::syscalls::ignored_at_generation(state.ignored, state.caught) & bit == 0 {
         return Ok(());
     }
@@ -1614,10 +1613,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             })
             && match crate::syscalls::signal_shadow::copied_dispositions_for(guest, call.signum()) {
                 Some(copied) => copied.ignored & kernel_sigset_bit(call.signum()) != 0,
-                None => {
-                    crate::syscalls::threads::read_kernel_signal_state(guest.pid(), guest.tid())
-                        .is_ok_and(|state| state.ignored & kernel_sigset_bit(call.signum()) != 0)
-                }
+                None => crate::syscalls::read_guest_signal_state(guest)
+                    .is_ok_and(|state| state.ignored & kernel_sigset_bit(call.signum()) != 0),
             };
         // D37 rule (iii) under the in-guest delivery gate (A5 step 3c.1d): a
         // call that moves the signal away from ignored first removes the
@@ -1923,7 +1920,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
             if pending != 0 {
                 let (observable, discarded) =
-                    match read_thread_wait_signal_state(guest.pid(), guest.tid()) {
+                    match crate::syscalls::read_guest_wait_signal_state(guest) {
                         Ok(state) => unblocked_by(&state, state.blocked),
                         Err(_) => (REAL_TIME_SIGNALS, 0),
                     };
@@ -2118,19 +2115,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         match result {
             Ok(signal) if (1..32).contains(&(*signal as i32)) => {
-                let after =
-                    crate::syscalls::threads::read_kernel_signal_state(guest.pid(), guest.tid())
-                        .ok()
-                        .map(|state| (state.thread_pending, state.shared_pending));
+                let after = crate::syscalls::read_guest_signal_state(guest)
+                    .ok()
+                    .map(|state| (state.thread_pending, state.shared_pending));
                 crate::syscalls::helpers::take_outcome(guest, *signal as i32, after).await
             }
             Err(Error::Errno(Errno::EFAULT)) => {
                 let Some(set) = waited else {
                     return skip(false);
                 };
-                let Ok(state) =
-                    crate::syscalls::threads::read_kernel_signal_state(guest.pid(), guest.tid())
-                else {
+                let Ok(state) = crate::syscalls::read_guest_signal_state(guest) else {
                     return skip(false);
                 };
                 let at = guest.thread_state().thread_logical_time.as_nanos();
@@ -2300,10 +2294,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             let sigchld = kernel_sigset_bit(libc::SIGCHLD);
             if set & sigchld != 0
-                && let Ok(state) = crate::syscalls::threads::read_thread_wait_signal_state(
-                    guest.pid(),
-                    guest.tid(),
-                )
+                && let Ok(state) = crate::syscalls::read_guest_wait_signal_state(guest)
             {
                 let shared_pending = if set & !sigchld == 0 {
                     false
@@ -2921,7 +2912,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(OwnProcessSend::NotOwn);
         }
-        let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+        let state = crate::syscalls::read_guest_wait_signal_state(guest)?;
         let send = OwnProcessSignal {
             sig,
             names_sender,
@@ -3931,7 +3922,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let block = crate::tool_global::kernel_run_target(guest, target).await?;
         let task = reverie::Pid::from_raw(target.as_raw());
-        let state = crate::syscalls::read_thread_signal_state(task, task);
+        let state = crate::syscalls::read_guest_task_signal_state(guest, task, task);
         let refused = match &state {
             Ok(state) => crate::wait_signal_end::kernel_run_send_refused(
                 state,
@@ -4178,7 +4169,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             StopSendRefusal::Sigstop
         } else {
             let task = reverie::Pid::from_raw(receiver.as_raw());
-            match crate::syscalls::read_thread_signal_state(task, task) {
+            match crate::syscalls::read_guest_task_signal_state(guest, task, task) {
                 Ok(state) if (state.ignored | state.caught) & kernel_sigset_bit(signal) != 0 => {
                     return None;
                 }
@@ -4903,8 +4894,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let caught =
             match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal.raw()) {
                 Some(copied) => Ok(copied.caught),
-                None => read_thread_wait_signal_state(guest.pid(), guest.tid())
-                    .map(|state| state.caught),
+                None => {
+                    crate::syscalls::read_guest_wait_signal_state(guest).map(|state| state.caught)
+                }
             };
         if let Ok(caught) = caught
             && caught & kernel_sigset_bit(signal.raw()) == 0
@@ -4934,7 +4926,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .and_then(|addr| guest.memory().read_value(addr).ok());
         let (observable, discarded) = match (
             restored,
-            read_thread_wait_signal_state(guest.pid(), guest.tid()),
+            crate::syscalls::read_guest_wait_signal_state(guest),
         ) {
             (Some(mask), Ok(state)) => unblocked_by(&state, mask),
             // A frame the kernel cannot read either kills the guest with
@@ -5118,7 +5110,7 @@ where
         }
     };
     if deciding != 0 || held_woken != 0 {
-        let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+        let state = crate::syscalls::read_guest_wait_signal_state(guest)?;
         let mut ending = state.pending_interrupting(state.blocked, false) & deciding;
         if !stops_end_it && before_park {
             ending &= !(state.default_job_control_stops() | kernel_sigset_bit(libc::SIGSTOP));
@@ -5395,8 +5387,14 @@ pub(crate) const SIGNALFD_RECORD: usize = 128;
 
 /// The signals signalfd `fd` of process `pid` reads, from its `sigmask:`
 /// line in `/proc/<pid>/fdinfo/<fd>` (a kernel sigset in hex), or `None`
-/// when it cannot be read.
+/// when it cannot be read. Refused (`None`), as `read_kernel_signal_state`
+/// is, where guest process IDs do not name host processes: there
+/// `/proc/<pid>` would describe an unrelated host process, if any, and no
+/// backend reports a signalfd's mask.
 pub(crate) fn signalfd_mask(pid: i32, fd: i32) -> Option<u64> {
+    if crate::syscalls::host_signal_state_reads_refused() {
+        return None;
+    }
     let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
     info.lines()
         .find_map(|line| line.strip_prefix("sigmask:"))

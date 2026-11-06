@@ -42,7 +42,6 @@ use tracing::warn;
 use super::threads::KernelSigaction;
 use super::threads::KernelSigset;
 use super::threads::host_signal_state_reads_refused;
-use super::threads::read_thread_signal_state;
 use crate::Detcore;
 use crate::record_or_replay::RecordOrReplay;
 use crate::signal_state::Action;
@@ -527,7 +526,7 @@ where
     if guest.thread_state().signal_shadow_lost || !kernel_state_is_the_guests(guest) {
         return;
     }
-    match read_thread_signal_state(guest.pid(), guest.tid()) {
+    match crate::syscalls::read_guest_thread_signal_state(guest) {
         Ok(state) => {
             guest.thread_state_mut().signal_shadow =
                 Some(SignalShadow::seeded(state.ignored, state.blocked));
@@ -2008,7 +2007,7 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    match read_thread_signal_state(guest.pid(), guest.tid()) {
+    match crate::syscalls::read_guest_thread_signal_state(guest) {
         Ok(state) => Some(state),
         Err(errno) => {
             debug!(

@@ -324,17 +324,16 @@ fn select_thread_start_detpid(thread_detpid: Option<DetPid>, guest_pid: Pid) -> 
     thread_detpid.unwrap_or_else(|| DetPid::from_raw(guest_pid.into()))
 }
 
-/// What a stop of thread `tid` of `pid` did with a copy of the standard
-/// `signal` (`kept`: resumed into the thread, or else dropped), for the
-/// scheduler's record of copies Linux discarded when they were sent
-/// (`scheduler::discarded_at_send`, <https://github.com/rrnewton/hermit/issues/4293>).
-/// Reads, after the stop, the thread's queues and its mask, which decides
-/// whether a kept copy is requeued at the resume (`ptrace_signal`). `None`
-/// for a signal the record does not track, or a state that cannot be read,
-/// which changes nothing.
+/// What a stop of a thread did with a copy of the standard `signal` (`kept`:
+/// resumed into the thread, or else dropped), for the scheduler's record of
+/// copies Linux discarded when they were sent (`scheduler::discarded_at_send`,
+/// <https://github.com/rrnewton/hermit/issues/4293>). `read_state` reads,
+/// after the stop, the thread's queues and its mask, which decides whether a
+/// kept copy is requeued at the resume (`ptrace_signal`); the caller names
+/// where it reads them. `None` for a signal the record does not track, or a
+/// state that cannot be read, which changes nothing.
 fn consumed_signal_control(
-    pid: Pid,
-    tid: Pid,
+    read_state: impl FnOnce() -> Result<syscalls::KernelSignalState, Errno>,
     signal: i32,
     kept: bool,
 ) -> Option<scheduler::discarded_at_send::DiscardedSignalControl> {
@@ -343,7 +342,7 @@ fn consumed_signal_control(
     if !(1..32).contains(&signal) {
         return None;
     }
-    let state = syscalls::read_kernel_signal_state(pid, tid).ok()?;
+    let state = read_state().ok()?;
     let bit = scheduler::kernel_signal_bit(signal);
     let how = if kept {
         Consumption::KeptResume {
@@ -2400,10 +2399,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A claimed copy that is dropped has no delivery to place, but
             // the claim may have held this duplicate while the claimed copy
             // is still pending (`syscalls::signal::claim_still_pending`).
-            let (pid, tid) = (guest.pid(), guest.tid());
             let claimed =
                 crate::syscalls::claim_still_pending(guest.thread_state().claimed_sigchld, || {
-                    crate::syscalls::read_thread_signal_state(pid, tid)
+                    crate::syscalls::read_guest_thread_signal_state(guest)
                 });
             guest.thread_state_mut().claimed_sigchld = claimed;
             self.keep_timer_across_dropped_signal(guest);
@@ -5120,8 +5118,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .await?;
         if scheduler::discarded_at_send::records(&self.cfg)
             && let Some(control) = consumed_signal_control(
-                guest.pid(),
-                guest.tid(),
+                || crate::syscalls::read_guest_signal_state(guest),
                 signal as i32,
                 delivered.is_some(),
             )
@@ -5525,9 +5522,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
         .await;
         if scheduler::discarded_at_send::records(&self.cfg)
+            // Only the ptrace backend passes signals on unreported, and its
+            // guest threads are host tasks, so `/proc` is the thread's own.
             && let Some(control) = consumed_signal_control(
-                unreported.pid(),
-                unreported.tid(),
+                || syscalls::read_kernel_signal_state(unreported.pid(), unreported.tid()),
                 unreported.number(),
                 kept,
             )
@@ -6558,10 +6556,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
         // A claimed `SIGCHLD` stays claimed only while it is still pending for
         // this thread (`syscalls::signal::claim_still_pending`).
-        let (pid, tid) = (guest.pid(), guest.tid());
         let claimed =
             crate::syscalls::claim_still_pending(guest.thread_state().claimed_sigchld, || {
-                crate::syscalls::read_thread_signal_state(pid, tid)
+                crate::syscalls::read_guest_thread_signal_state(guest)
             });
         guest.thread_state_mut().claimed_sigchld = claimed;
         let boundary_entry = slice_boundary::callbacks::Callback::Syscall(call.number());

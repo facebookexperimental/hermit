@@ -47,7 +47,7 @@ use crate::syscalls::threads::WaitSignalDisposition;
 use crate::syscalls::threads::block_signals_for_disposition;
 use crate::syscalls::threads::blocked_signal_mask;
 use crate::syscalls::threads::kernel_sigset_bit;
-use crate::syscalls::threads::read_thread_wait_signal_state;
+#[cfg(test)]
 use crate::syscalls::threads::read_wait_signal_state;
 use crate::syscalls::threads::restore_signals_after_disposition;
 use crate::syscalls::threads::wait_signal_disposition;
@@ -4135,7 +4135,7 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    let state = read_wait_signal_state(guest.pid(), guest.tid())?;
+    let state = crate::syscalls::read_guest_group_wait_signal_state(guest)?;
     let mask = mask.unwrap_or(state.blocked);
     let host_timed = host_timed_signals(guest).await;
     Ok((
@@ -4210,7 +4210,7 @@ where
     G: Guest<Detcore<T>>,
 {
     let mask = wait.as_ref().and_then(KernelSignalWait::effective_mask);
-    let state = read_wait_signal_state(guest.pid(), guest.tid())?;
+    let state = crate::syscalls::read_guest_group_wait_signal_state(guest)?;
     let (host_timed, recorded) = crate::tool_global::host_timed_and_private_sigchld(guest).await;
     let mut private = 0;
     if let Some(wait) = wait.as_mut() {
@@ -4339,7 +4339,7 @@ where
     // here either: it is held until the call returns, where it is delivered
     // late (https://github.com/rrnewton/hermit/issues/3995), as the turn
     // decided (the Claude re-check of R2b-1, N1).
-    let state = read_wait_signal_state(guest.pid(), guest.tid())?;
+    let state = crate::syscalls::read_guest_group_wait_signal_state(guest)?;
     let kept = crate::syscalls::threads::without_discarded(guest, &state, state.pending, 0).await;
     wait.hold_until_return(host_timed_signals(guest).await | (state.pending & !kept));
     wait.block(guest, Some(cell)).await?;
@@ -4402,7 +4402,7 @@ where
     if !guest.config().in_guest_signal_delivery {
         return Ok(None);
     }
-    let state = crate::syscalls::threads::read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+    let state = crate::syscalls::read_guest_wait_signal_state(guest)?;
     let mask = gated_own_mask(guest, fallback.unwrap_or(state.blocked));
     Ok(crate::wait_signal_end::wait_end_with_virtual(
         &state,
@@ -4705,7 +4705,7 @@ where
             "removing ignored signal {signal} from the {queue:?} queue: {what}"
         ))
     };
-    let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+    let state = crate::syscalls::read_guest_wait_signal_state(guest)?;
     let in_queue = match queue {
         OneQueue::Private => state.thread_pending,
         OneQueue::Shared => state.shared_pending,
@@ -4738,7 +4738,7 @@ where
     // them; their siginfo is kept to queue them again for `Shared`.
     let mut kept: Vec<[u8; 128]> = Vec::new();
     let mut removals = 0;
-    while read_thread_wait_signal_state(guest.pid(), guest.tid())?.thread_pending & bit != 0 {
+    while crate::syscalls::read_guest_wait_signal_state(guest)?.thread_pending & bit != 0 {
         removals += 1;
         if removals > MAX_IGNORED_REMOVALS {
             return Err(failed("too many instances"));
@@ -4856,7 +4856,7 @@ where
     G: Guest<Detcore<T>>,
 {
     use crate::wait_signal_end::WaitSignalEnd;
-    let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+    let state = crate::syscalls::read_guest_wait_signal_state(guest)?;
     let reserved = guest.config().in_guest_reserved_signals;
     match crate::wait_signal_end::wait_end(&state, m_temp, reserved) {
         None => {}
@@ -5114,7 +5114,7 @@ where
         // be ended by (https://github.com/rrnewton/hermit/issues/4089).
         let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
         if pending != 0 {
-            match signals.observable_now() {
+            match signals.observable_now(guest) {
                 Ok(observable) => act_on_pending_real_time(guest, pending, observable, 0).await,
                 Err(error) => break Err(error),
             }
@@ -5127,7 +5127,7 @@ where
             // whatever signal is pending (`inject_first_probe`).
             signals.inject_first_probe(guest, call).await
         } else {
-            let state = match signals.interrupted_with_state() {
+            let state = match signals.interrupted_with_state(guest) {
                 Ok((false, state)) => state,
                 // Linux takes a completion before it returns EINTR: a queued
                 // signal of rt_sigtimedwait's set (`do_sigtimedwait` dequeues
@@ -5192,7 +5192,7 @@ where
         }
         if first {
             // The first turn's check, after its probe found nothing to report.
-            match signals.interrupted_with_state() {
+            match signals.interrupted_with_state(guest) {
                 Ok((false, _)) => {}
                 Ok((true, state)) => {
                     deliver_under_wait_mask = signals.interrupts_only_under_wait_mask(&state);
@@ -5470,7 +5470,7 @@ impl IgnoredSignalShield {
         T: RecordOrReplay,
         G: Guest<Detcore<T>>,
     {
-        let state = match crate::syscalls::read_thread_signal_state(guest.pid(), guest.tid()) {
+        let state = match crate::syscalls::read_guest_thread_signal_state(guest) {
             Ok(state) => state,
             Err(errno) => {
                 tracing::debug!("[tid {}] no ignored-signal shield: {errno}", guest.tid());
@@ -5746,7 +5746,7 @@ where
     if pending != 0 {
         let ignored = match crate::syscalls::signal_shadow::copied_dispositions(guest) {
             Some(copied) => copied.ignored,
-            None => read_thread_wait_signal_state(guest.pid(), guest.tid())?.ignored,
+            None => crate::syscalls::read_guest_wait_signal_state(guest)?.ignored,
         };
         let (observable, discarded) = unblocked_by_ignored(ignored, mask);
         act_on_pending_real_time(guest, pending, observable, discarded).await;
@@ -6159,7 +6159,7 @@ impl KernelSignalWait {
         if recorded == 0 || self.saved_mask.is_none() {
             return Ok(0);
         }
-        let state = read_wait_signal_state(self.pid, self.tid)?;
+        let state = crate::syscalls::read_guest_group_wait_signal_state(guest)?;
         Ok(recorded & state.thread_pending)
     }
 
@@ -6183,8 +6183,12 @@ impl KernelSignalWait {
     /// The signals whose pending presence this wait would observe now: those
     /// it consumes, and those that would end it under the guest's mask, or
     /// the wait mask when it has one (`could_interrupt`). Read from the kernel's state in this turn.
-    pub(crate) fn observable_now(&self) -> Result<KernelSigset, Error> {
-        let state = read_wait_signal_state(self.pid, self.tid)?;
+    pub(crate) fn observable_now<T, G>(&self, guest: &G) -> Result<KernelSigset, Error>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        let state = crate::syscalls::read_guest_group_wait_signal_state(guest)?;
         Ok(self.consumed | self.could_interrupt(&state))
     }
 
@@ -6193,10 +6197,13 @@ impl KernelSignalWait {
         state.interrupting_wait(guest_mask, self.defers_default_stops) & !self.consumed
     }
 
-    /// `interrupted_with_state` without the state, for the tests.
+    /// `interrupted_with_state` without the state, for the tests, which read
+    /// their own thread's `/proc` state.
     #[cfg(test)]
     pub(crate) fn interrupted(&self) -> Result<bool, Error> {
-        Ok(self.interrupted_with_state()?.0)
+        Ok(self
+            .interrupted_in(read_wait_signal_state(self.pid, self.tid)?)
+            .0)
     }
 
     /// Whether a signal that would end the wait natively is pending, in which case
@@ -6216,8 +6223,19 @@ impl KernelSignalWait {
     /// counts. A signal that the backend holds since `inject_absorbing` absorbed
     /// it counts as pending. A failed read is never returned as the call's errno
     /// (`read_wait_signal_state`).
-    pub(crate) fn interrupted_with_state(&self) -> Result<(bool, KernelSignalState), Error> {
-        let state = read_wait_signal_state(self.pid, self.tid)?;
+    pub(crate) fn interrupted_with_state<T, G>(
+        &self,
+        guest: &G,
+    ) -> Result<(bool, KernelSignalState), Error>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        Ok(self.interrupted_in(crate::syscalls::read_guest_group_wait_signal_state(guest)?))
+    }
+
+    /// [`Self::interrupted_with_state`] given the thread's state.
+    fn interrupted_in(&self, state: KernelSignalState) -> (bool, KernelSignalState) {
         let could_interrupt = self.could_interrupt(&state);
         let held = self.held.map_or(0, |held| kernel_sigset_bit(held.signal));
         let held_until_return = self.held_until_return & !self.committed;
@@ -6233,7 +6251,7 @@ impl KernelSignalWait {
                 interrupting
             );
         }
-        Ok((interrupting != 0, state))
+        (interrupting != 0, state)
     }
 
     /// Inject `call`, a probe or a mask change, absorbing the signal stops that do
@@ -6432,7 +6450,7 @@ impl KernelSignalWait {
         loop {
             let before = match first.take() {
                 Some(state) => state,
-                None => read_wait_signal_state(self.pid, self.tid)?,
+                None => crate::syscalls::read_guest_group_wait_signal_state(guest)?,
             };
             let ends_wait = self.could_interrupt(&before) & !self.held_until_return;
             if !first_probe && before.pending & ends_wait != 0 {
@@ -6471,7 +6489,7 @@ impl KernelSignalWait {
             if !probe_was_interrupted_by_signal(errno) {
                 return Ok(result);
             }
-            let after = read_wait_signal_state(self.pid, self.tid)?;
+            let after = crate::syscalls::read_guest_group_wait_signal_state(guest)?;
             // A probe that carries the call's temporary mask, as a masked
             // ppoll's does (`with_wait_mask`), and that the kernel itself
             // ended, for a pending signal the mask lets in, leaves that mask
@@ -6700,7 +6718,7 @@ impl KernelSignalWait {
         T: RecordOrReplay,
         G: Guest<Detcore<T>>,
     {
-        let guest_mask = read_wait_signal_state(self.pid, self.tid)?.blocked;
+        let guest_mask = crate::syscalls::read_guest_group_wait_signal_state(guest)?.blocked;
         let mask = blocked_signal_mask() | guest_mask;
         let result = match scratch {
             Some(cell) => match guest.memory().write_value(cell, &mask) {
@@ -6778,7 +6796,7 @@ impl KernelSignalWait {
         // fallback injected restoration holds one that stops it
         // (`absorb_restoration_stop`) rather than counting it lost.
         self.hold_until_return(host_timed);
-        let guest_mask = read_wait_signal_state(self.pid, self.tid)?.blocked;
+        let guest_mask = crate::syscalls::read_guest_group_wait_signal_state(guest)?.blocked;
         match guest
             .set_blocked_signals(blocked_signal_mask() | guest_mask)
             .await
@@ -6962,7 +6980,7 @@ impl KernelSignalWait {
         // the mask is back.
         let mut loss = None;
         while attempts < ATTEMPTS {
-            let state = read_wait_signal_state(self.pid, self.tid)?;
+            let state = crate::syscalls::read_guest_group_wait_signal_state(guest)?;
             if let Some(before) = stopped.take() {
                 let replaced = self.absorb_restoration_stop(&before, &state);
                 loss = loss.or(replaced);
@@ -6986,7 +7004,7 @@ impl KernelSignalWait {
                 }
             }
         }
-        let state = read_wait_signal_state(self.pid, self.tid)?;
+        let state = crate::syscalls::read_guest_group_wait_signal_state(guest)?;
         if let Some(before) = stopped.take() {
             let replaced = self.absorb_restoration_stop(&before, &state);
             loss = loss.or(replaced);
@@ -8861,6 +8879,28 @@ pub(crate) mod kernel_signal_wait_failures {
         fn memory(&self) -> Self::Memory {
             LocalMemory::new()
         }
+        /// The fake kernel's sets, as a backend that delivers signals itself
+        /// reports them (`provides_process_signal_control`, KVM here); every
+        /// other backend reports nothing, as the trait's default.
+        fn signal_sets(&self, tid: Pid) -> Result<reverie::SignalSets, reverie::FactError> {
+            if !self.config.backend.provides_process_signal_control {
+                return Err(reverie::FactError::NotProvided);
+            }
+            let mut kernel = self.kernel.lock().unwrap();
+            if tid != self.tid || kernel.gone {
+                return Err(reverie::FactError::Errno(Errno::ESRCH));
+            }
+            if let Some(errno) = kernel.read_failures.pop_front() {
+                return Err(reverie::FactError::Errno(errno));
+            }
+            Ok(reverie::SignalSets::new(
+                kernel.pending & !kernel.shared,
+                kernel.pending & kernel.shared,
+                kernel.blocked,
+                kernel.ignored,
+                kernel.caught,
+            ))
+        }
         fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
             &mut self.thread
         }
@@ -10169,6 +10209,77 @@ pub(crate) mod kernel_signal_wait_failures {
             read_wait_signal_state(guest.pid, guest.tid),
             Err(Error::Errno(Errno::ERESTARTNOINTR))
         ));
+    }
+
+    /// SIGSHARE S3a: on a backend whose guest threads are not host tasks
+    /// (KVM), a blocked wait reads its thread's state from the backend
+    /// (`Guest::signal_sets`) at every read, and never host `/proc`, which
+    /// would describe an unrelated host task. Host reads are refused here
+    /// (the latch) and the `/proc` seam panics, so a wait that kept its
+    /// `/proc` read fails. A thread the backend no longer knows ends the call
+    /// with `ERESTARTNOINTR`, and any other failure ends the run, as for the
+    /// `/proc` read.
+    #[tokio::test]
+    async fn a_kvm_wait_reads_its_backend_and_never_host_proc() {
+        let (mut guest, kernel) = WaitGuest::live(guest_mask());
+        guest.config = Config {
+            sequentialize_threads: true,
+            ..Config::default().with_backend(|backend| {
+                *backend = reverie::BackendCapabilities::KVM;
+            })
+        };
+        crate::syscalls::refuse_host_signal_state_reads(&reverie::BackendCapabilities::KVM);
+        let _proc = signal_state_read_seam::install(|pid, tid| {
+            panic!("a KVM wait read host /proc of {pid}/{tid}")
+        });
+        let wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
+        {
+            let mut kernel = kernel.lock().unwrap();
+            kernel.caught = kernel_sigset_bit(libc::SIGUSR1) | kernel_sigset_bit(libc::SIGUSR2);
+            kernel.pending = kernel_sigset_bit(libc::SIGUSR2);
+        }
+        let (interrupted, state) = wait.interrupted_with_state(&guest).unwrap();
+        assert!(!interrupted, "SIGUSR2 is blocked");
+        assert_eq!(state.blocked, guest_mask());
+        // The signals that could end the wait: the caught SIGUSR1, never the
+        // blocked SIGUSR2.
+        let observable = wait.observable_now(&guest).unwrap();
+        assert_ne!(observable & kernel_sigset_bit(libc::SIGUSR1), 0);
+        assert_eq!(observable & kernel_sigset_bit(libc::SIGUSR2), 0);
+        kernel.lock().unwrap().pending = kernel_sigset_bit(libc::SIGUSR1);
+        assert!(
+            wait.interrupted_with_state(&guest).unwrap().0,
+            "SIGUSR1 is not blocked"
+        );
+        assert_eq!(
+            crate::syscalls::read_guest_group_wait_signal_state(&guest)
+                .unwrap()
+                .pending,
+            kernel_sigset_bit(libc::SIGUSR1)
+        );
+
+        kernel.lock().unwrap().read_failures.push_back(Errno::EIO);
+        assert_eq!(
+            diagnostic(crate::syscalls::read_guest_group_wait_signal_state(&guest)),
+            BlockedWaitSignalError::StateUnreadable {
+                pid: guest.pid,
+                tid: guest.tid,
+                errno: Errno::EIO,
+            }
+        );
+        kernel.lock().unwrap().gone = true;
+        assert!(matches!(
+            crate::syscalls::read_guest_group_wait_signal_state(&guest),
+            Err(Error::Errno(Errno::ERESTARTNOINTR))
+        ));
+        assert!(matches!(
+            wait.interrupted_with_state(&guest),
+            Err(Error::Errno(Errno::ERESTARTNOINTR))
+        ));
+        assert_eq!(
+            crate::syscalls::read_guest_task_signal_state(&guest, guest.pid, guest.tid),
+            Err(Errno::ESRCH)
+        );
     }
 
     #[tokio::test]

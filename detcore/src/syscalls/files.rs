@@ -10736,10 +10736,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // https://github.com/rrnewton/hermit/pull/4491, P2: 80 stale entries).
         while done + RECORD <= call.len() {
             if done > 0 {
-                let pending =
-                    crate::syscalls::threads::read_kernel_signal_state(guest.pid(), guest.tid())
-                        .map(|state| state.thread_pending | state.shared_pending)
-                        .unwrap_or(0);
+                let pending = crate::syscalls::read_guest_signal_state(guest)
+                    .map(|state| state.thread_pending | state.shared_pending)
+                    .unwrap_or(0);
                 if mask.is_none_or(|mask| pending & mask == 0) {
                     break;
                 }
@@ -12086,9 +12085,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if mask.is_some_and(|mask| mask & sigchld == 0) {
             return lost_a_discarded_copy;
         }
-        let Ok(state) =
-            crate::syscalls::threads::read_thread_wait_signal_state(guest.pid(), guest.tid())
-        else {
+        let Ok(state) = crate::syscalls::read_guest_wait_signal_state(guest) else {
             return lost_a_discarded_copy;
         };
         // A failed read of a descriptor for SIGCHLD alone took a SIGCHLD.
