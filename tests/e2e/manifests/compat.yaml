@@ -1555,7 +1555,10 @@ corpus:
           which KVM refused by name (`KVM flock is unsupported`,
           HERMIT_POLICY_REFUSAL, exit 122) in 10 of 10 KVM verify runs. What
           stops it on this tree, which has the flock model, is unmeasured; it
-          stays off KVM until it is measured. Measured then on the combined
+          stays off KVM until it is measured. The workload now also runs
+          its JVMs with -XX:-UsePerfData (dh-gg5uv), so no perf-data file
+          is created or flocked at all; what stops it on KVM must be
+          remeasured either way. Measured then on the combined
           java row; both split halves start a JVM, so both inherit this.
         java-run: >-
           The JVM's shared file mappings beside its other threads now go ahead
@@ -1567,7 +1570,10 @@ corpus:
           which KVM refused by name (`KVM flock is unsupported`,
           HERMIT_POLICY_REFUSAL, exit 122) in 10 of 10 KVM verify runs. What
           stops it on this tree, which has the flock model, is unmeasured; it
-          stays off KVM until it is measured. Measured then on the combined
+          stays off KVM until it is measured. The workload now also runs
+          its JVMs with -XX:-UsePerfData (dh-gg5uv), so no perf-data file
+          is created or flocked at all; what stops it on KVM must be
+          remeasured either way. Measured then on the combined
           java row; both split halves start a JVM, so both inherit this.
         javac-compile: >-
           javac's JVM gets past its shared file mappings beside its threads on
@@ -1577,7 +1583,10 @@ corpus:
           which KVM refused by name (`KVM flock is unsupported`,
           HERMIT_POLICY_REFUSAL, exit 122) in 10 of 10 KVM verify runs. What
           stops it on this tree, which has the flock model, is unmeasured; it
-          stays off KVM until it is measured. Measured then on the combined
+          stays off KVM until it is measured. The workload now also runs
+          its JVMs with -XX:-UsePerfData (dh-gg5uv), so no perf-data file
+          is created or flocked at all; what stops it on KVM must be
+          remeasured either way. Measured then on the combined
           javac row; both split halves start a JVM, so both inherit this.
         javac-run: >-
           javac's JVM gets past its shared file mappings beside its threads on
@@ -1587,7 +1596,10 @@ corpus:
           which KVM refused by name (`KVM flock is unsupported`,
           HERMIT_POLICY_REFUSAL, exit 122) in 10 of 10 KVM verify runs. What
           stops it on this tree, which has the flock model, is unmeasured; it
-          stays off KVM until it is measured. Measured then on the combined
+          stays off KVM until it is measured. The workload now also runs
+          its JVMs with -XX:-UsePerfData (dh-gg5uv), so no perf-data file
+          is created or flocked at all; what stops it on KVM must be
+          remeasured either way. Measured then on the combined
           javac row; both split halves start a JVM, so both inherit this.
         lsof: >-
           lsof stats every process's /proc/<pid> directory, which KVM's /proc

@@ -155,6 +155,63 @@ source bytes.
 
 # compat
 
+## compat/javac
+
+### 2026-11-06T02:46:31-05:00 — portable / replay / ptrace — ERROR
+
+- Hermit: `3d0e7775bcdef3ef0ac58ed359b7ada452f77f6c`; tree:
+  `a67d4b36fe2f4354f59b130f75389fb509731cd1`; binary: the pinned-root
+  validate-profile build (`target/debug/hermit` sha256 prefix
+  `5b2a9ff03f9e9d54` for the companion local build).
+- Command: off-record `--requalify-cell compat/javac replay ptrace`
+  (`scripts/validate.rs --allow-local-off-the-record-run`); run
+  exit 0 only after retry: attempt 1 `ERROR`/`no_result`/`incomplete-verification-evidence`
+  (13,301 ms), attempt 2 `PASS` (22,630 ms), so the sample is `flaky`
+  (1 ERROR, 1 PASS). Same first-attempt signature as merge-queue run
+  `20261106T052002Z` batch `0010-batch` at `858629ebdbfa`, and as
+  5199's split-cell reds at `e0a711220e` (java-run twice,
+  javac-run and javac-compile once each, `/tmp/hsperfdata_root/15`).
+- Evidence:
+  `ignored/validate/e2e/validate-cell-requalification-3d0e7775bcde-20261106T072925Z-3808091-1793950165410082310/portable/manifest_compat/results.jsonl`
+  and the retained
+  `compat-javac-replay-ptrace/verify-runs/1/run1/run.log` (record) and
+  `run2/run.log` (replay) beside it.
+- Observed: replay refuses descriptor 6 at `flock(6, 6)`:
+  `recorded open of "/tmp/hsperfdata_root/9" does not resolve to a lockable object beneath the replay root ("/tmp/hsperfdata_root/9" cannot be resolved: No such file or directory (os error 2))`.
+  The record log shows why (dtid 11, javac pid 9): `getdents64` on
+  `/tmp/hsperfdata_root` lists a pre-existing `9`, then
+  `openat(AT_FDCWD, "9", O_CLOEXEC) = Ok(6)` (syscall 134),
+  `flock(6, 6) = Ok(0)` (137), `unlink("9") = Ok(0)` (139) — the JVM's
+  stale perf-data cleanup — before its own
+  `openat(..., "9", O_CREAT|O_RDWR) = Ok(6)` (158) and `flock` (164).
+- Current explanation: the stale file is external state in the shared
+  pinned-root `/tmp`, not anything the recording created. The record
+  leg deletes it for real, so at replay the recorded non-`O_CREAT`
+  open names an object that does not exist beneath the replay root,
+  and there is no replay-owned object to lock. Whether attempt 1
+  fails depends on whether another JVM has since recreated a stale
+  pid file in the shared `/tmp`; the split cells' concurrent JVMs
+  raise that rate. `-XX:-UsePerfData` makes the JVM neither
+  create nor clean perf-data files (verified natively on the pinned
+  OpenJDK 21.0.12: a planted stale file survives with the flag and
+  is deleted without it; `TMPDIR`/`-Djava.io.tmpdir` do not move
+  hsperfdata). The flag landed folded into the split
+  java/javac rows via 5199 (folded head
+  `be927c9a840333dad8ed51f39834367f3891f41a`, workload hunks from
+  5205 at `43f8bcc959`), at the measured cost of the discarded
+  second-JVM warm-ups and 28 lines / 39-40 regions of Hermit coverage
+  (measured in-slot pre/post-flag pair diffs at the rebased head (same instrumented binary and commands; pre-flag workload from be927c9a8^): java pair 29356 -> 29328 covered source lines (lost 28, gained 0) and 42296 -> 42258 regions (lost 39, gained 1); javac pair 29231 -> 29203 lines (lost 28) and 42092 -> 42052 regions (lost 40); lost lines are the perf-data startup path in detcore (lib.rs:7436, scheduler.rs:12599, syscalls/files.rs, descriptor_directory.rs, rendered_procfs.rs), identical in both pairs; reports target/hermit-code-coverage/diffs/{java,javac}-split-preflag-main-vs-{java,javac}-split-postflag-main.md in the museskid slot). Replay still refuses by named gate
+  rather than inventing an object for a recorded open it cannot
+  resolve.
+- Ruled out / next: not a scheduling or recorded-base divergence —
+  record and replay DETLOGs agree line-for-line through the flock
+  inbound. At the combined-row flag head `43f8bcc959`, five
+  `--requalify-cell compat/javac replay ptrace` runs passed on
+  attempt 1 (run ids `20261106T075303Z`, `T075911Z`, `T080403Z`,
+  `T080840Z`, `T081339Z`). Next: the queue first-attempt tally
+  (about five validations on a base containing `97bca3b00d`) for
+  dh-gg5uv before this entry is removed.
+
 ## compat/lsof
 
 ### 2026-10-07T16:46:19-04:00 — buck / verify / ptrace — FAIL
