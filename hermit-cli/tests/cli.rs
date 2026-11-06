@@ -5839,9 +5839,12 @@ fn rewrite_exclusives_picks_memory_without_a_namespace_and_refuses_what_cannot_a
         "/bin/true",
     ]);
     assert!(!replay_rewritten.status.success());
+    // The plain fixture states no rewrite provenance at all, so a
+    // rewriting replay is refused for exactly that unstated provenance,
+    // not as a plain-versus-memory mismatch.
     assert!(
-        stderr(&replay_rewritten)
-            .contains("was recorded with exclusive loops as the files have them"),
+        stderr(&replay_rewritten).contains("does not state how its run rewrote exclusive loops")
+            && stderr(&replay_rewritten).contains("cannot reproduce the run"),
         "{}",
         stderr(&replay_rewritten)
     );
