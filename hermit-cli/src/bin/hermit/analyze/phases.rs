@@ -3803,8 +3803,14 @@ mod tests {
                 ],
                 "two next-thread and two slice-end replays"
             );
-            assert_eq!(report.critical_event1.as_ref().unwrap().event_index, ends[0]);
-            assert_eq!(report.critical_event2.as_ref().unwrap().event_index, ends[1]);
+            assert_eq!(
+                report.critical_event1.as_ref().unwrap().event_index,
+                ends[0]
+            );
+            assert_eq!(
+                report.critical_event2.as_ref().unwrap().event_index,
+                ends[1]
+            );
             assert_eq!(
                 report.critical_event1.as_ref().unwrap().stack,
                 Some(timing_report_stack(
