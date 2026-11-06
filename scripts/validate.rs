@@ -2341,6 +2341,18 @@ fn run_scorecard_owner_reexec_probe(
         service_result_path,
         scorecard_delegated,
     ) {
+        if code == COULD_NOT_RUN_EXIT_CODE {
+            return RunSummary::refused(
+                code,
+                LABEL,
+                "systemd user scope bus",
+                vec![
+                    "cgroup setup could not run: the systemd user scope bus was \
+                     unavailable; see the probe attempts above"
+                        .into(),
+                ],
+            );
+        }
         return RunSummary::new(
             Verdict::Fail,
             2,
@@ -2397,9 +2409,60 @@ fn run_scorecard_owner_reexec_probe(
     summary
 }
 
-/// One child of [`scorecard_owner_reexec_self_test`]: the real boxing re-exec
-/// with a service result path, and the post-verdict owner only when `delegated`.
+/// One launch of a [`scorecard_owner_reexec_self_test`] child, with bounded
+/// counted relaunches when the systemd user scope bus refuses the scope
+/// launch. The bus can refuse briefly under concurrent scope churn; that is
+/// infrastructure, and relaunching the whole child is the only retry point
+/// because a successful launch replaces the child process by exec.
 fn scorecard_owner_reexec_child(
+    exe: &Path,
+    result_path: &Path,
+    delegated: bool,
+) -> Result<(std::process::Output, serde_json::Value), String> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let _ = std::fs::remove_file(result_path);
+        let bus_refused = |text: &str| safe_ci_scope::user_bus_refused(text);
+        match scorecard_owner_reexec_child_once(exe, result_path, delegated) {
+            Ok((output, published)) => {
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if attempt < MAX_ATTEMPTS
+                    && output.status.code() == Some(i32::from(COULD_NOT_RUN_EXIT_CODE))
+                    && bus_refused(&combined)
+                {
+                    eprintln!(
+                        "scorecard owner self-test: user scope bus refused the scope \
+                         launch on attempt {attempt} of {MAX_ATTEMPTS}; relaunching"
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    continue;
+                }
+                return Ok((output, published));
+            }
+            Err(error) => {
+                if attempt < MAX_ATTEMPTS && bus_refused(&error) {
+                    eprintln!(
+                        "scorecard owner self-test: user scope bus refused the scope \
+                         launch on attempt {attempt} of {MAX_ATTEMPTS}; relaunching"
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// One child launch: the real boxing re-exec with a service result path,
+/// and the post-verdict owner only when `delegated`.
+fn scorecard_owner_reexec_child_once(
     exe: &Path,
     result_path: &Path,
     delegated: bool,

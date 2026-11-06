@@ -123,13 +123,36 @@ fn require_scope_observations(
     Ok(())
 }
 
+/// Exit code for an infrastructure refusal that produced no measured result.
+/// Callers that publish a validate service result map it to COULD_NOT_RUN.
+pub const COULD_NOT_RUN_EXIT_CODE: u8 = 75;
+
+/// systemd-run's exact user-bus connection refusal shape (lowercase).
+const USER_BUS_REFUSED_SIGNATURE: &str = "failed to connect to user scope bus via local transport:";
+
+/// Whether captured systemd output names the user scope bus connection
+/// refusal specifically. A bare "connection refused" is deliberately not
+/// enough: only systemd's full user-bus shape is infrastructure evidence.
+pub fn user_bus_refused(text: &str) -> bool {
+    text.to_ascii_lowercase()
+        .contains(USER_BUS_REFUSED_SIGNATURE)
+}
+
+fn scope_unavailable_exit_code(message: &str) -> u8 {
+    if user_bus_refused(message) {
+        COULD_NOT_RUN_EXIT_CODE
+    } else {
+        3
+    }
+}
+
 fn unavailable(label: &str, allow_failure: bool, message: &str) -> Result<BoxedCgroups, u8> {
     if allow_failure {
         eprintln!("{label}: WARNING: {message}; running UNBOXED (--allow-cgroup-failure).");
         Ok(None)
     } else {
         eprintln!("{label}: ERROR: {message}.");
-        Err(3)
+        Err(scope_unavailable_exit_code(message))
     }
 }
 
@@ -630,6 +653,93 @@ fn establish_cpu_placement(
     result
 }
 
+const USER_BUS_PROBE_ATTEMPTS: u32 = 3;
+const USER_BUS_PROBE_BACKOFF: Duration = Duration::from_secs(1);
+
+enum UserBusProbeFailure {
+    Refused(String),
+    Other(String),
+}
+
+/// Mirror dagrun's policy skip: in CI-style environments the scope attempt
+/// is skipped without asking the user manager anything, so probing there
+/// would only manufacture a refusal the attempt itself never makes.
+fn scope_attempt_skipped_by_policy() -> bool {
+    if std::env::var(dagrun::cgroup::FORCE_ATTEMPT_ENV)
+        .map(|value| value == "1")
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    std::env::var_os("GITHUB_ACTIONS").is_some() || std::env::var_os("CI").is_some()
+}
+
+fn run_user_bus_probe(attempt: u32) -> Result<(), UserBusProbeFailure> {
+    let unit = format!(
+        "--unit=validate-scope-probe-{}-{attempt}",
+        std::process::id()
+    );
+    let output = Command::new("timeout")
+        .args([
+            "--kill-after=1s",
+            "8s",
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            &unit,
+            "true",
+        ])
+        .output()
+        .map_err(|error| {
+            UserBusProbeFailure::Other(format!("cannot launch systemd-run: {error}"))
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = format!("probe exited {}: {stderr}", output.status);
+    if user_bus_refused(&stderr) {
+        Err(UserBusProbeFailure::Refused(detail))
+    } else {
+        Err(UserBusProbeFailure::Other(detail))
+    }
+}
+
+/// Launch throwaway user scopes until one succeeds, bounded and counted.
+/// The real re-exec replaces this process, so a bus refusal after it cannot
+/// be retried in-process; probing first turns a briefly unavailable bus
+/// into a counted wait, and a persistent one into a could-not-run refusal
+/// instead of a bare systemd-run exit with no service result.
+fn probe_user_scope_bus(label: &str) -> Result<(), UserBusProbeFailure> {
+    for attempt in 1..=USER_BUS_PROBE_ATTEMPTS {
+        match run_user_bus_probe(attempt) {
+            Ok(()) => {
+                if attempt > 1 {
+                    eprintln!(
+                        "{label}: systemd user scope bus probe attempt {attempt} of \
+                         {USER_BUS_PROBE_ATTEMPTS} succeeded after refusal"
+                    );
+                }
+                return Ok(());
+            }
+            Err(UserBusProbeFailure::Refused(detail)) => {
+                eprintln!(
+                    "{label}: systemd user scope bus probe attempt {attempt} of \
+                     {USER_BUS_PROBE_ATTEMPTS} refused: {detail}"
+                );
+                if attempt == USER_BUS_PROBE_ATTEMPTS {
+                    return Err(UserBusProbeFailure::Refused(detail));
+                }
+                std::thread::sleep(USER_BUS_PROBE_BACKOFF);
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    unreachable!("the bounded probe loop always returns")
+}
+
 /// Establish two-level cgroup-v2 boxing for a direct Rust scheduler client.
 ///
 /// A successful initial call re-executes the current CLI inside a transient
@@ -650,6 +760,32 @@ pub fn resolve_cgroups(
                 true,
                 "cgroup boxing was not established; process-group teardown and per-step wall limits remain active",
             );
+        }
+        if !scope_attempt_skipped_by_policy() {
+            match probe_user_scope_bus(label) {
+                Ok(()) => {}
+                Err(UserBusProbeFailure::Refused(detail)) => {
+                    return unavailable(
+                        label,
+                        false,
+                        &format!(
+                            "systemd user scope bus unavailable after \
+                             {USER_BUS_PROBE_ATTEMPTS} counted probe attempts: {detail}; \
+                             resource boxing is required"
+                        ),
+                    );
+                }
+                Err(UserBusProbeFailure::Other(detail)) => {
+                    return unavailable(
+                        label,
+                        false,
+                        &format!(
+                            "systemd user scope probe failed: {detail}; \
+                             resource boxing is required"
+                        ),
+                    );
+                }
+            }
         }
         let attempt = attempt_scope_reexec(None, None, scope_runtime_s);
         return unavailable(
@@ -773,6 +909,22 @@ pub fn self_test() -> Result<String, String> {
     }
     if !matches!(propagate_result(Err(3)), Err(3)) {
         return Err("the caller-facing helper result did not preserve fail-closed exit 3".into());
+    }
+    // The user-bus refusal is infrastructure (could-not-run), never a
+    // product refusal: it must exit 75, while every other scope failure
+    // keeps fail-closed exit 3. Only systemd's full shape counts.
+    let bus_refused = "Failed to connect to user scope bus via local transport: \
+                       Connection refused";
+    if !user_bus_refused(bus_refused)
+        || user_bus_refused("connect: Connection refused")
+        || user_bus_refused("Failed to connect to user scope bus")
+    {
+        return Err("user-bus refusal signature did not match exactly the full shape".into());
+    }
+    let bus_result =
+        expecting_refusal(|| unavailable("safe-ci scope self-test", false, bus_refused));
+    if !matches!(bus_result, Err(COULD_NOT_RUN_EXIT_CODE)) {
+        return Err("a user-bus refusal did not propagate as could-not-run exit 75".into());
     }
     if !runtime_readback_satisfies(false, false)
         || !runtime_readback_satisfies(true, true)

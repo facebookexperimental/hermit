@@ -94,6 +94,11 @@ pub fn understood_infrastructure_class(output: &str) -> Option<&'static str> {
     {
         return Some(class);
     }
+    // systemd-run's full user-bus refusal shape only: a bare "connection
+    // refused" elsewhere is product evidence, not an infrastructure cause.
+    if lower.contains("failed to connect to user scope bus via local transport:") {
+        return Some("user-bus-unavailable");
+    }
     if lower.contains("prehook: pmu rcb overshoot!")
         && lower.contains("clock_value:")
         && lower.contains("stepped forward")
@@ -1778,6 +1783,11 @@ pub fn self_test() -> Result<String, String> {
             "2026-08-27 ERROR detcore: prehook: PMU RCB overshoot! Clock_value: 16249. \
              Stepped forward 139 RCBs, but should have trapped at 100",
         ),
+        (
+            "user-bus-unavailable",
+            "[dagrun] re-exec inside transient systemd scope dagrun-3414313.scope\n\
+             Failed to connect to user scope bus via local transport: Connection refused",
+        ),
     ] {
         if understood_infrastructure_class(text) != Some(want) {
             return Err(format!(
@@ -1792,6 +1802,8 @@ pub fn self_test() -> Result<String, String> {
         "error: failed to run custom build command for `reverie-dbi v0.1.0`",
         "guest wrote: prehook: PMU RCB overshoot!",
         "guest wrote: mount failed: -1",
+        "connect: Connection refused",
+        "Failed to connect to user scope bus",
         "Error: Sandbox container failed to spawn\nCaused by: No such file or directory",
     ] {
         if understood_infrastructure_class(text).is_some() {
