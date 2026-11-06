@@ -146,6 +146,10 @@ struct InfoRecord {
     background_starts: Vec<BackgroundStart>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     rewrite_exclusives_in_memory: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    rows_alone: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    background_starts_unnoted: bool,
 }
 
 struct InfoLegacyFields<'a>(&'a PreemptionRecord);
@@ -905,5 +909,71 @@ mod tests {
         let back: PreemptionRecord = serde_json::from_str(&marked).unwrap();
         assert!(back.rewrite_exclusives_in_memory());
         assert_eq!(back.replay_departed_at(), Some(7));
+
+        // The INFO projection is RawRecord's exact serialization minus the
+        // host-observed store-exclusive count, so it carries the two marks
+        // RawRecord writes after `rewrite_exclusives_in_memory`: a record
+        // differing only in either mark projects to other JSON, and so to
+        // another summary digest and INFO comparison.
+        let plain = PreemptionRecord::default();
+        assert_eq!(
+            serde_json::to_string(&InfoProjection(&plain)).unwrap(),
+            r#"{"per_thread":{},"global":[]}"#
+        );
+        let mut alone = plain.clone();
+        alone.rows_alone = true;
+        assert_eq!(
+            serde_json::to_string(&alone).unwrap(),
+            r#"{"per_thread":{},"global":[],"rows_alone":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&InfoProjection(&alone)).unwrap(),
+            r#"{"per_thread":{},"global":[],"rows_alone":true}"#
+        );
+        let mut unnoted = plain.clone();
+        unnoted.background_starts_unnoted = true;
+        assert_eq!(
+            serde_json::to_string(&unnoted).unwrap(),
+            r#"{"per_thread":{},"global":[],"background_starts_unnoted":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&InfoProjection(&unnoted)).unwrap(),
+            r#"{"per_thread":{},"global":[],"background_starts_unnoted":true}"#
+        );
+        every_record_field_is_named_for_both_mirrors(plain);
+    }
+
+    /// Exhaustive on purpose (no `..`): the next field added to
+    /// `PreemptionRecord` fails to compile here until it is mirrored in
+    /// `RawRecord` and, unless it is the host-observed count the INFO view
+    /// excludes, in `InfoRecord` too.
+    fn every_record_field_is_named_for_both_mirrors(record: PreemptionRecord) {
+        let PreemptionRecord {
+            per_thread: _,
+            global: _,
+            epoch: _,
+            pipe_wake_latency: _,
+            signal_state_copy: _,
+            cap_preemption_charge: _,
+            chaos_timeslice: _,
+            guest_ids: _,
+            replay_departed_at: _,
+            reserved_input: _,
+            post_crash_timeslice: _,
+            post_crash: _,
+            callback_checkpoints: _,
+            rng_seed: _,
+            expired_wait_runs_charged_once: _,
+            host_inputs: _,
+            queued_sleeps_registered_at_first_pass: _,
+            store_exclusive_failures: _,
+            format_version: _,
+            time_skips: _,
+            rejoins: _,
+            background_starts: _,
+            rewrite_exclusives_in_memory: _,
+            rows_alone: _,
+            background_starts_unnoted: _,
+        } = record;
     }
 }

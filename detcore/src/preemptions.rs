@@ -3070,6 +3070,45 @@ mod tests {
             writer.summary().unwrap()
         };
         assert_eq!(boundary_summary(0), boundary_summary(20));
+
+        // The instruction-offset marks are recorded content too: rows alone
+        // and a record that notes no background starts time their rows by
+        // other rules, so a record differing only in either mark must not
+        // collapse to an unmarked record's summary, on either writer path.
+        // (InfoRecord, the INFO mirror in record_serde, carries both marks
+        // for this to hold.)
+        let marked_summary = |rows_alone: bool, unnoted: bool, boundaries: bool| {
+            let mut writer = PreemptionWriter::new(None);
+            if boundaries {
+                writer = writer.with_slice_boundaries().unwrap();
+            }
+            writer.register_thread(tid, DEFAULT_PRIORITY);
+            writer.insert_reprioritization(
+                tid,
+                LogicalTime::from_nanos(100),
+                10,
+                DEFAULT_PRIORITY,
+                20,
+                None,
+            );
+            writer.inner.format_version = Some(INSTRUCTION_OFFSET_ROWS_FORMAT);
+            writer.inner.rows_alone = rows_alone;
+            writer.inner.background_starts_unnoted = unnoted;
+            writer.summary().unwrap()
+        };
+        for boundaries in [false, true] {
+            let plain = marked_summary(false, false, boundaries);
+            assert_ne!(
+                plain,
+                marked_summary(true, false, boundaries),
+                "rows_alone alone must move the summary (boundaries={boundaries})"
+            );
+            assert_ne!(
+                plain,
+                marked_summary(false, true, boundaries),
+                "background_starts_unnoted alone must move the summary (boundaries={boundaries})"
+            );
+        }
     }
 
     /// Every streaming write/summary path runs the writer's stopless
