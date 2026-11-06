@@ -1106,10 +1106,11 @@ mod tests {
     fn every_top_level_class_is_classified_by_the_allow_list() {
         // All sixteen top-level classes (bits 28:25), one representative
         // unrecognised word each: only the positively known non-direct
-        // classes (data processing immediate/register, scalar FP/SIMD,
-        // loads/stores) may sit beside a rewrite. Reserved, SVE and both
-        // UNALLOCATED classes refuse, as does an unrecognised word in
-        // the branch/exception/system group.
+        // classes (SVE class 0010, data processing immediate/register,
+        // scalar FP/SIMD, loads/stores) may sit beside a rewrite. Reserved
+        // class 0000 permits only the UDF subrange (bits 31:16 are zero);
+        // its other encodings and both UNALLOCATED classes refuse, as does
+        // an unrecognised word in the branch/exception/system group.
         let cases: [(u32, bool); 16] = [
             (0x0001_0000, true),  // 0000 reserved (SME), not UDF
             (0x0200_0000, true),  // 0001 UNALLOCATED
