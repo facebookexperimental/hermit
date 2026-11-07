@@ -74,24 +74,28 @@
 //!
 //! DECLARED, KVM: for the run's root image, the record (from `AT_EXECFN`,
 //! the path the root was launched by) names the task as Linux does, while
-//! the KVM executor, which still answers `PR_GET_NAME` and
-//! `/proc/<pid>/status` there, names it by its resolved, canonical
-//! `argv[0]` (reverie-kvm `elf.rs`, `initial_thread_name`): for a `#!`
-//! script root, which Hermit's launcher rewrites to the interpreter, `stat`
-//! says `t.sh` where `status` says `sh`; for an ELF root launched through a
-//! symbolic link `/path/alias -> /path/actual`, `stat` says `alias` where
-//! `status` says `actual`. The record is the Linux-correct side and is kept;
-//! the executor's naming is the executor's
-//! (<https://github.com/rrnewton/reverie/issues/1106>; cells
-//! `system-utils/stat-script-root` and `system-utils/stat-alias-root` record
-//! it). On ptrace and DBT all three are the kernel's. The rendered `comm`
-//! file follows the record, so on KVM it agrees with `stat` and disagrees
-//! with `PR_GET_NAME` and `status` for those two roots in the same way, and
-//! in every descendant that has not renamed itself or exec'd since. The same
-//! split can follow a guest exec by a spelling the executor canonicalizes: a
-//! slashless `execve("alias", ...)` of a symbolic link `alias -> actual` can
-//! be named `actual` by the executor while the record, `stat` and `comm` say
-//! `alias`, as Linux does. After `PR_SET_NAME`, both follow the same rule.
+//! the KVM executor, which still answers `PR_GET_NAME` there, names it by its
+//! resolved, canonical `argv[0]` (reverie-kvm `elf.rs`,
+//! `initial_thread_name`): for a `#!` script root, which Hermit's launcher
+//! rewrites to the interpreter, `stat` says `t.sh` where `PR_GET_NAME` says
+//! `sh`; for an ELF root launched through a symbolic link
+//! `/path/alias -> /path/actual`, `stat` says `alias` where `PR_GET_NAME`
+//! says `actual`. The record is the Linux-correct side and is kept; the
+//! executor's naming is the executor's
+//! (<https://github.com/rrnewton/reverie/issues/1106>). On ptrace and DBT
+//! every name is the kernel's. The rendered `comm` file and, since package K
+//! slice 2b-2, the rendered `status` (`task_status`, whose `Name` is this
+//! name) follow the record, so on KVM `stat`, `status` and `comm` agree, as
+//! Linux's do, and disagree only with `PR_GET_NAME` for those two roots, and
+//! in every descendant that has not renamed itself or exec'd since (cells
+//! `system-utils/stat-script-root` and `system-utils/stat-alias-root` check
+//! the three files against the native output; before 2b-2 their KVM rows
+//! said `status=bash`, the executor's name). The same split can follow a
+//! guest exec by a spelling the executor canonicalizes: a slashless
+//! `execve("alias", ...)` of a symbolic link `alias -> actual` can be named
+//! `actual` by the executor while the record, `stat`, `status` and `comm`
+//! say `alias`, as Linux does. After `PR_SET_NAME`, both follow the same
+//! rule.
 //!
 //! The rules are Linux 6.17's (fs/proc/array.c `do_task_stat`, fs/exec.c
 //! `begin_new_exec`, kernel/sys.c `PR_SET_NAME`, fs/proc/base.c
