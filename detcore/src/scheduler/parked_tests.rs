@@ -9118,7 +9118,10 @@ const SIGALRM_BIT: u64 = 1 << (libc::SIGALRM - 1);
 /// Reports `sets` for task (`pid`, `tid`) through the fake control's
 /// `signal_sets`.
 fn report_signal_sets(b: &Backend, pid: i32, tid: i32, sets: reverie::SignalSets) {
-    b.task_signal_sets.lock().unwrap().push((task(pid, tid), sets));
+    b.task_signal_sets
+        .lock()
+        .unwrap()
+        .push((task(pid, tid), sets));
 }
 
 /// Files an ordinary request for `tid`, one that has nothing to do with
