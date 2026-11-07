@@ -28,7 +28,8 @@ mod dap_adapter;
 mod dispatch_entry;
 mod dispatch_executable;
 mod dispatch_input;
-#[cfg(test)]
+// This fixture uses the x86 in-guest exec-stop substrate, matching its dev dependency.
+#[cfg(all(test, target_arch = "x86_64"))]
 mod exec_stop_launch_tests;
 mod executable_probe;
 mod gdb_client;
