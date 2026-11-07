@@ -381,6 +381,7 @@ mod tests {
     /// counts as.
     #[test]
     fn a_source_of_rows_alone_with_instruction_offsets_counts_as_format_one() {
+        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
         use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::preemptions::PreemptionWriter;
@@ -421,6 +422,7 @@ mod tests {
     /// unless it holds offsets.
     #[test]
     fn a_trial_shares_the_timing_format_of_a_recording_with_instruction_offsets() {
+        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
         use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         let offset = InstructionOffset {
@@ -431,7 +433,7 @@ mod tests {
             SchedEvent::branches(DetTid::from_raw(3), 20).with_instruction_offset(Some(offset)),
         ])
         .with_current_format();
-        assert_eq!(with.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+        assert_eq!(with.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
         let without = PreemptionRecord::from_sched_events(events(&[3])).with_current_format();
         // Built from events, it notes no background starts.
         assert_eq!(
@@ -456,7 +458,7 @@ mod tests {
             PreemptionRecord::from_sched_events(with.schedevents().clone())
                 .with_format(trial)
                 .format_version(),
-            Some(INSTRUCTION_OFFSET_ROWS_FORMAT)
+            Some(INSTRUCTION_OFFSET_FORMAT)
         );
         // A source of a format this Hermit does not read keeps it, so a trial
         // from it states it too and is refused, not lowered into a format

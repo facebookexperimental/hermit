@@ -2984,6 +2984,7 @@ mod tests {
     /// in either cache order.
     #[test]
     fn a_trial_of_a_recording_with_instruction_offsets_keeps_its_own_jumps() {
+        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
         use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::types::DetTid;
@@ -3015,7 +3016,7 @@ mod tests {
             s.format_version(),
             Some(detcore::preemptions::BACKGROUND_STARTS_FORMAT - 1)
         );
-        assert_eq!(t.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+        assert_eq!(t.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("trial.json");
         for order in [[&s, &t], [&t, &s]] {
@@ -3029,7 +3030,7 @@ mod tests {
                 options.time_skip_sources.lock().unwrap().remember(source);
             }
             for (source, format, target) in [
-                (&t, INSTRUCTION_OFFSET_ROWS_FORMAT, 2000),
+                (&t, INSTRUCTION_OFFSET_FORMAT, 2000),
                 (&s, detcore::preemptions::BACKGROUND_STARTS_FORMAT - 1, 1000),
             ] {
                 options

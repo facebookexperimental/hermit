@@ -6638,7 +6638,7 @@ fn replay_of_instruction_offsets_is_refused_where_unsupported() {
             serde_json::from_slice(&std::fs::read(&with).unwrap()).unwrap();
         assert_eq!(
             json["format_version"],
-            detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT,
+            detcore::preemptions::INSTRUCTION_OFFSET_FORMAT,
             "{json}"
         );
         let object = json.as_object_mut().unwrap();
@@ -6803,7 +6803,7 @@ fn replay_of_instruction_offsets_is_refused_where_unsupported() {
             serde_json::json!({
                 "slice_boundary_recording": {
                     "preemptions": {"per_thread": {}, "global": [], "format_version": format},
-                    "schedule": [],
+                    "schedule": {"protocol": "hermit-slice-boundaries", "version": 1, "record_count": 0, "boundary_count": 0, "records": []},
                 }
             })
             .to_string(),

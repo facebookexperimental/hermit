@@ -468,7 +468,7 @@ impl std::hash::Hash for HostObservedCount {
 /// so a Hermit that reads only formats 1 to 4 refuses a record with such
 /// marks rather than replay it with a stop it would not find at those ends, and
 /// one that reads only formats 1 to 5 refuses a record with offset rows.
-pub const PREEMPTION_RECORD_FORMAT_MAX: u32 = INSTRUCTION_OFFSET_ROWS_FORMAT;
+pub const PREEMPTION_RECORD_FORMAT_MAX: u32 = INSTRUCTION_OFFSET_FORMAT;
 
 /// The format a fresh record states when its rows hold no instruction
 /// offset: the newest format below [`INSTRUCTION_OFFSET_ROWS_FORMAT`],
@@ -536,6 +536,12 @@ pub const STOPLESS_SLICE_ENDS_FORMAT: u32 = 5;
 /// timing on the format reads `PreemptionRecord::timing_format`, which
 /// decides that by the mark, not the number alone.
 pub const INSTRUCTION_OFFSET_ROWS_FORMAT: u32 = 6;
+
+/// The format from which a record's schedule trace (its `global` events)
+/// may carry an instruction offset on a batch of branches
+/// (`SchedEvent::instruction_offset`): above
+/// [`INSTRUCTION_OFFSET_ROWS_FORMAT`], which only its rows may hold.
+pub const INSTRUCTION_OFFSET_FORMAT: u32 = 7;
 
 /// The newest format a record may state when its rows hold no instruction
 /// offset: `format`, lowered below [`INSTRUCTION_OFFSET_ROWS_FORMAT`] when it is a
@@ -1947,7 +1953,9 @@ impl PreemptionRecord {
     /// offset: a Hermit that predates the offsets must refuse the record
     /// rather than replay its rows without them.
     fn adopt_offsets_format(&mut self) {
-        if self.rows_carry_instruction_offsets() {
+        if self.schedule_carries_instruction_offsets() {
+            self.raise_format(INSTRUCTION_OFFSET_FORMAT);
+        } else if self.rows_carry_instruction_offsets() {
             self.raise_format(INSTRUCTION_OFFSET_ROWS_FORMAT);
         }
     }
@@ -2124,11 +2132,11 @@ impl PreemptionRecord {
             // A format this Hermit does not read is refused as such
             // (`validate_format`), whatever it holds.
             let stated = self.format_version.unwrap_or(1);
-            if reads_format(self.format_version) && stated < INSTRUCTION_OFFSET_ROWS_FORMAT {
+            if reads_format(self.format_version) && stated < INSTRUCTION_OFFSET_FORMAT {
                 return Err(format!(
                     "schedule event #{index} of thread {} records an instruction offset, which a \
                      format-{stated} record cannot hold (offsets need format \
-                     {INSTRUCTION_OFFSET_ROWS_FORMAT})",
+                     {INSTRUCTION_OFFSET_FORMAT})",
                     event.dettid,
                 ));
             }
@@ -6906,7 +6914,7 @@ impl PreemptionWriter {
         }
         if ev.count > 0 {
             if ev.instruction_offset.is_some() {
-                self.inner.raise_format(INSTRUCTION_OFFSET_ROWS_FORMAT);
+                self.inner.raise_format(INSTRUCTION_OFFSET_FORMAT);
             }
             self.inner.global.push(ev)
             // TODO, aggregation: possibly check if the last event was the SAME, and combine them,
