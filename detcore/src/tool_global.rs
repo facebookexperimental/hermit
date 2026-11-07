@@ -11686,7 +11686,12 @@ pub(crate) fn finish_thread_start<G, T>(
     if let Some(length) = first_slice {
         install_replayed_timeslice(guest, length);
     }
-    guest.thread_state_mut().replay_instruction_offset = start_offset;
+    // Only a schedule first-slice pair displaces the reset's own decision:
+    // with no first slice, a history (preemption-row) replay installs its
+    // row's offset during the reset, and that decision stands.
+    if first_slice.is_some() {
+        guest.thread_state_mut().replay_instruction_offset = start_offset;
+    }
     crate::slice_boundary::grant::finish_start(guest.thread_state_mut(), reset)
         .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
 }
@@ -14964,6 +14969,69 @@ mod tests {
         };
         super::finish_thread_start(&config, &mut guest, None, Some(slice));
         assert_eq!(guest.thread.replay_instruction_offset, Some(offset));
+
+        // Real schedule startup (past the first execve): the first slice's
+        // duration is installed and its offset survives beside it.
+        let (config, state, tid, process) = cancellation_test_state();
+        let mut thread = crate::ThreadState::new(tid, &config, ());
+        thread.detpid = Some(process);
+        thread.past_global_first_execve = true;
+        thread.replay_instruction_offset = Some(offset);
+        let mut guest = ExternalRegistrationGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            post_exec: false,
+            ppid: None,
+            private_memory: None,
+        };
+        super::finish_thread_start(&config, &mut guest, None, Some(slice));
+        assert_eq!(guest.thread.replay_instruction_offset, Some(offset));
+        assert_eq!(
+            guest.thread.end_of_timeslice,
+            Some(guest.thread.thread_logical_time.as_nanos() + slice)
+        );
+
+        // History startup (no schedule first slice): the reset installs
+        // the first row's offset itself, and it survives.
+        let (config, state, tid, process) = cancellation_test_state();
+        let probe = crate::ThreadState::new(tid, &config, ());
+        let at = LogicalTime::from_nanos(probe.thread_logical_time.as_nanos().as_nanos() + 1_000);
+        let mut writer = crate::preemptions::PreemptionWriter::new(None);
+        writer.register_thread(tid, crate::scheduler::runqueue::DEFAULT_PRIORITY);
+        writer.insert_reprioritization(
+            tid,
+            at,
+            20,
+            crate::scheduler::runqueue::DEFAULT_PRIORITY,
+            5,
+            Some(crate::resources::InstructionOffset {
+                rcb_target: 18,
+                instructions: 4,
+            }),
+        );
+        let record: crate::preemptions::PreemptionRecord =
+            serde_json::from_str(&writer.into_string()).unwrap();
+        let history = record.extract_all().remove(&tid).unwrap();
+        let row_offset = Some(crate::resources::InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        });
+        let mut thread = crate::ThreadState::new(tid, &config, ());
+        thread.detpid = Some(process);
+        let mut guest = ExternalRegistrationGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            post_exec: false,
+            ppid: None,
+            private_memory: None,
+        };
+        super::finish_thread_start(&config, &mut guest, Some(history), None);
+        assert_eq!(guest.thread.replay_instruction_offset, row_offset);
+        assert!(row_offset.is_some());
     }
 
     #[tokio::test]
