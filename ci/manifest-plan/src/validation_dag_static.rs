@@ -3368,7 +3368,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_transferred_exec_gives_the_leader_the_survivors_own_cpu_time and
     // a_pre_exec_cpu_publication_after_a_transferred_exec_is_dropped: 3665.
     // Four census provenance units plus the non-PROGBITS control: 3665 + 5.
-    ("test.detcore_unit", 3755),
+    ("test.detcore_unit", 3766),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -6127,7 +6127,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // merge-queue recount after #5219: 3659.
     // The same six 2b-1 units: 3659 + 6 = 3665.
     // Four census provenance units plus the non-PROGBITS control: 3665 + 5.
-    ("test.detcore_unit_on_host", 3755),
+    ("test.detcore_unit_on_host", 3766),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
