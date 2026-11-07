@@ -15336,10 +15336,10 @@ fn pressure_timeout_self_test() -> Result<(), String> {
     };
     let selected = BTreeSet::from([key.clone()]);
     for (cpu, wall, expected_cpu, expected_wall, expected_outer) in [
-        (1.0, 1.0, 22, 57, 278),
-        (1.5, 1.0, 33, 57, 278),
-        (1.0, 1.5, 22, 86, 394),
-        (2.0, 3.0, 44, 171, 734),
+        (1.0, 1.0, 22, 176, 754),
+        (1.5, 1.0, 33, 264, 1106),
+        (1.0, 1.5, 22, 264, 1106),
+        (2.0, 3.0, 44, 1056, 4274),
     ] {
         let policy = PressureTimeoutPolicy {
             version: 1,
@@ -15409,9 +15409,13 @@ fn pressure_timeout_self_test() -> Result<(), String> {
             cpu_multiplier: 1.0,
             wall_multiplier: f64::NAN,
         },
+        // CPU 30x pushes the scaled CPU (660 s) past the 600 s derived
+        // wall cap, so wall <= CPU and the policy is refused; a smaller
+        // CPU multiplier is no longer inverted, because the wall now
+        // derives from the scaled CPU.
         PressureTimeoutPolicy {
             version: 1,
-            cpu_multiplier: 3.0,
+            cpu_multiplier: 30.0,
             wall_multiplier: 1.0,
         },
     ] {

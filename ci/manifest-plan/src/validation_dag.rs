@@ -5460,10 +5460,13 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         // preparation reserve (https://github.com/rrnewton/hermit/issues/3906).
         // 6900 = 7200 minus setup.manifest_plan's 300-second wall, which since
         // 2026-10-16 runs beside the 1200-second rust-script producer instead
-        // of after it.
-        if profile.label == "quick" && critical_path_wall_seconds(&selected)? != 6900 {
+        // of after it. 8500 since the cell wall derivation (max(declared,
+        // min(8x CPU, 600))) raised quick.e2e_verify's wall bound from 1800
+        // to 3390 so two attempts of the largest resolved cell wall plus
+        // grace fit inside it (require_manifest_selection_headroom).
+        if profile.label == "quick" && critical_path_wall_seconds(&selected)? != 8490 {
             return Err(format!(
-                "quick selected critical path differs from 6900 seconds with image-owned Nextest, the measured rust-script wall bound, setup.manifest_plan beside it and the 1200-second quick.build wall: {}",
+                "quick selected critical path differs from 8490 seconds with image-owned Nextest, the measured rust-script wall bound, setup.manifest_plan beside it and the 1200-second quick.build wall: {}",
                 critical_path_wall_seconds(&selected)?
             ));
         }
@@ -5484,9 +5487,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         // privileged-build.manifest_guests a 240-second one (120 before: 8
         // times its 30-CPU-second floor; 21.6 s measured); the path's nodes are
         // unchanged.
-        if profile.label == "privileged" && critical_path_wall_seconds(&selected)? != 5160 {
+        // 6410 since the cell wall derivation raised
+        // privileged-only-e2e.manifest_applications' wall bound from 600 to
+        // 1850 for the same retry-window reason as quick above.
+        if profile.label == "privileged" && critical_path_wall_seconds(&selected)? != 6410 {
             return Err(format!(
-                "local privileged selected critical path differs from 5160 seconds with the measured rust-script wall bound and setup.manifest_plan beside it: {}",
+                "local privileged selected critical path differs from 6410 seconds with the measured rust-script wall bound and setup.manifest_plan beside it: {}",
                 critical_path_wall_seconds(&selected)?
             ));
         }
@@ -5555,11 +5561,14 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
                 return Err("hosted privileged graph gained an unmeasured resource demand".into());
             }
             // 2400 = 2100 plus the 300 seconds the rust-script producer's
-            // wall bound grew (900 to 1200).
+            // wall bound grew (900 to 1200). 3650 since the cell wall
+            // derivation raised
+            // privileged-only-e2e.manifest_applications_on_host's wall bound
+            // from 600 to 1850 for the cell retry window.
             let critical = critical_path_wall_seconds(&selected)?;
-            if critical != 2400 {
+            if critical != 3650 {
                 return Err(format!(
-                    "hosted privileged critical path differs from 2400 seconds with the measured rust-script wall bound: {critical}"
+                    "hosted privileged critical path differs from 3650 seconds with the measured rust-script wall bound: {critical}"
                 ));
             }
         }
@@ -7977,8 +7986,11 @@ sys.exit(37)
         // https://github.com/rrnewton/hermit/issues/3301); the two buckets
         // measured 128.62 s and 75.76 s of wall time in one run. 1080 since
         // 2026-11-02: 61 runs under concurrent validations peaked at 707 s
-        // (step_limits.rs).
-        assert_eq!(local.timeout, 1080);
+        // (step_limits.rs). 1450 since the cell wall derivation
+        // (max(declared, min(8x CPU, 600))): two attempts of the largest
+        // resolved cell wall at CPU 1.25x/wall 1.5x plus grace need 1412 s
+        // (require_manifest_selection_headroom).
+        assert_eq!(local.timeout, 1450);
         assert_eq!(hosted.timeout, local.timeout);
     }
 
@@ -8148,7 +8160,12 @@ sys.exit(37)
     /// committed selection's node budgets are never clamped to it. Measured
     /// preparation on one development host: 65 s and 134 s typically, 734 s at
     /// worst (https://github.com/rrnewton/hermit/issues/3896).
-    const PREPARATION_RESERVE_S: i64 = 1200;
+    // 800 since quick.e2e_verify's wall bound rose to 3400 for the cell
+    // retry window (two attempts of the largest resolved cell wall at
+    // CPU 1.25x/wall 1.5x plus grace, 3380 s): the reserve must leave
+    // that node inside the 4200 s budget, and 800 still covers the
+    // measured worst preparation (734 s, issue 3896).
+    const PREPARATION_RESERVE_S: i64 = 800;
 
     #[test]
     fn every_committed_node_declares_its_caps_and_an_uncapped_one_is_refused() {

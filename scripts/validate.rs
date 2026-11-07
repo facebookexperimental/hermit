@@ -20742,7 +20742,7 @@ mod nextest_timeout_tests {
         };
         let resolved = resolved_cell_timeouts(cell, multipliers).unwrap();
         assert_eq!(resolved.cpu_seconds, 28);
-        assert_eq!(resolved.wall_seconds, 270);
+        assert_eq!(resolved.wall_seconds, 336);
         assert!(!manifest_command_is_prebuilt("quick.e2e_verify", &quick.cmd).unwrap());
         assert_eq!(
             require_manifest_selection_headroom(
@@ -20756,7 +20756,7 @@ mod nextest_timeout_tests {
                 10,
             )
             .unwrap(),
-            Some(700)
+            Some(2026)
         );
         assert_eq!(
             require_manifest_selection_headroom(
@@ -20770,7 +20770,7 @@ mod nextest_timeout_tests {
                 10,
             )
             .unwrap(),
-            Some(1240),
+            Some(2698),
             "prebuilt cells have no separate fixture-preparation wall window"
         );
 
@@ -20784,7 +20784,7 @@ mod nextest_timeout_tests {
             ),
             (
                 TimeoutMultipliers {
-                    cpu: 9.0,
+                    cpu: 30.0,
                     wall: 1.0,
                 },
                 "scaled wall timeout must remain greater",
@@ -20827,21 +20827,25 @@ mod nextest_timeout_tests {
             10,
         )
         .expect_err("non-prebuilt zstd can outgrow the quick node at wall 4x");
-        assert!(error.contains("can consume 1908s"), "{error}");
-        assert_eq!(
-            require_manifest_selection_headroom(
-                &manifests,
-                "prebuilt-zstd-control",
-                quick.timeout,
-                &zstd,
-                slow_host,
-                true,
-                validate_runtime::MAX_ATTEMPTS_PER_CELL as u64,
-                10,
-            )
-            .unwrap(),
-            Some(836),
-            "prebuilt zstd must not be charged for fixture preparation it skips"
+        assert!(error.contains("can consume 7188s"), "{error}");
+        // Prebuilt zstd is charged one wall window per attempt, not the
+        // non-prebuilt pair: at wall 4x it can consume 3604 s (half the
+        // non-prebuilt 7188 s, plus grace), which the quick node also
+        // refuses - the point is the window count, not that it fits.
+        let prebuilt_error = require_manifest_selection_headroom(
+            &manifests,
+            "prebuilt-zstd-control",
+            quick.timeout,
+            &zstd,
+            slow_host,
+            true,
+            validate_runtime::MAX_ATTEMPTS_PER_CELL as u64,
+            10,
+        )
+        .expect_err("prebuilt zstd at wall 4x also outgrows the quick node");
+        assert!(
+            prebuilt_error.contains("can consume 3604s"),
+            "{prebuilt_error}"
         );
         assert!(
             manifest_command_is_prebuilt(
@@ -20958,7 +20962,7 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
             .unwrap(),
             hermit_manifest_plan::timeouts::ResolvedTestTimeouts {
                 cpu_seconds: 28,
-                wall_seconds: 315,
+                wall_seconds: 392,
             }
         );
         for (name, value) in [
@@ -21306,8 +21310,13 @@ exec env -u HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER -u HERMIT_TEST_WALL_TIMEOUT_MULTI
             for (cpu, wall, expected) in [
                 (
                     Some("1.25"),
+                    Some("1.5"),
+                    Ok("RESOLVED_CPU=28 RESOLVED_WALL=336"),
+                ),
+                (
+                    Some("1.25"),
                     Some("1.75"),
-                    Ok("RESOLVED_CPU=28 RESOLVED_WALL=315"),
+                    Err("can consume 3940s"),
                 ),
                 (None, None, Ok("RESOLVED_CPU=22 RESOLVED_WALL=180")),
                 (
@@ -21321,12 +21330,12 @@ exec env -u HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER -u HERMIT_TEST_WALL_TIMEOUT_MULTI
                     Err(TEST_WALL_TIMEOUT_MULTIPLIER_ENV),
                 ),
                 (
-                    Some("3"),
+                    Some("30"),
                     Some("1"),
                     Err("scaled wall timeout must remain greater"),
                 ),
                 (Some("1e308"), Some("1e308"), Err("overflows")),
-                (Some("1"), Some("4"), Err("can consume 2900s")),
+                (Some("1"), Some("4"), Err("can consume 7188s")),
             ] {
                 let output = run(&argv, cpu, wall);
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -22042,7 +22051,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         quick.timeout,
         &quick_selection,
         TimeoutMultipliers {
-            cpu: 3.0,
+            cpu: 30.0,
             wall: 1.0,
         },
         quick_prebuilt,
@@ -22093,7 +22102,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
     )
     .expect_err("non-prebuilt zstd at wall 4x must exceed the enclosing node bound");
     if !nonprebuilt_zstd_error.contains("wall multiplier 4")
-        || !nonprebuilt_zstd_error.contains("can consume 1908s")
+        || !nonprebuilt_zstd_error.contains("can consume 7188s")
     {
         return Err(format!(
             "retry bounds: non-prebuilt zstd control failed for the wrong reason: {nonprebuilt_zstd_error}"

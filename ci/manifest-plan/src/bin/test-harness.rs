@@ -2526,7 +2526,7 @@ fn audit_run_dag_workflow_runner(label: &str, workflow: &YamlValue) -> Result<()
     // environment carries any cgroup input the runner reads, and the explicit
     // unboxed one only when it carries none.
     const VALIDATION_PRIVILEGED: &str = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\nif [[ -n ${DAGRUN_DELEGATED_CGROUP+set}${DAGRUN_IN_SCOPE+set}${DAGRUN_SCOPE_UNIT+set}${DAGRUN_DIRECT_CGROUP+set}${DAGRUN_DELEGATED_UNBOXED+set}${DAGRUN_FORCE_SCOPE_ATTEMPT+set} ]]; then\n  env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v\nelse\n  env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v\nfi";
-    const STANDALONE_PRIVILEGED: &str = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\ntimeout --foreground --kill-after=10s 2460s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v";
+    const STANDALONE_PRIVILEGED: &str = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\ntimeout --foreground --kill-after=10s 3720s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v";
     const FIXTURES: &[&str] = &[
         "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v",
         "timeout --foreground --kill-after=10s 2160s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -v",
@@ -5028,7 +5028,7 @@ rundir.mkdir()
                 row.require_current_classification().unwrap();
                 row.require_current_timeout_policy().unwrap();
                 assert_eq!(row.execution_cpu_timeout_seconds, Some(5));
-                assert_eq!(row.execution_wall_timeout_seconds, Some(10));
+                assert_eq!(row.execution_wall_timeout_seconds, Some(40));
                 assert_eq!(row.outcome, "PASS", "{scenario}: {row:#?}");
                 assert_eq!(row.result, Some(ObservedResult::Pass), "{scenario}");
                 assert_eq!(row.attempts.len(), 1, "{scenario}: {row:#?}");
@@ -9959,7 +9959,7 @@ sys.exit(1 if failed else 0)
         let error = super::audit_privileged_workflow_overhead(&privileged_workflow).unwrap_err();
         assert!(
             error.contains(
-                "privileged job 2640s must cover 2910s of explicit inner step budgets plus at least 300s"
+                "privileged job 2640s must cover 4170s of explicit inner step budgets plus at least 300s"
             ),
             "{error}"
         );
@@ -11125,8 +11125,8 @@ sys.exit(1 if failed else 0)
             assert_eq!(row.mode, "naked");
             assert_eq!(row.backend, None);
             assert_eq!(row.execution_cpu_timeout_seconds, Some(1));
-            assert_eq!(row.execution_wall_timeout_seconds, Some(2));
-            assert_eq!(row.timeout_seconds, 2);
+            assert_eq!(row.execution_wall_timeout_seconds, Some(8));
+            assert_eq!(row.timeout_seconds, 8);
             histories.entry(row.test.clone()).or_default().push(row);
         }
         assert_eq!(
@@ -11276,12 +11276,12 @@ sys.exit(1 if failed else 0)
                         json!({
                             "attempt": 1,
                             "outcome": "wall_timeout",
-                            "detail": "cell exceeded 2 wall s backstop (1 s CPU budget)",
+                            "detail": "cell exceeded 8 wall s backstop (1 s CPU budget)",
                         }),
                         json!({
                             "attempt": 2,
                             "outcome": "wall_timeout",
-                            "detail": "cell exceeded 2 wall s backstop (1 s CPU budget)",
+                            "detail": "cell exceeded 8 wall s backstop (1 s CPU budget)",
                         }),
                     ]),
                 ]

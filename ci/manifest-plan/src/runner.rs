@@ -21131,7 +21131,7 @@ int main(int argc, char **argv) {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["attempt"], 1);
         assert_eq!(rows[0]["duration_ms"], 111);
-        assert_eq!(rows[0]["timeout_seconds"], 15);
+        assert_eq!(rows[0]["timeout_seconds"], 80);
         assert_eq!(rows[0]["outcome"], "FAIL");
         assert_eq!(rows[0]["result"], "determinism-failure");
         assert_eq!(rows[0]["failure_class"], "product_failure");
@@ -21149,7 +21149,7 @@ int main(int argc, char **argv) {
         );
         assert_eq!(rows[1]["attempt"], 2);
         assert_eq!(rows[1]["duration_ms"], 222);
-        assert_eq!(rows[1]["timeout_seconds"], 15);
+        assert_eq!(rows[1]["timeout_seconds"], 80);
         assert_eq!(rows[1]["outcome"], "PASS");
         assert_eq!(rows[1]["result"], "pass");
         assert_eq!(rows[1]["failure_class"], JsonValue::Null);
