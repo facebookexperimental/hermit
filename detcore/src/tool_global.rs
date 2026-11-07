@@ -8331,7 +8331,9 @@ pub enum SignalScope {
 /// provisional; the merge queue assigns the final number at landing.
 /// From https://github.com/rrnewton/hermit/pull/5175, merged at landing by the merge queue: 51 is
 /// its revision, renumbered from 50, and is current; the revisions called current above precede it.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 51;
+/// From https://github.com/rrnewton/hermit/pull/4759, merged at landing by the merge queue: 52 is
+/// its revision, renumbered from 49, and is current; the revisions called current above precede it.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 52;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a

@@ -356,6 +356,18 @@ mod tests {
         // (renumbered from 50 to 51 at landing by the merge queue; digests measured on the combined
         // tree)
         (51, "ad4bb7658a751c72", "f013e36743d8d9e6"),
+        // Adds `TraceSchedEventResponse::backstop`, the replay backstop of a
+        // schedule replay of a record whose slices ran without the
+        // `--max-timeslice` bound, which `GlobalResponse::TraceSchedEvent`
+        // carries. The reply's fields are digested as `TRACE_REPLY_WIRE`
+        // items, so the field changes the digest in domain 5
+        // (https://github.com/rrnewton/hermit/pull/4759, allocated revision
+        // 25 on its own base after main's 24, assigned 42 at its rebase
+        // onto 41, renumbered to 49 at its rebase onto main's 48, skipping
+        // reserved revisions; digest measured at this head).
+        // (renumbered from 49 to 52 at landing by the merge queue; digests measured on the combined
+        // tree)
+        (52, "18b49ae6affb5c77", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
