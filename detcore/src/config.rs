@@ -107,8 +107,11 @@ mod tests {
     /// payload layout. 48 adds `WithCpuTime` and `RecordExitCode` from
     /// package K item 2b slice 2b-1. 49 adds `Rewrite::not_written` from
     /// https://github.com/rrnewton/hermit/pull/5222, numbered 48 on its
-    /// source base and renumbered to 49 at landing. The table below is the
-    /// authority for the landed rows; the reservation list is unchanged.
+    /// source base and renumbered to 49 at landing. 50 adds
+    /// `Found::unverified_pairs` to the `StoreExclusive` payload; it is
+    /// provisional; the merge queue assigns the final number at landing.
+    /// The table below records the landed history and this provisional row;
+    /// the reservation list is unchanged.
     const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39, 42, 43, 44];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
@@ -339,6 +342,12 @@ mod tests {
         // (renumbered from 48 to 49 at landing by the merge queue; digests measured on the combined
         // tree)
         (49, "cc10df0910192a63", "f013e36743d8d9e6"),
+        // Adds `Found::unverified_pairs` to the positional StoreExclusive
+        // payload. Source revision 44 is carried after main's landed 49.
+        // Both digests were printed by the revision guard on the carried
+        // tree. Revision 50 is provisional; the merge queue assigns the
+        // final number at landing.
+        (50, "317db02ddad70067", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

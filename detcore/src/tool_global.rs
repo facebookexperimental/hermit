@@ -8315,8 +8315,11 @@ pub enum SignalScope {
 /// its rebase onto 41, 46 at its rebase onto 45, then mechanically to 48
 /// at its rebase onto 47). 49 adds `Rewrite::not_written` to the
 /// `StoreExclusive` payload (https://github.com/rrnewton/hermit/pull/5222;
-/// numbered 48 on its source base, renumbered to 49 at landing).
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 49;
+/// numbered 48 on its source base, renumbered to 49 at landing). 50 adds
+/// `Found::unverified_pairs` to the `StoreExclusive` payload (source
+/// revision 44, carried after main's landed 49). Revision 50 is
+/// provisional; the merge queue assigns the final number at landing.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 50;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
