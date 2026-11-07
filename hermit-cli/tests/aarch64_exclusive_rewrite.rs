@@ -14,6 +14,8 @@
 
 #![cfg(target_arch = "aarch64")]
 
+#[path = "common/exclusive_rewrite_summary.rs"]
+mod exclusive_rewrite_summary;
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
 
@@ -267,6 +269,8 @@ fn the_in_memory_rewrite_replaces_a_guests_loop_and_it_still_counts() {
     let summary: serde_json::Value =
         serde_json::from_slice(&fs::read(&summary_path).unwrap()).unwrap();
     assert_eq!(rewrite_of(&summary, &guest), (1, 0, 0), "{summary:#}");
+    exclusive_rewrite_summary::check_no_failed_rewrites(&summary)
+        .unwrap_or_else(|error| panic!("{error}: {summary:#}"));
     // Every file with loops is one this test put in its disk directory: anything else
     // (a library the guest found on the host) cannot be proven and would be
     // counted as not written.

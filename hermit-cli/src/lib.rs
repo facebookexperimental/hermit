@@ -5500,8 +5500,75 @@ pub fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Result<Out
 mod in_guest_delivery_harness;
 
 #[cfg(test)]
+#[path = "../tests/common/exclusive_rewrite_summary.rs"]
+mod exclusive_rewrite_summary;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_rewrite_without_a_scanned_pair_is_rejected() {
+        let mut summary = serde_json::json!({
+            "exclusive_pairs": { "/fixture/guest": 1 },
+            "exclusive_rewrites": {
+                "/fixture/guest": { "rewritten": 1, "left": 0, "failed": 0 },
+                "/fixture/unreadable.so": {
+                    "rewritten": 0,
+                    "left": 0,
+                    "failed": 1,
+                    "not_written": "the guest's memory could not be read or written"
+                }
+            }
+        });
+        let pairs = summary["exclusive_pairs"].as_object().unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert!(!pairs.contains_key("/fixture/unreadable.so"));
+        let guest = &summary["exclusive_rewrites"]["/fixture/guest"];
+        assert_eq!(
+            (
+                guest["rewritten"].as_u64(),
+                guest["left"].as_u64(),
+                guest["failed"].as_u64()
+            ),
+            (Some(1), Some(0), Some(0))
+        );
+        // The former pair-key traversal sees only the healthy guest. The failed
+        // mapping is retained in rewrites even though it has no scanned pair.
+        for (path, count) in pairs {
+            assert!(std::path::Path::new(path).starts_with("/fixture"));
+            let entry = &summary["exclusive_rewrites"][path];
+            assert_eq!(entry["failed"].as_u64(), Some(0));
+            assert_eq!(
+                entry["rewritten"].as_u64().unwrap() + entry["left"].as_u64().unwrap(),
+                count.as_u64().unwrap()
+            );
+        }
+        assert_eq!(
+            exclusive_rewrite_summary::check_no_failed_rewrites(&summary),
+            Err("/fixture/unreadable.so: 1 not written".to_owned())
+        );
+
+        summary["exclusive_rewrites"]
+            .as_object_mut()
+            .unwrap()
+            .remove("/fixture/unreadable.so");
+        assert_eq!(
+            exclusive_rewrite_summary::check_no_failed_rewrites(&summary),
+            Ok(())
+        );
+        // Native loops left intentionally and successful rewrite-only rows
+        // are not failed writes and need no invented reverse pair membership.
+        summary["exclusive_pairs"]["/fixture/native.so"] = serde_json::json!(2);
+        summary["exclusive_rewrites"]["/fixture/native.so"] =
+            serde_json::json!({ "rewritten": 0, "left": 2, "failed": 0 });
+        summary["exclusive_rewrites"]["/fixture/empty.so"] =
+            serde_json::json!({ "rewritten": 0, "left": 0, "failed": 0 });
+        assert_eq!(
+            exclusive_rewrite_summary::check_no_failed_rewrites(&summary),
+            Ok(())
+        );
+    }
 
     // Historical capability rows are test data, not public backend selections.
     // Core rows still call the real builtin preparation path; external rows
