@@ -289,9 +289,23 @@ fn git_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(result.stdout)
 }
 
-fn source_identity(root: &Path) -> Result<String, String> {
+/// The parts of one root's source identity, kept in the record so a
+/// stale refusal can name the root and the part that changed instead
+/// of reporting one opaque hash (dh-0pw53).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct SourcePart {
+    head: String,
+    tree: String,
+    diff_sha256: String,
+    untracked: Vec<(String, String, u32)>,
+}
+
+fn source_snapshot(root: &Path) -> Result<(String, SourcePart), String> {
     let mut hash = Sha256::new();
-    for args in [
+    let mut head = String::new();
+    let mut tree = String::new();
+    let mut diff_sha256 = String::new();
+    for (index, args) in [
         &["rev-parse", "HEAD", "HEAD^{tree}"][..],
         &[
             "diff",
@@ -302,13 +316,26 @@ fn source_identity(root: &Path) -> Result<String, String> {
             "HEAD",
             "--",
         ][..],
-    ] {
+    ]
+    .iter()
+    .enumerate()
+    {
         let bytes = git_bytes(root, args)?;
         hash.update((bytes.len() as u64).to_le_bytes());
-        hash.update(bytes);
+        hash.update(&bytes);
+        if index == 0 {
+            let text =
+                std::str::from_utf8(&bytes).map_err(|_| "git rev-parse output is not UTF-8")?;
+            let mut lines = text.lines();
+            head = lines.next().unwrap_or_default().to_string();
+            tree = lines.next().unwrap_or_default().to_string();
+        } else {
+            diff_sha256 = format!("{:x}", Sha256::digest(&bytes));
+        }
     }
-    let untracked = git_bytes(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
-    for name in untracked
+    let untracked_bytes = git_bytes(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    let mut untracked = Vec::new();
+    for name in untracked_bytes
         .split(|byte| *byte == 0)
         .filter(|name| !name.is_empty())
     {
@@ -319,8 +346,104 @@ fn source_identity(root: &Path) -> Result<String, String> {
         hash.update(name.as_bytes());
         hash.update(identity.sha256.as_bytes());
         hash.update(identity.mode.to_le_bytes());
+        untracked.push((name.to_string(), identity.sha256, identity.mode));
     }
-    Ok(format!("{:x}", hash.finalize()))
+    let part = SourcePart {
+        head,
+        tree,
+        diff_sha256,
+        untracked,
+    };
+    Ok((format!("{:x}", hash.finalize()), part))
+}
+
+fn source_identity(root: &Path) -> Result<String, String> {
+    Ok(source_snapshot(root)?.0)
+}
+
+fn source_part(root: &Path) -> Result<SourcePart, String> {
+    Ok(source_snapshot(root)?.1)
+}
+
+/// Why CURRENT no longer matches RECORD, naming the first differing
+/// root and part (dh-0pw53): HEAD, tree, tracked diff, or the first
+/// added/removed/changed untracked file.
+fn stale_source_detail(
+    record: &PreparedRecord,
+    current: &BTreeMap<PathBuf, String>,
+    current_parts: &BTreeMap<PathBuf, SourcePart>,
+) -> String {
+    for (root, before_identity) in &record.sources {
+        if current.get(root) == Some(before_identity) {
+            continue;
+        }
+        let Some(before) = record.source_parts.get(root) else {
+            return format!("source identity changed at {}", root.display());
+        };
+        let Some(after) = current_parts.get(root) else {
+            return format!(
+                "source identity changed at {}: source root is gone",
+                root.display()
+            );
+        };
+        if after.head != before.head {
+            return format!(
+                "source identity changed at {}: HEAD moved {}..{}",
+                root.display(),
+                &before.head[..before.head.len().min(12)],
+                &after.head[..after.head.len().min(12)]
+            );
+        }
+        if after.tree != before.tree {
+            return format!(
+                "source identity changed at {}: HEAD tree changed",
+                root.display()
+            );
+        }
+        if after.diff_sha256 != before.diff_sha256 {
+            return format!(
+                "source identity changed at {}: tracked diff changed",
+                root.display()
+            );
+        }
+        let before_map: BTreeMap<&str, (&str, u32)> = before
+            .untracked
+            .iter()
+            .map(|(name, sha, mode)| (name.as_str(), (sha.as_str(), *mode)))
+            .collect();
+        let after_map: BTreeMap<&str, (&str, u32)> = after
+            .untracked
+            .iter()
+            .map(|(name, sha, mode)| (name.as_str(), (sha.as_str(), *mode)))
+            .collect();
+        for (name, value) in &after_map {
+            match before_map.get(name) {
+                None => {
+                    return format!(
+                        "source identity changed at {}: untracked file {name} was added",
+                        root.display()
+                    );
+                }
+                Some(old) if old != value => {
+                    return format!(
+                        "source identity changed at {}: untracked file {name} changed",
+                        root.display()
+                    );
+                }
+                _ => {}
+            }
+        }
+        for name in before_map.keys() {
+            if !after_map.contains_key(name) {
+                return format!(
+                    "source identity changed at {}: untracked file {name} was removed",
+                    root.display()
+                );
+            }
+        }
+        return format!("source identity changed at {}", root.display());
+    }
+    "source identity changed".to_string()
 }
 
 fn read_json(path: &Path) -> Result<Value, String> {
@@ -393,6 +516,11 @@ struct PreparedRecord {
     repository: PathBuf,
     target: PathBuf,
     sources: BTreeMap<PathBuf, String>,
+    /// Per-root identity parts, for stale refusals that name the
+    /// changed root and part (dh-0pw53). Defaulted so records
+    /// written before this field still read.
+    #[serde(default)]
+    source_parts: BTreeMap<PathBuf, SourcePart>,
     rustc: String,
     cargo_config: BTreeMap<PathBuf, Option<FileIdentity>>,
     build_environment: BTreeMap<String, String>,
@@ -1023,6 +1151,21 @@ fn metadata_binaries(
     Ok((result, runtime_files))
 }
 
+type SourceMap = BTreeMap<PathBuf, String>;
+type SourcePartMap = BTreeMap<PathBuf, SourcePart>;
+
+fn sources_and_parts(
+    cargo: &Value,
+    root: &Path,
+) -> Result<(SourceMap, SourcePartMap), String> {
+    let collected = sources(cargo, root)?;
+    let mut parts = BTreeMap::new();
+    for root in collected.keys() {
+        parts.insert(root.clone(), source_part(root)?);
+    }
+    Ok((collected, parts))
+}
+
 fn sources(cargo: &Value, root: &Path) -> Result<BTreeMap<PathBuf, String>, String> {
     let mut roots = BTreeSet::from([root.to_owned()]);
     for package in cargo["packages"]
@@ -1374,8 +1517,12 @@ fn verify_record(root: &Path, record: &PreparedRecord) -> Result<Value, String> 
     if target != record.target || target.canonicalize().map_err(|e| e.to_string())? != target {
         return Err("prepared record has the wrong Cargo target directory".into());
     }
-    if record.sources != sources(&cargo, root)? {
-        return Err("prepared executables are stale: source identity changed".into());
+    let (current_sources, current_parts) = sources_and_parts(&cargo, root)?;
+    if record.sources != current_sources {
+        return Err(format!(
+            "prepared executables are stale: {}",
+            stale_source_detail(record, &current_sources, &current_parts)
+        ));
     }
     if record.rustc != rustc_identity()?
         || record.build_environment != build_environment()
@@ -2232,7 +2379,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         let core = owner.current()?;
         same_core_package(project, &cargo, &read_json(&core.cargo_metadata.path)?)?;
     }
-    let before_sources = sources(&cargo, &root)?;
+    let (before_sources, before_source_parts) = sources_and_parts(&cargo, &root)?;
     let before_rustc = rustc_identity()?;
     let before_environment = build_environment();
     let before_config = cargo_config(&root)?;
@@ -2428,6 +2575,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         repository: root.clone(),
         target: target.clone(),
         sources: before_sources,
+        source_parts: before_source_parts,
         rustc: before_rustc,
         cargo_config: before_config,
         build_environment: before_environment,
@@ -3083,6 +3231,7 @@ mod tests {
                     repository: self.root.clone(),
                     target: self.target.clone(),
                     sources: BTreeMap::new(),
+                    source_parts: BTreeMap::new(),
                     rustc: String::new(),
                     cargo_config: BTreeMap::new(),
                     build_environment: BTreeMap::new(),
@@ -3771,6 +3920,100 @@ mod tests {
         )
         .unwrap();
         assert_ne!(sources(&f.cargo, &f.root).unwrap(), before);
+    }
+
+    /// The race from dh-0pw53: a root mutated between the record and
+    /// its verification must be named, with the differing part, so the
+    /// writer can be found from the refusal alone. Without the parts
+    /// in the record this detail cannot be produced.
+    #[test]
+    fn stale_source_detail_names_the_root_and_the_part() {
+        let root = PathBuf::from("/fixture/root");
+        let part = |head: &str, diff: &str, untracked: Vec<(String, String, u32)>| SourcePart {
+            head: head.into(),
+            tree: "tree".into(),
+            diff_sha256: diff.into(),
+            untracked,
+        };
+        let base = part("aaaa1111", "diff", vec![]);
+        let record = PreparedRecord {
+            schema: RECORD_SCHEMA,
+            project: None,
+            repository: root.clone(),
+            target: root.clone(),
+            sources: BTreeMap::from([(root.clone(), "identity".into())]),
+            source_parts: BTreeMap::from([(root.clone(), base.clone())]),
+            rustc: String::new(),
+            cargo_config: BTreeMap::new(),
+            build_environment: BTreeMap::new(),
+            cargo_metadata: FileIdentity {
+                path: root.join("cargo.json"),
+                size: 0,
+                mode: 0,
+                sha256: String::new(),
+            },
+            selections: BTreeMap::new(),
+            guests: vec![],
+            lit_guests: vec![],
+            record_workloads: None,
+            cpu_wrapper: CpuWrapperRecord {
+                metadata: FileIdentity {
+                    path: root.join("wrapper.json"),
+                    size: 0,
+                    mode: 0,
+                    sha256: String::new(),
+                },
+                executable: FileIdentity {
+                    path: root.join("wrapper"),
+                    size: 0,
+                    mode: 0,
+                    sha256: String::new(),
+                },
+            },
+            prepared_for: "fixture".into(),
+            cargo_profile: "dev".into(),
+        };
+        let current = BTreeMap::from([(root.clone(), "changed".to_string())]);
+        let detail = |after: SourcePart| {
+            stale_source_detail(&record, &current, &BTreeMap::from([(root.clone(), after)]))
+        };
+        assert!(
+            detail(part("bbbb2222", "diff", vec![])).contains("HEAD moved"),
+            "HEAD change not named"
+        );
+        assert!(
+            detail(part("aaaa1111", "other", vec![])).contains("tracked diff changed"),
+            "diff change not named"
+        );
+        let added = detail(part(
+            "aaaa1111",
+            "diff",
+            vec![(".hermit-verify-summary-x".into(), "sha".into(), 0o644)],
+        ));
+        assert!(
+            added.contains("/fixture/root")
+                && added.contains("untracked file .hermit-verify-summary-x was added"),
+            "untracked addition not named: {added}"
+        );
+        let removed = stale_source_detail(
+            &PreparedRecord {
+                source_parts: BTreeMap::from([(
+                    root.clone(),
+                    part(
+                        "aaaa1111",
+                        "diff",
+                        vec![("gone".into(), "sha".into(), 0o644)],
+                    ),
+                )]),
+                ..record.clone()
+            },
+            &current,
+            &BTreeMap::from([(root.clone(), base)]),
+        );
+        assert!(
+            removed.contains("untracked file gone was removed"),
+            "untracked removal not named: {removed}"
+        );
     }
 
     /// A disposable run summary must not move source identity, and a stray one

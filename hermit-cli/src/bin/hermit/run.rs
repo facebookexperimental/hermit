@@ -443,7 +443,54 @@ fn disposable_dir_is_ignored(root: &Path) -> bool {
 /// importable from another crate, so that whole test surface could not reach
 /// the code it was written for, even in principle. Taking the directory as an
 /// argument lets the unit tests below drive every branch.
+/// The work-tree root containing START, as git itself resolves it, or
+/// None when START is in no work tree (or git cannot say). An empty
+/// `.git` directory a fixture made does not resolve, which is what
+/// keeps the stray-`.git` behaviour below intact.
+fn work_tree_root(start: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(start)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let root = text.trim();
+    (!root.is_empty()).then(|| PathBuf::from(root))
+}
+
 fn summary_dir_under(start: &Path) -> Result<PathBuf, Error> {
+    // A real work tree whose .gitignore has no `ignored/` rule has no
+    // disposable home for the summary: writing it at the work-tree
+    // root (the old fallback) puts an untracked file exactly where
+    // prepared source identity enumerates. Cargo git checkouts are
+    // such trees (reverie and rust-shed checkouts carry no `ignored/`
+    // rule), and a hermit run started in one poisoned every later
+    // prepared node in validate run 20261107T000239Z the same way
+    // run 1819 was poisoned at the checkout root. Refuse, as the
+    // un-creatable-directory case below already does; the fallback
+    // below remains for directories in no work tree at all.
+    if let Some(top) = work_tree_root(start) {
+        if disposable_dir_is_ignored(&top) {
+            let disposable = top.join("ignored");
+            std::fs::create_dir_all(&disposable).with_context(|| {
+                format!(
+                    "creating the disposable run-summary directory {}; refusing to fall back to \
+                     the work tree, where this file would be counted as prepared source",
+                    disposable.display()
+                )
+            })?;
+            return Ok(disposable);
+        }
+        return Err(Error::msg(format!(
+            "run summary has no disposable home: work tree {} does not ignore ignored/; \
+             refusing to write it into the work tree, where it would be counted as prepared source",
+            top.display()
+        )));
+    }
     // The enumeration is rooted at the work tree, not at the process cwd, so a
     // summary in ANY tracked subdirectory still trips it. Resolve the work-tree
     // root rather than assuming this runs from it.
@@ -21787,6 +21834,35 @@ mod tests {
                 parent.display()
             );
         }
+    }
+
+    /// A real work tree with no `ignored/` rule (a Cargo git checkout
+    /// of reverie or rust-shed is one) must refuse rather than write
+    /// the summary at its root, where prepared source identity counts
+    /// it. Before this, the walk fell back to the start directory.
+    #[test]
+    fn summary_dir_refuses_in_a_real_work_tree_without_a_disposable_rule() {
+        let tmp = tempfile::tempdir().expect("fixture root");
+        let root = tmp.path();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(root)
+            .output()
+            .expect("git init fixture");
+        assert!(init.status.success(), "git init failed: {init:?}");
+        // No .gitignore at all: no disposable rule.
+        let nested = root.join("guest");
+        std::fs::create_dir(&nested).expect("fixture subdirectory");
+        let error = summary_dir_under(&nested)
+            .expect_err("a work tree with no disposable rule must refuse");
+        assert!(
+            format!("{error:#}").contains("no disposable home"),
+            "the refusal did not say why: {error:#}"
+        );
+        assert!(
+            !root.join(".hermit-verify-summary-fixture").exists(),
+            "a summary was written into the work tree"
+        );
     }
 
     /// The control, and the reviewer's own case: a regular FILE named `ignored`.
