@@ -804,14 +804,17 @@ sys.exit(int(os.environ.get("FAKE_RUN_RC", "0")))
 # buck2, for what validate-node asks of it: `log show FILE` prints FILE, which here holds the
 # JSON lines themselves (or fails, with FAKE_BUCK2_LOG_SHOW_FAILS, or never ends, with
 # FAKE_BUCK2_LOG_SHOW_HANGS), and `kill` appends a line to FAKE_BUCK2_KILLS, when set, and
-# exits FAKE_BUCK2_KILL_RC.
+# exits FAKE_BUCK2_KILL_RC. With FAKE_BUCK2_ORDER set, `log` and `kill` also append their
+# name to that file, so a test can see which the node asked for first.
 FAKE_NODE_BUCK2 = """#!/bin/sh
 case $1 in
     log)
+        if [ -n "${FAKE_BUCK2_ORDER:-}" ]; then echo log >>"$FAKE_BUCK2_ORDER"; fi
         if [ -n "${FAKE_BUCK2_LOG_SHOW_FAILS:-}" ]; then echo "buck2: cannot read $3" >&2; exit 3; fi
         if [ -n "${FAKE_BUCK2_LOG_SHOW_HANGS:-}" ]; then exec sleep 600; fi
         exec cat -- "$3" ;;
     kill)
+        if [ -n "${FAKE_BUCK2_ORDER:-}" ]; then echo kill >>"$FAKE_BUCK2_ORDER"; fi
         if [ -n "${FAKE_BUCK2_KILLS:-}" ]; then echo kill >>"$FAKE_BUCK2_KILLS"; fi
         exit "${FAKE_BUCK2_KILL_RC:-0}" ;;
 esac
@@ -1101,10 +1104,20 @@ class ValidateNodeTest(unittest.TestCase):
     def test_a_group_sigterm_is_recorded_as_a_signal_and_the_node_still_dies_of_it(self):
         results = self.root / "e2e-results"
         kills = self.root / "kills"
+        order = self.root / "order"
         for name, added in (("summaries that work", {}), ("a summary that stalls", {"FAKE_BUCK2_LOG_SHOW_HANGS": "1"})):
             with self.subTest(name):
                 kills.unlink(missing_ok=True)
-                process, elapsed = self.interrupt(results, FAKE_BUCK2_KILLS=str(kills), **added)
+                order.unlink(missing_ok=True)
+                process, elapsed = self.interrupt(results, FAKE_BUCK2_KILLS=str(kills),
+                                                   FAKE_BUCK2_ORDER=str(order), **added)
+                # The daemon stop comes before any record keeping (the stage
+                # summaries ask buck2 to `log show`): the DAG reaps the group
+                # 5 s after its SIGTERM, and record keeping under load once
+                # spent that whole window, leaving the daemon unstopped
+                # (dh-6aaks). This assertion fails on the old order.
+                self.assertEqual(order.read_text().splitlines()[0], "kill",
+                                 "the buck2 daemon was not stopped before keeping records")
                 stderr = (self.root / "node.stderr").read_text()
                 self.assertEqual(process.returncode, -signal.SIGTERM, stderr)
                 # The validation DAG reaps the group 5 s after its SIGTERM.
