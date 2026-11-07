@@ -586,18 +586,35 @@ fn read_file(path: &Path) -> Option<(Vec<u8>, u64, u64)> {
     Some((contents, metadata.dev(), metadata.ino()))
 }
 
+/// How long `join` waits for a shared hold before giving up on this round.
+/// The exclusive holder is either filling (bounded copying) or removing
+/// (bounded deletion); a wait far beyond this means the holder is stuck,
+/// and blocking forever would hang the whole run (dh-vnpsq).
+const JOIN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Take a shared hold on the existing copy directory `copy_dir`, if it is in
 /// place and still linked once the hold is granted. A run removing it holds
 /// the exclusive lock until the directory is gone, so a hold granted after
 /// that finds the lock file unlinked, and the caller makes the directory
-/// again.
+/// again. The wait is bounded: a holder that never lets go (or a lock queued
+/// on an inode whose path was unlinked and remade) must not wedge the
+/// caller, which retries the round and then refuses by name.
 fn join(copy_dir: &Path) -> Option<File> {
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC)
         .open(copy_dir.join(LOCK_NAME))
         .ok()?;
-    flock(&lock, libc::LOCK_SH).ok()?;
+    let deadline = std::time::Instant::now() + JOIN_WAIT;
+    loop {
+        match flock(&lock, libc::LOCK_SH | libc::LOCK_NB) {
+            Ok(()) => break,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
     (lock.metadata().ok()?.nlink() > 0).then_some(lock)
 }
 
@@ -1005,6 +1022,40 @@ mod tests {
                 ino: 8,
                 name: "properties_serial".to_owned(),
             }]
+        );
+    }
+
+    /// A holder that takes the copy's lock exclusively and never lets go
+    /// must not hang a later run forever (dh-vnpsq): joining it is bounded
+    /// and the run refuses by name instead of blocking in flock.
+    #[test]
+    fn a_stuck_exclusive_holder_does_not_hang_the_next_run() {
+        let source = area(&[("properties_serial", &[1, 2, 3, 4])]);
+        let under = tempfile::tempdir().unwrap();
+        let first = take_as_root(source.path(), under.path(), false).unwrap();
+        let copy = first.config().copy_dir;
+        drop(first);
+        // The last holder let go, so the directory is gone; remake just its
+        // lock file and hold it exclusively, as a stuck run would.
+        std::fs::create_dir_all(&copy).unwrap();
+        let stuck = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(copy.join(LOCK_NAME))
+            .unwrap();
+        flock(&stuck, libc::LOCK_EX).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let under_path = under.path().to_path_buf();
+        let source_path = source.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = sender.send(take_as_root(&source_path, &under_path, false).map(|_| ()));
+        });
+        let outcome = receiver.recv_timeout(std::time::Duration::from_secs(60));
+        drop(stuck);
+        assert!(
+            outcome.is_ok(),
+            "the next run hung on a stuck exclusive holder"
         );
     }
 
