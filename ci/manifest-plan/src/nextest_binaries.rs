@@ -1154,10 +1154,7 @@ fn metadata_binaries(
 type SourceMap = BTreeMap<PathBuf, String>;
 type SourcePartMap = BTreeMap<PathBuf, SourcePart>;
 
-fn sources_and_parts(
-    cargo: &Value,
-    root: &Path,
-) -> Result<(SourceMap, SourcePartMap), String> {
+fn sources_and_parts(cargo: &Value, root: &Path) -> Result<(SourceMap, SourcePartMap), String> {
     let collected = sources(cargo, root)?;
     let mut parts = BTreeMap::new();
     for root in collected.keys() {
