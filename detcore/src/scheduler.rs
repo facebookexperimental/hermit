@@ -24470,18 +24470,25 @@ mod test {
         std::fs::write(
             &schedule,
             serde_json::json!({
-                "per_thread": {},
-                "global": [event(waiting), event(last)],
-                "uncapped_slices": 9_400_000,
+                "rcb_history": {
+                    "format": 2,
+                    "identity": "rcb:cond-retired:user:v1",
+                    "recording": {
+                        "per_thread": {},
+                        "global": [event(waiting), event(last)],
+                        "uncapped_slices": 9_400_000,
+                    }
+                }
             })
             .to_string(),
         )
         .unwrap();
-        let mut scheduler = Scheduler::new(&Config {
-            replay_schedule_from: Some(schedule),
-            max_timeslice: std::num::NonZeroU64::new(100_000),
-            ..Config::default()
-        });
+        let mut scheduler =
+            Scheduler::new(&crate::clock_identity::test_sources::qualified(Config {
+                replay_schedule_from: Some(schedule),
+                max_timeslice: std::num::NonZeroU64::new(100_000),
+                ..Config::default()
+            }));
         assert!(!scheduler.consume_schedevent(&event(waiting)).keep_running);
         let read_before_the_wait = scheduler.uncapped_backstop();
         assert_eq!(
