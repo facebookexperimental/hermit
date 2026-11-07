@@ -117,9 +117,20 @@ enum ProcfsKind {
     /// memory at every read by Linux's `get_mm_cmdline` rule
     /// ([`read_cmdline`]), at the area Detcore recorded from the image's
     /// initial stack (`Detcore::record_process_auxv`). Only rendered, and
-    /// only for the reader's own process; a file the kernel opens keeps the
-    /// kernel's bytes, unclassified (`ProcfsFile::kernel_served`).
+    /// only for the reader's own process, and, where the tool cannot read
+    /// another process's memory (KVM), for another process from the strings
+    /// its `execve` passed (`Detcore::read_rendered_cmdline`, package K item
+    /// 2b slice 2b-3); a file the kernel opens keeps the kernel's bytes,
+    /// unclassified (`ProcfsFile::kernel_served`).
     ProcessCmdline,
+    /// `/proc/<pid>/environ`: the process's environment area, read at every
+    /// read by Linux's `environ_read` rule ([`read_environ`]). Rendered only
+    /// where the tool cannot read another process's host task (KVM, whose
+    /// provider refuses the file): the reader's own from its memory, another
+    /// process's from the strings its `execve` passed (package K item 2b
+    /// slice 2b-3). Everywhere else every spelling is the kernel's file,
+    /// unclassified (`ProcfsFile::kernel_served`).
+    ProcessEnviron,
     CpuidleCounter,
     Smaps,
     /// `/proc/*/maps`. Its per-mapping line carries a DEVICE and an INODE for
@@ -713,6 +724,140 @@ pub(crate) fn read_cmdline(
         remaining -= out as u64;
     }
     Ok(copied)
+}
+
+/// One plain read of `count` bytes at position `pos` of a process's
+/// `/proc/<pid>/environ`, by Linux's `environ_read` (fs/proc/base.c:1006-1067,
+/// Linux 6.17), from the process's environment area in `area`, through
+/// `memory` as [`read_cmdline`] reads: nothing where the image is not yet
+/// laid out (`env_end` 0) or the position is at or past the area's length;
+/// otherwise the area from `env_start + pos`, a page at a time, each page
+/// read and then copied out, until `count` bytes are copied or a read reads
+/// nothing. As Linux's, a read that reads nothing ends the call with 0 even
+/// after earlier pages were copied (`ret = retval`), and a copy that copies
+/// short fails it with EFAULT. The bounds are unsigned, as Linux's are.
+///
+/// What Linux decides around this function: the open checks
+/// `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)` and pins the memory map
+/// (`environ_open`, `__mem_open`), and a map that is gone (the process
+/// exited) reads nothing (`mmget_not_zero`).
+pub(crate) fn read_environ(
+    area: &CmdlineArea,
+    pos: u64,
+    count: usize,
+    memory: &mut impl CmdlineMemory,
+) -> Result<usize, reverie::syscalls::Errno> {
+    let CmdlineArea {
+        env_start, env_end, ..
+    } = *area;
+    if env_end == 0 {
+        return Ok(0);
+    }
+    let length = env_end.wrapping_sub(env_start);
+    let mut src = pos;
+    let mut count = count as u64;
+    let mut copied = 0;
+    let mut page = vec![0_u8; cmdline_page() as usize];
+    while count > 0 {
+        if src >= length {
+            break;
+        }
+        let this_len = env_end
+            .wrapping_sub(env_start.wrapping_add(src))
+            .min(cmdline_page().min(count)) as usize;
+        let got = memory.read(env_start.wrapping_add(src), &mut page[..this_len]);
+        if got == 0 {
+            return Ok(0);
+        }
+        if memory.copy_out(copied, &page[..got]) != got {
+            return Err(reverie::syscalls::Errno::EFAULT);
+        }
+        copied += got;
+        src += got as u64;
+        count -= got as u64;
+    }
+    Ok(copied)
+}
+
+/// One read of a process's `environ` ([`read_environ`]) where `environ`,
+/// else of its `cmdline` ([`read_cmdline`]).
+pub(crate) fn read_exec_strings(
+    environ: bool,
+    area: &CmdlineArea,
+    pos: u64,
+    count: usize,
+    memory: &mut impl CmdlineMemory,
+) -> Result<usize, reverie::syscalls::Errno> {
+    if environ {
+        read_environ(area, pos, count, memory)
+    } else {
+        read_cmdline(area, pos, count, memory)
+    }
+}
+
+/// Where [`RecordedStrings`] lays out a record's argument strings, so that
+/// every bound of its area is above 0 (an `env_end` of 0 means an image not
+/// yet laid out).
+const RECORDED_STRINGS_BASE: u64 = 1 << 12;
+
+/// A process image's argument and environment strings as its `execve`
+/// passed them (`tool_global::ExecStrings`), as the memory a read of its
+/// `cmdline` or `environ` reads ([`read_cmdline`], [`read_environ`]) where
+/// Detcore cannot read the process's own memory (package K item 2b slice
+/// 2b-3): the argument area at [`RECORDED_STRINGS_BASE`], the environment
+/// area just after it, as Linux's loader lays them out
+/// ([`initial_stack_cmdline_area`]), and every byte outside them unreadable.
+/// `copy_out` copies to the caller's buffer at an offset from its start, as
+/// [`CmdlineMemory::copy_out`] does.
+pub(crate) struct RecordedStrings<'a, C> {
+    /// The argument area's bytes.
+    pub(crate) argv: &'a [u8],
+    /// The environment area's bytes.
+    pub(crate) envp: &'a [u8],
+    /// The copy to the caller's buffer.
+    pub(crate) copy_out: C,
+}
+
+impl<C> RecordedStrings<'_, C> {
+    /// The argument and environment areas the record lays out.
+    pub(crate) fn area(&self) -> CmdlineArea {
+        let arg_start = RECORDED_STRINGS_BASE;
+        let arg_end = arg_start + self.argv.len() as u64;
+        CmdlineArea {
+            arg_start,
+            arg_end,
+            env_start: arg_end,
+            env_end: arg_end + self.envp.len() as u64,
+        }
+    }
+}
+
+impl<C: FnMut(usize, &[u8]) -> usize> CmdlineMemory for RecordedStrings<'_, C> {
+    fn read(&mut self, at: u64, buffer: &mut [u8]) -> usize {
+        let Some(offset) = at
+            .checked_sub(RECORDED_STRINGS_BASE)
+            .and_then(|offset| usize::try_from(offset).ok())
+        else {
+            return 0;
+        };
+        let mut read = 0;
+        for (area, start) in [(self.argv, 0), (self.envp, self.argv.len())] {
+            let Some(from) = (offset + read).checked_sub(start) else {
+                continue;
+            };
+            let Some(bytes) = area.get(from..) else {
+                continue;
+            };
+            let length = bytes.len().min(buffer.len() - read);
+            buffer[read..read + length].copy_from_slice(&bytes[..length]);
+            read += length;
+        }
+        read
+    }
+
+    fn copy_out(&mut self, offset: usize, bytes: &[u8]) -> usize {
+        (self.copy_out)(offset, bytes)
+    }
 }
 
 /// A task's `io` as Linux's `do_io_accounting` prints it with every counter
@@ -1874,6 +2019,7 @@ impl ProcfsFile {
             other if is_process_file_path(other, "cgroup") => ProcfsKind::ProcessCgroup,
             other if is_process_file_path(other, "auxv") => ProcfsKind::ProcessAuxv,
             other if is_process_file_path(other, "cmdline") => ProcfsKind::ProcessCmdline,
+            other if is_process_file_path(other, "environ") => ProcfsKind::ProcessEnviron,
             other if is_process_file_path(other, "comm") => ProcfsKind::ProcessComm,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-949): Review per-mapping memory accounting normalization.
@@ -2095,8 +2241,9 @@ impl ProcfsFile {
     /// name goes last. A task's `status` (package K item 2b slice 2b-2) is
     /// rendered only where Detcore renders it
     /// (`Detcore::kernel_serves_every_status`, `kept_by_kernel`); every
-    /// other open of one stays the kernel's.
-    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 14] = [
+    /// other open of one stays the kernel's. So is a process's `environ`
+    /// (package K item 2b slice 2b-3: `Detcore::kernel_serves_every_environ`).
+    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 15] = [
         (ProcfsKind::ProcessCgroup, "cgroup"),
         (ProcfsKind::ProcessAuxv, "auxv"),
         (ProcfsKind::Mountinfo, "mountinfo"),
@@ -2111,10 +2258,11 @@ impl ProcfsFile {
         (ProcfsKind::SmapsRollup, "smaps_rollup"),
         (ProcfsKind::NumaMaps, "numa_maps"),
         (ProcfsKind::ProcessStatus, "status"),
+        (ProcfsKind::ProcessEnviron, "environ"),
     ];
 
     /// The names of the per-process files Detcore renders.
-    pub(crate) const PER_PROCESS_NAMES: [&'static str; 14] = [
+    pub(crate) const PER_PROCESS_NAMES: [&'static str; 15] = [
         "cgroup",
         "auxv",
         "mountinfo",
@@ -2129,6 +2277,7 @@ impl ProcfsFile {
         "smaps_rollup",
         "numa_maps",
         "status",
+        "environ",
     ];
 
     /// Pin which view of the mounts this kernel-opened `mountinfo` or `mounts`
@@ -2201,11 +2350,12 @@ impl ProcfsFile {
 
     /// Whether this is a per-process file Linux serves with a plain `read`
     /// and `generic_file_llseek` on size 0, not a `seq_file`: a process's
-    /// `auxv` (`auxv_read`) and `cmdline` (`proc_pid_cmdline_read`).
+    /// `auxv` (`auxv_read`), `cmdline` (`proc_pid_cmdline_read`) and
+    /// `environ` (`environ_read`).
     fn is_plain_process_file(&self) -> bool {
         matches!(
             self.kind,
-            ProcfsKind::ProcessAuxv | ProcfsKind::ProcessCmdline
+            ProcfsKind::ProcessAuxv | ProcfsKind::ProcessCmdline | ProcfsKind::ProcessEnviron
         )
     }
 
@@ -2264,6 +2414,17 @@ impl ProcfsFile {
     /// Whether this is a process's `cmdline`.
     pub(crate) fn is_process_cmdline(&self) -> bool {
         self.kind == ProcfsKind::ProcessCmdline
+    }
+
+    /// Whether this is a process's `environ`.
+    pub(crate) fn is_process_environ(&self) -> bool {
+        self.kind == ProcfsKind::ProcessEnviron
+    }
+
+    /// Whether this is a process's `cmdline` or `environ`, the two files
+    /// Linux reads from the process's argument and environment areas.
+    pub(crate) fn reads_exec_strings(&self) -> bool {
+        self.is_process_cmdline() || self.is_process_environ()
     }
 
     /// Whether this is a task's `status`, by any spelling.
@@ -2436,9 +2597,10 @@ impl ProcfsFile {
     /// position and count, with no snapshot: a process's `cmdline`, which
     /// Linux's `get_mm_cmdline` reads that way, so a guest that rewrites its
     /// arguments in place (`setproctitle`) reads the new bytes at its next
-    /// read (`Detcore::read_rendered_cmdline`).
+    /// read (`Detcore::read_rendered_cmdline`); and a process's `environ`,
+    /// which Linux's `environ_read` reads the same way.
     pub(crate) fn reads_memory_at_every_read(&self) -> bool {
-        self.rendered && self.is_process_cmdline()
+        self.rendered && self.reads_exec_strings()
     }
 
     /// Bind the caller's spellings (`self`, `thread-self`) of a per-process
@@ -2571,9 +2733,11 @@ impl ProcfsFile {
     pub(crate) fn has_read_iter(&self) -> bool {
         match self.kind {
             ProcfsKind::Fixed(file) => file.has_read_iter(),
-            // `auxv_read` and `proc_pid_cmdline_read` are plain `read`s
-            // (RWF_NOWAIT is EOPNOTSUPP).
-            ProcfsKind::ProcessAuxv | ProcfsKind::ProcessCmdline => false,
+            // `auxv_read`, `proc_pid_cmdline_read` and `environ_read` are
+            // plain `read`s (RWF_NOWAIT is EOPNOTSUPP).
+            ProcfsKind::ProcessAuxv | ProcfsKind::ProcessCmdline | ProcfsKind::ProcessEnviron => {
+                false
+            }
             // A process's `stat` and `cgroup` are `ONE()` entries, served by
             // `proc_single_file_operations`, and a task's `comm` by
             // `proc_pid_set_comm_operations`: `.read = seq_read`, no
@@ -2697,8 +2861,9 @@ impl ProcfsFile {
             ProcfsKind::ProcessAuxv => b"",
             // The bytes are the process's argument area, which each read
             // reads from the process's memory
-            // (`Detcore::read_rendered_cmdline`); no snapshot is taken.
-            ProcfsKind::ProcessCmdline => b"",
+            // (`Detcore::read_rendered_cmdline`); no snapshot is taken. So
+            // for a process's environment area.
+            ProcfsKind::ProcessCmdline | ProcfsKind::ProcessEnviron => b"",
             // The bytes are the task's facts in Detcore's process table,
             // which the first read supplies (`procfs::task_stat`).
             ProcfsKind::Stat
@@ -3228,9 +3393,10 @@ impl ProcfsFile {
             // Binary, and Detcore's own record: kept as it is. A `comm` the
             // kernel opened is never classified (`Self::kernel_served`), so
             // only a rendered one is initialized, above.
-            ProcfsKind::ProcessAuxv | ProcfsKind::ProcessCmdline | ProcfsKind::ProcessComm => {
-                contents.to_vec()
-            }
+            ProcfsKind::ProcessAuxv
+            | ProcfsKind::ProcessCmdline
+            | ProcfsKind::ProcessEnviron
+            | ProcfsKind::ProcessComm => contents.to_vec(),
             ProcfsKind::CpuidleCounter => sanitize_cpuidle_counter(&contents),
             ProcfsKind::Smaps => sanitize_smaps(&contents, mapping_identities),
             ProcfsKind::Maps => {
@@ -11248,6 +11414,173 @@ total_commit_ms 0\n"
             read_cmdline(&titled_area, 0, 10, &mut nothing),
             Err(reverie::syscalls::Errno::EFAULT)
         );
+    }
+
+    /// Linux's `environ_read` (fs/proc/base.c:1006-1067, 6.17): the
+    /// environment area from `env_start + pos`, at any count, a page at a
+    /// time; nothing before the image is laid out or at the area's end; a
+    /// read that reads nothing ends the call with 0, even after a page was
+    /// copied; a short copy out is EFAULT.
+    #[test]
+    fn an_environ_read_is_the_environment_area_at_its_position() {
+        let base = 0x7fff_0000_u64;
+        let memory = b"prog\0arg\0PATH=/bin\0HOME=/\0".to_vec();
+        let area = CmdlineArea {
+            arg_start: base,
+            arg_end: base + 9,
+            env_start: base + 9,
+            env_end: base + 26,
+        };
+        let environ = |pos, count, memory: &[u8]| {
+            let mut test = TestCmdline {
+                read: cmdline_memory(base, memory),
+                out: Vec::new(),
+                writable: usize::MAX,
+            };
+            let copied = read_environ(&area, pos, count, &mut test).unwrap();
+            assert_eq!(copied, test.out.len());
+            test.out
+        };
+        assert_eq!(environ(0, usize::MAX, &memory), b"PATH=/bin\0HOME=/\0");
+        assert_eq!(environ(5, 4, &memory), b"/bin");
+        assert_eq!(environ(16, 100, &memory), b"\0");
+        assert_eq!(environ(17, 100, &memory), b"");
+        assert_eq!(environ(1000, 100, &memory), b"");
+        assert_eq!(environ(0, 0, &memory), b"");
+        // An image not yet laid out reads nothing.
+        let mut test = TestCmdline {
+            read: cmdline_memory(base, &memory),
+            out: Vec::new(),
+            writable: usize::MAX,
+        };
+        let unset = CmdlineArea { env_end: 0, ..area };
+        assert_eq!(read_environ(&unset, 0, 10, &mut test), Ok(0));
+        // Bytes that cannot be read end the call with 0.
+        assert_eq!(environ(0, usize::MAX, &memory[..9]), b"");
+        // More than a page: page by page, and a page that cannot be read
+        // after one that was copied still answers 0 (`ret = retval`).
+        let long = CmdlineArea {
+            env_end: base + 9 + 5000,
+            ..area
+        };
+        let bytes = [&memory[..9], &[b'E'; 5000][..]].concat();
+        let mut test = TestCmdline {
+            read: cmdline_memory(base, &bytes),
+            out: Vec::new(),
+            writable: usize::MAX,
+        };
+        assert_eq!(read_environ(&long, 0, 6000, &mut test), Ok(5000));
+        let mut test = TestCmdline {
+            read: cmdline_memory(base, &bytes[..9 + 4096]),
+            out: Vec::new(),
+            writable: usize::MAX,
+        };
+        assert_eq!(read_environ(&long, 0, 6000, &mut test), Ok(0));
+        // A copy out that copies short is EFAULT.
+        let mut test = TestCmdline {
+            read: cmdline_memory(base, &memory),
+            out: Vec::new(),
+            writable: 3,
+        };
+        assert_eq!(
+            read_environ(&area, 0, 10, &mut test),
+            Err(reverie::syscalls::Errno::EFAULT)
+        );
+    }
+
+    /// A record of an image's strings reads as the memory it was copied
+    /// from: the argument area, then the environment area straight after it,
+    /// so both files' rules read exactly the strings `execve` passed, at any
+    /// position, an argument longer than a page and an empty argument vector
+    /// included; nothing outside the two areas reads.
+    #[test]
+    fn recorded_strings_read_as_the_memory_they_came_from() {
+        let read = |argv: &[u8], envp: &[u8], environ: bool, pos: u64, count: usize| {
+            let mut out = Vec::new();
+            let mut recorded = RecordedStrings {
+                argv,
+                envp,
+                copy_out: |offset: usize, bytes: &[u8]| {
+                    assert_eq!(offset, out.len(), "copied out in order");
+                    out.extend_from_slice(bytes);
+                    bytes.len()
+                },
+            };
+            let area = recorded.area();
+            let copied = read_exec_strings(environ, &area, pos, count, &mut recorded).unwrap();
+            assert_eq!(copied, out.len());
+            out
+        };
+        let argv = b"kid\0alpha\0\0beta gamma\0";
+        let envp = b"K1=v1\0EMPTY=\0";
+        assert_eq!(read(argv, envp, false, 0, usize::MAX), argv);
+        assert_eq!(read(argv, envp, false, 6, 4), b"pha\0");
+        assert_eq!(read(argv, envp, true, 0, usize::MAX), envp);
+        assert_eq!(read(argv, envp, true, 3, 3), b"v1\0");
+        // Linux gives an empty argument vector an empty argv[0].
+        assert_eq!(read(b"\0", envp, false, 0, usize::MAX), b"\0");
+        // No strings at all: both files are empty.
+        assert_eq!(read(b"", b"", false, 0, usize::MAX), b"");
+        assert_eq!(read(b"", b"", true, 0, usize::MAX), b"");
+        // An argument longer than a page reads whole, across the boundary.
+        let long = [&b"kid\0"[..], &[b'y'; 5000][..], b"\0tail\0"].concat();
+        assert_eq!(read(&long, envp, false, 0, usize::MAX), long);
+        assert_eq!(read(&long, envp, false, 4092, 8), &long[4092..4100]);
+        // Outside the areas nothing reads.
+        let mut recorded = RecordedStrings {
+            argv,
+            envp,
+            copy_out: |_: usize, bytes: &[u8]| bytes.len(),
+        };
+        let area = recorded.area();
+        let mut buffer = [0_u8; 8];
+        assert_eq!(recorded.read(area.arg_start - 1, &mut buffer), 0);
+        assert_eq!(recorded.read(area.env_end, &mut buffer), 0);
+        assert_eq!(recorded.read(area.env_end - 2, &mut buffer), 2);
+        assert_eq!(recorded.read(area.arg_end - 1, &mut buffer), 8);
+        assert_eq!(&buffer, b"\0K1=v1\0E");
+    }
+
+    /// A process's `environ` is a per-process file Detcore renders, by every
+    /// spelling of a task's directory, appended last so the other files keep
+    /// their inode numbers. Like `cmdline` it is a plain file read through
+    /// `read`, with no `show` method, whose rendered descriptor reads the
+    /// process's memory at every read, and a descriptor the kernel opened
+    /// stays unclassified.
+    #[test]
+    fn a_process_environ_is_rendered_at_every_read() {
+        for spelling in [
+            "/proc/self/environ",
+            "/proc/thread-self/environ",
+            "/proc/7/environ",
+            "/proc/7/task/8/environ",
+        ] {
+            let file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            assert_eq!(file.per_process_name(), Some("environ"), "{spelling}");
+            assert!(file.is_process_environ(), "{spelling}");
+            assert!(file.reads_exec_strings(), "{spelling}");
+            assert!(!file.kernel_served(), "{spelling}");
+            assert!(!file.shows_at_read(), "{spelling}");
+            assert!(!file.snapshot_at_first_read(), "{spelling}");
+            assert!(!file.has_read_iter(), "{spelling}");
+            assert!(!file.reads_memory_at_every_read(), "{spelling}");
+        }
+        assert!(
+            ProcfsFile::from_path(Path::new("/proc/environ"))
+                .is_none_or(|file| file.per_process_name().is_none())
+        );
+        let mut file = ProcfsFile::from_path(Path::new("/proc/self/environ")).unwrap();
+        file.bind_task(3, 5);
+        file.set_task_incarnation(TaskIncarnation {
+            process: 1,
+            thread: None,
+        });
+        let rendered = file.into_rendered();
+        assert_eq!(rendered.opened_path(), Some(Path::new("/proc/3/environ")));
+        assert!(rendered.rendering_template().is_empty());
+        assert!(rendered.reads_memory_at_every_read());
+        assert_eq!(rendered.rendered_snapshot(), None);
+        assert_eq!(ProcfsFile::PER_PROCESS_NAMES[14], "environ");
     }
 
     /// A new image's argument and environment areas, from its initial stack,

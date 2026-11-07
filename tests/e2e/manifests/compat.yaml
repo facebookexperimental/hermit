@@ -1608,17 +1608,25 @@ corpus:
           https://github.com/rrnewton/hermit/issues/5039): each answers EACCES, so lsof
           exits 1 without output in 3 of 3 KVM verify runs at Hermit 26eb116d
         pgrep: >-
-          pgrep opens each /proc/<pid> directory, which KVM's /proc does not
-          serve for another guest process
-          (https://github.com/rrnewton/hermit/issues/4564): the opens answer
-          EACCES, so pgrep matches nothing and exits 1 in 3 of 3 KVM verify
-          runs at Hermit 26eb116d
+          pgrep opens each /proc/<pid> directory and reads its stat, status
+          and cmdline. At Hermit 26eb116d the opens answered EACCES (another
+          guest process's /proc was not served:
+          https://github.com/rrnewton/hermit/issues/4564), so pgrep matched
+          nothing and exited 1 in 3 of 3 KVM verify runs. Package K item 2b
+          slices 2b-1 to 2b-3 serve those files; at slice 2b-3 a host probe
+          of this row's command with procps 4.0.6 (the pinned root's) and
+          3.3.17 passes on KVM at L2. It stays off KVM until the pinned-root
+          compat cell itself is measured
         pkill: >-
-          pkill opens each /proc/<pid> directory, which KVM's /proc does not
-          serve for another guest process
-          (https://github.com/rrnewton/hermit/issues/4564): the opens answer
-          EACCES, so pkill matches nothing and exits 1 in 3 of 3 KVM verify
-          runs at Hermit 26eb116d
+          pkill opens each /proc/<pid> directory and reads its stat, status
+          and cmdline. At Hermit 26eb116d the opens answered EACCES (another
+          guest process's /proc was not served:
+          https://github.com/rrnewton/hermit/issues/4564), so pkill matched
+          nothing and exited 1 in 3 of 3 KVM verify runs. Package K item 2b
+          slices 2b-1 to 2b-3 serve those files; at slice 2b-3 a host probe
+          of this row's command with procps 4.0.6 (the pinned root's) and
+          3.3.17 passes on KVM at L2. It stays off KVM until the pinned-root
+          compat cell itself is measured
     # DBT (batch-2 flip, sweep 2026-10-27 at Hermit 0948c8eb): rows CLEAN on
     # DBT in both the 2026-10-26 and 2026-10-27 nightly sweeps get a required
     # DBT verify cell; the other rows keep no DBT cell under the reason below.

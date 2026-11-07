@@ -19262,6 +19262,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .is_some_and(|file| {
                     !self.kernel_serves_every_comm(&file)
                         && !self.kernel_serves_every_status(&file)
+                        && !self.kernel_serves_every_environ(&file)
                         && file.rendered_path(session_files).is_some()
                 });
                 let ino = match looked_up {

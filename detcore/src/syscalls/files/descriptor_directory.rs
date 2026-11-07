@@ -3165,6 +3165,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .is_some_and(|file| {
                     !self.kernel_serves_every_comm(&file)
                         && !self.kernel_serves_every_status(&file)
+                        && !self.kernel_serves_every_environ(&file)
                         && file.rendered_path(session_files).is_some()
                 });
                 let ino = match looked_up {
@@ -3204,10 +3205,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///   `fd` directory it serves (`descriptor_directory`: a process's to
     ///   every thread of it, a thread's to that thread alone, which is the
     ///   reader taking the listing), and a process's `task`, which it serves
-    ///   too; in another process's directory, neither its `fd` directory
-    ///   nor its `cmdline`, which Detcore refuses by name there
-    ///   (`other_process_procfs`, until package K item 2b slices 2b-3 and
-    ///   2b-5 serve them);
+    ///   too; in another process's directory, not its `fd` directory, which
+    ///   Detcore refuses by name there (`other_process_procfs`, until package
+    ///   K item 2b slice 2b-5 serves it), while its `cmdline` and `environ`
+    ///   are listed (slice 2b-3 serves them from the strings its `execve`
+    ///   passed);
     /// - in `task`, every thread of the process.
     ///
     /// Every other name in Linux's table is left out, deliberately: on this
@@ -3250,7 +3252,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         let kept = |name: &[u8]| match name {
             b"." | b".." => true,
             _ if binding.kind == TaskDirectoryKind::Tasks => true,
-            b"fd" | b"cmdline" if others => false,
+            // Another process's `cmdline` and `environ` are served from the
+            // strings its `execve` passed (package K item 2b slice 2b-3,
+            // `Detcore::serves_exec_strings`), so they are listed as Linux
+            // lists them, below.
+            b"fd" if others => false,
             b"fd" => binding.kind == TaskDirectoryKind::Process || binding.tid == reader,
             b"task" => binding.kind == TaskDirectoryKind::Process,
             b"smaps_rollup" if !rollup_readable => false,
@@ -3262,6 +3268,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     file.per_process_name().is_some()
                         && !self.kernel_serves_every_comm(&file)
                         && !self.kernel_serves_every_status(&file)
+                        && !self.kernel_serves_every_environ(&file)
                         && file.rendered_path(session_files).is_some()
                 })
             }

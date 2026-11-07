@@ -72468,7 +72468,9 @@ fn the_callers_own_proc_directories_answer_as_linux() {
 /// renders on KVM since package K item 2b slice 2b-2 (before it, this
 /// backend's procfs would have answered with its process's, so it was
 /// refused by name), answers at L2 as natively. Each process and thread
-/// directory lists `status` too, which Linux lists after `auxv`.
+/// directory lists `status` too, which Linux lists after `auxv`, and, since
+/// slice 2b-3 serves `environ` from Detcore's record of the exec strings,
+/// `environ`, which Linux lists before `auxv`.
 #[test]
 fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
     let test = "run_kvm_the_callers_own_proc_directories_answer_as_linux";
@@ -72480,6 +72482,7 @@ fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
         "../d",
         "task/d",
         "fd/d",
+        "environ/r",
         "auxv/r",
         "status/r",
         "comm/r",
@@ -73098,6 +73101,100 @@ fn run_kvm_another_processs_status_answers_as_linux() {
     let native = proc_other_process_status_native();
     assert_eq!(
         guest_transcript_at_l2("kvm", proc_other_process_status_guest(), &[]),
+        native,
+        "kvm"
+    );
+}
+
+static PROC_OTHER_PROCESS_CMDLINE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// `tests/c/proc_other_process_cmdline.c`'s guest.
+fn proc_other_process_cmdline_guest() -> &'static Path {
+    compiled_c_guest(
+        &PROC_OTHER_PROCESS_CMDLINE_GUEST,
+        "proc_other_process_cmdline",
+    )
+}
+
+/// The other-process cmdline guest's transcript, as Linux answers it to a
+/// reader that is not real root in the initial user namespace (a zombie's
+/// `environ` is then global root's, mode 0400: EACCES). No pid or path is
+/// printed, and no process rewrites its strings after its exec.
+const PROC_OTHER_PROCESS_CMDLINE_LINES: &[&str] = &[
+    "arguments cmdline: length=22 bytes=kid\\0alpha\\0\\0beta gamma\\0",
+    "arguments environ: length=57 bytes=TWIN_ROLE=wait\\0TWIN_READY=100\\0TWIN_HOLD=101\\0K1=v1\\0EMPTY=\\0",
+    "arguments cmdline: three-byte reads as one read=1",
+    "arguments cmdline: lseek=6",
+    "arguments cmdline from 6: length=16 bytes=pha\\0\\0beta gamma\\0",
+    "arguments cmdline pread 4 at 13: length=4 bytes=ta g",
+    "arguments cmdline: pread past the end=0",
+    "no arguments cmdline: length=1 bytes=\\0",
+    "long argument cmdline: length=5010 as passed=1 checksum=6320097696119153006",
+    "long argument cmdline pread 8 at 4092: length=8 bytes=ghijklmn",
+    "forked child cmdline: as the parent's own=1 nonempty=1",
+    "forked child environ: as the parent's own=1 nonempty=1",
+    "zombie cmdline: length=0 bytes=",
+    "zombie environ: EACCES",
+    "non-dumpable child: environ open=EACCES cmdline length=12",
+    "failures=0",
+];
+
+/// The other-process cmdline guest's transcript run natively, checked line by
+/// line first ([`PROC_OTHER_PROCESS_CMDLINE_LINES`]), so a host that
+/// answers otherwise fails here rather than in the comparison.
+fn proc_other_process_cmdline_native() -> String {
+    let output = Command::new(proc_other_process_cmdline_guest())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the other-process cmdline guest natively");
+    assert!(output.status.success(), "native: {output:?}");
+    let native = stdout(&output);
+    assert_eq!(
+        native.lines().collect::<Vec<_>>(),
+        PROC_OTHER_PROCESS_CMDLINE_LINES,
+        "native"
+    );
+    native
+}
+
+/// Another process's `/proc/<pid>/cmdline` and `/proc/<pid>/environ`
+/// (`tests/c/proc_other_process_cmdline.c`) on ptrace, at L2, exactly as
+/// natively, every line: an exec'd child with an empty argument and an empty
+/// environment value, read whole, three bytes at a time, after `lseek` and
+/// with `pread`; a child exec'd with an empty argument vector (Linux gives
+/// it an empty `argv[0]`); one with an argument longer than a page; a
+/// forked child that did not exec (its files are the parent's own); a
+/// zombie (`cmdline` empty, `environ` EACCES); and a non-dumpable child,
+/// whose `environ` a reader without effective capabilities cannot open
+/// while its `cmdline` reads. ptrace keeps the kernel's own files (package
+/// K item 2b slice 2b-3 changes nothing there).
+#[test]
+fn another_processs_cmdline_and_environ_answer_as_linux() {
+    let native = proc_other_process_cmdline_native();
+    assert_eq!(
+        guest_transcript_at_l2("ptrace", proc_other_process_cmdline_guest(), &[]),
+        native,
+        "ptrace"
+    );
+}
+
+/// [`another_processs_cmdline_and_environ_answer_as_linux`] on KVM, at L2,
+/// exactly as natively, every line. Before package K item 2b slice 2b-3 the
+/// run stopped at the first read of another process's `cmdline`, refused by
+/// name (https://github.com/rrnewton/hermit/issues/4564), and every
+/// `environ`, the reader's own included, was the KVM provider's EACCES.
+/// Detcore now serves another process's files from the strings its image's
+/// `execve` passed, recorded before its first instruction, and the reader's
+/// own `environ` from its memory, with Linux's access check at the open.
+#[test]
+fn run_kvm_another_processs_cmdline_and_environ_answer_as_linux() {
+    let test = "run_kvm_another_processs_cmdline_and_environ_answer_as_linux";
+    if kvm_unavailable(test) {
+        return;
+    }
+    let native = proc_other_process_cmdline_native();
+    assert_eq!(
+        guest_transcript_at_l2("kvm", proc_other_process_cmdline_guest(), &[]),
         native,
         "kvm"
     );

@@ -371,6 +371,17 @@ mod tests {
         // (renumbered from 49 to 52 at landing by the merge queue; digests measured on the combined
         // tree)
         (52, "18b49ae6affb5c77", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::RecordExecStrings` and
+        // `GlobalRequest::ProcessExecStrings` and their responses, which
+        // carry an image's argument and environment strings (`ExecStrings`,
+        // package K item 2b slice 2b-3; after(this base's last row),
+        // renumbered mechanically at each rebase: 42 on its old base, then
+        // 43, 47 and 49 at its rebases onto 2b-1, 51 after SIGSHARE S2b's
+        // provisional 50, 52 after main's 51, and 53 after main's 52). The
+        // digest covers that payload type too (domain 8; domain 7 on its old
+        // base, moved to 8 because main's 41 took domain 6 and 2b-1's payload
+        // types moved to 7). Digest measured at this head.
+        (53, "1be8dcd9ec41e276", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -449,6 +460,11 @@ mod tests {
     ];
     const TASK_CPU_TIMES_WIRE: [&str; 1] = ["pub struct TaskCpuTimes {"];
 
+    /// The payload type package K item 2b slice 2b-3 added, which
+    /// `RecordExecStrings` and `ProcessExecStrings`'s response carry, in
+    /// tool_global.rs.
+    const EXEC_STRINGS_WIRE: [&str; 1] = ["pub struct ExecStrings {"];
+
     /// The lines of code of the item `source` declares, unindented, on the
     /// line `header`: the attributes just above it (its derives and serde
     /// attributes decide its encoding), the header, and its body through
@@ -492,8 +508,9 @@ mod tests {
     /// `source`, of the StoreExclusive payload's types in `payload`, of the
     /// scheduled event's wire items in `schedule`, of the trace reply's
     /// wire items in `source` and `replayer`, of the nested wire types
-    /// in `host_input` (`HOST_INPUT_WIRE`), and of 2b-1's payload types in
-    /// `source` and `task_stat`: their variants, fields, payload types, order
+    /// in `host_input` (`HOST_INPUT_WIRE`), of 2b-1's payload types in
+    /// `source` and `task_stat`, and of 2b-3's in `source`: their variants,
+    /// fields, payload types, order
     /// and attributes, not their documentation.
     fn definition_digest(
         source: &str,
@@ -522,6 +539,7 @@ mod tests {
             wire_items(task_stat, &TASK_CPU_TIMES_WIRE),
         ]
         .join("\n");
+        let exec_strings = wire_items(source, &EXEC_STRINGS_WIRE);
         fnv_domains(&[
             (0, request.as_bytes()),
             (1, response.as_bytes()),
@@ -530,6 +548,7 @@ mod tests {
             (5, reply.as_bytes()),
             (6, nested.as_bytes()),
             (7, procfs.as_bytes()),
+            (8, exec_strings.as_bytes()),
         ])
     }
 
@@ -799,6 +818,41 @@ mod tests {
         let documented = source.replacen(
             "pub struct CpuPublication {\n",
             "pub struct CpuPublication {\n    /// Documentation only.\n",
+            1,
+        );
+        assert_ne!(documented, source);
+        assert_eq!(
+            definition_digest(
+                &documented,
+                payload,
+                schedule,
+                replayer,
+                host_input,
+                task_stat
+            ),
+            digest
+        );
+        // And 2b-3's: a field added to `ExecStrings` or one retyped changes
+        // the digest; a doc line does not.
+        let grown = source.replacen(
+            "pub struct ExecStrings {\n",
+            "pub struct ExecStrings {\n    pub added: u32,\n",
+            1,
+        );
+        assert_ne!(grown, source);
+        assert_ne!(
+            definition_digest(&grown, payload, schedule, replayer, host_input, task_stat),
+            digest
+        );
+        let retyped = source.replacen("    pub envp: Vec<u8>,\n", "    pub envp: String,\n", 1);
+        assert_ne!(retyped, source);
+        assert_ne!(
+            definition_digest(&retyped, payload, schedule, replayer, host_input, task_stat),
+            digest
+        );
+        let documented = source.replacen(
+            "pub struct ExecStrings {\n",
+            "pub struct ExecStrings {\n    /// Documentation only.\n",
             1,
         );
         assert_ne!(documented, source);

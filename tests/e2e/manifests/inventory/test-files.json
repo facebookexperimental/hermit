@@ -2042,6 +2042,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/proc_other_process_cmdline.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/proc_other_process_cmdline.c is owned by hermit-cli/tests/cli.rs: another_processs_cmdline_and_environ_answer_as_linux runs it on ptrace and run_kvm_another_processs_cmdline_and_environ_answer_as_linux on KVM, each under run --strict --verify --verify-strict at bitwise parity, and requires its transcript of other processes' /proc/<pid>/cmdline and /proc/<pid>/environ (an exec'd child read whole, in chunks, after lseek and with pread; an empty argument vector; an argument longer than a page; a forked child; a zombie; a non-dumpable child whose environ a reader without capabilities cannot open) to equal the same guest's native run line for line (package K item 2b slice 2b-3). The test checks the native transcript against fixed lines first, so a host that answers otherwise fails before the comparison."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/proc_other_process_stat.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/proc_other_process_stat.c is owned by hermit-cli/tests/cli.rs: another_processs_stat_and_comm_answer_as_linux runs it on ptrace and run_kvm_another_processs_stat_and_comm_answer_as_linux on KVM, each under run --strict --verify --verify-strict at bitwise parity, and requires its transcript of another process's /proc/<pid>/stat, task/<tid>/stat and comm (a live child named by PR_SET_NAME with a named second thread and the CPU time it used, read by path and relative to a descriptor of its directory, whose listing it checks; the parent's stat read by the child before the parent opened its own; a zombie's, with its exit code) to equal the same guest's native run line for line (package K item 2b slice 2b-1). A generic manifest cannot compare a backend's transcript with a native run whose pids and CPU time differ from run to run, so the guest prints those as comparisons and the test compares the transcripts."

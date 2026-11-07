@@ -153,19 +153,32 @@ const _: () = assert!(
 );
 const _: () = assert!(TAG_BITS + 2 * PID_BITS + 2 * INCARNATION_BITS == 64);
 
-/// The tag of the per-process file at `index` in `PER_PROCESS_NAMES`, from
-/// 1, which the top [`TAG_BITS`] bits of its inode number hold. The first
+/// The tag of the per-process file at `index` in `PER_PROCESS_NAMES`, which
+/// the top [`TAG_BITS`] bits of its inode number hold. The first
 /// [`FIRST_LAYOUT_FILES`] files take 9 to 15, the bits of the set bit 63 and
 /// the 3-bit index from 1 that their numbers had before the field grew, so
-/// their numbers are unchanged; the files after them take 1 to 8. A tag of 1
-/// or more puts every per-process number at 2^60 or above, out of the range
-/// of a system-wide rendered file's number (below 2^32) and of every number
-/// Detcore's inode pool mints (counting up from a few thousand).
+/// their numbers are unchanged; the next seven take 1 to 7. Tag 8 (bit 63
+/// with index 0) is every fdinfo's ([`fdinfo_inode`]). A tag of 1 or more
+/// puts a per-process number at 2^60 or above, out of the range of a
+/// system-wide rendered file's number (below 2^32) and of every number
+/// Detcore's inode pool mints (counting up from a few thousand). The
+/// fifteenth file, `environ` (package K item 2b slice 2b-3), takes the one
+/// tag left, 0: its number is its task's fields alone, at 2^38 or above (a
+/// task's pid is at least 1), out of both ranges too, and below every other
+/// per-process number.
 fn per_process_tag(index: usize) -> u64 {
+    const SECOND_LAYOUT_FILES: usize = 7;
     if index < FIRST_LAYOUT_FILES {
         8 + index as u64 + 1
-    } else {
+    } else if index < FIRST_LAYOUT_FILES + SECOND_LAYOUT_FILES {
         (index - FIRST_LAYOUT_FILES) as u64 + 1
+    } else {
+        assert_eq!(
+            index,
+            FIRST_LAYOUT_FILES + SECOND_LAYOUT_FILES,
+            "no tag is left for another per-process file"
+        );
+        0
     }
 }
 
@@ -1171,9 +1184,11 @@ mod tests {
                 .iter()
                 .all(|other| *other != fdinfo && index(*other) == 0)
         );
+        // Every other per-process file's tag is not fdinfo's 8 (bit 63 with
+        // index 0): `environ`'s is 0, without bit 63.
         for filename in crate::procfs::ProcfsFile::PER_PROCESS_NAMES {
             let inode = per_process_inode(name(3, None, 1, filename));
-            assert_ne!(index(inode), 0, "{filename}");
+            assert!(inode >> 63 == 0 || index(inode) != 0, "{filename}");
             assert_ne!(inode, fdinfo, "{filename}");
         }
         // The same file is the same number.
@@ -1199,15 +1214,17 @@ mod tests {
 
     /// The first seven per-process files keep the numbers they had when the
     /// field above the pid was bit 63 and a 3-bit index from 1 (tags 9 to
-    /// 15); the files after them take tags 1 to 7 below them; and every file
-    /// of one task has a number of its own, at 2^60 or above.
+    /// 15); the next seven take tags 1 to 7 below them, and `environ` the
+    /// last tag, 0, below fdinfo's 8; and every file of one task has a number
+    /// of its own, at 2^38 or above, and at 2^60 or above for all but
+    /// `environ`.
     #[test]
     fn per_process_files_take_tags_that_keep_the_first_seven_numbers() {
         assert_eq!(
             (0..crate::procfs::ProcfsFile::PER_PROCESS_NAMES.len())
                 .map(per_process_tag)
                 .collect::<Vec<_>>(),
-            [9, 10, 11, 12, 13, 14, 15, 1, 2, 3, 4, 5, 6, 7]
+            [9, 10, 11, 12, 13, 14, 15, 1, 2, 3, 4, 5, 6, 7, 0]
         );
         let task = 3 << (PID_BITS + 2 * INCARNATION_BITS) | 1 << INCARNATION_BITS;
         let inode = |name: &str| {
@@ -1231,6 +1248,8 @@ mod tests {
         assert_eq!(inode("smaps"), 4 << 60 | task);
         assert_eq!(inode("smaps_rollup"), 5 << 60 | task);
         assert_eq!(inode("numa_maps"), 6 << 60 | task);
+        assert_eq!(inode("status"), 7 << 60 | task);
+        assert_eq!(inode("environ"), task);
         let numbers = crate::procfs::ProcfsFile::PER_PROCESS_NAMES
             .iter()
             .map(|name| inode(name))
@@ -1239,7 +1258,12 @@ mod tests {
             numbers.len(),
             crate::procfs::ProcfsFile::PER_PROCESS_NAMES.len()
         );
-        assert!(numbers.iter().all(|number| *number >= 1 << 60));
+        assert!(
+            numbers
+                .iter()
+                .all(|number| *number >= 1 << 60 || *number == inode("environ"))
+        );
+        assert!(inode("environ") >= 1 << 38);
     }
 
     /// A host call that fails inside `preserving_errno` leaves the caller's

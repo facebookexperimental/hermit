@@ -6,10 +6,18 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Another guest process's `cmdline`, descriptor links and `fdinfo`, and the
-//! directories that list them, which Detcore does not serve, looked up on a
-//! backend whose `/proc/<pid>` is not the guest process with that number
+//! Another guest process's `cmdline`, `environ`, descriptor links and
+//! `fdinfo`, and the directories that list them, looked up on a backend whose
+//! `/proc/<pid>` is not the guest process with that number
 //! (<https://github.com/rrnewton/hermit/issues/4564>).
+//!
+//! Since package K item 2b slice 2b-3 Detcore serves another process's
+//! `cmdline` and `environ` there from the strings its image's `execve` passed
+//! (`Detcore::serves_exec_strings`), where it recorded them or the process has
+//! exited: such a lookup is left to the rendered path. Linux reads both from
+//! the process's memory at each read; the record is the named interim
+//! fallback, which does not show a rewrite of either after the exec (minibeads
+//! dh-ngy9z). Where no record exists, the file is refused by name, as before.
 //!
 //! Another process's directories, its `stat` and its `comm` Detcore serves
 //! itself since package K item 2b slice 2b-1
@@ -153,6 +161,8 @@ use crate::tool_local::Detcore;
 pub(crate) enum TaskFile {
     /// `cmdline`.
     Cmdline,
+    /// `environ`.
+    Environ,
     /// A descriptor link, `fd/<N>`, or a path below one.
     DescriptorLink,
     /// A descriptor's `fdinfo/<N>`.
@@ -200,6 +210,7 @@ pub(crate) fn named_task_file(path: &Path) -> Option<(BoundTask, TaskFile)> {
     };
     let file = match rest {
         [name] if *name == "cmdline" => TaskFile::Cmdline,
+        [name] if *name == "environ" => TaskFile::Environ,
         [directory, fd, ..] if *directory == "fd" && decimal_fd(fd).is_some() => {
             TaskFile::DescriptorLink
         }
@@ -251,6 +262,7 @@ fn task_regular_file(parts: &[&OsStr]) -> Option<(BoundTask, TaskFile)> {
     };
     match rest {
         [name] if *name == "cmdline" => Some((task, TaskFile::Cmdline)),
+        [name] if *name == "environ" => Some((task, TaskFile::Environ)),
         [directory, fd] if *directory == "fdinfo" && decimal_fd(fd).is_some() => {
             Some((task, TaskFile::DescriptorInfo))
         }
@@ -787,8 +799,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             if task.process == own_pid {
                 continue;
             }
-            let found = Self::named_tasks_exist(guest, &walked).await
-                && crate::tool_global::procfs_task(guest, task).await.exists;
+            let answer = crate::tool_global::procfs_task(guest, task).await;
+            let found = Self::named_tasks_exist(guest, &walked).await && answer.exists;
             let verdict = if !found {
                 Verdict::Absent
             } else {
@@ -803,11 +815,33 @@ impl<T: RecordOrReplay> Detcore<T> {
                     None if file == TaskFile::DescriptorInfo => Verdict::InitDescriptorInfo,
                     None => continue,
                     Some(process) if process == self.own_detpid(guest).as_raw() => continue,
-                    // Past another process's cmdline, which every task has
-                    // (`past_a_task_file`).
+                    // Another process's `cmdline` or `environ` itself, by a
+                    // pathname, which the rendered path serves where Detcore
+                    // holds the strings its image's `execve` passed, or the
+                    // process has exited (`Detcore::kept_by_kernel`). An
+                    // empty pathname names the descriptor, answered below.
+                    Some(process)
+                        if !empty
+                            && past.is_none()
+                            && matches!(file, TaskFile::Cmdline | TaskFile::Environ)
+                            && (answer.without_mm
+                                || crate::tool_global::process_exec_strings(
+                                    guest,
+                                    detcore_model::pid::DetPid::from_raw(process),
+                                )
+                                .await
+                                .1
+                                .is_some()) =>
+                    {
+                        continue;
+                    }
+                    // Past another process's cmdline or environ, which every
+                    // task has (`past_a_task_file`).
                     Some(_) => match (file, past) {
-                        (TaskFile::Cmdline, Some(PastFile::Component)) => Verdict::NotADirectory,
-                        (TaskFile::Cmdline, Some(PastFile::Slashes))
+                        (TaskFile::Cmdline | TaskFile::Environ, Some(PastFile::Component)) => {
+                            Verdict::NotADirectory
+                        }
+                        (TaskFile::Cmdline | TaskFile::Environ, Some(PastFile::Slashes))
                             if looks_up_whole_path(sysno, &values) =>
                         {
                             Verdict::NotADirectory
@@ -1003,6 +1037,11 @@ mod tests {
                 (task(9, Some(11)), TaskFile::DescriptorInfo),
             ),
             ("//proc/./1/cmdline", (task(1, None), TaskFile::Cmdline)),
+            ("/proc/5/environ", (task(5, None), TaskFile::Environ)),
+            (
+                "/proc/5/task/7/environ",
+                (task(5, Some(7)), TaskFile::Environ),
+            ),
             ("/proc/5/fd", (task(5, None), TaskFile::DescriptorDirectory)),
             (
                 "/proc/5/fdinfo/",
@@ -1036,7 +1075,7 @@ mod tests {
             "/proc/5/task",
             "/proc/5/fdinfo/1/x",
             "/proc/5/status",
-            "/proc/5/environ",
+            "/proc/5/environs",
             "/proc/5/task/7",
             "/proc/5/task/7/status",
             "/proc/5/../5/cmdline",
@@ -1066,6 +1105,16 @@ mod tests {
             ("/proc/5/cmdline/./", "/proc/5/cmdline/./", cmdline(Further)),
             ("/proc/5/cmdline/x", "/proc/5/cmdline/x", cmdline(Further)),
             ("/proc/5/cmdline/..", "/proc/5/cmdline/..", cmdline(Further)),
+            (
+                "/proc/5/environ/",
+                "/proc/5/environ/",
+                Some((task(5, None), TaskFile::Environ, Slashes)),
+            ),
+            (
+                "/proc/5/environ/x",
+                "/proc/5/environ/x",
+                Some((task(5, None), TaskFile::Environ, Further)),
+            ),
             ("/proc/5/fdinfo/3/", "/proc/5/fdinfo/3/", fdinfo(Slashes)),
             ("/proc/5/fdinfo/3/x", "/proc/5/fdinfo/3/x", fdinfo(Further)),
             (
@@ -1092,6 +1141,7 @@ mod tests {
         }
         for path in [
             "/proc/5/cmdline",
+            "/proc/5/environ",
             "/proc/5/fdinfo/3",
             "/proc/5/fd/3/",
             "/proc/5/fd/3/x",
