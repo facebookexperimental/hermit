@@ -72173,7 +72173,7 @@ fn procfs_own_directory_at_l2(backend: &str, level: &str, modes: &[&str]) -> Str
         directory.path().to_str().expect("directory path is UTF-8"),
     ];
     args.extend_from_slice(modes);
-    let output = hermit(&args);
+    let output = procfs_own_directory_hermit(&args);
     assert_success(&output, &args);
     let verdict: serde_json::Value =
         serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
@@ -72207,9 +72207,48 @@ fn procfs_own_directory_strict(backend: &str, modes: &[&str]) -> String {
         directory.path().to_str().expect("directory path is UTF-8"),
     ];
     args.extend_from_slice(modes);
-    let output = hermit(&args);
+    let output = procfs_own_directory_hermit(&args);
     assert_success(&output, &args);
     stdout(&output)
+}
+
+/// Marks every descriptor above 2 close-on-exec in `command`'s child, so the
+/// program it runs starts with only stdin, stdout and stderr open, whatever
+/// the harness that started this test left open without `FD_CLOEXEC` (a
+/// jobserver's pipe, a shell's redirection). The own-directory guest prints
+/// the `st_size` of its `fd` directory, which Linux gives as the number of
+/// descriptors open, so its native run and its runs under Hermit compare
+/// exactly only when both start with the same descriptors.
+/// `CLOSE_RANGE_CLOEXEC` rather than a close keeps the standard library's own
+/// close-on-exec pipe, which reports an exec failure, open until the exec.
+fn with_only_standard_descriptors(command: &mut Command) -> &mut Command {
+    // SAFETY: close_range(2) is async-signal-safe and changes only the
+    // descriptors of the child about to exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::syscall(
+                libc::SYS_close_range,
+                3u32,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            ) == 0
+            {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    command
+}
+
+/// Hermit with `args`, the own-directory guest's run, started with only the
+/// standard descriptors open ([`with_only_standard_descriptors`]).
+fn procfs_own_directory_hermit(args: &[&str]) -> Output {
+    hermit_test::hermit_output(
+        &format!("hermit {args:?}"),
+        with_only_standard_descriptors(&mut hermit_command(args)),
+    )
 }
 
 /// The own-directory guest's held-thread mode run natively: descriptors of a
@@ -72238,10 +72277,12 @@ fn held_thread_native() -> String {
     native
 }
 
-/// The own-directory guest's transcript run natively, in `modes`.
+/// The own-directory guest's transcript run natively, in `modes`, started
+/// with only the standard descriptors open, as under Hermit
+/// ([`with_only_standard_descriptors`]).
 fn procfs_own_directory_native(modes: &[&str]) -> String {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let output = Command::new(procfs_own_directory_guest())
+    let output = with_only_standard_descriptors(&mut Command::new(procfs_own_directory_guest()))
         .arg(directory.path())
         .args(modes)
         .stdin(Stdio::null())
