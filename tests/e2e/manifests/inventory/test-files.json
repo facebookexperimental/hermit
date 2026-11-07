@@ -2089,6 +2089,12 @@
       "why": "tests/c/process_signal_receiver.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests a_process_directed_signal_goes_to_the_thread_linux_chooses and a_signal_to_the_senders_own_process_that_another_thread_takes_is_refused_by_name compile this guest, which sends process-directed signals to multi-threaded processes (a parent's SIGTERM to a four-thread child whose threads all, all but one, or none leave it unblocked, a worker's pidfd SIGSEGV to its own process at the default disposition, and a worker's SIGUSR1 to its own process) and prints the receiving thread and its siginfo, and requires Linux's output under --strict, at bitwise parity for the three SIGTERM modes, and the named refusal for the SIGUSR1 mode (https://github.com/rrnewton/hermit/issues/4034); it remains a guest fixture because a generic manifest cannot assert this exact output, refusal reason or verdict."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/process_signal_target.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/process_signal_target.c is owned by hermit-cli/tests/cli.rs: a_kernel_sent_process_signal_reaches_the_thread_linux_chooses_natively_and_on_ptrace compiles this guest, in which the kernel itself sends a three-thread process a process-directed signal (a child's exit SIGCHLD, an ITIMER_REAL expiry or a POSIX timer expiry; the named thread, the walk from curr_target, a thread waiting in sigtimedwait, a busy thread, a thread holding only a copy Linux discarded, a coalesced SIGCHLD that moves no curr_target, an explicitly ignored SIGCHLD that moves none, and a default-ignored SIGCHLD a blocked creator leaves queued that moves it though its receiver discards it), and requires natively, in one run, the thread Linux's complete_signal chooses; on ptrace, at bitwise parity, that thread except where a mode records a known divergence (chld-creator and alrm-leader, issue 4991; suppressed-child-curr, dh-90p9w). Its KVM half arrives with SIGSHARE S3b's flip of kernel_signal_targets_are_predictable on KVM. The guest ends unconfirmed, with no line, when a prerequisite boundary is not reached (SIGSHARE S3b)."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/process_vm_readv_refusal_probe.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
