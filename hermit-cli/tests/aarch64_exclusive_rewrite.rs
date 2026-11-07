@@ -360,7 +360,7 @@ fn a_c_library_guests_loop_is_left_with_its_reason_and_it_still_counts() {
         .arg(&guest);
     let rendered = format!("{list:?}");
     let listed = hermit_test::hermit_output(&rendered, &mut list);
-    // `rewrite-exclusives` exits 1 when a file still holds a loop it refused.
+    // EXIT-CLASS: hermit. `rewrite-exclusives` exits 1 when a file still holds a loop it refused.
     assert_eq!(
         listed.status.code(),
         Some(1),
