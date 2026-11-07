@@ -202,6 +202,8 @@ mod decode {
     pub(crate) struct ExecutableSection {
         /// Its index in the section header table, which mapping symbols name.
         pub(crate) index: usize,
+        /// Its ELF section type; only `SHT_PROGBITS` admits code proof.
+        pub(crate) kind: u32,
         /// Its file offset and size.
         pub(crate) offset: u64,
         pub(crate) size: u64,
@@ -227,6 +229,7 @@ mod decode {
                 (kind != SHT_NOBITS && word(8) & SHF_EXECINSTR != 0 && word(32) != 0).then(|| {
                     ExecutableSection {
                         index,
+                        kind,
                         offset: word(24),
                         size: word(32),
                         address: word(16),
@@ -240,15 +243,16 @@ mod decode {
     pub(crate) type FileRanges = Vec<(u64, u64)>;
 
     /// The file ranges (start, end) of `sections` to scan, and of those the
-    /// ones scanned without proof, each sorted and merged. Only `$x` and `$d`
-    /// prove where code is, as the default rewrite takes them
+    /// ones scanned without proof, each sorted and merged. Only `SHT_PROGBITS`
+    /// sections admit `$x` and `$d` proof, as the default rewrite takes them
     /// ([`CodeEvidence::classify`]): what a section's mapping symbols mark
     /// `$x` is code, and what they mark `$d` is data and is not scanned, so a
     /// constant table in `.text` cannot pass for an exclusive pair. The rest
     /// is scanned and labelled unverified: bytes before a section's first
     /// mapping symbol, and the whole of a section that no mapping symbol
-    /// marks (whatever its unwind table says) or that holds one of another
-    /// kind ([`CodeEvidence::unsupported_in`]). The rewriter leaves those
+    /// marks (whatever its unwind table says), that has another section type,
+    /// or that holds a mapping symbol of another kind
+    /// ([`CodeEvidence::unsupported_in`]). The rewriter leaves those
     /// alone by default, but this census only names where retries may come
     /// from, and dropping them would hide a real loop.
     ///
@@ -271,7 +275,8 @@ mod decode {
         for section in sections {
             let end = section.address.saturating_add(section.size);
             let held = evidence.classify(section.index, section.address, section.size);
-            let (code, unknown) = if held.evidence == Some(mapping::Evidence::MappingSymbols)
+            let (code, unknown) = if section.kind == goblin::elf::section_header::SHT_PROGBITS
+                && held.evidence == Some(mapping::Evidence::MappingSymbols)
                 && evidence.unsupported_in(section.index).is_none()
             {
                 (held.code, held.unknown)
@@ -476,9 +481,10 @@ mod model {
         pub counter_reads: u64,
         /// Of `pairs`, those with any word, from the load-exclusive to the
         /// retry branch after the store, in bytes not known to be code: not
-        /// proved by mapping symbols (neither marked `$x` nor marked `$d`, or
-        /// in a section that holds a mapping symbol of another kind). An
-        /// unwind table proves nothing here. They may be data.
+        /// proved by mapping symbols in `SHT_PROGBITS` (neither marked `$x`
+        /// nor marked `$d`, another section type, or a section that holds a
+        /// mapping symbol of another kind). An unwind table proves nothing
+        /// here. They may be data.
         #[serde(default)]
         pub unverified_pairs: u64,
     }
@@ -3450,6 +3456,7 @@ mod tests {
         .concat();
         let at = |index, offset, size| ExecutableSection {
             index,
+            kind: PROGBITS,
             offset,
             size,
             address: offset + 0x10000,
@@ -3471,12 +3478,14 @@ mod tests {
         use crate::aarch64_lse::mapping::MappingSymbol;
         let text = ExecutableSection {
             index: 2,
+            kind: goblin::elf::section_header::SHT_PROGBITS,
             offset: 0x400,
             size: 0x800,
             address: 0x10400,
         };
         let plt = ExecutableSection {
             index: 5,
+            kind: goblin::elf::section_header::SHT_PROGBITS,
             offset: 0x1000,
             size: 0x20,
             address: 0x11000,
@@ -3559,6 +3568,67 @@ mod tests {
         );
     }
 
+    /// Section types outside the default rewriter's admission stay visible
+    /// to the census, but even `$x` cannot certify their bytes as code.
+    #[test]
+    fn non_progbits_executable_sections_are_scanned_unverified() {
+        use goblin::elf::section_header::SHF_ALLOC;
+        use goblin::elf::section_header::SHF_EXECINSTR;
+        use goblin::elf::section_header::SHT_NOTE;
+        use goblin::elf::section_header::SHT_PROGBITS;
+
+        use crate::aarch64_lse::mapping::CodeEvidence;
+        use crate::aarch64_lse::mapping::MappingSymbol;
+
+        let image: Vec<u8> = [LDAXR_X0_X2, ADD_X1_X0_1, STLXR_W3_X1_X2, CBNZ_W3]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let evidence = CodeEvidence {
+            symbols: vec![MappingSymbol {
+                section: 0,
+                address: 0x10400,
+                code: true,
+            }],
+            unsupported: Vec::new(),
+            unwind: None,
+        };
+        for (kind, unknown) in [(SHT_NOTE, true), (SHT_PROGBITS, false)] {
+            let headers = section(kind, u64::from(SHF_ALLOC | SHF_EXECINSTR), 0x400, 0x10);
+            let sections = executable_sections(&headers);
+            assert_eq!(
+                sections,
+                vec![ExecutableSection {
+                    index: 0,
+                    kind,
+                    offset: 0x400,
+                    size: 0x10,
+                    address: 0x10400,
+                }]
+            );
+            let (ranges, unverified) = code_file_ranges(&sections, &evidence);
+            assert_eq!(ranges, vec![(0x400, 0x410)]);
+            assert_eq!(
+                unverified,
+                if unknown {
+                    vec![(0x400, 0x410)]
+                } else {
+                    Vec::new()
+                }
+            );
+            let loops = scan_ranges(&ranges, unverified, |start, end, scan| {
+                scan.push_bytes(&image[(start - 0x400) as usize..(end - 0x400) as usize]);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+            let found = loops.found_in(0, 0x1000);
+            assert_eq!(
+                (found.pairs, found.unverified_pairs),
+                (1, u64::from(unknown))
+            );
+        }
+    }
+
     /// A malformed section header whose offset, or address plus size, runs
     /// past the end of the address space saturates instead of overflowing
     /// (the dev and validate profiles check overflow, so this was a panic in
@@ -3570,6 +3640,7 @@ mod tests {
         let nothing = CodeEvidence::default();
         let offset_overflows = ExecutableSection {
             index: 2,
+            kind: goblin::elf::section_header::SHT_PROGBITS,
             offset: u64::MAX - 0x10,
             size: 0x100,
             address: 0x10400,
@@ -3583,6 +3654,7 @@ mod tests {
         );
         let size_overflows = ExecutableSection {
             index: 2,
+            kind: goblin::elf::section_header::SHT_PROGBITS,
             offset: 0x10000,
             size: u64::MAX,
             address: 0x400,
@@ -3622,12 +3694,14 @@ mod tests {
         const NOP: u32 = 0xd503_201f;
         let marked = ExecutableSection {
             index: 2,
+            kind: goblin::elf::section_header::SHT_PROGBITS,
             offset: 0x400,
             size: 0x10,
             address: 0x10400,
         };
         let unmarked = ExecutableSection {
             index: 3,
+            kind: goblin::elf::section_header::SHT_PROGBITS,
             offset: 0x410,
             size: 0x10,
             address: 0x10410,

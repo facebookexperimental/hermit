@@ -367,11 +367,12 @@ pub struct RunSummary {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub exclusive_pairs: BTreeMap<String, u64>,
 
-    /// aarch64: of `exclusive_pairs`, those counted in bytes not known to be
-    /// code (neither marked `$x` by the file's mapping symbols nor covered
-    /// by its unwind table, nor marked `$d`), so they may be data, by guest
-    /// path, for the files that have any. A function of the files' bytes, so it is in the INFO
-    /// view. Empty elsewhere.
+    /// aarch64: of `exclusive_pairs`, those with any word in bytes the default
+    /// code proof does not establish: outside `SHT_PROGBITS`, before its first
+    /// mapping symbol, or in a section with missing or unsupported mapping
+    /// symbols. Unwind coverage alone proves nothing; `$d` data in a proved
+    /// section is not scanned. By guest path for files with unverified pairs.
+    /// A function of the files' bytes, so it is in the INFO view. Empty elsewhere.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub exclusive_pairs_unverified: BTreeMap<String, u64>,
 
