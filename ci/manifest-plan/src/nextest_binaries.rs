@@ -2370,7 +2370,6 @@ fn substitute_harvested_binaries(
 ) -> Result<(), PreparationError> {
     let status = std::process::Command::new("./ci/harvest-reverie-buck.sh")
         .current_dir(root)
-        .env("HARVEST_BUCK_HARVEST_ONLY", "1")
         .status()
         .map_err(|error| format!("buck harvest could not start: {error}"))?;
     if !status.success() {
@@ -2424,6 +2423,20 @@ fn apply_harvest(
     for file in files {
         let name = string(file, "name")?;
         let harvested_to = string(file, "harvested_to")?;
+        // Placement provenance is refused, not trusted: any manifest entry
+        // placed over a Cargo file, or landing outside buck-harvest/, is
+        // not a buck-harvest consumption record.
+        if file
+            .get("placed_over_cargo")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || !harvested_to.starts_with("target/validate/buck-harvest/")
+        {
+            return Err(format!(
+                "harvest manifest entry for {name} was placed over Cargo or outside buck-harvest: {harvested_to}"
+            )
+            .into());
+        }
         harvested.insert(name.to_string(), root.join(harvested_to));
     }
     if harvested.is_empty() {
@@ -2524,6 +2537,12 @@ fn apply_harvest(
                     *runtime = file_identity(&buck_so, false)?;
                 }
             }
+            // metadata_binaries derives runtime files as a sorted,
+            // deduplicated set; keep the record in that same shape.
+            record
+                .runtime_files
+                .sort_by(|left, right| left.path.cmp(&right.path));
+            record.runtime_files.dedup_by(|a, b| a.path == b.path);
             fs::write(
                 &metadata_path,
                 serde_json::to_vec(&metadata).map_err(|e| e.to_string())?,
@@ -3263,6 +3282,59 @@ mod tests {
         let error = apply_harvest(&manifest, &root, &generation, &mut fewer).unwrap_err();
         assert!(error.to_string().contains("case set"), "{error}");
         std::fs::write(&buck_file, script).unwrap();
+        // A placed (Cargo-overwriting) manifest entry refuses, whatever
+        // env the harvest ran under: this kills the env-removal mutant.
+        let placed_manifest = serde_json::json!({
+            "files": [{
+                "name": "basics",
+                "harvested_to": "target/validate/buck-harvest/basics",
+                "placed_over_cargo": true,
+            }]
+        });
+        let mut placed = BTreeMap::from([(
+            "full".to_string(),
+            SelectionRecord {
+                build_args: vec![],
+                metadata: identity(&metadata_path),
+                binaries: vec![BinaryIdentity {
+                    binary_id: "pkg:basics:test".into(),
+                    package_id: "pkg".into(),
+                    binary_name: "basics".into(),
+                    kind: "test".into(),
+                    build_platform: "target".into(),
+                    executable: identity(&cargo_file),
+                }],
+                runtime_files: vec![],
+            },
+        )]);
+        let error = apply_harvest(&placed_manifest, &root, &generation, &mut placed).unwrap_err();
+        assert!(error.to_string().contains("placed over Cargo"), "{error}");
+        // Two manifest names, one matched binary: the drifted stem refuses
+        // by name (kills the name-set-equality mutant).
+        let two_names = serde_json::json!({
+            "files": [
+                {"name": "basics", "harvested_to": "target/validate/buck-harvest/basics"},
+                {"name": "exit", "harvested_to": "target/validate/buck-harvest/basics"},
+            ]
+        });
+        let mut partial = BTreeMap::from([(
+            "full".to_string(),
+            SelectionRecord {
+                build_args: vec![],
+                metadata: identity(&metadata_path),
+                binaries: vec![BinaryIdentity {
+                    binary_id: "pkg:basics:test".into(),
+                    package_id: "pkg".into(),
+                    binary_name: "basics".into(),
+                    kind: "test".into(),
+                    build_platform: "target".into(),
+                    executable: identity(&cargo_file),
+                }],
+                runtime_files: vec![],
+            },
+        )]);
+        let error = apply_harvest(&two_names, &root, &generation, &mut partial).unwrap_err();
+        assert!(error.to_string().contains("exit"), "{error}");
         // The recomputed hash stays bound to the bytes that run: tampering
         // with the harvested file after substitution is refused by the same
         // check_identity every consumer path runs.

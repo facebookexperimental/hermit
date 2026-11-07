@@ -6,12 +6,12 @@
 # harvested binary with --list so the cohort is proven to run, and writes
 # the harvested-file manifest at target/validate/harvested-files.json.
 #
-# Placement: when a Cargo-built counterpart already sits in
-# target/validate/deps/<name>-<hash>, the Buck binary replaces it at that
-# exact path (its copy mtime is newer than the Cargo fingerprint inputs, so
-# `nextest-binaries.rs prepare` lists and hashes it as-is). Otherwise the
-# binary lands in target/validate/buck-harvest/<name> and the manifest
-# records it as unplaced; nothing is silently dropped.
+# Placement is buck-harvest-only by default: binaries land in
+# target/validate/buck-harvest/<name>, and nextest prepare repoints the
+# recorded metadata at them (option b; Cargo's target files are never
+# written). HARVEST_ALLOW_PLACED=1 is the explicit legacy opt-in that
+# instead replaces an existing Cargo counterpart in
+# target/validate/deps/; prepare refuses any manifest produced that way.
 #
 # The OSS shim reports no sanitizer (shim/build_defs/sanitizers.bzl), so in
 # this repository the Buck cohort is the unsanitized OSS configuration; in
@@ -60,6 +60,9 @@ if [[ ! -f shim/third-party/rust/BUCK ]]; then
 fi
 
 mkdir -p target/validate/buck-harvest
+# Never bind a stale sibling library: this run's copy is recreated below
+# only when the Buck output actually provides one.
+rm -f target/validate/buck-harvest/libreverie_examples.so
 BUILD_LOG=$(mktemp target/validate/buck-harvest/build.XXXXXX.log)
 trap 'rm -f "$BUILD_LOG"' EXIT
 
@@ -99,9 +102,9 @@ for entry in "${TARGETS[@]}"; do
     echo "harvest-reverie-buck: multiple Cargo counterparts for $name: ${matches[*]}" >&2
     exit 2
   fi
-  # HARVEST_BUCK_HARVEST_ONLY=1 (set by nextest prepare, option b): never
-  # overwrite Cargo's target files; placement is buck-harvest/ only.
-  if [[ ${HARVEST_BUCK_HARVEST_ONLY:-} != 1 && ${#matches[@]} -eq 1 ]]; then
+  # Placement over a Cargo counterpart only behind the explicit legacy
+  # opt-in HARVEST_ALLOW_PLACED=1; the default is buck-harvest/ only.
+  if [[ ${HARVEST_ALLOW_PLACED:-} == 1 && ${#matches[@]} -eq 1 ]]; then
     dest=${matches[0]}
     placed=true
   fi

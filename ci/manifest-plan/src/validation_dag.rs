@@ -2110,14 +2110,11 @@ fn is_buck_import_twin(step: &Step) -> bool {
 pub fn buck_e2e_selection(committed: &DagConfig) -> Result<DagConfig, String> {
     let replaced = buck_replaced_tags(committed)?;
     let mut pruned = committed.clone();
-    // Post-split extension brackets (build.reverie_buck, M2) are not part of
-    // the Buck E2E replacement composition: they carry the `full` label for
-    // the ordinary full profile, and selecting them here would keep the
-    // bracket inside the very mode whose selection it brackets. Exclude
-    // extension tags explicitly; the frozen population is unchanged.
     // Post-split extension nodes named *_buck (the rr twins and
     // build.reverie_buck) are part of this selection's population per the
-    // registry contract; no exclusion is applied here.
+    // registry contract; no exclusion is applied here. The bracket is
+    // accounted for explicitly in validate.rs's runner plan and in
+    // assert_buck_e2e_selection's dropped-set derivation below.
     for step in &mut pruned.steps {
         if replaced.contains(&step.tag()) {
             step.labels.retain(|label| label != "full");
@@ -3905,9 +3902,11 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
             "the Buck E2E selection still selects replaced node(s) {kept_replaced:?}"
         ));
     }
-    // Post-split extension brackets (build.reverie_buck, M2) are excluded
-    // from the Buck E2E selection by buck_e2e_selection itself, so they are
-    // dropped without being replaced; they are the only such nodes.
+    // Extension tags present in full but absent from the actual selection
+    // are dropped without being replaced; the set is derived from the
+    // selection itself, so this arm no longer independently catches an
+    // extension node being dropped (the script-level buck plan test pins
+    // the exact current tags).
     let extension_dropped = crate::dag_source_ownership::extension_tags()
         .iter()
         .filter(|tag| full_tags.contains(*tag) && !selected_tags.contains(*tag))
