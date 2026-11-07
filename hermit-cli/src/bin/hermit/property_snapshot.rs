@@ -336,6 +336,7 @@ fn take_as_root(
     remove_stale_copies(under);
     // Another run may be making, joining or removing the same directory; a
     // few rounds settle every interleaving (see `join`).
+    let mut last_holder: Option<String> = None;
     for _ in 0..4 {
         if let Some(lock) = join(&copy_dir) {
             if holds(&copy_dir, &files) {
@@ -383,10 +384,14 @@ fn take_as_root(
         }
         drop(lock);
         let _ = std::fs::remove_dir_all(&filling);
+        last_holder = lock_holder(&copy_dir.join(LOCK_NAME));
     }
     Err(format!(
-        "its copy in {} kept being removed while it was being joined",
-        copy_dir.display()
+        "its copy in {} kept being removed while it was being joined{}",
+        copy_dir.display(),
+        last_holder
+            .map(|holder| format!("; its lock is held by {holder}"))
+            .unwrap_or_default()
     ))
 }
 
@@ -616,6 +621,34 @@ fn join(copy_dir: &Path) -> Option<File> {
         }
     }
     (lock.metadata().ok()?.nlink() > 0).then_some(lock)
+}
+
+/// Who holds `lock_path`, from `/proc/locks`, for a refusal message: the
+/// next stuck wait then names its holder instead of hanging silently
+/// (dh-vnpsq). `None` when no holder is recorded (the lock was just let go,
+/// or the holder is in another mount namespace's table).
+fn lock_holder(lock_path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let inode = std::fs::metadata(lock_path).ok()?.ino().to_string();
+    let locks = std::fs::read_to_string("/proc/locks").ok()?;
+    for line in locks.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // `id: FLOCK ADVISORY WRITE pid major:minor:inode start end`. The
+        // device pair is the kernel's own encoding, which does not decode
+        // portably from `stat`'s dev_t, so match on the inode alone: an
+        // inode number names one file per filesystem, and a collision with
+        // another filesystem's identical number is the only ambiguity.
+        if fields.len() >= 6
+            && fields[1] == "FLOCK"
+            && fields[4] != "-1"
+            && fields[5]
+                .rsplit_once(':')
+                .is_some_and(|(_, ino)| ino == inode)
+        {
+            return Some(format!("pid {}", fields[4]));
+        }
+    }
+    None
 }
 
 /// Whether the copy directory `copy_dir` holds exactly `files`.
@@ -1049,13 +1082,18 @@ mod tests {
         let under_path = under.path().to_path_buf();
         let source_path = source.path().to_path_buf();
         std::thread::spawn(move || {
-            let _ = sender.send(take_as_root(&source_path, &under_path, false).map(|_| ()));
+            let _ = sender.send(
+                take_as_root(&source_path, &under_path, false)
+                    .map(|_| ())
+                    .unwrap_err(),
+            );
         });
         let outcome = receiver.recv_timeout(std::time::Duration::from_secs(60));
         drop(stuck);
+        let refusal = outcome.expect("the next run hung on a stuck exclusive holder");
         assert!(
-            outcome.is_ok(),
-            "the next run hung on a stuck exclusive holder"
+            refusal.contains("pid "),
+            "the refusal should name the lock holder: {refusal}"
         );
     }
 
