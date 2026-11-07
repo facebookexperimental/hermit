@@ -27924,8 +27924,7 @@ fn branch_free_race_lost(seed: u64, extra: &[&str]) -> u64 {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn branch_free_race_lost_at(seed: u64, extra: &[&str], iterations: u64) -> u64 {
-    let guest = branch_free_race_guest()
+fn branch_free_race_lost_at(seed: u64, extra: &[&str], iterations: u64) -> u64 {    let guest = branch_free_race_guest()
         .to_str()
         .expect("guest path should be UTF-8");
     let seed = format!("--sched-seed={seed}");
@@ -28197,15 +28196,26 @@ fn branch_free_race_offset_args<'a>(seed: &'a str, extra: &[&'a str]) -> Vec<&'a
 /// Control: the guest's fixed variant (one atomic add, no window) at the same
 /// seed and option loses nothing, its schedule replay prints the same line
 /// with no desync, and analyze decides that no run matches the target.
+///
+/// Seed 4 is fixed rather than searched: with the harness-compiled
+/// (-O0) guest at 30,000 iterations it loses 17,883 of 60,000 increments
+/// on code without the schedule-trace fix, while at 20,000 seeds 1-8
+/// lose none; the case therefore stays on a genuinely racy schedule
+/// without runtime seed probes. In the
+/// validation profile at d005dfbdc512, the 30,000-iteration case used
+/// 36.780064 CPU seconds, so its exact PMU-node cap is 56 CPU seconds
+/// (about 1.5x that use), not the node's ordinary 88-second cap.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_its_endpoints() {
     let _guard = hermit_run_guard();
-    const ITERATIONS: &str = "100000";
-    let seed = (1..=8)
-        .find(|seed| branch_free_race_lost(*seed, &["--chaos-instruction-offset=8"]) > 0)
-        .expect("one of seeds 1-8 should lose an update");
-    let seed_arg = format!("--sched-seed={seed}");
+    const SEED: u64 = 4;
+    const ITERATIONS: u64 = 30000;
+    assert!(
+        branch_free_race_lost_at(SEED, &["--chaos-instruction-offset=8"], ITERATIONS) > 0,
+        "fixed seed {SEED} at {ITERATIONS} iterations should lose an update"
+    );
+    let seed_arg = format!("--sched-seed={SEED}");
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     for (guest, fixed) in [
         (branch_free_race_guest(), false),
@@ -28229,7 +28239,7 @@ fn an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_i
 
         let recorded = run(branch_free_race_offset_args(&seed_arg, &[&record_arg]));
         let lost = parse_branch_free_race(&recorded);
-        assert_eq!(lost == 0, fixed, "{label} seed {seed}: {recorded}");
+        assert_eq!(lost == 0, fixed, "{label} seed {SEED}: {recorded}");
         let json: serde_json::Value =
             serde_json::from_slice(&fs::read(&record).expect("no preemption record")).unwrap();
         // Both guests record offset decisions, so each record states the
