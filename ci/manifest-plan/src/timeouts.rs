@@ -2022,15 +2022,15 @@ pub fn wall_backstop_seconds(cpu_seconds: u64) -> u64 {
 
 pub fn resolve_test_timeouts(
     cpu_base_seconds: u64,
+    wall_base_seconds: u64,
     multipliers: TimeoutMultipliers,
 ) -> Result<ResolvedTestTimeouts, String> {
     let cpu_seconds = scale_timeout_seconds(cpu_base_seconds, multipliers.cpu, "CPU timeout")?;
-    let wall_seconds = scale_timeout_seconds(
-        wall_backstop_seconds(cpu_seconds),
-        multipliers.wall,
-        "wall timeout",
-    )?
-    .min(600);
+    // Floor the derived wall at the declared wall (walls are generous:
+    // never shorter than the cell declared), then apply the wall
+    // multiplier and the 600 s cap.
+    let derived = wall_base_seconds.max(wall_backstop_seconds(cpu_seconds));
+    let wall_seconds = scale_timeout_seconds(derived, multipliers.wall, "wall timeout")?.min(600);
     Ok(ResolvedTestTimeouts {
         cpu_seconds,
         wall_seconds,
@@ -2272,6 +2272,7 @@ mod tests {
         assert_eq!(scale_timeout_seconds(57, 1.01, "wall").unwrap(), 58);
         let policy = resolve_test_timeouts(
             22,
+            180,
             TimeoutMultipliers {
                 cpu: 1.5,
                 wall: 2.0,
@@ -2279,21 +2280,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(policy.cpu_seconds, 33);
-        // Wall derives from the scaled CPU: min(8 x 33, 600) = 264,
-        // scaled by the wall multiplier and capped again at 600.
+        // Derived wall max(180 declared, 8 x 33) = 264, scaled by the
+        // wall multiplier and capped at 600.
         assert_eq!(policy.wall_seconds, 528);
     }
 
     #[test]
     fn wall_backstop_is_eight_times_cpu_capped_at_600() {
         // The ratio is pinned (owner rule 2026-11-01): a cell can never
-        // again carry a wall that is a small multiple of its CPU cap.
-        for (cpu, wall) in [(22, 176), (46, 368), (75, 600), (100, 600)] {
-            let policy = resolve_test_timeouts(cpu, TimeoutMultipliers::default()).unwrap();
+        // again carry a wall that is a small multiple of its CPU cap,
+        // and the derived wall is never shorter than the declared one.
+        for (cpu, declared, wall) in [
+            (22, 180, 180),
+            (46, 105, 368),
+            (22, 57, 176),
+            (75, 180, 600),
+            (100, 180, 600),
+        ] {
+            let policy =
+                resolve_test_timeouts(cpu, declared, TimeoutMultipliers::default()).unwrap();
             assert_eq!(policy.cpu_seconds, cpu);
-            assert_eq!(policy.wall_seconds, wall, "cpu={cpu}");
-            assert_eq!(wall_backstop_seconds(cpu), wall);
+            assert_eq!(policy.wall_seconds, wall, "cpu={cpu} declared={declared}");
         }
+        assert_eq!(wall_backstop_seconds(46), 368);
     }
 
     #[test]
@@ -2304,6 +2313,7 @@ mod tests {
         assert!(
             resolve_test_timeouts(
                 22,
+                180,
                 TimeoutMultipliers {
                     cpu: 3.0,
                     wall: 0.0,

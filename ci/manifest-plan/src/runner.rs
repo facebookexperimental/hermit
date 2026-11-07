@@ -5913,7 +5913,11 @@ pub fn resolved_cell_timeouts(
     cell: &SelectedCell,
     timeout_multipliers: TimeoutMultipliers,
 ) -> Result<ResolvedTestTimeouts, String> {
-    resolve_test_timeouts(cell.cpu_timeout_seconds, timeout_multipliers)
+    resolve_test_timeouts(
+        cell.cpu_timeout_seconds,
+        cell.timeout_seconds,
+        timeout_multipliers,
+    )
 }
 
 pub(crate) fn cell_timeouts(
