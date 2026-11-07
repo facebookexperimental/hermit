@@ -1550,10 +1550,14 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     let record_dir = PathBuf::from(required_env(CPU_RECORD_DIR_ENV)?);
     let run_id = required_env(RUN_ID_ENV)?;
     let identity = identity_from_command(program, child_args)?;
-    if let Some((path, digest)) = &invocation.budget_map {
-        invocation.cpu_budget_usec =
-            Some(ResolvedBudgets::read_bound(path, digest)?.cpu_budget_usec(&identity)?);
-    }
+    let mapped_wall_seconds = if let Some((path, digest)) = &invocation.budget_map {
+        let resolved = ResolvedBudgets::read_bound(path, digest)?;
+        let entry = resolved.entry(&identity)?;
+        invocation.cpu_budget_usec = Some(entry.cpu_seconds * 1_000_000);
+        Some(entry.wall_seconds)
+    } else {
+        None
+    };
     let started = Instant::now();
     RECEIVED_SIGNAL.store(0, Ordering::SeqCst);
     install_signal_handlers()?;
@@ -2037,6 +2041,19 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     )
     .with_wait4(wait4);
     write_attempt_atomic(&record_dir, &record)?;
+    if let Some(outcome) = match &completion {
+        AttemptCompletion::CpuTimeout { .. } => Some("CPU timeout"),
+        AttemptCompletion::SupervisorSignal { .. } => Some("supervisor stop"),
+        _ => None,
+    } {
+        let wall = mapped_wall_seconds.map_or_else(
+            || "unknown (no resolved budget map)".to_string(),
+            |seconds| format!("{seconds} s"),
+        );
+        eprintln!(
+            "nextest-cpu-wrapper: {outcome}; effective CPU budget: {cpu_budget_usec} us; Nextest wall backstop: {wall}"
+        );
+    }
     // Remove the credit file now: propagating a signal ends this process
     // without running destructors.
     drop(skid_credit);
@@ -3054,6 +3071,13 @@ fn budget_map_self_test(
     let stopped = run("exit-after-escaped-burner", &digest)?;
     if stopped.status.code() != Some(CPU_TIMEOUT_EXIT.into()) {
         return Err(format!("mapped CPU opponent did not stop: {stopped:?}"));
+    }
+    if !String::from_utf8_lossy(&stopped.stderr)
+        .contains("effective CPU budget: 1000000 us; Nextest wall backstop: 4 s")
+    {
+        return Err(format!(
+            "mapped CPU opponent omitted its effective CPU/wall limits: {stopped:?}"
+        ));
     }
     if process_exists(read_pid(&root.join("descendant.pid"))?) {
         return Err("mapped CPU opponent left its escaped descendant alive".into());

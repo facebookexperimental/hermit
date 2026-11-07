@@ -432,7 +432,8 @@ impl ResolvedBudgets {
         Ok(())
     }
 
-    pub fn cpu_budget_usec(&self, identity: &AttemptIdentity) -> Result<u64, String> {
+    /// The validated per-test row also governs retry attempts of that identity.
+    pub fn entry(&self, identity: &AttemptIdentity) -> Result<&ResolvedBudget, String> {
         self.validate()?;
         self.entries
             .iter()
@@ -441,8 +442,11 @@ impl ResolvedBudgets {
                     && entry.identity.binary == identity.binary
                     && entry.identity.test == identity.test
             })
-            .map(|entry| entry.cpu_seconds * 1_000_000)
             .ok_or_else(|| format!("executing identity absent from resolved budgets: {identity:?}"))
+    }
+
+    pub fn cpu_budget_usec(&self, identity: &AttemptIdentity) -> Result<u64, String> {
+        Ok(self.entry(identity)?.cpu_seconds * 1_000_000)
     }
 
     pub fn read_bound(path: &Path, expected_sha256: &str) -> Result<Self, String> {

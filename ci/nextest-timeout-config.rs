@@ -1210,9 +1210,7 @@ fn fail_fast_from_env() -> Result<bool, String> {
         Err(env::VarError::NotPresent) => Ok(true),
         Ok(value) if value == "1" => Ok(true),
         Ok(value) if value == "0" => Ok(false),
-        Ok(value) => Err(format!(
-            "{FAIL_FAST_ENV} must be 0 or 1, got {value:?}"
-        )),
+        Ok(value) => Err(format!("{FAIL_FAST_ENV} must be 0 or 1, got {value:?}")),
         Err(error) => Err(format!("{FAIL_FAST_ENV} must be UTF-8: {error}")),
     }
 }
@@ -1255,7 +1253,6 @@ fn pmu_cli_budget_scope(
     scope == Some(std::ffi::OsStr::new(PMU_CLI_BUDGET_SCOPE))
         && backend.is_none_or(|value| value == "ptrace")
 }
-
 
 fn prepared_selected_cpu_allowances(
     prepared: bool,
@@ -1457,14 +1454,20 @@ fn runtime_settings(args: &[String]) -> Option<(u64, Option<u64>)> {
     Some((threads, retries))
 }
 
+#[derive(Clone, Copy)]
+struct BudgetMultipliers {
+    cpu: f64,
+    wall: f64,
+}
+
 fn resolve_budgets(
     inventory: &[u8],
     context: BudgetContext,
     calibration: Option<&[u8]>,
     threads: u64,
     retries: u64,
-    cpu_multiplier: f64,
-    wall_multiplier: f64,
+    multipliers: BudgetMultipliers,
+    selected_allowances: &[MeasuredCpuAllowance],
 ) -> Result<ResolvedBudgets, String> {
     let identities = nextest_cpu::selected_inventory(inventory)?;
     context.validate_execution_cohort()?;
@@ -1481,7 +1484,12 @@ fn resolve_budgets(
         .transpose()
         .map_err(|error| format!("invalid regular calibration: {error}"))?;
     let mut rows = std::collections::BTreeMap::new();
-    let mut applicability = "absent: unchanged defaults".to_string();
+    let mut applicability = if selected_allowances.is_empty() {
+        "absent: unchanged defaults"
+    } else {
+        "absent: defaults with selected measured floors"
+    }
+    .to_string();
     if let Some(table) = &calibration {
         table.context.validate_execution_cohort()?;
         if table.schema != nextest_cpu::BUDGET_SCHEMA
@@ -1511,18 +1519,35 @@ fn resolve_budgets(
                 "applicable".into()
             } else {
                 rows.clear();
-                "stale source/build/resource cohort: unchanged defaults".into()
+                if selected_allowances.is_empty() {
+                    "stale source/build/resource cohort: unchanged defaults"
+                } else {
+                    "stale source/build/resource cohort: defaults with selected measured floors"
+                }
+                .into()
             };
     }
     let mut entries = Vec::with_capacity(identities.len());
     for identity in identities {
-        let mut cpu = timeouts::DEFAULT_TEST_CPU_TIMEOUT_SECONDS;
-        let mut wall = timeouts::DEFAULT_TEST_WALL_TIMEOUT_SECONDS;
-        let mut reason = "unresolved: unchanged defaults";
+        let allowance = selected_allowances
+            .iter()
+            .find(|allowance| allowance.identity() == identity);
+        let cpu_floor = allowance.map_or(0, |allowance| allowance.cpu_seconds);
+        let wall_floor = allowance
+            .and_then(|allowance| allowance.wall_seconds)
+            .unwrap_or(0);
+        let mut cpu = timeouts::DEFAULT_TEST_CPU_TIMEOUT_SECONDS.max(cpu_floor);
+        let mut wall = timeouts::DEFAULT_TEST_WALL_TIMEOUT_SECONDS.max(wall_floor);
+        let mut reason = if allowance.is_some() {
+            "unresolved: defaults with selected measured floors"
+        } else {
+            "unresolved: unchanged defaults"
+        };
         if let Some(row) = rows.get(&identity) {
             let candidate_cpu =
                 timeouts::cpu_bound_from_p90_usec(row.p90_cpu_usec.max(row.historical_cpu_usec))
-                    .max(1);
+                    .max(1)
+                    .max(cpu_floor);
             let candidate_wall = timeouts::wall_bound_from_p90_millis(
                 row.p90_wall_millis.max(row.historical_wall_millis),
             )
@@ -1530,21 +1555,26 @@ fn resolve_budgets(
                 candidate_cpu
                     .checked_add(3)
                     .ok_or("calibrated CPU bound overflows")?,
-            );
+            )
+            .max(wall_floor);
             if candidate_cpu <= cpu && candidate_wall <= wall {
                 cpu = candidate_cpu;
                 wall = candidate_wall;
                 reason = "calibrated: owner formula with historical floor";
             } else {
-                reason = "unresolved: owner formula exceeds unchanged defaults";
+                reason = if allowance.is_some() {
+                    "unresolved: owner formula exceeds defaults with measured floors"
+                } else {
+                    "unresolved: owner formula exceeds unchanged defaults"
+                };
             }
         }
         entries.push(ResolvedBudget {
             identity,
-            cpu_seconds: timeouts::scale_timeout_seconds(cpu, cpu_multiplier, "CPU multiplier")?,
+            cpu_seconds: timeouts::scale_timeout_seconds(cpu, multipliers.cpu, "CPU multiplier")?,
             wall_seconds: timeouts::scale_timeout_seconds(
                 wall,
-                wall_multiplier,
+                multipliers.wall,
                 "wall multiplier",
             )?,
             reason: reason.into(),
@@ -1567,7 +1597,7 @@ fn resolve_budgets(
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
         println!(
-            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), lone-slice-end backstop ({LONE_BACKSTOP_CPU_SECONDS}s), ptrace signal permits ({SIGNAL_PERMITS_CPU_SECONDS}s), schedule-replay clock ({SCHEDULE_REPLAY_CLOCK_CPU_SECONDS}s), chaos offset split ({CHAOS_OFFSET_SPLIT_CPU_SECONDS}s), chaos offset verify ({CHAOS_OFFSET_VERIFY_CPU_SECONDS}s), schedule-replay long slices ({SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS}s), chaos change points ({CHAOS_CHANGE_POINTS_CPU_SECONDS}s), posix timer signal rows ({POSIX_TIMER_SIGNAL_ROWS_CPU_SECONDS}s), trace replay split ({TRACE_REPLAY_SPLIT_CPU_SECONDS}s), chaos replay shell ({CHAOS_REPLAY_SHELL_CPU_SECONDS}s), rr vdso time ({RR_VDSO_TIME_CPU_SECONDS}s), rr vdso gettimeofday ({RR_VDSO_GETTIMEOFDAY_CPU_SECONDS}s), rr vdso clock_gettime ({RR_VDSO_CLOCK_GETTIME_CPU_SECONDS}s), shipped export ({SHIPPED_EXPORT_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. The PMU integration node alone gives replays_take_recorded_lone_slice_ends_the_same_way 40 CPU seconds and 320 wall seconds; The PMU CLI node (scope pmu-cli-cases) gives the schedule-offset case a 13-second base allowance, which that node's CPU multiplier of 4 scales to an actual 52 CPU seconds; other unscoped invocations keep their prior bounds. Every exact prepared selected liteinst_stacks identity, the Detcore allocator leaf, and the CPU-profile v3 host loader, gets a separate base wall backstop of eight times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains defaults with prepared selected measured floors. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), lone-slice-end backstop ({LONE_BACKSTOP_CPU_SECONDS}s), ptrace signal permits ({SIGNAL_PERMITS_CPU_SECONDS}s), schedule-replay clock ({SCHEDULE_REPLAY_CLOCK_CPU_SECONDS}s), chaos offset split ({CHAOS_OFFSET_SPLIT_CPU_SECONDS}s), chaos offset verify ({CHAOS_OFFSET_VERIFY_CPU_SECONDS}s), schedule-replay long slices ({SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS}s), chaos change points ({CHAOS_CHANGE_POINTS_CPU_SECONDS}s), posix timer signal rows ({POSIX_TIMER_SIGNAL_ROWS_CPU_SECONDS}s), trace replay split ({TRACE_REPLAY_SPLIT_CPU_SECONDS}s), chaos replay shell ({CHAOS_REPLAY_SHELL_CPU_SECONDS}s), rr vdso time ({RR_VDSO_TIME_CPU_SECONDS}s), rr vdso gettimeofday ({RR_VDSO_GETTIMEOFDAY_CPU_SECONDS}s), rr vdso clock_gettime ({RR_VDSO_CLOCK_GETTIME_CPU_SECONDS}s), shipped export ({SHIPPED_EXPORT_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. The PMU integration node alone gives replays_take_recorded_lone_slice_ends_the_same_way 40 CPU seconds and 320 wall seconds; The PMU CLI node (scope pmu-cli-cases) gives the schedule-offset case a 13-second base allowance, which that node's CPU multiplier of 4 scales to an actual 52 CPU seconds; other unscoped invocations keep their prior bounds. Every exact prepared selected liteinst_stacks identity, the Detcore allocator leaf, and the CPU-profile v3 host loader, gets a separate base wall backstop of eight times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
         );
         return Ok(());
     }
@@ -1595,14 +1625,6 @@ fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
         ),
         || fs::read(&args[3]).map_err(|error| error.to_string()),
     )?;
-    let rendered = scaled_config_with_allowances_and_fail_fast(
-        &source,
-        wall_multiplier,
-        Some((&wrapper, cpu_multiplier)),
-        &selected_allowances,
-        fail_fast_from_env()?,
-    )?;
-    let mut document = rendered.parse::<DocumentMut>().map_err(|e| e.to_string())?;
     let context: Option<BudgetContext> =
         serde_json::from_slice(&fs::read(&args[4]).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
@@ -1615,10 +1637,20 @@ fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     let settings = runtime_settings(&runtime);
-    if context.is_none()
-        || settings.is_none()
-        || !regular_config_compatible(&source.parse::<DocumentMut>().map_err(|e| e.to_string())?)
-    {
+    let regular = context.is_some()
+        && settings.is_some()
+        && regular_config_compatible(&source.parse::<DocumentMut>().map_err(|e| e.to_string())?);
+    // The regular map owns every wrapper and wall limit: earlier exact rules
+    // must not bypass or shadow it. Legacy callers retain their reviewed rendering.
+    let rendered = scaled_config_with_allowances_and_fail_fast(
+        &source,
+        wall_multiplier,
+        Some((&wrapper, cpu_multiplier)),
+        if regular { &[] } else { &selected_allowances },
+        fail_fast_from_env()?,
+    )?;
+    let mut document = rendered.parse::<DocumentMut>().map_err(|e| e.to_string())?;
+    if !regular {
         if !selected_allowances.is_empty() {
             for allowance in &selected_allowances {
                 let wall = match allowance.wall_seconds {
@@ -1671,8 +1703,11 @@ fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
         calibration.as_deref(),
         threads,
         retries,
-        cpu_multiplier,
-        wall_multiplier,
+        BudgetMultipliers {
+            cpu: cpu_multiplier,
+            wall: wall_multiplier,
+        },
+        &selected_allowances,
     )?;
     resolved.calibration_sha256 = calibration
         .as_ref()
@@ -1827,8 +1862,11 @@ mod tests {
                 Some(&serde_json::to_vec(table).unwrap()),
                 8,
                 0,
-                1.0,
-                1.0,
+                BudgetMultipliers {
+                    cpu: 1.0,
+                    wall: 1.0,
+                },
+                &[],
             )
             .unwrap()
         };
@@ -1921,8 +1959,11 @@ mod tests {
                 Some(&serde_json::to_vec(&table).unwrap()),
                 8,
                 0,
-                1.0,
-                1.0
+                BudgetMultipliers {
+                    cpu: 1.0,
+                    wall: 1.0
+                },
+                &[],
             )
             .is_err()
         );
@@ -1992,6 +2033,273 @@ mod tests {
         )
     }
 
+    fn trace_split_allowance() -> MeasuredCpuAllowance {
+        *MEASURED_CPU_ALLOWANCES
+            .iter()
+            .find(|allowance| allowance.test == "trace_replay_split_just_spin")
+            .expect("the reviewed trace-replay allowance")
+    }
+
+    /// Exercise the real resolver without changing this test process's environment.
+    /// The exact-test child receives all inputs through a private fixture directory.
+    fn regular_resolution_fixture(
+        test_name: &str,
+        calibration_mode: &str,
+    ) -> (ResolvedBudgets, DocumentMut) {
+        const FIXTURE_ENV: &str = "HERMIT_TEST_REGULAR_BUDGET_FIXTURE";
+        let read_outputs = |root: &Path| {
+            let map = fs::read(root.join("map.json")).unwrap();
+            let digest = format!("{:x}", Sha256::digest(&map));
+            (
+                ResolvedBudgets::read_bound(&root.join("map.json"), &digest).unwrap(),
+                fs::read_to_string(root.join("output.toml"))
+                    .unwrap()
+                    .parse::<DocumentMut>()
+                    .unwrap(),
+            )
+        };
+        if let Some(root) = env::var_os(FIXTURE_ENV) {
+            let root = std::path::PathBuf::from(root);
+            resolve_config(vec![
+                root.join("source.toml").into_os_string(),
+                "1".into(),
+                root.join("output.toml").into_os_string(),
+                root.join("inventory.json").into_os_string(),
+                root.join("context.json").into_os_string(),
+                root.join("map.json").into_os_string(),
+                root.join("calibration.json").into_os_string(),
+                "--".into(),
+                "-j8".into(),
+                "--retries=0".into(),
+            ])
+            .unwrap();
+            return read_outputs(&root);
+        }
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Fixture(env::temp_dir().join(format!(
+            "hermit-regular-budgets-{}-{test_name}",
+            std::process::id()
+        )));
+        fs::create_dir(&root.0).unwrap();
+        let measured = trace_split_allowance().identity();
+        let mut ordinary = measured.clone();
+        ordinary.test = "ordinary_unmeasured_test".into();
+        let mut other_binary = measured.clone();
+        other_binary.binary = "hermit-verify::other_binary".into();
+        let inventory = measured_inventory(&[measured.clone(), ordinary, other_binary]);
+        let (_, context, mut calibration) = budget_fixture();
+        calibration.rows[0].identity = measured;
+        match calibration_mode {
+            "absent" => {}
+            "stale" => {
+                calibration.context.source_sha256 = "f".repeat(64);
+                fs::write(
+                    root.0.join("calibration.json"),
+                    serde_json::to_vec(&calibration).unwrap(),
+                )
+                .unwrap();
+            }
+            "low" => fs::write(
+                root.0.join("calibration.json"),
+                serde_json::to_vec(&calibration).unwrap(),
+            )
+            .unwrap(),
+            _ => panic!("unknown calibration fixture {calibration_mode}"),
+        }
+        fs::write(
+            root.0.join("source.toml"),
+            include_str!("../.config/nextest.toml"),
+        )
+        .unwrap();
+        fs::write(
+            root.0.join("inventory.json"),
+            serde_json::to_vec(&inventory).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.0.join("context.json"),
+            serde_json::to_vec(&context).unwrap(),
+        )
+        .unwrap();
+        let output = std::process::Command::new(env::current_exe().unwrap())
+            .args(["--exact", &format!("tests::{test_name}"), "--nocapture"])
+            .env(FIXTURE_ENV, &root.0)
+            .env(CPU_WRAPPER_BIN_ENV, "/fixture/cpu-wrapper")
+            .env("HERMIT_PREPARED_NEXTEST_REQUIRED", "1")
+            .env(timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV, "1")
+            .env(FAIL_FAST_ENV, "1")
+            .env_remove("NEXTEST_PROFILE")
+            .env_remove("NEXTEST_TEST_THREADS")
+            .env_remove("NEXTEST_RETRIES")
+            .env_remove(PMU_INTEGRATION_BUDGET_ENV)
+            .env_remove("HERMIT_TEST_BACKEND")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "resolver child failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        read_outputs(&root.0)
+    }
+
+    fn assert_regular_measured_budget(map: &ResolvedBudgets, document: &DocumentMut) {
+        let allowance = trace_split_allowance();
+        assert_eq!(
+            (allowance.cpu_seconds, allowance.wall_seconds),
+            (28, Some(224))
+        );
+        let identity = allowance.identity();
+        let entry = map
+            .entries
+            .iter()
+            .find(|row| row.identity == identity)
+            .unwrap();
+        assert_eq!((entry.cpu_seconds, entry.wall_seconds), (28, 224));
+        assert_eq!(map.cpu_budget_usec(&identity).unwrap(), 28_000_000);
+        // Every regular attempt must use the authenticated map, not an earlier
+        // exact wrapper which bypasses it or a later duplicate wall override.
+        let scripts = document["profile"]["default"]["scripts"]
+            .as_array_of_tables()
+            .unwrap();
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts.get(0).unwrap()["filter"].as_str(), Some("all()"));
+        assert_eq!(
+            scripts.get(0).unwrap()["run-wrapper"].as_str(),
+            Some(CPU_WRAPPER_NAME)
+        );
+        let argv = wrapper_argv(document, CPU_WRAPPER_NAME);
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair[0] == "--budget-map" && pair[1].ends_with("/map.json"))
+        );
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec_pretty(map).unwrap())
+        );
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair[0] == "--budget-sha256" && pair[1] == digest)
+        );
+        let filter = exact_filter(&identity);
+        let walls = document["profile"]["default"]["overrides"]
+            .as_array_of_tables()
+            .unwrap()
+            .iter()
+            .filter(|row| {
+                row.contains_key("slow-timeout") && row["filter"].as_str() == Some(&filter)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            walls.len(),
+            1,
+            "Nextest must not choose an earlier competing wall bound"
+        );
+        assert_eq!(walls[0]["slow-timeout"]["period"].as_str(), Some("224s"));
+    }
+
+    #[test]
+    fn regular_map_preserves_selected_measured_budgets() {
+        let (map, document) =
+            regular_resolution_fixture("regular_map_preserves_selected_measured_budgets", "absent");
+        assert_regular_measured_budget(&map, &document);
+    }
+
+    #[test]
+    fn stale_regular_calibration_preserves_selected_measured_budgets() {
+        let (map, document) = regular_resolution_fixture(
+            "stale_regular_calibration_preserves_selected_measured_budgets",
+            "stale",
+        );
+        assert!(map.applicability.starts_with("stale"));
+        assert_regular_measured_budget(&map, &document);
+    }
+
+    #[test]
+    fn regular_calibration_cannot_lower_measured_budgets() {
+        let (map, document) =
+            regular_resolution_fixture("regular_calibration_cannot_lower_measured_budgets", "low");
+        assert_eq!(map.applicability, "applicable");
+        assert_regular_measured_budget(&map, &document);
+    }
+
+    #[test]
+    fn regular_map_keeps_unmeasured_defaults() {
+        let (map, _) =
+            regular_resolution_fixture("regular_map_keeps_unmeasured_defaults", "absent");
+        let measured = trace_split_allowance().identity();
+        let ordinary = map
+            .entries
+            .iter()
+            .filter(|row| row.identity != measured)
+            .collect::<Vec<_>>();
+        assert_eq!(ordinary.len(), 2);
+        assert!(
+            ordinary
+                .iter()
+                .all(|row| (row.cpu_seconds, row.wall_seconds) == (22, 180))
+        );
+    }
+
+    #[test]
+    fn regular_calibration_respects_a_measured_wall_below_the_default() {
+        let (inventory, context, calibration) = budget_fixture();
+        let allowance = MeasuredCpuAllowance {
+            wrapper_name: "fixture-measured",
+            package: "fixture",
+            binary: "fixture",
+            test: "same name,(special)",
+            cpu_seconds: 22,
+            wall_seconds: Some(176),
+        };
+        assert_eq!(allowance.identity(), calibration.rows[0].identity);
+        let initial = resolve_budgets(
+            &inventory,
+            context.clone(),
+            None,
+            8,
+            0,
+            BudgetMultipliers {
+                cpu: 1.0,
+                wall: 1.0,
+            },
+            &[allowance],
+        )
+        .unwrap();
+        let entry = initial
+            .entries
+            .iter()
+            .find(|row| row.identity == allowance.identity())
+            .unwrap();
+        assert_eq!((entry.cpu_seconds, entry.wall_seconds), (22, 180));
+        let calibrated = resolve_budgets(
+            &inventory,
+            context,
+            Some(&serde_json::to_vec(&calibration).unwrap()),
+            8,
+            0,
+            BudgetMultipliers {
+                cpu: 1.0,
+                wall: 1.0,
+            },
+            &[allowance],
+        )
+        .unwrap();
+        let entry = calibrated
+            .entries
+            .iter()
+            .find(|row| row.identity == allowance.identity())
+            .unwrap();
+        assert_eq!((entry.cpu_seconds, entry.wall_seconds), (22, 176));
+    }
+
     #[test]
     fn exact_identity_calibration_retains_unknowns_and_historical_floor() {
         let (inventory, context, mut calibration) = budget_fixture();
@@ -2001,8 +2309,11 @@ mod tests {
             Some(&serde_json::to_vec(&calibration).unwrap()),
             8,
             0,
-            1.0,
-            1.0,
+            BudgetMultipliers {
+                cpu: 1.0,
+                wall: 1.0,
+            },
+            &[],
         )
         .unwrap();
         assert_eq!(resolved.entries.len(), 3);
@@ -2029,8 +2340,11 @@ mod tests {
             Some(&serde_json::to_vec(&calibration).unwrap()),
             8,
             0,
-            1.0,
-            1.0,
+            BudgetMultipliers {
+                cpu: 1.0,
+                wall: 1.0,
+            },
+            &[],
         )
         .unwrap();
         assert!(
@@ -2060,8 +2374,19 @@ mod tests {
         let mut other_cpu = context.clone();
         other_cpu.available_cpus = 2;
         for changed in [stale, dirty, other_build, other_cpu] {
-            let result =
-                resolve_budgets(&inventory, changed, Some(&bytes), 8, 0, 1.0, 1.0).unwrap();
+            let result = resolve_budgets(
+                &inventory,
+                changed,
+                Some(&bytes),
+                8,
+                0,
+                BudgetMultipliers {
+                    cpu: 1.0,
+                    wall: 1.0,
+                },
+                &[],
+            )
+            .unwrap();
             assert_eq!(result.entries.len(), 3);
             assert!(
                 result
@@ -2071,7 +2396,19 @@ mod tests {
             );
             assert!(result.applicability.starts_with("stale"));
         }
-        let absent = resolve_budgets(&inventory, context, None, 8, 0, 1.0, 1.0).unwrap();
+        let absent = resolve_budgets(
+            &inventory,
+            context,
+            None,
+            8,
+            0,
+            BudgetMultipliers {
+                cpu: 1.0,
+                wall: 1.0,
+            },
+            &[],
+        )
+        .unwrap();
         assert_eq!(absent.entries.len(), 3);
         assert!(absent.applicability.starts_with("absent"));
     }
@@ -2081,12 +2418,34 @@ mod tests {
         let (inventory, context, mut calibration) = budget_fixture();
         let bytes = serde_json::to_vec(&calibration).unwrap();
         assert!(
-            resolve_budgets(&inventory, context.clone(), Some(&bytes), 8, 0, 2.0, 1.0)
-                .unwrap_err()
-                .contains("cleanup")
+            resolve_budgets(
+                &inventory,
+                context.clone(),
+                Some(&bytes),
+                8,
+                0,
+                BudgetMultipliers {
+                    cpu: 2.0,
+                    wall: 1.0
+                },
+                &[],
+            )
+            .unwrap_err()
+            .contains("cleanup")
         );
-        let scaled =
-            resolve_budgets(&inventory, context.clone(), Some(&bytes), 8, 0, 2.0, 2.0).unwrap();
+        let scaled = resolve_budgets(
+            &inventory,
+            context.clone(),
+            Some(&bytes),
+            8,
+            0,
+            BudgetMultipliers {
+                cpu: 2.0,
+                wall: 2.0,
+            },
+            &[],
+        )
+        .unwrap();
         assert!(
             scaled
                 .entries
@@ -2101,8 +2460,11 @@ mod tests {
                 Some(&serde_json::to_vec(&calibration).unwrap()),
                 8,
                 0,
-                1.0,
-                1.0
+                BudgetMultipliers {
+                    cpu: 1.0,
+                    wall: 1.0
+                },
+                &[],
             )
             .is_err()
         );
@@ -2115,18 +2477,47 @@ mod tests {
                 Some(&serde_json::to_vec(&calibration).unwrap()),
                 8,
                 0,
-                1.0,
-                1.0
+                BudgetMultipliers {
+                    cpu: 1.0,
+                    wall: 1.0
+                },
+                &[],
             )
             .is_err()
         );
-        assert!(resolve_budgets(&inventory, context, Some(b"{}"), 8, 0, 1.0, 1.0).is_err());
+        assert!(
+            resolve_budgets(
+                &inventory,
+                context,
+                Some(b"{}"),
+                8,
+                0,
+                BudgetMultipliers {
+                    cpu: 1.0,
+                    wall: 1.0
+                },
+                &[],
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn population_accounts_for_all_cases_width_retries_and_overflow() {
         let (inventory, context, _) = budget_fixture();
-        let result = resolve_budgets(&inventory, context, None, 8, 0, 1.0, 1.0).unwrap();
+        let result = resolve_budgets(
+            &inventory,
+            context,
+            None,
+            8,
+            0,
+            BudgetMultipliers {
+                cpu: 1.0,
+                wall: 1.0,
+            },
+            &[],
+        )
+        .unwrap();
         let eight = nextest_cpu::population_budget(&result.entries, 8, 0).unwrap();
         let one = nextest_cpu::population_budget(&result.entries, 1, 0).unwrap();
         assert_eq!(
@@ -2299,7 +2690,10 @@ mod tests {
         // The plain entry point defaults to early exit.
         let rendered = scaled_config(source, 1.0, None).unwrap();
         let document = rendered.parse::<DocumentMut>().unwrap();
-        assert_eq!(document["profile"]["default"]["fail-fast"].as_bool(), Some(true));
+        assert_eq!(
+            document["profile"]["default"]["fail-fast"].as_bool(),
+            Some(true)
+        );
     }
 
     #[test]
@@ -2484,7 +2878,8 @@ mod tests {
             .collect::<Vec<_>>();
         identities.push(target.clone());
         let bytes = serde_json::to_vec(&measured_inventory(&identities)).unwrap();
-        let ordinary = prepared_selected_cpu_allowances(true, false, false, || Ok(bytes.clone())).unwrap();
+        let ordinary =
+            prepared_selected_cpu_allowances(true, false, false, || Ok(bytes.clone())).unwrap();
         assert_eq!(ordinary, MEASURED_CPU_ALLOWANCES);
         let source = include_str!("../.config/nextest.toml");
         let render = |selected: &[MeasuredCpuAllowance]| {
@@ -2515,7 +2910,8 @@ mod tests {
             );
             assert_eq!(admitted, enabled, "scope={scope:?} backend={backend:?}");
             let selected =
-                prepared_selected_cpu_allowances(true, admitted, false, || Ok(bytes.clone())).unwrap();
+                prepared_selected_cpu_allowances(true, admitted, false, || Ok(bytes.clone()))
+                    .unwrap();
             assert_eq!(&selected[..ordinary.len()], ordinary.as_slice());
             assert_eq!(selected.len(), ordinary.len() + usize::from(enabled));
             if enabled {
@@ -2560,12 +2956,15 @@ mod tests {
             );
         }
         assert!(
-            prepared_selected_cpu_allowances(false, true, false, || panic!("legacy inventory read"))
-                .unwrap()
-                .is_empty()
+            prepared_selected_cpu_allowances(false, true, false, || panic!(
+                "legacy inventory read"
+            ))
+            .unwrap()
+            .is_empty()
         );
         assert!(
-            prepared_selected_cpu_allowances(true, true, false, || Ok(b"malformed".to_vec())).is_err()
+            prepared_selected_cpu_allowances(true, true, false, || Ok(b"malformed".to_vec()))
+                .is_err()
         );
 
         let selected = prepared_selected_cpu_allowances(true, true, false, || {
@@ -2661,8 +3060,7 @@ mod tests {
         );
     }
 
-
-#[test]
+    #[test]
     fn new_measured_cells_require_exact_prepared_selected_identities() {
         assert_pmu_lone_replay_scope();
         for (binary, test, name, budget) in [
@@ -2738,7 +3136,8 @@ mod tests {
                 let bytes =
                     serde_json::to_vec(&measured_inventory(std::slice::from_ref(&identity)))
                         .unwrap();
-                let selected = prepared_selected_cpu_allowances(true, false, false, || Ok(bytes)).unwrap();
+                let selected =
+                    prepared_selected_cpu_allowances(true, false, false, || Ok(bytes)).unwrap();
                 let expected = if identity == target {
                     Some((name, budget))
                 } else if identity == detcore_allocator_identity() {
@@ -2906,9 +3305,10 @@ mod tests {
         }
         // Without prepared admission the test keeps the ordinary 22-second cap.
         assert!(
-            prepared_selected_cpu_allowances(false, false, false, || Ok(
-                serde_json::to_vec(&inventory).unwrap()
-            ))
+            prepared_selected_cpu_allowances(false, false, false, || Ok(serde_json::to_vec(
+                &inventory
+            )
+            .unwrap()))
             .unwrap()
             .is_empty()
         );
@@ -3050,9 +3450,10 @@ mod tests {
             }
         }
         assert!(
-            prepared_selected_cpu_allowances(false, false, false, || Ok(
-                serde_json::to_vec(&inventory).unwrap()
-            ))
+            prepared_selected_cpu_allowances(false, false, false, || Ok(serde_json::to_vec(
+                &inventory
+            )
+            .unwrap()))
             .unwrap()
             .is_empty()
         );
@@ -3109,9 +3510,10 @@ mod tests {
         }
         // Without prepared admission the test keeps the ordinary 22-second cap.
         assert!(
-            prepared_selected_cpu_allowances(false, false, false, || Ok(
-                serde_json::to_vec(&inventory).unwrap()
-            ))
+            prepared_selected_cpu_allowances(false, false, false, || Ok(serde_json::to_vec(
+                &inventory
+            )
+            .unwrap()))
             .unwrap()
             .is_empty()
         );
@@ -3142,7 +3544,8 @@ mod tests {
                 .map(|(_, allowance)| allowance.identity())
                 .collect::<Vec<_>>();
             let bytes = serde_json::to_vec(&measured_inventory(&identities)).unwrap();
-            let selected = prepared_selected_cpu_allowances(true, false, false, || Ok(bytes)).unwrap();
+            let selected =
+                prepared_selected_cpu_allowances(true, false, false, || Ok(bytes)).unwrap();
             assert_eq!(selected.len(), identities.len());
             for (
                 cpu,
@@ -3467,10 +3870,9 @@ mod tests {
                         format!("{target}_extra")
                     };
                     assert!(
-                        prepared_selected_cpu_allowances(true, false, false, || Ok(serde_json::to_vec(
-                            &measured_inventory(&[neighbor])
-                        )
-                        .unwrap()))
+                        prepared_selected_cpu_allowances(true, false, false, || Ok(
+                            serde_json::to_vec(&measured_inventory(&[neighbor])).unwrap()
+                        ))
                         .unwrap()
                         .is_empty()
                     );
@@ -3486,10 +3888,9 @@ mod tests {
                     _ => {}
                 }
                 assert!(
-                    prepared_selected_cpu_allowances(state != 2, false, false, || Ok(serde_json::to_vec(
-                        &inventory
-                    )
-                    .unwrap()))
+                    prepared_selected_cpu_allowances(state != 2, false, false, || Ok(
+                        serde_json::to_vec(&inventory).unwrap()
+                    ))
                     .unwrap()
                     .is_empty()
                 );
@@ -3753,7 +4154,8 @@ mod tests {
         }
         for identity in identities {
             let bytes = serde_json::to_vec(&allocator_inventory(&identity)).unwrap();
-            let selected = prepared_selected_cpu_allowances(true, false, false, || Ok(bytes)).unwrap();
+            let selected =
+                prepared_selected_cpu_allowances(true, false, false, || Ok(bytes)).unwrap();
             assert_eq!(
                 selected
                     .iter()
@@ -3832,21 +4234,27 @@ mod tests {
             );
         }
         assert!(
-            prepared_selected_cpu_allowances(true, false, false, || Ok(br#"{"rust-suites":{}}"#.to_vec()))
-                .unwrap()
-                .is_empty()
+            prepared_selected_cpu_allowances(true, false, false, || Ok(
+                br#"{"rust-suites":{}}"#.to_vec()
+            ))
+            .unwrap()
+            .is_empty()
         );
         // The old null-context caller never consumed its unused inventory. Its
         // malformed or missing input must stay unused when not prepared.
         assert!(
-            prepared_selected_cpu_allowances(false, false, false, || panic!("legacy inventory read"))
-                .unwrap()
-                .is_empty()
+            prepared_selected_cpu_allowances(false, false, false, || panic!(
+                "legacy inventory read"
+            ))
+            .unwrap()
+            .is_empty()
         );
         assert!(
-            prepared_selected_cpu_allowances(false, false, false, || Err("missing inventory".into()))
-                .unwrap()
-                .is_empty()
+            prepared_selected_cpu_allowances(false, false, false, || Err(
+                "missing inventory".into()
+            ))
+            .unwrap()
+            .is_empty()
         );
         assert!(
             prepared_selected_cpu_allowances(false, false, false, || Ok(b"malformed".to_vec()))
@@ -3866,11 +4274,19 @@ mod tests {
     #[test]
     fn prepared_inventory_refuses_missing_malformed_and_ambiguous_binary_evidence() {
         assert!(
-            prepared_selected_cpu_allowances(true, false, false, || Err("missing inventory".into()))
-                .is_err()
+            prepared_selected_cpu_allowances(
+                true,
+                false,
+                false,
+                || Err("missing inventory".into())
+            )
+            .is_err()
         );
         for bytes in [b"malformed".as_slice(), b"{}".as_slice()] {
-            assert!(prepared_selected_cpu_allowances(true, false, false, || Ok(bytes.to_vec())).is_err());
+            assert!(
+                prepared_selected_cpu_allowances(true, false, false, || Ok(bytes.to_vec()))
+                    .is_err()
+            );
         }
         let target = detcore_allocator_identity();
         let original = allocator_inventory(&target);
@@ -4134,9 +4550,20 @@ mod tests {
         );
         let (_, context, _) = budget_fixture();
         assert!(
-            resolve_budgets(&inventory, context, None, 1, 0, 1.0, 1.0)
-                .unwrap_err()
-                .contains("regular calibration cannot cover the hermit package")
+            resolve_budgets(
+                &inventory,
+                context,
+                None,
+                1,
+                0,
+                BudgetMultipliers {
+                    cpu: 1.0,
+                    wall: 1.0
+                },
+                &[],
+            )
+            .unwrap_err()
+            .contains("regular calibration cannot cover the hermit package")
         );
         // The 32s formula bound over the quiet-host maximum (20_754_169us)
         // was censored repeatedly inside full validates, so the cap is the
