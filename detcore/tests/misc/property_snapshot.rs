@@ -884,15 +884,43 @@ fn a_late_property_file_is_refused_through_alias_spellings() {
 fn a_copy_is_served_by_dirfd_after_a_guest_chdir() {
     // Copies in a directory named relative to this process's working
     // directory, which the guest cannot resolve from its own cwd/dirfd.
+    // The directory itself lives in a fresh tempdir, never in the source
+    // tree: a relative name created in the cwd landed inside /src during
+    // validation, where another node's prepare step hashed it as a
+    // prepared input and then found it gone (the 5232 ejection).
     let area = area();
     let name = "u:object_r:test_prop:s0";
     let file = area.live.path().join(name);
-    let relative_name = format!("hermit-test-relative-copies-{}", std::process::id());
-    let relative_abs = std::env::current_dir().unwrap().join(&relative_name);
-    let _ = std::fs::remove_file(relative_abs.join(name));
-    let _ = std::fs::remove_dir(&relative_abs);
-    std::fs::create_dir(&relative_abs).unwrap();
-    std::fs::write(relative_abs.join(name), [5, 6, 7, 8]).unwrap();
+    let copies_root = std::env::temp_dir().join(format!(
+        "hermit-test-relative-copies-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(copies_root.join(name));
+    let _ = std::fs::remove_dir(&copies_root);
+    std::fs::create_dir_all(&copies_root).unwrap();
+    std::fs::write(copies_root.join(name), [5, 6, 7, 8]).unwrap();
+    // The copy_dir stays relative: expressed from this process's cwd to
+    // the tempdir, so the tracer still resolves a relative published
+    // directory while nothing is written into the source tree.
+    let relative_name = {
+        let cwd = std::env::current_dir().unwrap();
+        let cwd_parts: Vec<_> = cwd.components().collect();
+        let root_parts: Vec<_> = copies_root.components().collect();
+        let common = cwd_parts
+            .iter()
+            .zip(&root_parts)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let mut relative = std::path::PathBuf::new();
+        for _ in common..cwd_parts.len() {
+            relative.push("..");
+        }
+        for part in &root_parts[common..] {
+            relative.push(part.as_os_str());
+        }
+        relative.to_string_lossy().into_owned()
+    };
+    let relative_abs = copies_root.clone();
     let mut snapshot = area.snapshot.clone();
     snapshot.copy_dir = PathBuf::from(&relative_name);
     let config = detcore::Config {
