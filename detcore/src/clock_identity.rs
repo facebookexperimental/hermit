@@ -10,7 +10,7 @@
 //! the run may execute and what identity the histories it writes state.
 //!
 //! A run is prepared in four phases before anything that counts or writes
-//! exists ([`prepare_run`]):
+//! exists (`prepare_run`):
 //!
 //! 1. qualify: the backend's clock contract, the host's PMU profile and the
 //!    process's installed PMU configuration give the effective identity,
