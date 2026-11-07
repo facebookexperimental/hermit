@@ -222,8 +222,7 @@ const INTEGRATION_ARTIFACT_WRAPPER: &str =
 // a profile this producer had stopped preparing, so the bracket refused a graph
 // that was correct. Renamed as well as retargeted: a constant whose name says
 // portable while its value says full is the same defect one layer down.
-const NEXTEST_FULL_PREPARE_COMMAND: &str =
-    "./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target";
+const NEXTEST_FULL_PREPARE_COMMAND: &str = "./ci/nextest-binaries.rs prepare full --build-mode \"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\" && target/validate/stage-detcore-liteinst --git target";
 const NEXTEST_PRIVILEGED_ASSERT_COMMAND: &str =
     "./ci/nextest-binaries.rs assert privileged --prepared-by full";
 const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore-tests tests_misc)" || exit 1"#;
@@ -1421,6 +1420,12 @@ mod build_mode_environment_tests {
         let error =
             establish_build_mode_environment(None, Some("banana".into())).unwrap_err();
         assert!(error.contains(RUN_MODE_ENV), "{error}");
+        // Restore the process environment: these variables are global, and
+        // other tests in this process read them (prepare reads
+        // HERMIT_VALIDATE_BUILD_MODE). Leaving buck established here leaked
+        // buck mode into unrelated fixture prepares.
+        establish_build_mode_environment(None, None).unwrap();
+        assert_eq!(std::env::var(BUILD_MODE_ENV).unwrap(), BUILD_MODE_CARGO);
         // A non-UTF-8 ambient value refuses by variable name for both
         // variables, instead of collapsing to unset.
         #[cfg(unix)]

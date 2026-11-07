@@ -703,21 +703,35 @@ fn preparation_profile<'a>(tag: &str, command: &'a str) -> Result<Option<&'a str
         return Err(format!("{tag} has duplicate prepared commands"));
     }
     let profile = rest.split_whitespace().next().unwrap_or("");
-    let finalized = crate::nextest_binaries::cargo_profile_for(profile).map(|directory| {
-        format!("{profile} && target/{directory}/stage-detcore-liteinst --git target")
-    });
-    let gated = (tag == crate::validation_dag::PINNED_WORKSPACE_PREPARE_TAG)
-        .then(|| {
-            finalized.as_ref().map(|tail| {
+    // The full producer appends `--build-mode "${HERMIT_VALIDATE_BUILD_MODE:-cargo}"`
+    // before its finalizer; the bare and mode-less finalized forms stay exact.
+    let tails: Vec<String> = crate::nextest_binaries::cargo_profile_for(profile)
+        .map(|directory| {
+            vec![
+                format!(
+                    "{profile} --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" && target/{directory}/stage-detcore-liteinst --git target"
+                ),
+                format!("{profile} && target/{directory}/stage-detcore-liteinst --git target"),
+            ]
+        })
+        .unwrap_or_default();
+    let gated = if tag == crate::validation_dag::PINNED_WORKSPACE_PREPARE_TAG {
+        tails
+            .iter()
+            .map(|tail| {
                 format!(
                     "{tail}{}",
                     crate::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX
                 )
             })
-        })
-        .flatten();
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     if profile.is_empty()
-        || (rest != profile && finalized.as_deref() != Some(rest) && gated.as_deref() != Some(rest))
+        || (rest != profile
+            && !tails.iter().any(|tail| tail == rest)
+            && !gated.iter().any(|tail| tail == rest))
     {
         return Err(format!(
             "{tag} has an ambiguous prepared profile or finalizer"
@@ -1467,13 +1481,13 @@ mod tests {
             .unwrap();
         assert!(
             execution_command(producer).unwrap().ends_with(&format!(
-                "./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target{}",
+                "./ci/nextest-binaries.rs prepare full --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" && target/validate/stage-detcore-liteinst --git target{}",
                 crate::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX
             ))
         );
         producer.cmd = producer.cmd.replace(
             &format!(
-                "./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target{}",
+                "./ci/nextest-binaries.rs prepare full --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" && target/validate/stage-detcore-liteinst --git target{}",
                 crate::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX
             ),
             "./ci/nextest-binaries.rs prepare portable",

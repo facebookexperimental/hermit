@@ -28,8 +28,17 @@ fn run() -> Result<i32, String> {
                 println!("{PREPARE_USAGE}");
                 return Ok(0);
             }
-            if args.next().is_some() { return Err("unexpected prepare argument".into()); }
-            match hermit_manifest_plan::nextest_binaries::prepare(&root, &profile) {
+            let mut build_mode = "cargo";
+            let mut rest = args.peekable();
+            if rest.peek().is_some_and(|arg| arg == "--build-mode") {
+                rest.next();
+                match rest.next().map(String::as_str) {
+                    Some(mode @ ("cargo" | "buck")) => build_mode = mode,
+                    _ => return Err("prepare --build-mode needs cargo or buck".into()),
+                }
+            }
+            if rest.next().is_some() { return Err("unexpected prepare argument".into()); }
+            match hermit_manifest_plan::nextest_binaries::prepare(&root, &profile, build_mode) {
                 Ok(()) => Ok(0),
                 Err(error) => {
                     eprintln!("prepared-nextest: {error}");
@@ -126,14 +135,14 @@ fn run() -> Result<i32, String> {
             hermit_manifest_plan::nextest_binaries::run(&root, operation, config.as_deref(), &remaining, launch.as_deref(), budget.as_deref().zip(digest.as_deref()))
         }
         Some("--help" | "-h") => {
-            println!("usage: ci/nextest-binaries.rs prepare PROFILE | assert PROFILE [--prepared-by PRODUCER] | run|list [--launch-proof PATH] [--budget-map PATH SHA256] [--config-file PATH] NEXTEST_ARGS... | budget-context [--launch-proof PATH] NEXTEST_ARGS... | capture-launch --help\n\nPrepared run optionally rechecks the retained map and launch context under the artifact lock. Missing cohort evidence retains defaults; malformed evidence refuses. No consumer compiles artifacts. prepare --help and assert --help describe the prepared record and its Cargo-profile check.");
+            println!("usage: ci/nextest-binaries.rs prepare PROFILE [--build-mode cargo|buck] | assert PROFILE [--prepared-by PRODUCER] | run|list [--launch-proof PATH] [--budget-map PATH SHA256] [--config-file PATH] NEXTEST_ARGS... | budget-context [--launch-proof PATH] NEXTEST_ARGS... | capture-launch --help\n\nPrepared run optionally rechecks the retained map and launch context under the artifact lock. Missing cohort evidence retains defaults; malformed evidence refuses. No consumer compiles artifacts. prepare --help and assert --help describe the prepared record and its Cargo-profile check.");
             Ok(0)
         }
-        _ => Err("usage: ci/nextest-binaries.rs prepare PROFILE | assert PROFILE [--prepared-by PRODUCER] | run|list [--config-file PATH] NEXTEST_ARGS... | budget-context NEXTEST_ARGS... | capture-launch --help".into()),
+        _ => Err("usage: ci/nextest-binaries.rs prepare PROFILE [--build-mode cargo|buck] | assert PROFILE [--prepared-by PRODUCER] | run|list [--config-file PATH] NEXTEST_ARGS... | budget-context NEXTEST_ARGS... | capture-launch --help".into()),
     }
 }
 
-const PREPARE_USAGE: &str = "usage: ci/nextest-binaries.rs prepare PROFILE
+const PREPARE_USAGE: &str = "usage: ci/nextest-binaries.rs prepare PROFILE [--build-mode cargo|buck]
 
 Build PROFILE's committed Nextest selections and publish one record of them at
 target/ci/nextest-binaries/current.json, replacing the previous record. The

@@ -1703,7 +1703,7 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
         .iter_mut()
         .find(|step| step.tag() == "build.workspace_on_host")
         .ok_or("hosted workspace producer is absent")?;
-    let local_prepare = "./ci/nextest-binaries.rs prepare full";
+    let local_prepare = "./ci/nextest-binaries.rs prepare full --build-mode \"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\"";
     if hosted_workspace.cmd.matches(local_prepare).count() != 1 {
         return Err("hosted workspace producer lost the exact local preparation command".into());
     }
@@ -1722,7 +1722,7 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
         .find(|step| step.tag() == "build.workspace_on_host")
         .ok_or("hosted workspace producer is absent")?;
     let local_prebuild = local_prebuild.replace(
-        "./ci/nextest-binaries.rs prepare full",
+        "./ci/nextest-binaries.rs prepare full --build-mode \"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\"",
         "./ci/nextest-binaries.rs prepare hosted-portable",
     );
     if hosted_workspace.cmd.matches(&local_prebuild).count() != 1 {
@@ -2115,8 +2115,9 @@ pub fn buck_e2e_selection(committed: &DagConfig) -> Result<DagConfig, String> {
     // the ordinary full profile, and selecting them here would keep the
     // bracket inside the very mode whose selection it brackets. Exclude
     // extension tags explicitly; the frozen population is unchanged.
-    let extension = crate::dag_source_ownership::extension_tags();
-    pruned.steps.retain(|step| !extension.contains(&step.tag()));
+    // Post-split extension nodes named *_buck (the rr twins and
+    // build.reverie_buck) are part of this selection's population per the
+    // registry contract; no exclusion is applied here.
     for step in &mut pruned.steps {
         if replaced.contains(&step.tag()) {
             step.labels.retain(|label| label != "full");
@@ -3908,7 +3909,8 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
     // from the Buck E2E selection by buck_e2e_selection itself, so they are
     // dropped without being replaced; they are the only such nodes.
     let extension_dropped = crate::dag_source_ownership::extension_tags()
-        .intersection(&full_tags)
+        .iter()
+        .filter(|tag| full_tags.contains(*tag) && !selected_tags.contains(*tag))
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut expected_dropped = replaced
@@ -9012,7 +9014,7 @@ sys.exit(37)
         let compile_payload = crate::nextest_build_selections::execution_command(&compile).unwrap();
         let prepare_payload = crate::nextest_build_selections::execution_command(&prepare).unwrap();
         assert!(prepare_payload.ends_with(&format!(
-            "./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target{EARLY_ARTIFACT_GATE_SUFFIX}"
+            "./ci/nextest-binaries.rs prepare full --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" && target/validate/stage-detcore-liteinst --git target{EARLY_ARTIFACT_GATE_SUFFIX}"
         )));
         assert!(!compile_payload.contains("nextest-binaries.rs"));
         assert!(compile_payload.ends_with(HERMIT_BIN_SIGNAL_SUFFIX));

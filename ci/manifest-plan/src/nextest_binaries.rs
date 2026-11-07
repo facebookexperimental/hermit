@@ -2099,8 +2099,15 @@ pub fn unified_prebuild_command(
     let cargo_profile = cargo_profile_for(profile)
         .map(|name| format!(" --profile {name}"))
         .unwrap_or_default();
+    // Only the full producer carries the Reverie build-mode segment; the
+    // hosted twin's derivation strips it (its profile has no Buck build).
+    let build_mode = if profile == "full" {
+        " --build-mode \"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\""
+    } else {
+        ""
+    };
     Ok(format!(
-        "cargo build --locked{cargo_profile} {} && ./ci/nextest-binaries.rs prepare {profile} && target/validate/stage-detcore-liteinst --git target",
+        "cargo build --locked{cargo_profile} {} && ./ci/nextest-binaries.rs prepare {profile}{build_mode} && target/validate/stage-detcore-liteinst --git target",
         unified.join(" ")
     ))
 }
@@ -2439,15 +2446,14 @@ fn apply_harvest(
     }
     if substituted == 0 {
         return Err(
-            "buck mode harvested no binary any selection records; refusing a Cargo record"
-                .into(),
+            "buck mode harvested no binary any selection records; refusing a Cargo record".into(),
         );
     }
     eprintln!("buck prepare: substituted {substituted} harvested binaries");
     Ok(())
 }
 
-pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
+pub fn prepare(root: &Path, profile: &str, build_mode: &str) -> Result<(), PreparationError> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let prepared_project = project(&root)?;
     let tool_owner = project_tools(prepared_project.as_ref())?;
@@ -2639,13 +2645,11 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     // buck-harvest/ (Cargo's target files are never overwritten), their
     // identities rehashed, and their selection metadata patched so the
     // listing below enumerates the Buck binaries' own cases.
-    let build_mode = std::env::var("HERMIT_VALIDATE_BUILD_MODE")
-        .unwrap_or_else(|_| "cargo".to_string());
     if build_mode == "buck" {
         substitute_harvested_binaries(&root, &generation, &mut recorded_selections)?;
     } else if build_mode != "cargo" {
         return Err(PreparationError::from(format!(
-            "unknown HERMIT_VALIDATE_BUILD_MODE {build_mode:?} in nextest prepare"
+            "unknown build mode {build_mode:?} in nextest prepare"
         )));
     }
     // Nextest itself must accept every complete metadata pair after the final
@@ -3053,10 +3057,7 @@ mod tests {
 
     #[test]
     fn apply_harvest_repoints_matched_binaries_and_refuses_no_match() {
-        let root = std::env::temp_dir().join(format!(
-            "apply-harvest-test-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("apply-harvest-test-{}", std::process::id()));
         let generation = root.join("generation");
         std::fs::create_dir_all(&generation).unwrap();
         let buck_file = root.join("target/validate/buck-harvest/basics");
@@ -3065,8 +3066,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&buck_file, std::fs::Permissions::from_mode(0o755))
-                .unwrap();
+            std::fs::set_permissions(&buck_file, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let cargo_file = root.join("cargo-basics");
         std::fs::write(&cargo_file, b"cargo-built basics").unwrap();
