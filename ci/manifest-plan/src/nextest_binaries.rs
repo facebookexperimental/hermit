@@ -2350,6 +2350,103 @@ fn selection_metadata(unified: &Value, cargo: &Value, args: &[String]) -> Result
     Ok(result)
 }
 
+/// Repoint matched selection binaries at buck-harvested files (M2 Cut 4,
+/// option b). Runs the harvest script, whose default placement is
+/// buck-harvest-only (Cargo's target files are never written; overwriting
+/// a Cargo counterpart exists only behind the script's explicit legacy
+/// opt-in, which apply_harvest refuses), then applies the manifest.
+/// Fails closed when the harvest fails or the manifest is missing.
+fn substitute_harvested_binaries(
+    root: &Path,
+    generation: &Path,
+    selections: &mut BTreeMap<String, SelectionRecord>,
+) -> Result<(), PreparationError> {
+    let status = std::process::Command::new("./ci/harvest-reverie-buck.sh")
+        .current_dir(root)
+        .status()
+        .map_err(|error| format!("buck harvest could not start: {error}"))?;
+    if !status.success() {
+        return Err(format!("buck harvest failed with {status}").into());
+    }
+    let manifest_path = root.join("target/validate/harvested-files.json");
+    let manifest = read_json(&manifest_path).map_err(|error| {
+        format!(
+            "buck mode requires the harvest manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    apply_harvest(&manifest, root, generation, selections)
+}
+
+/// The substitution half of [`substitute_harvested_binaries`], split out so
+/// it can be tested without buck2: repoint, rehash, patch metadata.
+fn apply_harvest(
+    manifest: &Value,
+    root: &Path,
+    generation: &Path,
+    selections: &mut BTreeMap<String, SelectionRecord>,
+) -> Result<(), PreparationError> {
+    let files = manifest
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or("harvest manifest has no files")?;
+    let mut harvested: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for file in files {
+        let name = string(file, "name")?;
+        let harvested_to = string(file, "harvested_to")?;
+        harvested.insert(name.to_string(), root.join(harvested_to));
+    }
+    if harvested.is_empty() {
+        return Err("harvest manifest names no files".into());
+    }
+    let mut substituted = 0usize;
+    for (key, record) in selections.iter_mut() {
+        let metadata_path = generation.join(format!("{key}.json"));
+        let mut metadata = read_json(&metadata_path)?;
+        let mut patched = false;
+        for binary in &mut record.binaries {
+            let Some(buck_path) = harvested.get(&binary.binary_name) else {
+                continue;
+            };
+            if !buck_path.is_file() {
+                return Err(format!(
+                    "harvested binary for {} is missing: {}",
+                    binary.binary_name,
+                    buck_path.display()
+                )
+                .into());
+            }
+            let binaries = metadata
+                .get_mut("rust-binaries")
+                .and_then(Value::as_object_mut)
+                .ok_or("Nextest metadata has no rust-binaries")?;
+            let entry = binaries
+                .get_mut(&binary.binary_id)
+                .ok_or_else(|| format!("Nextest metadata lost binary {}", binary.binary_id))?;
+            entry["binary-path"] = Value::String(buck_path.display().to_string());
+            binary.executable = file_identity(buck_path, true)?;
+            substituted += 1;
+            patched = true;
+        }
+        if patched {
+            fs::write(
+                &metadata_path,
+                serde_json::to_vec(&metadata).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            record.metadata = file_identity(&metadata_path, false)?;
+        }
+    }
+    if substituted == 0 {
+        return Err(
+            "buck mode harvested no binary any selection records; refusing a Cargo record"
+                .into(),
+        );
+    }
+    eprintln!("buck prepare: substituted {substituted} harvested binaries");
+    Ok(())
+}
+
 pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let prepared_project = project(&root)?;
@@ -2534,6 +2631,22 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
                 runtime_files,
             },
         );
+    }
+    // M2 Cut 4 (option b): in buck build mode, prepare consumes the
+    // buck-harvest directly. The harvest script buck-builds the Reverie
+    // integration targets and writes target/validate/harvested-files.json;
+    // matched selection binaries are repointed at the harvested files in
+    // buck-harvest/ (Cargo's target files are never overwritten), their
+    // identities rehashed, and their selection metadata patched so the
+    // listing below enumerates the Buck binaries' own cases.
+    let build_mode = std::env::var("HERMIT_VALIDATE_BUILD_MODE")
+        .unwrap_or_else(|_| "cargo".to_string());
+    if build_mode == "buck" {
+        substitute_harvested_binaries(&root, &generation, &mut recorded_selections)?;
+    } else if build_mode != "cargo" {
+        return Err(PreparationError::from(format!(
+            "unknown HERMIT_VALIDATE_BUILD_MODE {build_mode:?} in nextest prepare"
+        )));
     }
     // Nextest itself must accept every complete metadata pair after the final
     // build; this enumerates tests and never invokes the compiler.
@@ -2936,6 +3049,88 @@ mod tests {
         assert!(!changed.iter().any(|field| field.starts_with("mode ")));
         assert_eq!(changed.last().unwrap(), "nlink 1 -> 1");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn apply_harvest_repoints_matched_binaries_and_refuses_no_match() {
+        let root = std::env::temp_dir().join(format!(
+            "apply-harvest-test-{}",
+            std::process::id()
+        ));
+        let generation = root.join("generation");
+        std::fs::create_dir_all(&generation).unwrap();
+        let buck_file = root.join("target/validate/buck-harvest/basics");
+        std::fs::create_dir_all(buck_file.parent().unwrap()).unwrap();
+        std::fs::write(&buck_file, b"buck-built basics").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&buck_file, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let cargo_file = root.join("cargo-basics");
+        std::fs::write(&cargo_file, b"cargo-built basics").unwrap();
+        let identity = |path: &Path| FileIdentity {
+            path: path.to_path_buf(),
+            size: 0,
+            mode: 0,
+            sha256: String::new(),
+        };
+        let metadata_path = generation.join("full.json");
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_vec(&serde_json::json!({
+                "rust-binaries": {
+                    "pkg:basics:test": {
+                        "binary-id": "pkg:basics:test",
+                        "binary-path": cargo_file.display().to_string(),
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let manifest = serde_json::json!({
+            "files": [{
+                "name": "basics",
+                "harvested_to": "target/validate/buck-harvest/basics",
+            }]
+        });
+        let record = SelectionRecord {
+            build_args: vec![],
+            metadata: identity(&metadata_path),
+            binaries: vec![BinaryIdentity {
+                binary_id: "pkg:basics:test".into(),
+                package_id: "pkg".into(),
+                binary_name: "basics".into(),
+                kind: "test".into(),
+                build_platform: "target".into(),
+                executable: identity(&cargo_file),
+            }],
+            runtime_files: vec![],
+        };
+        let mut selections = BTreeMap::from([("full".to_string(), record)]);
+        apply_harvest(&manifest, &root, &generation, &mut selections).unwrap();
+        let record = &selections["full"];
+        assert_eq!(record.binaries[0].executable.path, buck_file);
+        assert!(!record.binaries[0].executable.sha256.is_empty());
+        let patched = read_json(&metadata_path).unwrap();
+        assert_eq!(
+            patched["rust-binaries"]["pkg:basics:test"]["binary-path"],
+            buck_file.display().to_string()
+        );
+        // No matching binary name: buck mode refuses a Cargo record.
+        let mut unmatched = BTreeMap::from([(
+            "full".to_string(),
+            SelectionRecord {
+                build_args: vec![],
+                metadata: identity(&metadata_path),
+                binaries: vec![],
+                runtime_files: vec![],
+            },
+        )]);
+        assert!(apply_harvest(&manifest, &root, &generation, &mut unmatched).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
