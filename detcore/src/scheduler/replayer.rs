@@ -303,6 +303,13 @@ fn is_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
         return true;
     }
 
+    // Where a timer armed past its branch target stopped the thread: the
+    // replay arms the recorded one, so the observed event carries it exactly
+    // when the expected one does.
+    if observed.instruction_offset != expected.instruction_offset {
+        return true;
+    }
+
     false
 }
 
@@ -326,6 +333,9 @@ fn hard_desync_fields(observed: &SchedEvent, expected: &SchedEvent) -> Vec<&'sta
     }
     if expected.end_rip.is_some() && observed.end_rip != expected.end_rip && !expected.stopless {
         fields.push("end_rip");
+    }
+    if observed.instruction_offset != expected.instruction_offset {
+        fields.push("instruction_offset");
     }
     fields
 }

@@ -8075,7 +8075,7 @@ impl GlobalState {
                 print_stack,
                 event_ix: _,
                 timeslice_remaining: mut end_of_timeslice,
-                instruction_offset,
+                mut instruction_offset,
             } = consumed;
             trace!(
                 "keep_running :{}, end_of_timeslice: {:?}",
@@ -8107,6 +8107,12 @@ impl GlobalState {
                     length,
                     stopless: false,
                 });
+                // The offset the replayer put beside this grant's timeslice.
+                instruction_offset = self
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .take_granted_replay_instruction_offset(ev.dettid, timeslice);
                 trace!(
                     "[detcore, dtid {}] Thread reactivated after yielding for replay schedule",
                     &ev.dettid,

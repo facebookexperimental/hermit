@@ -1158,7 +1158,23 @@ impl RunData {
     /// that diverges does.
     pub fn with_preempts_path_in(mut self, path: PathBuf) -> Self {
         self.runopts.det_opts.det_config.replay_preemptions_from = Some(path);
+        Self::draw_no_instruction_offsets(&mut self.runopts);
         self
+    }
+
+    /// A trial that replays a record, or runs without chaos, draws no
+    /// instruction offsets: a replay arms the offsets its record holds, and
+    /// `hermit run` refuses `--chaos-instruction-offset` beside a replay or
+    /// without `--chaos`. Only the chaos runs that search for a target keep
+    /// the run arguments' `--chaos-instruction-offset`.
+    pub(crate) fn draw_no_instruction_offsets(runopts: &mut RunOpts) {
+        let config = &mut runopts.det_opts.det_config;
+        if config.replay_preemptions_from.is_some()
+            || config.replay_schedule_from.is_some()
+            || !config.chaos
+        {
+            config.chaos_instruction_offset = 0;
+        }
     }
 
     /// Replay the preemption record at `path`, one analyze edited
@@ -1225,6 +1241,7 @@ impl RunData {
         self.runopts.det_opts.det_config.chaos = false;
         self.runopts.det_opts.det_config.sched_heuristic =
             detcore_model::config::SchedHeuristic::None;
+        Self::draw_no_instruction_offsets(&mut self.runopts);
         self
     }
 
