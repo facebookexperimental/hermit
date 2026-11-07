@@ -5314,7 +5314,19 @@ impl GlobalState {
                                 .cloned()
                                 .unwrap_or_default(),
                         };
+                        // The offset the replayer put beside this start
+                        // grant's first slice rides with it; whatever pair a
+                        // signaled grant left staged goes now.
+                        let granted_offset = sched
+                            .take_granted_replay_instruction_offset(dettid, first_slice);
+                        sched.forget_replay_timeslice(&dettid);
                         let response = R::StartNewThread(history, first_slice);
+                        let response = match granted_offset {
+                            Some(offset) => {
+                                R::WithReplayInstructionOffset(offset, Box::new(response))
+                            }
+                            None => response,
+                        };
                         if sched.callback_history_active {
                             R::WithCallbackHistory(startup, Box::new(response))
                         } else {
@@ -7441,13 +7453,9 @@ impl GlobalState {
             }
             _ => None,
         };
-        // A new thread installs no replay instruction offset from its start
-        // grant. Whatever the replayer gave it for that grant goes now,
-        // staged or moved by the grant: a signaled start grant consumes
-        // neither, and they must not reach a later grant
-        // (`Scheduler::forget_replay_timeslice`). The first slice's length
-        // above is a copy and is installed by `finish_thread_start`.
-        self.sched.lock().unwrap().forget_replay_timeslice(&dettid);
+        // The start grant's offset, if any, is taken by the response
+        // (`receive_rpc`'s StartNewThread arm wraps it beside the first
+        // slice, and drops whatever pair a signaled grant left staged).
         if let Some(pr) = &self.preemptions_to_replay {
             let (history, old_prio) = {
                 let mut sched = self.lock_rpc_scheduler(false).await;
@@ -11617,20 +11625,31 @@ where
             GlobalRequest::StartNewThread(dettid, detpid, physical_ids, signal_identity),
         )
         .await;
-        match resp.1 {
+        let (start, first_slice_offset) = match resp.1 {
+            GlobalResponse::WithReplayInstructionOffset(offset, response) => match *response {
+                GlobalResponse::StartNewThread(preempts, first_slice) => {
+                    ((preempts, first_slice), Some(offset))
+                }
+                _ => unreachable!(),
+            },
             GlobalResponse::StartNewThread(preempts, first_slice) => {
-                // Publish only after the deterministic start grant. Before
-                // it, parent registration and this RPC can race in host time.
-                publish_runtime_private_memory(guest).await;
-                crate::reserved_input::granted(
-                    guest,
-                    reverie::reserved_input::InputGrantKind::Ordinary,
-                );
-                trace!("[detcore, dtid {}] new thread UNBLOCKED (post-rpc)", dettid);
-                (preempts, first_slice)
+                ((preempts, first_slice), None)
             }
             _ => unreachable!(),
+        };
+        if let Some(offset) = first_slice_offset {
+            guest.thread_state_mut().replay_instruction_offset = Some(offset);
         }
+        let (preempts, first_slice) = start;
+        // Publish only after the deterministic start grant. Before
+        // it, parent registration and this RPC can race in host time.
+        publish_runtime_private_memory(guest).await;
+        crate::reserved_input::granted(
+            guest,
+            reverie::reserved_input::InputGrantKind::Ordinary,
+        );
+        trace!("[detcore, dtid {}] new thread UNBLOCKED (post-rpc)", dettid);
+        (preempts, first_slice)
     } else {
         (None, None)
     }
@@ -14796,9 +14815,11 @@ mod tests {
     /// staged by hand here: the leader transfer that stages it and
     /// `reconnect_exec`'s installation are not exercised, and no recorded
     /// trace holds a nonleader exec (`reconnect_exec` refuses one while
-    /// recording, EOPNOTSUPP). A new thread installs no replay timeslice from
-    /// its start grant, with or without an offset, so a start grant, plain or
-    /// signaled, leaves neither the staged pair nor a granted offset behind.
+    /// recording, EOPNOTSUPP). A new thread's start grant carries its first
+    /// slice and the offset beside it (`thread_start_request` returns both,
+    /// and the guest installs the offset); a signaled start grant consumes
+    /// neither, and leaves neither the staged pair nor a granted offset
+    /// behind.
     #[tokio::test]
     async fn a_resume_exec_answer_carries_its_grants_offset_and_a_start_grant_drops_it() {
         let offset = crate::resources::InstructionOffset {
@@ -14833,11 +14854,15 @@ mod tests {
             };
             let mut request = Box::pin(async {
                 if start {
-                    // `thread_start_request` now returns the thread's history
-                    // and timeslice as a pair; the start cases assert on the
-                    // scheduler's staged state below.
-                    let _ = super::thread_start_request(&config, &mut guest, process).await;
-                    None
+                    let (history, first_slice) =
+                        super::thread_start_request(&config, &mut guest, process).await;
+                    assert_eq!(history, None);
+                    // The guest installs the offset beside the first slice.
+                    assert_eq!(
+                        guest.thread.replay_instruction_offset,
+                        if case == 1 { Some(offset) } else { None }
+                    );
+                    Some((first_slice, guest.thread.replay_instruction_offset))
                 } else {
                     let response =
                         super::send_and_update_time(&mut guest, GlobalRequest::ResumeExec(process))
@@ -14873,7 +14898,17 @@ mod tests {
             }
             let delivered = request.await;
             if start {
-                assert_eq!(delivered, None);
+                // Case 1 (an ordinary grant) delivers the first slice and
+                // its offset; case 2 (a signaled grant) delivers neither.
+                assert_eq!(
+                    delivered,
+                    if case == 1 {
+                        Some((Some(slice), Some(offset)))
+                    } else {
+                        Some((None, None))
+                    },
+                    "case {case}"
+                );
             } else {
                 assert_eq!(delivered, Some((Some(slice), Some(offset))));
             }

@@ -8773,7 +8773,13 @@ impl Scheduler {
             // ContextSwitch(false, new_leader, ..) already refers to the
             // replacement. Neither priority nor the old entry distinguishes
             // those cases, and the cursor may have advanced in the meantime.
-            self.timeslices.insert(new_leader, timeslice);
+            // The cursor has not moved since `replay_resume` was read, so its
+            // next event's offset is that timeslice's.
+            let offset = self
+                .replayer
+                .as_ref()
+                .and_then(Replayer::next_instruction_offset);
+            self.set_replay_timeslice(new_leader, timeslice, offset);
         }
         if let Some(writer) = &mut self.preemption_writer {
             // The caller survives exec; raw replay's foreground/deferred band
@@ -20170,10 +20176,13 @@ impl Scheduler {
         if let Some((next_tid, timeslice)) = replayer.next_resume()
             && next_tid != dettid
         {
+            // The offset beside the handed-off timeslice, from the same
+            // next event the timeslice came from.
+            let offset = replayer.next_instruction_offset();
             self.requeue_with_new_priority(dettid, REPLAY_DEFERRED_PRIORITY);
             self.requeue_with_new_priority(next_tid, REPLAY_FOREGROUND_PRIORITY);
             self.note_replay_switch(dettid, next_tid, false);
-            self.timeslices.insert(next_tid, timeslice);
+            self.set_replay_timeslice(next_tid, timeslice, offset);
         }
         // A start after the schedule's last event may have been its last
         // decision: then the replay is over, as at its last event. Taking

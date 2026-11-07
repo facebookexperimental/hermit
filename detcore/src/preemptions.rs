@@ -3650,6 +3650,11 @@ mod tests {
         let marked = SchedEvent::branches(tid, 100).taken_without_stop();
         const { assert!(PREEMPTION_RECORD_FORMAT_MAX >= STOPLESS_SLICE_ENDS_FORMAT) };
         assert_eq!(STOPLESS_SLICE_ENDS_FORMAT, BACKGROUND_STARTS_FORMAT + 1);
+        assert_eq!(
+            PREEMPTION_RECORD_FORMAT_WITHOUT_OFFSETS,
+            STOPLESS_SLICE_ENDS_FORMAT
+        );
+        assert_eq!(PREEMPTION_RECORD_FORMAT_MAX, INSTRUCTION_OFFSET_FORMAT);
         let written = |mut writer: PreemptionWriter| {
             writer.insert_schedevent(SchedEvent::branches(tid, 100));
             writer.insert_schedevent(marked.clone());
@@ -6161,6 +6166,20 @@ mod tests {
         std::fs::write(&without, &off).unwrap();
         assert_eq!(read_recorded_instruction_offsets(&with), Ok(true));
         assert_eq!(read_recorded_instruction_offsets(&without), Ok(false));
+        // Rows alone with offsets: format 6, a preemption replay's plan.
+        assert_eq!(record.format_version, Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+        assert_eq!(read_recorded_offsets(&with), Ok(RecordedOffsets::RowsOnly));
+        assert_eq!(read_recorded_offsets(&without), Ok(RecordedOffsets::None));
+        // The same rows in a record that states no format, as a Hermit before
+        // the fence wrote them: loading refuses its format by name.
+        let mut unfenced = record.clone();
+        unfenced.format_version = None;
+        assert!(
+            unfenced
+                .validate_format()
+                .unwrap_err()
+                .contains("instruction offsets in its rows")
+        );
     }
 
     /// <https://github.com/rrnewton/hermit/issues/3411>: the epoch a record was
