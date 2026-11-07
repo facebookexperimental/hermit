@@ -65,7 +65,7 @@ run_logged() { # run_logged LOG COMMAND...: run COMMAND, copying both streams to
     tee_out=$!
     exec {err_fd}> >(tee -a -- "$log" >&2)
     tee_err=$!
-    "$@" >&"$out_fd" 2>&"$err_fd"
+    "$@" 1>&"$out_fd" 2>&"$err_fd"
     status=$?
     exec {out_fd}>&- {err_fd}>&-
     wait "$tee_out" "$tee_err"
