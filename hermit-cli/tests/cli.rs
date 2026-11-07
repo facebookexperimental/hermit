@@ -27904,6 +27904,15 @@ fn a_draw_without_a_range_draws_from_the_recommended_range() {
 /// it lost.
 #[cfg(target_arch = "x86_64")]
 fn branch_free_race_lost(seed: u64, extra: &[&str]) -> u64 {
+    // 25_000 iterations (dh-boh41): a quarter of the original 100_000.
+    // The window semantics are per-preemption, not per-iteration: at
+    // 25_000 every seed still loses nothing without the offset and at
+    // least one seed loses with it, at about a quarter of the cost.
+    branch_free_race_lost_at(seed, extra, 25000)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn branch_free_race_lost_at(seed: u64, extra: &[&str], iterations: u64) -> u64 {
     let guest = branch_free_race_guest()
         .to_str()
         .expect("guest path should be UTF-8");
@@ -27918,7 +27927,8 @@ fn branch_free_race_lost(seed: u64, extra: &[&str]) -> u64 {
         "--max-timeslice=200000",
     ];
     args.extend(extra);
-    args.extend(["--", guest, "100000"]);
+    let iterations = iterations.to_string();
+    args.extend(["--", guest, &iterations]);
     let output = hermit(&args);
     assert_success(&output, &args);
     parse_branch_free_race(&stdout(&output))
@@ -27965,15 +27975,20 @@ fn chaos_instruction_offset_splits_a_branch_free_window() {
 fn a_chaos_instruction_offset_run_verifies_and_replays_at_its_offsets() {
     let _guard = hermit_run_guard();
     let offset = ["--chaos-instruction-offset=8"];
+    // This test keeps 100_000 iterations (dh-boh41): at 25_000 and
+    // 50_000 the strict verify run desyncs at a getrandom callback
+    // checkpoint near the end of the shorter schedule, so the
+    // workload is not shrunk here; only the splits test above is.
     let seed = (1..=8)
-        .find(|seed| branch_free_race_lost(*seed, &offset) > 0)
+        .find(|seed| branch_free_race_lost_at(*seed, &offset, 100000) > 0)
         .expect("one of seeds 1-8 should lose an update");
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let report = directory.path().join("verify.json");
     let report_arg = format!("--verify-json={}", report.display());
-    branch_free_race_lost(
+    branch_free_race_lost_at(
         seed,
         &[offset[0], "--verify", "--verify-strict", &report_arg],
+        100000,
     );
     let verdict: serde_json::Value =
         serde_json::from_slice(&fs::read(&report).expect("strict verification wrote no verdict"))
@@ -27988,7 +28003,7 @@ fn a_chaos_instruction_offset_run_verifies_and_replays_at_its_offsets() {
 
     let recorded = directory.path().join("recorded.json");
     let record_arg = format!("--record-preemptions-to={}", recorded.display());
-    let lost = branch_free_race_lost(seed, &[offset[0], &record_arg]);
+    let lost = branch_free_race_lost_at(seed, &[offset[0], &record_arg], 100000);
     assert!(lost > 0);
     let json: serde_json::Value =
         serde_json::from_slice(&fs::read(&recorded).expect("no preemption record")).unwrap();
@@ -30989,7 +31004,12 @@ fn a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_
                 bound.as_str(),
             ];
             args.extend_from_slice(extra);
-            args.extend(["--", program, "40", "300", "1500000"]);
+            // Second task's work: 500_000 loop iterations, down from
+            // 1_500_000 (dh-boh41). It only has to outlast the main
+            // task's 40 yield/clock-read cycles, which it still does
+            // by a wide margin; the test's own desync and digest
+            // assertions catch a second task that stops early.
+            args.extend(["--", program, "40", "300", "500000"]);
             let output = hermit(&args);
             assert_success(&output, &args);
             stdout(&output)
