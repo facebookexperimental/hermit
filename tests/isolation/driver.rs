@@ -1329,6 +1329,66 @@ fn installation_for(
     Ok(absolute.canonicalize().unwrap_or(absolute))
 }
 
+/// Name the first rows on which two input inventories disagree, so a
+/// `receipt.input_stability` no_result says WHAT changed during
+/// collection instead of only that something did (dh-j8eb7). Rows are
+/// keyed by everything before their digest; up to three differences are
+/// named, with twelve digest characters on each side when both exist.
+fn inventory_difference(before: &str, after: &str) -> String {
+    fn rows(inventory: &str) -> std::collections::BTreeMap<String, String> {
+        inventory
+            .lines()
+            .map(|line| {
+                let key = line
+                    .split(" sha256=")
+                    .next()
+                    .unwrap_or(line)
+                    .split(" bytes=")
+                    .next()
+                    .unwrap_or(line)
+                    .to_owned();
+                (key, line.to_owned())
+            })
+            .collect()
+    }
+    fn digest_of(line: &str) -> &str {
+        line.split("sha256=").nth(1).unwrap_or(line)
+    }
+    let before_rows = rows(before);
+    let after_rows = rows(after);
+    let mut differences = Vec::new();
+    for (key, before_line) in &before_rows {
+        match after_rows.get(key) {
+            None => differences.push(format!("{key} removed")),
+            Some(after_line) if after_line != before_line => differences.push(format!(
+                "{key} changed {} -> {}",
+                &digest_of(before_line)[..digest_of(before_line).len().min(12)],
+                &digest_of(after_line)[..digest_of(after_line).len().min(12)],
+            )),
+            _ => {}
+        }
+    }
+    for key in after_rows.keys() {
+        if !before_rows.contains_key(key) {
+            differences.push(format!("{key} added"));
+        }
+    }
+    if differences.is_empty() {
+        return "inventories differ only in row order".to_owned();
+    }
+    let shown = differences
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if differences.len() > 3 {
+        format!("{shown}; and {} more", differences.len() - 3)
+    } else {
+        shown
+    }
+}
+
 fn input_inventory(prepared: &Prepared) -> Result<String, String> {
     let mut rows = vec![prepared.command_bindings.inventory()?];
     for (role, path) in [
@@ -2349,12 +2409,24 @@ impl Prepared {
             },
         });
         assertions.push(match input_inventory(self) {
-            Ok(inventory) => Assertion {
+            Ok(inventory) if inventory == self.input_inventory => Assertion {
                 name: "receipt.input_stability".to_owned(),
-                verdict: if inventory == self.input_inventory { Verdict::Match } else { Verdict::NoResult },
+                verdict: Verdict::Match,
                 detail: "content hashes of the CLI, selected executor and sources, guest, native helper, verification parser/policy/standalone/manifest/lock inputs, and complete declared installation before and after collection".to_owned(),
             },
-            Err(error) => Assertion { name: "receipt.input_stability".to_owned(), verdict: Verdict::NoResult, detail: error },
+            Ok(inventory) => Assertion {
+                name: "receipt.input_stability".to_owned(),
+                verdict: Verdict::NoResult,
+                detail: format!(
+                    "input inventory changed during collection (dh-j8eb7): {}",
+                    inventory_difference(&self.input_inventory, &inventory)
+                ),
+            },
+            Err(error) => Assertion {
+                name: "receipt.input_stability".to_owned(),
+                verdict: Verdict::NoResult,
+                detail: format!("input inventory could not be measured (dh-j8eb7): {error}"),
+            },
         });
         assertions.push(match boundary {
             Ok(detail) => Assertion {
@@ -2609,6 +2681,33 @@ fn hex_bytes(bytes: &[u8]) -> String {
         write!(encoded, "{byte:02x}").expect("String writes succeed");
     }
     encoded
+}
+
+#[cfg(test)]
+mod inventory_difference_tests {
+    use super::inventory_difference;
+
+    /// dh-j8eb7 fixture: an inventory whose one hashed input changed
+    /// during collection must name that input, so a no_result receipt
+    /// identifies the differing path instead of reporting nothing.
+    #[test]
+    fn a_changed_input_is_named_with_both_digests() {
+        let before = "EXECUTABLE hermit sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nSOURCE workspace-Cargo.lock sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
+        let after = "EXECUTABLE hermit sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nSOURCE workspace-Cargo.lock sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n";
+        let difference = inventory_difference(before, after);
+        assert!(difference.contains("SOURCE workspace-Cargo.lock"), "{difference}");
+        assert!(difference.contains("bbbbbbbbbbbb -> cccccccccccc"), "{difference}");
+        assert!(!difference.contains("EXECUTABLE hermit"), "{difference}");
+    }
+
+    #[test]
+    fn added_and_removed_inputs_are_named() {
+        let before = "FILE 00 sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        let after = "FILE 11 sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
+        let difference = inventory_difference(before, after);
+        assert!(difference.contains("removed"), "{difference}");
+        assert!(difference.contains("added"), "{difference}");
+    }
 }
 
 #[cfg(test)]

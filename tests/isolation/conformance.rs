@@ -381,6 +381,18 @@ fn read_ledger(path: &Path) -> Result<Vec<Expected>, String> {
 struct LedgerFailure {
     id: String,
     message: String,
+    /// An infrastructure refusal, not a change verdict: the run's input
+    /// inventory changed (or could not be measured) during collection
+    /// (dh-j8eb7). When every failure is infra, the checker exits 75 so
+    /// the node is COULD_NOT_RUN, never a red cell.
+    infra: bool,
+}
+
+fn is_infra_failure(name: &str, verdict: driver::conformance::Verdict, detail: &str) -> bool {
+    name == "receipt.input_stability"
+        && verdict == driver::conformance::Verdict::NoResult
+        && (detail.starts_with("input inventory changed during collection")
+            || detail.starts_with("input inventory could not be measured"))
 }
 
 /// The structured result row of one collected cell.
@@ -424,6 +436,7 @@ fn check_ledger(
             (false, None) => {
                 failures.push(LedgerFailure {
                     id: cell_row_id(cell),
+                    infra: false,
                     message: format!(
                         "UNEXPECTED: {} collected no guest observations ({}), and no ledger row expects that",
                         cell.name(),
@@ -434,6 +447,7 @@ fn check_ledger(
             }
             (true, Some(row)) => failures.push(LedgerFailure {
                 id: cell_row_id(cell),
+                infra: false,
                 message: format!(
                     "STALE: ledger line {} ({}) expects {} to collect nothing, but it now does; delete or narrow the row",
                     row.line,
@@ -460,6 +474,7 @@ fn check_ledger(
                 }
                 None => failures.push(LedgerFailure {
                     id: cell_row_id(cell),
+                    infra: is_infra_failure(&assertion.name, assertion.verdict, &assertion.detail),
                     message: format!(
                         "UNEXPECTED: {} {} is {verdict} ({}), and no ledger row expects that",
                         cell.name(),
@@ -479,6 +494,7 @@ fn check_ledger(
             if complete.contains(backend) && !used.contains(&(row.line, backend.clone())) {
                 failures.push(LedgerFailure {
                     id: ledger_row_id(row.line, backend),
+                    infra: false,
                     message: format!(
                         "STALE: ledger line {} ({}) names {backend}, but nothing on {backend} needs it any more; delete {backend} from the row",
                         row.line, row.issue
@@ -1045,6 +1061,17 @@ fn run() -> Result<bool, String> {
             failures.len(),
         );
         matches = failures.is_empty();
+        if !failures.is_empty() && failures.iter().all(|failure| failure.infra) {
+            // Every disagreement is the input inventory changing (or
+            // being unmeasurable) during collection: an infrastructure
+            // refusal, not a verdict on the change (dh-j8eb7). The
+            // structured results are not written, so the node is
+            // COULD_NOT_RUN instead of red; the cells never pass either.
+            return Err(format!(
+                "INFRA: all {} disagreement(s) are input-inventory instability during collection (dh-j8eb7)",
+                failures.len()
+            ));
+        }
     }
     write_results(&prepared.artifacts, &collected, &ledger_rows, &failing)?;
     write_summary(&prepared, &required, &collected, &scope).map_err(|error| {
@@ -1067,7 +1094,8 @@ fn main() {
         Ok(false) => std::process::exit(1),
         Err(error) => {
             eprintln!("isolation conformance: {error}");
-            std::process::exit(2);
+            // INFRA: is the checker's could-not-run class (dh-j8eb7).
+            std::process::exit(if error.starts_with("INFRA:") { 75 } else { 2 });
         }
     }
 }

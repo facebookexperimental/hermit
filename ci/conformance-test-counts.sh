@@ -58,6 +58,14 @@ function main {
 
     local status=0 parsed parse_status=0
     "$@" || status=$?
+    if ((status == 75)); then
+        # The checker declared an infrastructure refusal (dh-j8eb7: the
+        # input inventory changed during collection). Write no counts:
+        # the node's structured results are refused upstream, so the
+        # run is COULD_NOT_RUN, never a red cell and never a pass.
+        echo "conformance-test-counts: checker exit 75 (infrastructure refusal); recording no result rows" >&2
+        exit 75
+    fi
     parsed=$(rows_from_results "$artifacts/results.tsv") || parse_status=$?
 
     local -a args=()
@@ -132,12 +140,16 @@ function self_test {
         '{"executed_tests":1,"filtered_tests":0,"results":[{"attempts":1,"id":"isolation/incomplete","result":"fail"}],"schema":2}' \
         "$iso" -- true
 
+    check_case infra-exit 75 \
+        '' \
+        "$iso" -- sh -c 'exit 75'
+
     rm -rf -- "$scratch"
     if ((status != 0)); then
         echo "conformance-test-counts: self-test FAILED" >&2
         return 1
     fi
-    echo "conformance-test-counts: self-test PASS (pass, fail, exit without failing row, missing, malformed, no header)"
+    echo "conformance-test-counts: self-test PASS (pass, fail, exit without failing row, missing, malformed, no header, infra exit)"
 }
 
 if [[ ${1:-} == --self-test ]]; then
