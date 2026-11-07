@@ -44058,6 +44058,95 @@ mod test {
         assert!(scheduler.is_parked_futex_waiter(creator));
     }
 
+    /// A timer's process-directed signal goes to the leader, which Linux
+    /// names, when the scheduler has woken it for a signal of its own and
+    /// queued it to resume: Linux woke it when that signal was sent, and it has
+    /// taken the signal before the expiry, so it is busy only for a signal it
+    /// was not woken for. With the same pending set and an ordinary queued
+    /// request, or woken for SIGUSR1 with SIGUSR2 pending too, or holding a
+    /// delivery stop's own read-write request, it is busy and the copy goes to
+    /// the worker (the coord7 review of
+    /// https://github.com/rrnewton/hermit/pull/5221, finding 2: ptrace
+    /// `busypause` gave a worker the copy where Linux gives the leader every
+    /// one).
+    #[test]
+    fn a_timer_signal_goes_to_a_leader_woken_for_its_own_signal() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let usr2 = kernel_signal_bit(libc::SIGUSR2);
+        let sig = |signal: libc::c_int| crate::types::SigWrapper(signal);
+        let cases = [
+            (
+                "woken by the drain for SIGUSR1",
+                Some((
+                    ResourceID::WaitidSignals(vec![sig(libc::SIGUSR1)]),
+                    Permission::W,
+                )),
+                usr1,
+                true,
+            ),
+            (
+                "woken by a scheduler send of SIGUSR1",
+                Some((ResourceID::InboundSignal(sig(libc::SIGUSR1)), Permission::W)),
+                usr1,
+                true,
+            ),
+            (
+                "woken for SIGUSR1 and SIGUSR2",
+                Some((
+                    ResourceID::WaitidSignals(vec![sig(libc::SIGUSR1), sig(libc::SIGUSR2)]),
+                    Permission::W,
+                )),
+                usr1 | usr2,
+                true,
+            ),
+            ("an ordinary queued request", None, usr1, false),
+            (
+                "woken for SIGUSR1 with SIGUSR2 pending too",
+                Some((
+                    ResourceID::WaitidSignals(vec![sig(libc::SIGUSR1)]),
+                    Permission::W,
+                )),
+                usr1 | usr2,
+                false,
+            ),
+            (
+                "a delivery stop's own request",
+                Some((
+                    ResourceID::InboundSignal(sig(libc::SIGUSR1)),
+                    Permission::RW,
+                )),
+                usr1,
+                false,
+            ),
+        ];
+        for (case, resource, pending, leader_takes) in cases {
+            let (mut scheduler, leader, worker, _child) = sigchld_family(libc::SIGCHLD);
+            assert!(scheduler.models_signal_targets);
+            scheduler.test_kernel_signal_states.insert(
+                leader,
+                KernelSignalState {
+                    pending,
+                    thread_pending: pending,
+                    ..Default::default()
+                },
+            );
+            scheduler
+                .test_kernel_signal_states
+                .insert(worker, KernelSignalState::default());
+            let mut request = Resources::new(leader);
+            if let Some((resource, permission)) = resource {
+                request.insert(resource, permission);
+            }
+            scheduler.next_turns.get_mut(&leader).unwrap().req = Ivar::full(Ok(request));
+            scheduler.runqueue_push_front(leader);
+            assert_eq!(
+                scheduler.timer_signal_target(leader, worker, Signal::SIGALRM),
+                if leader_takes { leader } else { worker },
+                "{case}"
+            );
+        }
+    }
+
     /// A timer's process-directed signal is sent to a thread that does not
     /// block it, since Linux gives it to no other, and the scheduler wakes the
     /// thread it names. The leader, which Linux names, keeps it if it does not

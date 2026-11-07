@@ -118,6 +118,7 @@ use serde::Serialize;
 use super::Scheduler;
 use super::discarded_at_send::STANDARD_SIGNALS;
 use super::kernel_signal_bit;
+use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::syscalls::KernelSignalState;
 use crate::types::DetPid;
@@ -606,7 +607,10 @@ impl Scheduler {
     /// unblocked signal pending for it alone (`task_sigpending`) and not
     /// already woken for another copy in the shared queue. A thread sleeping
     /// outside the schedule is read only for its wake (`signaled_background`),
-    /// since host timing can post it a signal, except a vfork parent.
+    /// since host timing can post it a signal, except a vfork parent. A
+    /// thread the scheduler has woken for signals of its own and queued to
+    /// resume (`committed_own_signal_wake`) is busy only for any other
+    /// signal pending for it alone.
     pub(super) fn kernel_sent_wants(&self, thread: DetTid, mask: Option<u64>, bit: u64) -> Wants {
         if self.parked.exit_fences.contains_key(&thread)
             || self.logically_killed_threads.contains(&thread)
@@ -642,9 +646,55 @@ impl Scheduler {
         {
             return Wants::Busy;
         }
+        // Woken at a committed point for signals pending for it alone, and not
+        // yet resumed. Linux woke it when those signals were sent
+        // (`signal_wake_up`, kernel/signal.c:1027-1033 at v6.17) and, its
+        // wake latency far below the step between a send and the next
+        // expiry, it has dequeued them by the time the kernel generates this
+        // one: `dequeue_signal` takes the private queue first, then the
+        // shared one (lines 618-640), and returns to its interruptible wait
+        // with nothing pending. Here the wake is only committed, at the drain
+        // that also dispatches this expiry, so its private queue still holds
+        // those signals, and reading them as `task_sigpending` gave the copy
+        // to a sibling Linux does not choose (ptrace `busypause`:
+        // alarm_worker=1 worker_eintr=1 where Linux prints 0 and 0, the
+        // coord7 review of https://github.com/rrnewton/hermit/pull/5221,
+        // finding 2). It is busy only for a signal it was not woken for.
+        let woken_for = self.committed_own_signal_wake(thread).unwrap_or(0);
         match self.reliable_pending(thread) {
-            Some(pending) if pending != 0 => Wants::Busy,
+            Some(pending) if pending & !woken_for != 0 => Wants::Busy,
             _ => Wants::Yes,
+        }
+    }
+
+    /// The signals `thread` is queued to resume for, if the scheduler woke it
+    /// for signals pending for it alone at a committed point and it has not
+    /// run since: its filed request is that wake's one write-only resource,
+    /// the signal set the step-2 drain of cross-task signals files for an
+    /// interrupted `pause`, `nanosleep`, futex wait or poll (`WaitidSignals`,
+    /// `Scheduler::drain_sleep_signals`) or the signal a scheduler send files
+    /// for a sleeper or poller it wakes (`InboundSignal`,
+    /// `Scheduler::wake_signaled_guest_as`), and it waits in the run queue.
+    /// Not a delivery stop's own request, which asks for its signal
+    /// read-write after the kernel dequeued it.
+    fn committed_own_signal_wake(&self, thread: DetTid) -> Option<u64> {
+        if !self.run_queue.contains_tid(thread) {
+            return None;
+        }
+        let request = self.next_turns.get(&thread)?.req.try_read()?.ok()?;
+        if request.resources.len() != 1 {
+            return None;
+        }
+        match request.resources.iter().next()? {
+            (ResourceID::InboundSignal(signal), Permission::W) => {
+                Some(kernel_signal_bit(signal.raw()))
+            }
+            (ResourceID::WaitidSignals(signals), Permission::W) => Some(
+                signals
+                    .iter()
+                    .fold(0, |bits, signal| bits | kernel_signal_bit(signal.raw())),
+            ),
+            _ => None,
         }
     }
 

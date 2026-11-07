@@ -26185,20 +26185,34 @@ const BUSY_PAUSE_CASES: [(&str, &str); 2] = [
 /// observation ran ahead of the receiver walk, KVM left the leader asleep with
 /// its SIGUSR1 pending and gave every expiry to the worker (alarm_worker=20
 /// worker_eintr=20). In `busypausealone`, with no timer, KVM left the leader
-/// asleep for ever (a deadlock under Hermit's model). Each mode must print
-/// Linux's line natively first, then on KVM at bitwise parity.
+/// asleep for ever (a deadlock under Hermit's model). On ptrace, after the
+/// kernel-sent receiver choice began reading a thread's private pending set
+/// (S3b-1), `busypause` gave one expiry to the worker (`alarm_worker=1
+/// worker_eintr=1`): the leader, woken at the step-2 drain for its SIGUSR1 in
+/// the same pass that dispatched the expiry, still held SIGUSR1 and read as
+/// busy, though Linux had woken it at the send (the coord7 review of
+/// https://github.com/rrnewton/hermit/pull/5221, finding 2). Each mode must
+/// print Linux's line natively first, then on ptrace at bitwise parity
+/// wherever this test runs, then on KVM at bitwise parity.
 #[test]
 fn run_kvm_a_paused_leader_takes_its_own_signal_as_linux_wakes_it() {
-    if !Path::new("/dev/kvm").exists() {
-        eprintln!("skipping the KVM paused-leader signal cases: /dev/kvm is unavailable");
-        return;
-    }
     for (mode, linux) in BUSY_PAUSE_CASES {
         assert_eq!(
             native_alarm_receiver_reach(mode, linux),
             linux,
             "{mode}: natively"
         );
+        assert_eq!(
+            alarm_receiver_reach_at_l2(&[], mode),
+            linux,
+            "{mode}: ptrace"
+        );
+    }
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM paused-leader signal cases: /dev/kvm is unavailable");
+        return;
+    }
+    for (mode, linux) in BUSY_PAUSE_CASES {
         assert_eq!(
             alarm_receiver_reach_at_l2(&["--backend=kvm"], mode),
             linux,
