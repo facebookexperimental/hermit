@@ -1336,8 +1336,12 @@ mod tests {
 
     /// Bisect refuses, before any trial, a pair of schedules whose RCB
     /// coordinates it cannot execute or mix: an unqualified or legacy
-    /// endpoint, or endpoints stating different identities. On any host one
-    /// of the two refusals applies, so no trial schedule is ever written.
+    /// endpoint, or endpoints stating different identities. The two
+    /// same-identity pairs (both legacy, both unqualified) combine
+    /// cleanly, so only bisect's own identity admission refuses them --
+    /// deleting that call turns this test red. On any host one of the
+    /// two refusals applies to the mixed pairs, so no trial schedule is
+    /// ever written.
     #[test]
     fn bisect_refuses_endpoints_it_cannot_execute_or_mix() {
         let dir = tempfile::tempdir().unwrap();
@@ -1347,10 +1351,16 @@ mod tests {
             path
         };
         let unqualified = || Some(HistoryIdentity::Unqualified("claim-unset".to_owned()));
-        for (good, bad) in [
-            (known(), unqualified()),
-            (unqualified(), known()),
-            (known(), None),
+        for (good, bad, cause) in [
+            (known(), unqualified(), None),
+            (unqualified(), known(), None),
+            (known(), None, None),
+            (None, None, Some("states no RCB coordinate identity")),
+            (
+                unqualified(),
+                unqualified(),
+                Some("recorded with an unqualified RCB clock"),
+            ),
         ] {
             let good = write("passing", "good.json", good);
             let bad = write("failing", "bad.json", bad);
@@ -1371,6 +1381,9 @@ mod tests {
             let error = options.prepare(&args.global).map(|_| ()).unwrap_err();
             assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
             assert!(format!("{error:#}").contains("hermit refused"), "{error:#}");
+            if let Some(cause) = cause {
+                assert!(format!("{error:#}").contains(cause), "{error:#}");
+            }
         }
     }
 

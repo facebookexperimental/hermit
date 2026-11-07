@@ -314,3 +314,21 @@ pub fn recorded_preemption_json(path: &Path) -> serde_json::Value {
         .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
     serde_json::to_value(&record).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
 }
+
+/// The preemption record inside a recording's parsed JSON, for a test
+/// editing a recording it then writes back: through the `rcb_history`
+/// envelope and the `slice_boundary_recording` envelope when present, so
+/// the edited file keeps the identity the recording stated.
+#[allow(dead_code)]
+pub fn recorded_preemption_inner_mut(record: &mut serde_json::Value) -> &mut serde_json::Value {
+    if record.get("rcb_history").is_some() {
+        let inner = record["rcb_history"]
+            .get_mut("recording")
+            .expect("an enveloped recording carries its record");
+        return recorded_preemption_inner_mut(inner);
+    }
+    if record.get("slice_boundary_recording").is_some() {
+        return &mut record["slice_boundary_recording"]["preemptions"];
+    }
+    record
+}

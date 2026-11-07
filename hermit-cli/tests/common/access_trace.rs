@@ -263,10 +263,22 @@ struct Replay {
 /// change it.
 fn recorded_global_events(events: &[u8]) -> Vec<serde_json::Value> {
     let value: serde_json::Value = serde_json::from_slice(events).unwrap();
-    let record = value
-        .get("incomplete_preemption_record")
-        .map(|envelope| &envelope["record"])
-        .unwrap_or(&value);
+    let mut record = &value;
+    if let Some(inner) = record
+        .get("rcb_history")
+        .and_then(|envelope| envelope.get("recording"))
+    {
+        record = inner;
+    }
+    if let Some(inner) = record
+        .get("slice_boundary_recording")
+        .and_then(|envelope| envelope.get("preemptions"))
+    {
+        record = inner;
+    }
+    if let Some(envelope) = record.get("incomplete_preemption_record") {
+        record = &envelope["record"];
+    }
     record["global"].as_array().expect("global events").clone()
 }
 

@@ -1407,10 +1407,7 @@ fn lone_record(mode: &str, eager: bool) -> (LoneRun, PathBuf, serde_json::Value)
         "record",
         &[format!("--record-preemptions-to={}", record.display())],
     );
-    let text = fs::read_to_string(&record)
-        .unwrap_or_else(|error| panic!("cannot read {}: {error}", record.display()));
-    let json = serde_json::from_str(&text)
-        .unwrap_or_else(|error| panic!("{} is not JSON: {error}", record.display()));
+    let json = hermit_test::recorded_preemption_json(&record);
     (run, record, json)
 }
 
@@ -1533,10 +1530,7 @@ fn replays_take_recorded_lone_slice_ends_the_same_way() {
                  recording's"
             );
             assert_eq!(lazy.desynced, 0, "{option}: desynchronized events");
-            let text = fs::read_to_string(&rerecorded)
-                .unwrap_or_else(|error| panic!("cannot read {}: {error}", rerecorded.display()));
-            let replayed: serde_json::Value = serde_json::from_str(&text)
-                .unwrap_or_else(|error| panic!("{} is not JSON: {error}", rerecorded.display()));
+            let replayed = hermit_test::recorded_preemption_json(&rerecorded);
             let replayed_events = global_events(&replayed);
             assert_eq!(
                 replayed_events.len(),
