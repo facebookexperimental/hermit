@@ -1245,8 +1245,6 @@ mod tests {
 
     /// Two schedules recorded under different `--pipe-wake-latency` values,
     /// off and `0` included, cannot be interpolated: no replay could
-    /// Two schedules recorded under different `--pipe-wake-latency` values,
-    /// off and `0` included, cannot be interpolated: no replay could
     /// reproduce the result (https://github.com/rrnewton/hermit/issues/4380).
     #[test]
     fn interpolate_refuses_schedules_recorded_under_different_pipe_wake_latencies() {

@@ -6774,12 +6774,12 @@ fn timerless_backends_refuse_explicit_preemption_before_starting_the_guest() {
     }
 }
 
-/// A preemption record with one callback checkpoint, for refusals decided
-/// before any guest starts: dtid 3's single row ends at a PMU timer stop at
-/// progress 0. Its epoch is `ANNOTATED_FIXTURE_EPOCH`.
-/// A synthetic callback-annotated priority history, stating the qualified
-/// RCB metric explicitly in the identity envelope, so a qualified host admits
-/// its identity and the annotated-replay checks that follow decide. It
+/// A synthetic callback-annotated priority history with one callback
+/// checkpoint, for refusals decided before any guest starts: dtid 3's
+/// single row ends at a PMU timer stop at progress 0, and its epoch is
+/// `ANNOTATED_FIXTURE_EPOCH`. It states the qualified RCB metric
+/// explicitly in the identity envelope, so a qualified host admits its
+/// identity and the annotated-replay checks that follow decide. It
 /// records no run.
 fn write_annotated_history_fixture(directory: &Path) -> PathBuf {
     let record = directory.join("annotated-history.json");
