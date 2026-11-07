@@ -22,14 +22,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -90,14 +92,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+          liteinst: "product_failure in qualification 2026-11-07 (dh-icd4a): clone3: the in-guest backend cannot create a thread or a vfork child"
+          in-guest-trap: "product_failure in qualification 2026-11-07 (dh-icd4a): clone3: the in-guest backend cannot create a thread or a vfork child"
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -158,14 +162,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -226,14 +232,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -294,14 +302,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -362,14 +372,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -430,14 +442,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -498,14 +512,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -566,14 +582,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -634,14 +652,22 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+          liteinst: "product_failure in qualification 2026-11-07 (dh-icd4a): clone3: the in-guest backend cannot create a thread or a vfork child"
+          in-guest-trap: "product_failure in qualification 2026-11-07 (dh-icd4a): clone3: the in-guest backend cannot create a thread or a vfork child"
+        timeout_seconds:
+          ptrace: 256
+        cpu_timeout_seconds:
+          ptrace: 32
+        slow_reason:
+          ptrace: "measured 21.23 CPU-s in pinned-image qualification low-concurrency retry 2026-11-07 (default 22 CPU-s cap timed out 6 sample cases at -j16 under host load ~200; owner 2026-11-05 high-load rule): allowance is 1.5x the 21.23 observed"
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -702,14 +728,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -770,14 +798,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -838,14 +868,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -906,14 +938,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -974,14 +1008,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -1042,14 +1078,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -1110,14 +1148,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -1178,14 +1218,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -1246,14 +1288,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -1314,14 +1358,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -1382,14 +1428,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -1450,14 +1498,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -1518,14 +1568,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -1586,14 +1638,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -1654,14 +1708,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -1722,14 +1778,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -1790,14 +1848,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -1858,14 +1918,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -1926,14 +1988,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -1994,14 +2058,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -2062,14 +2128,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -2130,14 +2198,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -2198,14 +2268,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -2266,14 +2338,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -2334,14 +2408,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -2402,14 +2478,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -2470,14 +2548,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -2538,14 +2618,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -2606,14 +2688,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -2674,14 +2758,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -2742,14 +2828,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -2810,14 +2898,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
+          kvm: "product_failure in qualification 2026-11-07 (dh-cus4u): KVM cannot send real-time signals or SIGCHLD"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+          liteinst: "product_failure in qualification 2026-11-07 (dh-cus4u): sigaction(__libc_current_sigrtmax()) = -1 EPERM at tkill.cc:65"
+          in-guest-trap: "product_failure in qualification 2026-11-07 (dh-cus4u): sigaction(__libc_current_sigrtmax()) = -1 EPERM at tkill.cc:65"
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -4170,14 +4260,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+          liteinst: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+          in-guest-trap: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -4238,14 +4330,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+          liteinst: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+          in-guest-trap: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -4306,14 +4400,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+          liteinst: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+          in-guest-trap: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -4374,14 +4470,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+          liteinst: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+          in-guest-trap: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -4442,14 +4540,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+          liteinst: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+          in-guest-trap: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -4510,14 +4610,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+          liteinst: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+          in-guest-trap: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -4578,14 +4680,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+          liteinst: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+          in-guest-trap: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -4646,14 +4750,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+          liteinst: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+          in-guest-trap: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -4714,14 +4820,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+          liteinst: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+          in-guest-trap: "product_failure in qualification 2026-11-07 (dh-uwh87): Check failed: sigaction(SIGALRM, &sa, &original_alarm_sa_) == 0 (errno 1)"
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -8182,14 +8290,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -8250,14 +8360,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable
@@ -8318,14 +8430,16 @@ test:
     modes:
       verify:
         ci: false
-        ci_disabled_reason: "Awaiting hermetic-image qualification; host sweep 2026-11-04 was pass/skip and deterministic"
-        backends_enabled: [ptrace]
+        ci_disabled_reason: "Optional (nightly sweep): hermetic qualification measured 2026-11-07 in pinned image sha256:4e1605ec at b4ce9e923; awaiting overnight evidence for auto-flip (owner 2026-10-30)"
+        backends_enabled:
+          - ptrace
+          - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: gVisor corpus not yet qualified on DBT
-          kvm: gVisor corpus not yet qualified on KVM
+          dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
-          liteinst: gVisor corpus not yet qualified on LiteInst
-          in-guest-trap: gVisor corpus not yet qualified on in-guest LiteInst
+
       chaos:
         ci: false
         ci_disabled_reason: Chaos cells join after the verify sample is stable

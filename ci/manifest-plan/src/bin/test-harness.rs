@@ -8901,7 +8901,16 @@ sys.exit(1 if failed else 0)
         // left full under dh-jn0hh part 2 (pkg-config 0.29.2 in the
         // pinned root emits -D before -I), so pkg-config@dbt,
         // pkg-config@kvm and pkg-config@sabre are unreported again.
-        assert_eq!(unreported.len(), 12, "{unreported:?}");
+        // 12 + 137 on 2026-11-07: the gVisor qualification sample's
+        // candidate backends (kvm, liteinst, in-guest-trap) joined
+        // backends_enabled as optional (ci: false) cells for the nightly
+        // sweep after the pinned-image qualification run at b4ce9e923
+        // (54 cases; 42 cases x 3 candidates + 11 kvm-only cases whose
+        // liteinst-family cells failed; tkill's real-signal case enabled
+        // nowhere new). Full selects none of them while ci: false, so
+        // their parity cells are unreported until the auto-flip promotes
+        // the overnight-green ones to required.
+        assert_eq!(unreported.len(), 149, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
