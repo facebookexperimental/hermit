@@ -2368,21 +2368,63 @@ fn substitute_harvested_binaries(
     generation: &Path,
     selections: &mut BTreeMap<String, SelectionRecord>,
 ) -> Result<(), PreparationError> {
-    let status = std::process::Command::new("./ci/harvest-reverie-buck.sh")
-        .current_dir(root)
-        .status()
-        .map_err(|error| format!("buck harvest could not start: {error}"))?;
-    if !status.success() {
-        return Err(format!("buck harvest failed with {status}").into());
-    }
+    // Route (ii): the harvest runs in the host step (build.reverie_buck),
+    // which has DotSlash/reindeer access; prepare inside the pinned root
+    // never spawns it and stays network-free. Prepare reads ONLY the
+    // declared manifest and buck-harvest directory, verifying every file's
+    // sha256 against the manifest and refusing missing, mismatched, or
+    // extra files by name.
     let manifest_path = root.join("target/validate/harvested-files.json");
     let manifest = read_json(&manifest_path).map_err(|error| {
         format!(
-            "buck mode requires the harvest manifest {}: {error}",
+            "buck mode requires the declared harvest manifest {} (produced by build.reverie_buck on the host): {error}",
             manifest_path.display()
         )
     })?;
+    verify_harvest_manifest(&manifest, root)?;
     apply_harvest(&manifest, root, generation, selections)
+}
+
+/// Verify the declared harvest input against the manifest: every named
+/// file exists with the recorded sha256 (and the shared library when the
+/// manifest names one), and buck-harvest/ contains nothing extra.
+fn verify_harvest_manifest(manifest: &Value, root: &Path) -> Result<(), PreparationError> {
+    let files = manifest
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or("harvest manifest has no files")?;
+    let harvest_dir = root.join("target/validate/buck-harvest");
+    let mut expected: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut check = |harvested_to: &str, sha256: &str| -> Result<(), PreparationError> {
+        let path = root.join(harvested_to);
+        if !path.is_file() {
+            return Err(format!("harvested file is missing: {harvested_to}").into());
+        }
+        let identity = file_identity(&path, false)?;
+        if identity.sha256 != sha256 {
+            return Err(format!("harvested file hash mismatch: {harvested_to}").into());
+        }
+        expected.insert(path);
+        Ok(())
+    };
+    for file in files {
+        check(string(file, "harvested_to")?, string(file, "sha256")?)?;
+    }
+    if let Some(so) = manifest.get("shared_library") {
+        check(string(so, "harvested_to")?, string(so, "sha256")?)?;
+    }
+    let mut actual: BTreeSet<PathBuf> = BTreeSet::new();
+    for entry in fs::read_dir(&harvest_dir).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.is_file() {
+            actual.insert(path);
+        }
+    }
+    if actual != expected {
+        let extra: Vec<_> = actual.difference(&expected).collect();
+        return Err(format!("buck-harvest contains undeclared file(s): {extra:?}").into());
+    }
+    Ok(())
 }
 
 /// Enumerate one test binary's case names (`--list`, libtest format).
@@ -3341,6 +3383,43 @@ mod tests {
         std::fs::write(&buck_file, b"tampered basics").unwrap();
         let record = &selections["full"];
         assert!(check_identity(&record.binaries[0].executable, true).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn harvest_manifest_verification_refuses_tampered_missing_and_extra() {
+        let root = std::env::temp_dir().join(format!(
+            "harvest-verify-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let dir = root.join("target/validate/buck-harvest");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("basics");
+        std::fs::write(&file, b"buck bytes").unwrap();
+        let sha = format!("{:x}", Sha256::digest(b"buck bytes"));
+        let manifest = serde_json::json!({
+            "files": [{
+                "name": "basics",
+                "harvested_to": "target/validate/buck-harvest/basics",
+                "sha256": sha,
+            }]
+        });
+        verify_harvest_manifest(&manifest, &root).unwrap();
+        // Tampered bytes refuse by name.
+        std::fs::write(&file, b"tampered").unwrap();
+        let error = verify_harvest_manifest(&manifest, &root).unwrap_err();
+        assert!(error.to_string().contains("hash mismatch"), "{error}");
+        std::fs::write(&file, b"buck bytes").unwrap();
+        // An undeclared extra file refuses.
+        std::fs::write(dir.join("stray"), b"stray").unwrap();
+        let error = verify_harvest_manifest(&manifest, &root).unwrap_err();
+        assert!(error.to_string().contains("undeclared"), "{error}");
+        std::fs::remove_file(dir.join("stray")).unwrap();
+        // A missing file refuses by name.
+        std::fs::remove_file(&file).unwrap();
+        let error = verify_harvest_manifest(&manifest, &root).unwrap_err();
+        assert!(error.to_string().contains("missing"), "{error}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

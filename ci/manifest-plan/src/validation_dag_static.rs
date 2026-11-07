@@ -7997,6 +7997,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         manifest: None,
         integration_test_binaries: None,
         deps: &[
+            r########"build.reverie_buck"########,
             r########"gate.manifest"########,
             r########"setup.nextest"########,
         ],
@@ -8084,16 +8085,17 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"build"########,
         job: r########"reverie_buck"########,
         desc: r########"Reverie Buck-build bracket for the validate test set"########,
-        description: r########"M2 Cut 3 wiring for the Reverie BUILD switch (HERMIT_VALIDATE_BUILD_MODE, default cargo). Cargo mode is an inert no-op: build.workspace still compiles and stages the Reverie test set through nextest-binaries. Buck mode runs ci/harvest-reverie-buck.sh after the pinned-root workspace build: it buck2-builds the ten Reverie integration-test targets, harvests them into target/validate/buck-harvest only (Cargo target files are never written; placement over a Cargo counterpart exists only behind the script's explicit legacy opt-in, which prepare refuses), executes each harvested binary with --list, and writes the harvested-file manifest at target/validate/harvested-files.json. Prepare consumes that manifest directly in buck mode. The OSS shim reports no sanitizer, so in this repository the Buck cohort is the unsanitized OSS configuration; in fbcode the same targets build under asan-ubsan-dev."########,
-        labels: &[r########"full"########],
+        description: r########"M2 Cut 3 wiring for the Reverie BUILD switch (HERMIT_VALIDATE_BUILD_MODE, default cargo). Cargo mode is an inert no-op: build.workspace still compiles and stages the Reverie test set through nextest-binaries. Buck mode runs ci/harvest-reverie-buck.sh on the host before the workspace build (build.workspace depends on this node): it buck2-builds the ten Reverie integration-test targets, harvests them into target/validate/buck-harvest only (Cargo target files are never written; placement over a Cargo counterpart exists only behind the script's explicit legacy opt-in, which prepare refuses), executes each harvested binary with --list, and writes the harvested-file manifest at target/validate/harvested-files.json. Prepare consumes that manifest directly in buck mode. The OSS shim reports no sanitizer, so in this repository the Buck cohort is the unsanitized OSS configuration; in fbcode the same targets build under asan-ubsan-dev."########,
+        labels: &[
+            r########"full"########,
+            r########"hosted-portable"########,
+            r########"portable"########,
+        ],
         cmd: r########"case "${HERMIT_VALIDATE_BUILD_MODE:-cargo}" in cargo) : ;; buck) ./ci/harvest-reverie-buck.sh ;; *) echo "unknown Hermit build mode: ${HERMIT_VALIDATE_BUILD_MODE}" >&2; exit 2 ;; esac"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[
-            r########"gate.manifest"########,
-            r########"build.workspace_in_pinned_root"########,
-        ],
+        deps: &[r########"gate.manifest"########],
         env: &[],
         hint: HintSpec {
             resources: &[],

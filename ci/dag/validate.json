@@ -819,14 +819,15 @@
       "group": "build",
       "job": "reverie_buck",
       "desc": "Reverie Buck-build bracket for the validate test set",
-      "description": "M2 Cut 3 wiring for the Reverie BUILD switch (HERMIT_VALIDATE_BUILD_MODE, default cargo). Cargo mode is an inert no-op: build.workspace still compiles and stages the Reverie test set through nextest-binaries. Buck mode runs ci/harvest-reverie-buck.sh after the pinned-root workspace build: it buck2-builds the ten Reverie integration-test targets, harvests them into target/validate/buck-harvest only (Cargo target files are never written; placement over a Cargo counterpart exists only behind the script's explicit legacy opt-in, which prepare refuses), executes each harvested binary with --list, and writes the harvested-file manifest at target/validate/harvested-files.json. Prepare consumes that manifest directly in buck mode. The OSS shim reports no sanitizer, so in this repository the Buck cohort is the unsanitized OSS configuration; in fbcode the same targets build under asan-ubsan-dev.",
+      "description": "M2 Cut 3 wiring for the Reverie BUILD switch (HERMIT_VALIDATE_BUILD_MODE, default cargo). Cargo mode is an inert no-op: build.workspace still compiles and stages the Reverie test set through nextest-binaries. Buck mode runs ci/harvest-reverie-buck.sh on the host before the workspace build (build.workspace depends on this node): it buck2-builds the ten Reverie integration-test targets, harvests them into target/validate/buck-harvest only (Cargo target files are never written; placement over a Cargo counterpart exists only behind the script's explicit legacy opt-in, which prepare refuses), executes each harvested binary with --list, and writes the harvested-file manifest at target/validate/harvested-files.json. Prepare consumes that manifest directly in buck mode. The OSS shim reports no sanitizer, so in this repository the Buck cohort is the unsanitized OSS configuration; in fbcode the same targets build under asan-ubsan-dev.",
       "labels": [
-        "full"
+        "full",
+        "hosted-portable",
+        "portable"
       ],
       "cmd": "case \"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\" in cargo) : ;; buck) ./ci/harvest-reverie-buck.sh ;; *) echo \"unknown Hermit build mode: ${HERMIT_VALIDATE_BUILD_MODE}\" >&2; exit 2 ;; esac",
       "result_manifests": [],
       "deps": [
-        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin"
       ],
@@ -43543,6 +43544,7 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export HERMIT_INSTALL_FORCE_RESTAGE=\"${DAGRUN_STEP_STARTED_MONOTONIC_NS:-$(date +%s%N)}\" && HERMIT_CARGO_TIMINGS_DIR=\"${E2E_RESULT_ROOT:+$E2E_RESULT_ROOT/cargo-timings}\" ./ci/run-with-core-build.sh cargo build --locked --profile validate -p hermetic_infra_hermit_tests --bins && HERMIT_CARGO_TIMINGS_DIR=\"${E2E_RESULT_ROOT:+$E2E_RESULT_ROOT/cargo-timings}\" ./ci/run-with-core-build.sh cargo build --locked --profile validate --workspace --all-targets --features hermit-run/kvm-native-test-support,hermit-run/liteinst && ./ci/nextest-binaries.rs prepare hosted-portable && target/validate/stage-detcore-liteinst --git target",
       "result_manifests": [],
       "deps": [
+        "build.reverie_buck",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"

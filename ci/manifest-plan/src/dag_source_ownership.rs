@@ -153,8 +153,8 @@ pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[
     },
     ExtensionNode {
         tag: "build.reverie_buck",
-        labels: &["full"],
-        deps: &["gate.manifest", "build.workspace_in_pinned_root"],
+        labels: &["full", "hosted-portable", "portable"],
+        deps: &["gate.manifest"],
         populations: &[],
     },
 ];

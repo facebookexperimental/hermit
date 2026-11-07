@@ -134,7 +134,7 @@ for entry in "${TARGETS[@]}"; do
 done
 
 printf '%s' "$ENTRIES" | python3 -c '
-import json, sys
+import hashlib, json, os, sys
 files = []
 for line in sys.stdin:
     line = line.rstrip("\n")
@@ -157,6 +157,16 @@ manifest = {
     "cohort": "oss-unsanitized (shim reports no sanitizer); fbcode builds the same targets under asan-ubsan-dev",
     "files": files,
 }
+so_path = "target/validate/buck-harvest/libreverie_examples.so"
+if os.path.exists(so_path):
+    digest = hashlib.sha256()
+    with open(so_path, "rb") as fh:
+        digest.update(fh.read())
+    manifest["shared_library"] = {
+        "harvested_to": so_path,
+        "sha256": digest.hexdigest(),
+        "bytes": os.path.getsize(so_path),
+    }
 with open("target/validate/harvested-files.json", "w") as fh:
     json.dump(manifest, fh, indent=2)
     fh.write("\n")

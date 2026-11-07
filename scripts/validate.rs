@@ -656,10 +656,20 @@ fn reverie_buck_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             .deps
             .iter()
             .any(|dep| dep == "gate.manifest")
-        || !reverie_buck
+        || reverie_buck
             .deps
             .iter()
             .any(|dep| dep == "build.workspace_in_pinned_root")
+        || !cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.workspace")
+            .is_some_and(|workspace| {
+                workspace
+                    .deps
+                    .iter()
+                    .any(|dep| dep == "build.reverie_buck")
+            })
     {
         return Err(
             "reverie-buck bracket: Reverie Buck producer lost its closed mode branch".into(),
