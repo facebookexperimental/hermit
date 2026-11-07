@@ -30439,7 +30439,11 @@ mod pressure_sample_tests {
     #[test]
     fn series_parity_post_pass_reports_missing_operands_and_leaves_the_summary_unchanged() {
         let root = checkout_root();
-        let checked = check_scorecard(&root).unwrap();
+        // Pin the plan's memory budget, as the sibling plan fixtures
+        // do: planning against the host's observed cgroup/machine
+        // budget makes this fixture's selected plan host-dependent.
+        let mut checked = check_scorecard(&root).unwrap();
+        checked.memory_budget_override = Some(i64::MAX);
         let manifests = ManifestSet::load(&root).unwrap();
         let matrix = parity::ParityMatrix::derive(&manifests).unwrap();
         let comparable = |cell: &parity::ParityCellId| {
@@ -30535,6 +30539,12 @@ mod pressure_sample_tests {
             repetitions: Some(PROMOTION_REPETITIONS),
             run_id_prefix: Some("parity-post-pass".into()),
             run_timeout_seconds: Some(run_timeout_seconds),
+            // Pin the plan's width and guest caps instead of the
+            // host-adaptive defaults, so the plan is host-independent
+            // (an explicit cap may not exceed the scheduler width,
+            // so the width is pinned at the caps' 4).
+            jobs: Some(4),
+            manifest_guest_cap: Some(4),
             ..CellSelection::default()
         };
         let (mut metadata, _) = write_plan_after_scorecard_check(
