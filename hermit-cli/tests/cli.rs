@@ -28498,6 +28498,11 @@ fn an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_i
 /// a scheduler turn, and each turn moves the virtual clock. Before, none of
 /// the first 12 seeds' replays printed their recordings' times. Seeds 1, 2
 /// and 3, one test each.
+///
+/// PMU SUBJECT: the recorded slice ends are timer preemptions, so without
+/// a usable PMU timer neither the recording nor its replay can end a
+/// slice and the case only times out; test.cli and test.cli_on_host skip
+/// it by exact name and privileged-test.pmu_cli_cases runs it.
 #[test]
 fn a_schedule_replay_ends_each_recorded_slice_once_at_seed_1() {
     assert_chaos_schedule_replay_follows(&["syscalls"], false, 1);
