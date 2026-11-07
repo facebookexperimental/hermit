@@ -630,14 +630,6 @@ fn parse_event_text_with_inventory(
     })
 }
 
-fn reconcile_cpu_attempts(
-    parsed: &ParsedEvents,
-    directory: &Path,
-    binary_map: &BinaryMap,
-) -> Result<CpuReport, String> {
-    Ok(reconcile_cpu_attempts_with_cancelled(parsed, directory, binary_map)?.0)
-}
-
 /// Reconcile the typed attempts with the CPU wrapper's records.
 /// Also returns the identities of attempts a fail-fast cancel killed in
 /// flight (signal completions with no typed attempt); the caller records
@@ -1353,7 +1345,7 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), ProducerError> {
     let (cpu_report, cancelled_attempts) = match (attempt_records, binary_map.as_ref(), cpu_report) {
         (Some(records), Some(binary_map), Some(output)) => {
             let (report, cancelled) =
-                reconcile_cpu_attempts_with_cancelled(&parsed, Path::new(&records), &binary_map)?;
+                reconcile_cpu_attempts_with_cancelled(&parsed, Path::new(&records), binary_map)?;
             (Some((report, output)), cancelled)
         }
         (None, None, None) => (None, Vec::new()),
@@ -1587,9 +1579,9 @@ mod tests {
                             );
                         }
                         assert_eq!(
-                            reconcile_cpu_attempts(&parsed, &scratch.0, &inv.binary_map)
+                            reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &inv.binary_map)
                                 .unwrap()
-                                .attempts
+                                .0.attempts
                                 .len(),
                             8
                         );
@@ -2062,7 +2054,7 @@ mod tests {
                 &identified_attempt("pkg", "pkg", "run", 1, AttemptCompletion::Exit { code: 23 }),
             );
             assert!(
-                reconcile_cpu_attempts(&parsed, &scratch.0, &inv.binary_map)
+                reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &inv.binary_map)
                     .unwrap_err()
                     .contains("missing=")
             );
@@ -2071,9 +2063,9 @@ mod tests {
                 &identified_attempt("pkg", "pkg", "run", 2, AttemptCompletion::Exit { code: 0 }),
             );
             assert_eq!(
-                reconcile_cpu_attempts(&parsed, &scratch.0, &inv.binary_map)
+                reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &inv.binary_map)
                     .unwrap()
-                    .attempts
+                    .0.attempts
                     .len(),
                 2
             );
@@ -2091,7 +2083,7 @@ mod tests {
                 );
             }
             assert!(
-                reconcile_cpu_attempts(&parsed, &wrong.0, &inv.binary_map)
+                reconcile_cpu_attempts_with_cancelled(&parsed, &wrong.0, &inv.binary_map)
                     .unwrap_err()
                     .contains("disagree on whether")
             );
@@ -2121,7 +2113,7 @@ mod tests {
             assert_eq!(parsed.results[1].id, "pkg@stress-2$run");
             let scratch = Scratch::new();
             assert!(
-                reconcile_cpu_attempts(&parsed, &scratch.0, &inv.binary_map)
+                reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &inv.binary_map)
                     .unwrap_err()
                     .contains("does not support stress_index")
             );
@@ -2704,7 +2696,7 @@ mod tests {
         ] {
             write_record(&scratch.0, &record);
         }
-        let report = reconcile_cpu_attempts(&parsed, &scratch.0, &map).unwrap();
+        let report = reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &map).unwrap().0;
         assert_eq!(report.attempts.len(), 3);
     }
 
@@ -2967,7 +2959,7 @@ mod tests {
                 .all(|row| row.id.contains("@stress-1"))
         );
         let scratch = Scratch::new();
-        let error = reconcile_cpu_attempts(&parsed, &scratch.0, &sample_binary_map()).unwrap_err();
+        let error = reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &sample_binary_map()).unwrap_err();
         assert!(
             error.contains("does not support stress_index identities"),
             "{error}"
@@ -2990,11 +2982,11 @@ mod tests {
         );
         assert_eq!(parsed.expected_attempts.len(), 2);
         let scratch = Scratch::new();
-        let error = reconcile_cpu_attempts(&parsed, &scratch.0, &sample_binary_map()).unwrap_err();
+        let error = reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &sample_binary_map()).unwrap_err();
         assert!(error.contains("retry population overflows"), "{error}");
         let parsed =
             parse_event_text(&sample_events().replace("recovers#2", "recovers#999999999")).unwrap();
-        let error = reconcile_cpu_attempts(&parsed, &scratch.0, &sample_binary_map()).unwrap_err();
+        let error = reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &sample_binary_map()).unwrap_err();
         assert!(
             error.contains("require 1000000000 attempt records, supplied 0"),
             "{error}"
@@ -3016,12 +3008,13 @@ mod tests {
             &scratch.0,
             &attempt("recovers", 2, AttemptCompletion::Exit { code: 0 }),
         );
-        let report = reconcile_cpu_attempts(
+        let report = reconcile_cpu_attempts_with_cancelled(
             &parse_event_text(sample_events()).unwrap(),
             &scratch.0,
             &sample_binary_map(),
         )
-        .unwrap();
+    .unwrap()
+        .0;
         assert_eq!(report.run_id.as_deref(), Some("sample-run"));
         assert_eq!(report.attempts.len(), 3);
     }
@@ -3048,12 +3041,13 @@ mod tests {
             &scratch.0,
             &attempt("recovers", 2, AttemptCompletion::Exit { code: 0 }),
         );
-        let report = reconcile_cpu_attempts(
+        let report = reconcile_cpu_attempts_with_cancelled(
             &parse_event_text(sample_events()).unwrap(),
             &scratch.0,
             &sample_binary_map(),
         )
-        .unwrap();
+    .unwrap()
+        .0;
         assert_eq!(report.run_id.as_deref(), Some("sample-run"));
         assert_eq!(report.attempts.len(), 3);
     }
@@ -3065,7 +3059,7 @@ mod tests {
             &missing.0,
             &attempt("passes", 1, AttemptCompletion::Exit { code: 0 }),
         );
-        let error = reconcile_cpu_attempts(
+        let error = reconcile_cpu_attempts_with_cancelled(
             &parse_event_text(sample_events()).unwrap(),
             &missing.0,
             &sample_binary_map(),
@@ -3082,7 +3076,7 @@ mod tests {
         ] {
             write_record(&unexpected.0, &record);
         }
-        let error = reconcile_cpu_attempts(
+        let error = reconcile_cpu_attempts_with_cancelled(
             &parse_event_text(sample_events()).unwrap(),
             &unexpected.0,
             &sample_binary_map(),
@@ -3202,7 +3196,7 @@ mod tests {
             &false_pass.0,
             &attempt("recovers", 2, AttemptCompletion::Exit { code: 0 }),
         );
-        let error = reconcile_cpu_attempts(
+        let error = reconcile_cpu_attempts_with_cancelled(
             &parse_event_text(sample_events()).unwrap(),
             &false_pass.0,
             &sample_binary_map(),
@@ -3230,7 +3224,7 @@ mod tests {
             &false_cpu_timeout.0,
             &attempt("recovers", 2, AttemptCompletion::Exit { code: 0 }),
         );
-        let error = reconcile_cpu_attempts(
+        let error = reconcile_cpu_attempts_with_cancelled(
             &parse_event_text(sample_events()).unwrap(),
             &false_cpu_timeout.0,
             &sample_binary_map(),
@@ -3251,7 +3245,7 @@ mod tests {
             &false_failure.0,
             &attempt("recovers", 2, AttemptCompletion::Exit { code: 0 }),
         );
-        let error = reconcile_cpu_attempts(
+        let error = reconcile_cpu_attempts_with_cancelled(
             &parse_event_text(sample_events()).unwrap(),
             &false_failure.0,
             &sample_binary_map(),
