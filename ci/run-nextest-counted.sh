@@ -154,6 +154,38 @@ function nextest_inventory_args {
     done
 }
 
+function report_in_flight { # $1: the typed event stream. Name the tests that started but
+    # never finished, on stderr. A CPU-cap kill cuts the stream before nextest prints any
+    # captured output, so without this the node log names neither the in-flight tests nor
+    # that they were cut (dh-for17). A truncated last line is ignored, never fatal.
+    python3 - "$1" <<'PYEOF'
+import json, re, sys
+started = {}
+finished = set()
+try:
+    lines = open(sys.argv[1], encoding="utf-8", errors="replace")
+except OSError:
+    lines = []
+for line in lines:
+    try:
+        event = json.loads(line)
+    except ValueError:
+        continue
+    if event.get("type") != "test" or not event.get("name"):
+        continue
+    name = re.sub(r"#\d+$", "", event["name"])
+    if event.get("event") == "started":
+        started.setdefault(name, 0)
+        started[name] += 1
+    elif event.get("event") in ("ok", "failed", "ignored"):
+        finished.add(name)
+in_flight = sorted(name for name in started if name not in finished)
+if in_flight:
+    print("run-nextest-counted: %d test(s) still in flight when the run ended: %s"
+          % (len(in_flight), ", ".join(in_flight)), file=sys.stderr)
+PYEOF
+}
+
 function emit_libtest_count {
     local events=$1 status=${2:-0} path=${DAGRUN_TEST_COUNTS_PATH:--}
     local attempts=${3-} binary_map=${4-} cpu_report=${5-} inventory=${6-}
@@ -406,6 +438,9 @@ function run_nextest {
             emit_libtest_count "$events_log" "$status" "$attempts" "$binary_map" \
             "$cpu_report" "$inventory") || count_status=$?
     fi
+    if ((status != 0)); then
+        report_in_flight "$events_log"
+    fi
     if [[ -n $skip_file ]]; then
         rm -f "$skip_file"
         unset HERMIT_TEST_SKIP_FILE
@@ -454,6 +489,19 @@ with open(sys.argv[1], encoding="utf-8") as source:
     ],
     }
 PYEOF
+
+    # A cut stream names its in-flight tests (dh-for17): one finished, one
+    # started and never finished, and a truncated last line is ignored.
+    printf '%s\n' \
+        '{"type":"test","event":"started","name":"suite::suite$passes"}' \
+        '{"type":"test","event":"ok","name":"suite::suite$passes","exec_time":0.1}' \
+        '{"type":"test","event":"started","name":"suite::suite$cut"}' \
+        '{"type":"test","event":"started","name":"suite::suite$cut' \
+        >"$scratch/cut-events.jsonl"
+    got=$(report_in_flight "$scratch/cut-events.jsonl" 2>&1 >/dev/null)
+    [[ $got == 'run-nextest-counted: 1 test(s) still in flight when the run ended: suite::suite$cut' ]] || return 1
+    got=$(report_in_flight "$scratch/events.jsonl" 2>&1 >/dev/null)
+    [[ -z $got ]] || return 1
 
     printf 'HERMIT-TEST-SKIP: passes\tno /dev/kvm on this host\n' \
         >"$scratch/skips.txt"
